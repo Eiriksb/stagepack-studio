@@ -6,3 +6,6 @@ license.workspace = true
 
 [lib]
 name = "slides_format"
+
+[dependencies]
+markdown = "=1.0.0"
