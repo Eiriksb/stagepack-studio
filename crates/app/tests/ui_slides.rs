@@ -1,6 +1,8 @@
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use gpui_kit::test::TestWindowExt;
+use gpui_kit::test::{TestQueryExt, TestWindowExt};
 use gpui_kit::{
     AnyWindowHandle, App, AppContext, Bounds, Context, Entity, Pixels, Point, RenderImage,
     TestAppContext, Window, WindowBounds, WindowOptions, point, px, size,
@@ -8,7 +10,9 @@ use gpui_kit::{
 use slides_engine::Fonts;
 use stagepack_studio::document::Document;
 use stagepack_studio::slide_canvas::{SlideCanvas, letterbox};
-use stagepack_studio::workspace_view::{self, NOTICES_ID, PROBLEM_ID, TITLE_ID, WorkspaceView};
+use stagepack_studio::workspace_view::{
+    self, CANVAS_ID, MARKDOWN_ID, NOTICES_ID, PROBLEM_ID, TITLE_ID, WorkspaceView,
+};
 
 fn document(source: &str) -> Document {
     let dir = tempfile::tempdir().unwrap();
@@ -300,6 +304,234 @@ fn a_folder_that_cannot_be_opened_says_why(cx: &mut TestAppContext) {
                 .label()
                 .is_some_and(|label| label.contains("slides.md")),
             "{problem:?}"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn ctrl_m_shows_the_markdown(cx: &mut TestAppContext) {
+    let handle = open_talk(cx, "# One\n");
+    cx.simulate_keystrokes(handle, "ctrl-m");
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find(MARKDOWN_ID).visible());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn ctrl_m_hides_the_markdown_again(cx: &mut TestAppContext) {
+    let handle = open_talk(cx, "# One\n");
+    cx.simulate_keystrokes(handle, "ctrl-m");
+    cx.simulate_keystrokes(handle, "ctrl-m");
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find(MARKDOWN_ID).is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn the_markdown_is_to_the_right_of_the_slide(cx: &mut TestAppContext) {
+    let handle = open_talk(cx, "# One\n");
+    cx.simulate_keystrokes(handle, "ctrl-m");
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let (canvas, panel) = (window.find(CANVAS_ID), window.find(MARKDOWN_ID));
+        assert_eq!(panel.bounds().left(), canvas.bounds().right());
+        assert_eq!(panel.bounds().top(), canvas.bounds().top());
+        assert_eq!(panel.bounds().bottom(), canvas.bounds().bottom());
+        assert_eq!(panel.bounds().right(), px(1280.));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn the_markdown_shows_the_lines_of_the_file(cx: &mut TestAppContext) {
+    let handle = open_talk(cx, "\n# One\n\nSome words\n");
+    cx.simulate_keystrokes(handle, "ctrl-m");
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let (heading, words) = (
+            window.find_by_label("# One"),
+            window.find_by_label("Some words"),
+        );
+        assert!(heading.visible() && words.visible());
+        // The list takes its row height from the first row, and here that's a blank line.
+        let row = heading.bounds().size.height;
+        assert!(row > px(0.), "{heading:?}");
+        assert_eq!(words.bounds().top() - heading.bounds().top(), row * 2.);
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn an_empty_talk_can_show_its_markdown(cx: &mut TestAppContext) {
+    let handle = open_talk(cx, "");
+    cx.simulate_keystrokes(handle, "ctrl-m");
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find(MARKDOWN_ID).visible());
+    })
+    .unwrap();
+}
+
+struct SavedTalk {
+    _folder: tempfile::TempDir,
+    file: PathBuf,
+    handle: AnyWindowHandle,
+    view: Entity<WorkspaceView>,
+}
+
+/// A talk whose file stays on disk, with the Markdown showing.
+fn open_saved_talk(cx: &mut TestAppContext, source: &str) -> SavedTalk {
+    let folder = tempfile::tempdir().unwrap();
+    let file = folder.path().join("slides.md");
+    std::fs::write(&file, source).unwrap();
+    let talk = Document::open(folder.path(), Fonts::bundled_only()).unwrap();
+    let (handle, view) = open_view(cx, |window, cx| WorkspaceView::open_with(talk, window, cx));
+    settle(cx, handle);
+    cx.simulate_keystrokes(handle, "ctrl-m");
+    settle(cx, handle);
+    SavedTalk {
+        _folder: folder,
+        file,
+        handle,
+        view,
+    }
+}
+
+fn save(cx: &mut TestAppContext, talk: &SavedTalk, contents: &str) {
+    std::fs::write(&talk.file, contents).unwrap();
+    cx.update(|cx| {
+        talk.view
+            .update(cx, |view, cx| view.reload_soon(talk.file.clone(), cx))
+    });
+}
+
+/// Lets `millis` pass, and everything waiting on them run and draw.
+fn wait(cx: &mut TestAppContext, talk: &SavedTalk, millis: u64) {
+    cx.executor().advance_clock(Duration::from_millis(millis));
+    cx.run_until_parked();
+    settle(cx, talk.handle);
+}
+
+fn shows_line(cx: &mut TestAppContext, talk: &SavedTalk, line: &str) -> bool {
+    cx.update_window(talk.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.try_find_by_label(line).is_some()
+    })
+    .unwrap()
+}
+
+#[gpui_kit::test]
+fn a_save_shows_once_the_file_has_been_quiet(cx: &mut TestAppContext) {
+    let talk = open_saved_talk(cx, "---\ntitle: T\n---\n\n# One\n");
+    let canvas = slide_canvas(cx, &talk.view);
+    let before = images(cx, &canvas);
+    assert_eq!(before.len(), 2, "background and title");
+
+    save(cx, &talk, "---\ntitle: T\n---\n\n# Changed\n");
+    wait(cx, &talk, 99);
+    assert!(shows_line(cx, &talk, "# One"), "too soon");
+    assert!(Arc::ptr_eq(&before[1], &images(cx, &canvas)[1]), "too soon");
+
+    wait(cx, &talk, 1);
+    assert!(shows_line(cx, &talk, "# Changed"));
+    assert!(!shows_line(cx, &talk, "# One"));
+    assert!(
+        !Arc::ptr_eq(&before[1], &images(cx, &canvas)[1]),
+        "the heading was drawn again"
+    );
+}
+
+#[gpui_kit::test]
+fn each_change_starts_the_wait_again(cx: &mut TestAppContext) {
+    let talk = open_saved_talk(cx, "# One\n");
+    save(cx, &talk, "# Half saved\n");
+    wait(cx, &talk, 60);
+    save(cx, &talk, "# Fully saved\n");
+    wait(cx, &talk, 60);
+    assert!(shows_line(cx, &talk, "# One"), "the file isn't quiet yet");
+
+    wait(cx, &talk, 40);
+    assert!(shows_line(cx, &talk, "# Fully saved"));
+}
+
+#[gpui_kit::test]
+fn a_save_to_another_slide_leaves_this_one_and_updates_the_count(cx: &mut TestAppContext) {
+    let talk = open_saved_talk(cx, "---\ntitle: T\n---\n\n# One\n\n---\n\n# Two\n");
+    let canvas = slide_canvas(cx, &talk.view);
+    let before = images(cx, &canvas);
+
+    save(
+        cx,
+        &talk,
+        "---\ntitle: T\n---\n\n# One\n\n---\n\n# Two\n\n---\n\n# Three\n",
+    );
+    wait(cx, &talk, 100);
+
+    assert_eq!(title(cx, talk.handle), "T · 1 / 3");
+    assert!(shows_line(cx, &talk, "# Three"));
+    let after = images(cx, &canvas);
+    assert_eq!(before.len(), after.len());
+    assert!(
+        before
+            .iter()
+            .zip(&after)
+            .all(|(before, after)| Arc::ptr_eq(before, after))
+    );
+}
+
+#[gpui_kit::test]
+fn being_moved_to_an_unchanged_slide_shows_it(cx: &mut TestAppContext) {
+    let talk = open_saved_talk(cx, "# One\n\n---\n\n# Two\n");
+    cx.simulate_keystrokes(talk.handle, "right");
+    settle(cx, talk.handle);
+    let canvas = slide_canvas(cx, &talk.view);
+    let on_second = images(cx, &canvas);
+
+    save(cx, &talk, "# One\n\n");
+    wait(cx, &talk, 100);
+
+    assert!(title(cx, talk.handle).ends_with("1 / 1"));
+    assert!(
+        !Arc::ptr_eq(&on_second[1], &images(cx, &canvas)[1]),
+        "the canvas moved to the slide that's left"
+    );
+}
+
+#[gpui_kit::test]
+fn a_file_that_cannot_be_read_keeps_what_is_showing(cx: &mut TestAppContext) {
+    let talk = open_saved_talk(cx, "# One\n");
+    let canvas = slide_canvas(cx, &talk.view);
+    let before = images(cx, &canvas);
+
+    save(cx, &talk, "");
+    wait(cx, &talk, 100);
+    std::fs::remove_file(&talk.file).unwrap();
+    cx.update(|cx| {
+        talk.view
+            .update(cx, |view, cx| view.reload_soon(talk.file.clone(), cx))
+    });
+    wait(cx, &talk, 100);
+
+    assert!(shows_line(cx, &talk, "# One"));
+    assert!(Arc::ptr_eq(&before[1], &images(cx, &canvas)[1]));
+}
+
+#[gpui_kit::test]
+fn a_folder_that_cannot_be_watched_says_so(cx: &mut TestAppContext) {
+    let (handle, view) = open_with_view(cx, "# One\n");
+    let gone = tempfile::tempdir().unwrap().path().to_path_buf();
+    cx.update(|cx| view.update(cx, |view, cx| view.follow_saves(gone, cx)));
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let notices = window.find(NOTICES_ID);
+        assert!(
+            notices.label().is_some_and(|label| label.contains("watch")),
+            "{notices:?}"
         );
     })
     .unwrap();

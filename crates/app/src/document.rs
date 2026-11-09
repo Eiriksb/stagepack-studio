@@ -5,8 +5,18 @@ use std::sync::Arc;
 
 use slides_engine::{Deck, FolderFiles, Fonts, Layer, TalkFiles};
 
-const SLIDES_FILE: &str = "slides.md";
+pub(crate) const SLIDES_FILE: &str = "slides.md";
 const FONTS_FOLDER: &str = "assets/fonts";
+
+/// What came of reading the talk's file again.
+pub enum Reload {
+    /// The talk took the new text. These are the slides to show again.
+    Changed(Vec<usize>),
+    /// The file says what it said before.
+    Unchanged,
+    /// The read gave nothing to use, so the talk stays as it was.
+    KeptLastGood,
+}
 
 pub struct Document {
     deck: Deck,
@@ -72,6 +82,27 @@ impl Document {
 
     pub fn source(&self) -> &str {
         self.deck.source()
+    }
+
+    /// Takes a new read of the talk's file: its text, or `None` if it couldn't be read. An
+    /// empty read is an editor caught halfway through a save, not an empty talk.
+    pub fn reload(&mut self, contents: Option<String>) -> Reload {
+        let Some(source) = contents.filter(|source| !source.is_empty()) else {
+            return Reload::KeptLastGood;
+        };
+        if source == self.source() {
+            return Reload::Unchanged;
+        }
+        let mut changed = self.deck.update(source);
+        let last = self.slide_count() - 1;
+        if self.current > last {
+            self.current = last;
+            // Its text may be as it was, but this is now the slide to show.
+            if !changed.contains(&last) {
+                changed.push(last);
+            }
+        }
+        Reload::Changed(changed)
     }
 }
 

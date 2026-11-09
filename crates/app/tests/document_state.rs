@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use slides_engine::{Fonts, Layer};
-use stagepack_studio::document::Document;
+use stagepack_studio::document::{Document, Reload};
 
 fn talk(source: &str) -> (tempfile::TempDir, Document) {
     let dir = tempfile::tempdir().unwrap();
@@ -197,4 +197,58 @@ fn a_font_link_cannot_reach_outside_the_talk() {
     std::fs::write(&outside, font_only_a_talk_has()).unwrap();
     std::os::unix::fs::symlink(&outside, folder.join("assets/fonts/link.ttf")).unwrap();
     assert!(same_pixels(&drawn_title(&folder), &without));
+}
+
+#[test]
+fn saving_a_change_reports_the_slide() {
+    let (_d, mut doc) = talk("# One\n\n---\n\n# Two\n");
+    assert!(
+        matches!(doc.reload(Some("# One\n\n---\n\n# Changed\n".into())), Reload::Changed(s) if s == vec![1])
+    );
+}
+
+#[test]
+fn saving_the_same_bytes_changes_nothing() {
+    let (_d, mut doc) = talk("# One\n");
+    assert!(matches!(
+        doc.reload(Some("# One\n".into())),
+        Reload::Unchanged
+    ));
+}
+
+#[test]
+fn empty_read_keeps_the_last_good_talk() {
+    let (_d, mut doc) = talk("# One\n");
+    assert!(matches!(
+        doc.reload(Some(String::new())),
+        Reload::KeptLastGood
+    ));
+    assert!(matches!(doc.reload(None), Reload::KeptLastGood));
+    assert_eq!(doc.source(), "# One\n");
+}
+
+#[test]
+fn reload_keeps_your_place() {
+    let (_d, mut doc) = talk("# One\n\n---\n\n# Two\n");
+    doc.next();
+    doc.reload(Some("# One\n\n---\n\n# Two!\n".into()));
+    assert_eq!(doc.current(), 1);
+}
+
+#[test]
+fn removing_slides_moves_you_to_the_last_one() {
+    let (_d, mut doc) = talk("# One\n\n---\n\n# Two\n\n---\n\n# Three\n");
+    doc.next();
+    doc.next();
+    doc.reload(Some("# One\n".into()));
+    assert_eq!(doc.current(), 0);
+}
+
+#[test]
+fn being_moved_to_a_slide_that_did_not_change_reports_it() {
+    // The first slide's text is exactly as it was, but it's now the one showing.
+    let (_d, mut doc) = talk("# One\n\n---\n\n# Two\n");
+    doc.next();
+    assert!(matches!(doc.reload(Some("# One\n\n".into())), Reload::Changed(s) if s == vec![0]));
+    assert_eq!(doc.current(), 0);
 }
