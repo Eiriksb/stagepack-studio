@@ -10,3 +10,7 @@ license = "MIT"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+
+# Debug info for GPUI and the WebKit bindings is what makes builds use the most memory.
+[profile.dev.package."*"]
+debug = false
