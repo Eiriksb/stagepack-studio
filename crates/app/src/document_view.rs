@@ -27,6 +27,8 @@ const STUDIO_ADDON: &str = "runtimes/53/node_modules/slidev-addon-studio";
 
 const TRUST_TITLE: &str = "Trust this presentation?";
 const CLOSED_TEXT: &str = "The presentation was closed.";
+const UNSAVED_HINT: &str = "Your unsaved changes are still here: use Save before closing.";
+const STILL_SAVING_TITLE: &str = "Still saving. Close anyway?";
 
 /// What the view asked of the sidecar. A document made with
 /// [`DocumentView::for_test`] records these instead of sending them.
@@ -75,11 +77,7 @@ impl DocumentView {
         let mut document = Document::new(path);
         canvas.update(cx, |canvas, cx| canvas.set_visible(false, cx));
         let subscription = cx.subscribe_in(&canvas, window, |this, _, event, window, cx| {
-            let effects = match event {
-                CanvasEvent::Page(msg) => this.document.on_page(msg),
-                CanvasEvent::ProtocolError(err) => this.document.on_protocol_error(err),
-            };
-            this.apply(effects, window, cx);
+            this.on_canvas(event, window, cx)
         });
 
         let spawned = spawn_options(&document.path).and_then(|options| {
@@ -145,6 +143,15 @@ impl DocumentView {
         self.apply(effects, window, cx);
     }
 
+    pub fn on_canvas(&mut self, event: &CanvasEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let effects = match event {
+            CanvasEvent::Page(msg) => self.document.on_page(msg),
+            CanvasEvent::ProtocolError(err) => self.document.on_protocol_error(err),
+            CanvasEvent::SaveShortcut => return self.save(window, cx),
+        };
+        self.apply(effects, window, cx);
+    }
+
     pub fn on_page(&mut self, msg: &PageMessage, window: &mut Window, cx: &mut Context<Self>) {
         let effects = self.document.on_page(msg);
         self.apply(effects, window, cx);
@@ -155,6 +162,7 @@ impl DocumentView {
         if !self.document.can_save() {
             return;
         }
+        self.document.save_sent();
         if let Err(err) = self.send(SidecarCommand::Save) {
             // As if serve had refused: the message shows, and a close waiting
             // for the save is called off.
@@ -167,12 +175,16 @@ impl DocumentView {
     }
 
     /// The window was asked to close. Returns whether it may close now; if
-    /// not, the save-changes question is up, or a save is on its way.
+    /// not, a question is up: save the changes, or stop waiting for a save.
     pub fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.closing {
             return true;
         }
+        // Only set while serve runs: stopping or exiting clears it.
         if self.document.closing_after_save() {
+            if !window.has_active_dialog(cx) {
+                self.ask_still_saving(window, cx);
+            }
             return false;
         }
         if self.document.wants_close_prompt() {
@@ -210,6 +222,11 @@ impl DocumentView {
                 }
                 Effect::ShowMessage(message) => show_message(message.into(), window, cx),
                 Effect::CloseWindow => self.close_window(window, cx),
+                Effect::AskSaveChanges => {
+                    if !window.has_active_dialog(cx) {
+                        self.ask_save_changes(window, cx);
+                    }
+                }
             }
         }
         self.sync_canvas(cx);
@@ -332,14 +349,7 @@ impl DocumentView {
         let view = cx.weak_entity();
         let title: SharedString = format!("Save changes to {}?", self.document.title).into();
         window.open_dialog(cx, move |dialog, _, _| {
-            type Choice = fn(&mut DocumentView, &mut Window, &mut Context<DocumentView>);
-            let choose = |choice: Choice| {
-                let view = view.clone();
-                move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
-                    window.close_dialog(cx);
-                    view.update(cx, |this, cx| choice(this, window, cx)).ok();
-                }
-            };
+            let choose = |choice: Choice| choose(view.clone(), choice);
             dialog
                 .title(
                     div()
@@ -368,6 +378,48 @@ impl DocumentView {
                         ),
                 )
         });
+    }
+
+    fn ask_still_saving(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let choose = |choice: Choice| choose(view.clone(), choice);
+            dialog
+                .title(
+                    div()
+                        .id("still-saving-title")
+                        .test_support()
+                        .aria_label(STILL_SAVING_TITLE)
+                        .child(STILL_SAVING_TITLE),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("still-saving-close")
+                                .label("Close Anyway")
+                                .on_click(choose(Self::close_window)),
+                        )
+                        .child(
+                            Button::new("still-saving-wait")
+                                .primary()
+                                .label("Keep Waiting")
+                                .on_click(choose(|_, _, _| {})),
+                        ),
+                )
+        });
+    }
+}
+
+/// What a dialog's button does to the document, once the dialog has closed.
+type Choice = fn(&mut DocumentView, &mut Window, &mut Context<DocumentView>);
+
+fn choose(
+    view: WeakEntity<DocumentView>,
+    choice: Choice,
+) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
+    move |_, window, cx| {
+        window.close_dialog(cx);
+        view.update(cx, |this, cx| choice(this, window, cx)).ok();
     }
 }
 
@@ -414,6 +466,9 @@ impl Render for DocumentView {
                             .max_w(px(640.))
                             .child(message),
                     )
+                    .when(self.document.wants_close_prompt(), |this| {
+                        this.child(note("failed-unsaved", UNSAVED_HINT.into()))
+                    })
                     .when(!log.is_empty(), |this| {
                         let log: SharedString = log.clone().into();
                         this.child(
