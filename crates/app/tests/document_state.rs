@@ -371,3 +371,134 @@ fn an_error_while_saving_to_close_keeps_the_window() {
     assert!(!d.closing_after_save());
     assert_eq!(d.state, failed("slidev exited", ""));
 }
+
+fn saved() -> SidecarEvent {
+    SidecarEvent::Saved {
+        updated: "2026-11-09T12:00:00Z".into(),
+    }
+}
+
+#[test]
+fn an_edit_during_a_save_stays_dirty() {
+    let mut d = open_doc();
+    d.on_page(&edited());
+    d.save_sent();
+    // The page wrote after serve had read the files: that edit isn't in the save.
+    d.on_page(&edited());
+    assert_eq!(d.on_sidecar(saved()), vec![]);
+    assert!(d.dirty, "the second edit is still unsaved");
+    assert!(d.wants_close_prompt());
+    assert!(d.can_save());
+}
+
+#[test]
+fn an_edit_during_save_then_close_asks_again() {
+    let mut d = open_doc();
+    d.on_page(&edited());
+    d.close_after_save();
+    d.save_sent();
+    d.on_page(&edited());
+    assert_eq!(
+        d.on_sidecar(saved()),
+        vec![Effect::AskSaveChanges],
+        "the window must not close over an unsaved edit"
+    );
+    assert!(d.dirty);
+    assert!(!d.closing_after_save());
+}
+
+#[test]
+fn saves_in_flight_settle_in_order() {
+    let mut d = open_doc();
+    d.on_page(&edited());
+    d.save_sent();
+    d.on_page(&edited());
+    d.save_sent();
+    d.on_sidecar(saved());
+    assert!(d.dirty, "the first save has only the first edit");
+    d.on_sidecar(saved());
+    assert!(!d.dirty, "the second save has both");
+
+    // A refused save gives up its place in the queue too.
+    d.on_page(&edited());
+    d.save_sent();
+    d.on_sidecar(SidecarEvent::Conflict {
+        message: "Changed on disk.".into(),
+    });
+    assert!(d.dirty);
+    d.save_sent();
+    d.on_sidecar(saved());
+    assert!(!d.dirty);
+}
+
+#[test]
+fn a_save_then_close_waits_for_the_save_that_has_every_edit() {
+    let mut d = open_doc();
+    d.on_page(&edited());
+    d.save_sent(); // Ctrl+S
+    d.on_page(&edited());
+    d.close_after_save();
+    d.save_sent(); // the close prompt's Save
+    assert_eq!(
+        d.on_sidecar(saved()),
+        vec![],
+        "the next save may have the rest"
+    );
+    assert!(d.closing_after_save());
+    assert_eq!(d.on_sidecar(saved()), vec![Effect::CloseWindow]);
+}
+
+#[test]
+fn stopping_ends_a_pending_save_then_close() {
+    let mut d = open_doc();
+    d.on_page(&edited());
+    d.close_after_save();
+    d.save_sent();
+    // Serve answered a signal with `stopped` and never said `saved`.
+    d.on_sidecar(SidecarEvent::Stopped);
+    assert!(!d.closing_after_save());
+    d.on_sidecar(SidecarEvent::Exited { code: Some(0) });
+    assert!(!d.closing_after_save());
+    assert_eq!(d.state, DocState::Closed);
+    assert!(!d.wants_close_prompt(), "nothing is left to save");
+
+    let mut d = open_doc();
+    d.on_page(&edited());
+    d.close_after_save();
+    d.on_sidecar(SidecarEvent::Exited { code: Some(0) });
+    assert!(!d.closing_after_save(), "an exit without `stopped` too");
+}
+
+#[test]
+fn a_failure_while_serve_runs_keeps_the_edits_savable() {
+    let mut d = open_doc();
+    d.on_page(&edited());
+    d.on_protocol_error("Unsupported bridge version: 2");
+    assert!(matches!(d.state, DocState::Failed { .. }));
+    assert!(d.wants_close_prompt(), "serve still has the edits");
+    assert!(d.can_save());
+
+    // An unreadable line from serve is an `Error` while serve keeps serving.
+    let mut d = open_doc();
+    d.on_page(&edited());
+    d.on_sidecar(SidecarEvent::Error {
+        message: "Unreadable message from Stagepack: x".into(),
+        log: String::new(),
+    });
+    assert!(d.wants_close_prompt());
+    assert!(d.can_save());
+}
+
+#[test]
+fn an_error_then_stopped_has_nothing_to_save() {
+    let mut d = open_doc();
+    d.on_page(&edited());
+    d.on_sidecar(SidecarEvent::Error {
+        message: "slidev exited".into(),
+        log: "boom".into(),
+    });
+    d.on_sidecar(SidecarEvent::Stopped);
+    assert!(d.dirty);
+    assert!(!d.wants_close_prompt(), "serve removed the work folder");
+    assert!(!d.can_save());
+}

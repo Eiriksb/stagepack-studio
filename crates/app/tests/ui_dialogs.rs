@@ -10,6 +10,7 @@ use gpui_kit::{
     AnyWindowHandle, AppContext, Bounds, Entity, Point, TestAppContext, VisualTestContext,
     WindowBounds, WindowOptions, px, size,
 };
+use stagepack_studio::canvas::CanvasEvent;
 use stagepack_studio::document::NOT_TRUSTED_MESSAGE;
 use stagepack_studio::document_view::{DocumentView, SidecarCommand};
 use stagepack_studio::workspace_view::{self, WorkspaceView};
@@ -381,4 +382,153 @@ async fn failed_state_shows_message_and_log(cx: &mut TestAppContext) {
         assert_eq!(log.label(), Some("boom\nat line 2"));
     })
     .unwrap();
+}
+
+fn saved() -> SidecarEvent {
+    SidecarEvent::Saved {
+        updated: "2026-11-09T12:00:00Z".into(),
+    }
+}
+
+fn edited() -> PageMessage {
+    PageMessage::Edited {
+        slide: 2,
+        label: "Move".into(),
+    }
+}
+
+fn is_dirty(cx: &mut TestAppContext, doc: &Entity<DocumentView>) -> bool {
+    cx.update(|cx| doc.read(cx).document().dirty)
+}
+
+#[gpui_kit::test]
+async fn an_edit_during_save_then_close_asks_again(cx: &mut TestAppContext) {
+    let (handle, doc) = open_dirty(cx);
+    answer_close_prompt(cx, handle, "save-changes-save").await;
+    // The page wrote after serve had read the files, so the save misses it.
+    page(cx, handle, &doc, edited());
+    sidecar(cx, handle, &doc, saved());
+    cx.run_until_parked();
+    assert!(is_open(cx, handle), "the window stays over an unsaved edit");
+    assert!(is_dirty(cx, &doc));
+    cx.wait_for(handle, WAIT, |window, _| {
+        window.try_find("save-changes-save").is_some()
+    })
+    .await;
+}
+
+#[gpui_kit::test]
+async fn a_second_close_while_saving_offers_to_close_anyway(cx: &mut TestAppContext) {
+    let (handle, doc) = open_dirty(cx);
+    answer_close_prompt(cx, handle, "save-changes-save").await;
+
+    assert!(!request_close(cx, handle));
+    cx.wait_for(handle, WAIT, |window, _| {
+        window.try_find("still-saving-wait").is_some()
+    })
+    .await;
+    cx.update_window(handle, |_, window, cx| {
+        let mut dialog = window.within("dialog");
+        assert_eq!(
+            dialog.find("still-saving-title").label(),
+            Some("Still saving. Close anyway?")
+        );
+        assert!(dialog.find("still-saving-close").visible());
+        dialog.click("still-saving-wait", cx);
+    })
+    .unwrap();
+    cx.wait_for(handle, WAIT, |window, _| {
+        window.try_find("dialog").is_none()
+    })
+    .await;
+    assert!(is_open(cx, handle), "Keep Waiting keeps the window");
+    assert_eq!(sent(cx, &doc), vec![SidecarCommand::Save]);
+
+    assert!(!request_close(cx, handle));
+    cx.wait_for(handle, WAIT, |window, _| {
+        window.try_find("still-saving-close").is_some()
+    })
+    .await;
+    cx.update_window(handle, |_, window, cx| {
+        window.within("dialog").click("still-saving-close", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(!is_open(cx, handle), "Close Anyway closes");
+    assert_eq!(
+        sent(cx, &doc),
+        vec![SidecarCommand::Save, SidecarCommand::Stop]
+    );
+}
+
+#[gpui_kit::test]
+async fn a_stop_during_save_then_close_lets_the_window_close(cx: &mut TestAppContext) {
+    let (handle, doc) = open_dirty(cx);
+    answer_close_prompt(cx, handle, "save-changes-save").await;
+    // Serve answered a signal with `stopped` and never said `saved`.
+    sidecar(cx, handle, &doc, SidecarEvent::Stopped);
+    sidecar(cx, handle, &doc, SidecarEvent::Exited { code: Some(0) });
+    assert!(request_close(cx, handle), "nothing is waiting any more");
+}
+
+#[gpui_kit::test]
+async fn a_failed_talk_with_edits_still_offers_save(cx: &mut TestAppContext) {
+    let (handle, doc) = open_dirty(cx);
+    // Serve keeps serving after an unreadable line.
+    sidecar(
+        cx,
+        handle,
+        &doc,
+        SidecarEvent::Error {
+            message: "Unreadable message from Stagepack: x".into(),
+            log: String::new(),
+        },
+    );
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("failed-message").visible());
+        assert_eq!(
+            window.find("failed-unsaved").label(),
+            Some("Your unsaved changes are still here: use Save before closing.")
+        );
+        assert_ne!(window.find("save").disabled(), Some(true), "Save works");
+    })
+    .unwrap();
+
+    assert!(!request_close(cx, handle), "closing asks first");
+    cx.wait_for(handle, WAIT, |window, _| {
+        window.try_find("save-changes-cancel").is_some()
+    })
+    .await;
+    cx.update_window(handle, |_, window, cx| {
+        window.within("dialog").click("save-changes-cancel", cx);
+    })
+    .unwrap();
+    cx.wait_for(handle, WAIT, |window, _| {
+        window.try_find("dialog").is_none()
+    })
+    .await;
+
+    // Once serve has stopped, its work folder is gone: nothing to save or ask.
+    sidecar(cx, handle, &doc, SidecarEvent::Stopped);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("failed-unsaved").is_none());
+        assert_eq!(window.find("save").disabled(), Some(true));
+    })
+    .unwrap();
+    assert!(request_close(cx, handle));
+}
+
+#[gpui_kit::test]
+async fn ctrl_s_in_the_page_saves(cx: &mut TestAppContext) {
+    let (handle, doc) = open_dirty(cx);
+    // What the canvas emits when the web view has focus and sees Ctrl+S.
+    cx.update_window(handle, |_, window, cx| {
+        doc.update(cx, |doc, cx| {
+            doc.on_canvas(&CanvasEvent::SaveShortcut, window, cx)
+        });
+    })
+    .unwrap();
+    assert_eq!(sent(cx, &doc), vec![SidecarCommand::Save]);
 }

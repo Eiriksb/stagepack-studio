@@ -13,6 +13,7 @@ use studio_protocol::{Command, CommandBody, PageMessage, command_script, parse_p
 pub enum CanvasEvent {
     Page(PageMessage),
     ProtocolError(String),
+    SaveShortcut,
 }
 
 /// What the web view hands over from outside GPUI, in the order it happened.
@@ -21,6 +22,8 @@ enum Incoming {
     /// A new document committed. On Linux wry reports WebKit's commit as
     /// `PageLoadEvent::Started`; the old page lives until then.
     LoadCommitted,
+    /// Ctrl+S, while the page had the keyboard.
+    SaveShortcut,
 }
 
 /// `STUDIO_DEBUG_IPC=1` logs the type of each page message, and each sidecar
@@ -63,6 +66,8 @@ impl EventEmitter<CanvasEvent> for Canvas {}
 impl Canvas {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (tx, rx) = async_channel::unbounded::<Incoming>();
+        #[cfg(target_os = "linux")]
+        let on_save_key = tx.clone();
         let webview = cx.new(|cx| {
             // Both handlers run on the UI thread but outside GPUI, so they only
             // pass what happened on to the loop below.
@@ -80,6 +85,8 @@ impl Canvas {
             let builder = builder.with_devtools(true);
             WebView::build(builder, window, cx).expect("Failed to create the web view")
         });
+        #[cfg(target_os = "linux")]
+        watch_save_key(webview.read(cx).raw(), on_save_key);
 
         cx.spawn(async move |this, cx| {
             while let Ok(incoming) = rx.recv().await {
@@ -140,6 +147,13 @@ impl Canvas {
                 self.handshake.load_committed();
                 return;
             }
+            Incoming::SaveShortcut => {
+                if *DEBUG_IPC {
+                    eprintln!("[studio ipc] save shortcut");
+                }
+                cx.emit(CanvasEvent::SaveShortcut);
+                return;
+            }
         };
         match parse_page_message(&json) {
             Ok(msg) => match self.handshake.on_page(&msg) {
@@ -182,6 +196,39 @@ impl Render for Canvas {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div().size_full().child(self.webview.clone())
     }
+}
+
+/// GTK gives keys to the focused web view, so GPUI never sees them while the
+/// page has the keyboard. Takes Ctrl+S before WebKit does, and passes it on;
+/// every other key, Ctrl+Z included, goes on to the page.
+#[cfg(target_os = "linux")]
+fn watch_save_key(webview: &wry::WebView, tx: async_channel::Sender<Incoming>) {
+    use gtk::glib::Propagation;
+    use gtk::prelude::WidgetExt as _;
+    use wry::WebViewExtUnix as _;
+
+    webview.webview().connect_key_press_event(move |_, event| {
+        if !is_save_key(event.keyval(), event.state()) {
+            return Propagation::Proceed;
+        }
+        // Runs inside GTK's main loop, so it only passes the key on.
+        let _ = tx.try_send(Incoming::SaveShortcut);
+        Propagation::Stop
+    });
+}
+
+/// Ctrl+S with no other modifier held. Caps Lock and Num Lock don't count.
+#[cfg(target_os = "linux")]
+fn is_save_key(key: gtk::gdk::keys::Key, state: gtk::gdk::ModifierType) -> bool {
+    use gtk::gdk::ModifierType as Held;
+
+    let held = state
+        & (Held::CONTROL_MASK
+            | Held::SHIFT_MASK
+            | Held::MOD1_MASK
+            | Held::SUPER_MASK
+            | Held::META_MASK);
+    held == Held::CONTROL_MASK && key.to_lower() == gtk::gdk::keys::constants::s
 }
 
 /// The `ready` handshake and the commands waiting for it, kept apart from
@@ -423,5 +470,34 @@ mod tests {
     #[test]
     fn an_empty_queue_sends_nothing() {
         assert!(queued_commands(1, Vec::new()).is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_a_plain_ctrl_s_is_the_save_key() {
+        use super::is_save_key;
+        use gtk::gdk::ModifierType as Held;
+        use gtk::gdk::keys::constants as key;
+
+        assert!(is_save_key(key::s, Held::CONTROL_MASK));
+        assert!(
+            is_save_key(key::S, Held::CONTROL_MASK | Held::LOCK_MASK),
+            "Caps Lock"
+        );
+        assert!(
+            is_save_key(key::s, Held::CONTROL_MASK | Held::MOD2_MASK),
+            "Num Lock"
+        );
+
+        assert!(!is_save_key(key::s, Held::empty()), "typing an s");
+        assert!(!is_save_key(key::z, Held::CONTROL_MASK), "undo");
+        assert!(
+            !is_save_key(key::S, Held::CONTROL_MASK | Held::SHIFT_MASK),
+            "Ctrl+Shift+S"
+        );
+        assert!(
+            !is_save_key(key::s, Held::CONTROL_MASK | Held::MOD1_MASK),
+            "Ctrl+Alt+S"
+        );
     }
 }
