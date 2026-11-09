@@ -2,7 +2,7 @@
 
 2026-11-09, app code at fa9e7da, debug build through `scripts/cargo-safe.sh run`.
 
-**Result: the scripted pass passed on the real fixture.** It covers hand-check steps 1 to 5 and 8 to 11 (with Ctrl+S from the inspector field in the first run and from the page in the second), and the new step 12. It does not cover step 6 (Free position), step 7, or steps 13 and 14, which need the installed Stagepack. The hand check below is still to do.
+**Result: the scripted pass passed on the real fixture.** It covers hand-check steps 1 to 5, 8 to 10, 11 except Cancel, and 14 (Ctrl+S from the inspector field in the first run, from the page in the second). It does not cover steps 6 and 7 (Free position and its Undo), or steps 12 and 13, which need the installed Stagepack. The hand check below is still to do.
 
 ## Scripted pass (nested display)
 
@@ -39,6 +39,6 @@ No `stagepack`, `node`, app, WebKit or Xephyr process was left after any run.
 - [ ] 9. Close the window, with no prompt.
 - [ ] 10. Run `scripts/check-saved.sh "<path>"`: `saved talk check: ok`.
 - [ ] 11. Reopen the talk, make an edit and close. The save prompt appears. **Cancel** keeps the window. **Don't Save** closes, and the file's mtime is unchanged.
-- [ ] 12. Double-click text on the slide and type some words. Press Ctrl+S without pressing Escape, and close the window. Reopen the talk: the words are there.
-- [ ] 13. Open the same file with the installed Stagepack first (`~/.local/share/stagepack/stagepack open "<path>"`), then in the app. The app shows `This presentation is already open in Stagepack. Close it there, then open it here.`
-- [ ] 14. The reverse order: open the file in the app first, then with the installed Stagepack. Stagepack opens the talk in its window on the app's server, and there is no second copy (`ls ~/.local/share/stagepack/runtimes/*/work` stays empty for it).
+- [ ] 12. Open the same file with the installed Stagepack first (`~/.local/share/stagepack/stagepack open "<path>"`), then in the app. The app shows `This presentation is already open in Stagepack. Close it there, then open it here.`
+- [ ] 13. The reverse order: open the file in the app first, then with the installed Stagepack. Stagepack opens the talk in its window on the app's server, and there is no second copy (no new folder appears in `~/.local/share/stagepack/runtimes/*/work`).
+- [ ] 14. Double-click text on the slide and type some words. Press Ctrl+S without pressing Escape, and close the window. Reopen the talk: the words are there.
