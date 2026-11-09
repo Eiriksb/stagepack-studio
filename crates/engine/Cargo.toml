@@ -5,7 +5,13 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+slides-format = { path = "../format" }
 toolkit = { path = "../toolkit" }
 tiny-skia = "=0.11.4"
 cosmic-text = "=0.19.0"
 image = "0.25"
+syntect = "5"
+taffy = "=0.15.0"
+
+[dev-dependencies]
+tempfile = "3"

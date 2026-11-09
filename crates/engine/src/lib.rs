@@ -1,6 +1,15 @@
 mod display;
+mod files;
+mod flow;
+mod highlight;
+mod layouts;
 mod render;
+mod slide;
 mod text;
 pub use display::*;
+pub use files::*;
+pub use highlight::*;
+pub use layouts::*;
 pub use render::*;
+pub use slide::*;
 pub use text::*;
