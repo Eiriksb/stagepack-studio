@@ -809,3 +809,155 @@ fn ordinary_nesting_is_left_alone() {
     assert_eq!(slide.notices, []);
     assert_eq!(text_of(&slide.layers[1]).trim_end(), "Deep");
 }
+
+fn assert_svg_shows_a_placeholder(svg: String) {
+    let (slide, _) = lay_out("<Picture src=\"a.svg\" x=\"0\" w=\"100\" h=\"100\" />\n", &[("a.svg", svg.into_bytes())]);
+    assert!(notice_about(&slide, "a.svg"));
+    assert!(!has_picture(slide.layers.last().unwrap()));
+}
+
+fn svg(side: u32, body: &str) -> String {
+    format!("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{side}\" height=\"{side}\">{body}</svg>")
+}
+
+fn pattern(id: &str, side: u32, inside: &str) -> String {
+    format!("<pattern id=\"{id}\" patternUnits=\"userSpaceOnUse\" width=\"{side}\" height=\"{side}\">{inside}</pattern>")
+}
+
+#[test]
+fn svg_with_a_huge_pattern_shows_a_placeholder() {
+    let tile = pattern("p", 12000, "<rect width=\"12000\" height=\"12000\" fill=\"red\"/>");
+    assert_svg_shows_a_placeholder(svg(10, &format!("<defs>{tile}</defs><rect width=\"10\" height=\"10\" fill=\"url(#p)\"/>")));
+}
+
+#[test]
+fn svg_with_a_huge_layer_shows_a_placeholder() {
+    assert_svg_shows_a_placeholder(svg(
+        4096,
+        "<g opacity=\"0.5\"><rect x=\"-8192\" y=\"-8192\" width=\"20480\" height=\"20480\" fill=\"red\"/></g>",
+    ));
+}
+
+#[test]
+fn an_ordinary_svg_still_draws() {
+    let body = "<defs>\
+        <pattern id=\"p\" patternUnits=\"userSpaceOnUse\" width=\"32\" height=\"32\"><circle cx=\"16\" cy=\"16\" r=\"8\" fill=\"red\"/></pattern>\
+        <clipPath id=\"c\"><circle cx=\"256\" cy=\"256\" r=\"200\"/></clipPath>\
+        <mask id=\"m\"><rect width=\"512\" height=\"512\" fill=\"white\"/></mask>\
+        <filter id=\"f\"><feGaussianBlur stdDeviation=\"4\"/></filter>\
+        </defs>\
+        <rect width=\"512\" height=\"512\" fill=\"url(#p)\"/>\
+        <g opacity=\"0.5\" clip-path=\"url(#c)\" mask=\"url(#m)\"><rect width=\"512\" height=\"512\" fill=\"blue\"/></g>\
+        <g style=\"mix-blend-mode:multiply\"><rect x=\"100\" y=\"100\" width=\"100\" height=\"100\" fill=\"green\" filter=\"url(#f)\"/></g>";
+    let (slide, _) = lay_out("<Picture src=\"a.svg\" x=\"0\" />\n", &[("a.svg", svg(512, body).into_bytes())]);
+    assert_eq!(slide.notices, []);
+    let (picture, _) = picture_of(slide.layers.last().unwrap());
+    assert_eq!((picture.width(), picture.height()), (512, 512));
+    assert!(painted(picture));
+}
+
+#[test]
+fn svg_with_a_huge_pattern_inside_a_small_one_shows_a_placeholder() {
+    let inner = pattern("big", 12000, "<rect width=\"12000\" height=\"12000\" fill=\"red\"/>");
+    let outer = pattern("small", 8, "<rect width=\"8\" height=\"8\" fill=\"url(#big)\"/>");
+    assert_svg_shows_a_placeholder(svg(10, &format!("<defs>{inner}{outer}</defs><rect width=\"10\" height=\"10\" fill=\"url(#small)\"/>")));
+}
+
+#[test]
+fn svg_with_a_huge_filter_region_shows_a_placeholder() {
+    let filter = "<filter id=\"f\" filterUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\"12000\" height=\"12000\"><feFlood flood-color=\"red\"/></filter>";
+    assert_svg_shows_a_placeholder(svg(10, &format!("<defs>{filter}</defs><rect width=\"10\" height=\"10\" fill=\"blue\" filter=\"url(#f)\"/>")));
+}
+
+#[test]
+fn svg_with_a_very_long_filter_shows_a_placeholder() {
+    let steps = "<feFlood flood-color=\"red\"/>".repeat(100);
+    let filter = format!("<filter id=\"f\" filterUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\"1000\" height=\"1000\">{steps}</filter>");
+    assert_svg_shows_a_placeholder(svg(1000, &format!("<defs>{filter}</defs><rect width=\"1000\" height=\"1000\" fill=\"blue\" filter=\"url(#f)\"/>")));
+}
+
+#[test]
+fn svg_with_a_long_chain_of_clips_or_masks_shows_a_placeholder() {
+    let chain = |tag: &str, link: &str, inside: &str| -> String {
+        (0..40)
+            .map(|n| {
+                let next = if n + 1 < 40 { format!(" {link}=\"url(#c{})\"", n + 1) } else { String::new() };
+                format!("<{tag} id=\"c{n}\"{next}>{inside}</{tag}>")
+            })
+            .collect()
+    };
+    let rect = "<rect width=\"2000\" height=\"2000\"/>";
+    let drawn = |link: &str| format!("<g {link}=\"url(#c0)\"><rect width=\"2000\" height=\"2000\" fill=\"red\"/></g>");
+    assert_svg_shows_a_placeholder(svg(2000, &format!("<defs>{}</defs>{}", chain("clipPath", "clip-path", rect), drawn("clip-path"))));
+    assert_svg_shows_a_placeholder(svg(2000, &format!("<defs>{}</defs>{}", chain("mask", "mask", rect), drawn("mask"))));
+}
+
+fn text_items(layer: &LayerSpec) -> Vec<&ShapedText> {
+    layer
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            DisplayItem::Text { text, .. } => Some(text),
+            _ => None,
+        })
+        .collect()
+}
+
+const RED: (u8, u8, u8) = (255, 0, 0);
+
+/// The colour of the first glyph of each text in a layer.
+fn glyph_colours(layer: &LayerSpec) -> Vec<(u8, u8, u8)> {
+    text_items(layer)
+        .iter()
+        .map(|text| {
+            let colour = text.buffer.layout_runs().next().unwrap().glyphs[0].color_opt.unwrap();
+            (colour.r(), colour.g(), colour.b())
+        })
+        .collect()
+}
+
+#[test]
+fn block_level_text_styles_its_children() {
+    let (plain, _) = lay_out("Hello\n", &[]);
+    let (slide, _) = lay_out("<Text color=\"#ff0000\" size=\"100\" bold italic underline>\n\nHello\n\n- World\n\n</Text>\n", &[]);
+    assert_eq!(slide.notices, []);
+    let layer = slide.layers.last().unwrap();
+    assert_eq!(text_of(layer).trim_end(), "Hello");
+    assert_eq!(glyph_colours(layer)[0], RED);
+    let texts = text_items(layer);
+    assert!(texts[0].height > text_items(plain.layers.last().unwrap())[0].height);
+    assert!(!texts[0].underlines.is_empty());
+}
+
+#[test]
+fn block_level_text_stops_at_its_closing_tag_and_reaches_inside_other_tags() {
+    let (slide, _) = lay_out("<Text color=\"#ff0000\">\n\n<Box>\n\nIn a box\n\n</Box>\n\n</Text>\n\nOutside\n", &[]);
+    assert_eq!(slide.notices, []);
+    let colours = glyph_colours(slide.layers.last().unwrap());
+    assert_eq!(colours.len(), 2);
+    assert_eq!(colours[0], RED);
+    assert_ne!(colours[1], RED);
+}
+
+#[test]
+fn a_spans_own_colour_wins_over_a_block_level_text() {
+    let (slide, _) = lay_out("<Text color=\"#ff0000\">\n\n<Text color=\"#00ff00\">green</Text> then red\n\n</Text>\n", &[]);
+    assert_eq!(slide.notices, []);
+    assert_eq!(glyph_colours(slide.layers.last().unwrap()), [(0, 255, 0)]);
+}
+
+#[test]
+fn block_level_text_styles_code_too() {
+    let (slide, _) = lay_out("<Text color=\"#ff0000\">\n\n```\nlet a = 1;\n```\n\n</Text>\n", &[]);
+    assert_eq!(slide.notices, []);
+    assert_eq!(glyph_colours(slide.layers.last().unwrap()), [RED]);
+}
+
+#[test]
+fn a_placed_block_level_text_styles_its_children() {
+    let (slide, _) = lay_out("<Text x=\"100\" y=\"100\" color=\"#ff0000\">\n\nHello\n\n</Text>\n", &[]);
+    assert_eq!(slide.notices, []);
+    let layer = slide.layers.last().unwrap();
+    assert_eq!(text_of(layer).trim_end(), "Hello");
+    assert_eq!(glyph_colours(layer), [RED]);
+}

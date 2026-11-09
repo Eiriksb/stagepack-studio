@@ -9,7 +9,7 @@ use taffy::prelude::{
 use tiny_skia::{Path, PathBuilder};
 use toolkit::{Color, Ctx, Element, Props, ShapeKind, Theme};
 
-use crate::flow::{Content, Flow, column, rounded_rect, rounded_rect_with};
+use crate::flow::{Content, Flow, TEXT_TAG, column, rounded_rect, rounded_rect_with};
 use crate::pictures::{icon_pixmap, path_pixmap};
 use crate::slide::{MAX_SIZE, SLIDE_HEIGHT, SLIDE_WIDTH, is_positioned};
 use crate::{Align, DisplayItem, LayoutEnv, Notice, PLACEMENT_ATTRS, RegionDef, layout_by_name};
@@ -101,7 +101,7 @@ pub(crate) fn lay_out_positioned_tag(
     let natural = element.as_ref().and_then(|element| flow.natural_size(element));
     let (w, h) = box_size(wanted, natural);
     let content = match element {
-        Some(element) => flow.element(&element, &tag.children, Align::Left, true),
+        Some(element) => flow.with_text_style_of(tag, |flow| flow.element(&element, &tag.children, Align::Left, true)),
         None => Some(flow.placeholder(tag.name.clone(), size_of(0.0, 0.0, true))),
     };
     let style = Style {
@@ -116,6 +116,9 @@ pub(crate) fn lay_out_positioned_tag(
 impl Flow<'_, '_> {
     /// What a tag's component returned, or `None`, with a notice, if there's no such component.
     fn render_tag(&mut self, tag: &Tag) -> Option<Element> {
+        if tag.name == TEXT_TAG {
+            return Some(Element::Children);
+        }
         let Some(component) = self.env.registry.get(&tag.name) else {
             self.notice(format!("There is no component called {}", tag.name));
             return None;
@@ -154,7 +157,7 @@ impl Flow<'_, '_> {
             self.notice(format!("{} is inside another tag, so the place it asks for is ignored", tag.name));
         }
         match self.render_tag(tag) {
-            Some(element) => self.element(&element, &tag.children, align, false),
+            Some(element) => self.with_text_style_of(tag, |flow| flow.element(&element, &tag.children, align, false)),
             None => Some(self.block_placeholder(tag.name.clone())),
         }
     }

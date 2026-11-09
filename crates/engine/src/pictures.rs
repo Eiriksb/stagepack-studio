@@ -20,6 +20,11 @@ const MAX_EDGE: u32 = 4096;
 const MAX_DECODED_SIDE: u32 = 16384;
 const MAX_DECODED_BYTES: u64 = 256 * 1024 * 1024;
 
+/// The most an SVG can need while it's drawn, in pixels of 4 bytes.
+const MAX_SVG_PIXELS: u64 = 256 * 1024 * 1024 / 4;
+/// How much resvg pads a layer by, past the edges of what's in it.
+const LAYER_MARGIN: u32 = 4;
+
 const CARBON_ICONS: &str = include_str!("../assets/icons/carbon.json");
 /// The side of the square every Carbon icon is drawn in.
 const ICON_VIEW_BOX: f32 = 32.0;
@@ -94,9 +99,147 @@ fn draw_svg(markup: &str, scale_for: impl FnOnce(usvg::Size) -> f32) -> Option<P
     let tree = usvg::Tree::from_str(markup, &options).ok()?;
     let scale = scale_for(tree.size());
     let side = |length: f32| ((length * scale).round() as u32).clamp(1, MAX_EDGE);
-    let mut pixmap = Pixmap::new(side(tree.size().width()), side(tree.size().height()))?;
+    let canvas = (side(tree.size().width()), side(tree.size().height()));
+    if !fits_in_memory(&tree, scale, canvas) {
+        return None;
+    }
+    let mut pixmap = Pixmap::new(canvas.0, canvas.1)?;
     resvg::render(&tree, Transform::from_scale(scale, scale), &mut pixmap.as_mut());
     Some(pixmap)
+}
+
+/// Whether drawing `tree` at `scale` on a canvas of `canvas` pixels stays within
+/// `MAX_SVG_PIXELS`. resvg allocates a buffer for every pattern tile, layer, clip, mask and
+/// filter step, sized by what the SVG says, and running out of memory aborts the app. This
+/// follows the steps resvg's drawing would take, without its recursion, and adds up those
+/// buffers as if they were all held at once.
+fn fits_in_memory(tree: &usvg::Tree, scale: f32, canvas: (u32, u32)) -> bool {
+    // resvg's own limit on the side of a layer.
+    let bounds = (canvas.0.saturating_mul(5), canvas.1.saturating_mul(5));
+    let root = DrawStep::Children { group: tree.root(), transform: Transform::from_scale(scale, scale), bounds };
+    let mut count = BufferCount { pixels: pixel_count(canvas.0, canvas.1), steps: vec![root] };
+    // Anything drawn more than once costs at least a pixel each time, so this ends even
+    // when patterns refer to patterns many times over.
+    while count.pixels <= MAX_SVG_PIXELS {
+        let Some(step) = count.steps.pop() else { return true };
+        count.follow(step);
+    }
+    false
+}
+
+fn pixel_count(width: u32, height: u32) -> u64 {
+    u64::from(width) * u64::from(height)
+}
+
+/// Something resvg would draw, still to be counted.
+enum DrawStep<'a> {
+    /// A group's children, through `transform`, with layers up to `bounds` pixels a side.
+    Children { group: &'a usvg::Group, transform: Transform, bounds: (u32, u32) },
+    /// A clip path over a layer of `layer` pixels.
+    Clip { clip: &'a usvg::ClipPath, layer: u64 },
+    /// A group inside a clip path over a layer of `layer` pixels.
+    ClipChildren { group: &'a usvg::Group, layer: u64 },
+}
+
+struct BufferCount<'a> {
+    pixels: u64,
+    steps: Vec<DrawStep<'a>>,
+}
+
+impl<'a> BufferCount<'a> {
+    fn add(&mut self, pixels: u64) {
+        self.pixels = self.pixels.saturating_add(pixels);
+    }
+
+    fn follow(&mut self, step: DrawStep<'a>) {
+        match step {
+            DrawStep::Children { group, transform, bounds } => {
+                for child in group.children() {
+                    match child {
+                        usvg::Node::Group(group) => self.group(group, transform, bounds),
+                        usvg::Node::Path(path) => {
+                            let paints = [path.fill().map(usvg::Fill::paint), path.stroke().map(usvg::Stroke::paint)];
+                            for paint in paints.into_iter().flatten() {
+                                if let usvg::Paint::Pattern(pattern) = paint {
+                                    self.pattern(pattern, transform, bounds);
+                                }
+                            }
+                        }
+                        usvg::Node::Text(text) => self.group(text.flattened(), transform, bounds),
+                        // `draw_svg` turns pictures off, so an SVG has none of these.
+                        usvg::Node::Image(_) => {}
+                    }
+                }
+            }
+            DrawStep::Clip { clip, layer } => {
+                self.add(layer);
+                self.steps.extend(clip.clip_path().map(|clip| DrawStep::Clip { clip, layer }));
+                self.steps.push(DrawStep::ClipChildren { group: clip.root(), layer });
+            }
+            DrawStep::ClipChildren { group, layer } => {
+                for child in group.children() {
+                    match child {
+                        usvg::Node::Group(group) => {
+                            if let Some(clip) = group.clip_path() {
+                                self.add(layer);
+                                self.steps.push(DrawStep::Clip { clip, layer });
+                            }
+                            self.steps.push(DrawStep::ClipChildren { group, layer });
+                        }
+                        usvg::Node::Text(text) => self.steps.push(DrawStep::ClipChildren { group: text.flattened(), layer }),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    fn group(&mut self, group: &'a usvg::Group, transform: Transform, bounds: (u32, u32)) {
+        let transform = transform.pre_concat(group.transform());
+        if group.should_isolate() {
+            let Some(area) = group.layer_bounding_box().transform(transform) else { return };
+            let side = |length: f32, bound: u32| (length.ceil() as u32).saturating_add(LAYER_MARGIN).min(bound);
+            let layer = pixel_count(side(area.width(), bounds.0), side(area.height(), bounds.1));
+            self.add(layer);
+            for filter in group.filters() {
+                self.filter(filter, transform, layer);
+            }
+            self.steps.extend(group.clip_path().map(|clip| DrawStep::Clip { clip, layer }));
+            let mut mask = group.mask();
+            while let Some(this_mask) = mask {
+                self.add(layer);
+                self.steps.push(DrawStep::Children { group: this_mask.root(), transform, bounds });
+                mask = this_mask.mask();
+            }
+        }
+        self.steps.push(DrawStep::Children { group, transform, bounds });
+    }
+
+    /// A pattern is drawn to a tile of its own, as big as one repeat at this scale.
+    fn pattern(&mut self, pattern: &'a usvg::Pattern, transform: Transform, bounds: (u32, u32)) {
+        let (scale_x, scale_y) = transform.pre_concat(pattern.transform()).get_scale();
+        let tile = pixel_count((pattern.rect().width() * scale_x).round() as u32, (pattern.rect().height() * scale_y).round() as u32);
+        if tile > 0 {
+            self.add(tile);
+            self.steps.push(DrawStep::Children { group: pattern.root(), transform: Transform::from_scale(scale_x, scale_y), bounds });
+        }
+    }
+
+    /// A filter works on its own region, which nothing keeps to the size of its layer, and
+    /// holds on to the result of every step until it's done.
+    fn filter(&mut self, filter: &'a usvg::filter::Filter, transform: Transform, layer: u64) {
+        let Some(region) = filter.rect().transform(transform) else { return };
+        let (width, height) = (region.width().ceil() as u32, region.height().ceil() as u32);
+        let results = filter.primitives().len() as u64 + 1;
+        self.add(pixel_count(width, height).max(layer).saturating_mul(results));
+        let (scale_x, scale_y) = transform.get_scale();
+        for primitive in filter.primitives() {
+            if let usvg::filter::Kind::Image(image) = primitive.kind() {
+                let transform = Transform::from_scale(scale_x, scale_y);
+                self.steps.push(DrawStep::Children { group: image.root(), transform, bounds: (width, height) });
+            }
+        }
+    }
 }
 
 fn svg_color(color: Color) -> String {

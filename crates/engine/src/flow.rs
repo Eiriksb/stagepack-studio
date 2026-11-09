@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use slides_format::{Block, Span};
+use slides_format::{Block, Span, Style as TextStyle, Tag};
 use taffy::compute_leaf_layout;
 use taffy::prelude::{
     AvailableSpace, Display, FlexDirection, NodeId, Size, Style, TaffyTree, auto, evenly_sized_tracks, length, line, zero,
@@ -25,6 +25,8 @@ const CODE_PANEL: Color = Color::rgb(0xf1, 0xf5, 0xf9);
 /// How far lists and tags can sit inside each other. A talk could nest them as deep as it
 /// likes, and laying out each level uses up more of the stack.
 const MAX_NESTING: u32 = 16;
+/// The tag that styles the text inside it. It isn't a component and has nothing of its own to draw.
+pub(crate) const TEXT_TAG: &str = "Text";
 
 /// What a leaf draws behind its text.
 #[derive(Clone, Copy)]
@@ -111,6 +113,8 @@ pub(crate) struct Flow<'a, 'env> {
     pub(crate) env: &'a mut LayoutEnv<'env>,
     notices: &'a mut Vec<Notice>,
     nesting: u32,
+    /// What the `<Text>` tags around the current block ask of the text in it.
+    text_tag_style: TextStyle,
 }
 
 /// A column with the gap between blocks.
@@ -148,7 +152,7 @@ impl<'a, 'env> Flow<'a, 'env> {
         let mut tree = TaffyTree::new();
         // Slide units aren't pixels. Rounding would also leave text a sliver narrower than it was measured at.
         tree.disable_rounding();
-        Flow { tree, region, theme, env, notices, nesting: 0 }
+        Flow { tree, region, theme, env, notices, nesting: 0, text_tag_style: TextStyle::default() }
     }
 
     /// Lays out the tree under `root`, `width` wide, and returns its drawing.
@@ -207,19 +211,35 @@ impl<'a, 'env> Flow<'a, 'env> {
         TextLook { size, bold: true }
     }
 
+    /// Runs `draw`, with what's drawn styled by `tag` if it's a `<Text>` tag.
+    pub(crate) fn with_text_style_of<T>(&mut self, tag: &Tag, draw: impl FnOnce(&mut Self) -> T) -> T {
+        if tag.name != TEXT_TAG {
+            return draw(self);
+        }
+        let outer = self.text_tag_style.clone();
+        for attr in &tag.attrs {
+            self.text_tag_style.apply_text_attr(&attr.name, &attr.value);
+        }
+        let drawn = draw(self);
+        self.text_tag_style = outer;
+        drawn
+    }
+
+    /// A span's own style wins over the `<Text>` tags around it, as it does inside an inline one.
     fn run(&self, span: &Span, look: TextLook) -> TextRun {
         let style = &span.style;
+        let tag = &self.text_tag_style;
         let color = if style.link.is_some() {
             self.theme.accent
         } else {
-            style.color.as_deref().and_then(Color::parse).unwrap_or(self.theme.text)
+            style.color.as_deref().or(tag.color.as_deref()).and_then(Color::parse).unwrap_or(self.theme.text)
         };
         TextRun {
             text: span.text.clone(),
-            size: style.size.map_or(look.size, |size| size as f32),
-            bold: look.bold || style.bold,
-            italic: style.italic,
-            underline: style.underline || style.link.is_some(),
+            size: style.size.or(tag.size).map_or(look.size, |size| size as f32),
+            bold: look.bold || style.bold || tag.bold,
+            italic: style.italic || tag.italic,
+            underline: style.underline || tag.underline || style.link.is_some(),
             color,
             family: if style.code { self.theme.mono_font.clone() } else { self.theme.font.clone() },
         }
@@ -235,6 +255,7 @@ impl<'a, 'env> Flow<'a, 'env> {
         let look = TextLook { size: size.unwrap_or(self.region.size), bold: bold || self.region.bold };
         let mut run = self.run(&Span { text: text.to_string(), style: Default::default() }, look);
         run.color = color.unwrap_or(run.color);
+        run.size = size.unwrap_or(run.size);
         self.leaf(Style::default(), Content::Text(Leaf { runs: vec![run], align, wraps: true, frame: Frame::None }))
     }
 
@@ -319,16 +340,18 @@ impl<'a, 'env> Flow<'a, 'env> {
     }
 
     fn code(&mut self, language: Option<&str>, code: &str) -> NodeId {
+        let tag = &self.text_tag_style;
+        let tag_color = tag.color.as_deref().and_then(Color::parse);
         let runs = highlight(code, language)
             .into_iter()
             .flatten()
             .map(|(color, text)| TextRun {
                 text,
-                size: CODE_SIZE,
-                bold: false,
-                italic: false,
-                underline: false,
-                color,
+                size: tag.size.map_or(CODE_SIZE, |size| size as f32),
+                bold: tag.bold,
+                italic: tag.italic,
+                underline: tag.underline,
+                color: tag_color.unwrap_or(color),
                 family: self.theme.mono_font.clone(),
             })
             .collect();
