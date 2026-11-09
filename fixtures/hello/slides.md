@@ -10,7 +10,7 @@ A tiny talk for development
 
 # The box
 
-<div v-drag="100,100,200,120" class="box">Box</div>
+<div v-drag="[100,100,200,120]" class="box">Box</div>
 
 This paragraph sits in the normal flow of the slide.
 
