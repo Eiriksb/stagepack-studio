@@ -151,6 +151,28 @@ fn a_region_line_keeps_what_it_omits_and_what_it_cannot_read() {
 }
 
 #[test]
+fn region_values_are_clamped_to_sensible_limits() {
+    let (slide, _) = lay_out("---\nregion.title: x=99999 w=99999999\n---\n\n# T\n");
+    assert_eq!(slide.layers[1].rect.x, 7680.0);
+    assert_eq!(slide.layers[1].rect.w, 3840.0);
+
+    let (slide, _) = lay_out("---\nregion.title: x=-99999 y=-99999 h=-5 rotate=9000\n---\n\n# T\n");
+    assert_eq!(slide.layers[1].rect, Rect { x: -3840.0, y: -3840.0, w: 1720.0, h: 0.0 });
+    assert_eq!(slide.layers[1].rotate, 360.0);
+}
+
+#[test]
+fn long_text_is_not_cut_off_at_the_region_edge() {
+    let (slide, mut fonts) = lay_out(&format!("# {}\n", "Overflowing title words ".repeat(12)));
+    let text_height = first_text(&slide.layers[1]).height;
+    assert!(text_height > 140.0, "the heading has to overflow its region");
+    let layer = render_layer(&slide.layers[1], 1.0, &mut fonts);
+    assert_eq!(layer.y, 60);
+    // The pixmap always had 1 spare row, so being taller than 140 alone would prove nothing.
+    assert!(layer.pixmap.height() as f32 >= text_height);
+}
+
+#[test]
 fn blocks_stack_from_the_layers_corner_with_a_gap() {
     let (slide, _) = lay_out("# T\n\nOne\n\nTwo\n\nThree\n");
     let boxes = text_boxes(&slide.layers[2]);

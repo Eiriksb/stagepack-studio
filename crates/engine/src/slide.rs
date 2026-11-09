@@ -11,6 +11,13 @@ const SLIDE_WIDTH: f32 = 1920.0;
 const SLIDE_HEIGHT: f32 = 1080.0;
 const DEFAULT_LAYOUT: &str = "content";
 
+// The most a talk can ask for in a place on the slide, so one line of a settings block
+// can't make a layer that needs gigabytes.
+pub(crate) const MIN_POSITION: f32 = -3840.0;
+pub(crate) const MAX_POSITION: f32 = 7680.0;
+pub(crate) const MAX_SIZE: f32 = 3840.0;
+pub(crate) const MAX_ROTATION: f32 = 360.0;
+
 pub struct LayoutEnv<'a> {
     pub fonts: &'a mut Fonts,
     pub registry: &'a Registry,
@@ -103,7 +110,8 @@ fn assign_blocks<'a>(slide: &'a Slide, layout: &LayoutDef, notices: &mut Vec<Not
 }
 
 /// Where a region sits on this slide: the layout's place, changed by any `region.<name>`
-/// settings line. A value that isn't a finite number is ignored.
+/// settings line. A value that isn't a finite number is ignored, and the rest are held
+/// within the limits above.
 fn placement(slide: &Slide, region: &RegionDef) -> (Rect, f32) {
     let mut rect = region.rect;
     let mut rotate = 0.0;
@@ -117,11 +125,11 @@ fn placement(slide: &Slide, region: &RegionDef) -> (Rect, f32) {
             continue;
         };
         match name {
-            "x" => rect.x = value,
-            "y" => rect.y = value,
-            "w" => rect.w = value,
-            "h" => rect.h = value,
-            "rotate" => rotate = value,
+            "x" => rect.x = value.clamp(MIN_POSITION, MAX_POSITION),
+            "y" => rect.y = value.clamp(MIN_POSITION, MAX_POSITION),
+            "w" => rect.w = value.clamp(0.0, MAX_SIZE),
+            "h" => rect.h = value.clamp(0.0, MAX_SIZE),
+            "rotate" => rotate = value.clamp(-MAX_ROTATION, MAX_ROTATION),
             // `click` says when a region appears, not where it sits.
             _ => {}
         }
