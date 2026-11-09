@@ -177,7 +177,7 @@ impl Flow<'_, '_> {
         match element {
             Element::Text { text, size, bold, color } => Some(self.plain_text(text, *size, *bold, *color, align)),
             Element::Stack { horizontal, gap, children } => self.stack(*horizontal, *gap, children, blocks, align),
-            Element::Shape { kind, width, height, fill, outline, outline_width, radius, child } => {
+            Element::Shape { kind, width, height, fill, outline, outline_width, radius, padding, child } => {
                 let child = child.as_deref();
                 // Whatever is in a stack starts at the corner. Anything else is centred.
                 let inner_align = if matches!(child, Some(Element::Stack { .. })) { align } else { Align::Center };
@@ -187,12 +187,13 @@ impl Flow<'_, '_> {
                     None => size_when_empty(*width, *height, boxed),
                 };
                 let tail = if *kind == ShapeKind::Callout { CALLOUT_TAIL } else { 0.0 };
+                let pad = length(limited(*padding, MAX_SIZE));
                 let style = Style {
                     size,
                     flex_direction: FlexDirection::Column,
                     justify_content: JustifyContent::CENTER,
                     align_items: AlignItems::CENTER,
-                    padding: taffy::Rect { left: zero(), right: zero(), top: zero(), bottom: length(tail) },
+                    padding: taffy::Rect { left: pad, right: pad, top: pad, bottom: length(limited(*padding, MAX_SIZE) + tail) },
                     ..Style::default()
                 };
                 let look = ShapeLook {

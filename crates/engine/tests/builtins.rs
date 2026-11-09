@@ -481,7 +481,7 @@ fn a_flowing_box_is_as_wide_as_its_region_and_as_tall_as_its_content() {
     let (slide, _) = lay_out("<Box fill=\"red\">\n\nHello\n\n</Box>\n", &[]);
     let layer = &slide.layers[1];
     let (_, _, _, height) = text_boxes(layer)[0];
-    assert_eq!(bounds(fills(layer)[0]), (0.0, 0.0, 1720.0, height));
+    assert_eq!(bounds(fills(layer)[0]), (0.0, 0.0, 1720.0, height + 48.0), "the text plus 24 of padding above and below");
 }
 
 #[test]
@@ -960,4 +960,33 @@ fn a_placed_block_level_text_styles_its_children() {
     let layer = slide.layers.last().unwrap();
     assert_eq!(text_of(layer).trim_end(), "Hello");
     assert_eq!(glyph_colours(layer), [RED]);
+}
+
+fn first_text_position(layer: &LayerSpec) -> (f32, f32) {
+    layer
+        .items
+        .iter()
+        .find_map(|item| match item {
+            DisplayItem::Text { x, y, .. } => Some((*x, *y)),
+            _ => None,
+        })
+        .expect("the layer draws text")
+}
+
+#[test]
+fn a_box_with_a_fill_pads_its_text() {
+    let filled = "<Box x=\"0\" y=\"0\" w=\"400\" h=\"200\" fill=\"#dbeafe\">\n\nHi\n\n</Box>\n";
+    let (slide, _) = lay_out(filled, &[]);
+    let (x, y) = first_text_position(slide.layers.last().unwrap());
+    assert!(x >= 24.0 && y >= 24.0, "({x}, {y})");
+    let outlined = filled.replace("fill=\"#dbeafe\"", "outline=\"black\"");
+    let (slide, _) = lay_out(&outlined, &[]);
+    let (x, y) = first_text_position(slide.layers.last().unwrap());
+    assert!(x >= 24.0 && y >= 24.0, "({x}, {y})");
+    let bare = filled.replace(" fill=\"#dbeafe\"", "");
+    let (slide, _) = lay_out(&bare, &[]);
+    assert_eq!(first_text_position(slide.layers.last().unwrap()), (0.0, 0.0));
+    let tight = filled.replace("fill=", "padding=\"0\" fill=");
+    let (slide, _) = lay_out(&tight, &[]);
+    assert_eq!(first_text_position(slide.layers.last().unwrap()), (0.0, 0.0));
 }

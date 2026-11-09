@@ -41,7 +41,11 @@ Where the talk turns
 layout: blank
 ---
 
+<Box x="560" y="400" w="800" h="280" fill="#fef3c7" outline="#d97706" radius="32">
+
 Just a few words, with nothing around them.
+
+</Box>
 
 ---
 
@@ -55,7 +59,7 @@ In a box
 
 <Shape kind="ellipse" x="700" y="560" w="240" h="200" fill="orange" outline="black" outline-width="4" />
 
-<Shape kind="arrow" x="1000" y="640" w="240" h="40" fill="#16a34a" />
+<Shape kind="arrow" x="1000" y="640" w="240" h="0" fill="#16a34a" />
 
 <Icon name="arrow-right" x="100" y="840" size="96" />
 

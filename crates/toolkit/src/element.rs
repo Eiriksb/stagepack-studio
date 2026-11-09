@@ -24,6 +24,8 @@ pub enum Element {
         outline_width: f32,
         /// The corner radius of a `Rounded` shape, where 0 means the usual one.
         radius: f32,
+        /// Space kept clear between the edge and what is inside.
+        padding: f32,
         child: Option<Box<Element>>,
     },
     Picture { src: String, width: f32, height: f32 },
@@ -48,7 +50,7 @@ pub fn text(text: impl Into<String>) -> Element {
 }
 
 pub fn shape(kind: ShapeKind, width: f32, height: f32) -> Element {
-    Element::Shape { kind, width, height, fill: None, outline: None, outline_width: 0.0, radius: 0.0, child: None }
+    Element::Shape { kind, width, height, fill: None, outline: None, outline_width: 0.0, radius: 0.0, padding: 0.0, child: None }
 }
 
 pub fn picture(src: impl Into<String>, width: f32, height: f32) -> Element {
