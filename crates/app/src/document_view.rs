@@ -13,7 +13,7 @@ use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::{ActiveTheme as _, WindowExt as _, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use studio_protocol::PageMessage;
+use studio_protocol::{CommandBody, PageMessage};
 use studio_sidecar::{Sidecar, SidecarEvent, SpawnOptions};
 
 use crate::canvas::{Canvas, CanvasEvent, DEBUG_IPC};
@@ -28,7 +28,10 @@ const STUDIO_ADDON: &str = "runtimes/53/node_modules/slidev-addon-studio";
 const TRUST_TITLE: &str = "Trust this presentation?";
 const CLOSED_TEXT: &str = "The presentation was closed.";
 const UNSAVED_HINT: &str = "Your unsaved changes are still here: use Save before closing.";
+const LOST_HINT: &str = "Your unsaved changes could not be saved.";
 const STILL_SAVING_TITLE: &str = "Still saving. Close anyway?";
+/// How long a Save or close waits for the page to apply its inline editor.
+const FINISH_EDIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// What the view asked of the sidecar. A document made with
 /// [`DocumentView::for_test`] records these instead of sending them.
@@ -61,6 +64,9 @@ pub struct DocumentView {
     canvas_visible: bool,
     /// The window is going away; its close needs no more asking.
     closing: bool,
+    /// What would have gone to the page, for a document with no canvas.
+    page_sent: Vec<CommandBody>,
+    _finish_timeout: Option<Task<()>>,
     _listen: Option<Task<()>>,
     _subscription: Option<Subscription>,
 }
@@ -103,6 +109,8 @@ impl DocumentView {
             canvas: Some(canvas),
             canvas_visible: false,
             closing: false,
+            page_sent: Vec::new(),
+            _finish_timeout: None,
             _listen: listen,
             _subscription: Some(subscription),
         }
@@ -118,6 +126,8 @@ impl DocumentView {
             canvas: None,
             canvas_visible: false,
             closing: false,
+            page_sent: Vec::new(),
+            _finish_timeout: None,
             _listen: None,
             _subscription: None,
         }
@@ -125,6 +135,16 @@ impl DocumentView {
 
     pub fn document(&self) -> &Document {
         &self.document
+    }
+
+    /// The commands a canvas-less test document would have sent the page.
+    pub fn page_sent(&self) -> &[CommandBody] {
+        &self.page_sent
+    }
+
+    /// A command went to the page under `id`.
+    pub fn command_sent(&mut self, id: i64) {
+        self.document.command_sent(id);
     }
 
     /// The commands a test document recorded; empty for a real one.
@@ -157,11 +177,16 @@ impl DocumentView {
         self.apply(effects, window, cx);
     }
 
-    /// Ctrl+S and the Save button: saves when there is something to save.
+    /// Ctrl+S and the Save button: gets what is being typed on the page into
+    /// the slide, then saves when there is something to save.
     pub fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.document.can_save() {
-            return;
-        }
+        let effects = self.document.request_save();
+        self.apply(effects, window, cx);
+    }
+
+    /// Tells serve to save. A close prompt's Save comes here directly: its
+    /// close already went through the page.
+    fn send_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.document.save_sent();
         if let Err(err) = self.send(SidecarCommand::Save) {
             // As if serve had refused: the message shows, and a close waiting
@@ -187,15 +212,14 @@ impl DocumentView {
             }
             return false;
         }
-        if self.document.wants_close_prompt() {
-            if !window.has_active_dialog(cx) {
-                self.ask_save_changes(window, cx);
-            }
-            return false;
+        let effects = self.document.request_close();
+        if effects == [Effect::CloseWindow] {
+            self.closing = true;
+            self.shutdown(cx);
+            return true;
         }
-        self.closing = true;
-        self.shutdown(cx);
-        true
+        self.apply(effects, window, cx);
+        false
     }
 
     fn listen(events: Receiver<SidecarEvent>, window: &Window, cx: &mut Context<Self>) -> Task<()> {
@@ -222,6 +246,8 @@ impl DocumentView {
                 }
                 Effect::ShowMessage(message) => show_message(message.into(), window, cx),
                 Effect::CloseWindow => self.close_window(window, cx),
+                Effect::FinishEdit => self.finish_edit(window, cx),
+                Effect::SendSave => self.send_save(window, cx),
                 Effect::AskSaveChanges => {
                     if !window.has_active_dialog(cx) {
                         self.ask_save_changes(window, cx);
@@ -231,6 +257,32 @@ impl DocumentView {
         }
         self.sync_canvas(cx);
         cx.notify();
+    }
+
+    /// Asks the page to apply its inline editor, and gives it
+    /// [`FINISH_EDIT_TIMEOUT`] to answer.
+    fn finish_edit(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let id = match &self.canvas {
+            Some(canvas) => {
+                canvas.update(cx, |canvas, cx| canvas.send(CommandBody::FinishEdit, cx))
+            }
+            None => {
+                self.page_sent.push(CommandBody::FinishEdit);
+                self.page_sent.len() as i64
+            }
+        };
+        self.document.finish_edit_sent(id);
+        let timeout = cx.background_executor().timer(FINISH_EDIT_TIMEOUT);
+        self._finish_timeout = Some(cx.spawn_in(window, async move |this, cx| {
+            timeout.await;
+            cx.update(|window, cx| {
+                this.update(cx, |this, cx| {
+                    let effects = this.document.finish_edit_timed_out(id);
+                    this.apply(effects, window, cx);
+                })
+            })
+            .ok();
+        }));
     }
 
     /// The web view shows only while the talk is open. Otherwise the canvas
@@ -276,7 +328,7 @@ impl DocumentView {
     fn save_and_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.document.can_save() {
             self.document.close_after_save();
-            self.save(window, cx);
+            self.send_save(window, cx);
         } else if !self.document.dirty {
             self.close_window(window, cx);
         }
@@ -468,6 +520,9 @@ impl Render for DocumentView {
                     )
                     .when(self.document.wants_close_prompt(), |this| {
                         this.child(note("failed-unsaved", UNSAVED_HINT.into()))
+                    })
+                    .when(self.document.changes_lost(), |this| {
+                        this.child(note("failed-lost", LOST_HINT.into()))
                     })
                     .when(!log.is_empty(), |this| {
                         let log: SharedString = log.clone().into();

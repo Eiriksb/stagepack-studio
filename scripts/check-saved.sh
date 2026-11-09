@@ -22,6 +22,8 @@ TIME_LIMIT=90
 EXPECTED='v-drag="[140,100,200,120]"'
 
 TMP="$(mktemp -d)"
+# Serve also claims the talk in the per-user Stagepack it finds there: a check leaves that one alone.
+export XDG_DATA_HOME="$TMP/data"
 OUT="$TMP/events.jsonl"
 PID=""
 

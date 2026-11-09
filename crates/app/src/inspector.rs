@@ -11,6 +11,15 @@ use gpui_kit::*;
 use studio_protocol::{CommandBody, DragPos, SelectionInfo};
 
 pub const EMPTY_TEXT: &str = "Click something on the slide to select it.";
+pub const MISSED_TEXT: &str = "Nothing here can be traced back to the slide's text.";
+// Studio's own words for a selection with no lines of its own.
+const NOT_TRACED_TEXT: &str = "This element could not be traced back to the Markdown.";
+const NOT_TRACED_HINT: &str = "That happens when a custom Markdown transformer moves lines around. \
+                               The element still renders, it just cannot be edited visually.";
+/// Studio goes on to the Layout panel, which this app doesn't have.
+const FRONTMATTER_HINT: &str = "Double click to rewrite them on the slide.";
+/// The kind of text a layout was handed from the slide's frontmatter.
+const FRONTMATTER_KIND: &str = "frontmatter";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InspectorEvent {
@@ -95,6 +104,8 @@ fn with_field(pos: &DragPos, field: Field, text: &str) -> Option<DragPos> {
 
 pub struct Inspector {
     selection: Option<SelectionInfo>,
+    /// The last click hit the slide but nothing traceable.
+    missed: bool,
     x: Entity<InputState>,
     y: Entity<InputState>,
     w: Entity<InputState>,
@@ -135,6 +146,7 @@ impl Inspector {
         );
         Self {
             selection: None,
+            missed: false,
             x,
             y,
             w,
@@ -142,6 +154,29 @@ impl Inspector {
             rotate,
             uncommitted: [false; 5],
             _subscriptions: subscriptions,
+        }
+    }
+
+    /// Shows that the last click hit nothing traceable, until the next selection.
+    pub fn set_missed(&mut self, missed: bool, cx: &mut Context<Self>) {
+        if self.missed != missed {
+            self.missed = missed;
+            cx.notify();
+        }
+    }
+
+    /// Puts every field back on the selection, typing and all: the page
+    /// refused an edit, so what the fields hold is not what the talk has.
+    pub fn reset_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pos) = self.selection.as_ref().and_then(|s| s.pos.clone()) else {
+            return;
+        };
+        for field in Field::ALL {
+            self.uncommitted[field.index()] = false;
+            let text = field.text(&pos);
+            self.input(field)
+                .clone()
+                .update(cx, |input, cx| input.set_value(text, window, cx));
         }
     }
 
@@ -226,6 +261,51 @@ impl Inspector {
             .on_click(cx.listener(move |this, _, _, cx| this.send(body.clone(), cx)))
     }
 
+    fn render_label(selection: &SelectionInfo) -> impl IntoElement {
+        div()
+            .id("inspector-label")
+            .test_support()
+            .aria_label(selection.label.clone())
+            .text_sm()
+            .font_weight(FontWeight::SEMIBOLD)
+            .child(selection.label.clone())
+    }
+
+    /// A selection with no lines of its own: nothing here could be honoured,
+    /// so it says why and offers nothing.
+    fn render_untraced(selection: &SelectionInfo, cx: &mut Context<Self>) -> impl IntoElement {
+        let (why, hint): (SharedString, SharedString) = if selection.kind == FRONTMATTER_KIND {
+            (
+                format!("These words are the slide's {}.", selection.label).into(),
+                FRONTMATTER_HINT.into(),
+            )
+        } else {
+            (NOT_TRACED_TEXT.into(), NOT_TRACED_HINT.into())
+        };
+        v_flex()
+            .size_full()
+            .p_3()
+            .gap_2()
+            .child(Self::render_label(selection))
+            .child(
+                div()
+                    .id("inspector-why")
+                    .test_support()
+                    .aria_label(why.clone())
+                    .text_sm()
+                    .child(why),
+            )
+            .child(
+                div()
+                    .id("inspector-why-hint")
+                    .test_support()
+                    .aria_label(hint.clone())
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(hint),
+            )
+    }
+
     fn render_fields(&self) -> impl IntoElement {
         v_flex().gap_2().children(Field::ALL.map(|field| {
             h_flex()
@@ -245,6 +325,7 @@ impl Inspector {
 impl Render for Inspector {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(selection) = self.selection.clone() else {
+            let text = if self.missed { MISSED_TEXT } else { EMPTY_TEXT };
             return div()
                 .size_full()
                 .p_3()
@@ -252,13 +333,16 @@ impl Render for Inspector {
                     div()
                         .id("inspector-empty")
                         .test_support()
-                        .aria_label(EMPTY_TEXT)
+                        .aria_label(text)
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
-                        .child(EMPTY_TEXT),
+                        .child(text),
                 )
                 .into_any_element();
         };
+        if selection.range.is_none() {
+            return Self::render_untraced(&selection, cx).into_any_element();
+        }
 
         let flow_button = if selection.positioned {
             self.action(
@@ -282,23 +366,21 @@ impl Render for Inspector {
             .size_full()
             .p_3()
             .gap_3()
-            .child(
-                div()
-                    .id("inspector-label")
-                    .test_support()
-                    .aria_label(selection.label.clone())
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(selection.label.clone()),
-            )
-            .when(selection.positioned, |this| {
+            .child(Self::render_label(&selection))
+            .when(selection.pos.is_some(), |this| {
                 this.child(self.render_fields())
             })
             .child(flow_button)
             .child(
                 h_flex()
                     .gap_2()
-                    .child(self.action("duplicate", "Duplicate", CommandBody::Duplicate, false, cx))
+                    .child(self.action(
+                        "duplicate",
+                        "Duplicate",
+                        CommandBody::Duplicate,
+                        !selection.can_reorder,
+                        cx,
+                    ))
                     .child(self.action("delete", "Delete", CommandBody::Delete, false, cx)),
             )
             .into_any_element()

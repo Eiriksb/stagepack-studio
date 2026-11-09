@@ -45,6 +45,8 @@ pub struct WorkspaceView {
     inspector: Entity<Inspector>,
     /// What would have gone to the page, in tests that have no canvas.
     sent: Vec<CommandBody>,
+    /// The page's refusals the inspector has already answered.
+    refusals_seen: u64,
     focus_handle: FocusHandle,
     _observe: Option<Subscription>,
     _inspector_events: Subscription,
@@ -121,6 +123,7 @@ impl WorkspaceView {
             document,
             inspector,
             sent: Vec::new(),
+            refusals_seen: 0,
             focus_handle,
             _observe: observe,
             _inspector_events: inspector_events,
@@ -132,9 +135,10 @@ impl WorkspaceView {
     fn send(&mut self, body: CommandBody, cx: &mut Context<Self>) {
         match &self.canvas {
             Some(canvas) => {
-                canvas.update(cx, |canvas, cx| {
-                    canvas.send(body, cx);
-                });
+                let id = canvas.update(cx, |canvas, cx| canvas.send(body, cx));
+                if let Some(document) = &self.document {
+                    document.update(cx, |document, _| document.command_sent(id));
+                }
             }
             None => self.sent.push(body),
         }
@@ -151,12 +155,26 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let selection = document.read(cx).document().selection.clone();
-        if self.inspector.read(cx).selection() != selection.as_ref() {
-            self.inspector.update(cx, |inspector, cx| {
-                inspector.set_selection(selection, window, cx)
-            });
-        }
+        let (selection, missed, refusals) = {
+            let document = document.read(cx).document();
+            (
+                document.selection.clone(),
+                document.missed,
+                document.refusals(),
+            )
+        };
+        let selection_changed = self.inspector.read(cx).selection() != selection.as_ref();
+        let refused = refusals != self.refusals_seen;
+        self.refusals_seen = refusals;
+        self.inspector.update(cx, |inspector, cx| {
+            if selection_changed {
+                inspector.set_selection(selection, window, cx);
+            }
+            inspector.set_missed(missed, cx);
+            if refused {
+                inspector.reset_fields(window, cx);
+            }
+        });
     }
 
     pub fn canvas(&self) -> Option<&Entity<Canvas>> {
