@@ -1,7 +1,3 @@
-//! Stagepack Studio: a native editor for Slidev talks.
+//! Stagepack Studio: a native editor for Markdown slide talks.
 
-pub mod canvas;
-pub mod document;
-pub mod document_view;
-pub mod inspector;
 pub mod workspace_view;

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/protocol", "crates/sidecar", "crates/app"]
+members = ["crates/app"]
 
 [workspace.package]
 edition = "2024"
@@ -11,6 +11,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 
-# Debug info for GPUI and the WebKit bindings is what makes builds use the most memory.
+# Debug info for GPUI is what makes builds use the most memory.
 [profile.dev.package."*"]
 debug = false
