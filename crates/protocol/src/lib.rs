@@ -50,6 +50,9 @@ pub enum PageMessage {
     },
     Selection {
         selection: Option<SelectionInfo>,
+        /// The last click hit the slide but nothing traceable. Only true with
+        /// no selection.
+        missed: bool,
     },
     History {
         #[serde(rename = "canUndo")]
@@ -98,7 +101,9 @@ impl PageMessage {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "cmd", rename_all = "kebab-case")]
 pub enum CommandBody {
-    SetPos { pos: DragPos },
+    SetPos {
+        pos: DragPos,
+    },
     FreePosition,
     ReturnToFlow,
     Delete,
@@ -106,7 +111,12 @@ pub enum CommandBody {
     Undo,
     Redo,
     Deselect,
-    Go { slide: u32 },
+    Go {
+        slide: u32,
+    },
+    /// Apply the page's inline editor if it is open, and answer once the write
+    /// has landed.
+    FinishEdit,
 }
 
 /// A command for the page: `{"v":1,"id":…,"cmd":…,…}`.

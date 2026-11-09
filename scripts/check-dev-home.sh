@@ -5,6 +5,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ROOT/dev.env"
 HOME_DIR="$ROOT/target/dev-home"
 TMP="$(mktemp -d)"
+# Serve also claims the talk in the per-user Stagepack it finds there: a check leaves that one alone.
+export XDG_DATA_HOME="$TMP/data"
 OUT="$TMP/out.jsonl"
 : > "$OUT"
 mkfifo "$TMP/in"

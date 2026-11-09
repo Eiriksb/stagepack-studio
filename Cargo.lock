@@ -7588,6 +7588,7 @@ dependencies = [
  "lb-wry",
  "studio-protocol",
  "studio-sidecar",
+ "url",
 ]
 
 [[package]]

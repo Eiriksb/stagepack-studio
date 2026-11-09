@@ -14,7 +14,7 @@ use stagepack_studio::canvas::CanvasEvent;
 use stagepack_studio::document::NOT_TRUSTED_MESSAGE;
 use stagepack_studio::document_view::{DocumentView, SidecarCommand};
 use stagepack_studio::workspace_view::{self, WorkspaceView};
-use studio_protocol::PageMessage;
+use studio_protocol::{CommandBody, PageMessage};
 use studio_sidecar::SidecarEvent;
 
 const WAIT: Duration = Duration::from_secs(1);
@@ -531,4 +531,195 @@ async fn ctrl_s_in_the_page_saves(cx: &mut TestAppContext) {
     })
     .unwrap();
     assert_eq!(sent(cx, &doc), vec![SidecarCommand::Save]);
+}
+
+// --- Text being typed in place goes first (finish-edit).
+
+const FINISH_EDIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn page_ready() -> PageMessage {
+    PageMessage::Ready {
+        studio: "0.0.0".into(),
+        slide: 1,
+        total: 2,
+    }
+}
+
+/// A talk open in the canvas, with the page up. Commands sent to it get ids from 1.
+fn open_page(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<DocumentView>) {
+    let (handle, doc) = open_document(cx);
+    sidecar(cx, handle, &doc, ready());
+    page(cx, handle, &doc, page_ready());
+    (handle, doc)
+}
+
+fn result_ok(id: i64) -> PageMessage {
+    PageMessage::Result {
+        id,
+        ok: true,
+        error: None,
+    }
+}
+
+fn page_sent(cx: &mut TestAppContext, doc: &Entity<DocumentView>) -> Vec<CommandBody> {
+    cx.update(|cx| doc.read(cx).page_sent().to_vec())
+}
+
+fn press_ctrl_s(cx: &mut TestAppContext, handle: AnyWindowHandle) {
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.press("ctrl-s", cx);
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+async fn ctrl_s_with_text_being_typed_saves_it(cx: &mut TestAppContext) {
+    let (handle, doc) = open_page(cx);
+    press_ctrl_s(cx, handle);
+    assert_eq!(page_sent(cx, &doc), vec![CommandBody::FinishEdit]);
+    assert_eq!(sent(cx, &doc), vec![], "the page goes first");
+
+    // The page applies the editor: `edited`, then the result.
+    page(cx, handle, &doc, edited());
+    page(cx, handle, &doc, result_ok(1));
+    assert_eq!(sent(cx, &doc), vec![SidecarCommand::Save]);
+}
+
+#[gpui_kit::test]
+async fn ctrl_s_in_the_page_finishes_the_edit_too(cx: &mut TestAppContext) {
+    let (handle, doc) = open_page(cx);
+    cx.update_window(handle, |_, window, cx| {
+        doc.update(cx, |doc, cx| {
+            doc.on_canvas(&CanvasEvent::SaveShortcut, window, cx)
+        });
+    })
+    .unwrap();
+    assert_eq!(page_sent(cx, &doc), vec![CommandBody::FinishEdit]);
+    page(cx, handle, &doc, edited());
+    page(cx, handle, &doc, result_ok(1));
+    assert_eq!(sent(cx, &doc), vec![SidecarCommand::Save]);
+}
+
+#[gpui_kit::test]
+async fn a_dead_page_cannot_hold_up_ctrl_s(cx: &mut TestAppContext) {
+    let (handle, doc) = open_page(cx);
+    page(cx, handle, &doc, edited());
+    press_ctrl_s(cx, handle);
+    cx.run_until_parked();
+    assert_eq!(sent(cx, &doc), vec![], "still within the wait");
+
+    cx.executor().advance_clock(FINISH_EDIT_TIMEOUT);
+    cx.run_until_parked();
+    assert_eq!(sent(cx, &doc), vec![SidecarCommand::Save]);
+}
+
+#[gpui_kit::test]
+async fn closing_waits_for_the_page_then_closes(cx: &mut TestAppContext) {
+    let (handle, doc) = open_page(cx);
+    assert!(!request_close(cx, handle), "the page goes first");
+    assert_eq!(page_sent(cx, &doc), vec![CommandBody::FinishEdit]);
+    assert!(is_open(cx, handle));
+    page(cx, handle, &doc, result_ok(1));
+    cx.run_until_parked();
+    assert!(
+        !is_open(cx, handle),
+        "nothing was typed, and the talk is clean"
+    );
+    assert_eq!(sent(cx, &doc), vec![SidecarCommand::Stop]);
+}
+
+#[gpui_kit::test]
+async fn closing_with_text_being_typed_asks_about_it(cx: &mut TestAppContext) {
+    let (handle, doc) = open_page(cx);
+    assert!(!request_close(cx, handle));
+    page(cx, handle, &doc, edited());
+    page(cx, handle, &doc, result_ok(1));
+    cx.wait_for(handle, WAIT, |window, _| {
+        window.try_find("save-changes-save").is_some()
+    })
+    .await;
+    assert!(is_open(cx, handle));
+}
+
+#[gpui_kit::test]
+async fn a_dead_page_cannot_hold_up_a_close(cx: &mut TestAppContext) {
+    let (handle, _doc) = open_page(cx);
+    assert!(!request_close(cx, handle));
+    cx.run_until_parked();
+    assert!(is_open(cx, handle));
+    cx.executor().advance_clock(FINISH_EDIT_TIMEOUT);
+    cx.run_until_parked();
+    assert!(!is_open(cx, handle));
+}
+
+#[gpui_kit::test]
+async fn a_refusal_reaches_the_person(cx: &mut TestAppContext) {
+    let (handle, doc) = open_page(cx);
+    let reason = "This element is not freely positioned.";
+    page(
+        cx,
+        handle,
+        &doc,
+        PageMessage::Result {
+            id: 9,
+            ok: false,
+            error: Some(reason.into()),
+        },
+    );
+    cx.wait_for(handle, WAIT, |window, _| {
+        window.try_find("message").is_some()
+    })
+    .await;
+    cx.update_window(handle, |_, window, _| {
+        assert_eq!(
+            window.within("dialog").find("message").label(),
+            Some(reason)
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+async fn once_serve_has_ended_the_failed_screen_says_the_edits_are_lost(cx: &mut TestAppContext) {
+    let (handle, doc) = open_dirty(cx);
+    sidecar(
+        cx,
+        handle,
+        &doc,
+        SidecarEvent::Error {
+            message: "slidev exited".into(),
+            log: String::new(),
+        },
+    );
+    sidecar(cx, handle, &doc, SidecarEvent::Stopped);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("failed-lost").label(),
+            Some("Your unsaved changes could not be saved.")
+        );
+        assert!(window.try_find("failed-unsaved").is_none(), "never both");
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+async fn with_serve_still_running_the_failed_screen_does_not_say_lost(cx: &mut TestAppContext) {
+    let (handle, doc) = open_dirty(cx);
+    sidecar(
+        cx,
+        handle,
+        &doc,
+        SidecarEvent::Error {
+            message: "slidev exited".into(),
+            log: String::new(),
+        },
+    );
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("failed-unsaved").visible());
+        assert!(window.try_find("failed-lost").is_none());
+    })
+    .unwrap();
 }

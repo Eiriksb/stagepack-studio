@@ -244,6 +244,7 @@ fn reload_clears_selection() {
     let mut d = open_doc();
     d.on_page(&PageMessage::Selection {
         selection: Some(selection()),
+        missed: false,
     });
     assert_eq!(d.selection, Some(selection()));
 
@@ -260,8 +261,12 @@ fn selection_and_history_follow_the_page() {
     let mut d = open_doc();
     d.on_page(&PageMessage::Selection {
         selection: Some(selection()),
+        missed: false,
     });
-    d.on_page(&PageMessage::Selection { selection: None });
+    d.on_page(&PageMessage::Selection {
+        selection: None,
+        missed: false,
+    });
     assert_eq!(d.selection, None);
 
     d.on_page(&PageMessage::History {
@@ -501,4 +506,352 @@ fn an_error_then_stopped_has_nothing_to_save() {
     assert!(d.dirty);
     assert!(!d.wants_close_prompt(), "serve removed the work folder");
     assert!(!d.can_save());
+}
+
+// --- Text being typed in place goes first (finish-edit).
+
+fn page_ready() -> PageMessage {
+    PageMessage::Ready {
+        studio: "0.0.0".into(),
+        slide: 1,
+        total: 2,
+    }
+}
+
+/// A document whose page is up and has said `ready`.
+fn page_up() -> Document {
+    let mut d = open_doc();
+    d.on_page(&page_ready());
+    d
+}
+
+fn answered(id: i64) -> PageMessage {
+    PageMessage::Result {
+        id,
+        ok: true,
+        error: None,
+    }
+}
+
+fn refused(id: i64, error: &str) -> PageMessage {
+    PageMessage::Result {
+        id,
+        ok: false,
+        error: Some(error.into()),
+    }
+}
+
+#[test]
+fn ctrl_s_on_a_clean_talk_with_text_being_typed_ends_up_saved() {
+    let mut d = page_up();
+    assert_eq!(
+        d.request_save(),
+        vec![Effect::FinishEdit],
+        "the edit goes first"
+    );
+    d.finish_edit_sent(5);
+    // The page applies the editor: `edited`, then the result.
+    assert_eq!(d.on_page(&edited()), vec![]);
+    assert_eq!(d.on_page(&answered(5)), vec![Effect::SendSave]);
+}
+
+#[test]
+fn save_with_nothing_typed_on_a_clean_talk_sends_nothing() {
+    let mut d = page_up();
+    d.request_save();
+    d.finish_edit_sent(5);
+    assert_eq!(d.on_page(&answered(5)), vec![]);
+}
+
+#[test]
+fn save_waits_for_the_result_of_its_own_command() {
+    let mut d = page_up();
+    d.on_page(&edited());
+    d.request_save();
+    d.finish_edit_sent(5);
+    assert_eq!(d.on_page(&answered(4)), vec![], "another command's result");
+    assert_eq!(d.on_page(&answered(5)), vec![Effect::SendSave]);
+}
+
+#[test]
+fn a_dead_page_cannot_block_a_save() {
+    let mut d = page_up();
+    d.on_page(&edited());
+    d.request_save();
+    d.finish_edit_sent(5);
+    assert_eq!(d.finish_edit_timed_out(5), vec![Effect::SendSave]);
+    assert_eq!(
+        d.on_page(&answered(5)),
+        vec![],
+        "the late result does nothing"
+    );
+    assert_eq!(d.finish_edit_timed_out(5), vec![], "nor a second timeout");
+}
+
+#[test]
+fn a_stale_timeout_is_ignored() {
+    let mut d = page_up();
+    d.on_page(&edited());
+    d.request_save();
+    d.finish_edit_sent(5);
+    d.on_page(&answered(5));
+    d.request_save();
+    d.finish_edit_sent(6);
+    assert_eq!(
+        d.finish_edit_timed_out(5),
+        vec![],
+        "the first command's timer"
+    );
+    assert_eq!(d.on_page(&answered(6)), vec![Effect::SendSave]);
+}
+
+#[test]
+fn with_no_page_up_a_save_goes_straight_to_serve() {
+    let mut d = open_doc();
+    assert_eq!(d.request_save(), vec![], "nothing to save");
+    d.on_page(&edited());
+    assert_eq!(d.request_save(), vec![Effect::SendSave]);
+
+    // The page of a failed talk is hidden; there is nothing left to wait for.
+    let mut d = page_up();
+    d.on_page(&edited());
+    d.on_sidecar(SidecarEvent::Error {
+        message: "slidev exited".into(),
+        log: String::new(),
+    });
+    assert_eq!(d.request_save(), vec![Effect::SendSave]);
+}
+
+#[test]
+fn a_new_load_means_the_page_is_not_up() {
+    let mut d = page_up();
+    d.on_page(&edited());
+    d.on_sidecar(ready()); // loads the canvas again
+    assert_eq!(d.request_save(), vec![Effect::SendSave]);
+}
+
+#[test]
+fn a_second_save_while_waiting_does_nothing() {
+    let mut d = page_up();
+    d.on_page(&edited());
+    d.request_save();
+    d.finish_edit_sent(5);
+    assert_eq!(d.request_save(), vec![]);
+    assert_eq!(d.on_page(&answered(5)), vec![Effect::SendSave]);
+}
+
+#[test]
+fn closing_finishes_the_edit_first() {
+    let mut d = page_up();
+    assert_eq!(d.request_close(), vec![Effect::FinishEdit]);
+    d.finish_edit_sent(7);
+    assert_eq!(
+        d.on_page(&answered(7)),
+        vec![Effect::CloseWindow],
+        "still clean"
+    );
+
+    let mut d = page_up();
+    d.request_close();
+    d.finish_edit_sent(7);
+    d.on_page(&edited());
+    assert_eq!(
+        d.on_page(&answered(7)),
+        vec![Effect::AskSaveChanges],
+        "the text typed made it dirty"
+    );
+}
+
+#[test]
+fn a_dead_page_cannot_block_a_close() {
+    let mut d = page_up();
+    d.request_close();
+    d.finish_edit_sent(7);
+    assert_eq!(d.finish_edit_timed_out(7), vec![Effect::CloseWindow]);
+
+    let mut d = page_up();
+    d.on_page(&edited());
+    d.request_close();
+    d.finish_edit_sent(7);
+    assert_eq!(d.finish_edit_timed_out(7), vec![Effect::AskSaveChanges]);
+}
+
+#[test]
+fn with_no_page_up_a_close_decides_at_once() {
+    let mut d = open_doc();
+    assert_eq!(d.request_close(), vec![Effect::CloseWindow]);
+    let mut d = open_doc();
+    d.on_page(&edited());
+    assert_eq!(d.request_close(), vec![Effect::AskSaveChanges]);
+}
+
+#[test]
+fn a_close_during_the_wait_of_a_save_wins() {
+    let mut d = page_up();
+    d.on_page(&edited());
+    d.request_save();
+    d.finish_edit_sent(5);
+    assert_eq!(d.request_close(), vec![], "already waiting");
+    assert_eq!(d.on_page(&answered(5)), vec![Effect::AskSaveChanges]);
+}
+
+#[test]
+fn an_edit_that_cannot_be_written_back_shows_and_the_save_still_goes() {
+    let message = "That edit could not be written back as Markdown, so nothing was changed.";
+    let mut d = page_up();
+    d.on_page(&edited());
+    d.request_save();
+    d.finish_edit_sent(5);
+    d.on_page(&PageMessage::Error {
+        message: message.into(),
+    });
+    assert_eq!(
+        d.on_page(&refused(5, message)),
+        vec![Effect::SendSave],
+        "once for the message, and the earlier edit is saved"
+    );
+}
+
+#[test]
+fn a_refused_finish_calls_off_the_close_so_the_message_can_be_read() {
+    let message = "That edit could not be written back as Markdown, so nothing was changed.";
+    let mut d = page_up();
+    d.request_close();
+    d.finish_edit_sent(5);
+    assert_eq!(
+        d.on_page(&refused(5, message)),
+        vec![Effect::ShowMessage(message.into())]
+    );
+    // The editor is shut by now: asking again closes.
+    assert_eq!(d.request_close(), vec![Effect::FinishEdit]);
+    d.finish_edit_sent(6);
+    assert_eq!(d.on_page(&answered(6)), vec![Effect::CloseWindow]);
+}
+
+// --- Every result ok:false is answered.
+
+#[test]
+fn a_refusal_shows_its_reason() {
+    let mut d = page_up();
+    d.command_sent(9);
+    assert_eq!(d.refusals(), 0);
+    assert_eq!(
+        d.on_page(&refused(9, "This element is not freely positioned.")),
+        vec![Effect::ShowMessage(
+            "This element is not freely positioned.".into()
+        )]
+    );
+    assert_eq!(d.refusals(), 1, "the inspector goes back to the selection");
+    assert!(matches!(d.state, DocState::Ready { .. }));
+}
+
+#[test]
+fn a_result_that_is_ok_says_nothing() {
+    let mut d = page_up();
+    d.command_sent(9);
+    assert_eq!(d.on_page(&answered(9)), vec![]);
+    assert_eq!(d.refusals(), 0);
+}
+
+#[test]
+fn a_mismatch_in_a_result_is_a_protocol_error() {
+    for error in [
+        "Unsupported bridge version: 2",
+        "Unknown command: explode",
+        "Bad command: not JSON",
+    ] {
+        let mut d = page_up();
+        d.command_sent(9);
+        assert_eq!(d.on_page(&refused(9, error)), vec![], "{error}");
+        assert_eq!(d.state, failed(&format!("{MISMATCH_MESSAGE}{error}"), ""));
+        assert_eq!(d.refusals(), 0, "{error}");
+    }
+}
+
+#[test]
+fn a_reported_failure_shows_once() {
+    let mut d = page_up();
+    d.command_sent(9);
+    let message = "Could not write slides.md";
+    assert_eq!(
+        d.on_page(&PageMessage::Error {
+            message: message.into()
+        }),
+        vec![Effect::ShowMessage(message.into())]
+    );
+    assert_eq!(d.on_page(&refused(9, message)), vec![], "already on screen");
+    assert_eq!(d.refusals(), 1, "the inspector still goes back");
+}
+
+#[test]
+fn an_older_error_does_not_swallow_a_refusal() {
+    let mut d = page_up();
+    let message = "Could not write slides.md";
+    d.on_page(&PageMessage::Error {
+        message: message.into(),
+    });
+    d.command_sent(9); // went out after that error
+    assert_eq!(
+        d.on_page(&refused(9, message)),
+        vec![Effect::ShowMessage(message.into())]
+    );
+}
+
+#[test]
+fn a_different_error_does_not_swallow_a_refusal() {
+    let mut d = page_up();
+    d.command_sent(9);
+    d.on_page(&PageMessage::Error {
+        message: "Something else".into(),
+    });
+    assert_eq!(
+        d.on_page(&refused(9, "The reason")),
+        vec![Effect::ShowMessage("The reason".into())]
+    );
+}
+
+// --- What the Failed screen says.
+
+#[test]
+fn edits_are_lost_only_once_serve_has_ended() {
+    let mut d = open_doc();
+    d.on_page(&edited());
+    d.on_sidecar(SidecarEvent::Error {
+        message: "slidev exited".into(),
+        log: String::new(),
+    });
+    assert!(!d.changes_lost(), "serve still has them");
+    assert!(d.wants_close_prompt());
+    d.on_sidecar(SidecarEvent::Stopped);
+    assert!(d.changes_lost());
+    assert!(!d.wants_close_prompt());
+
+    let mut d = open_doc();
+    d.on_sidecar(SidecarEvent::Stopped);
+    assert!(!d.changes_lost(), "a clean talk lost nothing");
+}
+
+// --- A click on nothing traceable.
+
+#[test]
+fn missed_follows_the_page_until_the_next_selection() {
+    let mut d = open_doc();
+    assert!(!d.missed);
+    d.on_page(&PageMessage::Selection {
+        selection: None,
+        missed: true,
+    });
+    assert!(d.missed);
+    d.on_page(&PageMessage::Selection {
+        selection: Some(selection()),
+        missed: false,
+    });
+    assert!(!d.missed);
+
+    d.on_page(&PageMessage::Selection {
+        selection: None,
+        missed: true,
+    });
+    d.on_page(&page_ready());
+    assert!(!d.missed, "a new page has heard no click");
 }

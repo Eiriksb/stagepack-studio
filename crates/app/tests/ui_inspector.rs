@@ -312,7 +312,11 @@ fn nested_disables_free_position(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn return_to_flow_duplicate_and_delete_send_their_commands(cx: &mut TestAppContext) {
     let (handle, inspector, events) = open_inspector(cx);
-    select(cx, handle, &inspector, Some(positioned()));
+    let selection = SelectionInfo {
+        can_reorder: true,
+        ..positioned()
+    };
+    select(cx, handle, &inspector, Some(selection));
     cx.update_window(handle, |_, window, cx| {
         window.click("return-to-flow", cx);
         window.click("duplicate", cx);
@@ -426,6 +430,7 @@ fn a_page_selection_reaches_the_inspector_and_its_edits_are_sent(cx: &mut TestAp
             doc.on_page(
                 &PageMessage::Selection {
                     selection: Some(positioned()),
+                    missed: false,
                 },
                 window,
                 cx,
@@ -505,4 +510,202 @@ fn an_echo_that_changes_y_is_what_enter_in_w_sends(cx: &mut TestAppContext) {
     })
     .unwrap();
     assert_eq!(*events.borrow(), vec![set_pos(120.0, 90.0, 250.0)]);
+}
+
+fn untraced() -> SelectionInfo {
+    SelectionInfo {
+        range: None,
+        positioned: false,
+        pos: None,
+        label: "Text".into(),
+        kind: "paragraph".into(),
+        ..positioned()
+    }
+}
+
+#[gpui_kit::test]
+fn an_element_that_cannot_be_traced_says_so_and_offers_nothing(cx: &mut TestAppContext) {
+    let (handle, inspector, _) = open_inspector(cx);
+    select(cx, handle, &inspector, Some(untraced()));
+    cx.update_window(handle, |_, window, _| {
+        assert_eq!(window.find("inspector-label").label(), Some("Text"));
+        assert_eq!(
+            window.find("inspector-why").label(),
+            Some("This element could not be traced back to the Markdown.")
+        );
+        assert_eq!(
+            window.find("inspector-why-hint").label(),
+            Some(
+                "That happens when a custom Markdown transformer moves lines around. \
+                 The element still renders, it just cannot be edited visually."
+            )
+        );
+        for id in [
+            "pos-x",
+            "free-position",
+            "return-to-flow",
+            "duplicate",
+            "delete",
+        ] {
+            assert!(window.try_find(id).is_none(), "{id}");
+        }
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn a_layouts_frontmatter_text_has_its_own_explanation(cx: &mut TestAppContext) {
+    let (handle, inspector, _) = open_inspector(cx);
+    let selection = SelectionInfo {
+        kind: "frontmatter".into(),
+        label: "eyebrow".into(),
+        ..untraced()
+    };
+    select(cx, handle, &inspector, Some(selection));
+    cx.update_window(handle, |_, window, _| {
+        assert_eq!(
+            window.find("inspector-why").label(),
+            Some("These words are the slide's eyebrow.")
+        );
+        assert_eq!(
+            window.find("inspector-why-hint").label(),
+            Some("Double click to rewrite them on the slide.")
+        );
+        assert!(window.try_find("duplicate").is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn a_missed_click_says_so_until_the_next_selection(cx: &mut TestAppContext) {
+    let (handle, inspector, _) = open_inspector(cx);
+    select(cx, handle, &inspector, None);
+    cx.update_window(handle, |_, window, cx| {
+        inspector.update(cx, |inspector, cx| inspector.set_missed(true, cx));
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("inspector-empty").label(),
+            Some("Nothing here can be traced back to the slide's text.")
+        );
+        inspector.update(cx, |inspector, cx| inspector.set_missed(false, cx));
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("inspector-empty").label(),
+            Some("Click something on the slide to select it.")
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn duplicate_follows_can_reorder(cx: &mut TestAppContext) {
+    let (handle, inspector, events) = open_inspector(cx);
+    let selection = SelectionInfo {
+        can_reorder: false,
+        ..positioned()
+    };
+    select(cx, handle, &inspector, Some(selection));
+    cx.update_window(handle, |_, window, cx| {
+        assert_eq!(window.find("duplicate").disabled(), Some(true));
+        window.click("duplicate", cx);
+    })
+    .unwrap();
+    assert!(events.borrow().is_empty(), "{:?}", events.borrow());
+
+    let selection = SelectionInfo {
+        can_reorder: true,
+        ..positioned()
+    };
+    select(cx, handle, &inspector, Some(selection));
+    cx.update_window(handle, |_, window, _| {
+        assert_ne!(window.find("duplicate").disabled(), Some(true));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn positioned_without_a_position_shows_no_fields(cx: &mut TestAppContext) {
+    let (handle, inspector, _) = open_inspector(cx);
+    // Numbers from the element before it, in the field state.
+    select(cx, handle, &inspector, Some(positioned()));
+    // Slidev's named form: `v-drag="'square'"`, or a bare `v-drag`.
+    let named = SelectionInfo {
+        pos: None,
+        label: "Named".into(),
+        ..positioned()
+    };
+    select(cx, handle, &inspector, Some(named));
+    cx.update_window(handle, |_, window, _| {
+        assert!(window.try_find("pos-x").is_none());
+        assert!(window.find("return-to-flow").visible());
+    })
+    .unwrap();
+}
+
+fn on_page(
+    cx: &mut TestAppContext,
+    handle: AnyWindowHandle,
+    document: &Entity<DocumentView>,
+    message: PageMessage,
+) {
+    cx.update_window(handle, |_, window, cx| {
+        document.update(cx, |doc, cx| doc.on_page(&message, window, cx));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn a_page_miss_reaches_the_inspector(cx: &mut TestAppContext) {
+    let (handle, _, document) = open_workspace(cx);
+    on_page(
+        cx,
+        handle,
+        &document,
+        PageMessage::Selection {
+            selection: None,
+            missed: true,
+        },
+    );
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("inspector-empty").label(),
+            Some("Nothing here can be traced back to the slide's text.")
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn a_refused_edit_puts_the_field_back(cx: &mut TestAppContext) {
+    let (handle, _, document) = open_workspace(cx);
+    on_page(
+        cx,
+        handle,
+        &document,
+        PageMessage::Selection {
+            selection: Some(positioned()),
+            missed: false,
+        },
+    );
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        type_into(window, "pos-x", "140", cx);
+    })
+    .unwrap();
+    on_page(
+        cx,
+        handle,
+        &document,
+        PageMessage::Result {
+            id: 1,
+            ok: false,
+            error: Some("This element is not freely positioned.".into()),
+        },
+    );
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("pos-x").value(), Some("120"));
+    })
+    .unwrap();
 }

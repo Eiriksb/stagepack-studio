@@ -79,6 +79,36 @@ fn every_command_fixture_round_trips() {
 }
 
 #[test]
+fn a_selection_says_whether_the_click_missed() {
+    let missed = parse_page_message(r#"{"v":1,"type":"selection","selection":null,"missed":true}"#)
+        .expect("missed parses");
+    assert!(matches!(
+        missed,
+        PageMessage::Selection {
+            selection: None,
+            missed: true
+        }
+    ));
+    // It is a required field of v1.
+    assert!(matches!(
+        parse_page_message(r#"{"v":1,"type":"selection","selection":null}"#),
+        Err(ProtocolError::Bad(_))
+    ));
+}
+
+#[test]
+fn finish_edit_is_a_command() {
+    let cmd = Command {
+        id: 21,
+        body: CommandBody::FinishEdit,
+    };
+    assert_eq!(
+        serde_json::to_string(&cmd).unwrap(),
+        r#"{"v":1,"id":21,"cmd":"finish-edit"}"#
+    );
+}
+
+#[test]
 fn version_two_is_refused() {
     let err = parse_page_message(r#"{"v":2,"type":"slide","slide":1,"total":1}"#).unwrap_err();
     assert!(matches!(err, ProtocolError::Version(2)), "{err:?}");

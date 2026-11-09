@@ -4,6 +4,8 @@
 //! back through `window.__studioBridge.dispatch`. The page says `ready` on
 //! every load, and nothing is sent to it before that.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::LazyLock;
 
 use gpui_kit::*;
@@ -59,6 +61,8 @@ pub fn window_closing_on_x11() {
 pub struct Canvas {
     webview: Entity<WebView>,
     handshake: Handshake,
+    /// Where the page may go: the talk's own server, once one is loaded.
+    allowed_origin: Rc<RefCell<Option<url::Origin>>>,
 }
 
 impl EventEmitter<CanvasEvent> for Canvas {}
@@ -68,7 +72,9 @@ impl Canvas {
         let (tx, rx) = async_channel::unbounded::<Incoming>();
         #[cfg(target_os = "linux")]
         let on_save_key = tx.clone();
+        let allowed_origin = Rc::new(RefCell::new(None));
         let webview = cx.new(|cx| {
+            let origin = allowed_origin.clone();
             // Both handlers run on the UI thread but outside GPUI, so they only
             // pass what happened on to the loop below.
             let on_message = tx.clone();
@@ -80,6 +86,15 @@ impl Canvas {
                     if matches!(event, wry::PageLoadEvent::Started) {
                         let _ = tx.try_send(Incoming::LoadCommitted);
                     }
+                })
+                // A plain link on a slide would take the only web view off
+                // Slidev with no way back, and hand that site `window.ipc`.
+                .with_navigation_handler(move |url| {
+                    let allowed = navigation_allowed(&url, origin.borrow().as_ref());
+                    if !allowed && *DEBUG_IPC {
+                        eprintln!("[studio ipc] navigation to {url} blocked");
+                    }
+                    allowed
                 });
             #[cfg(debug_assertions)]
             let builder = builder.with_devtools(true);
@@ -103,6 +118,7 @@ impl Canvas {
         Self {
             webview,
             handshake: Handshake::new(),
+            allowed_origin,
         }
     }
 
@@ -114,6 +130,7 @@ impl Canvas {
 
     /// Loads `url` as it is. Commands sent from now on wait for its `ready`.
     pub fn load_url(&mut self, url: &str, cx: &mut Context<Self>) {
+        *self.allowed_origin.borrow_mut() = url::Url::parse(url).ok().map(|url| url.origin());
         self.handshake.load_requested();
         self.webview.update(cx, |webview, _| webview.load_url(url));
     }
@@ -310,6 +327,13 @@ fn queued_commands(next_id: i64, pending: Vec<CommandBody>) -> Vec<Command> {
         .collect()
 }
 
+/// Whether the web view may go to `url`: the origin of what was loaded (scheme,
+/// host and port, compared parsed, so a look-alike host doesn't pass), or the
+/// blank page it starts on. `allowed` is `None` until something is loaded.
+fn navigation_allowed(url: &str, allowed: Option<&url::Origin>) -> bool {
+    url == "about:blank" || url::Url::parse(url).is_ok_and(|url| Some(&url.origin()) == allowed)
+}
+
 fn message_type(msg: &PageMessage) -> &'static str {
     match msg {
         PageMessage::Ready { .. } => "ready",
@@ -326,7 +350,7 @@ fn message_type(msg: &PageMessage) -> &'static str {
 mod tests {
     // Not `super::*`: with test-support, `gpui_kit::*` brings a `test` macro
     // that shadows the built-in one.
-    use super::{Handshake, queued_commands};
+    use super::{Handshake, navigation_allowed, queued_commands};
     use studio_protocol::{Command, CommandBody, PageMessage};
 
     fn ready() -> PageMessage {
@@ -470,6 +494,39 @@ mod tests {
     #[test]
     fn an_empty_queue_sends_nothing() {
         assert!(queued_commands(1, Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn only_the_talks_own_origin_may_be_navigated_to() {
+        let origin = url::Url::parse("http://localhost:4000/1").unwrap().origin();
+        let allowed = Some(&origin);
+        for ok in [
+            "http://localhost:4000/",
+            "http://localhost:4000/2?clicks=1#x",
+            "about:blank",
+        ] {
+            assert!(navigation_allowed(ok, allowed), "{ok}");
+        }
+        for blocked in [
+            "http://localhost:4000.evil.example/",
+            "http://localhost:4000@evil.example/",
+            "http://localhost:4001/",
+            "https://localhost:4000/",
+            "http://127.0.0.1:4000/",
+            "https://example.org/some/page",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "not a url",
+            "",
+        ] {
+            assert!(!navigation_allowed(blocked, allowed), "{blocked}");
+        }
+    }
+
+    #[test]
+    fn before_a_load_only_the_blank_page_is_allowed() {
+        assert!(navigation_allowed("about:blank", None));
+        assert!(!navigation_allowed("http://localhost:4000/", None));
     }
 
     #[cfg(target_os = "linux")]
