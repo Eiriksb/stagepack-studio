@@ -40,5 +40,5 @@ No `stagepack`, `node`, app, WebKit or Xephyr process was left after any run.
 - [ ] 10. Run `scripts/check-saved.sh "<path>"`: `saved talk check: ok`.
 - [ ] 11. Reopen the talk, make an edit and close. The save prompt appears. **Cancel** keeps the window. **Don't Save** closes, and the file's mtime is unchanged.
 - [ ] 12. Open the same file with the installed Stagepack first (`~/.local/share/stagepack/stagepack open "<path>"`), then in the app. The app shows `This presentation is already open in Stagepack. Close it there, then open it here.`
-- [ ] 13. The reverse order: open the file in the app first, then with the installed Stagepack. Stagepack opens the talk in its window on the app's server, and there is no second copy (no new folder appears in `~/.local/share/stagepack/runtimes/*/work`).
+- [ ] 13. The reverse order: open the file in the app first, then with the installed Stagepack. Stagepack opens the talk in its window on the app's server, and there is no second copy (no new folder appears in `~/.local/share/stagepack/runtimes/*/work`). Notes typed in that presenter window aren't saved by the editor yet (a known limit, plan 2).
 - [ ] 14. Double-click text on the slide and type some words. Press Ctrl+S without pressing Escape, and close the window. Reopen the talk: the words are there.

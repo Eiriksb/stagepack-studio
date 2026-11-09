@@ -722,10 +722,40 @@ fn a_refused_finish_calls_off_the_close_so_the_message_can_be_read() {
         d.on_page(&refused(5, message)),
         vec![Effect::ShowMessage(message.into())]
     );
-    // The editor is shut by now: asking again closes.
-    assert_eq!(d.request_close(), vec![Effect::FinishEdit]);
+    // The reason has been shown; the next close decides at once.
+    assert_eq!(d.request_close(), vec![Effect::CloseWindow]);
+}
+
+#[test]
+fn a_page_that_refuses_every_finish_cannot_hold_the_window_open() {
+    let message = "That edit could not be written back as Markdown, so nothing was changed.";
+    let mut d = page_up();
+    d.request_close();
+    d.finish_edit_sent(5);
+    d.on_page(&refused(5, message));
+    // The second request doesn't ask the page again, so it decides as usual.
+    assert_eq!(d.request_close(), vec![Effect::CloseWindow]);
+
+    let mut d = page_up();
+    d.request_close();
+    d.finish_edit_sent(5);
+    d.on_page(&refused(5, message));
+    d.on_page(&edited());
+    assert_eq!(d.request_close(), vec![Effect::AskSaveChanges], "dirty");
+}
+
+#[test]
+fn a_finish_that_succeeds_asks_again_the_next_time() {
+    let message = "That edit could not be written back as Markdown, so nothing was changed.";
+    let mut d = page_up();
+    d.request_close();
+    d.finish_edit_sent(5);
+    d.on_page(&refused(5, message));
+    // A save asks the page, and the page does it this time.
+    assert_eq!(d.request_save(), vec![Effect::FinishEdit]);
     d.finish_edit_sent(6);
-    assert_eq!(d.on_page(&answered(6)), vec![Effect::CloseWindow]);
+    d.on_page(&answered(6));
+    assert_eq!(d.request_close(), vec![Effect::FinishEdit]);
 }
 
 // --- Every result ok:false is answered.

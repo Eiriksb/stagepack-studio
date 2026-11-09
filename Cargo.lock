@@ -7589,6 +7589,7 @@ dependencies = [
  "studio-protocol",
  "studio-sidecar",
  "url",
+ "webkit2gtk",
 ]
 
 [[package]]

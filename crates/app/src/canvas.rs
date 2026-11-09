@@ -61,8 +61,9 @@ pub fn window_closing_on_x11() {
 pub struct Canvas {
     webview: Entity<WebView>,
     handshake: Handshake,
-    /// Where the page may go: the talk's own server, once one is loaded.
-    allowed_origin: Rc<RefCell<Option<url::Origin>>>,
+    /// Where the page may go: the talk's own server, once one is loaded, as
+    /// the origin's serialization (`http://localhost:4000`).
+    allowed_origin: Rc<RefCell<Option<String>>>,
 }
 
 impl EventEmitter<CanvasEvent> for Canvas {}
@@ -72,9 +73,8 @@ impl Canvas {
         let (tx, rx) = async_channel::unbounded::<Incoming>();
         #[cfg(target_os = "linux")]
         let on_save_key = tx.clone();
-        let allowed_origin = Rc::new(RefCell::new(None));
+        let allowed_origin: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let webview = cx.new(|cx| {
-            let origin = allowed_origin.clone();
             // Both handlers run on the UI thread but outside GPUI, so they only
             // pass what happened on to the loop below.
             let on_message = tx.clone();
@@ -86,22 +86,32 @@ impl Canvas {
                     if matches!(event, wry::PageLoadEvent::Started) {
                         let _ = tx.try_send(Incoming::LoadCommitted);
                     }
-                })
-                // A plain link on a slide would take the only web view off
-                // Slidev with no way back, and hand that site `window.ipc`.
-                .with_navigation_handler(move |url| {
-                    let allowed = navigation_allowed(&url, origin.borrow().as_ref());
+                });
+            // Windows' handler sees the main frame only, so it can keep the
+            // web view on the talk's origin as it is.
+            #[cfg(not(target_os = "linux"))]
+            let builder = {
+                let origin = allowed_origin.clone();
+                builder.with_navigation_handler(move |url| {
+                    let allowed = origin_matches(&url, origin.borrow().as_deref());
                     if !allowed && *DEBUG_IPC {
                         eprintln!("[studio ipc] navigation to {url} blocked");
                     }
                     allowed
-                });
+                })
+            };
             #[cfg(debug_assertions)]
             let builder = builder.with_devtools(true);
             WebView::build(builder, window, cx).expect("Failed to create the web view")
         });
         #[cfg(target_os = "linux")]
-        watch_save_key(webview.read(cx).raw(), on_save_key);
+        {
+            let raw = webview.read(cx).raw();
+            watch_save_key(raw, on_save_key);
+            // The handler lives in WebKit's `decide-policy` signal, not
+            // Wry's: Wry's sees iframes too, and has only the URL to go on.
+            keep_on_talk(raw, allowed_origin.clone());
+        }
 
         cx.spawn(async move |this, cx| {
             while let Ok(incoming) = rx.recv().await {
@@ -130,7 +140,9 @@ impl Canvas {
 
     /// Loads `url` as it is. Commands sent from now on wait for its `ready`.
     pub fn load_url(&mut self, url: &str, cx: &mut Context<Self>) {
-        *self.allowed_origin.borrow_mut() = url::Url::parse(url).ok().map(|url| url.origin());
+        *self.allowed_origin.borrow_mut() = url::Url::parse(url)
+            .ok()
+            .map(|url| url.origin().ascii_serialization());
         self.handshake.load_requested();
         self.webview.update(cx, |webview, _| webview.load_url(url));
     }
@@ -234,6 +246,51 @@ fn watch_save_key(webview: &wry::WebView, tx: async_channel::Sender<Incoming>) {
     });
 }
 
+/// Keeps the web view on the talk: a link or form that leaves the allowed
+/// origin is ignored (see [`blocks_navigation`]); frames, reloads and the rest
+/// go ahead. Runs inside GTK's main loop and never touches GPUI.
+#[cfg(target_os = "linux")]
+fn keep_on_talk(webview: &wry::WebView, allowed_origin: Rc<RefCell<Option<String>>>) {
+    use webkit2gtk::glib::Cast as _;
+    use webkit2gtk::{
+        NavigationPolicyDecision, NavigationPolicyDecisionExt as _, NavigationType, PolicyDecisionExt as _, PolicyDecisionType,
+        URIRequestExt as _, WebViewExt as _,
+    };
+    use wry::WebViewExtUnix as _;
+
+    webview
+        .webview()
+        .connect_decide_policy(move |_, decision, kind| {
+            if kind != PolicyDecisionType::NavigationAction {
+                return false; // New windows stay as they were.
+            }
+            let Some(nav) = decision
+                .dynamic_cast_ref::<NavigationPolicyDecision>()
+                .and_then(|d| d.navigation_action())
+            else {
+                return false;
+            };
+            let Some(url) = nav.request().and_then(|r| r.uri()) else {
+                return false;
+            };
+            let kind = match nav.navigation_type() {
+                NavigationType::LinkClicked => NavKind::LinkClick,
+                NavigationType::FormSubmitted | NavigationType::FormResubmitted => {
+                    NavKind::FormSubmit
+                }
+                _ => NavKind::Other,
+            };
+            if !blocks_navigation(kind, &url, allowed_origin.borrow().as_deref()) {
+                return false; // WebKit's own decision: go ahead.
+            }
+            if *DEBUG_IPC {
+                eprintln!("[studio ipc] navigation to {url} blocked");
+            }
+            decision.ignore();
+            true
+        });
+}
+
 /// Ctrl+S with no other modifier held. Caps Lock and Num Lock don't count.
 #[cfg(target_os = "linux")]
 fn is_save_key(key: gtk::gdk::keys::Key, state: gtk::gdk::ModifierType) -> bool {
@@ -327,11 +384,47 @@ fn queued_commands(next_id: i64, pending: Vec<CommandBody>) -> Vec<Command> {
         .collect()
 }
 
-/// Whether the web view may go to `url`: the origin of what was loaded (scheme,
-/// host and port, compared parsed, so a look-alike host doesn't pass), or the
-/// blank page it starts on. `allowed` is `None` until something is loaded.
-fn navigation_allowed(url: &str, allowed: Option<&url::Origin>) -> bool {
-    url == "about:blank" || url::Url::parse(url).is_ok_and(|url| Some(&url.origin()) == allowed)
+/// What kind of navigation WebKit is deciding on. Only the person's own
+/// clicks and submissions can take the web view off the talk; a frame loading
+/// inside a slide (an iframe, a video embed) is the slide's own content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum NavKind {
+    /// A link was clicked.
+    LinkClick,
+    /// A form was submitted or resubmitted.
+    FormSubmit,
+    /// Anything else: a frame loading, a reload, history, script.
+    Other,
+}
+
+/// Whether `url` is on the talk's own origin (scheme, host and port, compared
+/// parsed, so a look-alike host doesn't pass), or is the blank page the web
+/// view starts on. `allowed` is the loaded URL or its origin, `None` until
+/// something is loaded.
+fn origin_matches(url: &str, allowed: Option<&str>) -> bool {
+    if url == "about:blank" {
+        return true;
+    }
+    let (Some(allowed), Ok(url)) = (allowed, url::Url::parse(url)) else {
+        return false;
+    };
+    url::Url::parse(allowed).is_ok_and(|allowed| url.origin() == allowed.origin())
+}
+
+/// Whether to stop a navigation. A link or a form that leaves the talk's
+/// origin is blocked: it would take the only web view off Slidev with no way
+/// back, and hand that site `window.ipc`. Everything else goes ahead, frames
+/// included: `layout: iframe`, `<Youtube>` and `<Tweet>` load other origins
+/// in a frame, and `about:srcdoc` frames are the page's own. Nothing is
+/// blocked before the first load.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn blocks_navigation(kind: NavKind, url: &str, allowed_origin: Option<&str>) -> bool {
+    let clicked = matches!(kind, NavKind::LinkClick | NavKind::FormSubmit);
+    clicked
+        && allowed_origin.is_some()
+        && url != "about:srcdoc"
+        && !origin_matches(url, allowed_origin)
 }
 
 fn message_type(msg: &PageMessage) -> &'static str {
@@ -350,7 +443,7 @@ fn message_type(msg: &PageMessage) -> &'static str {
 mod tests {
     // Not `super::*`: with test-support, `gpui_kit::*` brings a `test` macro
     // that shadows the built-in one.
-    use super::{Handshake, navigation_allowed, queued_commands};
+    use super::{Handshake, NavKind, blocks_navigation, origin_matches, queued_commands};
     use studio_protocol::{Command, CommandBody, PageMessage};
 
     fn ready() -> PageMessage {
@@ -497,17 +590,16 @@ mod tests {
     }
 
     #[test]
-    fn only_the_talks_own_origin_may_be_navigated_to() {
-        let origin = url::Url::parse("http://localhost:4000/1").unwrap().origin();
-        let allowed = Some(&origin);
+    fn only_the_talks_own_origin_matches() {
+        let allowed = Some("http://localhost:4000");
         for ok in [
             "http://localhost:4000/",
             "http://localhost:4000/2?clicks=1#x",
             "about:blank",
         ] {
-            assert!(navigation_allowed(ok, allowed), "{ok}");
+            assert!(origin_matches(ok, allowed), "{ok}");
         }
-        for blocked in [
+        for other in [
             "http://localhost:4000.evil.example/",
             "http://localhost:4000@evil.example/",
             "http://localhost:4001/",
@@ -519,14 +611,74 @@ mod tests {
             "not a url",
             "",
         ] {
-            assert!(!navigation_allowed(blocked, allowed), "{blocked}");
+            assert!(!origin_matches(other, allowed), "{other}");
         }
     }
 
     #[test]
-    fn before_a_load_only_the_blank_page_is_allowed() {
-        assert!(navigation_allowed("about:blank", None));
-        assert!(!navigation_allowed("http://localhost:4000/", None));
+    fn before_a_load_only_the_blank_page_matches() {
+        assert!(origin_matches("about:blank", None));
+        assert!(!origin_matches("http://localhost:4000/", None));
+    }
+
+    const TALK: Option<&str> = Some("http://localhost:4000");
+
+    #[test]
+    fn a_cross_origin_link_click_is_blocked() {
+        assert!(blocks_navigation(
+            NavKind::LinkClick,
+            "https://example.org/some/page",
+            TALK
+        ));
+    }
+
+    #[test]
+    fn a_same_origin_link_click_is_allowed() {
+        assert!(!blocks_navigation(
+            NavKind::LinkClick,
+            "http://localhost:4000/2?clicks=1#x",
+            TALK
+        ));
+    }
+
+    #[test]
+    fn a_cross_origin_frame_load_is_allowed() {
+        assert!(!blocks_navigation(
+            NavKind::Other,
+            "https://www.youtube.com/embed/abc",
+            TALK
+        ));
+    }
+
+    #[test]
+    fn a_srcdoc_frame_is_allowed() {
+        assert!(!blocks_navigation(NavKind::Other, "about:srcdoc", TALK));
+        assert!(!blocks_navigation(NavKind::LinkClick, "about:srcdoc", TALK));
+    }
+
+    #[test]
+    fn a_look_alike_host_link_click_is_blocked() {
+        assert!(blocks_navigation(
+            NavKind::LinkClick,
+            "http://localhost:4000.evil.example/",
+            TALK
+        ));
+    }
+
+    #[test]
+    fn a_cross_origin_form_submission_is_blocked() {
+        assert!(blocks_navigation(
+            NavKind::FormSubmit,
+            "https://example.org/post",
+            TALK
+        ));
+    }
+
+    #[test]
+    fn nothing_is_blocked_before_the_first_load() {
+        for kind in [NavKind::LinkClick, NavKind::FormSubmit, NavKind::Other] {
+            assert!(!blocks_navigation(kind, "https://example.org/", None));
+        }
     }
 
     #[cfg(target_os = "linux")]
