@@ -91,6 +91,10 @@ pub struct Document {
     /// The page has said `ready` since the canvas last loaded.
     page_ready: bool,
     finishing: Option<FinishingEdit>,
+    /// The page refused a `finish-edit` that a close was waiting for, and none
+    /// has succeeded since. The next close doesn't ask it again: a page that
+    /// refuses every time would keep the window open for good.
+    finish_refused: bool,
     /// `error` messages from the page so far, and the text of the last.
     page_errors: u64,
     last_page_error: Option<String>,
@@ -117,6 +121,7 @@ impl Document {
             sidecar_ended: false,
             page_ready: false,
             finishing: None,
+            finish_refused: false,
             page_errors: 0,
             last_page_error: None,
             commands_out: HashMap::new(),
@@ -291,7 +296,7 @@ impl Document {
             finishing.then = AfterFinish::Close;
             return Vec::new();
         }
-        if self.page_up() {
+        if self.page_up() && !self.finish_refused {
             self.finishing = Some(FinishingEdit {
                 id: None,
                 then: AfterFinish::Close,
@@ -321,12 +326,19 @@ impl Document {
 
     /// The page has answered, or isn't going to. A refused edit calls a close
     /// off: the reason is on screen and the window would take it away, and the
-    /// editor is shut, so the next close goes through.
+    /// next close doesn't ask the page again, so it goes through.
     fn finish_edit_done(&mut self, ok: bool) -> Vec<Effect> {
+        if ok {
+            self.finish_refused = false;
+        }
         match self.finishing.take().map(|finishing| finishing.then) {
             Some(AfterFinish::Save) => self.save_effects(),
             Some(AfterFinish::Close) if ok => self.close_effects(),
-            _ => Vec::new(),
+            Some(AfterFinish::Close) => {
+                self.finish_refused = true;
+                Vec::new()
+            }
+            None => Vec::new(),
         }
     }
 

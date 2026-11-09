@@ -25,3 +25,6 @@ gpui-kit = { version = "=0.9.0", features = ["test-support"] }
 # exiting on the X11 errors a closing window causes (see canvas.rs).
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
+# Already in Cargo.lock through Wry: the `decide-policy` signal that keeps
+# the web view on the talk (see canvas.rs). Same version as Wry's.
+webkit2gtk = "=2.0.1"
