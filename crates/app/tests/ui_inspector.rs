@@ -452,3 +452,57 @@ fn a_page_selection_reaches_the_inspector_and_its_edits_are_sent(cx: &mut TestAp
         );
     });
 }
+
+fn set_pos(x: f64, y: f64, w: f64) -> InspectorEvent {
+    InspectorEvent::Send(CommandBody::SetPos {
+        pos: DragPos {
+            x,
+            y,
+            w,
+            h: None,
+            rotate: 0.0,
+        },
+    })
+}
+
+#[gpui_kit::test]
+fn undo_echo_updates_the_focused_field_after_enter(cx: &mut TestAppContext) {
+    let (handle, inspector, events) = open_inspector(cx);
+    select(cx, handle, &inspector, Some(positioned()));
+    cx.update_window(handle, |_, window, cx| {
+        type_into(window, "pos-x", "140", cx)
+    })
+    .unwrap();
+    settle(cx, handle);
+    // Undo: the page puts the box back, and the field still has focus.
+    let mut undone = positioned();
+    undone.pos.as_mut().unwrap().x = 100.0;
+    select(cx, handle, &inspector, Some(undone));
+    cx.update_window(handle, |_, window, cx| {
+        assert_eq!(window.find("pos-x").value(), Some("100"));
+        type_into(window, "pos-y", "81", cx);
+    })
+    .unwrap();
+    assert_eq!(events.borrow()[1], set_pos(100.0, 81.0, 200.0));
+}
+
+#[gpui_kit::test]
+fn an_echo_that_changes_y_is_what_enter_in_w_sends(cx: &mut TestAppContext) {
+    let (handle, inspector, events) = open_inspector(cx);
+    select(cx, handle, &inspector, Some(positioned()));
+    // Uncommitted typing in X, which the page never hears of.
+    cx.update_window(handle, |_, window, cx| {
+        window.click("pos-x", cx);
+        window.press("ctrl-a", cx);
+        window.input("14", cx);
+    })
+    .unwrap();
+    let mut echoed = positioned();
+    echoed.pos.as_mut().unwrap().y = 90.0;
+    select(cx, handle, &inspector, Some(echoed));
+    cx.update_window(handle, |_, window, cx| {
+        type_into(window, "pos-w", "250", cx)
+    })
+    .unwrap();
+    assert_eq!(*events.borrow(), vec![set_pos(120.0, 90.0, 250.0)]);
+}

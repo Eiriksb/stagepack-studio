@@ -29,6 +29,10 @@ enum Field {
 impl Field {
     const ALL: [Field; 5] = [Field::X, Field::Y, Field::W, Field::H, Field::Rotate];
 
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|f| *f == self).unwrap_or(0)
+    }
+
     fn id(self) -> &'static str {
         match self {
             Field::X => "pos-x",
@@ -96,6 +100,8 @@ pub struct Inspector {
     w: Entity<InputState>,
     h: Entity<InputState>,
     rotate: Entity<InputState>,
+    /// Per field (in `Field::ALL` order): it holds typing not yet committed.
+    uncommitted: [bool; 5],
     _subscriptions: Vec<Subscription>,
 }
 
@@ -110,8 +116,11 @@ impl Inspector {
                 &state,
                 window,
                 move |this, _, event: &InputEvent, window, cx| {
-                    if matches!(event, InputEvent::PressEnter { .. }) {
-                        this.commit(field, window, cx);
+                    match event {
+                        // `set_value` emits nothing, so this is typing.
+                        InputEvent::Change => this.uncommitted[field.index()] = true,
+                        InputEvent::PressEnter { .. } => this.commit(field, window, cx),
+                        _ => {}
                     }
                 },
             ));
@@ -131,6 +140,7 @@ impl Inspector {
             w,
             h,
             rotate,
+            uncommitted: [false; 5],
             _subscriptions: subscriptions,
         }
     }
@@ -149,8 +159,8 @@ impl Inspector {
         }
     }
 
-    /// Shows `selection`. For the element already shown, a field being typed
-    /// in keeps its text, so the page's echo of an edit doesn't fight the
+    /// Shows `selection`. For the element already shown, a focused field holding
+    /// typing not yet committed keeps its text, so the page's echo of an edit doesn't fight the
     /// person typing; the other fields follow the page.
     pub fn set_selection(
         &mut self,
@@ -165,9 +175,12 @@ impl Inspector {
         if let Some(pos) = selection.as_ref().and_then(|s| s.pos.as_ref()) {
             for field in Field::ALL {
                 let input = self.input(field).clone();
-                if same_element && input.read(cx).focus_handle(cx).is_focused(window) {
+                let typing = self.uncommitted[field.index()]
+                    && input.read(cx).focus_handle(cx).is_focused(window);
+                if same_element && typing {
                     continue;
                 }
+                self.uncommitted[field.index()] = false;
                 let text = field.text(pos);
                 input.update(cx, |input, cx| input.set_value(text, window, cx));
             }
@@ -182,6 +195,7 @@ impl Inspector {
         let Some(current) = self.selection.as_ref().and_then(|s| s.pos.clone()) else {
             return;
         };
+        self.uncommitted[field.index()] = false;
         let text = self.input(field).read(cx).value();
         match with_field(&current, field, &text) {
             Some(pos) => cx.emit(InspectorEvent::Send(CommandBody::SetPos { pos })),
