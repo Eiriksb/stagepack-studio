@@ -1,0 +1,5 @@
+{
+  "name": "hello-fixture",
+  "private": true,
+  "dependencies": { "@slidev/cli": "^53.0.0" }
+}
