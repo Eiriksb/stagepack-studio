@@ -28,6 +28,8 @@ No `stagepack`, `node`, app, WebKit or Xephyr process was left after any run.
 
 ## Hand check (owner)
 
+**Not done.** On 2026-11-09 the owner chose to finish plan 1 without it, so no person has checked the app on a real screen. Only the scripted pass above ran. It did not cover Free position, the close dialog's Cancel and Save, or the "already open" message with an installed Stagepack. The steps stay here for whoever does it.
+
 - [ ] 1. Copy `target/fixtures/hello.sptx` to `/tmp/…/my talk æøå 100%.sptx`.
 - [ ] 2. Open it: `STUDIO_DEV_HOME=target/dev-home scripts/cargo-safe.sh run -p stagepack-studio -- "<path>"`.
 - [ ] 3. Go to slide 2 and click the Box. The inspector shows `<div>` and X 100.
