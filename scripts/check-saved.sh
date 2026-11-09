@@ -19,7 +19,7 @@ DEV_HOME="${STUDIO_DEV_HOME:-target/dev-home}"
 case "$DEV_HOME" in /*) ;; *) DEV_HOME="$ROOT/$DEV_HOME" ;; esac
 PLAIN_HOME="$STAGEPACK_SRC/dist/linux"
 TIME_LIMIT=90
-EXPECTED='v-drag="140,100,200,120"'
+EXPECTED='v-drag="[140,100,200,120]"'
 
 TMP="$(mktemp -d)"
 OUT="$TMP/events.jsonl"

@@ -1,49 +1,32 @@
 # Plan 1: Linux end-to-end check
 
-2026-11-09, at 6369405, debug build through `scripts/cargo-safe.sh run`.
+2026-11-09, app code at 6369405, debug build through `scripts/cargo-safe.sh run`.
 
-**Result: the core loop works, but not on the fixture as it stands.** The fixture's Box doesn't appear on slide 2, so the pass on the real fixture stopped at step 3. The whole loop passed on a copy with one line of the fixture corrected.
+**Result: the scripted pass passed on the real fixture, steps 1 to 7 and the save-changes dialog.** The hand check below is still to do.
 
 ## Scripted pass (nested display)
 
-XTest input and screenshots in `Xephyr :77 -screen 1280x800`, with `STUDIO_DEBUG_IPC=1`, no window manager. "Log" means the app's stderr.
+XTest input and screenshots in `Xephyr :77 -screen 1280x800`, with `STUDIO_DEBUG_IPC=1`, no window manager. "Log" means the app's stderr. A first pass stopped at step 3 because the fixture's `v-drag` had no brackets, so the Box never appeared. The fixture is corrected, and everything below is from the re-run on it.
 
-### The fixture as it stands: `target/checks/my talk æøå 100%.sptx`
+`target/checks/my talk æøå 100%.sptx`, a copy of the rebuilt `target/fixtures/hello.sptx`:
 
 | Step | Result |
 | --- | --- |
 | 1. Copy the fixture | Done |
 | 2. Open, wait for `ready` | `ready` in the log |
-| 3. Slide 2, click the Box | **Failed.** Right arrow gave `slide` and slide 2 shows, but the Box isn't on it: no pixel of its colour in the screenshot, and clicks where it should be gave no `selection`. A click on the paragraph did (`selection`, inspector `Text`), so clicks reach the page. |
-| 4 to 7 | Not reachable. `check-saved.sh` fails at its first check, as the file was never saved. |
-
-Closing it exited 0 with no prompt, and the file was unchanged.
-
-### One line corrected: `target/checks/my talk æøå 100% array.sptx`
-
-The same talk with `v-drag="[100,100,200,120]"`.
-
-| Step | Result |
-| --- | --- |
-| 2. Open, wait for `ready` | `ready` in the log |
-| 3. Slide 2, click the Box | `selection`; inspector shows `<div>`, X 100, Y 100, W 200, H 120 |
-| 4. X field, Ctrl+A, type 140, Enter | `edited` and `result`; the Box moved, the title shows `•` |
-| 5. Ctrl+S, focus in the X field | `Saved` from serve; `slides.md` has `v-drag="[140,100,200,120]"` |
+| 3. Slide 2 (Right arrow), click the Box | `slide`, then `selection`; inspector shows `<div>`, X 100, Y 100, W 200, H 120 |
+| 4. X field, Ctrl+A, type 140, Enter | `edited` and `result`; the Box's left edge moved from 104 to 145 on screen; the title shows `•` |
+| Undo, then Redo (title bar) | Each gives `history`; the Box goes back to 104, then forward to 145 |
+| 5. Ctrl+S, focus in the X field | `Saved` from serve; the `•` goes away; `slides.md` has `v-drag="[140,100,200,120]"` |
 | 6. WM_DELETE | No prompt, exit 0 |
-| 7. `check-saved.sh` | **Fails its first check**: Studio writes the bracket form, the script looks for `v-drag="140,100,200,120"`. With only that string changed to the bracket form, in a scratch copy: `saved talk check: ok`. |
-| Second run: edit, WM_DELETE | The save-changes dialog appears (screenshot). **Don't Save**: exit 0, mtime and content unchanged. |
+| 7. `scripts/check-saved.sh` | `saved talk check: ok` |
+| Second run: edit X to 150, WM_DELETE | The window stays and the save-changes dialog appears (screenshot). **Don't Save**: exit 0, mtime and content unchanged. |
 
-No `stagepack`, `node`, app or Xephyr process was left after any run.
+After Undo the X field still showed 140, with the Box back at 100, because the field keeps focus and a focused field ignores the page's echo.
 
-### Why the Box is missing
-
-`v-drag="100,100,200,120"` isn't a position to Slidev. Vue compiles it to `[_directive_drag, 100,100,200,120]`, so the directive's value is `100`, which Slidev reads as the name of a `dragPos` frontmatter entry. There is none, so Slidev places the element itself. Slidev's position form for the directive is `v-drag="[100,100,200,120]"`, and that is what Studio writes (`formatPos(pos, 'attr')` in `client/md/drag.ts`).
-
-Opening the same fixture straight at `/2` in Chromium, on a plain `serve` with Studio, also ended Slidev: it wrote the `dragPos` it had worked out, and crashed in `invalidateModule` (`Cannot read properties of undefined (reading '_clientModule')`). Seen once. The app loads `/1` first and didn't hit it in two runs on this fixture.
+No `stagepack`, `node`, app, WebKit or Xephyr process was left after any run.
 
 ## Hand check (owner)
-
-Steps 3 to 10 need the fixture and the first check of `check-saved.sh` corrected first (see above).
 
 - [ ] 1. Copy `target/fixtures/hello.sptx` to `/tmp/…/my talk æøå 100%.sptx`.
 - [ ] 2. Open it: `STUDIO_DEV_HOME=target/dev-home scripts/cargo-safe.sh run -p stagepack-studio -- "<path>"`.
