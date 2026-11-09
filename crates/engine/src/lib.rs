@@ -1,4 +1,5 @@
 mod builtins;
+mod deck;
 mod display;
 mod elements;
 mod files;
@@ -11,6 +12,7 @@ mod render;
 mod slide;
 mod text;
 pub use builtins::builtin_registry;
+pub use deck::Deck;
 pub use display::*;
 pub use files::*;
 pub use highlight::*;
