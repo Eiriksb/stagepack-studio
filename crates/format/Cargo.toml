@@ -1,0 +1,8 @@
+[package]
+name = "slides-format"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "slides_format"
