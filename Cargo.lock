@@ -6741,6 +6741,8 @@ name = "stagepack-studio"
 version = "0.1.0"
 dependencies = [
  "gpui-kit",
+ "slides-engine",
+ "tempfile",
 ]
 
 [[package]]
