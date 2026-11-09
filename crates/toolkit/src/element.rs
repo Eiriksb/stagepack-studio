@@ -72,7 +72,7 @@ macro_rules! row {
 }
 
 #[macro_export]
-macro_rules! column {
+macro_rules! col {
     ($($child:expr),* $(,)?) => { $crate::stack(false, vec![$($child),*]) };
 }
 

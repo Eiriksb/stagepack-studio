@@ -1,10 +1,9 @@
-use toolkit::column; // std has its own `column!`, so a glob import alone is ambiguous
 use toolkit::prelude::*;
 use std::collections::BTreeMap;
 
 #[component]
 fn Score(team: String, points: u32, colour: Color, ctx: &Ctx, children: Children) -> Element {
-    column![text(format!("{team} {points} {}", ctx.click_step)).fill(colour), children.into()]
+    col![text(format!("{team} {points} {}", ctx.click_step)).fill(colour), children.into()]
 }
 
 fn ctx() -> Ctx {

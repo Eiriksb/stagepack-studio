@@ -13,7 +13,7 @@ pub use toolkit_macros::component;
 
 pub mod prelude {
     pub use crate::{
-        column, component, icon, path, picture, row, shape, text, Children, Color, Ctx, Element, NativeComponent, Prop,
+        col, component, icon, path, picture, row, shape, text, Children, Color, Ctx, Element, NativeComponent, Prop,
         PropInfo, Props, Registry, ShapeKind, Theme,
     };
 }
