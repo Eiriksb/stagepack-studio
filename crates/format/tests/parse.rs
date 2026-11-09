@@ -107,7 +107,8 @@ fn bad_slide_doesnt_break_the_others() {
 }
 
 const TOO_DEEP: &str = "This slide is nested too deeply to read";
-const LEVELS: usize = 5000;
+/// Far deeper than the nesting limit, and still under the size limit.
+const LEVELS: usize = 500;
 
 /// `deep` as a slide of its own: an error with no blocks, and the slide after it parses.
 fn assert_too_deep_but_the_next_slide_parses(deep: &str) {
@@ -135,7 +136,8 @@ fn deeply_nested_quotes_are_a_slide_error_not_a_crash() {
 
 #[test]
 fn deeply_nested_lists_are_a_slide_error_not_a_crash() {
-    let deep: String = (0..LEVELS).map(|level| format!("{}- item\n", "  ".repeat(level))).collect();
+    // Each level is longer than the last, so this is about as deep as the size limit allows.
+    let deep: String = (0..170).map(|level| format!("{}- item\n", "  ".repeat(level))).collect();
     assert_too_deep_but_the_next_slide_parses(&deep);
 }
 
@@ -210,4 +212,154 @@ fn tags_spread_over_several_lines_still_parse() {
     let talk = parse_talk(&"<Box\n  x=\"1\"\n/>\n\n<Box\n  y=\"2\"\n>\n\nInside\n\n</Box>\n\n".repeat(10));
     assert!(talk.slides[0].error.is_none());
     assert_eq!(talk.slides[0].blocks.len(), 20);
+}
+
+const TOO_LARGE: &str = "This slide is too large to read";
+const MAX_BODY: usize = 32 * 1024;
+const MANY: usize = 20_000;
+const FEWER: usize = 1_000;
+
+/// `body`, as a slide of its own, is refused, and the slide after it parses.
+fn assert_refused_but_the_next_slide_parses(body: &str) -> Talk {
+    let talk = parse_talk(&format!("{body}\n---\n\n# Next\n"));
+    assert_eq!(talk.slides.len(), 2);
+    assert!(talk.slides[0].error.is_some());
+    assert!(talk.slides[0].blocks.is_empty());
+    assert!(talk.slides[1].error.is_none());
+    assert!(matches!(talk.slides[1].blocks[0], Block::Heading { .. }));
+    talk
+}
+
+/// `body(n)` is refused at `MANY` repeats, which is over the size limit, at `FEWER`, and at
+/// as many as fit under the limit, where the refusal has to come from reading the slide.
+fn assert_refused_at_every_size(body: impl Fn(usize) -> String) {
+    assert_refused_but_the_next_slide_parses(&body(MANY));
+    assert_refused_but_the_next_slide_parses(&body(FEWER));
+    let (empty, repeat) = (body(0).len(), body(1).len() - body(0).len());
+    let most = body((MAX_BODY - 1 - empty) / repeat);
+    assert!(most.len() < MAX_BODY && MAX_BODY - most.len() <= repeat + 1, "{} bytes", most.len());
+    let talk = assert_refused_but_the_next_slide_parses(&most);
+    assert_ne!(talk.slides[0].error.as_ref().map(|e| e.message.as_str()), Some(TOO_LARGE));
+}
+
+#[test]
+fn quotes_after_a_bare_carriage_return_are_refused_not_a_crash() {
+    assert_refused_but_the_next_slide_parses(&format!("x\r\r{} deep\r", ">".repeat(MANY)));
+}
+
+#[test]
+fn a_self_close_inside_an_attribute_expression_is_refused_not_a_crash() {
+    assert_refused_at_every_size(|n| "<Box a={/>\n}>\n\n".repeat(n));
+}
+
+#[test]
+fn a_closing_tag_inside_an_attribute_expression_is_refused_not_a_crash() {
+    assert_refused_at_every_size(|n| "<Box a={1>2\n</Box>\n}>\n\n".repeat(n));
+}
+
+#[test]
+fn a_closing_tag_in_a_link_target_on_the_next_line_is_refused_not_a_crash() {
+    assert_refused_at_every_size(|n| "<Box>\n\n[a](\n</Box>)\n\n".repeat(n));
+}
+
+#[test]
+fn tags_between_backticks_on_different_lines_are_refused_not_a_crash() {
+    assert_refused_at_every_size(|n| format!("`x\ny` {}d{} `z\n", "<a>".repeat(n), "</a>".repeat(n)));
+}
+
+#[test]
+fn deep_emphasis_is_refused_not_a_crash() {
+    assert_refused_at_every_size(|n| format!("{}b{}", "*a ".repeat(n), " a*".repeat(n)));
+}
+
+#[test]
+fn emphasis_packed_as_deep_as_the_size_limit_allows_is_refused_not_a_crash() {
+    assert_refused_at_every_size(|n| format!("{}b{}", "*".repeat(n), "*".repeat(n)));
+}
+
+#[test]
+fn reading_a_deep_slide_does_not_use_up_the_callers_stack() {
+    let deep = format!("{}b{}\n", "*a ".repeat(5000), " a*".repeat(5000));
+    let caller = std::thread::Builder::new().stack_size(64 * 1024).spawn(move || parse_talk(&deep)).unwrap();
+    let talk = caller.join().unwrap();
+    assert_eq!(talk.slides[0].error.as_ref().map(|e| e.message.as_str()), Some(TOO_DEEP));
+}
+
+#[test]
+fn markers_repeated_along_a_line_are_refused_without_the_long_wait() {
+    // Each of these keeps the `markdown` crate busy for many seconds if it gets that far.
+    let sources = [
+        format!("{}item\n", "- ".repeat(MAX_BODY / 2 - 8)),
+        format!("x\r\r{} deep\r", ">".repeat(MAX_BODY - 20)),
+    ];
+    for source in sources {
+        let started = std::time::Instant::now();
+        let talk = parse_talk(&source);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "took {:?}", started.elapsed());
+        assert_eq!(talk.slides[0].error.as_ref().map(|e| e.message.as_str()), Some(TOO_DEEP));
+    }
+}
+
+fn empty_nested_boxes(levels: usize) -> String {
+    format!("{}{}", "<Box>\n".repeat(levels), "</Box>\n".repeat(levels))
+}
+
+fn nested_emphasis(levels: usize) -> String {
+    format!("{}b{}\n", "*a ".repeat(levels), " a*".repeat(levels))
+}
+
+fn assert_reads_at(levels: usize, body: impl Fn(usize) -> String) {
+    let talk = parse_talk(&body(levels));
+    assert_eq!(talk.slides[0].error, None, "{levels} levels");
+    assert!(!talk.slides[0].blocks.is_empty());
+    assert_too_deep_but_the_next_slide_parses(&body(levels + 1));
+}
+
+#[test]
+fn exactly_64_nested_tags_are_read() {
+    assert_reads_at(64, nested_boxes);
+    assert_reads_at(64, empty_nested_boxes);
+    let talk = parse_talk(&nested_boxes(64));
+    let mut levels = 0;
+    let mut blocks = &talk.slides[0].blocks;
+    while let [Block::Tag(tag)] = blocks.as_slice() {
+        levels += 1;
+        blocks = &tag.children;
+    }
+    assert_eq!(levels, 64);
+}
+
+#[test]
+fn exactly_64_levels_of_quotes_lists_or_emphasis_are_read() {
+    assert_reads_at(64, |levels| format!("{} deep\n", ">".repeat(levels)));
+    assert_reads_at(64, |levels| format!("{}item\n", "- ".repeat(levels)));
+    assert_reads_at(64, nested_emphasis);
+}
+
+#[test]
+fn a_slide_over_the_size_limit_is_turned_away_unread() {
+    let talk = parse_talk(&format!("{}\n---\n\n# Next\n", "a".repeat(MAX_BODY)));
+    assert_eq!(talk.slides[0].error.as_ref().map(|e| e.message.as_str()), Some(TOO_LARGE));
+    assert!(talk.slides[0].blocks.is_empty());
+    assert!(talk.slides[1].error.is_none());
+    assert!(matches!(talk.slides[1].blocks[0], Block::Heading { .. }));
+}
+
+#[test]
+fn a_slide_exactly_at_the_size_limit_is_read() {
+    let talk = parse_talk(&format!("{}\n---\n\n# Next\n", "a".repeat(MAX_BODY - 1)));
+    assert_eq!(talk.slides[0].error, None);
+    assert!(matches!(talk.slides[0].blocks[0], Block::Paragraph { .. }));
+}
+
+#[test]
+fn a_real_fenced_block_full_of_tags_is_not_refused() {
+    let many = 200;
+    let sources = [
+        format!("  ```\n{}  ```\n", "<a></a>\n".repeat(many)),
+        format!("<Box\n  x=\"1\"\n/>\n\n```\n{}```\n", "<a></a>\n".repeat(many)),
+    ];
+    for source in sources {
+        assert_eq!(parse_talk(&source).slides[0].error, None, "{}", &source[..20]);
+    }
 }

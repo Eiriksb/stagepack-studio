@@ -13,6 +13,21 @@ pub struct Style {
     pub link: Option<String>,
 }
 
+impl Style {
+    /// Changes this style as the attribute `name` of a `<Text>` tag says to. Any
+    /// attribute that isn't about text changes nothing.
+    pub fn apply_text_attr(&mut self, name: &str, value: &str) {
+        match name {
+            "color" => self.color = Some(value.to_string()),
+            "size" => self.size = value.parse().ok(),
+            "bold" => self.bold = value == "true",
+            "italic" => self.italic = value == "true",
+            "underline" => self.underline = value == "true",
+            _ => {}
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Span {
     pub text: String,

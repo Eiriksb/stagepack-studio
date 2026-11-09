@@ -1,16 +1,27 @@
 use std::ops::Range;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::thread;
 
 use markdown::mdast::{AttributeContent, AttributeValue, Node};
 use markdown::{Constructs, ParseOptions};
 
 use crate::attrs::scan_open_tag;
 use crate::model::*;
-use crate::split::split_slides;
+use crate::split::{RawSlide, split_slides};
 
-/// How deep a slide can nest and still be read. The `markdown` crate and this parser
-/// each go further down the stack for every level, so a deep enough slide would overflow it.
+/// How many levels a slide can nest and still be read.
 const MAX_NESTING: usize = 64;
 const TOO_DEEP: &str = "This slide is nested too deeply to read";
+/// The most a slide's body can hold and still be read, far more than any slide needs. The
+/// `markdown` crate's time grows with the square of some slides' length, and the worst
+/// found at this size takes about 4 seconds in a release build: a long run of `*`.
+const MAX_BODY: usize = 32 * 1024;
+const TOO_LARGE: &str = "This slide is too large to read";
+const UNREADABLE: &str = "This slide could not be read";
+/// The `markdown` crate goes further down the stack for every level of a slide, however
+/// deep, and so does dropping its tree. Only what gets used of this is ever more than
+/// reserved addresses, and it's enough for the deepest slide `MAX_BODY` allows.
+const PARSER_STACK: usize = 1024 * 1024 * 1024;
 
 fn options() -> ParseOptions {
     ParseOptions {
@@ -34,108 +45,80 @@ fn options() -> ParseOptions {
 /// Reads a whole file into slides. A slide that fails to parse carries an
 /// error and no blocks; the others are unaffected.
 pub fn parse_talk(source: &str) -> Talk {
-    let slides = split_slides(source)
-        .into_iter()
-        .map(|raw| {
-            let mut slide = Slide {
-                range: raw.range,
-                settings: raw.settings,
-                blocks: Vec::new(),
-                notes: None,
-                error: None,
-            };
-            let body = &source[raw.body.clone()];
-            if nesting_estimate(body) > MAX_NESTING {
-                slide.error = Some(SlideError { message: TOO_DEEP.to_string() });
-                return slide;
-            }
-            match markdown::to_mdast(body, &options()) {
-                Ok(root) => {
-                    let ctx = Ctx { source, base: raw.body.start };
-                    let mut notes = None;
-                    for node in root.children().into_iter().flatten() {
-                        ctx.block(node, &mut slide.blocks, &mut notes);
-                    }
-                    slide.notes = notes;
-                }
-                Err(message) => {
-                    slide.error = Some(SlideError { message: message.to_string() });
-                }
-            }
-            slide
-        })
-        .collect();
+    let raw_slides = split_slides(source);
+    let slides = thread::scope(|scope| {
+        let reader = thread::Builder::new()
+            .stack_size(PARSER_STACK)
+            .spawn_scoped(scope, || raw_slides.iter().map(|raw| read_slide(source, raw)).collect::<Vec<_>>());
+        reader.ok().and_then(|reader| reader.join().ok())
+    });
+    let slides = slides.unwrap_or_else(|| raw_slides.iter().map(|raw| refused_slide(raw, UNREADABLE)).collect());
     Talk { source: source.to_string(), slides }
 }
 
-/// How deep `body` nests, estimated from its lines so that nothing recursive has to see a
-/// slide that's too deep. It leans high, because too high only matters to a slide nested
-/// far deeper than anyone writes, and too low could crash the app.
-fn nesting_estimate(body: &str) -> usize {
-    let mut deepest = 0;
-    let mut open_tags = 0;
-    let mut fence = None;
-    // Set once a line can't be read on its own, because a tag runs on past it or a fence
-    // doesn't start it. After that, a closing tag or a fence might only be text.
-    let mut unsure = false;
-    for line in body.lines() {
-        // Worked out even inside what looks like a code fence, which might not be one.
-        let (containers, rest) = containers_opening(line);
-        let mut tags = open_tags;
-        match fence {
-            Some(open) if closes_fence(line, open) => fence = None,
-            Some(_) => {}
-            None => {
-                fence = opening_fence(line).filter(|_| !unsure);
-                unsure |= fence.is_none() && (rest.starts_with("```") || rest.starts_with("~~~"));
-                if fence.is_none() {
-                    // A closing tag in indented code or a link's target is only text.
-                    let closes_count = !unsure && indentation(line) < 4 && !line.contains("](");
-                    tags = follow_tags(rest, closes_count, &mut open_tags, &mut unsure);
-                }
-            }
-        }
-        deepest = deepest.max(containers + tags);
+fn empty_slide(raw: &RawSlide) -> Slide {
+    Slide { range: raw.range.clone(), settings: raw.settings.clone(), blocks: Vec::new(), notes: None, error: None }
+}
+
+fn refused_slide(raw: &RawSlide, message: &str) -> Slide {
+    Slide { error: Some(SlideError { message: message.to_string() }), ..empty_slide(raw) }
+}
+
+/// Reads one slide, on the parser's thread. Inside `read_body` a tree can be as deep as
+/// the slide is long. Nothing deeper than `MAX_NESTING` comes out of it.
+fn read_slide(source: &str, raw: &RawSlide) -> Slide {
+    if raw.body.len() > MAX_BODY {
+        return refused_slide(raw, TOO_LARGE);
     }
-    deepest
+    if a_line_opens_too_many_levels(&source[raw.body.clone()]) {
+        return refused_slide(raw, TOO_DEEP);
+    }
+    // A slide that trips a bug in the `markdown` crate shouldn't take the rest of the talk with it.
+    match catch_unwind(AssertUnwindSafe(|| read_body(source, raw.body.clone()))) {
+        Ok(Ok((blocks, notes))) => Slide { blocks, notes, ..empty_slide(raw) },
+        Ok(Err(message)) => refused_slide(raw, &message),
+        Err(_) => refused_slide(raw, UNREADABLE),
+    }
 }
 
-fn indentation(line: &str) -> usize {
-    line.bytes().map_while(|byte| match byte {
-        b' ' => Some(1),
-        b'\t' => Some(4),
-        _ => None,
-    }).sum()
+fn read_body(source: &str, body: Range<usize>) -> Result<(Vec<Block>, Option<Notes>), String> {
+    let root = markdown::to_mdast(&source[body.clone()], &options()).map_err(|message| message.to_string())?;
+    if nests_too_deep(&root) {
+        return Err(TOO_DEEP.to_string());
+    }
+    let ctx = Ctx { source, base: body.start };
+    let (mut blocks, mut notes) = (Vec::new(), None);
+    for node in root.children().into_iter().flatten() {
+        ctx.block(node, &mut blocks, &mut notes);
+    }
+    Ok((blocks, notes))
 }
 
-/// How many quotes and list levels start `line`, and what comes after them. Lists count
-/// their markers as well as their indent, because several can start on one line.
-fn containers_opening(line: &str) -> (usize, &str) {
-    let bytes = line.as_bytes();
-    let (mut at, mut depth, mut columns, mut in_list) = (0, 0, 0, false);
+/// Whether a line starts with more quote and list markers than a slide can nest. Markers
+/// repeated along one line take the `markdown` crate far longer than anything else of
+/// their size, so these never reach it. The price is that a code block with a line of
+/// 65 markers is turned away too. A bare carriage return ends a line for Markdown too.
+fn a_line_opens_too_many_levels(body: &str) -> bool {
+    body.split(['\n', '\r']).any(|line| markers_starting(line.as_bytes()) > MAX_NESTING)
+}
+
+/// How many quote and list markers start `line`, and go on to its first other text.
+fn markers_starting(line: &[u8]) -> usize {
+    let (mut at, mut markers) = (0, 0);
     loop {
-        match bytes.get(at) {
-            Some(b' ') => {
-                columns += 1;
-                at += 1;
-            }
-            Some(b'\t') => {
-                columns += 4;
-                at += 1;
-            }
+        match line.get(at) {
+            Some(b' ' | b'\t') => at += 1,
             Some(b'>') => {
-                depth += 1;
+                markers += 1;
                 at += 1;
             }
             _ => {
-                let Some(length) = list_marker_length(&bytes[at..]) else { break };
-                depth += 1;
+                let Some(length) = list_marker_length(&line[at..]) else { return markers };
+                markers += 1;
                 at += length;
-                in_list = true;
             }
         }
     }
-    (depth + if in_list { columns / 2 } else { 0 }, &line[at..])
 }
 
 /// The length of the list marker that starts `text`, if one does.
@@ -149,93 +132,29 @@ fn list_marker_length(text: &[u8]) -> Option<usize> {
     matches!(text.get(length), None | Some(b' ' | b'\t')).then_some(length)
 }
 
-/// The marker and length of the code fence `line` opens. Only one at the very start of a
-/// line counts, as an indented or quoted one can end where a scan of lines can't tell.
-fn opening_fence(line: &str) -> Option<(u8, usize)> {
-    let marker = *line.as_bytes().first()?;
-    let length = line.bytes().take_while(|byte| *byte == marker).count();
-    let is_fence = matches!(marker, b'`' | b'~') && length >= 3 && !(marker == b'`' && line[length..].contains('`'));
-    is_fence.then_some((marker, length))
-}
-
-fn closes_fence(line: &str, (marker, length): (u8, usize)) -> bool {
-    let text = line.trim_start_matches(' ');
-    let run = text.bytes().take_while(|byte| *byte == marker).count();
-    line.len() - text.len() < 4 && run >= length && text[run..].trim().is_empty()
-}
-
-/// Follows the tags in `text`, the part of a line after its quotes and list markers, and
-/// returns the most that were open at once. A closing tag only counts if it starts the
-/// text or matches an opening tag before it there. Elsewhere it might not be a tag at all.
-fn follow_tags(text: &str, closes_count: bool, open_tags: &mut usize, unsure: &mut bool) -> usize {
-    let bytes = text.as_bytes();
-    let mut deepest = *open_tags;
-    let mut opened_here = 0_usize;
-    let mut at = 0;
-    while at < bytes.len() {
-        match (bytes[at], bytes.get(at + 1)) {
-            (b'\\', _) => at += 2,
-            (b'`', _) => at = after_code_span(bytes, at),
-            (b'<', Some(b'/')) => {
-                if closes_count && (at == 0 || opened_here > 0) {
-                    *open_tags = open_tags.saturating_sub(1);
-                    opened_here = opened_here.saturating_sub(1);
-                }
-                at += 2;
-            }
-            (b'<', Some(next)) if !next.is_ascii_whitespace() => {
-                let (end, closes_itself) = tag_end(bytes, at + 1).unwrap_or_else(|| {
-                    *unsure = true;
-                    (bytes.len(), false)
-                });
-                if !closes_itself {
-                    *open_tags += 1;
-                    opened_here += 1;
-                    deepest = deepest.max(*open_tags);
-                }
-                at = end;
-            }
-            _ => at += 1,
+/// Whether anywhere in the tree under `root` is more than `MAX_NESTING` levels in. Walks
+/// the tree with its own stack, because the tree can be as deep as the slide is long.
+fn nests_too_deep(root: &Node) -> bool {
+    let mut to_visit = vec![(root, 0)];
+    while let Some((node, levels_above)) = to_visit.pop() {
+        let levels = levels_above + usize::from(is_a_level(node));
+        if levels > MAX_NESTING {
+            return true;
         }
+        to_visit.extend(node.children().into_iter().flatten().map(|child| (child, levels)));
     }
-    deepest
+    false
 }
 
-/// Where the code span opened by the backticks at `start` ends, or just past those
-/// backticks if nothing on the line closes it.
-fn after_code_span(bytes: &[u8], start: usize) -> usize {
-    let run_at = |at: usize| bytes[at..].iter().take_while(|byte| **byte == b'`').count();
-    let length = run_at(start);
-    let mut at = start + length;
-    while at < bytes.len() {
-        if bytes[at] != b'`' {
-            at += 1;
-            continue;
-        }
-        let run = run_at(at);
-        if run == length {
-            return at + run;
-        }
-        at += run;
-    }
-    start + length
-}
-
-/// Where the tag whose name starts at `at` ends, and whether it closes itself, or `None`
-/// if it runs on past this line.
-fn tag_end(bytes: &[u8], mut at: usize) -> Option<(usize, bool)> {
-    let mut quote = None;
-    while at < bytes.len() {
-        match (quote, bytes[at]) {
-            (Some(open), byte) if byte == open => quote = None,
-            (Some(_), _) => {}
-            (None, byte @ (b'"' | b'\'')) => quote = Some(byte),
-            (None, b'>') => return Some((at + 1, bytes[at - 1] == b'/')),
-            _ => {}
-        }
-        at += 1;
-    }
-    None
+/// Whether `node` is a level of nesting. Anything that holds other nodes is, except for
+/// the parts of a node that can't sit inside themselves: a list counts once, not again
+/// for each item, and a paragraph, heading or table adds nothing to what's inside it.
+fn is_a_level(node: &Node) -> bool {
+    let plain_holder = matches!(
+        node,
+        Node::Root(_) | Node::Paragraph(_) | Node::Heading(_) | Node::ListItem(_) | Node::Table(_) | Node::TableRow(_) | Node::TableCell(_)
+    );
+    !plain_holder && node.children().is_some()
 }
 
 struct Ctx<'a> {
@@ -372,14 +291,7 @@ impl Ctx<'_> {
                             None => "true",
                             _ => continue,
                         };
-                        match p.name.as_str() {
-                            "color" => inner.color = Some(value.to_string()),
-                            "size" => inner.size = value.parse().ok(),
-                            "bold" => inner.bold = value == "true",
-                            "italic" => inner.italic = value == "true",
-                            "underline" => inner.underline = value == "true",
-                            _ => {}
-                        }
+                        inner.apply_text_attr(&p.name, value);
                     }
                 }
                 nested(&element.children, inner, out);
