@@ -27,6 +27,19 @@ const BUNDLED: [&[u8]; 8] = [
 /// Line height as a multiple of the font size.
 const LINE_HEIGHT: f32 = 1.25;
 
+/// The range of text sizes, in slide units. A talk sets the size, and outside this range
+/// the font code misbehaves: size 0 means unscaled font units, and huge sizes overflow.
+pub(crate) const MIN_TEXT_SIZE: f32 = 1.0;
+pub(crate) const MAX_TEXT_SIZE: f32 = 512.0;
+
+fn limited_size(size: f32) -> f32 {
+    if size.is_finite() {
+        size.clamp(MIN_TEXT_SIZE, MAX_TEXT_SIZE)
+    } else {
+        MIN_TEXT_SIZE
+    }
+}
+
 /// Something the user should hear about, such as a character no font can draw.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Notice(pub String);
@@ -105,18 +118,19 @@ pub struct ShapedText {
 }
 
 fn run_attrs(run: &TextRun, index: usize) -> Attrs<'_> {
+    let size = limited_size(run.size);
     Attrs::new()
         .family(Family::Name(&run.family))
         .weight(if run.bold { Weight::BOLD } else { Weight::NORMAL })
         .style(if run.italic { Style::Italic } else { Style::Normal })
         .color(TextColor::rgba(run.color.r, run.color.g, run.color.b, run.color.a))
-        .metrics(Metrics::new(run.size, run.size * LINE_HEIGHT))
+        .metrics(Metrics::new(size, size * LINE_HEIGHT))
         .metadata(index)
 }
 
 /// Shapes `runs` in slide units. With a width the text wraps at it.
 pub fn shape_text(fonts: &mut Fonts, runs: &[TextRun], width: Option<f32>, align: Align) -> ShapedText {
-    let biggest = runs.iter().map(|r| r.size).fold(1.0_f32, f32::max);
+    let biggest = runs.iter().map(|r| limited_size(r.size)).fold(MIN_TEXT_SIZE, f32::max);
     let mut buffer = Buffer::new(&mut fonts.system, Metrics::new(biggest, biggest * LINE_HEIGHT));
     buffer.set_size(width, None);
     let alignment = match align {
@@ -158,7 +172,7 @@ pub fn shape_text(fonts: &mut Fonts, runs: &[TextRun], width: Option<f32>, align
         }
         for (index, from, to) in spans {
             let run = &runs[index];
-            underlines.push((from, line.line_y + run.size * 0.12, to - from, run.color));
+            underlines.push((from, line.line_y + limited_size(run.size) * 0.12, to - from, run.color));
         }
     }
 
