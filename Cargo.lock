@@ -6634,6 +6634,8 @@ version = "0.1.0"
 dependencies = [
  "cosmic-text",
  "image",
+ "resvg 0.46.0",
+ "serde_json",
  "slides-format",
  "syntect",
  "taffy",

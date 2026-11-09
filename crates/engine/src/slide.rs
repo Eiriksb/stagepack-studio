@@ -1,15 +1,20 @@
 //! Puts a parsed slide's content into the regions of its layout.
 
-use slides_format::{Block, Slide, Talk};
+use slides_format::{Block, Slide, Tag, Talk};
 use tiny_skia::PathBuilder;
 use toolkit::{Color, Registry, Theme};
 
+use crate::elements::lay_out_positioned_tag;
 use crate::flow::flow_region;
-use crate::{DisplayItem, Fonts, LayerSpec, LayoutDef, Notice, Rect, RegionDef, TalkFiles, layout_by_name};
+use crate::placeholder::placeholder_items;
+use crate::{DisplayItem, Fonts, LayerSpec, LayoutDef, Notice, PictureCache, Rect, RegionDef, TalkFiles, layout_by_name};
 
-const SLIDE_WIDTH: f32 = 1920.0;
-const SLIDE_HEIGHT: f32 = 1080.0;
+pub(crate) const SLIDE_WIDTH: f32 = 1920.0;
+pub(crate) const SLIDE_HEIGHT: f32 = 1080.0;
 const DEFAULT_LAYOUT: &str = "content";
+
+/// The attributes that place a component, which it doesn't see as props.
+pub const PLACEMENT_ATTRS: [&str; 7] = ["x", "y", "w", "h", "rotate", "click", "enter"];
 
 // The most a talk can ask for in a place on the slide, so one line of a settings block
 // can't make a layer that needs gigabytes.
@@ -22,6 +27,7 @@ pub struct LayoutEnv<'a> {
     pub fonts: &'a mut Fonts,
     pub registry: &'a Registry,
     pub files: &'a dyn TalkFiles,
+    pub pictures: &'a mut PictureCache,
 }
 
 pub struct LaidOutSlide {
@@ -53,19 +59,80 @@ pub fn layout_slide(talk: &Talk, index: usize, env: &mut LayoutEnv) -> LaidOutSl
     let slide = &talk.slides[index];
     let theme = talk_theme(talk);
     let mut notices = Vec::new();
+    let mut layers = vec![background(&theme)];
+    if let Some(error) = &slide.error {
+        notices.push(Notice(error.message.clone()));
+        layers.push(error_layer(slide, &error.message, &theme, env.fonts));
+        return LaidOutSlide { layers, notices };
+    }
     let layout = slide_layout(slide, &mut notices);
     let contents = assign_blocks(slide, layout, &mut notices);
 
-    let mut layers = vec![background(&theme)];
     for (region, blocks) in layout.regions.iter().zip(&contents) {
         let (Some(first), Some(last)) = (blocks.first(), blocks.last()) else {
             continue;
         };
         let (rect, rotate) = placement(slide, region);
-        let items = flow_region(blocks, region, rect.w, &theme, env.fonts, &mut notices);
+        let items = flow_region(blocks, region, rect.w, &theme, env, &mut notices);
         layers.push(LayerSpec { source: Some(first.range().start..last.range().end), rect, rotate, items });
     }
+    for block in &slide.blocks {
+        if let Block::Tag(tag) = block
+            && is_positioned(tag)
+        {
+            layers.push(positioned_layer(tag, &theme, env, &mut notices));
+        }
+    }
     LaidOutSlide { layers, notices }
+}
+
+/// The placement numbers a tag gives. One that can't be read counts as absent, and the
+/// rest are held within the limits above.
+struct TagPlace {
+    x: Option<f32>,
+    y: Option<f32>,
+    w: Option<f32>,
+    h: Option<f32>,
+    rotate: Option<f32>,
+}
+
+impl TagPlace {
+    fn of(tag: &Tag) -> TagPlace {
+        let number = |name: &str, low: f32, high: f32| {
+            let value = tag.attr(name)?.trim().parse::<f32>().ok().filter(|value| value.is_finite())?;
+            Some(value.clamp(low, high))
+        };
+        TagPlace {
+            x: number("x", MIN_POSITION, MAX_POSITION),
+            y: number("y", MIN_POSITION, MAX_POSITION),
+            w: number("w", 0.0, MAX_SIZE),
+            h: number("h", 0.0, MAX_SIZE),
+            rotate: number("rotate", -MAX_ROTATION, MAX_ROTATION),
+        }
+    }
+}
+
+/// Whether a tag asks for a place on the slide, which gives it a layer of its own.
+pub(crate) fn is_positioned(tag: &Tag) -> bool {
+    let place = TagPlace::of(tag);
+    place.x.is_some() || place.y.is_some() || place.w.is_some() || place.h.is_some()
+}
+
+fn positioned_layer(tag: &Tag, theme: &Theme, env: &mut LayoutEnv, notices: &mut Vec<Notice>) -> LayerSpec {
+    let place = TagPlace::of(tag);
+    let ((w, h), items) = lay_out_positioned_tag(tag, (place.w, place.h), theme, env, notices);
+    LayerSpec {
+        source: Some(tag.range.clone()),
+        rect: Rect { x: place.x.unwrap_or(0.0), y: place.y.unwrap_or(0.0), w, h },
+        rotate: place.rotate.unwrap_or(0.0),
+        items,
+    }
+}
+
+/// What a slide that couldn't be parsed shows: the reason, across the whole slide.
+fn error_layer(slide: &Slide, message: &str, theme: &Theme, fonts: &mut Fonts) -> LayerSpec {
+    let rect = Rect { x: 0.0, y: 0.0, w: SLIDE_WIDTH, h: SLIDE_HEIGHT };
+    LayerSpec { source: Some(slide.range.clone()), rect, rotate: 0.0, items: placeholder_items(message, rect, theme, fonts) }
 }
 
 fn slide_layout(slide: &Slide, notices: &mut Vec<Notice>) -> &'static LayoutDef {
@@ -100,7 +167,7 @@ fn assign_blocks<'a>(slide: &'a Slide, layout: &LayoutDef, notices: &mut Vec<Not
                 });
                 continue;
             }
-            Block::Tag(_) | Block::Picture { .. } => continue,
+            Block::Tag(tag) if is_positioned(tag) => continue,
             Block::Heading { .. } => title.take().unwrap_or(current),
             _ => current,
         };

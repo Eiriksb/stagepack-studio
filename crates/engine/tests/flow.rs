@@ -1,7 +1,6 @@
 mod common;
 use slides_engine::*;
 use slides_format::parse_talk;
-use toolkit::Registry;
 
 struct NoFiles;
 impl TalkFiles for NoFiles { fn read(&self, _: &str) -> Option<Vec<u8>> { None } }
@@ -9,8 +8,8 @@ impl TalkFiles for NoFiles { fn read(&self, _: &str) -> Option<Vec<u8>> { None }
 fn lay_out(source: &str) -> (LaidOutSlide, Fonts) {
     let mut fonts = Fonts::bundled_only();
     let talk = parse_talk(source);
-    let registry = Registry::default();
-    let slide = layout_slide(&talk, 0, &mut LayoutEnv { fonts: &mut fonts, registry: &registry, files: &NoFiles });
+    let registry = builtin_registry();
+    let slide = layout_slide(&talk, 0, &mut LayoutEnv { fonts: &mut fonts, registry: &registry, files: &NoFiles, pictures: &mut PictureCache::default() });
     (slide, fonts)
 }
 

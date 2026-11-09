@@ -1,14 +1,18 @@
 //! Lays a region's blocks out top to bottom and turns them into drawing.
 
+use std::sync::Arc;
+
 use slides_format::{Block, Span};
 use taffy::compute_leaf_layout;
 use taffy::prelude::{
     AvailableSpace, Display, FlexDirection, NodeId, Size, Style, TaffyTree, auto, evenly_sized_tracks, length, line, zero,
 };
-use tiny_skia::PathBuilder;
+use tiny_skia::{Path, PathBuilder, Pixmap};
 use toolkit::{Color, Theme};
 
-use crate::{Align, DisplayItem, Fonts, Notice, RegionDef, ShapedText, TextRun, highlight, shape_text};
+use crate::elements::{ShapeLook, shape_items};
+use crate::placeholder::placeholder_items;
+use crate::{Align, DisplayItem, Fonts, LayoutEnv, Notice, Rect, RegionDef, ShapedText, TextRun, highlight, shape_text};
 
 const GAP: f32 = 24.0;
 const LIST_INDENT: f32 = 48.0;
@@ -18,6 +22,9 @@ const CODE_SIZE: f32 = 32.0;
 const CODE_PADDING: f32 = 24.0;
 const CODE_RADIUS: f32 = 12.0;
 const CODE_PANEL: Color = Color::rgb(0xf1, 0xf5, 0xf9);
+/// How far lists and tags can sit inside each other. A talk could nest them as deep as it
+/// likes, and laying out each level uses up more of the stack.
+const MAX_NESTING: u32 = 16;
 
 /// What a leaf draws behind its text.
 #[derive(Clone, Copy)]
@@ -27,8 +34,43 @@ enum Frame {
     Outline,
 }
 
-/// A piece of text, the only thing Taffy has to measure here.
-struct Leaf {
+/// What a node of the tree draws. A node with no content only arranges its children.
+pub(crate) enum Content {
+    Text(Leaf),
+    Shape(ShapeLook),
+    Picture(Arc<Pixmap>),
+    Placeholder(String),
+}
+
+impl Content {
+    fn measure(&self, known: Size<Option<f32>>, available: Size<AvailableSpace>, fonts: &mut Fonts) -> Size<f32> {
+        match self {
+            Content::Text(leaf) => leaf.measure(available, fonts),
+            Content::Picture(picture) => measure_picture(picture, known, available),
+            Content::Shape(_) | Content::Placeholder(_) => Size::ZERO,
+        }
+    }
+}
+
+/// A picture's own size, shrunk to the room there is. With one side known, the other
+/// keeps the picture's shape.
+fn measure_picture(picture: &Pixmap, known: Size<Option<f32>>, available: Size<AvailableSpace>) -> Size<f32> {
+    let (width, height) = (picture.width() as f32, picture.height() as f32);
+    let room = match available.width {
+        AvailableSpace::Definite(room) => room,
+        AvailableSpace::MinContent => 0.0,
+        AvailableSpace::MaxContent => width,
+    };
+    let scale = match (known.width, known.height) {
+        (Some(known), _) => known / width,
+        (None, Some(known)) => known / height,
+        (None, None) => (room / width).min(1.0),
+    };
+    Size { width: known.width.unwrap_or(width * scale), height: known.height.unwrap_or(height * scale) }
+}
+
+/// A piece of text.
+pub(crate) struct Leaf {
     runs: Vec<TextRun>,
     align: Align,
     /// A list marker stays on one line, however narrow the indent is.
@@ -61,14 +103,18 @@ struct TextLook {
     bold: bool,
 }
 
-struct Flow<'a> {
-    tree: TaffyTree<Leaf>,
+/// A layout tree being built for one layer, and what building it needs.
+pub(crate) struct Flow<'a, 'env> {
+    tree: TaffyTree<Content>,
     region: &'a RegionDef,
-    theme: &'a Theme,
+    pub(crate) theme: &'a Theme,
+    pub(crate) env: &'a mut LayoutEnv<'env>,
+    notices: &'a mut Vec<Notice>,
+    nesting: u32,
 }
 
 /// A column with the gap between blocks.
-fn column() -> Style {
+pub(crate) fn column() -> Style {
     Style {
         flex_direction: FlexDirection::Column,
         gap: Size { width: zero(), height: length(GAP) },
@@ -83,36 +129,65 @@ pub(crate) fn flow_region(
     region: &RegionDef,
     width: f32,
     theme: &Theme,
-    fonts: &mut Fonts,
+    env: &mut LayoutEnv,
     notices: &mut Vec<Notice>,
 ) -> Vec<DisplayItem> {
-    let mut flow = Flow { tree: TaffyTree::new(), region, theme };
-    // Slide units aren't pixels. Rounding would also leave text a sliver narrower than it was measured at.
-    flow.tree.disable_rounding();
+    let mut flow = Flow::new(region, theme, env, notices);
     let children: Vec<NodeId> = blocks.iter().filter_map(|block| flow.block(block, region.align)).collect();
     let root = flow.node(Style { size: Size { width: length(width), height: auto() }, ..column() }, &children);
-
-    let available = Size { width: AvailableSpace::Definite(width), height: AvailableSpace::MaxContent };
-    flow.tree
-        .compute_layout_with_measure(root, available, |inputs, _, leaf, style| {
-            compute_leaf_layout(inputs, style, |_, _| 0.0, |_, available| {
-                leaf.map_or(Size::ZERO, |leaf| leaf.measure(available, fonts))
-            })
-        })
-        .expect("every node is in the tree");
-
-    let mut items = Vec::new();
-    flow.draw(root, (0.0, 0.0), fonts, &mut items, notices);
-    items
+    flow.finish(root, width)
 }
 
-impl Flow<'_> {
-    fn node(&mut self, style: Style, children: &[NodeId]) -> NodeId {
+impl<'a, 'env> Flow<'a, 'env> {
+    pub(crate) fn new(
+        region: &'a RegionDef,
+        theme: &'a Theme,
+        env: &'a mut LayoutEnv<'env>,
+        notices: &'a mut Vec<Notice>,
+    ) -> Flow<'a, 'env> {
+        let mut tree = TaffyTree::new();
+        // Slide units aren't pixels. Rounding would also leave text a sliver narrower than it was measured at.
+        tree.disable_rounding();
+        Flow { tree, region, theme, env, notices, nesting: 0 }
+    }
+
+    /// Lays out the tree under `root`, `width` wide, and returns its drawing.
+    pub(crate) fn finish(mut self, root: NodeId, width: f32) -> Vec<DisplayItem> {
+        let available = Size { width: AvailableSpace::Definite(width), height: AvailableSpace::MaxContent };
+        let fonts = &mut *self.env.fonts;
+        self.tree
+            .compute_layout_with_measure(root, available, |inputs, _, content, style| {
+                compute_leaf_layout(inputs, style, |_, _| 0.0, |known, available| {
+                    content.map_or(Size::ZERO, |content| content.measure(known, available, fonts))
+                })
+            })
+            .expect("every node is in the tree");
+
+        let mut items = Vec::new();
+        self.draw(root, (0.0, 0.0), &mut items);
+        items
+    }
+
+    pub(crate) fn node(&mut self, style: Style, children: &[NodeId]) -> NodeId {
         self.tree.new_with_children(style, children).expect("every child is in the tree")
     }
 
-    fn leaf(&mut self, style: Style, leaf: Leaf) -> NodeId {
-        self.tree.new_leaf_with_context(style, leaf).expect("a new leaf can always be added")
+    pub(crate) fn node_with_content(&mut self, style: Style, children: &[NodeId], content: Content) -> NodeId {
+        let node = self.node(style, children);
+        self.tree.set_node_context(node, Some(content)).expect("the node was just added");
+        node
+    }
+
+    pub(crate) fn leaf(&mut self, style: Style, content: Content) -> NodeId {
+        self.tree.new_leaf_with_context(style, content).expect("a new leaf can always be added")
+    }
+
+    /// Says `text` to the user, once however often it comes up.
+    pub(crate) fn notice(&mut self, text: String) {
+        let notice = Notice(text);
+        if !self.notices.contains(&notice) {
+            self.notices.push(notice);
+        }
     }
 
     fn region_look(&self) -> TextLook {
@@ -152,19 +227,36 @@ impl Flow<'_> {
 
     fn text(&mut self, spans: &[Span], look: TextLook, align: Align) -> NodeId {
         let runs = spans.iter().map(|span| self.run(span, look)).collect();
-        self.leaf(Style::default(), Leaf { runs, align, wraps: true, frame: Frame::None })
+        self.leaf(Style::default(), Content::Text(Leaf { runs, align, wraps: true, frame: Frame::None }))
+    }
+
+    /// Text from a component. Whatever it leaves out comes from the region.
+    pub(crate) fn plain_text(&mut self, text: &str, size: Option<f32>, bold: bool, color: Option<Color>, align: Align) -> NodeId {
+        let look = TextLook { size: size.unwrap_or(self.region.size), bold: bold || self.region.bold };
+        let mut run = self.run(&Span { text: text.to_string(), style: Default::default() }, look);
+        run.color = color.unwrap_or(run.color);
+        self.leaf(Style::default(), Content::Text(Leaf { runs: vec![run], align, wraps: true, frame: Frame::None }))
     }
 
     /// The node for one block, if it's a block this flow draws.
-    fn block(&mut self, block: &Block, align: Align) -> Option<NodeId> {
-        Some(match block {
-            Block::Heading { level, spans, .. } => self.text(spans, self.heading_look(*level), align),
-            Block::Paragraph { spans, .. } => self.text(spans, self.region_look(), align),
-            Block::List { ordered, items, .. } => self.list(*ordered, items),
-            Block::Table { rows, .. } => self.table(rows, align),
-            Block::Code { language, code, .. } => self.code(language.as_deref(), code),
-            Block::Picture { .. } | Block::Tag(_) | Block::Region { .. } => return None,
-        })
+    pub(crate) fn block(&mut self, block: &Block, align: Align) -> Option<NodeId> {
+        if self.nesting == MAX_NESTING {
+            self.notice("Some content is nested too deeply to show".to_string());
+            return Some(self.block_placeholder("Nested too deeply".to_string()));
+        }
+        self.nesting += 1;
+        let node = match block {
+            Block::Heading { level, spans, .. } => Some(self.text(spans, self.heading_look(*level), align)),
+            Block::Paragraph { spans, .. } => Some(self.text(spans, self.region_look(), align)),
+            Block::List { ordered, items, .. } => Some(self.list(*ordered, items)),
+            Block::Table { rows, .. } => Some(self.table(rows, align)),
+            Block::Code { language, code, .. } => Some(self.code(language.as_deref(), code)),
+            Block::Picture { src, .. } => Some(self.picture(src, 0.0, 0.0, align, false)),
+            Block::Tag(tag) => self.tag(tag, align),
+            Block::Region { .. } => None,
+        };
+        self.nesting -= 1;
+        node
     }
 
     /// Each item is a row of its marker, in the indent, and a column of its blocks.
@@ -195,7 +287,7 @@ impl Flow<'_> {
             flex_shrink: 0.0,
             ..Style::default()
         };
-        self.leaf(style, Leaf { runs: vec![run], align: Align::Left, wraps: false, frame: Frame::None })
+        self.leaf(style, Content::Text(Leaf { runs: vec![run], align: Align::Left, wraps: false, frame: Frame::None }))
     }
 
     /// Columns share the width evenly. Cells are placed by number, so a row with too
@@ -213,7 +305,7 @@ impl Flow<'_> {
                     ..Style::default()
                 };
                 let runs = spans.iter().map(|span| self.run(span, look)).collect();
-                cells.push(self.leaf(style, Leaf { runs, align, wraps: true, frame: Frame::Outline }));
+                cells.push(self.leaf(style, Content::Text(Leaf { runs, align, wraps: true, frame: Frame::Outline })));
             }
         }
         let style = Style {
@@ -241,25 +333,34 @@ impl Flow<'_> {
             })
             .collect();
         let style = Style { padding: length(CODE_PADDING), ..Style::default() };
-        self.leaf(style, Leaf { runs, align: Align::Left, wraps: true, frame: Frame::Panel })
+        self.leaf(style, Content::Text(Leaf { runs, align: Align::Left, wraps: true, frame: Frame::Panel }))
     }
 
     /// Adds what `node` and its children draw. `parent` is the corner of `node`'s parent.
-    fn draw(&self, node: NodeId, parent: (f32, f32), fonts: &mut Fonts, items: &mut Vec<DisplayItem>, notices: &mut Vec<Notice>) {
-        let layout = self.tree.layout(node).expect("every node is in the tree");
+    fn draw(&mut self, node: NodeId, parent: (f32, f32), items: &mut Vec<DisplayItem>) {
+        let layout = *self.tree.layout(node).expect("every node is in the tree");
         let (x, y) = (parent.0 + layout.location.x, parent.1 + layout.location.y);
-        if let Some(leaf) = self.tree.get_node_context(node) {
-            items.extend(self.frame(leaf.frame, x, y, layout.size));
-            let text = leaf.shape(Some(layout.content_box_width()), fonts);
-            for notice in &text.notices {
-                if !notices.contains(notice) {
-                    notices.push(notice.clone());
+        let (w, h) = (layout.size.width, layout.size.height);
+        match self.tree.get_node_context(node) {
+            Some(Content::Text(leaf)) => {
+                items.extend(self.frame(leaf.frame, x, y, layout.size));
+                let text = leaf.shape(Some(layout.content_box_width()), self.env.fonts);
+                for notice in &text.notices {
+                    self.notice(notice.0.clone());
                 }
+                items.push(DisplayItem::Text { text, x: x + layout.padding.left, y: y + layout.padding.top });
             }
-            items.push(DisplayItem::Text { text, x: x + layout.padding.left, y: y + layout.padding.top });
+            Some(Content::Shape(look)) => items.extend(shape_items(look, x, y, w, h, self.theme)),
+            Some(Content::Picture(picture)) if w > 0.0 && h > 0.0 => {
+                items.push(DisplayItem::Picture { pixmap: picture.clone(), rect: Rect { x, y, w, h } });
+            }
+            Some(Content::Placeholder(label)) => {
+                items.extend(placeholder_items(label, Rect { x, y, w, h }, self.theme, self.env.fonts));
+            }
+            _ => {}
         }
         for child in self.tree.children(node).expect("every node is in the tree") {
-            self.draw(child, (x, y), fonts, items, notices);
+            self.draw(child, (x, y), items);
         }
     }
 
@@ -280,7 +381,13 @@ impl Flow<'_> {
     }
 }
 
-fn rounded_rect(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<tiny_skia::Path> {
+pub(crate) fn rounded_rect(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<Path> {
+    rounded_rect_with(x, y, w, h, radius, |_| {})
+}
+
+/// A rounded rectangle with `along_bottom` adding to its outline, which runs right to
+/// left along the bottom edge.
+pub(crate) fn rounded_rect_with(x: f32, y: f32, w: f32, h: f32, radius: f32, along_bottom: impl FnOnce(&mut PathBuilder)) -> Option<Path> {
     let r = radius.min(w / 2.0).min(h / 2.0);
     let (right, bottom) = (x + w, y + h);
     let mut b = PathBuilder::new();
@@ -289,6 +396,7 @@ fn rounded_rect(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<tiny_skia
     b.quad_to(right, y, right, y + r);
     b.line_to(right, bottom - r);
     b.quad_to(right, bottom, right - r, bottom);
+    along_bottom(&mut b);
     b.line_to(x + r, bottom);
     b.quad_to(x, bottom, x, bottom - r);
     b.line_to(x, y + r);
