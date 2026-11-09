@@ -15,7 +15,7 @@ fn open_workspace(cx: &mut TestAppContext) -> gpui_kit::AnyWindowHandle {
                 ..Default::default()
             },
             cx,
-            |_, cx| cx.new(WorkspaceView::for_test),
+            |window, cx| cx.new(|cx| WorkspaceView::for_test(window, cx)),
         )
         .expect("open test window");
         window

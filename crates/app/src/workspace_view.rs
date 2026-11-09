@@ -12,6 +12,8 @@ use gpui_kit::*;
 
 use crate::canvas::Canvas;
 use crate::document_view::DocumentView;
+use crate::inspector::{Inspector, InspectorEvent};
+use studio_protocol::CommandBody;
 
 pub const CANVAS_ID: &str = "canvas";
 pub const INSPECTOR_ID: &str = "inspector";
@@ -40,20 +42,19 @@ pub struct WorkspaceView {
     canvas: Option<Entity<Canvas>>,
     /// The open talk. `None` for `STUDIO_DEV_URL`, which only loads a page.
     document: Option<Entity<DocumentView>>,
+    inspector: Entity<Inspector>,
+    /// What would have gone to the page, in tests that have no canvas.
+    sent: Vec<CommandBody>,
     focus_handle: FocusHandle,
     _observe: Option<Subscription>,
+    _inspector_events: Subscription,
 }
 
 impl WorkspaceView {
     /// A canvas and no talk, for `STUDIO_DEV_URL`.
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let canvas = cx.new(|cx| Canvas::new(window, cx));
-        Self {
-            canvas: Some(canvas),
-            document: None,
-            focus_handle: cx.focus_handle(),
-            _observe: None,
-        }
+        Self::build(Some(canvas), None, None, window, cx)
     }
 
     /// Opens the talk at `path` through its sidecar.
@@ -64,13 +65,8 @@ impl WorkspaceView {
     }
 
     /// The same layout with a plain div where the web view goes.
-    pub fn for_test(cx: &mut Context<Self>) -> Self {
-        Self {
-            canvas: None,
-            document: None,
-            focus_handle: cx.focus_handle(),
-            _observe: None,
-        }
+    pub fn for_test(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::build(None, None, None, window, cx)
     }
 
     /// The layout with a talk that has no sidecar and no web view; see
@@ -90,7 +86,10 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let observe = cx.observe(&document, |_, _, cx| cx.notify());
+        let observe = cx.observe_in(&document, window, |this, document, window, cx| {
+            this.show_selection(&document, window, cx);
+            cx.notify();
+        });
         // The window manager's close button asks the talk first.
         let asked = document.downgrade();
         window.on_window_should_close(cx, move |window, cx| {
@@ -98,13 +97,65 @@ impl WorkspaceView {
                 .update(cx, |document, cx| document.request_close(window, cx))
                 .unwrap_or(true)
         });
+        Self::build(canvas, Some(document), Some(observe), window, cx)
+    }
+
+    fn build(
+        canvas: Option<Entity<Canvas>>,
+        document: Option<Entity<DocumentView>>,
+        observe: Option<Subscription>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let inspector = cx.new(|cx| Inspector::new(window, cx));
+        let inspector_events = cx.subscribe(&inspector, |this, _, event: &InspectorEvent, cx| {
+            let InspectorEvent::Send(body) = event;
+            this.send(body.clone(), cx);
+        });
         let focus_handle = cx.focus_handle();
-        focus_handle.focus(window, cx);
+        if document.is_some() {
+            focus_handle.focus(window, cx);
+        }
         Self {
             canvas,
-            document: Some(document),
+            document,
+            inspector,
+            sent: Vec::new(),
             focus_handle,
-            _observe: Some(observe),
+            _observe: observe,
+            _inspector_events: inspector_events,
+        }
+    }
+
+    /// Sends a command to the page. Without a canvas (headless tests) it is
+    /// recorded instead; see [`Self::sent_commands`].
+    fn send(&mut self, body: CommandBody, cx: &mut Context<Self>) {
+        match &self.canvas {
+            Some(canvas) => {
+                canvas.update(cx, |canvas, cx| {
+                    canvas.send(body, cx);
+                });
+            }
+            None => self.sent.push(body),
+        }
+    }
+
+    /// The commands a canvas-less workspace would have sent the page.
+    pub fn sent_commands(&self) -> &[CommandBody] {
+        &self.sent
+    }
+
+    fn show_selection(
+        &mut self,
+        document: &Entity<DocumentView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let selection = document.read(cx).document().selection.clone();
+        if self.inspector.read(cx).selection() != selection.as_ref() {
+            self.inspector.update(cx, |inspector, cx| {
+                inspector.set_selection(selection, window, cx)
+            });
         }
     }
 
@@ -137,20 +188,28 @@ impl WorkspaceView {
     }
 
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let action = |id: &'static str, label: &'static str| {
-            Button::new(id).ghost().small().label(label).disabled(true)
+        let action = |id: &'static str, label: &'static str, enabled: bool, body: CommandBody| {
+            Button::new(id)
+                .ghost()
+                .small()
+                .label(label)
+                .disabled(!enabled)
+                .on_click(cx.listener(move |this, _, _, cx| this.send(body.clone(), cx)))
         };
-        let (title, dirty, can_save): (SharedString, bool, bool) = match &self.document {
-            Some(document) => {
-                let document = document.read(cx).document();
-                (
-                    document.title.clone().into(),
-                    document.dirty,
-                    document.can_save(),
-                )
-            }
-            None => ("Untitled".into(), false, false),
-        };
+        let (title, dirty, can_save, can_undo, can_redo): (SharedString, bool, bool, bool, bool) =
+            match &self.document {
+                Some(document) => {
+                    let document = document.read(cx).document();
+                    (
+                        document.title.clone().into(),
+                        document.dirty,
+                        document.can_save(),
+                        document.can_undo,
+                        document.can_redo,
+                    )
+                }
+                None => ("Untitled".into(), false, false, false, false),
+            };
         // The kit's own close button (client-side decorations) asks the talk too.
         let closing = self.document.clone();
 
@@ -190,8 +249,8 @@ impl WorkspaceView {
                     .gap_1()
                     .pr_2()
                     .items_center()
-                    .child(action("undo", "Undo"))
-                    .child(action("redo", "Redo"))
+                    .child(action("undo", "Undo", can_undo, CommandBody::Undo))
+                    .child(action("redo", "Redo", can_redo, CommandBody::Redo))
                     .child(
                         Button::new("save")
                             .ghost()
@@ -222,7 +281,8 @@ impl Render for WorkspaceView {
             .id(INSPECTOR_ID)
             .test_support()
             .size_full()
-            .bg(cx.theme().background);
+            .bg(cx.theme().background)
+            .child(self.inspector.clone());
 
         v_flex()
             .key_context(KEY_CONTEXT)
