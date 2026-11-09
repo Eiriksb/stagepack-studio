@@ -1,7 +1,5 @@
 use gpui_kit::test::TestWindowExt;
-use gpui_kit::{
-    AppContext, Bounds, Point, TestAppContext, WindowBounds, WindowOptions, px, size,
-};
+use gpui_kit::{AppContext, Bounds, Point, TestAppContext, WindowBounds, WindowOptions, px, size};
 use stagepack_studio::workspace_view::{CANVAS_ID, INSPECTOR_ID, TITLE_ID, WorkspaceView};
 
 fn open_workspace(cx: &mut TestAppContext) -> gpui_kit::AnyWindowHandle {

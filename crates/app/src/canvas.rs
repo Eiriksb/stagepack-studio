@@ -18,7 +18,9 @@ pub enum CanvasEvent {
 /// What the web view hands over from outside GPUI, in the order it happened.
 enum Incoming {
     Message(String),
-    LoadStarted,
+    /// A new document committed. On Linux wry reports WebKit's commit as
+    /// `PageLoadEvent::Started`; the old page lives until then.
+    LoadCommitted,
 }
 
 /// `STUDIO_DEBUG_IPC=1` logs the type of each page message to stderr.
@@ -29,9 +31,7 @@ static DEBUG_IPC: LazyLock<bool> =
 /// window: gpui-webview 0.9.0 aborts on X11 when a web view is dropped.
 pub struct Canvas {
     webview: Entity<WebView>,
-    next_id: i64,
-    ready: bool,
-    pending: Vec<CommandBody>,
+    handshake: Handshake,
 }
 
 impl EventEmitter<CanvasEvent> for Canvas {}
@@ -49,7 +49,7 @@ impl Canvas {
                 })
                 .with_on_page_load_handler(move |event, _url| {
                     if matches!(event, wry::PageLoadEvent::Started) {
-                        let _ = tx.try_send(Incoming::LoadStarted);
+                        let _ = tx.try_send(Incoming::LoadCommitted);
                     }
                 });
             #[cfg(debug_assertions)]
@@ -71,9 +71,7 @@ impl Canvas {
 
         Self {
             webview,
-            next_id: 1,
-            ready: false,
-            pending: Vec::new(),
+            handshake: Handshake::new(),
         }
     }
 
@@ -85,19 +83,16 @@ impl Canvas {
 
     /// Loads `url` as it is. Commands sent from now on wait for its `ready`.
     pub fn load_url(&mut self, url: &str, cx: &mut Context<Self>) {
-        self.ready = false;
+        self.handshake.load_requested();
         self.webview.update(cx, |webview, _| webview.load_url(url));
     }
 
     /// Sends a command to the page, or keeps it until the page is ready.
     /// Returns the command's id, which the page's `result` refers to.
     pub fn send(&mut self, body: CommandBody, cx: &mut Context<Self>) -> i64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        if self.ready {
-            self.run(&Command { id, body }, cx);
-        } else {
-            self.pending.push(body);
+        let (id, now) = self.handshake.send(body);
+        if let Some(cmd) = now {
+            self.run(&cmd, cx);
         }
         id
     }
@@ -105,26 +100,31 @@ impl Canvas {
     fn receive(&mut self, incoming: Incoming, cx: &mut Context<Self>) {
         let json = match incoming {
             Incoming::Message(json) => json,
-            // A reload or navigation: the old page is going away.
-            Incoming::LoadStarted => {
-                self.ready = false;
+            Incoming::LoadCommitted => {
+                self.handshake.load_committed();
                 return;
             }
         };
         match parse_page_message(&json) {
-            Ok(msg) => {
-                if *DEBUG_IPC {
-                    eprintln!("[studio ipc] {}", message_type(&msg));
-                }
-                if matches!(msg, PageMessage::Ready { .. }) {
-                    self.ready = true;
-                    let pending = std::mem::take(&mut self.pending);
-                    for cmd in queued_commands(self.next_id, pending) {
+            Ok(msg) => match self.handshake.on_page(&msg) {
+                Some(run) => {
+                    if *DEBUG_IPC {
+                        eprintln!("[studio ipc] {}", message_type(&msg));
+                    }
+                    for cmd in run {
                         self.run(&cmd, cx);
                     }
+                    cx.emit(CanvasEvent::Page(msg));
                 }
-                cx.emit(CanvasEvent::Page(msg));
-            }
+                None => {
+                    if *DEBUG_IPC {
+                        eprintln!(
+                            "[studio ipc] {} from the page being replaced, dropped",
+                            message_type(&msg)
+                        );
+                    }
+                }
+            },
             Err(err) => {
                 if *DEBUG_IPC {
                     eprintln!("[studio ipc] bad message ({err}): {json}");
@@ -145,6 +145,74 @@ impl Canvas {
 impl Render for Canvas {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div().size_full().child(self.webview.clone())
+    }
+}
+
+/// The `ready` handshake and the commands waiting for it, kept apart from
+/// the web view so it can be tested headlessly.
+struct Handshake {
+    next_id: i64,
+    /// The page has said `ready` since the last document committed.
+    ready: bool,
+    /// `load` was called and its document hasn't committed yet. Until it
+    /// does, the old page is alive and may still say `ready`. A bool, not a
+    /// count: a second `load` cancels the first, so only one commit comes.
+    awaiting_commit: bool,
+    pending: Vec<CommandBody>,
+}
+
+impl Handshake {
+    fn new() -> Self {
+        Self {
+            next_id: 1,
+            ready: false,
+            awaiting_commit: false,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Gives the command the next id. Returns that id, and the command to
+    /// run now if the page is ready; otherwise the command is queued.
+    fn send(&mut self, body: CommandBody) -> (i64, Option<Command>) {
+        let id = self.next_id;
+        self.next_id += 1;
+        if self.ready {
+            (id, Some(Command { id, body }))
+        } else {
+            self.pending.push(body);
+            (id, None)
+        }
+    }
+
+    /// `load` was called.
+    fn load_requested(&mut self) {
+        self.ready = false;
+        self.awaiting_commit = true;
+    }
+
+    /// A document committed: the one `load` asked for, or a reload. The old
+    /// page is gone and the new one hasn't said `ready` yet.
+    fn load_committed(&mut self) {
+        self.ready = false;
+        self.awaiting_commit = false;
+    }
+
+    /// Takes a message from the page. Returns the commands to run before the
+    /// message is passed on, or `None` to drop it: a `ready` from the page
+    /// that a `load` is replacing. Other messages from that page still count
+    /// (a late `edited` is a real edit).
+    fn on_page(&mut self, msg: &PageMessage) -> Option<Vec<Command>> {
+        if !matches!(msg, PageMessage::Ready { .. }) {
+            return Some(Vec::new());
+        }
+        if self.awaiting_commit {
+            return None;
+        }
+        self.ready = true;
+        Some(queued_commands(
+            self.next_id,
+            std::mem::take(&mut self.pending),
+        ))
     }
 }
 
@@ -175,8 +243,124 @@ fn message_type(msg: &PageMessage) -> &'static str {
 mod tests {
     // Not `super::*`: with test-support, `gpui_kit::*` brings a `test` macro
     // that shadows the built-in one.
-    use super::queued_commands;
-    use studio_protocol::CommandBody;
+    use super::{Handshake, queued_commands};
+    use studio_protocol::{Command, CommandBody, PageMessage};
+
+    fn ready() -> PageMessage {
+        PageMessage::Ready {
+            studio: "0.0.0".into(),
+            slide: 2,
+            total: 3,
+        }
+    }
+
+    fn cmd(id: i64, body: CommandBody) -> Command {
+        Command { id, body }
+    }
+
+    /// A handshake with a page up and ready, and no load in flight.
+    fn page_up() -> Handshake {
+        let mut h = Handshake::new();
+        h.load_requested();
+        h.load_committed();
+        assert_eq!(h.on_page(&ready()), Some(Vec::new()));
+        h
+    }
+
+    #[test]
+    fn ready_while_awaiting_commit_is_dropped_and_flushes_nothing() {
+        let mut h = page_up();
+        h.load_requested();
+        assert_eq!(h.send(CommandBody::Deselect), (1, None));
+        // The old page is alive until the new document commits, and says ready.
+        assert_eq!(h.on_page(&ready()), None);
+        // Still not ready: the next command waits as well.
+        assert_eq!(h.send(CommandBody::Undo), (2, None));
+
+        h.load_committed();
+        assert_eq!(
+            h.on_page(&ready()),
+            Some(vec![
+                cmd(1, CommandBody::Deselect),
+                cmd(2, CommandBody::Undo)
+            ])
+        );
+    }
+
+    #[test]
+    fn commit_then_ready_flushes_in_order_then_sends_directly() {
+        let mut h = Handshake::new();
+        h.load_requested();
+        assert_eq!(h.send(CommandBody::Go { slide: 2 }), (1, None));
+        assert_eq!(h.send(CommandBody::Deselect), (2, None));
+        h.load_committed();
+        assert_eq!(h.send(CommandBody::Undo), (3, None));
+
+        assert_eq!(
+            h.on_page(&ready()),
+            Some(vec![
+                cmd(1, CommandBody::Go { slide: 2 }),
+                cmd(2, CommandBody::Deselect),
+                cmd(3, CommandBody::Undo),
+            ])
+        );
+        assert_eq!(
+            h.send(CommandBody::Redo),
+            (4, Some(cmd(4, CommandBody::Redo)))
+        );
+    }
+
+    #[test]
+    fn two_loads_then_one_commit_then_ready_flushes_once() {
+        let mut h = page_up();
+        h.load_requested();
+        assert_eq!(h.send(CommandBody::Deselect), (1, None));
+        // The second load cancels the first; only its document commits.
+        h.load_requested();
+        assert_eq!(h.send(CommandBody::Undo), (2, None));
+        assert_eq!(h.on_page(&ready()), None, "the old page's ready");
+
+        h.load_committed();
+        assert_eq!(
+            h.on_page(&ready()),
+            Some(vec![
+                cmd(1, CommandBody::Deselect),
+                cmd(2, CommandBody::Undo)
+            ])
+        );
+        assert_eq!(h.on_page(&ready()), Some(Vec::new()), "nothing twice");
+    }
+
+    #[test]
+    fn other_messages_while_awaiting_commit_are_passed_on() {
+        let mut h = page_up();
+        h.load_requested();
+        let edited = PageMessage::Edited {
+            slide: 2,
+            label: "Move".into(),
+        };
+        let result = PageMessage::Result {
+            id: 1,
+            ok: true,
+            error: None,
+        };
+        assert_eq!(h.on_page(&edited), Some(Vec::new()));
+        assert_eq!(h.on_page(&result), Some(Vec::new()));
+        assert_eq!(h.send(CommandBody::Undo), (1, None), "still not ready");
+    }
+
+    #[test]
+    fn a_reload_waits_for_the_new_pages_ready() {
+        let mut h = page_up();
+        assert_eq!(
+            h.send(CommandBody::Undo),
+            (1, Some(cmd(1, CommandBody::Undo)))
+        );
+        // Slidev reloads the page by itself: a commit with no load.
+        h.load_committed();
+        assert_eq!(h.send(CommandBody::Redo), (2, None));
+        assert_eq!(h.on_page(&ready()), Some(vec![cmd(2, CommandBody::Redo)]));
+    }
 
     #[test]
     fn queued_commands_keep_their_ids_in_order() {
