@@ -23,12 +23,36 @@ enum Incoming {
     LoadCommitted,
 }
 
-/// `STUDIO_DEBUG_IPC=1` logs the type of each page message to stderr.
-static DEBUG_IPC: LazyLock<bool> =
+/// `STUDIO_DEBUG_IPC=1` logs the type of each page message, and each sidecar
+/// event, to stderr.
+pub(crate) static DEBUG_IPC: LazyLock<bool> =
     LazyLock::new(|| std::env::var("STUDIO_DEBUG_IPC").is_ok_and(|v| v == "1"));
 
+/// Call when a window has closed, before GPUI destroys its X11 window (an
+/// `on_window_closed` observer runs just before that).
+///
+/// gpui-webview 0.9.0 on X11: destroying the window also destroys Wry's X11
+/// windows inside it, over GPUI's own connection. GTK's later requests for
+/// them (the web view's `hide` on drop, then Wry's destroy) fail with
+/// `BadWindow`, and GDK exits the process on any X11 error. Upstream's fix
+/// (dbb0b9a4, after 0.9.0) covers dropping a web view, not closing its window.
+/// So GTK's pending requests go out first, while the windows still exist, and
+/// GDK ignores X11 errors from then on. Nothing pops the trap: a closed window
+/// leaves nothing GTK draws, and this app quits once its window has closed.
+#[cfg(target_os = "linux")]
+pub fn window_closing_on_x11() {
+    if !gtk::is_initialized_main_thread() {
+        return; // No web view was ever built.
+    }
+    if let Some(display) = gtk::gdk::Display::default() {
+        display.sync();
+    }
+    gtk::gdk::error_trap_push();
+}
+
 /// The one web view of a window. It is built once and lives as long as the
-/// window: gpui-webview 0.9.0 aborts on X11 when a web view is dropped.
+/// window: gpui-webview 0.9.0 aborts on X11 when a web view is dropped (see
+/// [`window_closing_on_x11`] for the window's own close).
 pub struct Canvas {
     webview: Entity<WebView>,
     handshake: Handshake,
@@ -85,6 +109,18 @@ impl Canvas {
     pub fn load_url(&mut self, url: &str, cx: &mut Context<Self>) {
         self.handshake.load_requested();
         self.webview.update(cx, |webview, _| webview.load_url(url));
+    }
+
+    /// Shows or hides the native web view. A window that stops rendering the
+    /// canvas must hide it, or the page stays on screen where it last was.
+    pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        self.webview.update(cx, |webview, _| {
+            if visible {
+                webview.show();
+            } else {
+                webview.hide();
+            }
+        });
     }
 
     /// Sends a command to the page, or keeps it until the page is ready.

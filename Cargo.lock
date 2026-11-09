@@ -7584,6 +7584,7 @@ dependencies = [
  "async-channel",
  "gpui-kit",
  "gpui-webview",
+ "gtk",
  "lb-wry",
  "studio-protocol",
  "studio-sidecar",
