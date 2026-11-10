@@ -231,3 +231,44 @@ pub fn slide_looks(transition: Transition, seconds: f32) -> (SlideLook, SlideLoo
         ),
     }
 }
+
+/// A screen a show can use.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScreenInfo {
+    pub id: u32,
+    pub primary: bool,
+}
+
+/// Which windows a show opens, and on which screens.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WindowPlan {
+    Both { audience: u32, presenter: u32 },
+    AudienceOnly { screen: Option<u32> },
+    Rehearsal,
+}
+
+/// Where a show's windows go. The presenter stays on the primary screen, and the audience
+/// gets another. With only one screen the audience has it to themselves.
+pub fn choose_windows(screens: &[ScreenInfo], rehearsing: bool) -> WindowPlan {
+    if rehearsing {
+        return WindowPlan::Rehearsal;
+    }
+    let primary = screens.iter().find(|screen| screen.primary);
+    let Some(presenter) = primary.or(screens.first()) else {
+        return WindowPlan::AudienceOnly { screen: None };
+    };
+    match screens.iter().find(|screen| screen.id != presenter.id) {
+        Some(audience) => WindowPlan::Both {
+            audience: audience.id,
+            presenter: presenter.id,
+        },
+        None => WindowPlan::AudienceOnly {
+            screen: Some(presenter.id),
+        },
+    }
+}
+
+/// How long a show has been running, as `mm:ss`. The minutes go on past 59.
+pub fn clock_text(elapsed_seconds: u64) -> String {
+    format!("{:02}:{:02}", elapsed_seconds / 60, elapsed_seconds % 60)
+}

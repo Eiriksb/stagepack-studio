@@ -83,6 +83,11 @@ impl SlideCanvas {
         cx.notify();
     }
 
+    /// How each layer looks, as last set.
+    pub fn looks(&self) -> &[LayerLook] {
+        &self.looks
+    }
+
     /// How the whole slide looks.
     pub fn set_slide_look(&mut self, look: SlideLook, cx: &mut Context<Self>) {
         self.slide_look = look;

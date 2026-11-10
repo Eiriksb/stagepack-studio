@@ -1,6 +1,7 @@
 use slides_engine::{Enter, LayerTiming, Transition};
 use stagepack_studio::present::{
-    FLY_UNITS, LayerLook, Moved, Place, Session, SlideLook, ease, layer_look, slide_looks,
+    FLY_UNITS, LayerLook, Moved, Place, ScreenInfo, Session, SlideLook, WindowPlan, choose_windows,
+    clock_text, ease, layer_look, slide_looks,
 };
 
 fn session() -> Session {
@@ -257,4 +258,115 @@ fn no_transition_is_immediate() {
 #[test]
 fn with_no_transition_nothing_of_the_old_slide_shows() {
     assert_eq!(slide_looks(Transition::None, 0.0).0.opacity, 0.0);
+}
+
+#[test]
+fn one_screen_gives_one_full_screen_window() {
+    assert_eq!(
+        choose_windows(
+            &[ScreenInfo {
+                id: 1,
+                primary: true
+            }],
+            false
+        ),
+        WindowPlan::AudienceOnly { screen: Some(1) }
+    );
+}
+
+#[test]
+fn two_screens_put_the_audience_on_the_other_one() {
+    let screens = [
+        ScreenInfo {
+            id: 1,
+            primary: true,
+        },
+        ScreenInfo {
+            id: 2,
+            primary: false,
+        },
+    ];
+    assert_eq!(
+        choose_windows(&screens, false),
+        WindowPlan::Both {
+            audience: 2,
+            presenter: 1
+        }
+    );
+}
+
+#[test]
+fn the_presenter_stays_on_the_primary_screen_wherever_it_is_listed() {
+    let screens = [
+        ScreenInfo {
+            id: 7,
+            primary: false,
+        },
+        ScreenInfo {
+            id: 3,
+            primary: true,
+        },
+    ];
+    assert_eq!(
+        choose_windows(&screens, false),
+        WindowPlan::Both {
+            audience: 7,
+            presenter: 3
+        }
+    );
+}
+
+#[test]
+fn with_no_screen_marked_primary_the_first_one_counts_as_it() {
+    let screens = [
+        ScreenInfo {
+            id: 4,
+            primary: false,
+        },
+        ScreenInfo {
+            id: 5,
+            primary: false,
+        },
+    ];
+    assert_eq!(
+        choose_windows(&screens, false),
+        WindowPlan::Both {
+            audience: 5,
+            presenter: 4
+        }
+    );
+    assert_eq!(
+        choose_windows(&screens[..1], false),
+        WindowPlan::AudienceOnly { screen: Some(4) }
+    );
+}
+
+#[test]
+fn no_display_information_still_opens_a_window() {
+    assert_eq!(
+        choose_windows(&[], false),
+        WindowPlan::AudienceOnly { screen: None }
+    );
+}
+
+#[test]
+fn rehearsing_opens_ordinary_windows() {
+    assert_eq!(
+        choose_windows(
+            &[ScreenInfo {
+                id: 1,
+                primary: true
+            }],
+            true
+        ),
+        WindowPlan::Rehearsal
+    );
+    assert_eq!(choose_windows(&[], true), WindowPlan::Rehearsal);
+}
+
+#[test]
+fn the_clock_reads_minutes_and_seconds() {
+    assert_eq!(clock_text(0), "00:00");
+    assert_eq!(clock_text(65), "01:05");
+    assert_eq!(clock_text(3725), "62:05");
 }

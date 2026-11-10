@@ -7,7 +7,9 @@ use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::DropdownMenu as _;
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, TitleBar, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Sizable as _, TitleBar, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use notify::RecommendedWatcher;
@@ -16,6 +18,7 @@ use slides_engine::Fonts;
 use crate::document::{Document, OpenProblem, Reload, SLIDES_FILE};
 use crate::export::{self, ExportKind, run_export, stagepack_executable};
 use crate::markdown_panel::MarkdownPanel;
+use crate::present_view::{self, Presentation, start_show};
 use crate::slide_canvas::{ScaleChanged, SlideCanvas};
 use crate::watcher;
 
@@ -27,10 +30,14 @@ pub const PROBLEM_ID: &str = "problem";
 pub const MARKDOWN_ID: &str = "markdown";
 pub const FILE_MENU_ID: &str = "file-menu";
 pub const EXPORT_MENU_ID: &str = "export-menu";
+pub const PRESENT_ID: &str = "present";
 pub const OPEN_IN_STAGEPACK_ID: &str = "open-in-stagepack";
 
 /// The key context of the window's content, where its shortcuts apply.
 pub const KEY_CONTEXT: &str = "Workspace";
+
+/// How the desktop tells this app's windows from another's.
+pub(crate) const APP_ID: &str = "stagepack-studio";
 
 /// How long the file has to stay quiet before it's read, as one save can be several writes.
 const RELOAD_DELAY: Duration = Duration::from_millis(100);
@@ -54,10 +61,12 @@ actions!(
         SaveFolder,
         ExportPowerPoint,
         ExportPdf,
+        Present,
+        Rehearse,
     ]
 );
 
-/// The window's shortcuts. Call once, after `gpui_kit::init`.
+/// The window's shortcuts, and a show's. Call once, after `gpui_kit::init`.
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("right", NextSlide, Some(KEY_CONTEXT)),
@@ -65,7 +74,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("left", PreviousSlide, Some(KEY_CONTEXT)),
         KeyBinding::new("pageup", PreviousSlide, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-m", ToggleMarkdown, Some(KEY_CONTEXT)),
+        KeyBinding::new("f5", Present, Some(KEY_CONTEXT)),
+        KeyBinding::new("shift-f5", Rehearse, Some(KEY_CONTEXT)),
     ]);
+    present_view::bind_keys(cx);
 }
 
 /// Opens the talk at `path`, a folder or a packed file, in a window of its own.
@@ -118,6 +130,8 @@ pub struct WorkspaceView {
     watch_problem: Option<String>,
     /// The reload waiting for the file to go quiet.
     pending_reload: Option<Task<()>>,
+    /// The show of this talk, if one has been started.
+    show: Option<WeakEntity<Presentation>>,
     _scale_changed: Subscription,
 }
 
@@ -207,6 +221,7 @@ impl WorkspaceView {
             watcher: None,
             watch_problem: None,
             pending_reload: None,
+            show: None,
             _scale_changed: scale_changed,
         }
     }
@@ -229,7 +244,7 @@ impl WorkspaceView {
                 ..TitleBar::title_bar_options()
             }),
             window_min_size: Some(size(px(800.), px(500.))),
-            app_id: Some("stagepack-studio".into()),
+            app_id: Some(APP_ID.into()),
             ..TitleBar::window_options()
         }
     }
@@ -311,7 +326,14 @@ impl WorkspaceView {
         let Some(document) = self.document.clone() else {
             return;
         };
-        let reload = document.update(cx, |document, _| document.reload(contents));
+        let reload = document.update(cx, |document, cx| {
+            let reload = document.reload(contents);
+            if matches!(reload, Reload::Changed(_)) {
+                // A show of the talk has to know.
+                cx.notify();
+            }
+            reload
+        });
         let Reload::Changed(slides) = reload else {
             return;
         };
@@ -330,6 +352,33 @@ impl WorkspaceView {
             // The title counts the slides, and the talk may have gained some.
             cx.notify();
         }
+    }
+
+    /// Starts a show of the talk, unless one is running already.
+    fn present(&mut self, rehearsing: bool, cx: &mut Context<Self>) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        let running = self
+            .show
+            .as_ref()
+            .and_then(WeakEntity::upgrade)
+            .is_some_and(|show| !show.read(cx).has_ended());
+        if running {
+            return;
+        }
+        let this = cx.entity().downgrade();
+        // Once this window is free again, as the show asks it which screen it's on.
+        cx.defer(move |cx| {
+            let show = start_show(document, rehearsing, cx);
+            this.update(cx, |this, cx| {
+                if show.read(cx).has_ended() {
+                    this.say("Could not open a window for the show.", cx);
+                }
+                this.show = Some(show.downgrade());
+            })
+            .ok();
+        });
     }
 
     /// Puts `status` on the status line.
@@ -541,6 +590,8 @@ impl Render for WorkspaceView {
                 this.export(ExportKind::PowerPoint, cx)
             }))
             .on_action(cx.listener(|this, _: &ExportPdf, _, cx| this.export(ExportKind::Pdf, cx)))
+            .on_action(cx.listener(|this, _: &Present, _, cx| this.present(false, cx)))
+            .on_action(cx.listener(|this, _: &Rehearse, _, cx| this.present(true, cx)))
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
@@ -551,6 +602,14 @@ impl Render for WorkspaceView {
                         .items_center()
                         .child(file_menu(packed))
                         .child(export_menu(packed.is_some()))
+                        .child(
+                            Button::new(PRESENT_ID)
+                                .ghost()
+                                .small()
+                                .label("Present")
+                                .disabled(packed.is_none())
+                                .on_click(cx.listener(|this, _, _, cx| this.present(false, cx))),
+                        )
                         .child(
                             div()
                                 .id(TITLE_ID)
