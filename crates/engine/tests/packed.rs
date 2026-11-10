@@ -314,6 +314,19 @@ fn a_failed_pack_leaves_the_old_file_and_no_temp() {
     assert_eq!(left, ["talk.sptx"]);
 }
 
+#[cfg(unix)]
+#[test]
+fn a_replaced_file_keeps_its_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("x.bin");
+    std::fs::write(&out, "old").unwrap();
+    std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o640)).unwrap();
+    write_atomically(&out, |f| f.write_all(b"new")).unwrap();
+    assert_eq!(std::fs::read(&out).unwrap(), b"new");
+    assert_eq!(std::fs::metadata(&out).unwrap().permissions().mode() & 0o777, 0o640);
+}
+
 #[test]
 fn write_atomically_cleans_up_after_a_failure() {
     let dir = tempfile::tempdir().unwrap();
@@ -518,6 +531,19 @@ fn paths_are_read_the_way_a_folder_reads_them() {
     }
     for form in ["../slides.md", "assets/../../slides.md", "", "."] {
         assert_eq!(packed.read(form), None, "{form}");
+    }
+}
+
+#[test]
+fn a_leading_slash_is_refused_in_both_forms() {
+    let dir = talk_folder();
+    let out = dir.path().join("talk.sptx");
+    pack_folder(dir.path(), &out, "0.1.0").unwrap();
+    let packed = open_packed(&out).unwrap();
+    let folder = FolderFiles::new(dir.path().to_path_buf());
+    for form in ["/assets/a.png", "//assets/a.png", "/slides.md"] {
+        assert_eq!(folder.read(form), None, "folder {form}");
+        assert_eq!(packed.read(form), None, "packed {form}");
     }
 }
 

@@ -136,8 +136,12 @@ fn safe_name(name: &str) -> bool {
     !name.is_empty() && name.split('/').all(safe_part)
 }
 
-/// `path` with empty and `.` parts dropped and `..` resolved, or `None` if it climbs out.
+/// `path` with empty and `.` parts dropped and `..` resolved, or `None` if it starts at the root
+/// or climbs out, as a folder talk would refuse it too.
 fn normalise(path: &str) -> Option<String> {
+    if path.starts_with('/') {
+        return None;
+    }
     let mut parts = Vec::new();
     for part in path.split('/') {
         match part {
@@ -595,6 +599,11 @@ pub fn write_atomically(
     let (mut file, temp) = create_temp(out, &name)?;
     let result = (|| {
         write(&mut file)?;
+        // A file being replaced keeps its permissions. Where they can't be set, the new content
+        // still matters more.
+        if let Ok(existing) = std::fs::metadata(out) {
+            file.set_permissions(existing.permissions()).ok();
+        }
         file.sync_all()?;
         drop(file);
         rename_with_retry(&temp, out)?;
