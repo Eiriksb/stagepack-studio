@@ -1,6 +1,6 @@
 # Plan B: what ran, and how to check Windows and PowerPoint
 
-The first run was on the `plan-b` branch at commit ecde000 plus the `fixtures/show` talk from 49e8d28, on a 16-core Linux laptop, in debug builds, on 2026-11-10. After the final fix wave, the walk through the show and the exports were repeated at commit f29c5a0, and the tests at 232836d. Nothing here has run on Windows. The branch has not been pushed.
+The first run was on the `plan-b` branch at commit ecde000 plus the `fixtures/show` talk from 49e8d28, on a 16-core Linux laptop, in debug builds, on 2026-11-10. After the final fix wave, the walk through the show and the exports were repeated at commit f29c5a0, and the tests at 232836d. Nothing here has run on Windows. The work has since been merged into `main` and pushed.
 
 ## Tests on Linux
 
@@ -53,9 +53,9 @@ The talk was `fixtures/show`: three slides, with a `fade` entrance on a box (`cl
 
 ## Optional Windows and PowerPoint check, by hand
 
-On a Windows PC with Rust 1.98.0, the MSVC build tools and desktop PowerPoint installed. The branch hasn't been pushed, so first push it, or copy the folder over, to reach that PC.
+On a Windows PC with Rust 1.98.0, the MSVC build tools and desktop PowerPoint installed.
 
-1. Once the branch has been pushed, `git clone -b plan-b https://github.com/Eiriksb/stagepack-studio.git`. If the folder was copied over instead, skip this step and work in the copy.
+1. `git clone https://github.com/Eiriksb/stagepack-studio.git`, and work in that folder.
 2. `cargo test --workspace`. If only golden tests fail, the images differ slightly from Linux, so send back which ones.
 3. `cargo run --release -p stagepack-studio -- fixtures\show`. Press Shift+F5 with two screens connected and confirm the audience window is on one and the presenter window, with the notes, next slide, timer and counter, is on the other. Press Right through every click, and confirm the fade, the fly-up and the push play. Press Escape to end. Then press F5 and confirm the show fills the screen.
 4. Use Export, then PowerPoint, to write `show.pptx`, and Export, then PDF, to write `show.pdf`. Open both.
