@@ -96,21 +96,8 @@ pub struct Presentation {
     _window_closed: Subscription,
 }
 
-/// How many clicks each slide of the talk takes, and how each is arrived at.
-fn shape_of_talk(document: &Entity<Document>, cx: &mut App) -> (Vec<u32>, Vec<Transition>) {
-    document.update(cx, |document, _| {
-        (0..document.slide_count())
-            .map(|slide| {
-                let timeline = document.timeline_of(slide);
-                (timeline.steps, timeline.transition)
-            })
-            .unzip()
-    })
-}
-
 impl Presentation {
     fn new(document: Entity<Document>, cx: &mut Context<Self>) -> Self {
-        let (steps, transitions) = shape_of_talk(&document, cx);
         let talk_changed = cx.observe(&document, |this, _, cx| this.talk_changed(cx));
         let this = cx.entity().downgrade();
         let window_closed = cx.on_window_closed(move |cx, closed| {
@@ -119,7 +106,7 @@ impl Presentation {
         });
         Presentation {
             document,
-            session: Session::new(steps, transitions),
+            session: Session::new(),
             started_at: cx.background_executor().now(),
             reveal: None,
             arrival: None,
@@ -149,8 +136,11 @@ impl Presentation {
     /// Goes forward by a click, or to the next slide once this one's clicks have all come.
     pub fn next(&mut self, cx: &mut Context<Self>) {
         let left = self.session.place();
+        let moved = self
+            .document
+            .update(cx, |document, _| self.session.next(document));
         let began = cx.background_executor().now();
-        match self.session.next() {
+        match moved {
             Moved::Revealed { step } => self.reveal = Some(Reveal { step, began }),
             Moved::Arrived { transition, .. } => {
                 self.reveal = None;
@@ -167,7 +157,10 @@ impl Presentation {
 
     /// Goes back by a click, or to the end of the slide before, with nothing moving.
     pub fn previous(&mut self, cx: &mut Context<Self>) {
-        if self.session.previous() != Moved::Stayed {
+        let moved = self
+            .document
+            .update(cx, |document, _| self.session.previous(document));
+        if moved != Moved::Stayed {
             self.reveal = None;
             self.arrival = None;
             cx.notify();
@@ -216,12 +209,18 @@ impl Presentation {
     }
 
     fn talk_changed(&mut self, cx: &mut Context<Self>) {
-        let (steps, transitions) = shape_of_talk(&self.document, cx);
-        self.session.refit(steps, transitions);
+        self.document
+            .update(cx, |document, _| self.session.refit(document));
         // What was on its way in may be gone by now.
         self.reveal = None;
         self.arrival = None;
         cx.notify();
+    }
+
+    /// Where the next press goes. `None` at the end of the talk.
+    fn upcoming(&self, cx: &mut Context<Self>) -> Option<Place> {
+        self.document
+            .update(cx, |document, _| self.session.upcoming(document))
     }
 
     fn reveal_at(&self, now: Instant) -> Option<(u32, f32)> {
@@ -433,6 +432,7 @@ pub struct PresenterView {
     notes_scroll: ScrollHandle,
     /// The slide whose notes are showing.
     slide: usize,
+    at_the_end: bool,
     rehearsing: bool,
     focus_handle: FocusHandle,
     _watching: [Subscription; 3],
@@ -474,6 +474,7 @@ impl PresenterView {
             notes: SharedString::default(),
             notes_scroll: ScrollHandle::new(),
             slide: 0,
+            at_the_end: false,
             rehearsing,
             focus_handle,
             _watching: watching,
@@ -494,12 +495,10 @@ impl PresenterView {
     }
 
     fn show_place(&mut self, cx: &mut Context<Self>) {
+        let upcoming = self.show.update(cx, |show, cx| show.upcoming(cx));
+        self.at_the_end = upcoming.is_none();
         let show = self.show.read(cx);
-        let (document, place, upcoming) = (
-            show.document.clone(),
-            show.session.place(),
-            show.session.upcoming(),
-        );
+        let (document, place) = (show.document.clone(), show.session.place());
         self.notes = document
             .read(cx)
             .notes_of(place.slide)
@@ -546,7 +545,7 @@ impl Render for PresenterView {
             show.session.place().slide + 1,
             show.document.read(cx).slide_count()
         );
-        let at_the_end = show.session.upcoming().is_none();
+        let at_the_end = self.at_the_end;
         let title = self.rehearsing.then_some("Presenter");
 
         let slide_and_figures = v_flex()

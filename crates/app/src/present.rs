@@ -17,8 +17,18 @@ pub fn ease(t: f32) -> f32 {
     1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
 }
 
+/// What a show needs to know about a talk, asked for only as it needs it, as finding out about a
+/// slide can mean laying it out.
+pub trait TalkShape {
+    fn slide_count(&self) -> usize;
+    /// How many clicks `slide` takes.
+    fn steps(&mut self, slide: usize) -> u32;
+    /// How `slide` is arrived at.
+    fn transition(&mut self, slide: usize) -> Transition;
+}
+
 /// A moment of a talk: a slide, and how many of its clicks have come.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Place {
     pub slide: usize,
     pub step: u32,
@@ -33,29 +43,24 @@ pub enum Moved {
     Stayed,
 }
 
-/// Where a show is, in a talk with so many clicks on each slide.
+/// Where a show is. What the talk is like is asked of it each time, and only about the slides
+/// around the show.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Session {
-    steps: Vec<u32>,
-    transitions: Vec<Transition>,
     place: Place,
 }
 
 impl Session {
-    /// A show at the start of a talk. `steps` holds each slide's clicks, and `transitions`
-    /// how each slide is arrived at.
-    pub fn new(steps: Vec<u32>, transitions: Vec<Transition>) -> Session {
-        Session {
-            steps,
-            transitions,
-            place: Place { slide: 0, step: 0 },
-        }
+    /// A show at the start of a talk.
+    pub fn new() -> Session {
+        Session::default()
     }
 
     /// Goes forward by a click, or to the next slide once this one's clicks have all come.
     // Not an iterator: at the end of a show a press is still answered, with `Moved::Stayed`.
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Moved {
-        let Some(upcoming) = self.upcoming() else {
+    pub fn next(&mut self, talk: &mut impl TalkShape) -> Moved {
+        let Some(upcoming) = self.upcoming(talk) else {
             return Moved::Stayed;
         };
         let from = std::mem::replace(&mut self.place, upcoming).slide;
@@ -66,24 +71,20 @@ impl Session {
         } else {
             Moved::Arrived {
                 from,
-                transition: self
-                    .transitions
-                    .get(upcoming.slide)
-                    .copied()
-                    .unwrap_or_default(),
+                transition: talk.transition(upcoming.slide),
             }
         }
     }
 
     /// Goes back by a click, or to the end of the slide before.
-    pub fn previous(&mut self) -> Moved {
+    pub fn previous(&mut self, talk: &mut impl TalkShape) -> Moved {
         let Place { slide, step } = self.place;
         if step > 0 {
             self.place.step = step - 1;
         } else if slide > 0 {
             self.place = Place {
                 slide: slide - 1,
-                step: self.steps_of(slide - 1),
+                step: talk.steps(slide - 1),
             };
         } else {
             return Moved::Stayed;
@@ -96,14 +97,18 @@ impl Session {
     }
 
     /// Where [`Self::next`] would go. `None` at the end of the talk.
-    pub fn upcoming(&self) -> Option<Place> {
+    pub fn upcoming(&self, talk: &mut impl TalkShape) -> Option<Place> {
         let Place { slide, step } = self.place;
-        if step < self.steps_of(slide) {
+        let count = talk.slide_count();
+        if slide >= count {
+            return None;
+        }
+        if step < talk.steps(slide) {
             Some(Place {
                 slide,
                 step: step + 1,
             })
-        } else if slide + 1 < self.steps.len() {
+        } else if slide + 1 < count {
             Some(Place {
                 slide: slide + 1,
                 step: 0,
@@ -114,21 +119,18 @@ impl Session {
     }
 
     /// Takes in a talk that has changed, staying on a place that still exists.
-    pub fn refit(&mut self, steps: Vec<u32>, transitions: Vec<Transition>) {
-        self.steps = steps;
-        self.transitions = transitions;
-        let last = self.steps.len().saturating_sub(1);
+    pub fn refit(&mut self, talk: &mut impl TalkShape) {
+        let Some(last) = talk.slide_count().checked_sub(1) else {
+            self.place = Place::default();
+            return;
+        };
         if self.place.slide > last {
             self.place = Place {
                 slide: last,
-                step: self.steps_of(last),
+                step: talk.steps(last),
             };
         }
-        self.place.step = self.place.step.min(self.steps_of(self.place.slide));
-    }
-
-    fn steps_of(&self, slide: usize) -> u32 {
-        self.steps.get(slide).copied().unwrap_or(0)
+        self.place.step = self.place.step.min(talk.steps(self.place.slide));
     }
 }
 

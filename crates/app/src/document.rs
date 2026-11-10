@@ -4,11 +4,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use slides_engine::{
-    Deck, FolderFiles, Fonts, Layer, PackError, SlideTimeline, TalkFiles, open_packed, pack_folder,
-    unpack_to_folder,
+    Deck, FolderFiles, Fonts, Layer, PackError, SlideTimeline, TalkFiles, Transition, open_packed,
+    pack_folder, unpack_to_folder,
 };
 
 use crate::export::ExportInput;
+use crate::present::TalkShape;
 
 pub(crate) const SLIDES_FILE: &str = "slides.md";
 const FONTS_FOLDER: &str = "assets/fonts";
@@ -284,6 +285,20 @@ impl Document {
             }
         }
         Reload::Changed(changed)
+    }
+}
+
+impl TalkShape for Document {
+    fn slide_count(&self) -> usize {
+        self.deck.slide_count()
+    }
+
+    fn steps(&mut self, slide: usize) -> u32 {
+        self.timeline_of(slide).steps
+    }
+
+    fn transition(&mut self, slide: usize) -> Transition {
+        self.timeline_of(slide).transition
     }
 }
 

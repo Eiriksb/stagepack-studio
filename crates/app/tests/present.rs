@@ -1,11 +1,45 @@
 use slides_engine::{Enter, LayerTiming, Transition};
 use stagepack_studio::present::{
-    FLY_UNITS, LayerLook, Moved, Place, ScreenInfo, Session, SlideLook, WindowPlan, choose_windows,
-    clock_text, ease, layer_look, slide_looks,
+    FLY_UNITS, LayerLook, Moved, Place, ScreenInfo, Session, SlideLook, TalkShape, WindowPlan,
+    choose_windows, clock_text, ease, layer_look, slide_looks,
 };
 
-fn session() -> Session {
-    Session::new(
+/// A talk with so many clicks on each slide, which remembers the slides it was asked about.
+struct Shape {
+    steps: Vec<u32>,
+    transitions: Vec<Transition>,
+    asked: Vec<usize>,
+}
+
+impl Shape {
+    fn new(steps: Vec<u32>, transitions: Vec<Transition>) -> Shape {
+        Shape {
+            steps,
+            transitions,
+            asked: Vec::new(),
+        }
+    }
+}
+
+impl TalkShape for Shape {
+    fn slide_count(&self) -> usize {
+        self.steps.len()
+    }
+
+    // By index, as there's no answer for a slide that isn't there.
+    fn steps(&mut self, slide: usize) -> u32 {
+        self.asked.push(slide);
+        self.steps[slide]
+    }
+
+    fn transition(&mut self, slide: usize) -> Transition {
+        self.asked.push(slide);
+        self.transitions.get(slide).copied().unwrap_or_default()
+    }
+}
+
+fn talk() -> Shape {
+    Shape::new(
         vec![2, 0, 1],
         vec![Transition::None, Transition::Fade, Transition::Push],
     )
@@ -13,11 +47,11 @@ fn session() -> Session {
 
 #[test]
 fn next_reveals_each_step_then_moves_on() {
-    let mut s = session();
-    assert_eq!(s.next(), Moved::Revealed { step: 1 });
-    assert_eq!(s.next(), Moved::Revealed { step: 2 });
+    let (mut s, mut t) = (Session::new(), talk());
+    assert_eq!(s.next(&mut t), Moved::Revealed { step: 1 });
+    assert_eq!(s.next(&mut t), Moved::Revealed { step: 2 });
     assert_eq!(
-        s.next(),
+        s.next(&mut t),
         Moved::Arrived {
             from: 0,
             transition: Transition::Fade
@@ -28,75 +62,75 @@ fn next_reveals_each_step_then_moves_on() {
 
 #[test]
 fn next_stops_at_the_end() {
-    let mut s = Session::new(vec![0], vec![Transition::None]);
-    assert_eq!(s.next(), Moved::Stayed);
+    let (mut s, mut t) = (Session::new(), Shape::new(vec![0], vec![Transition::None]));
+    assert_eq!(s.next(&mut t), Moved::Stayed);
 }
 
 #[test]
 fn previous_steps_back_with_no_animation() {
-    let mut s = session();
-    s.next();
-    assert_eq!(s.previous(), Moved::BackedUp);
+    let (mut s, mut t) = (Session::new(), talk());
+    s.next(&mut t);
+    assert_eq!(s.previous(&mut t), Moved::BackedUp);
     assert_eq!(s.place(), Place { slide: 0, step: 0 });
-    assert_eq!(s.previous(), Moved::Stayed);
+    assert_eq!(s.previous(&mut t), Moved::Stayed);
 }
 
 #[test]
 fn going_back_a_slide_lands_on_its_last_step() {
-    let mut s = session();
-    s.next();
-    s.next();
-    s.next();
-    assert_eq!(s.previous(), Moved::BackedUp);
+    let (mut s, mut t) = (Session::new(), talk());
+    s.next(&mut t);
+    s.next(&mut t);
+    s.next(&mut t);
+    assert_eq!(s.previous(&mut t), Moved::BackedUp);
     assert_eq!(s.place(), Place { slide: 0, step: 2 });
 }
 
 #[test]
 fn upcoming_is_the_next_step_or_slide() {
-    let mut s = session();
-    assert_eq!(s.upcoming(), Some(Place { slide: 0, step: 1 }));
-    s.next();
-    s.next();
-    assert_eq!(s.upcoming(), Some(Place { slide: 1, step: 0 }));
-    s.next();
-    s.next();
-    s.next();
-    assert_eq!(s.upcoming(), None);
+    let (mut s, mut t) = (Session::new(), talk());
+    assert_eq!(s.upcoming(&mut t), Some(Place { slide: 0, step: 1 }));
+    s.next(&mut t);
+    s.next(&mut t);
+    assert_eq!(s.upcoming(&mut t), Some(Place { slide: 1, step: 0 }));
+    s.next(&mut t);
+    s.next(&mut t);
+    s.next(&mut t);
+    assert_eq!(s.upcoming(&mut t), None);
 }
 
 #[test]
 fn refit_keeps_the_show_on_a_real_place() {
-    let mut s = session();
-    s.next();
-    s.next();
-    s.next();
-    s.next();
-    s.refit(vec![1], vec![Transition::None]);
+    let (mut s, mut t) = (Session::new(), talk());
+    s.next(&mut t);
+    s.next(&mut t);
+    s.next(&mut t);
+    s.next(&mut t);
+    s.refit(&mut Shape::new(vec![1], vec![Transition::None]));
     assert_eq!(s.place(), Place { slide: 0, step: 1 });
 }
 
 #[test]
 fn refit_keeps_a_place_that_still_exists() {
-    let mut s = session();
-    s.next();
-    s.refit(vec![5, 5], vec![]);
+    let (mut s, mut t) = (Session::new(), talk());
+    s.next(&mut t);
+    s.refit(&mut Shape::new(vec![5, 5], vec![]));
     assert_eq!(s.place(), Place { slide: 0, step: 1 });
 }
 
 #[test]
 fn refit_takes_back_a_step_the_slide_no_longer_has() {
-    let mut s = session();
-    s.next();
-    s.next();
-    s.refit(vec![1, 0, 1], vec![]);
+    let (mut s, mut t) = (Session::new(), talk());
+    s.next(&mut t);
+    s.next(&mut t);
+    s.refit(&mut Shape::new(vec![1, 0, 1], vec![]));
     assert_eq!(s.place(), Place { slide: 0, step: 1 });
 }
 
 #[test]
 fn a_slide_with_no_transition_listed_has_none() {
-    let mut s = Session::new(vec![0, 0], vec![]);
+    let (mut s, mut t) = (Session::new(), Shape::new(vec![0, 0], vec![]));
     assert_eq!(
-        s.next(),
+        s.next(&mut t),
         Moved::Arrived {
             from: 0,
             transition: Transition::None
@@ -106,17 +140,18 @@ fn a_slide_with_no_transition_listed_has_none() {
 
 #[test]
 fn a_show_with_no_slides_goes_nowhere() {
-    let mut s = Session::new(vec![], vec![]);
-    assert_eq!(s.next(), Moved::Stayed);
-    assert_eq!(s.previous(), Moved::Stayed);
-    assert_eq!(s.upcoming(), None);
+    let (mut s, mut t) = (Session::new(), Shape::new(vec![], vec![]));
+    assert_eq!(s.next(&mut t), Moved::Stayed);
+    assert_eq!(s.previous(&mut t), Moved::Stayed);
+    assert_eq!(s.upcoming(&mut t), None);
     assert_eq!(s.place(), Place { slide: 0, step: 0 });
 
-    let mut s = session();
-    s.next();
-    s.refit(vec![], vec![]);
+    let (mut s, mut t) = (Session::new(), talk());
+    s.next(&mut t);
+    let mut t = Shape::new(vec![], vec![]);
+    s.refit(&mut t);
     assert_eq!(s.place(), Place { slide: 0, step: 0 });
-    assert_eq!(s.next(), Moved::Stayed);
+    assert_eq!(s.next(&mut t), Moved::Stayed);
 }
 
 #[test]
@@ -126,6 +161,63 @@ fn ease_starts_fast_and_stays_between_nought_and_one() {
     assert_eq!(ease(0.5), 0.875);
     assert_eq!(ease(-3.0), 0.0);
     assert_eq!(ease(3.0), 1.0);
+}
+
+#[test]
+fn a_long_show_only_asks_about_the_slides_around_it() {
+    let (mut s, mut t) = (Session::new(), Shape::new(vec![1; 1000], vec![]));
+    assert!(t.asked.is_empty(), "starting a show asks about nothing");
+
+    s.next(&mut t);
+    assert_eq!(s.place(), Place { slide: 0, step: 1 });
+    s.next(&mut t);
+    assert_eq!(s.place(), Place { slide: 1, step: 0 });
+    s.upcoming(&mut t);
+    assert!(t.asked.iter().all(|slide| *slide <= 2), "{:?}", t.asked);
+
+    t.asked.clear();
+    for _ in 0..40 {
+        s.next(&mut t);
+    }
+    let here = s.place().slide;
+    assert_eq!(here, 21);
+    assert!(
+        t.asked.iter().all(|slide| *slide >= 1 && *slide <= here + 1),
+        "{:?}",
+        t.asked
+    );
+
+    t.asked.clear();
+    s.previous(&mut t);
+    s.previous(&mut t);
+    assert!(
+        t.asked.iter().all(|slide| slide.abs_diff(here) <= 1),
+        "{:?}",
+        t.asked
+    );
+}
+
+#[test]
+fn a_save_during_a_long_show_leaves_it_on_a_real_slide() {
+    let (mut s, mut t) = (Session::new(), Shape::new(vec![0; 1000], vec![]));
+    for _ in 0..500 {
+        s.next(&mut t);
+    }
+    assert_eq!(s.place(), Place { slide: 500, step: 0 });
+
+    let mut shorter = Shape::new(vec![0, 0, 3], vec![]);
+    s.refit(&mut shorter);
+    assert_eq!(s.place(), Place { slide: 2, step: 3 });
+    assert_eq!(s.next(&mut shorter), Moved::Stayed);
+
+    let mut same_length = Shape::new(vec![1; 1000], vec![]);
+    let mut there = Session::new();
+    for _ in 0..3 {
+        there.next(&mut same_length);
+    }
+    same_length.asked.clear();
+    there.refit(&mut same_length);
+    assert!(same_length.asked.iter().all(|slide| *slide == 1), "{:?}", same_length.asked);
 }
 
 const LATER: fn(Enter) -> LayerTiming = |enter| LayerTiming {
