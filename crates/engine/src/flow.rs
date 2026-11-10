@@ -1,5 +1,6 @@
 //! Lays a region's blocks out top to bottom and turns them into drawing.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -12,8 +13,12 @@ use tiny_skia::{Path, PathBuilder, Pixmap};
 use toolkit::{Color, Theme};
 
 use crate::elements::{ShapeLook, shape_items};
+use crate::native::{Semantic, native_elements};
 use crate::placeholder::placeholder_items;
-use crate::{Align, DisplayItem, Fonts, LayoutEnv, Notice, Rect, RegionDef, ShapedText, TextRun, highlight, shape_text};
+use crate::{
+    Align, Bullet, DisplayItem, Fonts, LayoutEnv, NativeElement, NativeParagraph, NativeRun, Notice, Rect, RegionDef, ShapedText, TextRun,
+    highlight, shape_text,
+};
 
 const GAP: f32 = 24.0;
 /// The least a list is indented, however narrow its markers.
@@ -23,9 +28,9 @@ const MARKER_GAP: f32 = 12.0;
 const CELL_PADDING: f32 = 12.0;
 const OUTLINE: f32 = 1.0;
 const CODE_SIZE: f32 = 32.0;
-const CODE_PADDING: f32 = 24.0;
+pub(crate) const CODE_PADDING: f32 = 24.0;
 const CODE_RADIUS: f32 = 12.0;
-const CODE_PANEL: Color = Color::rgb(0xf1, 0xf5, 0xf9);
+pub(crate) const CODE_PANEL: Color = Color::rgb(0xf1, 0xf5, 0xf9);
 /// How far lists and tags can sit inside each other. A talk could nest them as deep as it
 /// likes, and laying out each level uses up more of the stack.
 const MAX_NESTING: u32 = 16;
@@ -112,6 +117,8 @@ struct TextLook {
 /// A layout tree being built for one layer, and what building it needs.
 pub(crate) struct Flow<'a, 'env> {
     tree: TaffyTree<Content>,
+    /// What the tree's nodes are, for export.
+    semantics: HashMap<NodeId, Semantic>,
     region: &'a RegionDef,
     pub(crate) theme: &'a Theme,
     pub(crate) env: &'a mut LayoutEnv<'env>,
@@ -130,8 +137,9 @@ pub(crate) fn column() -> Style {
     }
 }
 
-/// Lays `blocks` out in a column `width` wide and returns their drawing, in layer
-/// coordinates. The column is as tall as its content, which can be taller than the region.
+/// Lays `blocks` out in a column `width` wide and returns their drawing and what they
+/// are, in layer coordinates. The column is as tall as its content, which can be taller
+/// than the region.
 pub(crate) fn flow_region(
     blocks: &[&Block],
     region: &RegionDef,
@@ -139,7 +147,7 @@ pub(crate) fn flow_region(
     theme: &Theme,
     env: &mut LayoutEnv,
     notices: &mut Vec<Notice>,
-) -> Vec<DisplayItem> {
+) -> (Vec<DisplayItem>, Vec<NativeElement>) {
     let mut flow = Flow::new(region, theme, env, notices);
     let children: Vec<NodeId> = blocks.iter().filter_map(|block| flow.block(block, region.align)).collect();
     let root = flow.node(Style { size: Size { width: length(width), height: auto() }, ..column() }, &children);
@@ -147,11 +155,12 @@ pub(crate) fn flow_region(
 }
 
 /// One block, or one item of a list, drawn on its own: `rect` is its box in the region's
-/// coordinates, and the items are relative to that box.
+/// coordinates, and the items and native elements are relative to that box.
 pub(crate) struct Piece {
     pub rect: Rect,
     pub source: Range<usize>,
     pub items: Vec<DisplayItem>,
+    pub native: Vec<NativeElement>,
 }
 
 /// As `flow_region`, laid out the same way, but each top-level block and each item of a
@@ -196,9 +205,11 @@ impl<'a, 'env> Flow<'a, 'env> {
     fn piece(&mut self, node: NodeId, parent: (f32, f32), source: Range<usize>) -> Piece {
         let layout = *self.tree.layout(node).expect("every node is in the tree");
         let (x, y) = (parent.0 + layout.location.x, parent.1 + layout.location.y);
+        let inside = (parent.0 - x, parent.1 - y);
         let mut items = Vec::new();
-        self.draw(node, (parent.0 - x, parent.1 - y), &mut items);
-        Piece { rect: Rect { x, y, w: layout.size.width, h: layout.size.height }, source, items }
+        self.draw(node, inside, &mut items);
+        let native = self.native(node, inside);
+        Piece { rect: Rect { x, y, w: layout.size.width, h: layout.size.height }, source, items, native }
     }
 
     pub(crate) fn new(
@@ -210,15 +221,26 @@ impl<'a, 'env> Flow<'a, 'env> {
         let mut tree = TaffyTree::new();
         // Slide units aren't pixels. Rounding would also leave text a sliver narrower than it was measured at.
         tree.disable_rounding();
-        Flow { tree, region, theme, env, notices, nesting: 0, text_tag_style: TextStyle::default() }
+        Flow { tree, semantics: HashMap::new(), region, theme, env, notices, nesting: 0, text_tag_style: TextStyle::default() }
     }
 
-    /// Lays out the tree under `root`, `width` wide, and returns its drawing.
-    pub(crate) fn finish(mut self, root: NodeId, width: f32) -> Vec<DisplayItem> {
+    /// Lays out the tree under `root`, `width` wide, and returns its drawing and what it is.
+    pub(crate) fn finish(mut self, root: NodeId, width: f32) -> (Vec<DisplayItem>, Vec<NativeElement>) {
         self.compute(root, width);
         let mut items = Vec::new();
         self.draw(root, (0.0, 0.0), &mut items);
-        items
+        let native = self.native(root, (0.0, 0.0));
+        (items, native)
+    }
+
+    /// What `node` and its children are, for export. Call it once, after laying out.
+    fn native(&mut self, node: NodeId, parent: (f32, f32)) -> Vec<NativeElement> {
+        native_elements(&self.tree, &mut self.semantics, self.theme, node, parent)
+    }
+
+    /// Notes what `node` is, for export.
+    pub(crate) fn note(&mut self, node: NodeId, semantic: Semantic) {
+        self.semantics.insert(node, semantic);
     }
 
     fn compute(&mut self, root: NodeId, width: f32) {
@@ -306,9 +328,23 @@ impl<'a, 'env> Flow<'a, 'env> {
         }
     }
 
+    /// The runs of `spans`, for drawing and for export.
+    fn runs(&self, spans: &[Span], look: TextLook) -> (Vec<TextRun>, Vec<NativeRun>) {
+        spans
+            .iter()
+            .map(|span| {
+                let run = self.run(span, look);
+                let native = NativeRun::new(&run, span.style.link.clone());
+                (run, native)
+            })
+            .unzip()
+    }
+
     fn text(&mut self, spans: &[Span], look: TextLook, align: Align) -> NodeId {
-        let runs = spans.iter().map(|span| self.run(span, look)).collect();
-        self.leaf(Style::default(), Content::Text(Leaf { runs, align, wraps: true, frame: Frame::None }))
+        let (runs, native) = self.runs(spans, look);
+        let node = self.leaf(Style::default(), Content::Text(Leaf { runs, align, wraps: true, frame: Frame::None }));
+        self.note(node, Semantic::Paragraph(NativeParagraph::new(native, align)));
+        node
     }
 
     /// Text from a component. Whatever it leaves out comes from the region.
@@ -317,7 +353,10 @@ impl<'a, 'env> Flow<'a, 'env> {
         let mut run = self.run(&Span { text: text.to_string(), style: Default::default() }, look);
         run.color = color.unwrap_or(run.color);
         run.size = size.unwrap_or(run.size);
-        self.leaf(Style::default(), Content::Text(Leaf { runs: vec![run], align, wraps: true, frame: Frame::None }))
+        let paragraph = NativeParagraph::new(vec![NativeRun::new(&run, None)], align);
+        let node = self.leaf(Style::default(), Content::Text(Leaf { runs: vec![run], align, wraps: true, frame: Frame::None }));
+        self.note(node, Semantic::Paragraph(paragraph));
+        node
     }
 
     /// The node for one block, if it's a block this flow draws.
@@ -333,7 +372,7 @@ impl<'a, 'env> Flow<'a, 'env> {
             Block::List { ordered, items, .. } => Some(self.list(*ordered, items)),
             Block::Table { rows, .. } => Some(self.table(rows, align)),
             Block::Code { language, code, .. } => Some(self.code(language.as_deref(), code)),
-            Block::Picture { src, .. } => Some(self.picture(src, 0.0, 0.0, align, false)),
+            Block::Picture { src, alt, .. } => Some(self.picture(src, alt, 0.0, 0.0, align, false)),
             Block::Tag(tag) => self.tag(tag, align),
             Block::Region { .. } => None,
         };
@@ -350,7 +389,7 @@ impl<'a, 'env> Flow<'a, 'env> {
         let widest = markers.iter().map(|marker| marker.shape(None, self.env.fonts).width).fold(0.0, f32::max);
         let indent = LIST_INDENT.max(widest + MARKER_GAP);
         let mut rows = Vec::with_capacity(items.len());
-        for (marker, item) in markers.into_iter().zip(items) {
+        for (index, (marker, item)) in markers.into_iter().zip(items).enumerate() {
             let in_the_indent = Style {
                 size: Size { width: length(indent), height: auto() },
                 flex_shrink: 0.0,
@@ -365,7 +404,9 @@ impl<'a, 'env> Flow<'a, 'env> {
                 ..column()
             };
             let content = self.node(content, &blocks);
-            rows.push(self.node(Style::default(), &[marker, content]));
+            let row = self.node(Style::default(), &[marker, content]);
+            self.note(row, Semantic::ListItem(if ordered { Bullet::Number(index as u32 + 1) } else { Bullet::Dot }));
+            rows.push(row);
         }
         self.node(column(), &rows)
     }
@@ -381,8 +422,10 @@ impl<'a, 'env> Flow<'a, 'env> {
     fn table(&mut self, rows: &[Vec<Vec<Span>>], align: Align) -> NodeId {
         let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
         let mut cells = Vec::new();
+        let mut native_rows = Vec::with_capacity(rows.len());
         for (r, row) in rows.iter().enumerate() {
             let look = TextLook { bold: r == 0 || self.region.bold, ..self.region_look() };
+            let mut native_row = Vec::with_capacity(row.len());
             for (c, spans) in row.iter().enumerate() {
                 let style = Style {
                     grid_row: line(r as i16 + 1),
@@ -390,9 +433,12 @@ impl<'a, 'env> Flow<'a, 'env> {
                     padding: length(CELL_PADDING),
                     ..Style::default()
                 };
-                let runs = spans.iter().map(|span| self.run(span, look)).collect();
-                cells.push(self.leaf(style, Content::Text(Leaf { runs, align, wraps: true, frame: Frame::Outline })));
+                let (runs, native) = self.runs(spans, look);
+                let cell = self.leaf(style, Content::Text(Leaf { runs, align, wraps: true, frame: Frame::Outline }));
+                native_row.push((cell, NativeParagraph::new(native, align)));
+                cells.push(cell);
             }
+            native_rows.push(native_row);
         }
         let style = Style {
             display: Display::Grid,
@@ -401,27 +447,37 @@ impl<'a, 'env> Flow<'a, 'env> {
             padding: taffy::Rect { left: zero(), top: zero(), right: length(OUTLINE), bottom: length(OUTLINE) },
             ..Style::default()
         };
-        self.node(style, &cells)
+        let table = self.node(style, &cells);
+        self.note(table, Semantic::Table(native_rows));
+        table
     }
 
     fn code(&mut self, language: Option<&str>, code: &str) -> NodeId {
         let tag = &self.text_tag_style;
         let tag_color = tag.color.as_deref().and_then(Color::parse);
-        let runs = highlight(code, language)
-            .into_iter()
-            .flatten()
-            .map(|(color, text)| TextRun {
-                text,
-                size: tag.size.map_or(CODE_SIZE, |size| size as f32),
-                bold: tag.bold,
-                italic: tag.italic,
-                underline: tag.underline,
-                color: tag_color.unwrap_or(color),
-                family: self.theme.mono_font.clone(),
-            })
-            .collect();
+        let mut runs = Vec::new();
+        let mut lines = Vec::new();
+        for line in highlight(code, language) {
+            let mut native = Vec::with_capacity(line.len());
+            for (color, text) in line {
+                let run = TextRun {
+                    text,
+                    size: tag.size.map_or(CODE_SIZE, |size| size as f32),
+                    bold: tag.bold,
+                    italic: tag.italic,
+                    underline: tag.underline,
+                    color: tag_color.unwrap_or(color),
+                    family: self.theme.mono_font.clone(),
+                };
+                native.push(NativeRun::new(&run, None));
+                runs.push(run);
+            }
+            lines.push(NativeParagraph::new(without_line_ending(native), Align::Left));
+        }
         let style = Style { padding: length(CODE_PADDING), ..Style::default() };
-        self.leaf(style, Content::Text(Leaf { runs, align: Align::Left, wraps: true, frame: Frame::Panel }))
+        let node = self.leaf(style, Content::Text(Leaf { runs, align: Align::Left, wraps: true, frame: Frame::Panel }));
+        self.note(node, Semantic::Code(lines));
+        node
     }
 
     /// Adds what `node` and its children draw. `parent` is the corner of `node`'s parent.
@@ -467,6 +523,19 @@ impl<'a, 'env> Flow<'a, 'env> {
             }
         }
     }
+}
+
+/// One line of code's runs, with its line ending gone. An empty line keeps one empty run,
+/// so that it stays as tall as the others.
+fn without_line_ending(mut runs: Vec<NativeRun>) -> Vec<NativeRun> {
+    while let Some(last) = runs.last_mut() {
+        last.text.truncate(last.text.trim_end_matches(['\r', '\n']).len());
+        if !last.text.is_empty() || runs.len() == 1 {
+            break;
+        }
+        runs.pop();
+    }
+    runs
 }
 
 pub(crate) fn rounded_rect(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<Path> {

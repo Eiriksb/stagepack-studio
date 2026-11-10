@@ -12,7 +12,8 @@ use toolkit::{Color, Ctx, Element, Props, ShapeKind, Theme};
 use crate::flow::{Content, Flow, TEXT_TAG, column, rounded_rect, rounded_rect_with};
 use crate::pictures::{icon_pixmap, path_pixmap};
 use crate::slide::{MAX_SIZE, SLIDE_HEIGHT, SLIDE_WIDTH, is_positioned};
-use crate::{Align, DisplayItem, LayoutEnv, Notice, PLACEMENT_ATTRS, RegionDef, layout_by_name};
+use crate::native::Semantic;
+use crate::{Align, DisplayItem, LayoutEnv, NativeContent, NativeElement, Notice, PLACEMENT_ATTRS, RegionDef, layout_by_name};
 
 const DEFAULT_WIDTH: f32 = 400.0;
 const DEFAULT_HEIGHT: f32 = 200.0;
@@ -32,6 +33,31 @@ pub(crate) struct ShapeLook {
     outline: Option<Color>,
     outline_width: f32,
     radius: f32,
+}
+
+impl ShapeLook {
+    fn drawn_radius(&self) -> f32 {
+        if self.radius > 0.0 { self.radius } else { DEFAULT_RADIUS }
+    }
+
+    /// The shape for export, in the colours and sizes `shape_items` draws it with, and
+    /// with no text yet.
+    pub(crate) fn native(&self, theme: &Theme) -> NativeContent {
+        let (fill, outline, outline_width) = if matches!(self.kind, ShapeKind::Line | ShapeKind::Arrow) {
+            let (color, width) = self.line_look(theme);
+            (None, Some(color), width)
+        } else {
+            (self.fill, self.outline.filter(|_| self.outline_width > 0.0), self.outline_width)
+        };
+        let radius = if matches!(self.kind, ShapeKind::Rounded | ShapeKind::Callout) { self.drawn_radius() } else { 0.0 };
+        NativeContent::Shape { kind: self.kind, fill, outline, outline_width, radius, paragraphs: Vec::new() }
+    }
+
+    /// The colour and width of a line: the outline colour or, with no outline, the fill.
+    fn line_look(&self, theme: &Theme) -> (Color, f32) {
+        let color = self.outline.or(self.fill).unwrap_or(theme.text);
+        (color, if self.outline_width > 0.0 { self.outline_width } else { DEFAULT_LINE_WIDTH })
+    }
 }
 
 /// A number from a talk or a component, held to what can be drawn.
@@ -87,15 +113,15 @@ fn positioned_tag_region() -> &'static RegionDef {
     &layout_by_name("blank").expect("the blank layout exists").regions[0]
 }
 
-/// Lays out a tag with a layer of its own, and returns the size of its box and its
-/// drawing. `wanted` is the width and height the tag gives.
+/// Lays out a tag with a layer of its own, and returns the size of its box, its drawing
+/// and what it is. `wanted` is the width and height the tag gives.
 pub(crate) fn lay_out_positioned_tag(
     tag: &Tag,
     wanted: (Option<f32>, Option<f32>),
     theme: &Theme,
     env: &mut LayoutEnv,
     notices: &mut Vec<Notice>,
-) -> ((f32, f32), Vec<DisplayItem>) {
+) -> ((f32, f32), Vec<DisplayItem>, Vec<NativeElement>) {
     let mut flow = Flow::new(positioned_tag_region(), theme, env, notices);
     let element = flow.render_tag(tag);
     let natural = element.as_ref().and_then(|element| flow.natural_size(element));
@@ -110,7 +136,8 @@ pub(crate) fn lay_out_positioned_tag(
         ..Style::default()
     };
     let root = flow.node(style, content.as_slice());
-    ((w, h), flow.finish(root, w))
+    let (items, native) = flow.finish(root, w);
+    ((w, h), items, native)
 }
 
 impl Flow<'_, '_> {
@@ -205,7 +232,7 @@ impl Flow<'_, '_> {
                 };
                 Some(self.node_with_content(style, content.as_slice(), Content::Shape(look)))
             }
-            Element::Picture { src, width, height } => Some(self.picture(src, *width, *height, align, boxed)),
+            Element::Picture { src, width, height } => Some(self.picture(src, "", *width, *height, align, boxed)),
             Element::Icon { name, size, color } => Some(self.icon(name, *size, *color, align)),
             Element::Path { data, width, height, fill } => Some(self.path(data, *width, *height, *fill, align)),
             Element::Children => self.child_blocks(blocks, align),
@@ -227,7 +254,9 @@ impl Flow<'_, '_> {
             align_self: Some(AlignSelf::STRETCH),
             ..Style::default()
         };
-        Some(self.node(style, &nodes))
+        let stack = self.node(style, &nodes);
+        self.note(stack, Semantic::Stack);
+        Some(stack)
     }
 
     fn child_blocks(&mut self, blocks: &[Block], align: Align) -> Option<NodeId> {
@@ -240,12 +269,14 @@ impl Flow<'_, '_> {
 
     /// A picture, or its placeholder. With no size set and no box, it is the size of the
     /// picture, shrunk to fit its column.
-    pub(crate) fn picture(&mut self, src: &str, width: f32, height: f32, align: Align, boxed: bool) -> NodeId {
+    pub(crate) fn picture(&mut self, src: &str, alt: &str, width: f32, height: f32, align: Align, boxed: bool) -> NodeId {
         match self.env.pictures.get(src, self.env.files) {
             Some(picture) => {
                 let style =
                     Style { size: size_of(width, height, boxed), align_self: along_column(align), ..Style::default() };
-                self.leaf(style, Content::Picture(picture))
+                let node = self.leaf(style, Content::Picture(picture));
+                self.note(node, Semantic::File { src: src.to_string(), alt: alt.to_string() });
+                node
             }
             None => {
                 self.notice(format!("Can't show the picture {src}"));
@@ -302,7 +333,7 @@ fn closed_path(look: &ShapeLook, x: f32, y: f32, w: f32, h: f32) -> Option<Path>
     if w <= 0.0 || h <= 0.0 {
         return None;
     }
-    let radius = if look.radius > 0.0 { look.radius } else { DEFAULT_RADIUS };
+    let radius = look.drawn_radius();
     match look.kind {
         ShapeKind::Rounded => rounded_rect(x, y, w, h, radius),
         ShapeKind::Ellipse => PathBuilder::from_oval(tiny_skia::Rect::from_xywh(x, y, w, h)?),
@@ -333,8 +364,7 @@ fn line_items(look: &ShapeLook, x: f32, y: f32, w: f32, h: f32, theme: &Theme) -
     if length == 0.0 {
         return Vec::new();
     }
-    let color = look.outline.or(look.fill).unwrap_or(theme.text);
-    let width = if look.outline_width > 0.0 { look.outline_width } else { DEFAULT_LINE_WIDTH };
+    let (color, width) = look.line_look(theme);
     let (start, end) = ((x, y), (x + w, y + h));
     let mut items = Vec::new();
     let mut shaft_end = end;

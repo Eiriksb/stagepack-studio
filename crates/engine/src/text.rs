@@ -32,7 +32,7 @@ const LINE_HEIGHT: f32 = 1.25;
 pub(crate) const MIN_TEXT_SIZE: f32 = 1.0;
 pub(crate) const MAX_TEXT_SIZE: f32 = 512.0;
 
-fn limited_size(size: f32) -> f32 {
+pub(crate) fn limited_size(size: f32) -> f32 {
     if size.is_finite() {
         size.clamp(MIN_TEXT_SIZE, MAX_TEXT_SIZE)
     } else {

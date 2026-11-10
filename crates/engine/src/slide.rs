@@ -7,6 +7,7 @@ use toolkit::{Color, Registry, Theme};
 use crate::elements::lay_out_positioned_tag;
 use crate::flow::{flow_region, flow_region_each};
 use crate::timeline::{MAX_CLICK, RegionClick, read_region_timing, read_tag_timing, read_transition};
+use crate::native::placeholder_element;
 use crate::placeholder::placeholder_items;
 use crate::{DisplayItem, Enter, Fonts, LayerSpec, LayoutDef, Notice, PictureCache, Rect, RegionDef, TalkFiles, Transition, layout_by_name};
 
@@ -80,6 +81,7 @@ pub fn layout_slide(talk: &Talk, index: usize, env: &mut LayoutEnv) -> LaidOutSl
         let line = region_line(slide, region);
         let timing = read_region_timing(line, &mut notices);
         let source = first.range().start..last.range().end;
+        let is_title = region.name == "title";
         let mut click = match timing.click {
             RegionClick::Step(click) => Some(click),
             RegionClick::Each => Some(1),
@@ -103,6 +105,9 @@ pub fn layout_slide(talk: &Talk, index: usize, env: &mut LayoutEnv) -> LaidOutSl
                             items: piece.items,
                             click: Some((step as u32 + 1).min(MAX_CLICK)),
                             enter: timing.enter,
+                            native: piece.native,
+                            // A slide has one title, so only the first piece is it.
+                            is_title: is_title && step == 0,
                         });
                     }
                     continue;
@@ -110,8 +115,8 @@ pub fn layout_slide(talk: &Talk, index: usize, env: &mut LayoutEnv) -> LaidOutSl
                 click = Some(1);
             }
         }
-        let items = flow_region(blocks, region, rect.w, &theme, env, &mut notices);
-        layers.push(LayerSpec { source: Some(source), rect, rotate, items, click, enter: timing.enter });
+        let (items, native) = flow_region(blocks, region, rect.w, &theme, env, &mut notices);
+        layers.push(LayerSpec { source: Some(source), rect, rotate, items, click, enter: timing.enter, native, is_title });
     }
     for block in &slide.blocks {
         if let Block::Tag(tag) = block
@@ -171,7 +176,7 @@ fn positioned_layer(tag: &Tag, theme: &Theme, env: &mut LayoutEnv, notices: &mut
             notices.push(notice);
         }
     }
-    let ((w, h), items) = lay_out_positioned_tag(tag, (place.w, place.h), theme, env, notices);
+    let ((w, h), items, native) = lay_out_positioned_tag(tag, (place.w, place.h), theme, env, notices);
     LayerSpec {
         source: Some(tag.range.clone()),
         rect: Rect { x: place.x.unwrap_or(0.0), y: place.y.unwrap_or(0.0), w, h },
@@ -179,13 +184,24 @@ fn positioned_layer(tag: &Tag, theme: &Theme, env: &mut LayoutEnv, notices: &mut
         items,
         click: place.click,
         enter: place.enter,
+        native,
+        is_title: false,
     }
 }
 
 /// What a slide that couldn't be parsed shows: the reason, across the whole slide.
 fn error_layer(slide: &Slide, message: &str, theme: &Theme, fonts: &mut Fonts) -> LayerSpec {
     let rect = Rect { x: 0.0, y: 0.0, w: SLIDE_WIDTH, h: SLIDE_HEIGHT };
-    LayerSpec { source: Some(slide.range.clone()), rect, rotate: 0.0, items: placeholder_items(message, rect, theme, fonts), click: None, enter: Enter::Appear }
+    LayerSpec {
+        source: Some(slide.range.clone()),
+        rect,
+        rotate: 0.0,
+        items: placeholder_items(message, rect, theme, fonts),
+        click: None,
+        enter: Enter::Appear,
+        native: vec![placeholder_element(message, rect, theme)],
+        is_title: false,
+    }
 }
 
 fn slide_layout(slide: &Slide, notices: &mut Vec<Notice>) -> &'static LayoutDef {
@@ -271,5 +287,7 @@ fn background(theme: &Theme) -> LayerSpec {
         items: vec![DisplayItem::Fill { path: PathBuilder::from_rect(area), color: theme.background }],
         click: None,
         enter: Enter::Appear,
+        native: Vec::new(),
+        is_title: false,
     }
 }

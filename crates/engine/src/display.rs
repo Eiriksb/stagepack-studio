@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use toolkit::Color;
 
-use crate::{Enter, ShapedText};
+use crate::{Enter, NativeElement, ShapedText};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rect {
@@ -32,6 +32,10 @@ pub struct LayerSpec {
     /// The click this layer appears on, or `None` if it's there from the start.
     pub click: Option<u32>,
     pub enter: Enter,
+    /// What the layer is made of, for export. The background has nothing here.
+    pub native: Vec<NativeElement>,
+    /// Whether this layer is the slide's title.
+    pub is_title: bool,
 }
 
 /// A drawn element in device pixels, placed at (`x`, `y`) on the slide. It has no
