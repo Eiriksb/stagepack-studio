@@ -103,9 +103,7 @@ pub fn split_slides(source: &str) -> Vec<RawSlide> {
 
 /// If the break at `at` opens a settings block, the index of its closing line.
 fn settings_close(all: &[Line<'_>], at: usize) -> Option<usize> {
-    if parse_entry(all.get(at + 1)?.text, 0).is_none() {
-        return None;
-    }
+    parse_entry(all.get(at + 1)?.text, 0)?;
     for (j, l) in all.iter().enumerate().skip(at + 1) {
         if is_break(l.text) {
             return Some(j);

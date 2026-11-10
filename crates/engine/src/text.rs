@@ -274,7 +274,7 @@ pub fn draw_text(target: &mut PixmapMut, text: &ShapedText, fonts: &mut Fonts, t
             let Some(mut bitmap) = Pixmap::new(image.placement.width, image.placement.height) else {
                 continue;
             };
-            for (pixel, rgba) in bitmap.pixels_mut().iter_mut().zip(image.data.chunks_exact(4)) {
+            for (pixel, rgba) in bitmap.pixels_mut().iter_mut().zip(image.data.as_chunks::<4>().0) {
                 *pixel = ColorU8::from_rgba(rgba[0], rgba[1], rgba[2], rgba[3]).premultiply();
             }
             let paint = PixmapPaint { quality: FilterQuality::Bilinear, ..PixmapPaint::default() };

@@ -64,7 +64,7 @@ fn characters_nothing_covers_raise_a_notice() {
 fn wrapping_respects_the_width() {
     let mut fonts = Fonts::bundled_only();
     let long = run("word ".repeat(40).trim());
-    let wrapped = shape_text(&mut fonts, &[long.clone()], Some(400.0), Align::Left);
+    let wrapped = shape_text(&mut fonts, std::slice::from_ref(&long), Some(400.0), Align::Left);
     let single = shape_text(&mut fonts, &[long], None, Align::Left);
     assert!(wrapped.height > single.height * 2.0);
     assert!(wrapped.width <= 400.0);

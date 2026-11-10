@@ -100,7 +100,7 @@ fn name_utf16le(font: &Bytes, table: u64, name_id: u16) -> Result<Vec<u8>, Strin
     let Some((length, offset)) = found else { return Ok(Vec::new()) };
     let big_endian = font.slice(strings + offset, length)?;
     let mut little_endian = vec![0u8; big_endian.len()];
-    for (out, pair) in little_endian.chunks_exact_mut(2).zip(big_endian.chunks_exact(2)) {
+    for (out, pair) in little_endian.as_chunks_mut::<2>().0.iter_mut().zip(big_endian.as_chunks::<2>().0) {
         out[0] = pair[1];
         out[1] = pair[0];
     }
@@ -108,7 +108,7 @@ fn name_utf16le(font: &Bytes, table: u64, name_id: u16) -> Result<Vec<u8>, Strin
 }
 
 fn decode(utf16le: &[u8]) -> String {
-    let units: Vec<u16> = utf16le.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
+    let units: Vec<u16> = utf16le.as_chunks::<2>().0.iter().map(|p| u16::from_le_bytes(*p)).collect();
     String::from_utf16_lossy(&units)
 }
 
