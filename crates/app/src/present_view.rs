@@ -60,7 +60,9 @@ struct Reveal {
 struct Arrival {
     left: Place,
     transition: Transition,
-    began: Instant,
+    /// When its first frame was drawn. Until then none of it has been seen, however long
+    /// getting the slide ready takes.
+    began: Option<Instant>,
 }
 
 /// One of a show's windows, and what's in it.
@@ -147,7 +149,7 @@ impl Presentation {
                 self.arrival = (transition != Transition::None).then_some(Arrival {
                     left,
                     transition,
-                    began,
+                    began: None,
                 });
             }
             Moved::BackedUp | Moved::Stayed => return,
@@ -231,8 +233,18 @@ impl Presentation {
 
     fn arrival_at(&self, now: Instant) -> Option<(Arrival, f32)> {
         let arrival = self.arrival?;
-        let seconds = now.saturating_duration_since(arrival.began).as_secs_f32();
+        let Some(began) = arrival.began else {
+            return Some((arrival, 0.0));
+        };
+        let seconds = now.saturating_duration_since(began).as_secs_f32();
         (seconds < TRANSITION_SECONDS).then_some((arrival, seconds))
+    }
+
+    /// Starts the clock of the slide being arrived at, if this is its first frame.
+    fn first_frame_drawn(&mut self, now: Instant) {
+        if let Some(arrival) = &mut self.arrival {
+            arrival.began.get_or_insert(now);
+        }
     }
 }
 
@@ -366,6 +378,7 @@ impl AudienceView {
     /// Brings the canvases to this moment, and asks for another frame if anything is moving.
     fn animate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let now = cx.background_executor().now();
+        self.show.update(cx, |show, _| show.first_frame_drawn(now));
         let show = self.show.read(cx);
         let step = show.session.place().step;
         let arrival = show.arrival_at(now);

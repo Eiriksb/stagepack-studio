@@ -94,13 +94,18 @@ impl SlideCanvas {
         cx.notify();
     }
 
+    /// How the whole slide looks, as last set.
+    pub fn slide_look(&self) -> SlideLook {
+        self.slide_look
+    }
+
     /// The scale to draw layers at: the slide's width in device pixels over 1920. `None`
     /// until the first paint has measured the slide.
     pub fn scale(&self) -> Option<f32> {
         self.scale
     }
 
-    /// The image of each layer showing, first to last.
+    /// The image of every layer, first to last, hidden ones included.
     pub fn images(&self) -> Vec<Arc<RenderImage>> {
         self.sprites
             .iter()

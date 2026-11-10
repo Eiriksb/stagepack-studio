@@ -9,7 +9,7 @@ use gpui_kit::{
 };
 use slides_engine::Fonts;
 use stagepack_studio::document::Document;
-use stagepack_studio::present::LayerLook;
+use stagepack_studio::present::{LayerLook, SlideLook, ease};
 use stagepack_studio::present_view::{
     AUDIENCE_ID, AudienceView, COUNTER_ID, CURRENT_ID, NEXT_ID, NOTES_ID, Presentation,
     PresenterView, TIMER_ID, start_show,
@@ -158,6 +158,10 @@ fn looks(cx: &TestAppContext, canvas: &Entity<SlideCanvas>) -> Vec<LayerLook> {
 
 fn shown(cx: &TestAppContext, canvas: &Entity<SlideCanvas>) -> Vec<bool> {
     looks(cx, canvas).iter().map(|look| look.visible).collect()
+}
+
+fn slide_look(cx: &TestAppContext, canvas: &Entity<SlideCanvas>) -> SlideLook {
+    cx.read(|cx| canvas.read(cx).slide_look())
 }
 
 fn outgoing(cx: &TestAppContext, view: &Entity<AudienceView>) -> Option<Entity<SlideCanvas>> {
@@ -436,6 +440,23 @@ fn a_transition_releases_the_old_slide(cx: &mut TestAppContext) {
     frames_asked_for(cx, show.audience);
     settle(cx, show.audience);
     assert_eq!(frames_asked_for(cx, show.audience), 0, "it's over");
+}
+
+#[gpui_kit::test]
+fn a_transition_starts_on_its_first_frame(cx: &mut TestAppContext) {
+    let show = rehearse(cx, FADES);
+    let executor = cx.executor();
+    // Inside one update, so that the time passes before anything is drawn.
+    cx.update(|cx| {
+        show.show.update(cx, |show, cx| show.next(cx));
+        // However long getting the new slide ready takes, none of the fade has been seen yet.
+        executor.advance_clock(Duration::from_millis(100));
+    });
+    assert_eq!(slide_look(cx, &show.canvas(cx)).opacity, 0.0);
+
+    wait(cx, &show, 250);
+    let halfway = slide_look(cx, &show.canvas(cx)).opacity;
+    assert!((halfway - ease(0.5)).abs() < 1e-4, "{halfway}");
 }
 
 #[gpui_kit::test]
