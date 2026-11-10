@@ -80,6 +80,12 @@ impl Fonts {
         Fonts::build(true)
     }
 
+    /// The bytes of the file a face lives in, and its index in that file. `None` if the
+    /// face is gone or its file can't be read.
+    pub fn face_bytes(&mut self, id: fontdb::ID) -> Option<(Arc<Vec<u8>>, u32)> {
+        self.system.db().with_face_data(id, |data, index| (Arc::new(data.to_vec()), index))
+    }
+
     /// A font that travels inside the talk file.
     pub fn load_talk_font(&mut self, data: Vec<u8>) {
         let ids = self

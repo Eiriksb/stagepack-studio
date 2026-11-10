@@ -1,0 +1,15 @@
+[package]
+name = "slides-pdf"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+slides-engine = { path = "../engine" }
+toolkit = { path = "../toolkit" }
+cosmic-text = "=0.19.0"
+krilla = "=0.8.2"
+tiny-skia = "=0.11.4"
+
+[dev-dependencies]
+tempfile = "3"

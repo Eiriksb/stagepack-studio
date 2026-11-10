@@ -220,6 +220,13 @@ impl Deck {
         &self.slides[index].laid.as_ref().expect("the slide was just laid out").specs
     }
 
+    /// A slide's specs together with the fonts, for code that draws text from them.
+    pub fn specs_and_fonts(&mut self, index: usize) -> (&[LayerSpec], &mut Fonts) {
+        self.lay_out(index);
+        let laid = self.slides[index].laid.as_ref().expect("the slide was just laid out");
+        (&laid.specs, &mut self.fonts)
+    }
+
     /// The talk's look.
     pub fn theme(&self) -> toolkit::Theme {
         talk_theme(&self.talk)
