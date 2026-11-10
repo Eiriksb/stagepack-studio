@@ -1,0 +1,13 @@
+[package]
+name = "slides-pptx"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+slides-engine = { path = "../engine" }
+toolkit = { path = "../toolkit" }
+zip = { version = "=9.5.0", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+quick-xml = "=0.41.0"

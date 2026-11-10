@@ -6750,6 +6750,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "slides-pptx"
+version = "0.1.0"
+dependencies = [
+ "quick-xml 0.41.0",
+ "slides-engine",
+ "toolkit",
+ "zip",
+]
+
+[[package]]
 name = "slotmap"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
