@@ -75,6 +75,44 @@ fn a_named_pipe_reads_as_absent_without_waiting_for_a_writer() {
 }
 
 #[test]
+fn a_talks_text_is_read_as_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slides.md");
+    std::fs::write(&path, "# Hei på deg\n").unwrap();
+    assert_eq!(read_talk_text(&path).unwrap(), "# Hei på deg\n");
+}
+
+#[test]
+fn a_talks_text_over_the_limit_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slides.md");
+    // Sparse, so the test costs no disk.
+    std::fs::File::create(&path).unwrap().set_len(MAX_FILE_BYTES + 1).unwrap();
+    assert!(read_talk_text(&path).unwrap_err().to_string().contains("limit"));
+}
+
+#[test]
+fn a_talks_text_that_is_not_utf8_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slides.md");
+    std::fs::write(&path, [0xFF, 0xFE, 0x00]).unwrap();
+    assert!(read_talk_text(&path).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_named_pipe_is_refused_as_a_talks_text_without_waiting_for_a_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slides.md");
+    let made = std::process::Command::new("mkfifo").arg(&path).status().unwrap();
+    assert!(made.success());
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || done.send(read_talk_text(&path).is_err()));
+    let refused = finished.recv_timeout(std::time::Duration::from_secs(5)).expect("the read waited for a writer");
+    assert!(refused);
+}
+
+#[test]
 fn a_folder_reads_as_absent() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("assets")).unwrap();

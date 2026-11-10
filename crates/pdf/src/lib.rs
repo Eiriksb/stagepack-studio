@@ -134,12 +134,73 @@ fn image_from_pixmap(pixmap: &tiny_skia::Pixmap) -> Option<Image> {
 
 /// A JPEG file as itself. `decode` in the engine's `pictures.rs` ignores an EXIF orientation, and
 /// so does a PDF reader, so the page shows it the way the slide does. What it's named doesn't
-/// matter: only the file's first bytes say it's a JPEG.
+/// matter: only the file's first bytes say it's a JPEG. One with four channels is CMYK, which a
+/// PDF reader shows in other colours than the slide has, so that one isn't taken as it is.
 fn image_from_jpeg(bytes: Vec<u8>) -> Option<Image> {
-    if !bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+    if !bytes.starts_with(&[0xFF, 0xD8, 0xFF]) || !matches!(jpeg_channels(&bytes), Some(1 | 3)) {
         return None;
     }
     Image::from_jpeg(bytes.into(), true).ok()
+}
+
+/// How many colour channels a JPEG has, from its frame header. `None` if it hasn't got one.
+fn jpeg_channels(bytes: &[u8]) -> Option<u8> {
+    let mut at = 2;
+    loop {
+        let (mark, marker) = (*bytes.get(at)?, *bytes.get(at + 1)?);
+        if mark != 0xFF {
+            return None;
+        }
+        if marker == 0xFF {
+            at += 1;
+            continue;
+        }
+        // Every 0xCn is a frame header, but for the three that are something else.
+        if matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+            return bytes.get(at + 9).copied();
+        }
+        let length = u16::from_be_bytes([*bytes.get(at + 2)?, *bytes.get(at + 3)?]);
+        at += 2 + usize::from(length);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{image_from_jpeg, jpeg_channels};
+
+    /// A JPEG's opening as far as its frame header: an empty APP0 segment, then the frame.
+    fn jpeg_start(frame_marker: u8, channels: u8) -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x02];
+        bytes.extend([0xFF, frame_marker, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01, channels]);
+        bytes
+    }
+
+    #[test]
+    fn the_frame_header_says_how_many_channels_a_jpeg_has() {
+        assert_eq!(jpeg_channels(&jpeg_start(0xC0, 3)), Some(3));
+        assert_eq!(jpeg_channels(&jpeg_start(0xC2, 1)), Some(1));
+        assert_eq!(jpeg_channels(&jpeg_start(0xC0, 4)), Some(4));
+    }
+
+    #[test]
+    fn a_table_of_codes_is_not_a_frame_header() {
+        let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x03, 0x07];
+        bytes.extend(&jpeg_start(0xC0, 3)[2..]);
+        assert_eq!(jpeg_channels(&bytes), Some(3));
+    }
+
+    #[test]
+    fn a_jpeg_cut_short_has_no_channels_to_tell_of() {
+        assert_eq!(jpeg_channels(&[0xFF, 0xD8, 0xFF]), None);
+        assert_eq!(jpeg_channels(&[0xFF, 0xD8, 0xFF, 0xE0, 0xFF, 0xFF]), None);
+        assert_eq!(jpeg_channels(&[0xFF, 0xD8, 0x00, 0x00]), None);
+        assert_eq!(jpeg_channels(&jpeg_start(0xC0, 3)[..14]), None);
+    }
+
+    #[test]
+    fn a_cmyk_jpeg_is_not_taken_as_it_is() {
+        assert!(image_from_jpeg(jpeg_start(0xC0, 4)).is_none());
+    }
 }
 
 /// The picture to embed. One from a file of the talk is made once, however often it's used.

@@ -316,7 +316,7 @@ impl WorkspaceView {
         self.pending_reload = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(RELOAD_DELAY).await;
             let contents = cx
-                .background_spawn(async move { std::fs::read_to_string(file).ok() })
+                .background_spawn(async move { slides_engine::read_talk_text(&file).ok() })
                 .await;
             this.update(cx, |this, cx| this.reload(contents, cx)).ok();
         }));

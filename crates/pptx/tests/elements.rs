@@ -255,7 +255,7 @@ fn a_link_is_trimmed_and_written_in_its_normal_form() {
 
 #[test]
 fn a_link_that_is_not_a_web_or_mail_address_has_no_target() {
-    for url in ["https://exa mple.com/a", "http://", "javascript:alert(1)", "file:///etc/passwd", "\\\\server\\share", "/a/b", ""] {
+    for url in ["https://exa mple.com/a", "mailto:a b@example.com", "http://", "javascript:alert(1)", "file:///etc/passwd", "\\\\server\\share", "/a/b", ""] {
         assert_eq!(text::link_target(url), None, "{url:?}");
     }
 }

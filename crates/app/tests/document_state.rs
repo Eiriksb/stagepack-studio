@@ -504,12 +504,30 @@ fn only_font_files_right_in_the_font_folder_of_a_pack_are_fonts() {
 fn fonts_past_what_a_talk_can_bring_are_left_out() {
     let (_dir, folder) = talk_folder();
     std::fs::write(folder.join("assets/fonts/a.ttf"), font_only_a_talk_has()).unwrap();
-    // Sparse, so that this costs the test some memory for a moment and no disk.
-    let enormous = File::create(folder.join("assets/fonts/b.ttf")).unwrap();
-    enormous.set_len(257 * 1024 * 1024).unwrap();
+    // Sparse, so that this costs the test some memory for a moment and no disk. Each is small
+    // enough to read, and together they're more than a talk can bring.
+    for name in ["b.ttf", "c.ttf"] {
+        let big = File::create(folder.join("assets/fonts").join(name)).unwrap();
+        big.set_len(129 * 1024 * 1024).unwrap();
+    }
     drawn_title(&folder);
     let doc = Document::open(&folder, Fonts::bundled_only()).unwrap();
-    assert_eq!(doc.export_input().talk_fonts, vec![Arc::new(font_only_a_talk_has())]);
+    let talk_fonts = doc.export_input().talk_fonts;
+    assert_eq!(talk_fonts.len(), 2);
+    assert_eq!(talk_fonts[0], Arc::new(font_only_a_talk_has()));
+}
+
+#[test]
+fn a_slides_file_over_the_limit_is_refused_and_the_folder_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let huge = File::create(dir.path().join("slides.md")).unwrap();
+    // Sparse, so the test costs no disk.
+    huge.set_len(slides_engine::MAX_FILE_BYTES + 1).unwrap();
+    let Err(problem) = Document::open(dir.path(), Fonts::bundled_only()) else {
+        panic!("a file that size should not open");
+    };
+    assert!(problem.contains(&dir.path().display().to_string()), "{problem}");
+    assert!(problem.contains("limit"), "{problem}");
 }
 
 #[test]

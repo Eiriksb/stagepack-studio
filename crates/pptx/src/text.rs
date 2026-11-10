@@ -117,7 +117,9 @@ fn rpr(look: &Look, ctx: &mut TextCtx, tag: &str) -> String {
 /// talk can't put a file, a network share or a script behind a click in somebody's PowerPoint.
 pub fn link_target(url: &str) -> Option<String> {
     let parsed = url::Url::parse(url.trim()).ok()?;
-    ["http", "https", "mailto"].contains(&parsed.scheme()).then(|| parsed.to_string())
+    let written = parsed.to_string();
+    // The parser leaves a space alone in a mail address.
+    (["http", "https", "mailto"].contains(&parsed.scheme()) && !written.contains(char::is_whitespace)).then_some(written)
 }
 
 fn run_look(run: &NativeRun, with_link: bool) -> Look<'_> {

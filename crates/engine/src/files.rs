@@ -1,7 +1,7 @@
 //! Reading the files that belong to a talk.
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
@@ -61,20 +61,36 @@ impl FolderFiles {
 
 /// The bytes of the regular file at `path`, if it's within `MAX_FILE_BYTES`. Its kind is asked
 /// first, as opening a named pipe waits until something writes to it.
-fn read_bounded(path: &Path) -> Option<Vec<u8>> {
-    let metadata = std::fs::metadata(path).ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
-        return None;
+fn read_bounded(path: &Path) -> io::Result<Vec<u8>> {
+    let too_big = || {
+        let limit = MAX_FILE_BYTES / (1024 * 1024);
+        io::Error::new(io::ErrorKind::InvalidData, format!("it's over the limit of {limit} MiB"))
+    };
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "it isn't a regular file"));
+    }
+    if metadata.len() > MAX_FILE_BYTES {
+        return Err(too_big());
     }
     let mut bytes = Vec::new();
     // Bounded, in case the file grows while it is read.
-    File::open(path).ok()?.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes).ok()?;
-    (bytes.len() as u64 <= MAX_FILE_BYTES).then_some(bytes)
+    File::open(path)?.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(too_big());
+    }
+    Ok(bytes)
+}
+
+/// The text of a folder talk's own `slides.md`, held to the same rules as the files it uses.
+pub fn read_talk_text(path: &Path) -> io::Result<String> {
+    String::from_utf8(read_bounded(path)?)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "it isn't UTF-8 text"))
 }
 
 impl TalkFiles for FolderFiles {
     fn read(&self, path: &str) -> Option<Vec<u8>> {
-        read_bounded(&self.resolve(path)?)
+        read_bounded(&self.resolve(path)?).ok()
     }
 
     fn stamp(&self, path: &str) -> Option<(u64, SystemTime)> {

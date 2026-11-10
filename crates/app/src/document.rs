@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use slides_engine::{
     Deck, FolderFiles, Fonts, Layer, PackError, SlideTimeline, TalkFiles, Transition, open_packed,
-    pack_folder, unpack_to_folder,
+    pack_folder, read_talk_text, unpack_to_folder,
 };
 
 use crate::export::ExportInput;
@@ -114,7 +114,7 @@ pub struct Document {
 impl Document {
     /// Opens the talk kept in `folder`, along with any fonts it carries.
     pub fn open(folder: &Path, fonts: Fonts) -> Result<Document, String> {
-        let source = std::fs::read_to_string(folder.join(SLIDES_FILE)).map_err(|error| {
+        let source = read_talk_text(&folder.join(SLIDES_FILE)).map_err(|error| {
             format!(
                 "Could not read {SLIDES_FILE} in {}: {error}",
                 folder.display()
