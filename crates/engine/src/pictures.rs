@@ -1,9 +1,12 @@
 //! Reads a talk's pictures and draws icons, as pixmaps.
 
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hasher;
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
+use std::time::SystemTime;
 
 use image::{ImageReader, Limits};
 use resvg::usvg;
@@ -31,22 +34,66 @@ const ICON_VIEW_BOX: f32 = 32.0;
 
 const SVG_NAMESPACE: &str = "http://www.w3.org/2000/svg";
 
+/// What tells a file from a later version of itself: its stamp, or a hash of its bytes
+/// where there's no stamp to go by.
+#[derive(PartialEq)]
+enum FileVersion {
+    Stamp(u64, SystemTime),
+    Hash(u64),
+}
+
+impl FileVersion {
+    fn of_bytes(bytes: &[u8]) -> FileVersion {
+        let mut hasher = DefaultHasher::new();
+        hasher.write(bytes);
+        FileVersion::Hash(hasher.finish())
+    }
+
+    /// The version of `path` as it is now, or `None` if it can't be read.
+    fn of_file(path: &str, files: &dyn TalkFiles) -> Option<FileVersion> {
+        match files.stamp(path) {
+            Some((length, modified)) => Some(FileVersion::Stamp(length, modified)),
+            None => files.read(path).map(|bytes| FileVersion::of_bytes(&bytes)),
+        }
+    }
+}
+
+struct CachedPicture {
+    picture: Arc<Pixmap>,
+    version: FileVersion,
+}
+
 /// The pictures read so far, by their path in the talk. One that couldn't be read isn't
 /// kept, so it appears the next time its slide is laid out after the file is fixed.
 #[derive(Default)]
 pub struct PictureCache {
-    pictures: HashMap<String, Arc<Pixmap>>,
+    pictures: HashMap<String, CachedPicture>,
 }
 
 impl PictureCache {
     pub(crate) fn get(&mut self, path: &str, files: &dyn TalkFiles) -> Option<Arc<Pixmap>> {
-        if let Some(picture) = self.pictures.get(path) {
-            return Some(picture.clone());
+        if let Some(cached) = self.pictures.get(path) {
+            return Some(cached.picture.clone());
         }
+        // The stamp comes before the read, so a file that changes in between looks changed
+        // the next time it's checked, not current.
+        let stamp = files.stamp(path);
         let bytes = files.read(path)?;
+        let version = match stamp {
+            Some((length, modified)) => FileVersion::Stamp(length, modified),
+            None => FileVersion::of_bytes(&bytes),
+        };
         let picture = Arc::new(decode(path, &bytes)?);
-        self.pictures.insert(path.to_string(), picture.clone());
+        self.pictures.insert(path.to_string(), CachedPicture { picture: picture.clone(), version });
         Some(picture)
+    }
+
+    /// Forgets every picture whose file is no longer the one that was read, and says
+    /// whether there were any.
+    pub(crate) fn drop_replaced(&mut self, files: &dyn TalkFiles) -> bool {
+        let before = self.pictures.len();
+        self.pictures.retain(|path, cached| FileVersion::of_file(path, files).as_ref() == Some(&cached.version));
+        self.pictures.len() != before
     }
 }
 

@@ -109,6 +109,16 @@ fn absurd_rects_do_not_panic() {
 }
 
 #[test]
+fn a_layer_is_limited_by_pixel_count() {
+    let spec = layer_of(Rect { x: 0.0, y: 0.0, w: 16000.0, h: 16000.0 }, 0.0, DisplayItem::Fill { path: square(0.0, 0.0), color: RED });
+    let layer = render_layer(&spec, 1.0, &mut Fonts::bundled_only());
+    let (width, height) = (u64::from(layer.pixmap.width()), u64::from(layer.pixmap.height()));
+    assert!(width * height <= 64_000_000, "{width} by {height}");
+    assert!(width > 1 && height > 1 && width <= 16384 && height <= 16384, "{width} by {height}");
+    assert!(is_red(&layer, 50, 50), "what fits is still drawn");
+}
+
+#[test]
 fn frames_hold_straight_alpha_in_bgra_order() {
     let mut pixmap = tiny_skia::Pixmap::new(1, 1).unwrap();
     pixmap.pixels_mut()[0] = tiny_skia::ColorU8::from_rgba(255, 0, 0, 128).premultiply();

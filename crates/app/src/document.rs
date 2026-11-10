@@ -10,9 +10,10 @@ const FONTS_FOLDER: &str = "assets/fonts";
 
 /// What came of reading the talk's file again.
 pub enum Reload {
-    /// The talk took the new text. These are the slides to show again.
+    /// The talk took the new text, or a picture it shows was replaced. These are the
+    /// slides to show again.
     Changed(Vec<usize>),
-    /// The file says what it said before.
+    /// The file says what it said before, and its pictures are as they were.
     Unchanged,
     /// The read gave nothing to use, so the talk stays as it was.
     KeptLastGood,
@@ -90,10 +91,12 @@ impl Document {
         let Some(source) = contents.filter(|source| !source.is_empty()) else {
             return Reload::KeptLastGood;
         };
-        if source == self.source() {
+        let same_text = source == self.source();
+        // Even the same text goes through: a picture it shows may have been replaced.
+        let mut changed = self.deck.update(source);
+        if same_text && changed.is_empty() {
             return Reload::Unchanged;
         }
-        let mut changed = self.deck.update(source);
         let last = self.slide_count() - 1;
         if self.current > last {
             self.current = last;

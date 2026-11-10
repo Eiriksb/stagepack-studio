@@ -216,6 +216,29 @@ fn saving_the_same_bytes_changes_nothing() {
     ));
 }
 
+fn one_colour_svg(color: &str) -> String {
+    format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"8\" height=\"8\"><rect width=\"8\" height=\"8\" fill=\"{color}\"/></svg>"
+    )
+}
+
+#[test]
+fn a_replaced_picture_counts_as_a_change() {
+    let source = "![](photo.svg)\n";
+    let (dir, mut doc) = talk(source);
+    let picture = dir.path().join("photo.svg");
+    std::fs::write(&picture, one_colour_svg("red")).unwrap();
+    doc.layers(1.0);
+
+    // A different length, so that it's a different file however soon it's written.
+    std::fs::write(&picture, one_colour_svg("blue")).unwrap();
+    assert!(matches!(doc.reload(Some(source.into())), Reload::Changed(s) if s == vec![0]));
+    assert!(
+        matches!(doc.reload(Some(source.into())), Reload::Unchanged),
+        "nothing has changed since"
+    );
+}
+
 #[test]
 fn empty_read_keeps_the_last_good_talk() {
     let (_d, mut doc) = talk("# One\n");

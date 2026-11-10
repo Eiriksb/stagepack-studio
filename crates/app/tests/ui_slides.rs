@@ -146,10 +146,16 @@ fn the_next_slide_replaces_the_images_and_releases_the_old_ones(cx: &mut TestApp
     settle(cx, handle);
     let new = images(cx, &canvas);
     assert_eq!(new.len(), 2);
+    assert!(
+        Arc::ptr_eq(&old[0], &new[0]),
+        "the slides share one background, which keeps its image"
+    );
     cx.update_window(handle, |_, window, _| {
         assert!(
-            old.iter().all(|image| !window.has_image_atlas_entry(image)),
-            "the first slide's images were released"
+            old[1..]
+                .iter()
+                .all(|image| !window.has_image_atlas_entry(image)),
+            "the first slide's own images were released"
         );
         assert!(
             new.iter().all(|image| window.has_image_atlas_entry(image)),

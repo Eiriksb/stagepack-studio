@@ -18,6 +18,10 @@ fn paint(color: Color) -> Paint<'static> {
 /// The longest side a layer's pixmap can have. What doesn't fit isn't drawn.
 const MAX_SIDE: u32 = 16384;
 
+/// The most pixels a layer's pixmap can have, as two long sides could otherwise ask for a
+/// gibibyte. What doesn't fit isn't drawn.
+const MAX_PIXELS: u64 = 64_000_000;
+
 /// How far from the slide a layer can sit. `compose` adds a layer's size to its position,
 /// and that sum has to fit in an `i32`.
 const MAX_OFFSET: f32 = 1_000_000_000.0;
@@ -57,6 +61,17 @@ fn pixmap_side(from: f32, to: f32) -> u32 {
     ((to - from) as u32).saturating_add(1).min(MAX_SIDE)
 }
 
+/// A size with no more than `MAX_PIXELS`, in the same proportions as the one asked for.
+/// Both sides are at least a few thousand by the time this has anything to do.
+fn within_max_pixels(width: u32, height: u32) -> (u32, u32) {
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels <= MAX_PIXELS {
+        return (width, height);
+    }
+    let shrink = (MAX_PIXELS as f64 / pixels as f64).sqrt();
+    ((f64::from(width) * shrink) as u32, (f64::from(height) * shrink) as u32)
+}
+
 /// Draws one element. Rotation is baked in, so moving the layer later is a plain blit.
 /// The pixmap holds everything the items draw, even outside `spec.rect`, though the layer
 /// still turns around the centre of `spec.rect`. A talk decides these numbers, so no
@@ -80,7 +95,8 @@ pub fn render_layer(spec: &LayerSpec, scale: f32, fonts: &mut Fonts) -> Layer {
     let min_y = corners.iter().map(|p| p.y).fold(f32::MAX, f32::min).floor();
     let max_x = corners.iter().map(|p| p.x).fold(f32::MIN, f32::max).ceil();
     let max_y = corners.iter().map(|p| p.y).fold(f32::MIN, f32::max).ceil();
-    let Some(mut pixmap) = Pixmap::new(pixmap_side(min_x, max_x), pixmap_side(min_y, max_y)) else {
+    let (width, height) = within_max_pixels(pixmap_side(min_x, max_x), pixmap_side(min_y, max_y));
+    let Some(mut pixmap) = Pixmap::new(width, height) else {
         return blank_layer();
     };
 
