@@ -395,6 +395,7 @@ impl<'a, 'env> Flow<'a, 'env> {
                 flex_shrink: 0.0,
                 ..Style::default()
             };
+            let color = marker.runs[0].color;
             let marker = self.leaf(in_the_indent, Content::Text(marker));
             let blocks: Vec<NodeId> = item.iter().filter_map(|block| self.block(block, Align::Left)).collect();
             let content = Style {
@@ -405,7 +406,7 @@ impl<'a, 'env> Flow<'a, 'env> {
             };
             let content = self.node(content, &blocks);
             let row = self.node(Style::default(), &[marker, content]);
-            self.note(row, Semantic::ListItem(if ordered { Bullet::Number(index as u32 + 1) } else { Bullet::Dot }));
+            self.note(row, Semantic::ListItem(if ordered { Bullet::Number(index as u32 + 1) } else { Bullet::Dot }, color));
             rows.push(row);
         }
         self.node(column(), &rows)

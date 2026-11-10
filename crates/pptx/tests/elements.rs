@@ -30,7 +30,7 @@ fn run(text: &str) -> NativeRun {
 }
 
 fn para(runs: Vec<NativeRun>, align: Align, level: u8, bullet: Bullet) -> NativeParagraph {
-    NativeParagraph { runs, align, level, bullet }
+    NativeParagraph { runs, align, level, bullet, line_height: None, space_before: None, bullet_color: None }
 }
 
 fn plain(text: &str) -> NativeParagraph {
@@ -194,6 +194,55 @@ fn special_characters_stay_valid_xml() {
         }
     }
     assert!(xml.contains("a &amp; &lt;b&gt; &quot;c&quot;  🎉"), "{xml}");
+}
+
+#[test]
+fn spacing_is_written_in_hundredths_of_a_point_ahead_of_the_bullet() {
+    let spaced = NativeParagraph { line_height: Some(50.0), space_before: Some(24.0), ..para(vec![run("x")], Align::Left, 0, Bullet::Dot) };
+    let xml = text::ppr_xml(&spaced, None, false);
+    assert!(
+        xml.contains("<a:lnSpc><a:spcPts val=\"2500\"/></a:lnSpc><a:spcBef><a:spcPts val=\"1200\"/></a:spcBef><a:buClr>"),
+        "{xml}"
+    );
+}
+
+#[test]
+fn spacing_is_held_to_what_the_schema_allows() {
+    let spaced = |line_height: f32, space_before: f32| {
+        let paragraph = NativeParagraph { line_height: Some(line_height), space_before: Some(space_before), ..plain("x") };
+        text::ppr_xml(&paragraph, None, false)
+    };
+    assert_eq!(
+        spaced(1.0e6, 1.0e6),
+        "<a:pPr><a:lnSpc><a:spcPts val=\"158400\"/></a:lnSpc><a:spcBef><a:spcPts val=\"158400\"/></a:spcBef></a:pPr>"
+    );
+    assert_eq!(
+        spaced(f32::NAN, -5.0),
+        "<a:pPr><a:lnSpc><a:spcPts val=\"0\"/></a:lnSpc><a:spcBef><a:spcPts val=\"0\"/></a:spcBef></a:pPr>"
+    );
+}
+
+#[test]
+fn a_bullet_is_written_in_the_colour_it_is_given() {
+    let red = NativeParagraph { bullet_color: Some(Color::rgb(0xcc, 0, 0)), ..para(vec![run("x")], Align::Left, 0, Bullet::Dot) };
+    let xml = text::ppr_xml(&red, None, false);
+    assert!(xml.contains("<a:buClr><a:srgbClr val=\"CC0000\"/></a:buClr><a:buFont typeface=\"Arial\"/>"), "{xml}");
+    assert!(!xml.contains("accent1"), "{xml}");
+}
+
+#[test]
+fn a_bullet_with_no_colour_stays_the_accent() {
+    let xml = text::ppr_xml(&para(vec![run("x")], Align::Left, 0, Bullet::Dot), None, false);
+    assert!(xml.contains("<a:buClr><a:schemeClr val=\"accent1\"/></a:buClr>"), "{xml}");
+}
+
+#[test]
+fn a_number_is_written_in_the_colour_it_is_given() {
+    let red = NativeParagraph { bullet_color: Some(Color::rgb(0xcc, 0, 0)), ..para(vec![run("x")], Align::Left, 0, Bullet::Number(1)) };
+    let xml = text::ppr_xml(&red, None, false);
+    assert!(xml.contains("<a:buClr><a:srgbClr val=\"CC0000\"/></a:buClr><a:buFont typeface=\"+mj-lt\"/>"), "{xml}");
+    let plain_number = text::ppr_xml(&para(vec![run("x")], Align::Left, 0, Bullet::Number(1)), None, false);
+    assert!(!plain_number.contains("buClr"), "{plain_number}");
 }
 
 // ---- shapes.rs ----

@@ -41,6 +41,38 @@ fn a_region_of_text_is_one_text_box() {
 }
 
 #[test]
+fn paragraphs_carry_the_line_height_and_gaps_they_are_laid_out_with() {
+    let slide = lay_out("# T\n\nFirst\n\nSecond\n\n- a\n  - b\n");
+    let NativeContent::Text { paragraphs, .. } = &slide.layers.last().unwrap().native[0].content else { panic!() };
+    for paragraph in paragraphs {
+        assert_eq!(paragraph.line_height, Some(paragraph.runs[0].size * 1.25), "{}", text_of(paragraph));
+    }
+    assert_eq!(paragraphs.iter().map(|p| p.space_before).collect::<Vec<_>>(), [None, Some(24.0), Some(24.0), Some(24.0)]);
+}
+
+#[test]
+fn a_line_is_as_tall_as_the_biggest_run_on_it_makes_it() {
+    let slide = lay_out("# T\n\nsmall <Text size=\"80\">big</Text>\n");
+    let NativeContent::Text { paragraphs, .. } = &slide.layers.last().unwrap().native[0].content else { panic!() };
+    assert_eq!(paragraphs[0].line_height, Some(100.0));
+}
+
+#[test]
+fn code_lines_are_as_far_apart_as_they_are_drawn() {
+    let slide = lay_out("# T\n\n```\none\ntwo\n```\n");
+    let NativeContent::Text { paragraphs, .. } = &slide.layers.last().unwrap().native[0].content else { panic!() };
+    assert_eq!(paragraphs.iter().map(|p| (p.line_height, p.space_before)).collect::<Vec<_>>(), [(Some(40.0), None), (Some(40.0), None)]);
+}
+
+#[test]
+fn a_marker_has_the_colour_it_is_drawn_in() {
+    let slide = lay_out("---\ncolor.text: #112233\n---\n\n# T\n\n- [a](https://example.com)\n\n1. b\n\nplain\n");
+    let NativeContent::Text { paragraphs, .. } = &slide.layers.last().unwrap().native[0].content else { panic!() };
+    let ink = Color::parse("#112233");
+    assert_eq!(paragraphs.iter().map(|p| p.bullet_color).collect::<Vec<_>>(), [ink, ink, None]);
+}
+
+#[test]
 fn only_the_title_region_is_marked_as_the_title() {
     let slide = lay_out("# T\n\nBody\n");
     assert_eq!(slide.layers.iter().map(|l| l.is_title).collect::<Vec<_>>(), [false, true, false]);

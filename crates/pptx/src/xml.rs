@@ -136,10 +136,18 @@ pub fn solid_fill(color: ColorRef, alpha: Option<f64>) -> String {
     format!("<a:solidFill>{}</a:solidFill>", color_xml(color, alpha))
 }
 
+fn own_alpha(color: Color) -> Option<f64> {
+    (color.a < 255).then(|| f64::from(color.a) / 255.0)
+}
+
 /// A fixed color as a solid fill, with the color's own alpha as the fill's.
 pub fn solid_fill_of(color: Color) -> String {
-    let alpha = (color.a < 255).then(|| f64::from(color.a) / 255.0);
-    solid_fill(ColorRef::Rgb(color), alpha)
+    solid_fill(ColorRef::Rgb(color), own_alpha(color))
+}
+
+/// A fixed color, with its own alpha.
+pub fn color_xml_of(color: Color) -> String {
+    color_xml(ColorRef::Rgb(color), own_alpha(color))
 }
 
 fn fnv1a(text: &str) -> u32 {

@@ -11,7 +11,7 @@ use toolkit::{Color, ShapeKind, Theme};
 use crate::elements::ShapeLook;
 use crate::flow::{CODE_PADDING, CODE_PANEL, Content};
 use crate::placeholder::placeholder_run;
-use crate::text::limited_size;
+use crate::text::{LINE_HEIGHT, limited_size};
 use crate::{Align, Rect, TextRun};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -55,11 +55,19 @@ pub struct NativeParagraph {
     pub align: Align,
     pub level: u8,
     pub bullet: Bullet,
+    /// From one line to the next, in slide units. With none, the program showing it decides.
+    pub line_height: Option<f32>,
+    /// The gap above it, in slide units. With none, the program showing it decides.
+    pub space_before: Option<f32>,
+    /// The colour of its marker. With none, a bullet takes the accent and a number its text's colour.
+    pub bullet_color: Option<Color>,
 }
 
 impl NativeParagraph {
+    /// A paragraph on its own, with lines as far apart as `shape_text` puts them.
     pub(crate) fn new(runs: Vec<NativeRun>, align: Align) -> NativeParagraph {
-        NativeParagraph { runs, align, level: 0, bullet: Bullet::None }
+        let line_height = runs.iter().map(|run| run.size).reduce(f32::max).map(|biggest| biggest * LINE_HEIGHT);
+        NativeParagraph { runs, align, level: 0, bullet: Bullet::None, line_height, space_before: None, bullet_color: None }
     }
 }
 
@@ -111,8 +119,8 @@ pub(crate) const MAX_TABLE_CELLS: usize = 10_000;
 pub(crate) enum Semantic {
     /// A heading, a paragraph or a component's text.
     Paragraph(NativeParagraph),
-    /// A list item: a row of its marker and a column of its blocks.
-    ListItem(Bullet),
+    /// A list item: a row of its marker and a column of its blocks, and the marker's colour.
+    ListItem(Bullet, Color),
     /// A table's cells, row by row: each one's node and its text.
     Table(Vec<Vec<(NodeId, NativeParagraph)>>),
     /// A table with more cells than `MAX_TABLE_CELLS`.
@@ -151,7 +159,17 @@ pub(crate) fn native_elements(
 #[derive(Clone, Copy)]
 struct Marker {
     bullet: Bullet,
+    color: Color,
     rect: Rect,
+}
+
+/// Paragraphs on their way to being one text box.
+struct RunningText {
+    paragraphs: Vec<NativeParagraph>,
+    around: Rect,
+    /// Where the last paragraph's own text ends. Its marker can reach further, as a marker's
+    /// row is as tall as everything nested in its item.
+    bottom: f32,
 }
 
 /// One pass over a laid-out tree, the same way `Flow::draw` goes.
@@ -160,8 +178,8 @@ struct Walk<'a> {
     semantics: &'a mut HashMap<NodeId, Semantic>,
     theme: &'a Theme,
     elements: Vec<NativeElement>,
-    /// The text so far and the box around it, until something ends the run.
-    text: Option<(Vec<NativeParagraph>, Rect)>,
+    /// The text so far, until something ends the run.
+    text: Option<RunningText>,
     marker: Option<Marker>,
     /// How many lists the current node is inside.
     lists: u8,
@@ -183,7 +201,7 @@ impl Walk<'_> {
         let tree = self.tree;
         match (self.semantics.remove(&node), tree.get_node_context(node)) {
             (Some(Semantic::Paragraph(paragraph)), _) => self.add_paragraph(paragraph, rect),
-            (Some(Semantic::ListItem(bullet)), _) => self.list_item(node, corner, bullet),
+            (Some(Semantic::ListItem(bullet, color)), _) => self.list_item(node, corner, bullet, color),
             (Some(Semantic::Table(cells)), _) => self.table(cells, rect),
             (Some(Semantic::TableTooBig), _) => self.label("This table is too big to export", rect),
             (Some(Semantic::Code(paragraphs)), _) => {
@@ -217,17 +235,22 @@ impl Walk<'_> {
 
     /// Adds to the text so far, taking the marker of the list item it starts, if any.
     fn add_paragraph(&mut self, mut paragraph: NativeParagraph, mut rect: Rect) {
+        let (top, bottom) = (rect.y, rect.y + rect.h);
         if let Some(marker) = self.marker.take() {
             paragraph.bullet = marker.bullet;
+            paragraph.bullet_color = Some(marker.color);
             rect = union(rect, marker.rect);
         }
         paragraph.level = self.lists.saturating_sub(1);
         match &mut self.text {
-            Some((paragraphs, around)) => {
-                paragraphs.push(paragraph);
-                *around = union(*around, rect);
+            Some(text) => {
+                // As far from the text above it as the layout put it.
+                paragraph.space_before = Some((top - text.bottom).max(0.0));
+                text.paragraphs.push(paragraph);
+                text.around = union(text.around, rect);
+                text.bottom = bottom;
             }
-            None => self.text = Some((vec![paragraph], rect)),
+            None => self.text = Some(RunningText { paragraphs: vec![paragraph], around: rect, bottom }),
         }
     }
 
@@ -241,8 +264,8 @@ impl Walk<'_> {
     /// Makes the text so far into a text box.
     fn end_text(&mut self) {
         self.show_marker_alone();
-        if let Some((paragraphs, rect)) = self.text.take() {
-            self.elements.push(NativeElement { rect, content: NativeContent::Text { paragraphs, fill: None, inset: 0.0 } });
+        if let Some(RunningText { paragraphs, around, .. }) = self.text.take() {
+            self.elements.push(NativeElement { rect: around, content: NativeContent::Text { paragraphs, fill: None, inset: 0.0 } });
         }
     }
 
@@ -258,13 +281,13 @@ impl Walk<'_> {
         self.elements.push(placeholder_element(label, rect, self.theme));
     }
 
-    fn list_item(&mut self, node: NodeId, corner: (f32, f32), bullet: Bullet) {
+    fn list_item(&mut self, node: NodeId, corner: (f32, f32), bullet: Bullet, color: Color) {
         let children = self.children(node);
         let [marker, content] = children[..] else {
             return;
         };
         self.show_marker_alone();
-        self.marker = Some(Marker { bullet, rect: self.rect_of(marker, corner) });
+        self.marker = Some(Marker { bullet, color, rect: self.rect_of(marker, corner) });
         self.lists += 1;
         self.visit(content, corner);
         self.show_marker_alone();

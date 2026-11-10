@@ -85,7 +85,7 @@ pub fn table_xml(
     let width = |i: usize| if column_widths.len() == columns { column_widths[i] } else { rect.w / columns as f32 };
     // A row's height is its minimum: rows still grow to fit their text.
     let height = |i: usize| if row_heights.len() == rows.len() { row_heights[i] } else { rect.h / rows.len().max(1) as f32 };
-    let empty = [NativeParagraph { runs: Vec::new(), align: slides_engine::Align::Left, level: 0, bullet: slides_engine::Bullet::None }];
+    let empty = [NativeParagraph { runs: Vec::new(), align: slides_engine::Align::Left, level: 0, bullet: slides_engine::Bullet::None, line_height: None, space_before: None, bullet_color: None }];
     let grid: String = (0..columns).map(|i| format!("<a:gridCol w=\"{}\"/>", emu_from_units(width(i)).max(0))).collect();
     let body: String = rows
         .iter()

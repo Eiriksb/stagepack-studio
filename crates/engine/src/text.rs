@@ -25,7 +25,7 @@ const BUNDLED: [&[u8]; 8] = [
 ];
 
 /// Line height as a multiple of the font size.
-const LINE_HEIGHT: f32 = 1.25;
+pub(crate) const LINE_HEIGHT: f32 = 1.25;
 
 /// The range of text sizes, in slide units. A talk sets the size, and outside this range
 /// the font code misbehaves: size 0 means unscaled font units, and huge sizes overflow.

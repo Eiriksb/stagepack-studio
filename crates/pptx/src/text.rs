@@ -7,7 +7,7 @@
 use slides_engine::{Align, Bullet, NativeParagraph, NativeRun};
 use toolkit::Color;
 
-use crate::xml::{emu, emu_from_units, esc, round_half_up, solid_fill_of};
+use crate::xml::{color_xml_of, emu, emu_from_units, esc, round_half_up, solid_fill_of};
 
 /// What text writing needs from the part it is written into.
 pub struct TextCtx {
@@ -153,6 +153,15 @@ fn runs_xml(runs: &[NativeRun], ctx: &mut TextCtx) -> String {
     out
 }
 
+/// The most `a:spcPts` takes, in hundredths of a point.
+const MOST_SPACING: f64 = 158_400.0;
+
+/// A distance in slide units as `tag`, in hundredths of a point.
+fn spacing_xml(tag: &str, units: f32) -> String {
+    let val = if units.is_finite() { round_half_up(f64::from(units) * 50.0).clamp(0.0, MOST_SPACING) as i64 } else { 0 };
+    format!("<{tag}><a:spcPts val=\"{val}\"/></{tag}>")
+}
+
 fn align_value(align: Align) -> &'static str {
     match align {
         Align::Left => "l",
@@ -188,9 +197,17 @@ pub fn ppr_xml(para: &NativeParagraph, previous: Option<&NativeParagraph>, place
     }
 
     // Child order per CT_TextParagraphProperties: lnSpc, spcBef, spcAft, buClr, buSz, buFont, bullet.
+    if let Some(line_height) = para.line_height {
+        kids.push_str(&spacing_xml("a:lnSpc", line_height));
+    }
+    if let Some(space_before) = para.space_before {
+        kids.push_str(&spacing_xml("a:spcBef", space_before));
+    }
+    let marker_color = para.bullet_color.map(|color| format!("<a:buClr>{}</a:buClr>", color_xml_of(color)));
     match para.bullet {
         Bullet::Dot if !placeholder => {
-            kids.push_str("<a:buClr><a:schemeClr val=\"accent1\"/></a:buClr><a:buFont typeface=\"Arial\"/><a:buChar char=\"•\"/>");
+            kids.push_str(marker_color.as_deref().unwrap_or("<a:buClr><a:schemeClr val=\"accent1\"/></a:buClr>"));
+            kids.push_str("<a:buFont typeface=\"Arial\"/><a:buChar char=\"•\"/>");
         }
         Bullet::Number(n) => {
             // Numbered paragraphs one after another count on by themselves; the first of a list
@@ -200,6 +217,7 @@ pub fn ppr_xml(para: &NativeParagraph, previous: Option<&NativeParagraph>, place
                 _ => n == 1,
             };
             let start = if follows { String::new() } else { format!(" startAt=\"{n}\"") };
+            kids.push_str(marker_color.as_deref().unwrap_or_default());
             kids.push_str(&format!("<a:buFont typeface=\"+mj-lt\"/><a:buAutoNum type=\"arabicPeriod\"{start}/>"));
         }
         Bullet::None if placeholder => kids.push_str("<a:buNone/>"),
@@ -257,7 +275,7 @@ pub fn body_pr_xml(body: &BodyOptions) -> String {
 /// A text body as `tag` (`p:txBody`, or `a:txBody` in a table cell). No paragraphs gives one
 /// empty one: a body must have a paragraph.
 pub fn tx_body_xml(paragraphs: &[NativeParagraph], ctx: &mut TextCtx, body: &BodyOptions, tag: &str) -> String {
-    let empty = [NativeParagraph { runs: Vec::new(), align: Align::Left, level: 0, bullet: Bullet::None }];
+    let empty = [NativeParagraph { runs: Vec::new(), align: Align::Left, level: 0, bullet: Bullet::None, line_height: None, space_before: None, bullet_color: None }];
     let list = if paragraphs.is_empty() { &empty[..] } else { paragraphs };
     let paras: String = list
         .iter()

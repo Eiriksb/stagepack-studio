@@ -259,6 +259,37 @@ fn a_rotated_layer_turns_its_elements_around_its_centre() {
     assert!((got.0 - expected.0).abs() <= 1 && (got.1 - expected.1).abs() <= 1, "{got:?} vs {expected:?}");
 }
 
+/// The first `a:pPr` of the paragraph holding `text`.
+fn paragraph_properties<'a>(xml: &'a str, text: &str) -> &'a str {
+    let run = xml.find(&format!("<a:t>{text}</a:t>")).unwrap_or_else(|| panic!("no run {text} in {xml}"));
+    let start = xml[..run].rfind("<a:p>").expect("the run is in a paragraph");
+    &xml[start..run]
+}
+
+#[test]
+fn paragraphs_keep_the_line_height_and_gaps_of_the_slide() {
+    let out = export("# T\n\nFirst\n\nSecond\n\n- item\n");
+    let xml = part(&out.bytes, "ppt/slides/slide1.xml");
+    let lines = "<a:lnSpc><a:spcPts val=\"2500\"/></a:lnSpc>";
+    let gap = "<a:spcBef><a:spcPts val=\"1200\"/></a:spcBef>";
+    let first = paragraph_properties(&xml, "First");
+    assert!(first.contains(lines) && !first.contains("spcBef"), "{first}");
+    let second = paragraph_properties(&xml, "Second");
+    assert!(second.contains(&format!("{lines}{gap}")), "{second}");
+    let item = paragraph_properties(&xml, "item");
+    assert!(item.contains(&format!("{lines}{gap}<a:buClr>")), "{item}");
+}
+
+#[test]
+fn a_bullet_is_the_colour_the_slide_draws_it_in() {
+    let out = export("---\ncolor.text: #112233\ncolor.accent: #445566\n---\n\n# T\n\n- item\n\n<Text color=\"#778899\">\n\n- tinted\n\n</Text>\n");
+    let xml = part(&out.bytes, "ppt/slides/slide1.xml");
+    let item = paragraph_properties(&xml, "item");
+    assert!(item.contains("<a:buClr><a:srgbClr val=\"112233\"/></a:buClr>"), "{item}");
+    let tinted = paragraph_properties(&xml, "tinted");
+    assert!(tinted.contains("<a:buClr><a:srgbClr val=\"778899\"/></a:buClr>"), "{tinted}");
+}
+
 #[test]
 fn exporting_twice_gives_identical_bytes() {
     assert!(showcase().bytes == showcase().bytes);
