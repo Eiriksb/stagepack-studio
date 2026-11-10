@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use toolkit::Color;
 
-use crate::ShapedText;
+use crate::{Enter, ShapedText};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rect {
@@ -29,6 +29,9 @@ pub struct LayerSpec {
     pub rect: Rect,
     pub rotate: f32,
     pub items: Vec<DisplayItem>,
+    /// The click this layer appears on, or `None` if it's there from the start.
+    pub click: Option<u32>,
+    pub enter: Enter,
 }
 
 /// A drawn element in device pixels, placed at (`x`, `y`) on the slide. It has no

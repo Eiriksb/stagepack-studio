@@ -5,9 +5,10 @@ use tiny_skia::PathBuilder;
 use toolkit::{Color, Registry, Theme};
 
 use crate::elements::lay_out_positioned_tag;
-use crate::flow::flow_region;
+use crate::flow::{flow_region, flow_region_each};
+use crate::timeline::{MAX_CLICK, RegionClick, read_region_timing, read_tag_timing, read_transition};
 use crate::placeholder::placeholder_items;
-use crate::{DisplayItem, Fonts, LayerSpec, LayoutDef, Notice, PictureCache, Rect, RegionDef, TalkFiles, layout_by_name};
+use crate::{DisplayItem, Enter, Fonts, LayerSpec, LayoutDef, Notice, PictureCache, Rect, RegionDef, TalkFiles, Transition, layout_by_name};
 
 pub(crate) const SLIDE_WIDTH: f32 = 1920.0;
 pub(crate) const SLIDE_HEIGHT: f32 = 1080.0;
@@ -33,6 +34,8 @@ pub struct LayoutEnv<'a> {
 pub struct LaidOutSlide {
     pub layers: Vec<LayerSpec>,
     pub notices: Vec<Notice>,
+    /// How the slide is played on arriving at it.
+    pub transition: Transition,
 }
 
 /// The talk's look, which its first slide's settings decide.
@@ -63,8 +66,9 @@ pub fn layout_slide(talk: &Talk, index: usize, env: &mut LayoutEnv) -> LaidOutSl
     if let Some(error) = &slide.error {
         notices.push(Notice(error.message.clone()));
         layers.push(error_layer(slide, &error.message, &theme, env.fonts));
-        return LaidOutSlide { layers, notices };
+        return LaidOutSlide { layers, notices, transition: Transition::None };
     }
+    let transition = read_transition(slide.settings.as_ref().and_then(|settings| settings.get("transition")), &mut notices);
     let layout = slide_layout(slide, &mut notices);
     let contents = assign_blocks(slide, layout, &mut notices);
 
@@ -73,8 +77,41 @@ pub fn layout_slide(talk: &Talk, index: usize, env: &mut LayoutEnv) -> LaidOutSl
             continue;
         };
         let (rect, rotate) = placement(slide, region);
+        let line = region_line(slide, region);
+        let timing = read_region_timing(line, &mut notices);
+        let source = first.range().start..last.range().end;
+        let mut click = match timing.click {
+            RegionClick::Step(click) => Some(click),
+            RegionClick::Each => Some(1),
+            RegionClick::Absent => None,
+        };
+        if timing.click == RegionClick::Each {
+            if rotate != 0.0 {
+                notices.push(Notice(format!(
+                    "The {} region is rotated, so click=each shows it all on click 1",
+                    region.name
+                )));
+            } else {
+                let pieces = flow_region_each(blocks, region, rect.w, &theme, env, &mut notices);
+                if !pieces.is_empty() {
+                    for (step, piece) in pieces.into_iter().enumerate() {
+                        let rect = Rect { x: rect.x + piece.rect.x, y: rect.y + piece.rect.y, ..piece.rect };
+                        layers.push(LayerSpec {
+                            source: Some(piece.source),
+                            rect,
+                            rotate: 0.0,
+                            items: piece.items,
+                            click: Some((step as u32 + 1).min(MAX_CLICK)),
+                            enter: timing.enter,
+                        });
+                    }
+                    continue;
+                }
+                click = Some(1);
+            }
+        }
         let items = flow_region(blocks, region, rect.w, &theme, env, &mut notices);
-        layers.push(LayerSpec { source: Some(first.range().start..last.range().end), rect, rotate, items });
+        layers.push(LayerSpec { source: Some(source), rect, rotate, items, click, enter: timing.enter });
     }
     for block in &slide.blocks {
         if let Block::Tag(tag) = block
@@ -83,7 +120,7 @@ pub fn layout_slide(talk: &Talk, index: usize, env: &mut LayoutEnv) -> LaidOutSl
             layers.push(positioned_layer(tag, &theme, env, &mut notices));
         }
     }
-    LaidOutSlide { layers, notices }
+    LaidOutSlide { layers, notices, transition }
 }
 
 /// The placement numbers a tag gives. One that can't be read counts as absent, and the
@@ -94,10 +131,16 @@ struct TagPlace {
     w: Option<f32>,
     h: Option<f32>,
     rotate: Option<f32>,
+    click: Option<u32>,
+    enter: Enter,
+    /// What was wrong with the `click` and `enter` it gave.
+    notices: Vec<Notice>,
 }
 
 impl TagPlace {
     fn of(tag: &Tag) -> TagPlace {
+        let mut notices = Vec::new();
+        let (click, enter) = read_tag_timing(tag.attr("click"), tag.attr("enter"), &mut notices);
         let number = |name: &str, low: f32, high: f32| {
             let value = tag.attr(name)?.trim().parse::<f32>().ok().filter(|value| value.is_finite())?;
             Some(value.clamp(low, high))
@@ -108,6 +151,9 @@ impl TagPlace {
             w: number("w", 0.0, MAX_SIZE),
             h: number("h", 0.0, MAX_SIZE),
             rotate: number("rotate", -MAX_ROTATION, MAX_ROTATION),
+            click,
+            enter,
+            notices,
         }
     }
 }
@@ -120,19 +166,26 @@ pub(crate) fn is_positioned(tag: &Tag) -> bool {
 
 fn positioned_layer(tag: &Tag, theme: &Theme, env: &mut LayoutEnv, notices: &mut Vec<Notice>) -> LayerSpec {
     let place = TagPlace::of(tag);
+    for notice in place.notices {
+        if !notices.contains(&notice) {
+            notices.push(notice);
+        }
+    }
     let ((w, h), items) = lay_out_positioned_tag(tag, (place.w, place.h), theme, env, notices);
     LayerSpec {
         source: Some(tag.range.clone()),
         rect: Rect { x: place.x.unwrap_or(0.0), y: place.y.unwrap_or(0.0), w, h },
         rotate: place.rotate.unwrap_or(0.0),
         items,
+        click: place.click,
+        enter: place.enter,
     }
 }
 
 /// What a slide that couldn't be parsed shows: the reason, across the whole slide.
 fn error_layer(slide: &Slide, message: &str, theme: &Theme, fonts: &mut Fonts) -> LayerSpec {
     let rect = Rect { x: 0.0, y: 0.0, w: SLIDE_WIDTH, h: SLIDE_HEIGHT };
-    LayerSpec { source: Some(slide.range.clone()), rect, rotate: 0.0, items: placeholder_items(message, rect, theme, fonts) }
+    LayerSpec { source: Some(slide.range.clone()), rect, rotate: 0.0, items: placeholder_items(message, rect, theme, fonts), click: None, enter: Enter::Appear }
 }
 
 fn slide_layout(slide: &Slide, notices: &mut Vec<Notice>) -> &'static LayoutDef {
@@ -176,14 +229,19 @@ fn assign_blocks<'a>(slide: &'a Slide, layout: &LayoutDef, notices: &mut Vec<Not
     contents
 }
 
+/// The slide's `region.<name>` settings line for a region, or nothing.
+fn region_line<'a>(slide: &'a Slide, region: &RegionDef) -> &'a str {
+    let key = format!("region.{}", region.name);
+    slide.settings.as_ref().and_then(|settings| settings.get(&key)).unwrap_or_default()
+}
+
 /// Where a region sits on this slide: the layout's place, changed by any `region.<name>`
 /// settings line. A value that isn't a finite number is ignored, and the rest are held
 /// within the limits above.
 fn placement(slide: &Slide, region: &RegionDef) -> (Rect, f32) {
     let mut rect = region.rect;
     let mut rotate = 0.0;
-    let key = format!("region.{}", region.name);
-    let line = slide.settings.as_ref().and_then(|settings| settings.get(&key)).unwrap_or_default();
+    let line = region_line(slide, region);
     for pair in line.split_whitespace() {
         let Some((name, value)) = pair.split_once('=') else {
             continue;
@@ -211,5 +269,7 @@ fn background(theme: &Theme) -> LayerSpec {
         rect: Rect { x: 0.0, y: 0.0, w: SLIDE_WIDTH, h: SLIDE_HEIGHT },
         rotate: 0.0,
         items: vec![DisplayItem::Fill { path: PathBuilder::from_rect(area), color: theme.background }],
+        click: None,
+        enter: Enter::Appear,
     }
 }

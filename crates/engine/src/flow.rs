@@ -1,5 +1,6 @@
 //! Lays a region's blocks out top to bottom and turns them into drawing.
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use slides_format::{Block, Span, Style as TextStyle, Tag};
@@ -145,7 +146,61 @@ pub(crate) fn flow_region(
     flow.finish(root, width)
 }
 
+/// One block, or one item of a list, drawn on its own: `rect` is its box in the region's
+/// coordinates, and the items are relative to that box.
+pub(crate) struct Piece {
+    pub rect: Rect,
+    pub source: Range<usize>,
+    pub items: Vec<DisplayItem>,
+}
+
+/// As `flow_region`, laid out the same way, but each top-level block and each item of a
+/// top-level list is drawn on its own.
+pub(crate) fn flow_region_each(
+    blocks: &[&Block],
+    region: &RegionDef,
+    width: f32,
+    theme: &Theme,
+    env: &mut LayoutEnv,
+    notices: &mut Vec<Notice>,
+) -> Vec<Piece> {
+    let mut flow = Flow::new(region, theme, env, notices);
+    let placed: Vec<(&Block, NodeId)> =
+        blocks.iter().filter_map(|block| flow.block(block, region.align).map(|node| (*block, node))).collect();
+    let children: Vec<NodeId> = placed.iter().map(|(_, node)| *node).collect();
+    let root = flow.node(Style { size: Size { width: length(width), height: auto() }, ..column() }, &children);
+    flow.compute(root, width);
+
+    let mut pieces = Vec::new();
+    for (block, node) in placed {
+        match block {
+            Block::List { items, .. } => {
+                let rows = flow.tree.children(node).expect("every node is in the tree");
+                let list_at = flow.tree.layout(node).expect("every node is in the tree").location;
+                for (row, item) in rows.into_iter().zip(items) {
+                    let source = match (item.first(), item.last()) {
+                        (Some(first), Some(last)) => first.range().start..last.range().end,
+                        _ => block.range().clone(),
+                    };
+                    pieces.push(flow.piece(row, (list_at.x, list_at.y), source));
+                }
+            }
+            _ => pieces.push(flow.piece(node, (0.0, 0.0), block.range().clone())),
+        }
+    }
+    pieces
+}
+
 impl<'a, 'env> Flow<'a, 'env> {
+    /// `node` drawn on its own. `parent` is the corner of its parent.
+    fn piece(&mut self, node: NodeId, parent: (f32, f32), source: Range<usize>) -> Piece {
+        let layout = *self.tree.layout(node).expect("every node is in the tree");
+        let (x, y) = (parent.0 + layout.location.x, parent.1 + layout.location.y);
+        let mut items = Vec::new();
+        self.draw(node, (parent.0 - x, parent.1 - y), &mut items);
+        Piece { rect: Rect { x, y, w: layout.size.width, h: layout.size.height }, source, items }
+    }
+
     pub(crate) fn new(
         region: &'a RegionDef,
         theme: &'a Theme,
@@ -160,6 +215,13 @@ impl<'a, 'env> Flow<'a, 'env> {
 
     /// Lays out the tree under `root`, `width` wide, and returns its drawing.
     pub(crate) fn finish(mut self, root: NodeId, width: f32) -> Vec<DisplayItem> {
+        self.compute(root, width);
+        let mut items = Vec::new();
+        self.draw(root, (0.0, 0.0), &mut items);
+        items
+    }
+
+    fn compute(&mut self, root: NodeId, width: f32) {
         let available = Size { width: AvailableSpace::Definite(width), height: AvailableSpace::MaxContent };
         let fonts = &mut *self.env.fonts;
         self.tree
@@ -169,10 +231,6 @@ impl<'a, 'env> Flow<'a, 'env> {
                 })
             })
             .expect("every node is in the tree");
-
-        let mut items = Vec::new();
-        self.draw(root, (0.0, 0.0), &mut items);
-        items
     }
 
     pub(crate) fn node(&mut self, style: Style, children: &[NodeId]) -> NodeId {

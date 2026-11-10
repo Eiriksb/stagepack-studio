@@ -1,12 +1,16 @@
 //! A talk and its drawn layers, kept so that an edit only draws again what it changed.
 
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
 use slides_format::{Settings, Talk, parse_talk};
 use toolkit::Registry;
 
-use crate::{Fonts, Layer, LayoutEnv, PictureCache, TalkFiles, builtin_registry, layout_slide, render_layer, talk_theme};
+use crate::{
+    DisplayItem, Fonts, Layer, LayerSpec, LayerTiming, LayoutEnv, PictureCache, SlideTimeline, TalkFiles, Transition, builtin_registry,
+    layout_slide, render_layer, talk_theme,
+};
 
 /// How many scales of one slide are kept drawn. A zoom or a resize asks for many in a row.
 const KEPT_SCALES: usize = 4;
@@ -21,15 +25,35 @@ const DEFAULT_MEMORY_BUDGET: usize = 512 * 1024 * 1024;
 struct LayerKey {
     text: String,
     place: [u32; 5],
+    /// Where and how big what the layer draws is. Text moves inside a layer when something
+    /// elsewhere changes it, such as a list's indent, with the layer's text just as it was.
+    drawing: u64,
     picture_generation: u64,
 }
 
 /// A slide laid out. The keys are made when the slide is, because `LayerSpec::source`
 /// points into the text of that moment, which later edits move.
 struct Laid {
-    specs: Vec<crate::LayerSpec>,
+    specs: Vec<LayerSpec>,
     keys: Vec<LayerKey>,
     notices: Vec<String>,
+    transition: Transition,
+}
+
+/// A number that differs when a layer's items sit or measure differently.
+fn drawing_fingerprint(items: &[DisplayItem]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for item in items {
+        match item {
+            DisplayItem::Fill { path, .. } | DisplayItem::Stroke { path, .. } => {
+                let b = path.bounds();
+                (0u8, [b.left(), b.top(), b.right(), b.bottom()].map(f32::to_bits)).hash(&mut hasher);
+            }
+            DisplayItem::Text { text, x, y } => (1u8, [*x, *y, text.width, text.height].map(f32::to_bits)).hash(&mut hasher),
+            DisplayItem::Picture { rect, .. } => (2u8, [rect.x, rect.y, rect.w, rect.h].map(f32::to_bits)).hash(&mut hasher),
+        }
+    }
+    hasher.finish()
 }
 
 #[derive(Default)]
@@ -175,6 +199,36 @@ impl Deck {
         self.slides[index].laid.as_ref().map(|laid| laid.notices.clone()).unwrap_or_default()
     }
 
+    /// The slide's notes, if it has any.
+    pub fn notes(&self, index: usize) -> Option<String> {
+        self.talk.slides[index].notes.as_ref().map(|notes| notes.text.clone())
+    }
+
+    /// When each layer of the slide appears, in the order of `layers`, and how the slide is arrived at.
+    pub fn timeline(&mut self, index: usize) -> SlideTimeline {
+        self.lay_out(index);
+        let laid = self.slides[index].laid.as_ref().expect("the slide was just laid out");
+        let layers: Vec<LayerTiming> =
+            laid.specs.iter().map(|spec| LayerTiming { click: spec.click, enter: spec.enter }).collect();
+        let steps = layers.iter().filter_map(|layer| layer.click).max().unwrap_or(0);
+        SlideTimeline { steps, layers, transition: laid.transition }
+    }
+
+    /// What each layer of the slide draws, before it is drawn at any scale.
+    pub fn specs(&mut self, index: usize) -> &[LayerSpec] {
+        self.lay_out(index);
+        &self.slides[index].laid.as_ref().expect("the slide was just laid out").specs
+    }
+
+    /// The talk's look.
+    pub fn theme(&self) -> toolkit::Theme {
+        talk_theme(&self.talk)
+    }
+
+    pub fn fonts_mut(&mut self) -> &mut Fonts {
+        &mut self.fonts
+    }
+
     /// The slide's layers, first to last, drawn at `scale`.
     pub fn layers(&mut self, index: usize, scale: f32) -> Vec<Arc<Layer>> {
         self.lay_out(index);
@@ -270,11 +324,12 @@ impl Deck {
                 LayerKey {
                     text: format!("{theme}\n{layout}\n{}\n{text}", spec.source.is_some()),
                     place: [rect.x, rect.y, rect.w, rect.h, spec.rotate].map(f32::to_bits),
+                    drawing: drawing_fingerprint(&spec.items),
                     picture_generation: self.picture_generation,
                 }
             })
             .collect();
         let notices = laid.notices.into_iter().map(|notice| notice.0).collect();
-        self.slides[index].laid = Some(Laid { specs: laid.layers, keys, notices });
+        self.slides[index].laid = Some(Laid { specs: laid.layers, keys, notices, transition: laid.transition });
     }
 }
