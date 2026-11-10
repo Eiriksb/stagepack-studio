@@ -20,7 +20,9 @@ const SLIDES_NAME: &str = "slides.md";
 const MANIFEST_LIMIT: u64 = 1024 * 1024;
 const PACKED_FOLDERS: [&str; 3] = ["components", "assets", "build"];
 /// Pictures and fonts are already compressed, so they are stored as they are.
-const STORED_EXTENSIONS: [&str; 9] = ["png", "jpg", "jpeg", "gif", "webp", "avif", "ico", "woff", "woff2"];
+const STORED_EXTENSIONS: [&str; 9] = [
+    "png", "jpg", "jpeg", "gif", "webp", "avif", "ico", "woff", "woff2",
+];
 
 #[derive(Clone, Copy)]
 pub struct PackLimits {
@@ -31,7 +33,11 @@ pub struct PackLimits {
 
 impl Default for PackLimits {
     fn default() -> PackLimits {
-        PackLimits { entry_bytes: 256 * 1024 * 1024, total_bytes: 2 * 1024 * 1024 * 1024, entries: 10_000 }
+        PackLimits {
+            entry_bytes: 256 * 1024 * 1024,
+            total_bytes: 2 * 1024 * 1024 * 1024,
+            entries: 10_000,
+        }
     }
 }
 
@@ -71,22 +77,67 @@ impl From<std::io::Error> for PackError {
     }
 }
 
+/// An error from reading the pack: bad data inside the file is damage, anything else is the disk.
+fn read_error(e: std::io::Error) -> PackError {
+    use std::io::ErrorKind::{InvalidData, InvalidInput, UnexpectedEof};
+    match e.kind() {
+        InvalidData | InvalidInput | UnexpectedEof => PackError::Corrupt(e.to_string()),
+        _ => PackError::Io(e),
+    }
+}
+
 impl From<zip::result::ZipError> for PackError {
     fn from(e: zip::result::ZipError) -> PackError {
         match e {
-            zip::result::ZipError::Io(e) => PackError::Io(e),
+            zip::result::ZipError::Io(e) => read_error(e),
             other => PackError::Corrupt(other.to_string()),
         }
     }
 }
 
+/// Names Windows won't create as files, whatever their extension.
+const RESERVED: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Whether one part of a path can be used as a file name on every platform.
+fn safe_part(part: &str) -> bool {
+    let stem = part
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    !part.is_empty()
+        && part != "."
+        && part != ".."
+        && !part.ends_with(['.', ' '])
+        && !part.contains(['\\', ':', '<', '>', '"', '|', '?', '*'])
+        && !part.chars().any(char::is_control)
+        && !RESERVED.contains(&stem.as_str())
+}
+
 /// Whether `name` (a `/`-separated path, optionally ending in `/` for a folder) stays inside
-/// the talk.
+/// the talk and can be a file on every platform.
 fn safe_name(name: &str) -> bool {
     let name = name.strip_suffix('/').unwrap_or(name);
-    !name.is_empty()
-        && !name.contains(['\\', ':', '\0'])
-        && name.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
+    !name.is_empty() && name.split('/').all(safe_part)
+}
+
+/// `path` with empty and `.` parts dropped and `..` resolved, or `None` if it climbs out.
+fn normalise(path: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            part => parts.push(part),
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
 }
 
 /// A packed talk, read on demand.
@@ -96,13 +147,23 @@ pub struct PackedFiles {
     index: HashMap<String, usize>,
     directories: Vec<String>,
     entry_bytes: u64,
+    total_bytes: u64,
 }
 
-/// At most `limit` bytes of `reader`, or `None` if there are more.
-fn read_limited(reader: impl Read, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+/// What an entry says it holds, read without trusting it: more than `size` bytes means the
+/// stated size lied.
+fn read_sized(reader: impl Read, size: u64, what: &str) -> Result<Vec<u8>, PackError> {
     let mut bytes = Vec::new();
-    reader.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
-    Ok((bytes.len() as u64 <= limit).then_some(bytes))
+    reader
+        .take(size.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(read_error)?;
+    if bytes.len() as u64 > size {
+        return Err(PackError::Corrupt(format!(
+            "{what} holds more than it says"
+        )));
+    }
+    Ok(bytes)
 }
 
 pub fn open_packed(path: &Path) -> Result<PackedFiles, PackError> {
@@ -111,15 +172,21 @@ pub fn open_packed(path: &Path) -> Result<PackedFiles, PackError> {
 
 pub fn open_packed_limited(path: &Path, limits: PackLimits) -> Result<PackedFiles, PackError> {
     let mut zip = ZipArchive::new(File::open(path)?)?;
+    if zip.has_duplicate_names() {
+        return Err(PackError::Corrupt("a file name appears twice".into()));
+    }
     if zip.len() > limits.entries {
-        return Err(PackError::TooLarge(format!("it holds more than {} files", limits.entries)));
+        return Err(PackError::TooLarge(format!(
+            "it holds more than {} files",
+            limits.entries
+        )));
     }
     // Every name is checked before any entry is read.
     let mut index = HashMap::new();
     let mut directories = Vec::new();
     let mut total = 0u64;
     for i in 0..zip.len() {
-        let entry = zip.by_index_raw(i)?;
+        let entry = zip.by_index_data(i)?;
         let name = entry.name()?.to_string();
         if !safe_name(&name) || entry.is_symlink() {
             return Err(PackError::UnsafeName(name));
@@ -128,41 +195,63 @@ pub fn open_packed_limited(path: &Path, limits: PackLimits) -> Result<PackedFile
             directories.push(name.trim_end_matches('/').to_string());
             continue;
         }
+        if name == MANIFEST_NAME && entry.size() > MANIFEST_LIMIT {
+            return Err(PackError::Corrupt("talk.json is too large".into()));
+        }
         if entry.size() > limits.entry_bytes {
-            return Err(PackError::TooLarge(format!("{name} is bigger than {} bytes", limits.entry_bytes)));
+            return Err(PackError::TooLarge(format!(
+                "{name} is bigger than {} bytes",
+                limits.entry_bytes
+            )));
         }
         total = total.saturating_add(entry.size());
         if total > limits.total_bytes {
-            return Err(PackError::TooLarge(format!("it holds more than {} bytes", limits.total_bytes)));
+            return Err(PackError::TooLarge(format!(
+                "it holds more than {} bytes",
+                limits.total_bytes
+            )));
         }
-        if index.insert(name.clone(), i).is_some() {
-            return Err(PackError::Corrupt(format!("{name} appears twice")));
-        }
+        index.insert(name, i);
     }
     let Some(&manifest_at) = index.get(MANIFEST_NAME) else {
-        return Err(if index.contains_key(STAGEPACK_MANIFEST) { PackError::SlidevTalk } else { PackError::NotATalk });
+        return Err(if index.contains_key(STAGEPACK_MANIFEST) {
+            PackError::SlidevTalk
+        } else {
+            PackError::NotATalk
+        });
     };
     let manifest = {
         let entry = zip.by_index(manifest_at)?;
-        read_limited(entry, MANIFEST_LIMIT)?.ok_or_else(|| PackError::Corrupt("talk.json is too large".into()))?
+        let size = entry.size();
+        read_sized(entry, size, MANIFEST_NAME)?
     };
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&manifest).map_err(|e| PackError::Corrupt(format!("talk.json: {e}")))?;
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest)
+        .map_err(|e| PackError::Corrupt(format!("talk.json: {e}")))?;
     let format = manifest
         .get("format")
         .and_then(|f| f.as_u64())
         .filter(|&f| f >= 1)
         .ok_or_else(|| PackError::Corrupt("talk.json has no format".into()))?;
     if format > FORMAT_VERSION as u64 {
-        return Err(PackError::TooNew { format: u32::try_from(format).unwrap_or(u32::MAX) });
+        return Err(PackError::TooNew {
+            format: u32::try_from(format).unwrap_or(u32::MAX),
+        });
     }
     if manifest.get("entry").and_then(|e| e.as_str()) != Some(SLIDES_NAME) {
-        return Err(PackError::Corrupt("talk.json doesn't name slides.md".into()));
+        return Err(PackError::Corrupt(
+            "talk.json doesn't name slides.md".into(),
+        ));
     }
     if !index.contains_key(SLIDES_NAME) {
         return Err(PackError::Corrupt("slides.md is missing".into()));
     }
-    Ok(PackedFiles { zip: Mutex::new(zip), index, directories, entry_bytes: limits.entry_bytes })
+    Ok(PackedFiles {
+        zip: Mutex::new(zip),
+        index,
+        directories,
+        entry_bytes: limits.entry_bytes,
+        total_bytes: limits.total_bytes,
+    })
 }
 
 impl PackedFiles {
@@ -181,19 +270,27 @@ impl PackedFiles {
         names
     }
 
+    /// `path` as it is in the pack, read with the limits of the pack.
     fn read_checked(&self, path: &str) -> Result<Option<Vec<u8>>, PackError> {
-        let Some(&i) = self.index.get(path) else { return Ok(None) };
+        let Some(&i) = self.index.get(path) else {
+            return Ok(None);
+        };
         let mut zip = self.zip.lock().unwrap_or_else(|e| e.into_inner());
         let entry = zip.by_index(i)?;
-        read_limited(entry, self.entry_bytes)?
-            .map(Some)
-            .ok_or_else(|| PackError::TooLarge(format!("{path} is bigger than {} bytes", self.entry_bytes)))
+        let size = entry.size();
+        if size > self.entry_bytes {
+            return Err(PackError::TooLarge(format!(
+                "{path} is bigger than {} bytes",
+                self.entry_bytes
+            )));
+        }
+        read_sized(entry, size, path).map(Some)
     }
 }
 
 impl TalkFiles for PackedFiles {
     fn read(&self, path: &str) -> Option<Vec<u8>> {
-        self.read_checked(path).ok().flatten()
+        self.read_checked(&normalise(path)?).ok().flatten()
     }
 }
 
@@ -203,7 +300,10 @@ pub struct PackReport {
 }
 
 /// Collects what goes in a pack: relative names with the path to read each from.
-fn collect(folder: &Path, skipped: &mut Vec<String>) -> Result<Vec<(String, std::path::PathBuf)>, PackError> {
+fn collect(
+    folder: &Path,
+    skipped: &mut Vec<String>,
+) -> Result<Vec<(String, std::path::PathBuf)>, PackError> {
     fn walk(
         dir: &Path,
         prefix: &str,
@@ -267,7 +367,10 @@ pub fn pack_folder(folder: &Path, out: &Path, app_version: &str) -> Result<PackR
     let files = collect(folder, &mut skipped)?;
     let limits = PackLimits::default();
     if files.len() + 1 > limits.entries {
-        return Err(PackError::TooLarge(format!("it would hold more than {} files", limits.entries)));
+        return Err(PackError::TooLarge(format!(
+            "it would hold more than {} files",
+            limits.entries
+        )));
     }
     // Written by hand so the fields keep this order.
     let manifest = format!(
@@ -276,8 +379,10 @@ pub fn pack_folder(folder: &Path, out: &Path, app_version: &str) -> Result<PackR
     )
     .into_bytes();
 
-    let mut entries: Vec<(String, Option<&Path>)> =
-        files.iter().map(|(name, path)| (name.clone(), Some(path.as_path()))).collect();
+    let mut entries: Vec<(String, Option<&Path>)> = files
+        .iter()
+        .map(|(name, path)| (name.clone(), Some(path.as_path())))
+        .collect();
     entries.push((MANIFEST_NAME.to_string(), None));
     entries.sort();
 
@@ -287,17 +392,26 @@ pub fn pack_folder(folder: &Path, out: &Path, app_version: &str) -> Result<PackR
         let size = std::fs::metadata(path)?.len();
         total = total.saturating_add(size);
         if size > limits.entry_bytes {
-            return Err(PackError::TooLarge(format!("{name} is bigger than {} bytes", limits.entry_bytes)));
+            return Err(PackError::TooLarge(format!(
+                "{name} is bigger than {} bytes",
+                limits.entry_bytes
+            )));
         }
         if total > limits.total_bytes {
-            return Err(PackError::TooLarge(format!("it would hold more than {} bytes", limits.total_bytes)));
+            return Err(PackError::TooLarge(format!(
+                "it would hold more than {} bytes",
+                limits.total_bytes
+            )));
         }
     }
 
     write_atomically(out, |file| {
         let mut zip = ZipWriter::new(file);
         for (name, path) in &entries {
-            let extension = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+            let extension = name
+                .rsplit_once('.')
+                .map(|(_, e)| e.to_ascii_lowercase())
+                .unwrap_or_default();
             let method = if STORED_EXTENSIONS.contains(&extension.as_str()) {
                 CompressionMethod::Stored
             } else {
@@ -330,6 +444,18 @@ pub fn pack_folder(folder: &Path, out: &Path, app_version: &str) -> Result<PackR
 /// written, since packing makes a new one. A failure leaves `folder` as it was.
 pub fn unpack_to_folder(packed: &Path, folder: &Path) -> Result<(), PackError> {
     let files = open_packed(packed)?;
+    // Only what a talk is made of is written: not `.git/config` and the like.
+    let under_a_folder =
+        |name: &str| PACKED_FOLDERS.contains(&name.split('/').next().unwrap_or(""));
+    let bad_file = files.index.keys().find(|n| {
+        !(n.as_str() == SLIDES_NAME
+            || n.as_str() == MANIFEST_NAME
+            || (n.contains('/') && under_a_folder(n)))
+    });
+    let bad_directory = files.directories.iter().find(|d| !under_a_folder(d));
+    if let Some(bad) = bad_file.or(bad_directory) {
+        return Err(PackError::UnsafeName(bad.clone()));
+    }
     let existed = match std::fs::read_dir(folder) {
         Ok(mut entries) => {
             if entries.next().is_some() {
@@ -349,7 +475,11 @@ pub fn unpack_to_folder(packed: &Path, folder: &Path) -> Result<(), PackError> {
             if let Ok(entries) = std::fs::read_dir(folder) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    let _ = if path.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+                    let _ = if path.is_dir() {
+                        std::fs::remove_dir_all(&path)
+                    } else {
+                        std::fs::remove_file(&path)
+                    };
                 }
             }
         } else {
@@ -360,20 +490,43 @@ pub fn unpack_to_folder(packed: &Path, folder: &Path) -> Result<(), PackError> {
 }
 
 fn unpack_into(files: &PackedFiles, folder: &Path) -> Result<(), PackError> {
+    // The place a name leads to, which must be inside `folder`.
+    let target_of = |name: &str| {
+        let target = folder.join(name);
+        let plain = Path::new(name)
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)));
+        (plain && target.starts_with(folder))
+            .then_some(target)
+            .ok_or_else(|| PackError::UnsafeName(name.to_string()))
+    };
     std::fs::create_dir_all(folder)?;
     for directory in &files.directories {
-        std::fs::create_dir_all(folder.join(directory))?;
+        std::fs::create_dir_all(target_of(directory)?)?;
     }
+    let mut written = 0u64;
     for name in files.names() {
         if name == MANIFEST_NAME {
             continue;
         }
-        let bytes = files.read_checked(&name)?.ok_or_else(|| PackError::Corrupt(format!("{name} is missing")))?;
-        let target = folder.join(&name);
+        let bytes = files
+            .read_checked(&name)?
+            .ok_or_else(|| PackError::Corrupt(format!("{name} is missing")))?;
+        written = written.saturating_add(bytes.len() as u64);
+        if written > files.total_bytes {
+            return Err(PackError::TooLarge(format!(
+                "it holds more than {} bytes",
+                files.total_bytes
+            )));
+        }
+        let target = target_of(&name)?;
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&target)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)?;
         file.write_all(&bytes)?;
     }
     Ok(())
@@ -389,9 +542,8 @@ pub fn write_atomically(
         .file_name()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?
         .to_string_lossy();
-    let temp = out.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    let (mut file, temp) = create_temp(out, &name)?;
     let result = (|| {
-        let mut file = File::create(&temp)?;
         write(&mut file)?;
         file.sync_all()?;
         drop(file);
@@ -410,6 +562,29 @@ pub fn write_atomically(
         let _ = std::fs::remove_file(&temp);
     }
     result
+}
+
+/// A new temporary file beside `out`. The name has a random part and the file is created only
+/// if nothing is there, so a link planted at a likely name is never followed.
+fn create_temp(out: &Path, name: &str) -> std::io::Result<(File, std::path::PathBuf)> {
+    use std::hash::{BuildHasher, Hasher};
+    let mut last = None;
+    for _ in 0..16 {
+        let random = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        let temp = out.with_file_name(format!(".{name}.{}.{random:016x}.tmp", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+        {
+            Ok(file) => return Ok((file, temp)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("no temporary file name was free")))
 }
 
 fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
