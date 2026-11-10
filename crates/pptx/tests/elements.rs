@@ -245,6 +245,21 @@ fn a_number_is_written_in_the_colour_it_is_given() {
     assert!(!plain_number.contains("buClr"), "{plain_number}");
 }
 
+#[test]
+fn a_link_is_trimmed_and_written_in_its_normal_form() {
+    assert_eq!(text::link_target("  https://example.com/a  ").as_deref(), Some("https://example.com/a"));
+    assert_eq!(text::link_target("https://example.com/a b").as_deref(), Some("https://example.com/a%20b"));
+    assert_eq!(text::link_target("HTTPS://EXAMPLE.com/a").as_deref(), Some("https://example.com/a"));
+    assert_eq!(text::link_target("mailto:me@example.com").as_deref(), Some("mailto:me@example.com"));
+}
+
+#[test]
+fn a_link_that_is_not_a_web_or_mail_address_has_no_target() {
+    for url in ["https://exa mple.com/a", "http://", "javascript:alert(1)", "file:///etc/passwd", "\\\\server\\share", "/a/b", ""] {
+        assert_eq!(text::link_target(url), None, "{url:?}");
+    }
+}
+
 // ---- shapes.rs ----
 
 #[test]

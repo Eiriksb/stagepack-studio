@@ -13,7 +13,8 @@ use crate::xml::{color_xml_of, emu, emu_from_units, esc, round_half_up, solid_fi
 pub struct TextCtx {
     /// The language every run is tagged with.
     pub lang: String,
-    /// The relationship id for a link's target. It is asked once per linked run.
+    /// The relationship id for a link's target. It is asked for each piece of linked text, so
+    /// one run that a line break cuts in two asks twice.
     pub link: Box<dyn FnMut(&str) -> String>,
 }
 
@@ -70,7 +71,7 @@ struct Look<'a> {
     underline: bool,
     color: Option<Color>,
     family: &'a str,
-    link: Option<&'a str>,
+    link: Option<String>,
 }
 
 /// `sz` in hundredths of a point, held to what PowerPoint accepts. Not finite or zero gives none.
@@ -105,18 +106,18 @@ fn rpr(look: &Look, ctx: &mut TextCtx, tag: &str) -> String {
         let family = esc(look.family);
         kids.push_str(&format!("<a:latin typeface=\"{family}\"/><a:cs typeface=\"{family}\"/>"));
     }
-    if let Some(url) = look.link {
+    if let Some(url) = &look.link {
         kids.push_str(&format!("<a:hlinkClick r:id=\"{}\"/>", esc(&(ctx.link)(url))));
     }
     if kids.is_empty() { format!("<{tag}{attrs}/>") } else { format!("<{tag}{attrs}>{kids}</{tag}>") }
 }
 
-/// Whether a talk's link may be written: only web and mail addresses, so a talk can't put a file,
-/// a network share or a script behind a click in somebody's PowerPoint.
-pub fn is_safe_link(url: &str) -> bool {
-    let url = url.trim();
-    let scheme = url.split_once(':').map_or("", |(scheme, _)| scheme);
-    ["http", "https", "mailto"].iter().any(|allowed| scheme.eq_ignore_ascii_case(allowed))
+/// A talk's link as it is written, in the form the URL parser gives it: PowerPoint can complain
+/// about a target that isn't a well-formed address. Only web and mail addresses have one, so a
+/// talk can't put a file, a network share or a script behind a click in somebody's PowerPoint.
+pub fn link_target(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url.trim()).ok()?;
+    ["http", "https", "mailto"].contains(&parsed.scheme()).then(|| parsed.to_string())
 }
 
 fn run_look(run: &NativeRun, with_link: bool) -> Look<'_> {
@@ -127,7 +128,7 @@ fn run_look(run: &NativeRun, with_link: bool) -> Look<'_> {
         underline: run.underline,
         color: Some(run.color),
         family: &run.family,
-        link: run.link.as_deref().filter(|url| with_link && is_safe_link(url)),
+        link: run.link.as_deref().filter(|_| with_link).and_then(link_target),
     }
 }
 

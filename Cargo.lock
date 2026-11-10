@@ -6760,6 +6760,7 @@ dependencies = [
  "tempfile",
  "tiny-skia",
  "toolkit",
+ "url",
  "zip",
 ]
 

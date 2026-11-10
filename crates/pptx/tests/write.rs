@@ -291,6 +291,30 @@ fn a_bullet_is_the_colour_the_slide_draws_it_in() {
 }
 
 #[test]
+fn a_link_with_a_space_in_its_path_is_written_encoded() {
+    let out = export("# A\n\n[a](<https://example.com/a b>)\n");
+    let rels = part(&out.bytes, "ppt/slides/_rels/slide1.xml.rels");
+    assert!(rels.contains("Target=\"https://example.com/a%20b\""), "{rels}");
+    assert!(out.notices.is_empty(), "{:?}", out.notices);
+}
+
+#[test]
+fn a_link_with_leading_spaces_is_written_without_them() {
+    let out = export("# A\n\n[a](<  https://example.com/a>)\n");
+    let rels = part(&out.bytes, "ppt/slides/_rels/slide1.xml.rels");
+    assert!(rels.contains("Target=\"https://example.com/a\""), "{rels}");
+}
+
+#[test]
+fn a_link_with_a_space_in_its_host_is_left_out_and_said_so() {
+    let out = export("# A\n\n[a](<https://exa mple.com/a>)\n");
+    assert!(!part(&out.bytes, "ppt/slides/slide1.xml").contains("hlinkClick"));
+    assert!(!part(&out.bytes, "ppt/slides/_rels/slide1.xml.rels").contains("exa mple"));
+    assert_eq!(out.notices.len(), 1, "{:?}", out.notices);
+    assert!(out.notices[0].contains("exa mple.com"), "{:?}", out.notices);
+}
+
+#[test]
 fn exporting_twice_gives_identical_bytes() {
     assert!(showcase().bytes == showcase().bytes);
 }

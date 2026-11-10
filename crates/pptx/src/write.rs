@@ -26,7 +26,7 @@ use crate::shapes::{
     Ph, background_xml, graphic_frame_xml, picture_xml_rotated, placeholder_xml_rotated, shape_xml_rotated, slide_xml,
 };
 use crate::table::{TABLE_URI, table_styles_xml, table_xml};
-use crate::text::{Anchor, Autofit, BodyOptions, TextCtx, is_safe_link};
+use crate::text::{Anchor, Autofit, BodyOptions, TextCtx, link_target};
 use crate::theme::theme_xml;
 use crate::timing::{Effect, animation_timing_xml, transition_xml};
 
@@ -186,7 +186,7 @@ fn left_out_links(specs: &[LayerSpec]) -> Vec<String> {
             NativeContent::Picture { .. } => Vec::new(),
         };
         for url in paragraphs.iter().flat_map(|p| &p.runs).filter_map(|run| run.link.as_deref()) {
-            if !is_safe_link(url) && !left_out.iter().any(|seen| seen == url) {
+            if link_target(url).is_none() && !left_out.iter().any(|seen| seen == url) {
                 left_out.push(url.to_string());
             }
         }
