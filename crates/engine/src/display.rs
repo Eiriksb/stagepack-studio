@@ -19,7 +19,8 @@ pub enum DisplayItem {
     Fill { path: tiny_skia::Path, color: Color },
     Stroke { path: tiny_skia::Path, color: Color, width: f32 },
     Text { text: ShapedText, x: f32, y: f32 },
-    Picture { pixmap: Arc<tiny_skia::Pixmap>, rect: Rect },
+    /// `src` is the file of the talk it was read from. An icon or a path has none.
+    Picture { pixmap: Arc<tiny_skia::Pixmap>, src: Option<String>, rect: Rect },
 }
 
 /// One element's drawing. Item coordinates are relative to `rect`'s top-left corner,

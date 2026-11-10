@@ -502,7 +502,11 @@ impl<'a, 'env> Flow<'a, 'env> {
             }
             Some(Content::Shape(look)) => items.extend(shape_items(look, x, y, w, h, self.theme)),
             Some(Content::Picture(picture)) if w > 0.0 && h > 0.0 => {
-                items.push(DisplayItem::Picture { pixmap: picture.clone(), rect: Rect { x, y, w, h } });
+                let src = match self.semantics.get(&node) {
+                    Some(Semantic::File { src, .. }) => Some(src.clone()),
+                    _ => None,
+                };
+                items.push(DisplayItem::Picture { pixmap: picture.clone(), src, rect: Rect { x, y, w, h } });
             }
             Some(Content::Placeholder(label)) => {
                 items.extend(placeholder_items(label, Rect { x, y, w, h }, self.theme, self.env.fonts));

@@ -13,7 +13,7 @@ use krilla::text::{Font, GlyphId, KrillaGlyph};
 use krilla::image::Image;
 use krilla::Document;
 use cosmic_text::{fontdb, LayoutGlyph};
-use slides_engine::{Deck, DisplayItem, Fonts, LayerSpec, Rect, ShapedText};
+use slides_engine::{Deck, DisplayItem, Fonts, LayerSpec, Rect, ShapedText, TalkFiles};
 use tiny_skia::PathSegment;
 use toolkit::Color;
 
@@ -26,6 +26,18 @@ const POINTS_PER_UNIT: f32 = 0.5;
 /// that couldn't be read.
 type FontCache = HashMap<fontdb::ID, Option<Font>>;
 
+/// Krilla images by the talk file they came from, so a picture used again is neither read nor
+/// encoded again. `None` marks one that couldn't be made.
+type ImageCache = HashMap<String, Option<Image>>;
+
+/// What every layer of a talk is drawn with.
+struct Drawing<'a> {
+    fonts: &'a mut Fonts,
+    files: &'a dyn TalkFiles,
+    font_cache: &'a mut FontCache,
+    image_cache: &'a mut ImageCache,
+}
+
 /// Writes the whole talk. What can't be drawn, such as a glyph from a missing font, is left
 /// out; only a failure of the PDF writer is an error.
 pub fn write_pdf(deck: &mut Deck) -> Result<Vec<u8>, String> {
@@ -33,15 +45,16 @@ pub fn write_pdf(deck: &mut Deck) -> Result<Vec<u8>, String> {
     if let Some(title) = deck.title() {
         document.set_metadata(krilla::metadata::Metadata::new().title(title));
     }
-    let mut cache = FontCache::new();
+    let (mut font_cache, mut image_cache) = (FontCache::new(), ImageCache::new());
     for index in 0..deck.slide_count() {
         let settings = PageSettings::from_wh(PAGE_WIDTH, PAGE_HEIGHT).ok_or("the page size is invalid")?;
         let mut page = document.start_page_with(settings);
         let mut surface = page.surface();
         surface.push_transform(&Transform::from_scale(POINTS_PER_UNIT, POINTS_PER_UNIT));
-        let (specs, fonts) = deck.specs_and_fonts(index);
+        let (specs, fonts, files) = deck.specs_fonts_and_files(index);
+        let mut drawing = Drawing { fonts, files, font_cache: &mut font_cache, image_cache: &mut image_cache };
         for spec in specs {
-            draw_layer(&mut surface, spec, fonts, &mut cache);
+            draw_layer(&mut surface, spec, &mut drawing);
         }
         surface.pop();
         surface.finish();
@@ -51,7 +64,7 @@ pub fn write_pdf(deck: &mut Deck) -> Result<Vec<u8>, String> {
 }
 
 /// Places the layer the way `render_layer` does: turned around the centre of its rect.
-fn draw_layer(surface: &mut Surface, spec: &LayerSpec, fonts: &mut Fonts, cache: &mut FontCache) {
+fn draw_layer(surface: &mut Surface, spec: &LayerSpec, drawing: &mut Drawing) {
     let Rect { x, y, w, h } = spec.rect;
     if ![x, y, w, h, spec.rotate].into_iter().all(f32::is_finite) {
         return;
@@ -74,8 +87,8 @@ fn draw_layer(surface: &mut Surface, spec: &LayerSpec, fonts: &mut Fonts, cache:
                     surface.draw_path(&path);
                 }
             }
-            DisplayItem::Text { text, x, y } => draw_text(surface, text, *x, *y, fonts, cache),
-            DisplayItem::Picture { pixmap, rect } => draw_picture(surface, pixmap, rect),
+            DisplayItem::Text { text, x, y } => draw_text(surface, text, *x, *y, drawing.fonts, drawing.font_cache),
+            DisplayItem::Picture { pixmap, src, rect } => draw_picture(surface, pixmap, src.as_deref(), rect, drawing),
         }
     }
     surface.pop();
@@ -114,9 +127,37 @@ fn convert_path(path: &tiny_skia::Path) -> Option<Path> {
     b.finish()
 }
 
-fn draw_picture(surface: &mut Surface, pixmap: &tiny_skia::Pixmap, rect: &Rect) {
-    let Ok(png) = pixmap.encode_png() else { return };
-    let Ok(image) = Image::from_png(png.into(), true) else { return };
+/// A picture as it was decoded for the slide, which stays lossless.
+fn image_from_pixmap(pixmap: &tiny_skia::Pixmap) -> Option<Image> {
+    Image::from_png(pixmap.encode_png().ok()?.into(), true).ok()
+}
+
+/// A JPEG file as itself. `decode` in the engine's `pictures.rs` ignores an EXIF orientation, and
+/// so does a PDF reader, so the page shows it the way the slide does. What it's named doesn't
+/// matter: only the file's first bytes say it's a JPEG.
+fn image_from_jpeg(bytes: Vec<u8>) -> Option<Image> {
+    if !bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return None;
+    }
+    Image::from_jpeg(bytes.into(), true).ok()
+}
+
+/// The picture to embed. One from a file of the talk is made once, however often it's used.
+fn image_for(pixmap: &tiny_skia::Pixmap, src: Option<&str>, drawing: &mut Drawing) -> Option<Image> {
+    let Some(src) = src else {
+        return image_from_pixmap(pixmap);
+    };
+    if let Some(image) = drawing.image_cache.get(src) {
+        return image.clone();
+    }
+    let image = drawing.files.read(src).and_then(image_from_jpeg).or_else(|| image_from_pixmap(pixmap));
+    drawing.image_cache.insert(src.to_string(), image.clone());
+    image
+}
+
+/// Draws the picture stretched over `rect`, as the slide does, however many pixels it has.
+fn draw_picture(surface: &mut Surface, pixmap: &tiny_skia::Pixmap, src: Option<&str>, rect: &Rect, drawing: &mut Drawing) {
+    let Some(image) = image_for(pixmap, src, drawing) else { return };
     let Some(size) = Size::from_wh(rect.w, rect.h) else { return };
     surface.push_transform(&Transform::from_translate(rect.x, rect.y));
     surface.draw_image(image, size);

@@ -156,3 +156,115 @@ fn a_slide_with_an_error_still_exports() {
     let Some(info) = run("pdfinfo", &[&pdf]) else { return };
     assert!(info.contains("Pages:           3"), "{info}");
 }
+
+/// What a picture can add to a file besides its own bytes.
+const PICTURE_OVERHEAD: usize = 32 * 1024;
+
+/// Noise, which compresses as badly as a photo, as a file of `format`.
+fn noisy_picture(width: u32, height: u32, format: image::ImageFormat) -> Vec<u8> {
+    let mut state = 0x2545_f491_u32;
+    let mut byte = move || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state as u8
+    };
+    let picture = image::RgbImage::from_fn(width, height, |_, _| image::Rgb([byte(), byte(), byte()]));
+    let mut bytes = Vec::new();
+    picture.write_to(&mut std::io::Cursor::new(&mut bytes), format).unwrap();
+    bytes
+}
+
+/// A deck on a folder holding `files`, which has to outlive it.
+fn deck_with_files(source: &str, files: &[(&str, &[u8])]) -> (tempfile::TempDir, Deck) {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, bytes) in files {
+        std::fs::write(dir.path().join(name), bytes).unwrap();
+    }
+    let deck = Deck::open(Box::new(FolderFiles::new(dir.path().to_path_buf())), Fonts::bundled_only(), source.to_string());
+    (dir, deck)
+}
+
+fn holds(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|window| window == needle)
+}
+
+#[test]
+fn a_jpeg_goes_in_as_its_own_bytes() {
+    let jpeg = noisy_picture(800, 450, image::ImageFormat::Jpeg);
+    let (_dir, mut deck) = deck_with_files("![](photo.jpg)\n", &[("photo.jpg", &jpeg)]);
+    let pdf = slides_pdf::write_pdf(&mut deck).unwrap();
+    assert!(holds(&pdf, b"DCTDecode"));
+    assert!(holds(&pdf, &jpeg), "the file's own bytes");
+    assert!(pdf.len() < jpeg.len() + PICTURE_OVERHEAD, "{} against a JPEG of {}", pdf.len(), jpeg.len());
+}
+
+#[test]
+fn a_jpeg_used_twice_is_stored_once() {
+    let jpeg = noisy_picture(800, 450, image::ImageFormat::Jpeg);
+    let (_dir, mut deck) = deck_with_files(
+        "![](photo.jpg)\n\n![](photo.jpg)\n\n---\n\n![](photo.jpg)\n",
+        &[("photo.jpg", &jpeg)],
+    );
+    let pdf = slides_pdf::write_pdf(&mut deck).unwrap();
+    assert!(pdf.len() < jpeg.len() + PICTURE_OVERHEAD, "{} against a JPEG of {}", pdf.len(), jpeg.len());
+}
+
+#[test]
+fn a_png_stays_lossless_and_is_stored_once() {
+    let png = noisy_picture(400, 225, image::ImageFormat::Png);
+    let (_dir, mut once) = deck_with_files("![](a.png)\n", &[("a.png", &png)]);
+    let (_dir_too, mut twice) = deck_with_files("![](a.png)\n\n---\n\n![](a.png)\n", &[("a.png", &png)]);
+    let one = slides_pdf::write_pdf(&mut once).unwrap();
+    let two = slides_pdf::write_pdf(&mut twice).unwrap();
+    assert!(!holds(&one, b"DCTDecode"));
+    assert!(two.len() < one.len() + PICTURE_OVERHEAD, "once {}, twice {}", one.len(), two.len());
+}
+
+#[test]
+fn a_picture_that_only_calls_itself_a_jpeg_is_still_drawn() {
+    let png = noisy_picture(64, 36, image::ImageFormat::Png);
+    let (dir, mut deck) = deck_with_files("![](a.jpg)\n", &[("a.jpg", &png)]);
+    let pdf = write_to(&mut deck, dir.path(), "out.pdf");
+    assert!(!holds(&std::fs::read(&pdf).unwrap(), b"DCTDecode"));
+    let Some(difference) = page_difference(&mut deck, &pdf, 1, dir.path()) else { return };
+    assert!(difference < 6.0, "differs by {difference}");
+}
+
+/// A photo with bands in it, which shows if it's turned or stretched wrongly.
+fn banded_jpeg(width: u32, height: u32) -> Vec<u8> {
+    let picture = image::RgbImage::from_fn(width, height, |x, y| {
+        image::Rgb([if x < width / 2 { 220 } else { 30 }, if y < height / 2 { 200 } else { 40 }, 90])
+    });
+    let mut bytes = Vec::new();
+    picture.write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Jpeg).unwrap();
+    bytes
+}
+
+#[test]
+fn a_jpeg_is_stretched_to_the_box_it_is_placed_in() {
+    let jpeg = banded_jpeg(640, 160);
+    let (dir, mut deck) = deck_with_files("<Picture src=\"a.jpg\" x=\"200\" y=\"100\" w=\"300\" h=\"800\" />\n", &[("a.jpg", &jpeg)]);
+    let pdf = write_to(&mut deck, dir.path(), "out.pdf");
+    assert!(holds(&std::fs::read(&pdf).unwrap(), b"DCTDecode"));
+    let Some(difference) = page_difference(&mut deck, &pdf, 1, dir.path()) else { return };
+    assert!(difference < 6.0, "differs by {difference}");
+}
+
+/// `jpeg` with an EXIF block saying it is to be turned a quarter of a circle.
+fn with_exif_orientation(jpeg: &[u8]) -> Vec<u8> {
+    let exif: &[u8] = &[
+        0xFF, 0xE1, 0, 34, b'E', b'x', b'i', b'f', 0, 0, b'I', b'I', 42, 0, 8, 0, 0, 0, 1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0,
+        0, 0, 0, 0, 0, 0,
+    ];
+    [&jpeg[..2], exif, &jpeg[2..]].concat()
+}
+
+#[test]
+fn a_jpeg_marked_as_turned_looks_as_it_does_on_the_slide() {
+    let jpeg = with_exif_orientation(&banded_jpeg(640, 160));
+    let (dir, mut deck) = deck_with_files("![](a.jpg)\n", &[("a.jpg", &jpeg)]);
+    let pdf = write_to(&mut deck, dir.path(), "out.pdf");
+    let Some(difference) = page_difference(&mut deck, &pdf, 1, dir.path()) else { return };
+    assert!(difference < 6.0, "differs by {difference}");
+}

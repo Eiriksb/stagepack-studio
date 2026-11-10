@@ -68,7 +68,7 @@ fn a_stroke_counts_half_its_width_past_its_path() {
 #[test]
 fn a_picture_past_the_rect_grows_the_layer() {
     let pixmap = std::sync::Arc::new(tiny_skia::Pixmap::new(1, 1).unwrap());
-    let spec = layer_of(PLACE, 0.0, DisplayItem::Picture { pixmap, rect: Rect { x: 0.0, y: 150.0, w: 100.0, h: 100.0 } });
+    let spec = layer_of(PLACE, 0.0, DisplayItem::Picture { pixmap, src: None, rect: Rect { x: 0.0, y: 150.0, w: 100.0, h: 100.0 } });
     let layer = render_layer(&spec, 1.0, &mut Fonts::bundled_only());
     assert!(layer.pixmap.height() >= 250);
 }

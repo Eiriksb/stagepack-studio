@@ -115,7 +115,7 @@ pub fn render_layer(spec: &LayerSpec, scale: f32, fonts: &mut Fonts) -> Layer {
             DisplayItem::Text { text, x, y } => {
                 draw_text(&mut target, text, fonts, at.pre_translate(*x, *y));
             }
-            DisplayItem::Picture { pixmap: picture, rect } => {
+            DisplayItem::Picture { pixmap: picture, rect, .. } => {
                 let fit = at
                     .pre_translate(rect.x, rect.y)
                     .pre_scale(rect.w / picture.width() as f32, rect.h / picture.height() as f32);

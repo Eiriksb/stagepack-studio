@@ -6742,6 +6742,7 @@ name = "slides-pdf"
 version = "0.1.0"
 dependencies = [
  "cosmic-text",
+ "image",
  "krilla",
  "slides-engine",
  "tempfile",

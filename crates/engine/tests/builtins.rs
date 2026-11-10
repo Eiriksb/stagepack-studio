@@ -45,7 +45,7 @@ fn picture_of(layer: &LayerSpec) -> (&tiny_skia::Pixmap, Rect) {
         .items
         .iter()
         .find_map(|item| match item {
-            DisplayItem::Picture { pixmap, rect } => Some((&**pixmap, *rect)),
+            DisplayItem::Picture { pixmap, rect, .. } => Some((&**pixmap, *rect)),
             _ => None,
         })
         .expect("the layer has a picture")
