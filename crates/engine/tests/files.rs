@@ -16,6 +16,9 @@ fn reading_outside_the_talk_is_refused() {
     std::fs::create_dir(&talk).unwrap();
     let files = FolderFiles::new(talk.clone());
     assert_eq!(files.read("../secret.txt"), None);
+    assert_eq!(files.read("\\\\server\\share\\x"), None);
+    assert_eq!(files.read("C:\\x"), None);
+    assert_eq!(files.read("a\\b"), None);
     assert_eq!(files.read(dir.path().join("secret.txt").to_str().unwrap()), None);
     #[cfg(unix)]
     {

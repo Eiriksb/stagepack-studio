@@ -226,25 +226,37 @@ fn attr_of(xml: &str, tag: &str, key: &str) -> i64 {
     rest[at..].split('"').next().unwrap().parse().unwrap()
 }
 
-/// The centre of the first shape that isn't the slide's own title, in EMU.
-fn centre_of_box(xml: &str) -> (i64, i64) {
-    let at = xml.find("<a:xfrm").unwrap();
-    let rest = &xml[at..];
+/// The centre of the `n`th shape of the slide (from 0), in EMU.
+fn centre_of_shape(xml: &str, n: usize) -> (i64, i64) {
+    let tree = &xml[xml.find("</p:grpSpPr>").unwrap()..];
+    let at = tree.match_indices("<a:xfrm").nth(n).expect("a shape").0;
+    let rest = &tree[at..];
     let (x, y) = (attr_of(rest, "a:off", "x"), attr_of(rest, "a:off", "y"));
     let (cx, cy) = (attr_of(rest, "a:ext", "cx"), attr_of(rest, "a:ext", "cy"));
     (x + cx / 2, y + cy / 2)
 }
 
+const UNIT: i64 = 6350;
+
 #[test]
 fn a_rotated_layer_turns_its_elements_around_its_centre() {
-    let flat = export("<Box x=\"100\" y=\"100\" w=\"400\" h=\"200\" fill=\"red\">\n\nHi\n\n</Box>\n");
-    let turned = export("<Box x=\"100\" y=\"100\" w=\"400\" h=\"200\" fill=\"red\" rotate=\"90\">\n\nHi\n\n</Box>\n");
-    let flat = part(&flat.bytes, "ppt/slides/slide1.xml");
-    let turned = part(&turned.bytes, "ppt/slides/slide1.xml");
-    assert!(turned.contains("rot=\"5400000\""));
+    // A layer of 400 x 200 at (100, 100) holding two shapes, turned or not. The outer box fills
+    // the layer, so its centre stays; the inner one is off the centre and goes around it.
+    let nested = |turn: &str| {
+        format!("<Box x=\"100\" y=\"100\" w=\"400\" h=\"200\"{turn} fill=\"blue\">\n\n<Box x=\"0\" y=\"0\" w=\"100\" h=\"60\" fill=\"red\">\n\nHi\n\n</Box>\n\n</Box>\n")
+    };
+    let flat = part(&export(&nested("")).bytes, "ppt/slides/slide1.xml");
+    let turned = part(&export(&nested(" rotate=\"90\"")).bytes, "ppt/slides/slide1.xml");
     assert!(!flat.contains("rot=\""));
-    let (a, b) = (centre_of_box(&flat), centre_of_box(&turned));
-    assert!((a.0 - b.0).abs() <= 1 && (a.1 - b.1).abs() <= 1, "{a:?} vs {b:?}");
+    assert_eq!(turned.matches("rot=\"5400000\"").count(), 2, "both shapes take the layer's turn");
+    let layer = (300 * UNIT, 200 * UNIT);
+    assert_eq!(centre_of_shape(&turned, 0), layer);
+    let inner = centre_of_shape(&flat, 1);
+    assert_ne!(inner, layer, "the inner box has to be off the centre for this to mean anything");
+    // 90 degrees clockwise on a screen with y down: (dx, dy) becomes (-dy, dx).
+    let expected = (layer.0 - (inner.1 - layer.1), layer.1 + (inner.0 - layer.0));
+    let got = centre_of_shape(&turned, 1);
+    assert!((got.0 - expected.0).abs() <= 1 && (got.1 - expected.1).abs() <= 1, "{got:?} vs {expected:?}");
 }
 
 #[test]
@@ -312,4 +324,54 @@ fn it_opens_in_libreoffice() {
     assert!(info.lines().any(|l| l.starts_with("Pages:") && l.trim_end().ends_with(" 7")), "{info}");
     let text = Command::new("pdftotext").arg(&pdf).arg("-").output().unwrap();
     assert!(String::from_utf8_lossy(&text.stdout).contains("Stagepack Showcase"));
+}
+
+fn title_shape(xml: &str) -> &str {
+    let at = xml.find("type=\"title\"").expect("a title placeholder");
+    let start = xml[..at].rfind("<p:sp>").unwrap();
+    &xml[start..at + xml[at..].find("</p:sp>").unwrap()]
+}
+
+#[test]
+fn a_shape_with_no_text_has_no_text_build() {
+    let out = export("<Shape kind=\"ellipse\" x=\"0\" y=\"0\" w=\"99\" h=\"99\" fill=\"red\" click=\"1\" />\n");
+    let xml = part(&out.bytes, "ppt/slides/slide1.xml");
+    assert!(xml.contains("presetID=\"1\""), "it still comes in on the click");
+    assert!(!xml.contains("grpId") && !xml.contains("bldP"), "{xml}");
+}
+
+#[test]
+fn a_title_is_placed_as_the_app_draws_it() {
+    let xml = part(&export("# A title\n").bytes, "ppt/slides/slide1.xml");
+    let title = title_shape(&xml);
+    assert!(title.contains("anchor=\"t\""), "{title}");
+    assert!(title.contains("lIns=\"0\"") && title.contains("tIns=\"0\""), "{title}");
+    assert!(title.contains("<a:noAutofit/>") && !title.contains("normAutofit"), "{title}");
+}
+
+#[test]
+fn a_rotated_title_is_still_a_placeholder() {
+    let xml = part(&export("---\nregion.title: x=100 y=100 w=500 h=100 rotate=30\n---\n\n# T\n").bytes, "ppt/slides/slide1.xml");
+    let title = title_shape(&xml);
+    assert!(title.contains("rot=\"1800000\""), "{title}");
+}
+
+#[test]
+fn only_web_and_mail_links_are_written() {
+    let out = export(concat!(
+        "# A\n\n[a](file:///etc/passwd) [b](javascript:alert(1)) [c](\\\\server\\share\\x) [d]() ",
+        "[e](https://example.com/ok) [f](  MAILTO:me@example.com)\n"
+    ));
+    let xml = part(&out.bytes, "ppt/slides/slide1.xml");
+    let rels = part(&out.bytes, "ppt/slides/_rels/slide1.xml.rels");
+    assert_eq!(xml.matches("hlinkClick").count(), 2, "{xml}");
+    assert!(rels.contains("https://example.com/ok") && rels.to_lowercase().contains("mailto:me@example.com"), "{rels}");
+    for bad in ["file:", "javascript:", "server"] {
+        assert!(!rels.contains(bad), "{rels}");
+    }
+    for word in ["a", "b", "c", "d"] {
+        assert!(xml.contains(&format!("<a:t>{word}</a:t>")), "the text of {word} stays");
+    }
+    assert!(out.notices.iter().any(|n| n.contains("file:///etc/passwd")), "{:?}", out.notices);
+    assert!(out.notices.iter().any(|n| n.contains("javascript:")), "{:?}", out.notices);
 }

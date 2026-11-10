@@ -1,6 +1,6 @@
 //! Reading the files that belong to a talk.
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
 /// Where a talk's pictures and fonts come from.
@@ -28,6 +28,26 @@ impl FolderFiles {
     /// Where `path` really is. A talk can't reach outside its folder, whether by `..`, an
     /// absolute path or a symlink.
     fn resolve(&self, path: &str) -> Option<PathBuf> {
+        // Judged by the text alone, before the disk is touched: on Windows even finding out
+        // where a network path leads reaches out to the network. A path that is absolute, has a
+        // Windows prefix or a backslash, or climbs out of the talk with `..`, is refused.
+        let mut clean = PathBuf::new();
+        if path.contains('\\') {
+            return None;
+        }
+        for part in Path::new(path).components() {
+            match part {
+                Component::Normal(name) => clean.push(name),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if !clean.pop() {
+                        return None;
+                    }
+                }
+                Component::RootDir | Component::Prefix(_) => return None,
+            }
+        }
+        let path = clean.as_path();
         let root = self.root.canonicalize().ok()?;
         let file = root.join(path).canonicalize().ok()?;
         file.starts_with(&root).then_some(file)

@@ -13,7 +13,7 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use tiny_skia::Pixmap;
-use slides_engine::{Deck, LayerSpec, NativeContent, NativeElement, Rect, TalkFiles};
+use slides_engine::{Deck, LayerSpec, NativeContent, NativeElement, NativeParagraph, Rect, TalkFiles};
 
 use crate::master::{Geometry, LayoutId, layout_defs, layout_xml, master_xml};
 use crate::notes::{notes_master_xml, notes_slide_xml};
@@ -22,10 +22,10 @@ use crate::presentation::{
     Presentation, SlideRef, app_xml, core_xml, pres_props_xml, presentation_xml, view_props_xml,
 };
 use crate::shapes::{
-    Ph, background_xml, graphic_frame_xml, picture_xml_rotated, placeholder_xml, shape_xml_rotated, slide_xml,
+    Ph, background_xml, graphic_frame_xml, picture_xml_rotated, placeholder_xml_rotated, shape_xml_rotated, slide_xml,
 };
 use crate::table::{TABLE_URI, table_styles_xml, table_xml};
-use crate::text::{BodyOptions, TextCtx};
+use crate::text::{Anchor, Autofit, BodyOptions, TextCtx, is_safe_link};
 use crate::theme::theme_xml;
 use crate::timing::{Effect, animation_timing_xml, transition_xml};
 
@@ -149,12 +149,17 @@ impl SlideEnv<'_> {
     fn element_xml(&mut self, id: u32, layer: &LayerSpec, element: &NativeElement, title: bool) -> Option<(String, bool)> {
         let (rect, rotate) = place(layer, element)?;
         match &element.content {
-            NativeContent::Text { paragraphs, .. } if title => {
+            NativeContent::Text { paragraphs, fill, inset } if title => {
+                // As the app draws it: the text where the box starts, not the master's insets,
+                // bottom anchor and shrinking.
                 let ph = Ph { kind: Some("title"), idx: None };
-                Some((placeholder_xml(id, "Title 1", &ph, Some(rect), paragraphs, &mut self.ctx, &BodyOptions::default()), true))
+                let body = BodyOptions { inset: Some(*inset), anchor: Some(Anchor::Top), autofit: Autofit::Off, ..BodyOptions::default() };
+                let xml = placeholder_xml_rotated(id, "Title 1", &ph, Some(rect), rotate, *fill, paragraphs, &mut self.ctx, &body);
+                Some((xml, true))
             }
-            NativeContent::Text { .. } | NativeContent::Shape { .. } => {
-                Some((shape_xml_rotated(id, rect, rotate, &element.content, &mut self.ctx)?, true))
+            NativeContent::Text { .. } => Some((shape_xml_rotated(id, rect, rotate, &element.content, &mut self.ctx)?, true)),
+            NativeContent::Shape { paragraphs, .. } => {
+                Some((shape_xml_rotated(id, rect, rotate, &element.content, &mut self.ctx)?, !paragraphs.is_empty()))
             }
             NativeContent::Table { rows, column_widths, row_heights, line } => {
                 // A table frame can't be turned in PowerPoint, so it is only moved.
@@ -170,6 +175,24 @@ impl SlideEnv<'_> {
     }
 }
 
+/// The links of the slide that aren't written, each once.
+fn left_out_links(specs: &[LayerSpec]) -> Vec<String> {
+    let mut left_out: Vec<String> = Vec::new();
+    for element in specs.iter().flat_map(|spec| &spec.native) {
+        let paragraphs: Vec<&NativeParagraph> = match &element.content {
+            NativeContent::Text { paragraphs, .. } | NativeContent::Shape { paragraphs, .. } => paragraphs.iter().collect(),
+            NativeContent::Table { rows, .. } => rows.iter().flatten().flatten().collect(),
+            NativeContent::Picture { .. } => Vec::new(),
+        };
+        for url in paragraphs.iter().flat_map(|p| &p.runs).filter_map(|run| run.link.as_deref()) {
+            if !is_safe_link(url) && !left_out.iter().any(|seen| seen == url) {
+                left_out.push(url.to_string());
+            }
+        }
+    }
+    left_out
+}
+
 fn has_fill(content: &NativeContent) -> bool {
     match content {
         NativeContent::Text { fill, .. } => fill.is_some(),
@@ -181,9 +204,9 @@ fn has_fill(content: &NativeContent) -> bool {
 }
 
 /// The layer and element that become the slide's title placeholder: the first text of the title
-/// layer. A turned title is a text box, as a placeholder can't be turned.
+/// layer.
 fn title_of(specs: &[LayerSpec]) -> Option<(usize, usize)> {
-    let (layer, spec) = specs.iter().enumerate().find(|(_, spec)| spec.is_title && spec.rotate == 0.0)?;
+    let (layer, spec) = specs.iter().enumerate().find(|(_, spec)| spec.is_title)?;
     let element = spec.native.iter().position(|e| matches!(e.content, NativeContent::Text { .. }))?;
     Some((layer, element))
 }
@@ -243,6 +266,7 @@ pub fn write_pptx(deck: &mut Deck, files: &dyn TalkFiles) -> Result<PptxOutput, 
         notices.extend(deck.notices(index).into_iter().map(|n| format!("Slide {}: {n}", index + 1)));
         let timeline = deck.timeline(index);
         let specs = deck.specs(index);
+        notices.extend(left_out_links(specs).into_iter().map(|url| format!("Slide {}: the link {url:?} was left out: only http, https and mailto links are kept", index + 1)));
         let part = format!("/ppt/slides/slide{}.xml", index + 1);
         let title_at = title_of(specs);
         let layout = layout_parts[if title_at.is_some() { "titleOnly" } else { "blank" }].clone();

@@ -111,6 +111,14 @@ fn rpr(look: &Look, ctx: &mut TextCtx, tag: &str) -> String {
     if kids.is_empty() { format!("<{tag}{attrs}/>") } else { format!("<{tag}{attrs}>{kids}</{tag}>") }
 }
 
+/// Whether a talk's link may be written: only web and mail addresses, so a talk can't put a file,
+/// a network share or a script behind a click in somebody's PowerPoint.
+pub fn is_safe_link(url: &str) -> bool {
+    let url = url.trim();
+    let scheme = url.split_once(':').map_or("", |(scheme, _)| scheme);
+    ["http", "https", "mailto"].iter().any(|allowed| scheme.eq_ignore_ascii_case(allowed))
+}
+
 fn run_look(run: &NativeRun, with_link: bool) -> Look<'_> {
     Look {
         size: run.size,
@@ -119,7 +127,7 @@ fn run_look(run: &NativeRun, with_link: bool) -> Look<'_> {
         underline: run.underline,
         color: Some(run.color),
         family: &run.family,
-        link: run.link.as_deref().filter(|_| with_link),
+        link: run.link.as_deref().filter(|url| with_link && is_safe_link(url)),
     }
 }
 

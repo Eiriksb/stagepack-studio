@@ -55,9 +55,27 @@ pub fn placeholder_xml(
     ctx: &mut TextCtx,
     body: &BodyOptions,
 ) -> String {
+    placeholder_xml_rotated(id, name, ph, rect, 0.0, None, paragraphs, ctx, body)
+}
+
+/// `placeholder_xml`, turned `rotate` degrees (which needs a `rect`) and with a `fill` behind it.
+#[allow(clippy::too_many_arguments)]
+pub fn placeholder_xml_rotated(
+    id: u32,
+    name: &str,
+    ph: &Ph,
+    rect: Option<Rect>,
+    rotate: f32,
+    fill: Option<Color>,
+    paragraphs: &[NativeParagraph],
+    ctx: &mut TextCtx,
+    body: &BodyOptions,
+) -> String {
     let kind = ph.kind.map(|k| format!(" type=\"{}\"", esc(k))).unwrap_or_default();
     let idx = ph.idx.map(|i| format!(" idx=\"{i}\"")).unwrap_or_default();
-    let sp_pr = rect.map_or("<p:spPr/>".to_string(), |r| format!("<p:spPr>{}</p:spPr>", xfrm_xml(r, 0.0)));
+    let xfrm = rect.map(|r| xfrm_xml(r, rotate)).unwrap_or_default();
+    let fill = fill.map(solid_fill_of).unwrap_or_default();
+    let sp_pr = if xfrm.is_empty() && fill.is_empty() { "<p:spPr/>".to_string() } else { format!("<p:spPr>{xfrm}{fill}</p:spPr>") };
     let body = tx_body_xml(paragraphs, ctx, &BodyOptions { placeholder: true, ..body.clone() }, "p:txBody");
     format!(
         "<p:sp><p:nvSpPr><p:cNvPr id=\"{id}\" name=\"{}\"/><p:cNvSpPr><a:spLocks noGrp=\"1\"/></p:cNvSpPr>\
