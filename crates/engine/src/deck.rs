@@ -1,6 +1,6 @@
 //! A talk and its drawn layers, kept so that an edit only draws again what it changed.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
@@ -38,6 +38,8 @@ struct Laid {
     keys: Vec<LayerKey>,
     notices: Vec<String>,
     transition: Transition,
+    /// Whether it shows a picture from a file of the talk, and so holds that picture in memory.
+    holds_pictures: bool,
 }
 
 /// A number that differs when a layer's items sit or measure differently.
@@ -88,6 +90,8 @@ pub struct Deck {
     backgrounds: HashMap<(String, u32), Arc<Layer>>,
     memory_budget: usize,
     layers_asked_for: u64,
+    /// The slides whose `laid` holds pictures, which are the ones that can give memory back.
+    slides_holding_pictures: BTreeSet<usize>,
 }
 
 /// The talk's settings, as far as they decide how a slide looks: not where they sit.
@@ -122,6 +126,7 @@ impl Deck {
             backgrounds: HashMap::new(),
             memory_budget: DEFAULT_MEMORY_BUDGET,
             layers_asked_for: 0,
+            slides_holding_pictures: BTreeSet::new(),
         }
     }
 
@@ -166,6 +171,12 @@ impl Deck {
         }
         self.theme = theme_key(&talk);
         self.talk = talk;
+        self.slides_holding_pictures = slides
+            .iter()
+            .enumerate()
+            .filter(|(_, slide)| slide.laid.as_ref().is_some_and(|laid| laid.holds_pictures))
+            .map(|(index, _)| index)
+            .collect();
         self.slides = slides;
         changed
     }
@@ -174,6 +185,17 @@ impl Deck {
     /// next call to `layers` on.
     pub fn set_memory_budget(&mut self, bytes: usize) {
         self.memory_budget = bytes;
+    }
+
+    /// How many pixel bytes the pictures of the talk can add up to, from the next slide laid
+    /// out on. The slide being asked for keeps its pictures, however much they take alone.
+    pub fn set_picture_budget(&mut self, bytes: usize) {
+        self.pictures.set_memory_budget(bytes);
+    }
+
+    /// The pixel bytes of the talk's pictures in memory. A picture many slides show counts once.
+    pub fn picture_bytes(&self) -> usize {
+        self.pictures.bytes()
     }
 
     /// The pixel bytes the deck is holding in drawn layers. A layer the slides share counts once.
@@ -195,7 +217,7 @@ impl Deck {
     }
 
     pub fn notices(&mut self, index: usize) -> Vec<String> {
-        self.lay_out(index);
+        self.ensure_laid(index);
         self.slides[index].laid.as_ref().map(|laid| laid.notices.clone()).unwrap_or_default()
     }
 
@@ -206,7 +228,7 @@ impl Deck {
 
     /// When each layer of the slide appears, in the order of `layers`, and how the slide is arrived at.
     pub fn timeline(&mut self, index: usize) -> SlideTimeline {
-        self.lay_out(index);
+        self.ensure_laid(index);
         let laid = self.slides[index].laid.as_ref().expect("the slide was just laid out");
         let layers: Vec<LayerTiming> =
             laid.specs.iter().map(|spec| LayerTiming { click: spec.click, enter: spec.enter }).collect();
@@ -216,13 +238,13 @@ impl Deck {
 
     /// What each layer of the slide draws, before it is drawn at any scale.
     pub fn specs(&mut self, index: usize) -> &[LayerSpec] {
-        self.lay_out(index);
+        self.ensure_laid(index);
         &self.slides[index].laid.as_ref().expect("the slide was just laid out").specs
     }
 
     /// A slide's specs with what they are drawn from: the fonts, and the talk's files.
     pub fn specs_fonts_and_files(&mut self, index: usize) -> (&[LayerSpec], &mut Fonts, &dyn TalkFiles) {
-        self.lay_out(index);
+        self.ensure_laid(index);
         let laid = self.slides[index].laid.as_ref().expect("the slide was just laid out");
         (&laid.specs, &mut self.fonts, &*self.files)
     }
@@ -238,7 +260,7 @@ impl Deck {
 
     /// The slide's layers, first to last, drawn at `scale`.
     pub fn layers(&mut self, index: usize, scale: f32) -> Vec<Arc<Layer>> {
-        self.lay_out(index);
+        self.ensure_laid(index);
         self.layers_asked_for += 1;
         self.slides[index].last_used = self.layers_asked_for;
         let layers = self.drawn_layers(index, scale);
@@ -304,7 +326,26 @@ impl Deck {
         ordered
     }
 
-    fn lay_out(&mut self, index: usize) {
+    /// Forgets how the slides furthest from slide `asked` are laid out, until the pictures in
+    /// memory are within budget. Each of those is laid out again when next needed. A laid-out
+    /// slide holds its pictures, so the cache can't free them by itself.
+    fn keep_pictures_within_budget(&mut self, asked: usize) {
+        self.pictures.let_go_of_unused();
+        while self.pictures.is_over_budget() {
+            let ends = [self.slides_holding_pictures.first(), self.slides_holding_pictures.last()];
+            let others = ends.into_iter().flatten().copied().filter(|slide| *slide != asked);
+            let Some(furthest) = others.max_by_key(|slide| slide.abs_diff(asked)) else {
+                return;
+            };
+            self.slides[furthest].laid = None;
+            self.slides_holding_pictures.remove(&furthest);
+            self.pictures.let_go_of_unused();
+        }
+    }
+
+    /// Lays out slide `index` if it isn't already, which is the one place pictures come into
+    /// memory, so that anything walking the slides stays within the budget.
+    fn ensure_laid(&mut self, index: usize) {
         if self.slides[index].laid.is_some() {
             return;
         }
@@ -337,6 +378,15 @@ impl Deck {
             })
             .collect();
         let notices = laid.notices.into_iter().map(|notice| notice.0).collect();
-        self.slides[index].laid = Some(Laid { specs: laid.layers, keys, notices, transition: laid.transition });
+        let holds_pictures = laid
+            .layers
+            .iter()
+            .flat_map(|spec| &spec.items)
+            .any(|item| matches!(item, DisplayItem::Picture { src: Some(_), .. }));
+        self.slides[index].laid = Some(Laid { specs: laid.layers, keys, notices, transition: laid.transition, holds_pictures });
+        if holds_pictures {
+            self.slides_holding_pictures.insert(index);
+        }
+        self.keep_pictures_within_budget(index);
     }
 }

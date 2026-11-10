@@ -18,6 +18,9 @@ use crate::TalkFiles;
 /// The longest edge a picture is kept at.
 const MAX_EDGE: u32 = 4096;
 
+/// What the pictures of a talk can add up to in memory, in pixel bytes, unless it's told otherwise.
+const DEFAULT_MEMORY_BUDGET: usize = 512 * 1024 * 1024;
+
 // What a picture file can ask for while it is decoded. A file can claim any dimensions,
 // so one that claims too much has to fail before anything is allocated for it.
 const MAX_DECODED_SIDE: u32 = 16384;
@@ -59,40 +62,119 @@ impl FileVersion {
 }
 
 struct CachedPicture {
-    picture: Arc<Pixmap>,
+    /// `None` once it has been let go. What its file was stays, so that a change to the file
+    /// still shows.
+    picture: Option<Arc<Pixmap>>,
     version: FileVersion,
+    /// The value of `PictureCache::asked_for` when it was last asked for.
+    last_used: u64,
+}
+
+impl CachedPicture {
+    fn bytes(&self) -> usize {
+        self.picture.as_ref().map_or(0, |picture| picture.data().len())
+    }
 }
 
 /// The pictures read so far, by their path in the talk. One that couldn't be read isn't
 /// kept, so it appears the next time its slide is laid out after the file is fixed.
-#[derive(Default)]
+///
+/// Past its budget it lets go of the pictures asked for longest ago. A picture that something
+/// else still holds, such as a laid-out slide, stays: letting go of it would free nothing, and
+/// it keeps every picture in memory counted here, once each.
 pub struct PictureCache {
     pictures: HashMap<String, CachedPicture>,
+    memory_budget: usize,
+    /// The pixel bytes of the pictures held.
+    bytes: usize,
+    asked_for: u64,
+}
+
+impl Default for PictureCache {
+    fn default() -> PictureCache {
+        PictureCache { pictures: HashMap::new(), memory_budget: DEFAULT_MEMORY_BUDGET, bytes: 0, asked_for: 0 }
+    }
 }
 
 impl PictureCache {
+    /// How many pixel bytes the pictures can add up to, from the next picture read on.
+    pub fn set_memory_budget(&mut self, bytes: usize) {
+        self.memory_budget = bytes;
+    }
+
+    /// The pixel bytes of the pictures in memory.
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub(crate) fn is_over_budget(&self) -> bool {
+        self.bytes > self.memory_budget
+    }
+
     pub(crate) fn get(&mut self, path: &str, files: &dyn TalkFiles) -> Option<Arc<Pixmap>> {
-        if let Some(cached) = self.pictures.get(path) {
-            return Some(cached.picture.clone());
+        self.asked_for += 1;
+        let asked_for = self.asked_for;
+        if let Some(CachedPicture { picture: Some(picture), last_used, .. }) = self.pictures.get_mut(path) {
+            *last_used = asked_for;
+            return Some(picture.clone());
         }
         // The stamp comes before the read, so a file that changes in between looks changed
         // the next time it's checked, not current.
         let stamp = files.stamp(path);
         let bytes = files.read(path)?;
-        let version = match stamp {
-            Some((length, modified)) => FileVersion::Stamp(length, modified),
-            None => FileVersion::of_bytes(&bytes),
-        };
         let picture = Arc::new(decode(path, &bytes)?);
-        self.pictures.insert(path.to_string(), CachedPicture { picture: picture.clone(), version });
+        self.bytes += picture.data().len();
+        match self.pictures.get_mut(path) {
+            // It keeps the version it was first read as: if the file has changed since, layers
+            // drawn from the old picture are still around, and the next check has to find them.
+            Some(let_go) => {
+                let_go.picture = Some(picture.clone());
+                let_go.last_used = asked_for;
+            }
+            None => {
+                let version = match stamp {
+                    Some((length, modified)) => FileVersion::Stamp(length, modified),
+                    None => FileVersion::of_bytes(&bytes),
+                };
+                self.pictures.insert(path.to_string(), CachedPicture { picture: Some(picture.clone()), version, last_used: asked_for });
+            }
+        }
+        self.let_go_of_unused();
         Some(picture)
+    }
+
+    /// While over budget, lets go of the pictures only this cache holds, oldest first.
+    pub(crate) fn let_go_of_unused(&mut self) {
+        if !self.is_over_budget() {
+            return;
+        }
+        let mut unused: Vec<&mut CachedPicture> = self
+            .pictures
+            .values_mut()
+            .filter(|cached| cached.picture.as_ref().is_some_and(|picture| Arc::strong_count(picture) == 1))
+            .collect();
+        unused.sort_unstable_by_key(|cached| cached.last_used);
+        for cached in unused {
+            if self.bytes <= self.memory_budget {
+                break;
+            }
+            self.bytes -= cached.bytes();
+            cached.picture = None;
+        }
     }
 
     /// Forgets every picture whose file is no longer the one that was read, and says
     /// whether there were any.
     pub(crate) fn drop_replaced(&mut self, files: &dyn TalkFiles) -> bool {
         let before = self.pictures.len();
-        self.pictures.retain(|path, cached| FileVersion::of_file(path, files).as_ref() == Some(&cached.version));
+        let held = &mut self.bytes;
+        self.pictures.retain(|path, cached| {
+            let same = FileVersion::of_file(path, files).as_ref() == Some(&cached.version);
+            if !same {
+                *held -= cached.bytes();
+            }
+            same
+        });
         self.pictures.len() != before
     }
 }

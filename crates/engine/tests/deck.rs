@@ -1,6 +1,6 @@
 mod common;
 use slides_engine::*;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 struct NoFiles;
 impl TalkFiles for NoFiles { fn read(&self, _: &str) -> Option<Vec<u8>> { None } }
@@ -226,4 +226,166 @@ fn going_back_to_an_evicted_slide_draws_it_again() {
     for (old, new) in before.iter().zip(&again) {
         assert!(pixels(old) == pixels(new), "drawn differently the second time");
     }
+}
+
+const PICTURE_SIDE: u32 = 256;
+/// What one of the pictures below takes in memory.
+const PICTURE_BYTES: usize = 256 * 256 * 4;
+
+fn png_of_side(side: u32, tint: u8) -> Vec<u8> {
+    let mut pixmap = tiny_skia::Pixmap::new(side, side).unwrap();
+    pixmap.fill(tiny_skia::Color::from_rgba8(tint, 255 - tint, 40, 255));
+    pixmap.encode_png().unwrap()
+}
+
+/// A talk with one slide for each of `count` pictures.
+fn talk_of_pictures(count: usize) -> String {
+    (0..count).map(|index| format!("![](p{index}.png)\n")).collect::<Vec<_>>().join("\n---\n\n")
+}
+
+/// A deck showing `source`, in a folder holding `count` pictures named as in `talk_of_pictures`.
+fn deck_of_pictures_showing(source: &str, count: usize) -> (tempfile::TempDir, Deck) {
+    let dir = tempfile::tempdir().unwrap();
+    for index in 0..count {
+        std::fs::write(dir.path().join(format!("p{index}.png")), png_of_side(PICTURE_SIDE, index as u8)).unwrap();
+    }
+    let files = FolderFiles::new(dir.path().to_path_buf());
+    let deck = Deck::open(Box::new(files), Fonts::bundled_only(), source.to_string());
+    (dir, deck)
+}
+
+fn deck_of_pictures(count: usize) -> (tempfile::TempDir, Deck) {
+    deck_of_pictures_showing(&talk_of_pictures(count), count)
+}
+
+/// Slide `index`'s picture, seen in a way that doesn't keep it in memory.
+fn picture_on(deck: &mut Deck, index: usize) -> Weak<tiny_skia::Pixmap> {
+    let drawn = deck.specs(index).iter().flat_map(|spec| &spec.items).find_map(|item| match item {
+        DisplayItem::Picture { pixmap, .. } => Some(Arc::downgrade(pixmap)),
+        _ => None,
+    });
+    drawn.expect("the slide has a picture")
+}
+
+fn bytes_still_held(pictures: &[Weak<tiny_skia::Pixmap>]) -> usize {
+    pictures.iter().filter_map(Weak::upgrade).map(|picture| picture.data().len()).sum()
+}
+
+#[test]
+fn walking_a_talk_of_large_pictures_stays_within_the_budget() {
+    let (_dir, mut deck) = deck_of_pictures(16);
+    let budget = 4 * PICTURE_BYTES;
+    deck.set_picture_budget(budget);
+    let mut seen = Vec::new();
+    for index in 0..16 {
+        seen.push(picture_on(&mut deck, index));
+        assert!(deck.picture_bytes() <= budget, "slide {index}: {}", deck.picture_bytes());
+        assert!(bytes_still_held(&seen) <= budget, "slide {index}: {}", bytes_still_held(&seen));
+    }
+}
+
+#[test]
+fn the_slide_asked_for_keeps_its_pictures_however_much_they_take() {
+    let (_dir, mut deck) = deck_of_pictures_showing("![](p0.png)\n\n![](p1.png)\n\n---\n\n![](p2.png)\n", 3);
+    deck.set_picture_budget(1);
+    let first = picture_on(&mut deck, 0);
+    assert!(first.upgrade().is_some());
+    let second = picture_on(&mut deck, 1);
+    assert!(second.upgrade().is_some());
+    assert!(first.upgrade().is_none(), "nothing else is worth keeping over budget");
+}
+
+#[test]
+fn the_slides_furthest_from_the_one_asked_for_are_let_go_first() {
+    let (_dir, mut deck) = deck_of_pictures(5);
+    deck.set_picture_budget(3 * PICTURE_BYTES);
+    let p0 = picture_on(&mut deck, 0);
+    let p1 = picture_on(&mut deck, 1);
+    let p2 = picture_on(&mut deck, 2);
+    let p4 = picture_on(&mut deck, 4);
+    assert!(p0.upgrade().is_none(), "slide 0 is the furthest from slide 4");
+    let p3 = picture_on(&mut deck, 3);
+    assert!(p1.upgrade().is_none(), "slide 1 is the furthest from slide 3");
+    assert!(p2.upgrade().is_some() && p3.upgrade().is_some() && p4.upgrade().is_some());
+}
+
+#[test]
+fn a_slide_walked_away_from_lays_out_again() {
+    let (_dir, mut deck) = deck_of_pictures_showing("<Nonesuch />\n\n![](p0.png)\n\n---\n\n![](p1.png)\n", 2);
+    deck.set_picture_budget(PICTURE_BYTES);
+    let notices = deck.notices(0);
+    assert!(!notices.is_empty());
+    let first = deck.layers(0, 0.5);
+    let timeline = deck.timeline(0);
+
+    let gone = picture_on(&mut deck, 0);
+    picture_on(&mut deck, 1);
+    assert!(gone.upgrade().is_none(), "walking on let it go");
+
+    assert_eq!(deck.notices(0), notices, "its notices are back");
+    assert_eq!(deck.timeline(0).layers.len(), timeline.layers.len());
+    let back = picture_on(&mut deck, 0).upgrade().expect("it's there again");
+    assert_eq!((back.width(), back.height()), (PICTURE_SIDE, PICTURE_SIDE));
+    let again = deck.layers(0, 0.5);
+    assert_eq!(again.len(), first.len());
+    assert!(first.iter().zip(&again).all(|(a, b)| Arc::ptr_eq(a, b)), "what was drawn is still good");
+}
+
+#[test]
+fn a_picture_on_many_slides_counts_once() {
+    let (_dir, mut deck) = deck_of_pictures_showing("![](p0.png)\n\n---\n\n![](p0.png)\n\n---\n\n![](p0.png)\n", 1);
+    deck.set_picture_budget(PICTURE_BYTES);
+    let pictures = [picture_on(&mut deck, 0), picture_on(&mut deck, 1), picture_on(&mut deck, 2)];
+    assert_eq!(deck.picture_bytes(), PICTURE_BYTES);
+    assert!(pictures.iter().all(|picture| picture.upgrade().is_some()));
+}
+
+#[test]
+fn pictures_no_slide_holds_are_let_go_oldest_first() {
+    let source = talk_of_pictures(3);
+    let (_dir, mut deck) = deck_of_pictures(3);
+    deck.set_picture_budget(2 * PICTURE_BYTES);
+    let older = picture_on(&mut deck, 0);
+    let newer = picture_on(&mut deck, 1);
+    // Their slides change, so that only the cache is left holding the two pictures.
+    deck.update(source.replace("![](p0.png)", "# A\n\n![](p0.png)").replace("![](p1.png)", "# B\n\n![](p1.png)"));
+    assert!(older.upgrade().is_some() && newer.upgrade().is_some());
+
+    let third = picture_on(&mut deck, 2);
+
+    assert!(older.upgrade().is_none(), "used longest ago");
+    assert!(newer.upgrade().is_some() && third.upgrade().is_some());
+}
+
+/// Puts a picture of another size over `p{index}.png`, which no stamp could mistake for the old one.
+fn replace_picture(dir: &tempfile::TempDir, index: usize) {
+    std::fs::write(dir.path().join(format!("p{index}.png")), png_of_side(PICTURE_SIDE / 2, 200)).unwrap();
+}
+
+#[test]
+fn a_picture_let_go_and_then_replaced_is_still_noticed() {
+    let (dir, mut deck) = deck_of_pictures(2);
+    deck.set_picture_budget(PICTURE_BYTES);
+    let gone = picture_on(&mut deck, 0);
+    picture_on(&mut deck, 1);
+    assert!(gone.upgrade().is_none());
+
+    replace_picture(&dir, 0);
+
+    assert_eq!(deck.update(talk_of_pictures(2)), vec![0, 1], "every slide is reported");
+    let back = picture_on(&mut deck, 0).upgrade().expect("the new picture");
+    assert_eq!(back.width(), PICTURE_SIDE / 2);
+}
+
+#[test]
+fn a_picture_replaced_and_read_again_before_the_save_is_still_noticed() {
+    let (dir, mut deck) = deck_of_pictures(2);
+    deck.set_picture_budget(PICTURE_BYTES);
+    picture_on(&mut deck, 0);
+    picture_on(&mut deck, 1);
+
+    replace_picture(&dir, 0);
+    picture_on(&mut deck, 0);
+
+    assert_eq!(deck.update(talk_of_pictures(2)), vec![0, 1], "drawn layers of the old picture have to go");
 }
