@@ -30,16 +30,18 @@ impl SourceEdit {
     }
 }
 
-fn escape(value: &str) -> String {
-    value.replace('"', "&quot;")
+/// `value` as it's written between `quote` characters.
+fn escape(value: &str, quote: char) -> String {
+    let entity = if quote == '"' { "&quot;" } else { "&apos;" };
+    value.replace('&', "&amp;").replace(quote, entity)
 }
 
 /// How an attribute's value is written in the source.
 enum ValueForm {
     /// No value at all: `flag`.
     Bare,
-    /// Inside quotes; the value range excludes them.
-    Quoted,
+    /// Inside these quotes; the value range excludes them.
+    Quoted(char),
     /// Without quotes: `x=1`.
     Unquoted,
 }
@@ -53,24 +55,23 @@ fn value_form(source: &str, attr: &Attr) -> ValueForm {
     let quoted = r.start > 0
         && matches!(bytes.get(r.start - 1), Some(b'"' | b'\''))
         && bytes.get(r.end) == bytes.get(r.start - 1);
-    if quoted { ValueForm::Quoted } else { ValueForm::Unquoted }
+    if quoted { ValueForm::Quoted(char::from(bytes[r.start - 1])) } else { ValueForm::Unquoted }
 }
 
 /// Sets attribute `name` on `tag` to `value`.
 pub fn set_attr(source: &str, tag: &Tag, name: &str, value: &str) -> SourceEdit {
-    let value = escape(value);
     if let Some(attr) = tag.attrs.iter().find(|a| a.name == name) {
         let r = attr.value_range.clone();
         let text = match value_form(source, attr) {
-            ValueForm::Bare => format!("=\"{value}\""),
-            ValueForm::Quoted => value,
-            ValueForm::Unquoted => format!("\"{value}\""),
+            ValueForm::Bare => format!("=\"{}\"", escape(value, '"')),
+            ValueForm::Quoted(quote) => escape(value, quote),
+            ValueForm::Unquoted => format!("\"{}\"", escape(value, '"')),
         };
         return SourceEdit { range: r, text };
     }
     let at = match tag.attrs.last() {
         Some(last) => match value_form(source, last) {
-            ValueForm::Quoted => last.value_range.end + 1,
+            ValueForm::Quoted(_) => last.value_range.end + 1,
             _ => last.value_range.end,
         },
         None => {
@@ -82,7 +83,7 @@ pub fn set_attr(source: &str, tag: &Tag, name: &str, value: &str) -> SourceEdit 
             i
         }
     };
-    SourceEdit { range: at..at, text: format!(" {name}=\"{value}\"") }
+    SourceEdit { range: at..at, text: format!(" {name}=\"{}\"", escape(value, '"')) }
 }
 
 fn eol_in(text: &str) -> &'static str {

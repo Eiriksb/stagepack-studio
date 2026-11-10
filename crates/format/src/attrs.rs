@@ -1,5 +1,24 @@
 use crate::model::Attr;
 
+const ENTITIES: [(&str, char); 3] = [("&quot;", '"'), ("&apos;", '\''), ("&amp;", '&')];
+
+/// The value an attribute's raw text stands for. It goes through once from the start, so
+/// that `&amp;quot;` is the text `&quot;` and not a quote.
+fn decode_entities(raw: &str) -> String {
+    let mut value = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(at) = rest.find('&') {
+        value.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let entity = ENTITIES.iter().find(|(entity, _)| rest.starts_with(entity));
+        let (character, length) = entity.map_or(('&', 1), |(entity, character)| (*character, entity.len()));
+        value.push(character);
+        rest = &rest[length..];
+    }
+    value.push_str(rest);
+    value
+}
+
 /// Reads the opening tag that starts at `start` (`source[start] == '<'`).
 /// Returns its attributes and the offset just past `>` or `/>`.
 /// The markdown crate gives attributes no positions, so they are found here.
@@ -59,7 +78,7 @@ pub(crate) fn scan_open_tag(source: &str, start: usize) -> (Vec<Attr>, usize) {
             };
             attrs.push(Attr {
                 name: source[name_range.clone()].to_string(),
-                value: source[value_range.clone()].to_string(),
+                value: decode_entities(&source[value_range.clone()]),
                 name_range,
                 value_range,
             });

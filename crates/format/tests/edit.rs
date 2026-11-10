@@ -47,6 +47,39 @@ fn a_quote_in_a_value_is_escaped() {
     assert_eq!(set_attr(src, first_tag(&talk), "x", "a\"b").apply(src), "<Box x=\"a&quot;b\" />\n");
 }
 
+/// Sets `x` on the tag in `src` to `value`, and returns the new source.
+fn with_x(src: &str, value: &str) -> String {
+    set_attr(src, first_tag(&parse_talk(src)), "x", value).apply(src)
+}
+
+fn x_of(source: &str) -> String {
+    first_tag(&parse_talk(source)).attr("x").unwrap().to_string()
+}
+
+#[test]
+fn a_single_quote_in_a_single_quoted_value_round_trips() {
+    let edited = with_x("<Box x='1' />\n", "it's");
+    assert_eq!(edited, "<Box x='it&apos;s' />\n");
+    assert_eq!(x_of(&edited), "it's");
+}
+
+#[test]
+fn a_double_quote_round_trips() {
+    let edited = with_x("<Box x=\"1\" />\n", "a\"b");
+    assert_eq!(x_of(&edited), "a\"b");
+    let talk = parse_talk(&edited);
+    let range = first_tag(&talk).attrs[0].value_range.clone();
+    assert_eq!(&edited[range], "a&quot;b", "the range is of the bytes as written");
+}
+
+#[test]
+fn an_ampersand_round_trips() {
+    let edited = with_x("<Box x=\"1\" />\n", "&quot;");
+    assert_eq!(edited, "<Box x=\"&amp;quot;\" />\n", "what was typed stays what was typed");
+    assert_eq!(x_of(&edited), "&quot;");
+    assert_eq!(x_of(&with_x("<Box x=\"1\" />\n", "fish & chips")), "fish & chips");
+}
+
 #[test]
 fn an_unquoted_value_is_replaced_with_a_quoted_one() {
     // The parser does not yet produce a tag for an unquoted value, so the tag is built by hand.
@@ -111,5 +144,16 @@ proptest! {
         let edit = SourceEdit { range: prefix.len()..prefix.len() + old.len(), text: new };
         let changed = edit.apply(&source);
         prop_assert_eq!(edit.inverse(&source).apply(&changed), source);
+    }
+
+    #[test]
+    fn set_attr_round_trips_any_value(value in "['\"&<>a-zA-Zéß漢🎉]{0,24}", quote in "['\"]") {
+        let source = format!("<Box x={quote}1{quote} />\n");
+        prop_assert_eq!(x_of(&with_x(&source, &value)), value.as_str());
+
+        let talk = parse_talk(&source);
+        let added = set_attr(&source, first_tag(&talk), "y", &value).apply(&source);
+        let reread = parse_talk(&added);
+        prop_assert_eq!(first_tag(&reread).attr("y"), Some(value.as_str()));
     }
 }
