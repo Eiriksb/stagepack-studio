@@ -5,5 +5,8 @@
 pub mod master;
 pub mod package;
 pub mod presentation;
+pub mod shapes;
+pub mod table;
+pub mod text;
 pub mod theme;
 pub mod xml;

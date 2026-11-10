@@ -45,7 +45,7 @@ pub const EMU_PER_INCH: f64 = 914_400.0;
 pub const EMU_PER_UNIT: f64 = 6350.0;
 
 /// JavaScript's `Math.round`: halves go up, also below zero.
-fn round_half_up(x: f64) -> f64 {
+pub(crate) fn round_half_up(x: f64) -> f64 {
     let floor = x.floor();
     if x - floor >= 0.5 { floor + 1.0 } else { floor }
 }
@@ -134,4 +134,26 @@ pub fn color_xml(color: ColorRef, alpha: Option<f64>) -> String {
 
 pub fn solid_fill(color: ColorRef, alpha: Option<f64>) -> String {
     format!("<a:solidFill>{}</a:solidFill>", color_xml(color, alpha))
+}
+
+/// A fixed color as a solid fill, with the color's own alpha as the fill's.
+pub fn solid_fill_of(color: Color) -> String {
+    let alpha = (color.a < 255).then(|| f64::from(color.a) / 255.0);
+    solid_fill(ColorRef::Rgb(color), alpha)
+}
+
+fn fnv1a(text: &str) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for c in text.chars() {
+        h ^= u32::from(c);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+/// A GUID made from its seed (four salted 32-bit FNV-1a hashes), so a table style's id is the
+/// same in every export: the same talk gives the same file.
+pub fn guid(seed: &str) -> String {
+    let hex: String = (0..4).map(|i| format!("{:08X}", fnv1a(&format!("{i}:{seed}")))).collect();
+    format!("{{{}-{}-{}-{}-{}}}", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32])
 }

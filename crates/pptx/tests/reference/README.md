@@ -74,3 +74,42 @@ pkg.addXml("/docProps/core.xml", CT.coreProps, "<c/>");
 | `package-presentation-rels.xml` | `ppt/_rels/presentation.xml.rels` |
 | `package-master-rels.xml` | `ppt/slideMasters/_rels/slideMaster1.xml.rels` |
 | `package-slide-rels.xml` | `ppt/slides/_rels/slide1.xml.rels` |
+
+## Text, shapes, tables and pictures (`tests/elements.rs`)
+
+Made by a throwaway script (not kept) calling `src/ooxml/{text,shapes,table,xml}.mjs`. The Rust side is given the native
+type that stands for each JavaScript object: a slide unit is 1/144 inch, a run's `size` is slide units (so points x 2),
+an outline width is slide units (points x 2). `ctx` = `{ lang: "en-US", fonts, link: () => "rId7" }`, `ink` = `#1e293b`,
+`run(text, extra)` = `{ text, size: 24, color: ink, typeface: "Inter", ...extra }`, `u(n)` = `n / 144` (units to inches),
+`box` = `{ x: u(144), y: u(288), w: u(720), h: u(216) }` (exactly 1", 2", 5" x 1.5"), and `body(paras, o)` =
+`txBodyXml(paras, ctx, { anchor: "t", inset: u(12), ...o })`. A paragraph is `{ runs, align: "l" }` unless said.
+
+| File | Call |
+| --- | --- |
+| `rpr-plain.xml` | `rPrXml(run("x"), ctx)` |
+| `rpr-styled.xml` | `rPrXml(run("x", { size: 18, b: true, i: true, u: true, color: "#2563eb", typeface: "JetBrains Mono" }), ctx)` |
+| `rpr-alpha.xml` | `rPrXml(run("x", { alpha: 128 / 255 }), ctx)` |
+| `rpr-link.xml` | `rPrXml(run("x", { link: "https://example.com/a?b=1&c=2", u: true, color: "#2563eb" }), ctx)` |
+| `body-bullet.xml` | `body([{ runs: [run("Item")], bullet: "char", align: "l" }])` |
+| `body-numbered.xml` | two paragraphs, `bullet: "number"`, the first `number: 1`, the second with none (the Rust gives `Number(1)`, `Number(2)`) |
+| `body-numbered-start.xml` | one paragraph, `bullet: "number", number: 3` |
+| `body-level1.xml` | `bullet: "char", level: 1` |
+| `body-centered.xml` | `align: "ctr"`, body option `anchor: "ctr"` |
+| `body-breaks.xml` | one bold run `"a\nb\n"` |
+| `body-empty.xml` | `body([])` |
+| `body-pr-autofit.xml` | `bodyPrXml({ placeholder: true, anchor: "b", autofit: "norm" })` then `bodyPrXml({ wrap: false, inset: 0, fontScale: 0.8 })` |
+| `text-box.xml` | `shapeXml({ ...box, paras: [{ runs: [run("Hello")], align: "l" }], inset: u(12) }, 4, ctx)` |
+| `shape-rect-text.xml` | `shapeXml({ ...box, fill: "#2563eb", paras: [{ runs: [run("Go", { color: "#ffffff" })], align: "ctr" }], anchor: "ctr", inset: u(12) }, 4, ctx)` |
+| `shape-rounded.xml` | `shapeXml({ x: 0, y: 0, w: u(400), h: u(200), geometry: "roundRect", radius: u(24), line: { width: 2, color: ink }, paras: [], anchor: "t", inset: 0 }, 4, ctx)` |
+| `shape-ellipse.xml` | `geometry: "ellipse"`, `fill: "#7c3aed"`, `fillAlpha: 128 / 255`, `line: { width: 1, color: "#000000" }`, on `box` |
+| `shape-line.xml` | `geometry: "line"`, `line: { width: 2, color: ink }`, on `box` |
+| `picture.xml` | `pictureXml({ id: 5, name: "Picture 5", descr: 'A "cat" & dog', rId: "rId3", box })` |
+| `picture-no-alt.xml` | the same without `descr` |
+| `table-2x2.xml` | `tableXml` of a `variant: "plain"` table on `box`, `colW: [u(300), u(420)]`, `rowH: [u(100), u(116)]`, cells with margins `u(12)`, anchor `t`, 0.5pt `ink` borders on every side, paragraphs `{ runs, align: "l", bullet: "none" }`, header cells bold |
+| `table-styles.xml` | `tableStylesXml()` |
+| `graphic-frame.xml` | `graphicFrameXml({ id: 6, name: "Table 6", box, uri: TABLE_URI, inner: "<x/>" })` |
+| `xfrm-plain.xml`, `xfrm-rot90.xml`, `xfrm-rot-minus90.xml` | `xfrmXml(box)` with `rot` unset, 90, -90 |
+| `placeholder-inherits.xml`, `placeholder-placed.xml` | `placeholderXml({ id: 2, name: "Title 1", ph: { type: "title" }, box: null or box, paras: [{ runs: [{ text: "Hi & bye", size: 26, color: ink }], align: "l", bullet: "none" }], ctx })` |
+| `background-color.xml`, `background-picture.xml` | `backgroundXml({ color: "#ffffff" })`, and with rId `"rId2"` |
+| `slide-one-shape.xml` | `slideXml(shapeXml({ ...box, fill: "#2563eb", paras: [], anchor: "t", inset: 0 }, 2, ctx), backgroundXml({ color: "#ffffff" }))` |
+| `guid.txt` | `guid("deck-table-default")`, newline, `guid("é🎉")` |
