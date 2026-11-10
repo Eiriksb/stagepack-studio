@@ -13,7 +13,7 @@ use tiny_skia::{Path, PathBuilder, Pixmap};
 use toolkit::{Color, Theme};
 
 use crate::elements::{ShapeLook, shape_items};
-use crate::native::{Semantic, native_elements};
+use crate::native::{MAX_TABLE_CELLS, Semantic, native_elements};
 use crate::placeholder::placeholder_items;
 use crate::{
     Align, Bullet, DisplayItem, Fonts, LayoutEnv, NativeElement, NativeParagraph, NativeRun, Notice, Rect, RegionDef, ShapedText, TextRun,
@@ -448,7 +448,12 @@ impl<'a, 'env> Flow<'a, 'env> {
             ..Style::default()
         };
         let table = self.node(style, &cells);
-        self.note(table, Semantic::Table(native_rows));
+        if rows.len() * columns > MAX_TABLE_CELLS {
+            self.notice("This table is too big to export, so it's shown as text".to_string());
+            self.note(table, Semantic::TableTooBig);
+        } else {
+            self.note(table, Semantic::Table(native_rows));
+        }
         table
     }
 

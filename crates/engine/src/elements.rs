@@ -33,6 +33,8 @@ pub(crate) struct ShapeLook {
     outline: Option<Color>,
     outline_width: f32,
     radius: f32,
+    /// Whether what's inside sits in the middle, rather than starting at the corner.
+    centered: bool,
 }
 
 impl ShapeLook {
@@ -41,8 +43,8 @@ impl ShapeLook {
     }
 
     /// The shape for export, in the colours and sizes `shape_items` draws it with, and
-    /// with no text yet.
-    pub(crate) fn native(&self, theme: &Theme) -> NativeContent {
+    /// with no text yet. `inset` is the padding the layout gave it.
+    pub(crate) fn native(&self, theme: &Theme, inset: f32) -> NativeContent {
         let (fill, outline, outline_width) = if matches!(self.kind, ShapeKind::Line | ShapeKind::Arrow) {
             let (color, width) = self.line_look(theme);
             (None, Some(color), width)
@@ -50,7 +52,7 @@ impl ShapeLook {
             (self.fill, self.outline.filter(|_| self.outline_width > 0.0), self.outline_width)
         };
         let radius = if matches!(self.kind, ShapeKind::Rounded | ShapeKind::Callout) { self.drawn_radius() } else { 0.0 };
-        NativeContent::Shape { kind: self.kind, fill, outline, outline_width, radius, paragraphs: Vec::new() }
+        NativeContent::Shape { kind: self.kind, fill, outline, outline_width, radius, paragraphs: Vec::new(), inset, centered: self.centered }
     }
 
     /// The colour and width of a line: the outline colour or, with no outline, the fill.
@@ -207,7 +209,8 @@ impl Flow<'_, '_> {
             Element::Shape { kind, width, height, fill, outline, outline_width, radius, padding, child } => {
                 let child = child.as_deref();
                 // Whatever is in a stack starts at the corner. Anything else is centred.
-                let inner_align = if matches!(child, Some(Element::Stack { .. })) { align } else { Align::Center };
+                let centered = !matches!(child, Some(Element::Stack { .. }));
+                let inner_align = if centered { Align::Center } else { align };
                 let content = child.and_then(|child| self.element(child, blocks, inner_align, boxed));
                 let size = match content {
                     Some(_) => size_of(*width, *height, boxed),
@@ -229,6 +232,7 @@ impl Flow<'_, '_> {
                     outline: *outline,
                     outline_width: limited(*outline_width, MAX_LINE_WIDTH),
                     radius: limited(*radius, MAX_SIZE),
+                    centered,
                 };
                 Some(self.node_with_content(style, content.as_slice(), Content::Shape(look)))
             }

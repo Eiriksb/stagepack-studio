@@ -75,9 +75,10 @@ fn code_is_a_text_box_with_a_panel() {
 #[test]
 fn a_box_with_text_is_a_shape_holding_it() {
     let slide = lay_out("<Box x=\"10\" y=\"10\" w=\"400\" h=\"200\" fill=\"red\">\n\nHello\n\n</Box>\n");
-    let NativeContent::Shape { paragraphs, fill, .. } = &slide.layers.last().unwrap().native[0].content else { panic!() };
+    let NativeContent::Shape { paragraphs, fill, inset, centered, .. } = &slide.layers.last().unwrap().native[0].content else { panic!() };
     assert_eq!(text_of(&paragraphs[0]), "Hello");
     assert_eq!(*fill, Color::parse("red"));
+    assert_eq!((*inset, *centered), (24.0, false));
 }
 
 #[test]
@@ -379,13 +380,29 @@ fn every_row_of_a_table_has_every_column() {
     assert!(rows.iter().all(|row| row.len() == 2 && row.iter().all(|cell| cell.len() == 1)));
 }
 
+/// A talk with text and then a table of `rows` rows, counting the header. Only the header
+/// has all its `columns`.
+fn talk_with_short_rows(columns: usize, rows: usize) -> String {
+    let (header, line, short_rows) = ("| a ".repeat(columns), "|---".repeat(columns), "| 1 |\n".repeat(rows - 1));
+    format!("# T\n\nBefore\n\n{header}|\n{line}|\n{short_rows}")
+}
+
 #[test]
 fn a_table_too_big_to_fill_out_is_labelled_text() {
-    let (header, line, rows) = ("| a ".repeat(200), "|---".repeat(200), "| 1 |\n".repeat(200));
-    let slide = lay_out(&format!("# T\n\nBefore\n\n{header}|\n{line}|\n{rows}"));
+    let slide = lay_out(&talk_with_short_rows(200, 201));
     let native = &slide.layers.last().unwrap().native;
     assert_eq!(native.len(), 2);
     assert_eq!(texts_of(&native[1]), ["This table is too big to export"]);
+}
+
+#[test]
+fn a_table_too_big_to_export_says_why_and_one_at_the_limit_does_not() {
+    let notice = Notice("This table is too big to export, so it's shown as text".to_string());
+    assert!(lay_out(&talk_with_short_rows(101, 100)).notices.contains(&notice));
+
+    let slide = lay_out(&talk_with_short_rows(100, 100));
+    assert!(!slide.notices.contains(&notice));
+    assert!(matches!(slide.layers.last().unwrap().native[1].content, NativeContent::Table { .. }));
 }
 
 #[test]
@@ -427,6 +444,26 @@ fn shapes_carry_what_they_are_drawn_with() {
     assert_eq!(radius, 24.0);
     let NativeContent::Shape { radius, .. } = shape_of("kind=\"rect\"").content else { panic!() };
     assert_eq!(radius, 0.0);
+}
+
+#[test]
+fn a_shape_with_text_inside_centres_it() {
+    let slide = lay_out("<Shape kind=\"ellipse\" x=\"0\" y=\"0\" w=\"400\" h=\"200\">\n\nHello\n\n</Shape>\n");
+    let NativeContent::Shape { paragraphs, inset, centered, .. } = &slide.layers.last().unwrap().native[0].content else { panic!() };
+    assert_eq!(text_of(&paragraphs[0]), "Hello");
+    assert_eq!((*inset, *centered), (0.0, true));
+}
+
+#[test]
+fn a_shapes_inset_is_the_padding_of_its_layout() {
+    let inset_of = |tag: &str| {
+        let slide = lay_out(&format!("{tag}\n"));
+        let NativeContent::Shape { inset, .. } = slide.layers.last().unwrap().native[0].content else { panic!() };
+        inset
+    };
+    assert_eq!(inset_of("<Box x=\"0\" y=\"0\" w=\"400\" h=\"200\" fill=\"red\" padding=\"40\" />"), 40.0);
+    assert_eq!(inset_of("<Box x=\"0\" y=\"0\" w=\"400\" h=\"200\" />"), 0.0);
+    assert_eq!(inset_of("<Shape kind=\"callout\" x=\"0\" y=\"0\" w=\"400\" h=\"200\" />"), 0.0, "a callout's tail isn't padding");
 }
 
 #[test]

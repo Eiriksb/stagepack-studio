@@ -77,6 +77,10 @@ pub enum NativeContent {
         outline_width: f32,
         radius: f32,
         paragraphs: Vec<NativeParagraph>,
+        /// The space kept clear between the shape's edge and its text.
+        inset: f32,
+        /// Whether its text sits in the middle, rather than starting at the corner.
+        centered: bool,
     },
     Table {
         rows: Vec<Vec<Vec<NativeParagraph>>>,
@@ -100,7 +104,7 @@ pub struct NativeElement {
 
 /// The most cells a table can have once its rows are filled out. A talk's short rows cost
 /// it almost nothing to write, but each one filled out would take memory for every column.
-const MAX_TABLE_CELLS: usize = 10_000;
+pub(crate) const MAX_TABLE_CELLS: usize = 10_000;
 
 /// What a node of a layout tree is, where what it draws doesn't say. The tree's builder
 /// notes this as it goes, so that one layout gives both the drawing and the export.
@@ -111,6 +115,8 @@ pub(crate) enum Semantic {
     ListItem(Bullet),
     /// A table's cells, row by row: each one's node and its text.
     Table(Vec<Vec<(NodeId, NativeParagraph)>>),
+    /// A table with more cells than `MAX_TABLE_CELLS`.
+    TableTooBig,
     /// A block of code, one paragraph per line.
     Code(Vec<NativeParagraph>),
     /// A stack from a component, whose children each stand alone.
@@ -179,6 +185,7 @@ impl Walk<'_> {
             (Some(Semantic::Paragraph(paragraph)), _) => self.add_paragraph(paragraph, rect),
             (Some(Semantic::ListItem(bullet)), _) => self.list_item(node, corner, bullet),
             (Some(Semantic::Table(cells)), _) => self.table(cells, rect),
+            (Some(Semantic::TableTooBig), _) => self.label("This table is too big to export", rect),
             (Some(Semantic::Code(paragraphs)), _) => {
                 self.push(rect, NativeContent::Text { paragraphs, fill: Some(CODE_PANEL), inset: CODE_PADDING });
             }
@@ -197,10 +204,7 @@ impl Walk<'_> {
                 self.push(rect, NativeContent::Picture { src, alt, pixmap: pixmap.clone() });
             }
             (_, Some(Content::Shape(look))) => self.shape(node, rect, look),
-            (_, Some(Content::Placeholder(label))) => {
-                self.end_text();
-                self.elements.push(placeholder_element(label, rect, self.theme));
-            }
+            (_, Some(Content::Placeholder(label))) => self.label(label, rect),
             _ => self.visit_children(node, corner),
         }
     }
@@ -248,6 +252,12 @@ impl Walk<'_> {
         self.elements.push(NativeElement { rect, content });
     }
 
+    /// Adds a placeholder's label.
+    fn label(&mut self, label: &str, rect: Rect) {
+        self.end_text();
+        self.elements.push(placeholder_element(label, rect, self.theme));
+    }
+
     fn list_item(&mut self, node: NodeId, corner: (f32, f32), bullet: Bullet) {
         let children = self.children(node);
         let [marker, content] = children[..] else {
@@ -266,11 +276,6 @@ impl Walk<'_> {
     fn table(&mut self, cells: Vec<Vec<(NodeId, NativeParagraph)>>, rect: Rect) {
         let columns = cells.iter().map(Vec::len).max().unwrap_or(0);
         if columns == 0 {
-            return;
-        }
-        if cells.len() * columns > MAX_TABLE_CELLS {
-            self.end_text();
-            self.elements.push(placeholder_element("This table is too big to export", rect, self.theme));
             return;
         }
         let size_of = |cell: &(NodeId, NativeParagraph)| self.tree.layout(cell.0).expect("every node is in the tree").size;
@@ -293,7 +298,8 @@ impl Walk<'_> {
     /// after it, placed by the layout.
     fn shape(&mut self, node: NodeId, rect: Rect, look: &ShapeLook) {
         let only_text = self.children(node).into_iter().all(|child| self.is_only_text(child));
-        self.push(rect, look.native(self.theme));
+        let inset = self.tree.layout(node).expect("every node is in the tree").padding.left;
+        self.push(rect, look.native(self.theme, inset));
         let shape = self.elements.len() - 1;
         self.visit_children(node, (rect.x, rect.y));
         self.end_text();
@@ -314,7 +320,7 @@ impl Walk<'_> {
     fn is_only_text(&self, node: NodeId) -> bool {
         let children = self.children(node);
         let breaks_up_text = match (self.semantics.get(&node), self.tree.get_node_context(node)) {
-            (Some(Semantic::Table(_) | Semantic::Code(_)), _) => true,
+            (Some(Semantic::Table(_) | Semantic::TableTooBig | Semantic::Code(_)), _) => true,
             (Some(Semantic::Stack), _) => children.len() > 1,
             (_, Some(Content::Shape(_) | Content::Picture(_) | Content::Placeholder(_))) => true,
             _ => false,
