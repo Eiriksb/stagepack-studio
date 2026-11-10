@@ -4,16 +4,14 @@ Run on the `native-rust` branch, on a 16-core Linux laptop, in debug builds, on 
 
 ## Tests on Linux
 
-`scripts/cargo-safe.sh test --workspace` passed: 247 tests, 0 failed, 0 ignored. Counts are from that run.
+`scripts/cargo-safe.sh test --workspace` passed at commit a5702ea: 266 tests, 0 failed, 0 ignored, no warnings.
 
 | Crate | Tests |
 | --- | --- |
-| slides-engine | 137 (builtins 81, flow 28, render 10, deck 8, text 8, files 2) |
-| slides-format | 56 (parse 35, edit 14, split 7) |
-| stagepack-studio (app) | 48 (ui_slides 24, document_state 19, watcher 4, ui_layout 1) |
+| slides-engine | 151 (builtins 81, flow 29, deck 18, render 11, text 8, files 4) |
+| slides-format | 60 (parse 35, edit 18, split 7) |
+| stagepack-studio (app) | 49 (ui_slides 24, document_state 20, watcher 4, ui_layout 1) |
 | toolkit | 6 |
-
-The run printed one warning: an unused import, `zero`, in `slides-engine`.
 
 ## Real-window check on Linux
 
@@ -24,6 +22,8 @@ The controller checked commit 41d907e in a debug build, with real key events on 
 - An outside edit to `slides.md` reached the panel, and the app stayed on slide 3.
 
 Earlier, a real-window run in Task 12 showed a slide's heading change after an outside edit, with no restart.
+
+At commit a5702ea, on the same kind of display, Right pressed five times reached slide 6 of 7. Replacing the picture on that slide and saving `slides.md` with unchanged text showed the new picture, and the app stayed on slide 6.
 
 ## Not exercised
 
