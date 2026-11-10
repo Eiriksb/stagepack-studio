@@ -365,7 +365,7 @@ impl Walk<'_> {
         let breaks_up_text = match (self.semantics.get(&node), self.tree.get_node_context(node)) {
             (Some(Semantic::Table(_) | Semantic::TableTooBig | Semantic::Code(_)), _) => true,
             (Some(Semantic::Stack), _) => children.len() > 1,
-            (_, Some(Content::Shape(_) | Content::Picture(_) | Content::Placeholder(_))) => true,
+            (_, Some(Content::Shape(_) | Content::Picture(_) | Content::Path(_) | Content::Placeholder(_))) => true,
             _ => false,
         };
         !breaks_up_text && children.into_iter().all(|child| self.is_only_text(child))

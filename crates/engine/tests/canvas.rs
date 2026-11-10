@@ -46,6 +46,24 @@ mod probe {
     }
 
     #[component]
+    pub fn Framed() -> Element {
+        match shape(ShapeKind::Rect, 100.0, 100.0) {
+            Element::Shape { kind, width, height, .. } => Element::Shape {
+                kind,
+                width,
+                height,
+                fill: None,
+                outline: None,
+                outline_width: 0.0,
+                radius: 0.0,
+                padding: 0.0,
+                child: Some(Box::new(path("M0 0 L10 0 L10 10 Z", 10.0, 10.0))),
+            },
+            other => other,
+        }
+    }
+
+    #[component]
     pub fn Both(data: String) -> Element {
         path(data, 10.0, 10.0).fill(Color::parse("red").unwrap()).stroke(Color::parse("blue").unwrap(), 3.0)
     }
@@ -60,6 +78,7 @@ fn registry() -> Registry {
     registry.add(probe::Solid_component());
     registry.add(probe::Outlined_component());
     registry.add(probe::Both_component());
+    registry.add(probe::Framed_component());
     registry
 }
 
@@ -183,4 +202,12 @@ fn an_absurd_canvas_is_held_to_the_limits() {
     let slide = lay_out("<Absurd />\n");
     let layer = slide.layers.last().unwrap();
     assert!(layer.rect.w <= 3840.0 && layer.rect.h <= 3840.0, "{:?}", layer.rect);
+}
+
+#[test]
+fn a_path_inside_a_shape_is_kept_in_the_export() {
+    let slide = lay_out("<Framed x=\"0\" y=\"0\" w=\"100\" h=\"100\" />\n");
+    let native = &slide.layers.last().unwrap().native;
+    assert!(native.iter().any(|e| matches!(e.content, NativeContent::Shape { .. })));
+    assert!(native.iter().any(|e| matches!(e.content, NativeContent::Path { .. })));
 }
