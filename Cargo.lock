@@ -6854,7 +6854,10 @@ dependencies = [
  "gpui-kit",
  "notify",
  "slides-engine",
+ "slides-pdf",
+ "slides-pptx",
  "tempfile",
+ "zip",
 ]
 
 [[package]]

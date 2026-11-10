@@ -1,8 +1,13 @@
-use std::path::Path;
+use std::fs::File;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use slides_engine::{Fonts, Layer};
-use stagepack_studio::document::{Document, Reload};
+use slides_engine::{Fonts, Layer, pack_folder};
+use stagepack_studio::document::{Document, OpenProblem, Reload};
+use stagepack_studio::export::{ExportKind, run_export};
+use zip::ZipArchive;
+use zip::write::SimpleFileOptions;
 
 fn talk(source: &str) -> (tempfile::TempDir, Document) {
     let dir = tempfile::tempdir().unwrap();
@@ -274,4 +279,252 @@ fn being_moved_to_a_slide_that_did_not_change_reports_it() {
     doc.next();
     assert!(matches!(doc.reload(Some("# One\n\n".into())), Reload::Changed(s) if s == vec![0]));
     assert_eq!(doc.current(), 0);
+}
+
+#[test]
+fn any_slide_can_be_asked_for_by_number() {
+    let (_d, mut doc) = talk(
+        "# One\n\n---\n\n# Two\n\n<Box x=\"0\" y=\"0\" w=\"9\" h=\"9\" click=\"2\" />\n\n<Notes>\nSay this\n</Notes>\n",
+    );
+    assert_eq!(doc.layers_of(0, 1.0).len(), 2, "background and title");
+    assert_eq!(
+        doc.layers_of(1, 1.0).len(),
+        3,
+        "background, title and shape"
+    );
+    assert_eq!(doc.timeline_of(0).steps, 0);
+    assert_eq!(doc.timeline_of(1).steps, 2);
+    assert_eq!(doc.notes_of(0), None);
+    assert_eq!(doc.notes_of(1).as_deref(), Some("Say this"));
+    assert_eq!(doc.current(), 0, "asking doesn't move you");
+}
+
+const TWO_SLIDES: &str = "---\ntitle: Review\n---\n\n# One\n\n---\n\n# Two\n";
+
+/// `source` packed into a file called `name`, in a folder that lasts as long as the first value.
+fn packed_talk(name: &str, source: &str) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("talk");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(folder.join("slides.md"), source).unwrap();
+    let file = dir.path().join(name);
+    pack_folder(&folder, &file, "test").unwrap();
+    (dir, file)
+}
+
+#[test]
+fn a_packed_talk_opens() {
+    let (_dir, file) = packed_talk("review.sptx", TWO_SLIDES);
+    let doc = Document::open_packed(&file, Fonts::bundled_only()).unwrap();
+    assert_eq!(doc.title(), "Review · 1 / 2");
+    assert_eq!(doc.slide_count(), 2);
+    assert!(doc.is_packed());
+}
+
+#[test]
+fn a_talk_in_a_folder_is_not_packed() {
+    let (_d, doc) = talk("# One\n");
+    assert!(!doc.is_packed());
+}
+
+#[test]
+fn with_no_title_setting_a_packed_talk_goes_by_its_files_name() {
+    let (_dir, file) = packed_talk("quarterly.sptx", "# One\n");
+    let doc = Document::open_packed(&file, Fonts::bundled_only()).unwrap();
+    assert_eq!(doc.title(), "quarterly · 1 / 1");
+}
+
+#[test]
+fn a_stagepack_file_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("slidev.sptx");
+    let mut zip = zip::ZipWriter::new(File::create(&file).unwrap());
+    zip.start_file("stagepack.json", SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(b"{}").unwrap();
+    zip.finish().unwrap();
+    assert_eq!(
+        Document::open_packed(&file, Fonts::bundled_only()).err(),
+        Some(OpenProblem::SlidevTalk)
+    );
+}
+
+#[test]
+fn a_file_that_is_not_a_talk_says_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("notes.txt");
+    std::fs::write(&file, "just some notes").unwrap();
+    assert!(matches!(
+        Document::open_packed(&file, Fonts::bundled_only()).err(),
+        Some(OpenProblem::Other(problem)) if !problem.is_empty()
+    ));
+}
+
+#[test]
+fn saving_a_packed_copy_then_opening_it_shows_the_same_talk() {
+    let (_d, doc) = talk(TWO_SLIDES);
+    let elsewhere = tempfile::tempdir().unwrap();
+    let out = elsewhere.path().join("copy.sptx");
+    assert!(doc.save_packed(&out).unwrap().is_empty());
+    let copy = Document::open_packed(&out, Fonts::bundled_only()).unwrap();
+    assert_eq!(copy.source(), TWO_SLIDES);
+}
+
+#[cfg(unix)]
+#[test]
+fn saving_a_packed_copy_says_what_was_left_out() {
+    let (dir, doc) = talk("# One\n");
+    std::fs::create_dir(dir.path().join("assets")).unwrap();
+    std::os::unix::fs::symlink("/nowhere", dir.path().join("assets/link.png")).unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let notices = doc
+        .save_packed(&elsewhere.path().join("copy.sptx"))
+        .unwrap();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(notices[0].contains("assets/link.png"), "{notices:?}");
+}
+
+#[test]
+fn a_packed_talk_can_be_saved_as_a_folder() {
+    let (dir, file) = packed_talk("talk.sptx", "# One\n");
+    let doc = Document::open_packed(&file, Fonts::bundled_only()).unwrap();
+    let folder = dir.path().join("unpacked");
+    doc.save_folder(&folder).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(folder.join("slides.md")).unwrap(),
+        "# One\n"
+    );
+}
+
+#[test]
+fn saving_over_a_folder_that_holds_things_says_why_and_leaves_them() {
+    let (dir, file) = packed_talk("talk.sptx", "# One\n");
+    let doc = Document::open_packed(&file, Fonts::bundled_only()).unwrap();
+    let folder = dir.path().join("in-use");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(folder.join("keep.txt"), "mine").unwrap();
+    assert!(doc.save_folder(&folder).is_err());
+    assert_eq!(
+        std::fs::read_to_string(folder.join("keep.txt")).unwrap(),
+        "mine"
+    );
+}
+
+#[test]
+fn a_talk_is_not_saved_as_the_form_it_already_has() {
+    let elsewhere = tempfile::tempdir().unwrap();
+    let (_d, in_a_folder) = talk("# One\n");
+    assert!(
+        in_a_folder
+            .save_folder(&elsewhere.path().join("a"))
+            .is_err()
+    );
+    let (_dir, file) = packed_talk("talk.sptx", "# One\n");
+    let packed = Document::open_packed(&file, Fonts::bundled_only()).unwrap();
+    assert!(
+        packed
+            .save_packed(&elsewhere.path().join("b.sptx"))
+            .is_err()
+    );
+}
+
+/// The text layer of a talk that asks for the talk's own font, packed from `folder` and drawn.
+fn drawn_title_when_packed(folder: &Path) -> Arc<Layer> {
+    drawn_title(folder);
+    let file = folder.with_extension("sptx");
+    pack_folder(folder, &file, "test").unwrap();
+    let mut doc = Document::open_packed(&file, Fonts::bundled_only()).unwrap();
+    let layers = doc.layers(1.0);
+    assert_eq!(layers.len(), 2, "background and title");
+    layers[1].clone()
+}
+
+#[test]
+fn fonts_in_a_packed_talk_are_used() {
+    let (_plain_dir, plain) = talk_folder();
+    let without = drawn_title_when_packed(&plain);
+    let (_dir, folder) = talk_folder();
+    std::fs::write(
+        folder.join("assets/fonts/brought.ttf"),
+        font_only_a_talk_has(),
+    )
+    .unwrap();
+    assert!(!same_pixels(&drawn_title_when_packed(&folder), &without));
+}
+
+#[test]
+fn only_font_files_right_in_the_font_folder_of_a_pack_are_fonts() {
+    let (_plain_dir, plain) = talk_folder();
+    let without = drawn_title_when_packed(&plain);
+    let (_dir, folder) = talk_folder();
+    std::fs::create_dir(folder.join("assets/fonts/deeper")).unwrap();
+    for name in ["deeper/brought.ttf", "brought.txt"] {
+        std::fs::write(
+            folder.join("assets/fonts").join(name),
+            font_only_a_talk_has(),
+        )
+        .unwrap();
+    }
+    assert!(same_pixels(&drawn_title_when_packed(&folder), &without));
+}
+
+#[test]
+fn fonts_past_what_a_talk_can_bring_are_left_out() {
+    let (_dir, folder) = talk_folder();
+    std::fs::write(folder.join("assets/fonts/a.ttf"), font_only_a_talk_has()).unwrap();
+    // Sparse, so that this costs the test some memory for a moment and no disk.
+    let enormous = File::create(folder.join("assets/fonts/b.ttf")).unwrap();
+    enormous.set_len(257 * 1024 * 1024).unwrap();
+    drawn_title(&folder);
+    let doc = Document::open(&folder, Fonts::bundled_only()).unwrap();
+    assert_eq!(doc.export_input().talk_fonts, vec![font_only_a_talk_has()]);
+}
+
+#[test]
+fn an_export_takes_the_talks_own_fonts_along() {
+    let (dir, folder) = talk_folder();
+    std::fs::write(
+        folder.join("assets/fonts/brought.ttf"),
+        font_only_a_talk_has(),
+    )
+    .unwrap();
+    drawn_title(&folder);
+    let doc = Document::open(&folder, Fonts::bundled_only()).unwrap();
+
+    let out = dir.path().join("out.pptx");
+    run_export(doc.export_input(), ExportKind::PowerPoint, &out).unwrap();
+
+    let archive = ZipArchive::new(File::open(&out).unwrap()).unwrap();
+    assert!(
+        archive
+            .file_names()
+            .filter_map(Result::ok)
+            .any(|name| name.starts_with("ppt/fonts/")),
+        "the talk's font was embedded"
+    );
+}
+
+#[test]
+fn an_export_of_a_packed_talk_reads_the_pack() {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("talk");
+    std::fs::create_dir_all(folder.join("assets")).unwrap();
+    std::fs::write(folder.join("assets/photo.svg"), one_colour_svg("red")).unwrap();
+    std::fs::write(folder.join("slides.md"), "![](assets/photo.svg)\n").unwrap();
+    let file = dir.path().join("talk.sptx");
+    pack_folder(&folder, &file, "test").unwrap();
+    let doc = Document::open_packed(&file, Fonts::bundled_only()).unwrap();
+
+    let out = dir.path().join("out.pptx");
+    let notices = run_export(doc.export_input(), ExportKind::PowerPoint, &out).unwrap();
+
+    assert!(notices.is_empty(), "the picture was found: {notices:?}");
+    let archive = ZipArchive::new(File::open(&out).unwrap()).unwrap();
+    assert!(
+        archive
+            .file_names()
+            .filter_map(Result::ok)
+            .any(|name| name.starts_with("ppt/media/")),
+        "the picture is in the file"
+    );
 }

@@ -11,7 +11,9 @@ use slides_engine::Fonts;
 use stagepack_studio::document::Document;
 use stagepack_studio::slide_canvas::{SlideCanvas, letterbox};
 use stagepack_studio::workspace_view::{
-    self, CANVAS_ID, MARKDOWN_ID, NOTICES_ID, PROBLEM_ID, TITLE_ID, WorkspaceView,
+    self, CANVAS_ID, EXPORT_MENU_ID, ExportPdf, ExportPowerPoint, FILE_MENU_ID, MARKDOWN_ID,
+    NOTICES_ID, OPEN_IN_STAGEPACK_ID, OpenFolder, OpenPacked, PROBLEM_ID, STATUS_ID, SaveFolder,
+    SavePacked, TITLE_ID, WorkspaceView,
 };
 
 fn document(source: &str) -> Document {
@@ -541,6 +543,401 @@ fn a_folder_that_cannot_be_watched_says_so(cx: &mut TestAppContext) {
         );
     })
     .unwrap();
+}
+
+#[gpui_kit::test]
+fn the_title_bar_has_file_and_export(cx: &mut TestAppContext) {
+    let handle = open_talk(cx, "# One\n");
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let (file, export) = (window.find(FILE_MENU_ID), window.find(EXPORT_MENU_ID));
+        assert!(file.visible(), "{file:?}");
+        assert!(export.visible(), "{export:?}");
+        let title = window.find(TITLE_ID);
+        assert!(
+            file.bounds().right() <= export.bounds().left()
+                && export.bounds().right() <= title.bounds().left(),
+            "{file:?} {export:?} {title:?}"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn the_slide_still_changes_with_the_document_shared(cx: &mut TestAppContext) {
+    let handle = open_talk(cx, "---\ntitle: T\n---\n\n# One\n\n---\n\n# Two\n");
+    assert_eq!(title(cx, handle), "T · 1 / 2");
+    cx.simulate_keystrokes(handle, "right");
+    assert_eq!(title(cx, handle), "T · 2 / 2");
+}
+
+#[gpui_kit::test]
+fn the_arrow_keys_still_work_after_using_a_menu(cx: &mut TestAppContext) {
+    let handle = open_talk(cx, "---\ntitle: T\n---\n\n# One\n\n---\n\n# Two\n");
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(EXPORT_MENU_ID, cx);
+        window.press("escape", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.simulate_keystrokes(handle, "right");
+    assert_eq!(title(cx, handle), "T · 2 / 2");
+}
+
+/// What the status line says, if it says anything.
+fn status(cx: &mut TestAppContext, handle: AnyWindowHandle) -> Option<String> {
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window
+            .try_find(STATUS_ID)
+            .map(|status| status.label().expect("the status has a label").to_string())
+    })
+    .unwrap()
+}
+
+/// Answers the Save dialog that has just been asked for, and lets what comes of it finish.
+fn choose(cx: &mut TestAppContext, chosen: Option<PathBuf>) {
+    cx.run_until_parked();
+    assert!(cx.did_prompt_for_new_path(), "a Save dialog is showing");
+    cx.simulate_new_path_selection(move |_| chosen);
+    cx.run_until_parked();
+}
+
+#[gpui_kit::test]
+fn an_export_writes_the_file_and_says_so(cx: &mut TestAppContext) {
+    let handle = open_talk(cx, "# One\n");
+    assert_eq!(status(cx, handle), None);
+    let elsewhere = tempfile::tempdir().unwrap();
+    let out = elsewhere.path().join("exported.pdf");
+
+    cx.dispatch_action(handle, ExportPdf);
+    choose(cx, Some(out.clone()));
+
+    assert!(std::fs::read(&out).unwrap().starts_with(b"%PDF"));
+    assert_eq!(
+        status(cx, handle).as_deref(),
+        Some("Exported exported.pdf.")
+    );
+}
+
+#[gpui_kit::test]
+fn a_powerpoint_export_reports_what_the_slides_said(cx: &mut TestAppContext) {
+    let handle = open_talk(cx, "# One\n\n---\nlayout: nope\n---\n\n# Two\n");
+    let elsewhere = tempfile::tempdir().unwrap();
+    let out = elsewhere.path().join("exported.pptx");
+
+    cx.dispatch_action(handle, ExportPowerPoint);
+    choose(cx, Some(out.clone()));
+
+    assert!(std::fs::read(&out).unwrap().starts_with(b"PK"));
+    let said = status(cx, handle).expect("it says what happened");
+    assert!(
+        said.starts_with("Exported exported.pptx.") && said.contains("nope"),
+        "{said}"
+    );
+}
+
+#[gpui_kit::test]
+fn cancelling_the_save_dialog_does_nothing(cx: &mut TestAppContext) {
+    let handle = open_talk(cx, "# One\n");
+    cx.dispatch_action(handle, ExportPdf);
+    choose(cx, None);
+    assert_eq!(status(cx, handle), None);
+}
+
+#[gpui_kit::test]
+fn an_export_that_fails_says_why(cx: &mut TestAppContext) {
+    let handle = open_talk(cx, "# One\n");
+    let elsewhere = tempfile::tempdir().unwrap();
+    let out = elsewhere.path().join("missing/exported.pdf");
+
+    cx.dispatch_action(handle, ExportPdf);
+    choose(cx, Some(out));
+
+    let said = status(cx, handle).expect("it says what happened");
+    assert!(said.contains("exported.pdf"), "{said}");
+    assert!(!said.starts_with("Exported"), "{said}");
+}
+
+#[gpui_kit::test]
+fn an_export_is_asked_for_beside_the_talk(cx: &mut TestAppContext) {
+    let talk = open_saved_talk(cx, "# One\n");
+    let beside = talk.file.parent().unwrap().parent().unwrap().to_path_buf();
+    cx.dispatch_action(talk.handle, ExportPdf);
+    cx.run_until_parked();
+    cx.simulate_new_path_selection(move |directory| {
+        assert_eq!(directory, beside);
+        None
+    });
+}
+
+/// How many windows are open.
+fn window_count(cx: &TestAppContext) -> usize {
+    cx.read(|cx| cx.windows().len())
+}
+
+/// The one window that isn't `first`, once a second one has opened.
+fn newest_window(cx: &TestAppContext, first: AnyWindowHandle) -> AnyWindowHandle {
+    assert_eq!(window_count(cx), 2, "a window of its own");
+    cx.read(|cx| cx.windows())
+        .into_iter()
+        .find(|window| window.window_id() != first.window_id())
+        .expect("there are two windows")
+}
+
+#[gpui_kit::test]
+fn opening_a_folder_gives_it_a_window_of_its_own(cx: &mut TestAppContext) {
+    let handle = open_talk(cx, "# One\n");
+    // With no slides.md, so that the new window has no watcher: a test's scheduler can't have a
+    // watcher's thread waking its tasks.
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().to_path_buf();
+
+    cx.dispatch_action(handle, OpenFolder);
+    cx.run_until_parked();
+    cx.simulate_path_prompt_response(move |options| {
+        assert!(options.directories && !options.files);
+        Some(vec![folder])
+    });
+    cx.run_until_parked();
+
+    let opened = newest_window(cx, handle);
+    cx.update_window(opened, |_, window, cx| {
+        window.render_frame(cx);
+        let problem = window.find(PROBLEM_ID);
+        assert!(
+            problem
+                .label()
+                .is_some_and(|label| label.contains("slides.md")),
+            "{problem:?}"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn opening_a_packed_talk_gives_it_a_window_of_its_own(cx: &mut TestAppContext) {
+    let handle = open_talk(cx, "# One\n");
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("talk");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(
+        folder.join("slides.md"),
+        "---\ntitle: Packed\n---\n\n# One\n",
+    )
+    .unwrap();
+    let file = dir.path().join("talk.sptx");
+    slides_engine::pack_folder(&folder, &file, "test").unwrap();
+
+    cx.dispatch_action(handle, OpenPacked);
+    cx.run_until_parked();
+    cx.simulate_path_prompt_response(move |options| {
+        assert!(options.files && !options.directories);
+        Some(vec![file])
+    });
+    cx.run_until_parked();
+
+    let opened = newest_window(cx, handle);
+    assert_eq!(title(cx, opened), "Packed · 1 / 1");
+}
+
+#[gpui_kit::test]
+fn cancelling_the_open_dialog_does_nothing(cx: &mut TestAppContext) {
+    let handle = open_talk(cx, "# One\n");
+    cx.dispatch_action(handle, OpenFolder);
+    cx.run_until_parked();
+    cx.simulate_path_prompt_response(|_| None);
+    cx.run_until_parked();
+    assert_eq!(window_count(cx), 1);
+    assert_eq!(status(cx, handle), None);
+}
+
+/// A window on a packed copy of `source`, opened the way the app opens one.
+fn open_packed_talk(
+    cx: &mut TestAppContext,
+    source: &str,
+) -> (tempfile::TempDir, AnyWindowHandle, Entity<WorkspaceView>) {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("talk");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(folder.join("slides.md"), source).unwrap();
+    let file = dir.path().join("talk.sptx");
+    slides_engine::pack_folder(&folder, &file, "test").unwrap();
+    let (handle, view) = open_view(cx, move |window, cx| WorkspaceView::open(file, window, cx));
+    (dir, handle, view)
+}
+
+/// Whether the File menu, opened and closed again, holds `item`.
+fn file_menu_has(cx: &mut TestAppContext, handle: AnyWindowHandle, item: &str) -> bool {
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(FILE_MENU_ID, cx);
+        let found = window.try_find_by_label(item).is_some();
+        window.click(FILE_MENU_ID, cx);
+        found
+    })
+    .unwrap()
+}
+
+#[gpui_kit::test]
+fn a_talk_in_a_folder_offers_to_be_packed(cx: &mut TestAppContext) {
+    let handle = open_talk(cx, "# One\n");
+    assert!(file_menu_has(cx, handle, "Save as packed talk…"));
+    assert!(!file_menu_has(cx, handle, "Save as folder…"));
+}
+
+#[gpui_kit::test]
+fn a_packed_talk_offers_to_become_a_folder(cx: &mut TestAppContext) {
+    let (_dir, handle, _view) = open_packed_talk(cx, "# One\n");
+    assert!(file_menu_has(cx, handle, "Save as folder…"));
+    assert!(!file_menu_has(cx, handle, "Save as packed talk…"));
+}
+
+#[gpui_kit::test]
+fn an_item_of_the_export_menu_runs_the_export(cx: &mut TestAppContext) {
+    let handle = open_talk(cx, "# One\n");
+    let elsewhere = tempfile::tempdir().unwrap();
+    let out = elsewhere.path().join("from-the-menu.pdf");
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(EXPORT_MENU_ID, cx);
+        // The menu's rows are numbered: PowerPoint, then PDF.
+        window.within("popup-menu").click(1usize, cx);
+    })
+    .unwrap();
+    choose(cx, Some(out.clone()));
+    assert!(std::fs::read(&out).unwrap().starts_with(b"%PDF"));
+}
+
+#[gpui_kit::test]
+fn a_packed_talk_shows_and_is_not_watched(cx: &mut TestAppContext) {
+    let (_dir, handle, view) = open_packed_talk(cx, "---\ntitle: T\n---\n\n# One\n");
+    assert_eq!(title(cx, handle), "T · 1 / 1");
+    cx.read(|cx| assert!(!view.read(cx).follows_saves()));
+}
+
+#[gpui_kit::test]
+fn a_packed_talk_can_be_saved_as_a_folder_from_the_window(cx: &mut TestAppContext) {
+    let (dir, handle, _view) = open_packed_talk(cx, "# One\n");
+    let folder = dir.path().join("unpacked");
+
+    cx.dispatch_action(handle, SaveFolder);
+    choose(cx, Some(folder.clone()));
+
+    assert_eq!(
+        std::fs::read_to_string(folder.join("slides.md")).unwrap(),
+        "# One\n"
+    );
+    assert_eq!(status(cx, handle).as_deref(), Some("Saved unpacked."));
+}
+
+#[gpui_kit::test]
+fn a_talk_in_a_folder_can_be_packed_from_the_window(cx: &mut TestAppContext) {
+    let talk = open_saved_talk(cx, "# One\n");
+    let elsewhere = tempfile::tempdir().unwrap();
+    let out = elsewhere.path().join("copy.sptx");
+
+    cx.dispatch_action(talk.handle, SavePacked);
+    choose(cx, Some(out.clone()));
+
+    let copy = Document::open_packed(&out, Fonts::bundled_only()).unwrap();
+    assert_eq!(copy.source(), "# One\n");
+    assert_eq!(status(cx, talk.handle).as_deref(), Some("Saved copy.sptx."));
+}
+
+const SLIDEV_TALK: &str =
+    "This is a Slidev talk made for Stagepack, so this app can't open it yet.";
+
+/// A file holding Stagepack's manifest.
+fn stagepack_file() -> (tempfile::TempDir, PathBuf) {
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("slidev.sptx");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&file).unwrap());
+    zip.start_file("stagepack.json", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(b"{}").unwrap();
+    zip.finish().unwrap();
+    (dir, file)
+}
+
+#[gpui_kit::test]
+fn a_stagepack_file_says_what_it_is(cx: &mut TestAppContext) {
+    let (_dir, file) = stagepack_file();
+    let (handle, _view) = open_view(cx, move |window, cx| WorkspaceView::open(file, window, cx));
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find(PROBLEM_ID).label(), Some(SLIDEV_TALK));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn with_no_stagepack_there_is_nothing_to_offer(cx: &mut TestAppContext) {
+    let (_dir, file) = stagepack_file();
+    let (handle, _view) = open_view(cx, move |window, cx| {
+        WorkspaceView::for_slidev_talk(file, None, window, cx)
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find(PROBLEM_ID).label(), Some(SLIDEV_TALK));
+        assert!(window.try_find(OPEN_IN_STAGEPACK_ID).is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn a_stagepack_that_will_not_start_says_so(cx: &mut TestAppContext) {
+    let (dir, file) = stagepack_file();
+    let gone = dir.path().join("no-such-program");
+    let (handle, _view) = open_view(cx, move |window, cx| {
+        WorkspaceView::for_slidev_talk(file, Some(gone), window, cx)
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(OPEN_IN_STAGEPACK_ID, cx);
+    })
+    .unwrap();
+    let said = status(cx, handle).expect("it says what happened");
+    assert!(said.contains("Stagepack"), "{said}");
+}
+
+#[cfg(unix)]
+#[gpui_kit::test]
+fn the_button_opens_the_file_in_stagepack(cx: &mut TestAppContext) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (dir, file) = stagepack_file();
+    let said = dir.path().join("said");
+    let stagepack = dir.path().join("stagepack");
+    std::fs::write(
+        &stagepack,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{0}.tmp'\nmv '{0}.tmp' '{0}'\n",
+            said.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&stagepack, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let expected = format!("open\n{}\n", file.display());
+    let (handle, _view) = open_view(cx, move |window, cx| {
+        WorkspaceView::for_slidev_talk(file, Some(stagepack), window, cx)
+    });
+
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(OPEN_IN_STAGEPACK_ID, cx);
+    })
+    .unwrap();
+
+    let start = std::time::Instant::now();
+    while !said.exists() {
+        assert!(start.elapsed() < Duration::from_secs(10), "it never ran");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(std::fs::read_to_string(&said).unwrap(), expected);
 }
 
 fn area(x: f32, y: f32, width: f32, height: f32) -> Bounds<Pixels> {
