@@ -138,3 +138,9 @@ fn a_family_that_cannot_be_embedded_says_so() {
         out.notices
     );
 }
+
+#[test]
+fn a_bullet_font_raises_no_notice() {
+    let out = export("# A\n\n- one\n- two\n");
+    assert!(!out.notices.iter().any(|n| n.contains("Arial")), "{:?}", out.notices);
+}

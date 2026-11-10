@@ -212,11 +212,19 @@ fn title_of(specs: &[LayerSpec]) -> Option<(usize, usize)> {
     Some((layer, element))
 }
 
-/// Every font name written to a part so far, sorted. A theme reference (`+mj-lt`) isn't one.
+/// Every font name written to a part so far, sorted, bullet fonts apart. A theme reference (`+mj-lt`) isn't one.
 fn typefaces_used(pkg: &Package) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     for xml in pkg.xml_parts() {
-        for chunk in xml.split("typeface=\"").skip(1) {
+        let mut pieces = xml.split("typeface=\"");
+        let mut before = pieces.next().unwrap_or("");
+        for chunk in pieces {
+            // A bullet's font isn't one the person chose.
+            let bullet = before.ends_with("<a:buFont ");
+            before = chunk;
+            if bullet {
+                continue;
+            }
             let name = chunk.split('"').next().unwrap_or("");
             if !name.is_empty() && !name.starts_with('+') {
                 names.insert(unescape(name));
