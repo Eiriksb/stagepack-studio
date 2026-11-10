@@ -284,7 +284,7 @@ The owner decided that a ready-made chart ships with custom components. The deta
 <Chart kind="line" data="assets/sales.csv" />
 ```
 
-- **What it is:** a built-in, written with the same toolkit and `#[component]` macro as anyone's own component. It's compiled into the app, so it works in any talk with no build step, and its source is the guide's worked example.
+- **What it is:** a built-in, written with the same toolkit and `#[component]` macro as anyone's own component. It's compiled into the app, so it works in any talk with no build step, and the guide's worked example is a small bar chart built the same way.
 - **Kinds:** bar, line and pie in the first release.
 - **Data:** one series written in the tag, or one or more series from a CSV file in the talk's `assets` folder. A bad file or a mismatched list shows the labelled box, not a crash.
 - **For people who don't code:** the usual form from its argument types, with a dropdown for the kind, a file picker for the data, and text boxes for labels and values. Colours come from the theme.
