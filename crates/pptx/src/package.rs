@@ -227,6 +227,11 @@ impl Package {
         self.parts.iter().find(|p| p.name == part_name).map(|p| p.data.as_slice())
     }
 
+    /// The text of the XML parts added so far (a part that isn't valid UTF-8 is left out).
+    pub fn xml_parts(&self) -> impl Iterator<Item = &str> {
+        self.parts.iter().filter(|p| p.compress).filter_map(|p| std::str::from_utf8(&p.data).ok())
+    }
+
     pub fn has(&self, part_name: &str) -> bool {
         self.names.contains(part_name)
     }

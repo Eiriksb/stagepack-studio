@@ -132,3 +132,12 @@ Made by a throwaway script (not kept) calling `src/ooxml/{timing,notes}.mjs`. `e
 | `notes-master.xml` | `notesMasterXml(ctx)` |
 | `notes-slide.xml` | `notesSlideXml("First line\n\n  second & <third>  \n\n\n\n", ctx)` |
 | `notes-slide-empty.xml` | `notesSlideXml("\n  \n", ctx)` |
+
+## Embedded fonts (`tests/fonts.rs`)
+
+Made by a throwaway script (not kept) calling `eotFromTtf` from `src/ooxml/eot.mjs`. The test holds the SHA-256 of the output,
+not the output (it is as large as the font).
+
+| Value | Call |
+| --- | --- |
+| `c3f45ed38ca197bf068dd75830de64a2036adf3f2512be8bd0eb38658efb0a85` (411844 bytes) | `eotFromTtf(readFileSync("crates/engine/assets/fonts/Inter-Regular.ttf"))` |

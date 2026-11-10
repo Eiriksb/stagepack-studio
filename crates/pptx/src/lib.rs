@@ -2,6 +2,7 @@
 //! were measured against real PowerPoint. `tests/parts.rs` checks every part byte for byte
 //! against the original's output, which is what keeps those forms intact.
 
+pub mod eot;
 pub mod master;
 pub mod notes;
 pub mod package;

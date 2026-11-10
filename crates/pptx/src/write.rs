@@ -7,19 +7,20 @@
 //! package parts, then the presentation itself.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use tiny_skia::Pixmap;
-use slides_engine::{Deck, LayerSpec, NativeContent, NativeElement, NativeParagraph, Rect, TalkFiles};
+use slides_engine::{Deck, Fonts, LayerSpec, NativeContent, NativeElement, NativeParagraph, Rect, TalkFiles};
 
+use crate::eot::eot_from_ttf;
 use crate::master::{Geometry, LayoutId, layout_defs, layout_xml, master_xml};
 use crate::notes::{notes_master_xml, notes_slide_xml};
 use crate::package::{CT, Package, REL};
 use crate::presentation::{
-    Presentation, SlideRef, app_xml, core_xml, pres_props_xml, presentation_xml, view_props_xml,
+    EmbeddedFont, Presentation, SlideRef, app_xml, core_xml, pres_props_xml, presentation_xml, view_props_xml,
 };
 use crate::shapes::{
     Ph, background_xml, graphic_frame_xml, picture_xml_rotated, placeholder_xml_rotated, shape_xml_rotated, slide_xml,
@@ -211,6 +212,69 @@ fn title_of(specs: &[LayerSpec]) -> Option<(usize, usize)> {
     Some((layer, element))
 }
 
+/// Every font name written to a part so far, sorted. A theme reference (`+mj-lt`) isn't one.
+fn typefaces_used(pkg: &Package) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for xml in pkg.xml_parts() {
+        for chunk in xml.split("typeface=\"").skip(1) {
+            let name = chunk.split('"').next().unwrap_or("");
+            if !name.is_empty() && !name.starts_with('+') {
+                names.insert(unescape(name));
+            }
+        }
+    }
+    names
+}
+
+fn unescape(text: &str) -> String {
+    text.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
+}
+
+/// Carries the fonts the slides use: each family of the talk's or the app's own fonts that is
+/// named in a part gets its styles stored once as `/ppt/fonts/fontN.fntdata` (Embedded OpenType)
+/// and related from the presentation. A family that can't be embedded is left as the name it
+/// has, and said so in `notices`.
+fn embed_fonts(pkg: &mut Package, fonts: &Fonts, notices: &mut Vec<String>) -> Vec<EmbeddedFont> {
+    let mut embedded: Vec<EmbeddedFont> = Vec::new();
+    let mut stored = 0;
+    for name in typefaces_used(pkg) {
+        let faces = fonts.embeddable_faces(&name);
+        let Some(family) = faces.first().map(|f| f.family.clone()) else {
+            notices.push(format!("{name} can't be embedded, so PowerPoint may show another font"));
+            continue;
+        };
+        if embedded.iter().any(|e| e.typeface == family) {
+            continue;
+        }
+        let mut font = EmbeddedFont { typeface: family, ..EmbeddedFont::default() };
+        let mut failed = false;
+        for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
+            let Some(face) = faces.iter().find(|f| f.bold == bold && f.italic == italic) else { continue };
+            let Ok(eot) = eot_from_ttf(&face.data) else {
+                failed = true;
+                continue;
+            };
+            stored += 1;
+            let part = format!("/ppt/fonts/font{stored}.fntdata");
+            pkg.add_media(&part, eot);
+            let r_id = Some(pkg.rel(PRES, &part, REL::FONT, false));
+            match (bold, italic) {
+                (false, false) => font.regular = r_id,
+                (true, false) => font.bold = r_id,
+                (false, true) => font.italic = r_id,
+                (true, true) => font.bold_italic = r_id,
+            }
+        }
+        if failed {
+            notices.push(format!("{name} can't be embedded, so PowerPoint may show another font"));
+        }
+        if font.regular.is_some() {
+            embedded.push(font);
+        }
+    }
+    embedded
+}
+
 /// Writes the talk as a PowerPoint file with one slide per slide of the talk. A picture the talk
 /// names as a PNG, JPEG or GIF is read through `files`, bounded as every read of a talk's files
 /// is; anything else is stored as the PNG it was drawn from.
@@ -320,6 +384,7 @@ pub fn write_pptx(deck: &mut Deck, files: &dyn TalkFiles) -> Result<PptxOutput, 
         p.add_xml(name, content_type, &xml);
         p.rel(PRES, name, kind, false);
     }
+    let embedded_fonts = embed_fonts(&mut p, deck.fonts_mut(), &mut notices);
     let presentation = Presentation {
         master_id,
         master_r_id: &master_r_id,
@@ -327,7 +392,7 @@ pub fn write_pptx(deck: &mut Deck, files: &dyn TalkFiles) -> Result<PptxOutput, 
         slides: &slide_refs,
         width: SLIDE_WIDTH_IN,
         height: SLIDE_HEIGHT_IN,
-        embedded_fonts: &[],
+        embedded_fonts: &embedded_fonts,
     };
     p.add_xml(PRES, CT::PRESENTATION, &presentation_xml(&presentation));
     p.add_xml("/docProps/core.xml", CT::CORE_PROPS, &core_xml(title.as_deref().unwrap_or(""), "", None));

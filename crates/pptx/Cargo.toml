@@ -13,3 +13,4 @@ zip = { version = "=9.5.0", default-features = false, features = ["deflate"] }
 [dev-dependencies]
 quick-xml = "=0.41.0"
 tempfile = "3"
+sha2 = "=0.10.9"

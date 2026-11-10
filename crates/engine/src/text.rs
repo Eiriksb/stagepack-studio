@@ -44,6 +44,16 @@ pub(crate) fn limited_size(size: f32) -> f32 {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Notice(pub String);
 
+/// One face of a font that ships with the app or the talk, with the file it lives in.
+#[derive(Clone)]
+pub struct EmbeddableFace {
+    pub family: String,
+    /// Weight 600 or more.
+    pub bold: bool,
+    pub italic: bool,
+    pub data: Arc<Vec<u8>>,
+}
+
 pub struct Fonts {
     pub system: FontSystem,
     pub cache: SwashCache,
@@ -84,6 +94,28 @@ impl Fonts {
     /// face is gone or its file can't be read.
     pub fn face_bytes(&mut self, id: fontdb::ID) -> Option<(Arc<Vec<u8>>, u32)> {
         self.system.db().with_face_data(id, |data, index| (Arc::new(data.to_vec()), index))
+    }
+
+    /// The faces of `family` (named in any case) among the fonts of the app and the talk, for a
+    /// file that carries its fonts. A font from this computer is never in it. A face that is one
+    /// of several in a font collection is left out, as the file would be taken whole.
+    pub fn embeddable_faces(&self, family: &str) -> Vec<EmbeddableFace> {
+        let db = self.system.db();
+        let mut faces = Vec::new();
+        for face in db.faces() {
+            if !self.known.contains(&face.id) || face.index != 0 {
+                continue;
+            }
+            let Some((name, _)) = face.families.iter().find(|(name, _)| name.eq_ignore_ascii_case(family)) else { continue };
+            let Some(data) = db.with_face_data(face.id, |data, _| Arc::new(data.to_vec())) else { continue };
+            faces.push(EmbeddableFace {
+                family: name.clone(),
+                bold: face.weight.0 >= 600,
+                italic: face.style != fontdb::Style::Normal,
+                data,
+            });
+        }
+        faces
     }
 
     /// A font that travels inside the talk file.
