@@ -6755,6 +6755,8 @@ version = "0.1.0"
 dependencies = [
  "quick-xml 0.41.0",
  "slides-engine",
+ "tempfile",
+ "tiny-skia",
  "toolkit",
  "zip",
 ]

@@ -289,7 +289,7 @@ fn backgrounds_and_slides_match_the_reference() {
     assert_eq!(shapes::background_xml(white, Some("rId2")), include_str!("reference/background-picture.xml"));
     let blue = Some(Color::rgb(0x25, 0x63, 0xeb));
     let one = shape_xml_with_id(2, &shape(ShapeKind::Rect, blue, None, 0.0, 0.0, vec![], 0.0, false));
-    assert_eq!(shapes::slide_xml(&one, &shapes::background_xml(white, None)), include_str!("reference/slide-one-shape.xml"));
+    assert_eq!(shapes::slide_xml(&one, &shapes::background_xml(white, None), "", ""), include_str!("reference/slide-one-shape.xml"));
 }
 
 fn shape_xml_with_id(id: u32, content: &NativeContent) -> String {

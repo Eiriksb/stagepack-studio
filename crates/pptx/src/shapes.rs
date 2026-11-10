@@ -104,7 +104,7 @@ struct Sp<'a> {
     anchor: Anchor,
 }
 
-fn sp_xml(id: u32, rect: Rect, sp: &Sp, ctx: &mut TextCtx) -> String {
+fn sp_xml(id: u32, rect: Rect, rotate: f32, sp: &Sp, ctx: &mut TextCtx) -> String {
     let text_box = sp.kind == ShapeKind::Rect && sp.fill.is_none() && sp.outline.is_none();
     let (name, tx_box) = if text_box { ("TextBox", " txBox=\"1\"") } else { ("Shape", "") };
     // spPr child order: xfrm, geometry, fill, ln.
@@ -113,7 +113,7 @@ fn sp_xml(id: u32, rect: Rect, sp: &Sp, ctx: &mut TextCtx) -> String {
     format!(
         "<p:sp><p:nvSpPr><p:cNvPr id=\"{id}\" name=\"{name} {id}\"/><p:cNvSpPr{tx_box}/><p:nvPr/></p:nvSpPr>\
          <p:spPr>{}{}{fill}{}</p:spPr>{}</p:sp>",
-        xfrm_xml(rect, 0.0),
+        xfrm_xml(rect, rotate),
         geometry_xml(sp.kind, rect, sp.radius),
         line_xml(sp.outline, sp.kind == ShapeKind::Arrow),
         tx_body_xml(sp.paragraphs, ctx, &options, "p:txBody"),
@@ -123,10 +123,15 @@ fn sp_xml(id: u32, rect: Rect, sp: &Sp, ctx: &mut TextCtx) -> String {
 /// A text box or a shape at `rect`, which is where it goes on the slide. Tables and pictures
 /// are not shapes, and give `None`.
 pub fn shape_xml(id: u32, rect: Rect, content: &NativeContent, ctx: &mut TextCtx) -> Option<String> {
+    shape_xml_rotated(id, rect, 0.0, content, ctx)
+}
+
+/// `shape_xml`, turned `rotate` degrees around its centre.
+pub fn shape_xml_rotated(id: u32, rect: Rect, rotate: f32, content: &NativeContent, ctx: &mut TextCtx) -> Option<String> {
     match content {
         NativeContent::Text { paragraphs, fill, inset } => {
             let sp = Sp { kind: ShapeKind::Rect, fill: *fill, outline: None, radius: 0.0, paragraphs, inset: *inset, anchor: Anchor::Top };
-            Some(sp_xml(id, rect, &sp, ctx))
+            Some(sp_xml(id, rect, rotate, &sp, ctx))
         }
         NativeContent::Shape { kind, fill, outline, outline_width, radius, paragraphs, inset, centered } => {
             let outline = outline.filter(|_| outline_width.is_finite() && *outline_width > 0.0).map(|c| (c, *outline_width));
@@ -140,7 +145,7 @@ pub fn shape_xml(id: u32, rect: Rect, content: &NativeContent, ctx: &mut TextCtx
             };
             let anchor = if *centered { Anchor::Center } else { Anchor::Top };
             let sp = Sp { kind: *kind, fill: *fill, outline, radius: *radius, paragraphs, inset: *inset, anchor };
-            Some(sp_xml(id, rect, &sp, ctx))
+            Some(sp_xml(id, rect, rotate, &sp, ctx))
         }
         NativeContent::Table { .. } | NativeContent::Picture { .. } => None,
     }
@@ -160,6 +165,11 @@ pub fn background_xml(color: Color, picture_r_id: Option<&str>) -> String {
 
 /// A picture stretched over `rect`. `alt` is its description for screen readers, if it has one.
 pub fn picture_xml(id: u32, name: &str, alt: &str, r_id: &str, rect: Rect) -> String {
+    picture_xml_rotated(id, name, alt, r_id, rect, 0.0)
+}
+
+/// `picture_xml`, turned `rotate` degrees.
+pub fn picture_xml_rotated(id: u32, name: &str, alt: &str, r_id: &str, rect: Rect, rotate: f32) -> String {
     let descr = if alt.is_empty() { String::new() } else { format!(" descr=\"{}\"", esc(alt)) };
     format!(
         "<p:pic><p:nvPicPr><p:cNvPr id=\"{id}\" name=\"{}\"{descr}/><p:cNvPicPr><a:picLocks noChangeAspect=\"1\"/></p:cNvPicPr><p:nvPr/></p:nvPicPr>\
@@ -167,7 +177,7 @@ pub fn picture_xml(id: u32, name: &str, alt: &str, r_id: &str, rect: Rect) -> St
          <p:spPr>{}<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></p:spPr></p:pic>",
         esc(name),
         esc(r_id),
-        xfrm_xml(rect, 0.0),
+        xfrm_xml(rect, rotate),
     )
 }
 
@@ -183,10 +193,11 @@ pub fn graphic_frame_xml(id: u32, name: &str, rect: Rect, uri: &str, inner: &str
     )
 }
 
-/// A slide: its background (`background_xml`, or nothing) and the shapes in drawing order.
-pub fn slide_xml(shapes: &str, background: &str) -> String {
+/// A slide: its background (`background_xml`, or nothing), the shapes in drawing order, and its
+/// transition and timing (`transition_xml` and `animation_timing_xml`, or nothing), in that order.
+pub fn slide_xml(shapes: &str, background: &str, timing: &str, transition: &str) -> String {
     format!(
         "{XML_DECL}<p:sld {NS_PML}><p:cSld>{background}<p:spTree>{SP_TREE_HEADER}{shapes}</p:spTree></p:cSld>\
-         <p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>"
+         <p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr>{transition}{timing}</p:sld>"
     )
 }

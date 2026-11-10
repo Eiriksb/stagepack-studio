@@ -222,6 +222,11 @@ impl Package {
         }
     }
 
+    /// The bytes of a part added so far.
+    pub fn data(&self, part_name: &str) -> Option<&[u8]> {
+        self.parts.iter().find(|p| p.name == part_name).map(|p| p.data.as_slice())
+    }
+
     pub fn has(&self, part_name: &str) -> bool {
         self.names.contains(part_name)
     }

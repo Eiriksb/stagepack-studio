@@ -12,3 +12,6 @@ pub mod text;
 pub mod theme;
 pub mod timing;
 pub mod xml;
+pub mod write;
+
+pub use write::{PptxOutput, write_pptx};
