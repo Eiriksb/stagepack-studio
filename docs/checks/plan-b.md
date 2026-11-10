@@ -1,18 +1,18 @@
 # Plan B: what ran, and how to check Windows and PowerPoint
 
-The first run was on the `plan-b` branch at commit ecde000 plus the `fixtures/show` talk from 49e8d28, on a 16-core Linux laptop, in debug builds, on 2026-11-10. After the final fix wave, the tests, the walk through the show and the exports were repeated at commit f29c5a0. Nothing here has run on Windows. The branch has not been pushed.
+The first run was on the `plan-b` branch at commit ecde000 plus the `fixtures/show` talk from 49e8d28, on a 16-core Linux laptop, in debug builds, on 2026-11-10. After the final fix wave, the walk through the show and the exports were repeated at commit f29c5a0, and the tests at 232836d. Nothing here has run on Windows. The branch has not been pushed.
 
 ## Tests on Linux
 
-At f29c5a0, `scripts/cargo-safe.sh test --workspace` passed: 626 tests, 0 failed, 0 ignored, no warnings. `scripts/cargo-safe.sh clippy --workspace --all-targets` gave no warnings.
+At 232836d, `scripts/cargo-safe.sh test --workspace` passed: 635 tests, 0 failed, 0 ignored, no warnings. `scripts/cargo-safe.sh clippy --workspace --all-targets` gave no warnings.
 
 | Crate | Tests |
 | --- | --- |
-| slides-engine | 263 (builtins 81, native 45, packed 42, flow 29, deck 26, timeline 13, render 11, text 8, files 8) |
+| slides-engine | 267 (builtins 81, native 45, packed 42, flow 29, deck 26, timeline 13, files 12, render 11, text 8) |
 | slides-format | 60 (parse 35, edit 18, split 7) |
-| slides-pdf | 14 |
+| slides-pdf | 18 |
 | slides-pptx | 98 (elements 30, write 29, parts 20, timing 10, fonts 9) |
-| stagepack-studio (app) | 185 (ui_slides 54, document_state 39, ui_present 38, present 33, export 16, watcher 4, ui_layout 1) |
+| stagepack-studio (app) | 186 (ui_slides 54, document_state 40, ui_present 38, present 33, export 16, watcher 4, ui_layout 1) |
 | toolkit | 6 |
 
 ## Real-window check on Linux
