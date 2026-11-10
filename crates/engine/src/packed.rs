@@ -114,8 +114,9 @@ fn safe_part(part: &str) -> bool {
         .trim_end_matches(' ')
         .to_ascii_uppercase();
     !part.is_empty()
-        && part != "."
-        && part != ".."
+        // Hidden names are how tools leave configuration that can run commands later, and
+        // this covers `.` and `..` as well.
+        && !part.starts_with('.')
         && !part.ends_with(['.', ' '])
         && !part.contains(['\\', ':', '<', '>', '"', '|', '?', '*'])
         && !part.chars().any(char::is_control)
@@ -176,6 +177,10 @@ pub fn open_packed(path: &Path) -> Result<PackedFiles, PackError> {
 
 pub fn open_packed_limited(path: &Path, limits: PackLimits) -> Result<PackedFiles, PackError> {
     let mut zip = ZipArchive::new(File::open(path)?)?;
+    // First, so that one of these gets its own message and not a complaint about what's in it.
+    if zip.index_for_name(STAGEPACK_MANIFEST).is_some() && zip.index_for_name(MANIFEST_NAME).is_none() {
+        return Err(PackError::SlidevTalk);
+    }
     if zip.has_duplicate_names() {
         return Err(PackError::Corrupt("a file name appears twice".into()));
     }
@@ -218,11 +223,7 @@ pub fn open_packed_limited(path: &Path, limits: PackLimits) -> Result<PackedFile
         index.insert(name, i);
     }
     let Some(&manifest_at) = index.get(MANIFEST_NAME) else {
-        return Err(if index.contains_key(STAGEPACK_MANIFEST) {
-            PackError::SlidevTalk
-        } else {
-            PackError::NotATalk
-        });
+        return Err(PackError::NotATalk);
     };
     let manifest = {
         let entry = zip.by_index(manifest_at)?;

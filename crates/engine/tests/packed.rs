@@ -546,7 +546,7 @@ fn unpacking_refuses_files_a_talk_has_no_business_with() {
         assert!(unpack_to_folder(&path, &target).is_err());
         assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0, "{name}");
     }
-    // Opening it is still fine, so a Stagepack file is still recognised.
+    // A Stagepack file is recognised whatever else it holds.
     let path = zip_with(&[("stagepack.json", b"{}"), (".git/config", b"x")]);
     assert!(matches!(open_packed(&path), Err(PackError::SlidevTalk)));
 }
@@ -592,6 +592,7 @@ fn names_that_windows_treats_specially_are_refused() {
         "assets/a*b",
         "assets/a\tb",
         "assets/a\u{7f}b",
+        "assets/.hidden",
     ] {
         let path = zip_with(&[("talk.json", MANIFEST), ("slides.md", b"# A"), (name, b"x")]);
         assert!(
@@ -604,7 +605,6 @@ fn names_that_windows_treats_specially_are_refused() {
         ("talk.json", MANIFEST),
         ("slides.md", b"# A"),
         ("assets/console.png", b"x"),
-        ("assets/.hidden", b"x"),
     ]);
     assert!(open_packed(&path).is_ok());
 }
@@ -647,6 +647,47 @@ fn a_picture_shown_twice_is_reported_once() {
 fn only_a_picture_that_could_have_been_packed_is_reported() {
     let report = pack_talk_with_pictures("![](pics/missing.jpg)\n\n![](../beside.jpg)\n\n![](https://example.com/a.jpg)\n", &[]);
     assert!(report.outside_pictures.is_empty(), "{:?}", report.outside_pictures);
+}
+
+#[test]
+fn a_hidden_folder_below_the_packed_folders_is_never_unpacked() {
+    for name in ["assets/.git/config", "components/.cargo/config.toml", "assets/deep/.hidden", "build/.env"] {
+        let path = zip_with(&[("talk.json", MANIFEST), ("slides.md", b"# A"), (name, b"x")]);
+        let work = tempfile::tempdir().unwrap();
+        let target = work.path().join("out");
+        assert!(matches!(unpack_to_folder(&path, &target), Err(PackError::UnsafeName(_))), "{name}");
+        assert!(!target.exists(), "{name}");
+    }
+}
+
+#[test]
+fn a_hidden_file_in_a_packed_folder_is_left_out_of_a_pack() {
+    let dir = talk_folder();
+    std::fs::write(dir.path().join("assets/.DS_Store"), "x").unwrap();
+    std::fs::create_dir(dir.path().join("assets/.git")).unwrap();
+    std::fs::write(dir.path().join("assets/.git/config"), "x").unwrap();
+    let out = dir.path().join("talk.sptx");
+    let report = pack_folder(dir.path(), &out, "0.1.0").unwrap();
+    assert_eq!(report.skipped, ["assets/.DS_Store", "assets/.git"]);
+    let names = open_packed(&out).unwrap().names();
+    assert!(!names.iter().any(|name| name.contains("/.")), "{names:?}");
+}
+
+#[test]
+fn a_stagepack_file_is_recognised_before_anything_in_it_is_judged() {
+    let limits = PackLimits::default();
+    let unsafe_name = zip_with(&[("stagepack.json", b"{}"), ("a:b", b"x")]);
+    assert!(matches!(open_packed(&unsafe_name), Err(PackError::SlidevTalk)));
+    let big = zip_with(&[("stagepack.json", b"{}"), ("big", &[0; 64])]);
+    assert!(matches!(open_packed_limited(&big, PackLimits { entry_bytes: 8, ..limits }), Err(PackError::SlidevTalk)));
+    assert!(matches!(open_packed_limited(&big, PackLimits { total_bytes: 8, ..limits }), Err(PackError::SlidevTalk)));
+    assert!(matches!(open_packed_limited(&big, PackLimits { entries: 1, ..limits }), Err(PackError::SlidevTalk)));
+}
+
+#[test]
+fn a_talk_of_ours_with_a_stagepack_file_in_it_is_ours() {
+    let path = zip_with(&[("talk.json", MANIFEST), ("slides.md", b"# A"), ("stagepack.json", b"{}")]);
+    assert!(open_packed(&path).is_ok());
 }
 
 #[cfg(unix)]
