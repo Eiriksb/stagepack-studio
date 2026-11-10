@@ -72,7 +72,7 @@ GitHub's Windows runner built the bundle and ran the loop: 375 ms p95 for a save
 **Owner's check: not done.** On 2026-11-09 the owner chose to move on without it, so no clean Windows machine has run this. The steps stay here for whoever does it.
 
 1. On the Windows PC, use a user account with no Rust. `where rustc` should find nothing.
-2. Download `spike-compile-windows` from the Actions run above, and unzip it to a folder with a space in its name.
+2. GitHub Actions is no longer used (owner's decision, 2026-11-10), so build the folder on a Windows machine that has Rust. On branch `spike/native-rust`, run `spikes/compile/bundle.ps1 -Out out/bundle` and `cargo build --release -p compile-host`, then copy `target/release/compile-host.exe`, `spikes/compile/fixtures` and `spikes/compile/run-check.cmd` into `out/`. Put `out/` somewhere with a space in its path.
 3. Double-click `run-check.cmd`, and send back the JSON line it prints.
 4. If Windows says a DLL is missing, send its name.
 

@@ -68,7 +68,7 @@ Windows checklist at the end of each.
 - Installers for Windows and Linux, per user, with no administrator rights.
 - The bundled compiler, fonts, icons and licence notices.
 - `.sptx` registered as the default, with Stagepack under *Open with*.
-- CI on Linux and Windows.
+- A local script that runs every test on Linux, and the same on the owner's Windows PC. No GitHub Actions (owner's decision, 2026-11-10).
 - Both success tests from the design, run from the installers.
 
 ### F. Slidev add-on

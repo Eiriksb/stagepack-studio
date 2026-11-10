@@ -22,6 +22,7 @@
 - There is no second copy of the talk that can drift from the file.
 - Each cached layer is its own image in GPUI's sprite atlas. Images hold straight-alpha BGRA. A layer that changes must release its old image with `drop_image`.
 - Tag names are `<Box>`, `<Shape>`, `<Icon>`, `<Picture>`, `<Text>`, `<Notes>` and `<Region>`. Attributes `x`, `y`, `w`, `h`, `rotate`, `click` and `enter` place any component.
+- No GitHub Actions, for Windows builds or anything else (owner's decision, 2026-11-10).
 - Never stage `docs/superpowers/plans/2026-11-09-roadmap.md`. It holds the owner's own uncommitted edit.
 - Don't name real decks, clients or organisations in commits. Use fixtures.
 
@@ -1376,34 +1377,39 @@ git add Cargo.lock crates/app
 git commit -m "App: update on save, and View Markdown"
 ```
 
-### Task 13: Check it on Windows
+### Task 13: Record what ran, and how to check Windows
+
+This project doesn't use GitHub Actions (owner's decision, 2026-11-10). An earlier version of this task added a workflow, and its one run was cancelled before it reported anything.
 
 **Files:**
-- Create: `.github/workflows/engine.yml`, `docs/checks/plan-a.md`
+- Delete: `.github/workflows/engine.yml`
+- Create: `docs/checks/plan-a.md`
 
 **Interfaces:**
-- Consumes: the golden tests from Tasks 7 to 10.
+- Consumes: the tests from Tasks 2 to 12.
 
-- [ ] **Step 1: Write the workflow**
-
-Trigger: push to `native-rust`. Two jobs, on `ubuntu-latest` and `windows-latest`, each installing Rust 1.98.0 and running `cargo test -p slides-format -p toolkit -p slides-engine`. The Windows job also runs `cargo build --release -p stagepack-studio` and uploads the executable and `fixtures/showcase` as `engine-windows`.
-
-- [ ] **Step 2: Push and wait for the result**
+- [ ] **Step 1: Remove the workflow**
 
 ```bash
-git add .github/workflows/engine.yml
-git commit -m "CI: engine tests on Linux and Windows"
-git push -u origin native-rust
+git revert --no-edit bf0a075
 ```
 
-Find the run with `gh run list --branch native-rust --limit 1`, once it has appeared, then `gh run watch <id> --exit-status`.
-Expected: both jobs pass, so the golden images match byte for byte on Windows. If only the Windows goldens differ, record how much in `docs/checks/plan-a.md` and allow a per-channel tolerance of 2 on Windows.
+Expected: `.github` no longer exists in the working tree.
+
+- [ ] **Step 2: Run every test locally**
+
+Run: `scripts/cargo-safe.sh test --workspace`
+Expected: all pass.
 
 - [ ] **Step 3: Write `docs/checks/plan-a.md`, and commit**
 
-Record the test counts and the Actions run. Add the owner's optional Windows check: download `engine-windows`, run `stagepack-studio.exe fixtures\showcase`, and confirm the slides match the goldens in `crates/engine/tests/golden/`.
+Record the test counts you measured, the Linux real-window check, what wasn't exercised, and that nothing has run on Windows. Add the owner's optional Windows check, by hand on their Windows PC, with Rust 1.98.0 and the MSVC build tools installed:
+
+1. `git clone -b native-rust https://github.com/Eiriksb/stagepack-studio.git`
+2. `cargo test -p slides-format -p toolkit -p slides-engine`. If only golden tests fail, the images differ slightly from Linux, so send back which ones.
+3. `cargo run --release -p stagepack-studio -- fixtures\showcase`, then confirm the slides match the images in `crates/engine/tests/golden/`, that Left and Right change slides, and that Ctrl+M opens the Markdown panel.
 
 ```bash
 git add docs/checks/plan-a.md
-git commit -m "Plan A check: what ran on Linux and Windows"
+git commit -m "Plan A check: what ran, and how to check Windows"
 ```
