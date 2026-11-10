@@ -9,22 +9,11 @@ name = "stagepack-studio"
 path = "src/main.rs"
 
 [dependencies]
+futures = "0.3"
 gpui-kit = { version = "=0.9.0", features = ["gpui-fast"] }
-gpui-webview = { version = "=0.9.0", features = ["gpui-fast"] }
-wry = { version = "=0.53.3", package = "lb-wry" }
-studio-protocol = { path = "../protocol" }
-studio-sidecar = { path = "../sidecar" }
-async-channel = "2"
-anyhow = "1"
-url = "2"
+notify = "8"
+slides-engine = { path = "../engine" }
 
 [dev-dependencies]
 gpui-kit = { version = "=0.9.0", features = ["test-support"] }
-
-# Already in Cargo.lock through gpui-webview and Wry; used to keep GDK from
-# exiting on the X11 errors a closing window causes (see canvas.rs).
-[target.'cfg(target_os = "linux")'.dependencies]
-gtk = "0.18"
-# Already in Cargo.lock through Wry: the `decide-policy` signal that keeps
-# the web view on the talk (see canvas.rs). Same version as Wry's.
-webkit2gtk = "=2.0.1"
+tempfile = "3"

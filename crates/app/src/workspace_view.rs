@@ -1,188 +1,126 @@
-//! The window's content: the title bar, the canvas and the inspector slot.
+//! The window's content: the title bar, the slide, its notices and the talk's Markdown.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
-use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, TitleBar, h_flex, h_resizable,
-    resizable_panel, v_flex,
-};
+use futures::StreamExt as _;
+use futures::channel::mpsc;
+use gpui_kit::component::{ActiveTheme as _, TitleBar, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use notify::RecommendedWatcher;
+use slides_engine::Fonts;
 
-use crate::canvas::Canvas;
-use crate::document_view::DocumentView;
-use crate::inspector::{Inspector, InspectorEvent};
-use studio_protocol::CommandBody;
+use crate::document::{Document, Reload, SLIDES_FILE};
+use crate::markdown_panel::MarkdownPanel;
+use crate::slide_canvas::{ScaleChanged, SlideCanvas};
+use crate::watcher;
 
 pub const CANVAS_ID: &str = "canvas";
-pub const INSPECTOR_ID: &str = "inspector";
 pub const TITLE_ID: &str = "title";
-
-pub const INSPECTOR_WIDTH: Pixels = px(280.);
+pub const NOTICES_ID: &str = "notices";
+pub const PROBLEM_ID: &str = "problem";
+pub const MARKDOWN_ID: &str = "markdown";
 
 /// The key context of the window's content, where its shortcuts apply.
 pub const KEY_CONTEXT: &str = "Workspace";
 
-actions!(stagepack_studio, [Save]);
+/// How long the file has to stay quiet before it's read, as one save can be several writes.
+const RELOAD_DELAY: Duration = Duration::from_millis(100);
+
+const MARKDOWN_WIDTH: Pixels = px(380.);
+
+actions!(stagepack_studio, [NextSlide, PreviousSlide, ToggleMarkdown]);
 
 /// The window's shortcuts. Call once, after `gpui_kit::init`.
 pub fn bind_keys(cx: &mut App) {
-    // `KeyBinding::new` takes explicit modifiers only, not `secondary-`.
-    let save = if cfg!(target_os = "macos") {
-        "cmd-s"
-    } else {
-        "ctrl-s"
-    };
-    cx.bind_keys([KeyBinding::new(save, Save, Some(KEY_CONTEXT))]);
+    cx.bind_keys([
+        KeyBinding::new("right", NextSlide, Some(KEY_CONTEXT)),
+        KeyBinding::new("pagedown", NextSlide, Some(KEY_CONTEXT)),
+        KeyBinding::new("left", PreviousSlide, Some(KEY_CONTEXT)),
+        KeyBinding::new("pageup", PreviousSlide, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-m", ToggleMarkdown, Some(KEY_CONTEXT)),
+    ]);
 }
 
 pub struct WorkspaceView {
-    /// `None` in headless tests, which can't host a web view.
-    canvas: Option<Entity<Canvas>>,
-    /// The open talk. `None` for `STUDIO_DEV_URL`, which only loads a page.
-    document: Option<Entity<DocumentView>>,
-    inspector: Entity<Inspector>,
-    /// What would have gone to the page, in tests that have no canvas.
-    sent: Vec<CommandBody>,
-    /// The page's refusals the inspector has already answered.
-    refusals_seen: u64,
+    document: Option<Document>,
+    /// Why no talk is showing, when one was asked for.
+    problem: Option<SharedString>,
+    slide_canvas: Entity<SlideCanvas>,
+    notices: Vec<String>,
+    markdown_panel: Entity<MarkdownPanel>,
+    show_markdown: bool,
     focus_handle: FocusHandle,
-    _observe: Option<Subscription>,
-    _inspector_events: Subscription,
+    /// Keeps the talk's folder watched for as long as the window is open.
+    _watcher: Option<RecommendedWatcher>,
+    /// Why saved changes won't show up, if the folder couldn't be watched.
+    watch_problem: Option<String>,
+    /// The reload waiting for the file to go quiet.
+    pending_reload: Option<Task<()>>,
+    _scale_changed: Subscription,
 }
 
 impl WorkspaceView {
-    /// A canvas and no talk, for `STUDIO_DEV_URL`.
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let canvas = cx.new(|cx| Canvas::new(window, cx));
-        Self::build(Some(canvas), None, None, window, cx)
+    /// Opens the talk in `folder` and follows its saves. If it can't be, the window says why.
+    pub fn open(folder: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        match Document::open(&folder, Fonts::with_system_fallback()) {
+            Ok(document) => {
+                let mut view = Self::open_with(document, window, cx);
+                view.follow_saves(folder, cx);
+                view
+            }
+            Err(problem) => Self::build(None, Some(problem.into()), window, cx),
+        }
     }
 
-    /// Opens the talk at `path` through its sidecar.
-    pub fn open(path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let canvas = cx.new(|cx| Canvas::new(window, cx));
-        let document = cx.new(|cx| DocumentView::open(path, canvas.clone(), window, cx));
-        Self::with_document(Some(canvas), document, window, cx)
+    /// Shows a talk that is already open.
+    pub fn open_with(document: Document, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::build(Some(document), None, window, cx)
     }
 
-    /// The same layout with a plain div where the web view goes.
+    /// The window with no talk, for headless tests.
     pub fn for_test(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::build(None, None, None, window, cx)
-    }
-
-    /// The layout with a talk that has no sidecar and no web view; see
-    /// [`DocumentView::for_test`].
-    pub fn for_test_with_document(
-        path: PathBuf,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let document = cx.new(|cx| DocumentView::for_test(path, cx));
-        Self::with_document(None, document, window, cx)
-    }
-
-    fn with_document(
-        canvas: Option<Entity<Canvas>>,
-        document: Entity<DocumentView>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let observe = cx.observe_in(&document, window, |this, document, window, cx| {
-            this.show_selection(&document, window, cx);
-            cx.notify();
-        });
-        // The window manager's close button asks the talk first.
-        let asked = document.downgrade();
-        window.on_window_should_close(cx, move |window, cx| {
-            asked
-                .update(cx, |document, cx| document.request_close(window, cx))
-                .unwrap_or(true)
-        });
-        Self::build(canvas, Some(document), Some(observe), window, cx)
+        Self::build(None, None, window, cx)
     }
 
     fn build(
-        canvas: Option<Entity<Canvas>>,
-        document: Option<Entity<DocumentView>>,
-        observe: Option<Subscription>,
+        mut document: Option<Document>,
+        problem: Option<SharedString>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let inspector = cx.new(|cx| Inspector::new(window, cx));
-        let inspector_events = cx.subscribe(&inspector, |this, _, event: &InspectorEvent, cx| {
-            let InspectorEvent::Send(body) = event;
-            this.send(body.clone(), cx);
+        let slide_canvas = cx.new(|_| SlideCanvas::default());
+        let scale_changed = cx.subscribe(&slide_canvas, |this, _, _: &ScaleChanged, cx| {
+            this.show_slide(cx)
+        });
+        let markdown_panel = cx.new(|cx| {
+            let mut panel = MarkdownPanel::default();
+            if let Some(document) = &document {
+                panel.set_source(document.source(), cx);
+            }
+            panel
         });
         let focus_handle = cx.focus_handle();
-        if document.is_some() {
-            focus_handle.focus(window, cx);
-        }
+        focus_handle.focus(window, cx);
+        let notices = document.as_mut().map(Document::notices).unwrap_or_default();
         Self {
-            canvas,
             document,
-            inspector,
-            sent: Vec::new(),
-            refusals_seen: 0,
+            problem,
+            slide_canvas,
+            notices,
+            markdown_panel,
+            show_markdown: false,
             focus_handle,
-            _observe: observe,
-            _inspector_events: inspector_events,
+            _watcher: None,
+            watch_problem: None,
+            pending_reload: None,
+            _scale_changed: scale_changed,
         }
     }
 
-    /// Sends a command to the page. Without a canvas (headless tests) it is
-    /// recorded instead; see [`Self::sent_commands`].
-    fn send(&mut self, body: CommandBody, cx: &mut Context<Self>) {
-        match &self.canvas {
-            Some(canvas) => {
-                let id = canvas.update(cx, |canvas, cx| canvas.send(body, cx));
-                if let Some(document) = &self.document {
-                    document.update(cx, |document, _| document.command_sent(id));
-                }
-            }
-            None => self.sent.push(body),
-        }
-    }
-
-    /// The commands a canvas-less workspace would have sent the page.
-    pub fn sent_commands(&self) -> &[CommandBody] {
-        &self.sent
-    }
-
-    fn show_selection(
-        &mut self,
-        document: &Entity<DocumentView>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let (selection, missed, refusals) = {
-            let document = document.read(cx).document();
-            (
-                document.selection.clone(),
-                document.missed,
-                document.refusals(),
-            )
-        };
-        let selection_changed = self.inspector.read(cx).selection() != selection.as_ref();
-        let refused = refusals != self.refusals_seen;
-        self.refusals_seen = refusals;
-        self.inspector.update(cx, |inspector, cx| {
-            if selection_changed {
-                inspector.set_selection(selection, window, cx);
-            }
-            inspector.set_missed(missed, cx);
-            if refused {
-                inspector.reset_fields(window, cx);
-            }
-        });
-    }
-
-    pub fn canvas(&self) -> Option<&Entity<Canvas>> {
-        self.canvas.as_ref()
-    }
-
-    pub fn document_view(&self) -> Option<&Entity<DocumentView>> {
-        self.document.as_ref()
+    pub fn slide_canvas(&self) -> &Entity<SlideCanvas> {
+        &self.slide_canvas
     }
 
     /// Window options for a window whose content is a `WorkspaceView`.
@@ -199,126 +137,190 @@ impl WorkspaceView {
         }
     }
 
-    fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(document) = &self.document {
-            document.update(cx, |document, cx| document.save(window, cx));
+    /// Brings the canvas and the notices up to date with the current slide. Before the
+    /// canvas has measured itself there's no scale to draw at, and its first paint brings
+    /// us back here.
+    fn show_slide(&mut self, cx: &mut Context<Self>) {
+        let Some(document) = &mut self.document else {
+            return;
+        };
+        self.notices = document.notices();
+        if let Some(scale) = self.slide_canvas.read(cx).scale() {
+            let layers = document.layers(scale);
+            self.slide_canvas
+                .update(cx, |canvas, cx| canvas.set_layers(layers, cx));
+        }
+        cx.notify();
+    }
+
+    fn go(&mut self, step: fn(&mut Document), cx: &mut Context<Self>) {
+        if let Some(document) = &mut self.document {
+            step(document);
+            self.show_slide(cx);
         }
     }
 
-    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let action = |id: &'static str, label: &'static str, enabled: bool, body: CommandBody| {
-            Button::new(id)
-                .ghost()
-                .small()
-                .label(label)
-                .disabled(!enabled)
-                .on_click(cx.listener(move |this, _, _, cx| this.send(body.clone(), cx)))
-        };
-        let (title, dirty, can_save, can_undo, can_redo): (SharedString, bool, bool, bool, bool) =
-            match &self.document {
-                Some(document) => {
-                    let document = document.read(cx).document();
-                    (
-                        document.title.clone().into(),
-                        document.dirty,
-                        document.can_save(),
-                        document.can_undo,
-                        document.can_redo,
-                    )
+    /// Watches `folder`, and reloads the talk from its file whenever that changes.
+    pub fn follow_saves(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
+        let (changed, mut changes) = mpsc::unbounded();
+        let watcher = watcher::watch(&folder, move || {
+            changed.unbounded_send(()).ok();
+        });
+        match watcher {
+            Ok(watcher) => self._watcher = Some(watcher),
+            Err(error) => {
+                self.watch_problem = Some(format!(
+                    "Saved changes won't show here: could not watch {}: {error}",
+                    folder.display()
+                ));
+                cx.notify();
+                return;
+            }
+        }
+        let file = folder.join(SLIDES_FILE);
+        cx.spawn(async move |this, cx| {
+            while changes.next().await.is_some() {
+                let file = file.clone();
+                if this
+                    .update(cx, |this, cx| this.reload_soon(file, cx))
+                    .is_err()
+                {
+                    break;
                 }
-                None => ("Untitled".into(), false, false, false, false),
-            };
-        // The kit's own close button (client-side decorations) asks the talk too.
-        let closing = self.document.clone();
+            }
+        })
+        .detach();
+    }
 
-        TitleBar::new()
-            .on_close_window(move |_, window, cx| {
-                let close_now = closing.as_ref().is_none_or(|document| {
-                    document.update(cx, |document, cx| document.request_close(window, cx))
-                });
-                if close_now {
-                    window.remove_window();
-                }
-            })
+    /// Reloads the talk from `file` once it has been quiet for a moment.
+    pub fn reload_soon(&mut self, file: PathBuf, cx: &mut Context<Self>) {
+        // Replacing the task cancels the one waiting, so the wait starts again from now.
+        self.pending_reload = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(RELOAD_DELAY).await;
+            let contents = cx
+                .background_spawn(async move { std::fs::read_to_string(file).ok() })
+                .await;
+            this.update(cx, |this, cx| this.reload(contents, cx)).ok();
+        }));
+    }
+
+    fn reload(&mut self, contents: Option<String>, cx: &mut Context<Self>) {
+        let Some(document) = &mut self.document else {
+            return;
+        };
+        let Reload::Changed(slides) = document.reload(contents) else {
+            return;
+        };
+        let showing_changed = slides.contains(&document.current());
+        self.markdown_panel
+            .update(cx, |panel, cx| panel.set_source(document.source(), cx));
+        if showing_changed {
+            self.show_slide(cx);
+        } else {
+            // The title counts the slides, and the talk may have gained some.
+            cx.notify();
+        }
+    }
+}
+
+impl Render for WorkspaceView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let title: SharedString = self
+            .document
+            .as_ref()
+            .map_or_else(|| "Untitled".to_string(), Document::title)
+            .into();
+        let muted_text = cx.theme().muted_foreground;
+        let notices: Vec<&str> = self
+            .notices
+            .iter()
+            .map(String::as_str)
+            .chain(self.watch_problem.as_deref())
+            .collect();
+        v_flex()
+            .key_context(KEY_CONTEXT)
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &NextSlide, _, cx| this.go(Document::next, cx)))
+            .on_action(
+                cx.listener(|this, _: &PreviousSlide, _, cx| this.go(Document::previous, cx)),
+            )
+            .on_action(cx.listener(|this, _: &ToggleMarkdown, _, cx| {
+                this.show_markdown = !this.show_markdown;
+                cx.notify();
+            }))
+            .size_full()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
             .child(
-                h_flex()
-                    .gap_1()
-                    .items_center()
-                    .child(
+                TitleBar::new().child(
+                    h_flex().gap_1().items_center().child(
                         div()
                             .id(TITLE_ID)
                             .test_support()
                             .aria_label(title.clone())
                             .text_sm()
                             .child(title),
-                    )
-                    .child(
-                        div()
-                            .id("dirty")
-                            .test_support()
-                            .aria_label("Unsaved changes")
-                            .text_sm()
-                            .when(!dirty, |this| this.invisible())
-                            .child("•"),
                     ),
+                ),
             )
             .child(
                 h_flex()
-                    .gap_1()
-                    .pr_2()
-                    .items_center()
-                    .child(action("undo", "Undo", can_undo, CommandBody::Undo))
-                    .child(action("redo", "Redo", can_redo, CommandBody::Redo))
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .items_stretch()
                     .child(
-                        Button::new("save")
-                            .ghost()
-                            .small()
-                            .label("Save")
-                            .disabled(!can_save)
-                            .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
-                    ),
+                        div()
+                            .id(CANVAS_ID)
+                            .test_support()
+                            .relative()
+                            .flex_1()
+                            .bg(cx.theme().muted)
+                            .child(self.slide_canvas.clone())
+                            .when_some(self.problem.clone(), |this, problem| {
+                                this.child(
+                                    div()
+                                        .id(PROBLEM_ID)
+                                        .test_support()
+                                        .aria_label(problem.clone())
+                                        .absolute()
+                                        .size_full()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .p_4()
+                                        .child(problem),
+                                )
+                            }),
+                    )
+                    .when(self.show_markdown, |this| {
+                        this.child(
+                            div()
+                                .id(MARKDOWN_ID)
+                                .test_support()
+                                .flex_none()
+                                .w(MARKDOWN_WIDTH)
+                                .border_l_1()
+                                .border_color(cx.theme().border)
+                                .child(self.markdown_panel.clone()),
+                        )
+                    }),
             )
-    }
-}
-
-impl Render for WorkspaceView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let canvas = div()
-            .id(CANVAS_ID)
-            .test_support()
-            .flex_1()
-            .size_full()
-            .bg(cx.theme().muted)
-            .map(|this| match (&self.document, &self.canvas) {
-                (Some(document), _) => this.child(document.clone()),
-                (None, Some(canvas)) => this.child(canvas.clone()),
-                (None, None) => this,
-            });
-
-        let inspector = div()
-            .id(INSPECTOR_ID)
-            .test_support()
-            .size_full()
-            .bg(cx.theme().background)
-            .child(self.inspector.clone());
-
-        v_flex()
-            .key_context(KEY_CONTEXT)
-            .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|this, _: &Save, window, cx| this.save(window, cx)))
-            .size_full()
-            .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
-            .child(self.render_title_bar(cx))
-            .child(
-                h_resizable("workspace")
-                    .child(resizable_panel().child(canvas))
-                    .child(
-                        resizable_panel()
-                            .size(INSPECTOR_WIDTH)
-                            .fixed()
-                            .child(inspector),
-                    ),
-            )
+            .when(!notices.is_empty(), |this| {
+                let line: SharedString = notices.join(" · ").into();
+                this.child(
+                    div()
+                        .id(NOTICES_ID)
+                        .test_support()
+                        .aria_label(line.clone())
+                        .w_full()
+                        .px_2()
+                        .py_1()
+                        .text_xs()
+                        .text_color(muted_text)
+                        .truncate()
+                        .child(line),
+                )
+            })
     }
 }
