@@ -674,6 +674,49 @@ fn a_hidden_file_in_a_packed_folder_is_left_out_of_a_pack() {
 }
 
 #[test]
+fn an_invisible_character_cannot_hide_a_name() {
+    for name in [
+        "assets/\u{200b}.git/config",
+        "assets/\u{feff}.git/config",
+        "assets/a\u{ad}b.png",
+        "assets/a\u{200c}b.png",
+        "assets/a\u{200f}b.png",
+        "assets/a\u{202a}b.png",
+        "assets/a\u{202e}b.png",
+        "assets/a\u{2060}b.png",
+        "assets/a\u{206f}b.png",
+    ] {
+        let path = zip_with(&[("talk.json", MANIFEST), ("slides.md", b"# A"), (name, b"x")]);
+        assert!(matches!(open_packed(&path), Err(PackError::UnsafeName(_))), "{name:?}");
+        let work = tempfile::tempdir().unwrap();
+        let target = work.path().join("out");
+        assert!(matches!(unpack_to_folder(&path, &target), Err(PackError::UnsafeName(_))), "{name:?}");
+        assert!(!target.exists(), "{name:?}");
+    }
+}
+
+#[test]
+fn a_character_next_to_the_invisible_ones_is_fine() {
+    for name in ["assets/a\u{200a}b.png", "assets/a\u{2010}b.png", "assets/a\u{2029}b.png", "assets/a\u{202f}b.png", "assets/a\u{2070}b.png"] {
+        let path = zip_with(&[("talk.json", MANIFEST), ("slides.md", b"# A"), (name, b"x")]);
+        assert!(open_packed(&path).is_ok(), "{name:?}");
+    }
+}
+
+#[test]
+fn an_invisible_character_keeps_a_file_out_of_a_pack() {
+    let dir = talk_folder();
+    let hiding = dir.path().join("assets/\u{200b}.git");
+    std::fs::create_dir(&hiding).unwrap();
+    std::fs::write(hiding.join("config"), "x").unwrap();
+    let out = dir.path().join("talk.sptx");
+    let report = pack_folder(dir.path(), &out, "0.1.0").unwrap();
+    assert_eq!(report.skipped, ["assets/\u{200b}.git"]);
+    let names = open_packed(&out).unwrap().names();
+    assert!(!names.iter().any(|name| name.contains(".git")), "{names:?}");
+}
+
+#[test]
 fn a_stagepack_file_is_recognised_before_anything_in_it_is_judged() {
     let limits = PackLimits::default();
     let unsafe_name = zip_with(&[("stagepack.json", b"{}"), ("a:b", b"x")]);

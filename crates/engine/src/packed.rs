@@ -105,6 +105,12 @@ const RESERVED: [&str; 22] = [
     "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
+/// Whether `c` is a format character that draws nothing, which could make one name pass for
+/// another: a zero-width space in front of `.git` isn't a hidden name to the dot check below.
+fn is_invisible(c: char) -> bool {
+    matches!(c, '\u{AD}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}')
+}
+
 /// Whether one part of a path can be used as a file name on every platform.
 fn safe_part(part: &str) -> bool {
     let stem = part
@@ -119,7 +125,7 @@ fn safe_part(part: &str) -> bool {
         && !part.starts_with('.')
         && !part.ends_with(['.', ' '])
         && !part.contains(['\\', ':', '<', '>', '"', '|', '?', '*'])
-        && !part.chars().any(char::is_control)
+        && !part.chars().any(|c| c.is_control() || is_invisible(c))
         && !RESERVED.contains(&stem.as_str())
 }
 
