@@ -2,7 +2,7 @@
 //! talk uses. A packed file is untrusted input, so it is checked when it opens (names, sizes,
 //! count) and read in bounded pieces afterwards.
 
-use crate::files::{FolderFiles, TalkFiles};
+use crate::files::{FolderFiles, MAX_FILE_BYTES, TalkFiles};
 use slides_format::{Block, Talk, parse_talk};
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
@@ -38,7 +38,7 @@ pub struct PackLimits {
 impl Default for PackLimits {
     fn default() -> PackLimits {
         PackLimits {
-            entry_bytes: 256 * 1024 * 1024,
+            entry_bytes: MAX_FILE_BYTES,
             total_bytes: 2 * 1024 * 1024 * 1024,
             entries: 10_000,
         }

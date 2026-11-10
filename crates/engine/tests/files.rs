@@ -51,3 +51,37 @@ fn a_stamp_cannot_reach_outside_the_talk() {
         assert_eq!(files.stamp("link.txt"), None);
     }
 }
+
+#[test]
+fn a_file_over_the_limit_reads_as_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let huge = std::fs::File::create(dir.path().join("huge.ttf")).unwrap();
+    // Sparse, so the test costs no disk.
+    huge.set_len(MAX_FILE_BYTES + 1).unwrap();
+    assert_eq!(FolderFiles::new(dir.path().into()).read("huge.ttf"), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_named_pipe_reads_as_absent_without_waiting_for_a_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let made = std::process::Command::new("mkfifo").arg(dir.path().join("pipe.png")).status().unwrap();
+    assert!(made.success());
+    let files = FolderFiles::new(dir.path().into());
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || done.send(files.read("pipe.png")));
+    let read = finished.recv_timeout(std::time::Duration::from_secs(5)).expect("the read came back");
+    assert_eq!(read, None);
+}
+
+#[test]
+fn a_folder_reads_as_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("assets")).unwrap();
+    assert_eq!(FolderFiles::new(dir.path().into()).read("assets"), None);
+}
+
+#[test]
+fn a_pack_takes_entries_as_big_as_a_folder_reads() {
+    assert_eq!(PackLimits::default().entry_bytes, MAX_FILE_BYTES);
+}
