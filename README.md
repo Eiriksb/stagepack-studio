@@ -4,7 +4,7 @@ A native desktop app for editing Markdown slide talks, written in Rust with GPUI
 
 It is being rebuilt as a fully native app: it reads a talk's files directly, draws the slides itself and writes edits back to the Markdown. It does not use a web view. The design is in `docs/superpowers/specs/2026-11-09-native-rust-slides-design.md` and the plans are under `docs/superpowers/plans/`.
 
-Right now the window shows a title bar and an empty canvas area, and the engine is the next piece of work.
+Right now the app opens a talk's folder and shows its slides, drawn by the engine from `slides.md` and the pictures and fonts beside it. The arrow and Page keys move between slides, Ctrl+M shows the talk's Markdown, and saving `slides.md` updates the window. Slides can't be edited in the app yet.
 
 ## Building
 

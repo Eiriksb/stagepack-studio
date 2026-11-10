@@ -4,7 +4,7 @@
 
 use slides_format::{Block, Tag};
 use taffy::prelude::{
-    AlignItems, AlignSelf, Dimension, FlexDirection, JustifyContent, NodeId, Size, Style, auto, length, percent, zero,
+    AlignItems, AlignSelf, Dimension, FlexDirection, JustifyContent, NodeId, Size, Style, auto, length, percent,
 };
 use tiny_skia::{Path, PathBuilder};
 use toolkit::{Color, Ctx, Element, Props, ShapeKind, Theme};
