@@ -2,7 +2,7 @@
 //! graphic frames (tables). Positions arrive in slide units, and ids come from the caller's
 //! per-part counter so they stay unique within a slide.
 
-use slides_engine::{Align, NativeContent, NativeParagraph, Rect};
+use slides_engine::{Align, NativeContent, NativeParagraph, PathStep, Rect};
 use toolkit::{Color, ShapeKind};
 
 use crate::text::{Anchor, BodyOptions, TextCtx, tx_body_xml};
@@ -139,7 +139,7 @@ fn sp_xml(id: u32, rect: Rect, rotate: f32, sp: &Sp, ctx: &mut TextCtx) -> Strin
 }
 
 /// A text box or a shape at `rect`, which is where it goes on the slide. Tables and pictures
-/// are not shapes, and give `None`; nor, until Task 3, are paths.
+/// and paths are not shapes (`freeform_xml` writes paths), and give `None`.
 pub fn shape_xml(id: u32, rect: Rect, content: &NativeContent, ctx: &mut TextCtx) -> Option<String> {
     shape_xml_rotated(id, rect, 0.0, content, ctx)
 }
@@ -167,6 +167,41 @@ pub fn shape_xml_rotated(id: u32, rect: Rect, rotate: f32, content: &NativeConte
         }
         NativeContent::Table { .. } | NativeContent::Picture { .. } | NativeContent::Path { .. } => None,
     }
+}
+
+fn point_xml(x: f32, y: f32) -> String {
+    format!("<a:pt x=\"{}\" y=\"{}\"/>", emu_from_units(x), emu_from_units(y))
+}
+
+/// A path as a freeform shape at `rect`. The steps are relative to the box, in slide units, and
+/// are written in EMU; the path's own width and height are the box, so a point is where it is in
+/// the box. With no `fill` the shape says so, which is also how an open path is a plain line.
+pub fn freeform_xml(id: u32, rect: Rect, rotate: f32, steps: &[PathStep], fill: Option<Color>, stroke: Option<(Color, f32)>) -> String {
+    let mut path = String::new();
+    for step in steps {
+        match *step {
+            PathStep::Move(x, y) => path.push_str(&format!("<a:moveTo>{}</a:moveTo>", point_xml(x, y))),
+            PathStep::Line(x, y) => path.push_str(&format!("<a:lnTo>{}</a:lnTo>", point_xml(x, y))),
+            PathStep::Quad(x1, y1, x, y) => {
+                path.push_str(&format!("<a:quadBezTo>{}{}</a:quadBezTo>", point_xml(x1, y1), point_xml(x, y)));
+            }
+            PathStep::Cubic(x1, y1, x2, y2, x, y) => {
+                path.push_str(&format!("<a:cubicBezTo>{}{}{}</a:cubicBezTo>", point_xml(x1, y1), point_xml(x2, y2), point_xml(x, y)));
+            }
+            PathStep::Close => path.push_str("<a:close/>"),
+        }
+    }
+    // Extents must not be negative: PowerPoint repairs the file if they are.
+    let (w, h) = (emu_from_units(rect.w).max(0), emu_from_units(rect.h).max(0));
+    // spPr child order: xfrm, geometry, fill, ln.
+    let fill = fill.map_or("<a:noFill/>".to_string(), solid_fill_of);
+    format!(
+        "<p:sp><p:nvSpPr><p:cNvPr id=\"{id}\" name=\"Freeform {id}\"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>\
+         <p:spPr>{}<a:custGeom><a:avLst/><a:gdLst/><a:ahLst/><a:cxnLst/><a:rect l=\"0\" t=\"0\" r=\"r\" b=\"b\"/>\
+         <a:pathLst><a:path w=\"{w}\" h=\"{h}\">{path}</a:path></a:pathLst></a:custGeom>{fill}{}</p:spPr></p:sp>",
+        xfrm_xml(rect, rotate),
+        line_xml(stroke, false),
+    )
 }
 
 /// The slide's background (`p:bg`): a picture (by relationship id) stretched over the slide, or a color.

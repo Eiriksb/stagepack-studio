@@ -23,7 +23,7 @@ use crate::presentation::{
     EmbeddedFont, Presentation, SlideRef, app_xml, core_xml, pres_props_xml, presentation_xml, view_props_xml,
 };
 use crate::shapes::{
-    Ph, background_xml, graphic_frame_xml, picture_xml_rotated, placeholder_xml_rotated, shape_xml_rotated, slide_xml,
+    Ph, background_xml, freeform_xml, graphic_frame_xml, picture_xml_rotated, placeholder_xml_rotated, shape_xml_rotated, slide_xml,
 };
 use crate::table::{TABLE_URI, table_styles_xml, table_xml};
 use crate::text::{Anchor, Autofit, BodyOptions, TextCtx, link_target};
@@ -172,8 +172,10 @@ impl SlideEnv<'_> {
                 let r_id = self.pkg.borrow_mut().rel(self.part, &part, REL::IMAGE, false);
                 Some((picture_xml_rotated(id, &format!("Picture {id}"), alt, &r_id, rect, rotate), false))
             }
-            // Written as a freeform shape by the next task.
-            NativeContent::Path { .. } => None,
+            NativeContent::Path { steps, fill, stroke, stroke_width } => {
+                let stroke = stroke.filter(|_| stroke_width.is_finite() && *stroke_width > 0.0).map(|c| (c, *stroke_width));
+                Some((freeform_xml(id, rect, rotate, steps, *fill, stroke), false))
+            }
         }
     }
 }
@@ -202,7 +204,10 @@ fn has_fill(content: &NativeContent) -> bool {
         NativeContent::Shape { fill, outline, outline_width, .. } => {
             fill.is_some() || (outline.is_some() && outline_width.is_finite() && *outline_width > 0.0)
         }
-        NativeContent::Table { .. } | NativeContent::Picture { .. } | NativeContent::Path { .. } => false,
+        NativeContent::Path { fill, stroke, stroke_width, .. } => {
+            fill.is_some() || (stroke.is_some() && stroke_width.is_finite() && *stroke_width > 0.0)
+        }
+        NativeContent::Table { .. } | NativeContent::Picture { .. } => false,
     }
 }
 
@@ -409,4 +414,48 @@ pub fn write_pptx(deck: &mut Deck, files: &dyn TalkFiles) -> Result<PptxOutput, 
     p.add_xml("/docProps/app.xml", CT::EXT_PROPS, &app_xml(slide_count, notes_count));
     let bytes = p.to_bytes().map_err(|e| e.to_string())?;
     Ok(PptxOutput { bytes, notices })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slides_engine::{Enter, FolderFiles, PathStep};
+    use toolkit::Color;
+
+    /// A deck can't be given a component that draws a path from here, so the slide's element
+    /// writer is handed one directly.
+    #[test]
+    fn a_slide_with_a_path_exports_a_freeform() {
+        let steps = vec![PathStep::Move(0.0, 0.0), PathStep::Line(10.0, 10.0), PathStep::Close];
+        let element = NativeElement {
+            rect: Rect { x: 5.0, y: 5.0, w: 10.0, h: 10.0 },
+            content: NativeContent::Path { steps, fill: Some(Color::rgb(255, 0, 0)), stroke: Some(Color::rgb(0, 0, 255)), stroke_width: 3.0 },
+        };
+        let layer = LayerSpec {
+            source: None,
+            rect: Rect { x: 100.0, y: 100.0, w: 50.0, h: 50.0 },
+            rotate: 0.0,
+            items: Vec::new(),
+            click: None,
+            enter: Enter::default(),
+            native: vec![element.clone()],
+            is_title: false,
+        };
+        let pkg: SharedPackage = Rc::new(RefCell::new(Package::default()));
+        let mut media = MediaStore::default();
+        let files = FolderFiles::new(std::env::temp_dir());
+        let mut env = SlideEnv {
+            pkg: &pkg,
+            media: &mut media,
+            files: &files,
+            part: "/ppt/slides/slide1.xml",
+            ctx: TextCtx { lang: "en-US".into(), link: Box::new(|_| String::new()) },
+        };
+        let (xml, is_text) = env.element_xml(2, &layer, &element, false).expect("a path is written");
+        assert!(xml.contains("<a:custGeom>") && !xml.contains("<p:pic>"), "{xml}");
+        assert!(xml.contains(r#"<a:off x="666750" y="666750"/>"#), "{xml}");
+        assert!(xml.contains(r#"<a:ln w="19050">"#), "{xml}");
+        assert!(!is_text);
+        assert!(has_fill(&element.content));
+    }
 }

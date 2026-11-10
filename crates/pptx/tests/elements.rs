@@ -2,7 +2,7 @@
 //! the matching input. `tests/reference/README.md` says which call made each reference file and
 //! which native value stands for each JavaScript object.
 
-use slides_engine::{Align, Bullet, NativeContent, NativeParagraph, NativeRun, Rect};
+use slides_engine::{Align, Bullet, NativeContent, NativeParagraph, NativeRun, PathStep, Rect};
 use slides_pptx::shapes::{self, Ph};
 use slides_pptx::table;
 use slides_pptx::text::{self, Anchor, Autofit, BodyOptions, TextCtx};
@@ -399,4 +399,69 @@ fn guids_match_the_reference() {
     let expected: Vec<&str> = reference.lines().collect();
     assert_eq!(xml::guid("deck-table-default"), expected[0]);
     assert_eq!(xml::guid("é🎉"), expected[1]);
+}
+
+fn freeform(steps: &[PathStep], rect: Rect, fill: Option<Color>, stroke: Option<(Color, f32)>) -> String {
+    shapes::freeform_xml(7, rect, 0.0, steps, fill, stroke)
+}
+
+const SQUARE: Rect = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+
+#[test]
+fn a_freeform_writes_its_path_in_emu() {
+    let steps = [PathStep::Move(0.0, 0.0), PathStep::Line(100.0, 0.0), PathStep::Close];
+    let xml = freeform(&steps, SQUARE, Some(Color::rgb(255, 0, 0)), None);
+    assert!(xml.contains(r#"<a:custGeom><a:avLst/><a:gdLst/><a:ahLst/><a:cxnLst/><a:rect l="0" t="0" r="r" b="b"/><a:pathLst><a:path w="635000" h="635000"><a:moveTo><a:pt x="0" y="0"/></a:moveTo><a:lnTo><a:pt x="635000" y="0"/></a:lnTo><a:close/></a:path></a:pathLst></a:custGeom>"#), "{xml}");
+    assert!(xml.contains(r#"name="Freeform 7""#));
+}
+
+#[test]
+fn a_curve_writes_its_control_points() {
+    let steps = [PathStep::Move(0.0, 0.0), PathStep::Cubic(1.0, 2.0, 3.0, 4.0, 5.0, 6.0), PathStep::Quad(7.0, 8.0, 9.0, 10.0)];
+    let xml = freeform(&steps, SQUARE, None, Some((INK, 2.0)));
+    let cubic = xml.split("<a:cubicBezTo>").nth(1).unwrap().split("</a:cubicBezTo>").next().unwrap();
+    assert_eq!(cubic.matches("<a:pt ").count(), 3, "{cubic}");
+    assert!(cubic.starts_with(r#"<a:pt x="6350" y="12700"/>"#), "{cubic}");
+    let quad = xml.split("<a:quadBezTo>").nth(1).unwrap().split("</a:quadBezTo>").next().unwrap();
+    assert_eq!(quad.matches("<a:pt ").count(), 2, "{quad}");
+    assert!(quad.ends_with(r#"<a:pt x="57150" y="63500"/>"#), "{quad}");
+}
+
+#[test]
+fn a_line_with_no_fill_says_so() {
+    let steps = [PathStep::Move(0.0, 0.0), PathStep::Line(100.0, 100.0)];
+    let xml = freeform(&steps, SQUARE, None, Some((INK, 4.0)));
+    assert!(xml.contains("</a:custGeom><a:noFill/><a:ln w=\"25400\"><a:solidFill>"), "{xml}");
+}
+
+#[test]
+fn a_freeform_with_no_stroke_has_no_line() {
+    let xml = freeform(&[PathStep::Move(0.0, 0.0)], SQUARE, Some(INK), None);
+    assert!(xml.contains("<a:ln><a:noFill/></a:ln></p:spPr>"), "{xml}");
+}
+
+#[test]
+fn a_freeform_is_valid_xml_inside_a_slide() {
+    let steps = [PathStep::Move(0.0, 0.0), PathStep::Cubic(1.0, 2.0, 3.0, 4.0, 5.0, 6.0), PathStep::Close];
+    let xml = shapes::slide_xml(&freeform(&steps, SQUARE, Some(INK), Some((INK, 3.0))), "", "", "");
+    let mut reader = quick_xml::Reader::from_str(&xml);
+    let mut custom = 0;
+    loop {
+        match reader.read_event().unwrap() {
+            quick_xml::events::Event::Eof => break,
+            quick_xml::events::Event::Start(e) if e.name().as_ref() == b"a:custGeom" => custom += 1,
+            _ => {}
+        }
+    }
+    assert_eq!(custom, 1);
+}
+
+#[test]
+fn points_are_never_negative_in_a_box_of_no_size() {
+    let empty = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+    let xml = freeform(&[PathStep::Move(0.0, 0.0), PathStep::Line(0.0, 0.0), PathStep::Close], empty, Some(INK), None);
+    assert!(xml.contains(r#"<a:path w="0" h="0">"#), "{xml}");
+    assert!(!xml.contains("\"-"), "{xml}");
+    let backwards = Rect { x: 0.0, y: 0.0, w: -5.0, h: f32::NAN };
+    assert!(freeform(&[PathStep::Move(0.0, 0.0)], backwards, None, None).contains(r#"<a:path w="0" h="0">"#));
 }
