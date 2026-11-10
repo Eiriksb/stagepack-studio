@@ -50,8 +50,9 @@ Windows checklist: present on two screens, and open the exported PowerPoint in d
 - The compile permission rules: source hashes, *Build components* and *Always build this folder*.
 - Forms from argument types, and `children`.
 - The optional `Cargo.toml`, the guide and examples.
+- A ready-made `<Chart>` for bar, line and pie charts (goal 17, owner's decision, 2026-11-10). It's built on the toolkit, so it's also the first real test of it. PowerPoint export needs a freeform shape for its lines and slices.
 
-Windows checklist: build and show a component with no Rust installed.
+Windows checklist: build and show a component with no Rust installed, and open a talk with a chart in desktop PowerPoint.
 
 ### D. Visual editor
 

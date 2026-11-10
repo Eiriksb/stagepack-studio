@@ -62,11 +62,11 @@ Added for this product:
 14. **Custom components in Rust (owner's answer):** see "Custom components".
 15. **Code blocks with syntax highlighting (my call):** coders come first, and they will show code.
 16. **Slidev add-on (owner's answer):** get it from the app's interface, then export a talk to Slidev or import a `.sptx` made with Slidev. See "The Slidev add-on". It isn't part of the success tests, so it can follow the first public release if time runs short (my call).
+17. **Charts (owner's answer, 2026-11-10):** a ready-made chart component, so that a graph needs no code. See "Charts".
 
 ## Non-goals for the first release, planned later
 
 Carried over from the earlier design:
-- charts;
 - video and audio;
 - cropping and grouping;
 - switching themes (the first release has one theme, with colours and fonts set in the talk);
@@ -78,6 +78,7 @@ Added:
 - outside Rust libraries from crates.io in components (owner accepted);
 - components that respond to the mouse or keyboard while presenting (my call);
 - maths and diagrams (my call);
+- PowerPoint's own chart objects, and charts that follow a spreadsheet (my call);
 - add-ons from anyone but us (my call);
 - right-to-left text, and bundled Chinese, Japanese and Korean fonts (owner's answer).
 
@@ -274,6 +275,22 @@ fn Score(team: String, points: u32, colour: Color) -> Element {
   - A component that currently fails to compile keeps its last good build. Saving a packed talk includes that build and says so in a one-line notice.
   - Before compiling, the app rejects `include!`, `include_str!`, `include_bytes!`, `env!`, `option_env!`, `#[path]`, `mod name;` and `#![feature]`. Otherwise a talk's source could copy a private file into its compiled output. `rustc` runs with a clean environment.
 
+### Charts
+
+The owner decided that a ready-made chart ships with custom components. The details below are my call, and none of them has been tested yet.
+
+```markdown
+<Chart kind="bar" labels="Q1, Q2, Q3" values="10, 24, 17" title="Sales" />
+<Chart kind="line" data="assets/sales.csv" />
+```
+
+- **What it is:** a built-in, written with the same toolkit and `#[component]` macro as anyone's own component. It's compiled into the app, so it works in any talk with no build step, and its source is the guide's worked example.
+- **Kinds:** bar, line and pie in the first release.
+- **Data:** one series written in the tag, or one or more series from a CSV file in the talk's `assets` folder. A bad file or a mismatched list shows the labelled box, not a crash.
+- **For people who don't code:** the usual form from its argument types, with a dropdown for the kind, a file picker for the data, and text boxes for labels and values. Colours come from the theme.
+- **Animation:** a chart appears whole by default, and can build up one series, or for a single series one bar or point, per click.
+- **Export:** the PDF gets vectors. In PowerPoint it follows the rule for plain elements, so it becomes native shapes. Bars are rectangles and labels are text boxes. Lines and pie slices are paths, and the PowerPoint writer has no freeform shape yet, so this stage adds one. A chart that builds up by clicks arrives in PowerPoint whole, with a notice.
+
 ### The editor
 
 - **The window** follows the earlier design's PowerPoint-style layout: title bar, ribbon tabs, slide strip, slide canvas, notes and inspector. All of it is GPUI. A problems panel and the *View Markdown* panel are added.
@@ -342,7 +359,7 @@ Build in this repo, on a new branch from `plan-1`, because the shell is there. P
 
 - **A. Engine:** open a folder, parse, draw, reload on save, built-in components and layouts.
 - **B. Present and export:** coders can use early builds from here.
-- **C. Custom components:** compiling, sandbox and forms.
+- **C. Custom components:** compiling, sandbox, forms and the ready-made chart.
 - **D. Visual editor:** goals 1 to 11.
 - **E. Packaging.**
 - **F. Slidev add-on.**
