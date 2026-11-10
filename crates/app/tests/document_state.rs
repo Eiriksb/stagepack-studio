@@ -395,6 +395,28 @@ fn saving_a_packed_copy_names_a_picture_it_could_not_take() {
 }
 
 #[test]
+fn a_mistyped_path_is_named_in_what_goes_wrong() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("no-such-talk");
+    let problem = Document::open_packed(&missing, Fonts::bundled_only()).err();
+    assert!(
+        matches!(&problem, Some(OpenProblem::Other(problem)) if problem.contains(&missing.display().to_string())),
+        "{problem:?}"
+    );
+}
+
+#[test]
+fn an_export_shares_the_talks_fonts_instead_of_copying_them() {
+    let (dir, _) = talk("# One\n");
+    let fonts = dir.path().join("assets/fonts");
+    std::fs::create_dir_all(&fonts).unwrap();
+    std::fs::write(fonts.join("a.ttf"), font_only_a_talk_has()).unwrap();
+    let doc = Document::open(dir.path(), Fonts::bundled_only()).unwrap();
+    let (first, second) = (doc.export_input(), doc.export_input());
+    assert!(Arc::ptr_eq(&first.talk_fonts[0], &second.talk_fonts[0]));
+}
+
+#[test]
 fn a_packed_talk_can_be_saved_as_a_folder() {
     let (dir, file) = packed_talk("talk.sptx", "# One\n");
     let doc = Document::open_packed(&file, Fonts::bundled_only()).unwrap();
@@ -487,7 +509,7 @@ fn fonts_past_what_a_talk_can_bring_are_left_out() {
     enormous.set_len(257 * 1024 * 1024).unwrap();
     drawn_title(&folder);
     let doc = Document::open(&folder, Fonts::bundled_only()).unwrap();
-    assert_eq!(doc.export_input().talk_fonts, vec![font_only_a_talk_has()]);
+    assert_eq!(doc.export_input().talk_fonts, vec![Arc::new(font_only_a_talk_has())]);
 }
 
 #[test]

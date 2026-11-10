@@ -119,11 +119,12 @@ impl Fonts {
     }
 
     /// A font that travels inside the talk file.
-    pub fn load_talk_font(&mut self, data: Vec<u8>) {
+    pub fn load_talk_font(&mut self, data: impl Into<Arc<Vec<u8>>>) {
+        let data: Arc<Vec<u8>> = data.into();
         let ids = self
             .system
             .db_mut()
-            .load_font_source(fontdb::Source::Binary(Arc::new(data)));
+            .load_font_source(fontdb::Source::Binary(data));
         self.known.extend(ids);
     }
 }

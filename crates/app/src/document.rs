@@ -105,7 +105,7 @@ pub struct Document {
     /// The talk's files, which exports read from their own thread.
     files: Arc<dyn TalkFiles + Send + Sync>,
     /// The talk's own fonts, for exports to load into decks of their own.
-    talk_fonts: Vec<Vec<u8>>,
+    talk_fonts: Vec<Arc<Vec<u8>>>,
     /// What to call the talk if it has no title setting.
     place_name: String,
     current: usize,
@@ -133,6 +133,12 @@ impl Document {
 
     /// Opens the packed talk in the file at `path`, along with any fonts it carries.
     pub fn open_packed(path: &Path, fonts: Fonts) -> Result<Document, OpenProblem> {
+        if !path.exists() {
+            return Err(OpenProblem::Other(format!(
+                "There's no talk at {}.",
+                path.display()
+            )));
+        }
         let packed = open_packed(path)?;
         let source = packed.slides()?;
         let names = packed
@@ -153,7 +159,7 @@ impl Document {
     fn new(
         place: TalkPlace,
         files: Arc<dyn TalkFiles + Send + Sync>,
-        talk_fonts: Vec<Vec<u8>>,
+        talk_fonts: Vec<Arc<Vec<u8>>>,
         source: String,
         mut fonts: Fonts,
     ) -> Document {
@@ -345,7 +351,7 @@ fn font_names_in_folder(folder: &Path) -> Vec<String> {
 /// Reads the talk's fonts in name order, as the order can decide between two similar fonts.
 /// They're read through `files`, which stops a link from reaching outside the talk. Past
 /// [`TALK_FONT_BYTES`] the rest are left out.
-fn read_talk_fonts(mut names: Vec<String>, files: &dyn TalkFiles) -> Vec<Vec<u8>> {
+fn read_talk_fonts(mut names: Vec<String>, files: &dyn TalkFiles) -> Vec<Arc<Vec<u8>>> {
     names.sort();
     let mut fonts = Vec::new();
     let mut total = 0;
@@ -357,7 +363,7 @@ fn read_talk_fonts(mut names: Vec<String>, files: &dyn TalkFiles) -> Vec<Vec<u8>
         if total > TALK_FONT_BYTES {
             break;
         }
-        fonts.push(data);
+        fonts.push(Arc::new(data));
     }
     fonts
 }

@@ -21,7 +21,7 @@ const LONGEST_STEM: usize = 60;
 pub struct ExportInput {
     pub source: String,
     pub files: Arc<dyn TalkFiles + Send + Sync>,
-    pub talk_fonts: Vec<Vec<u8>>,
+    pub talk_fonts: Vec<Arc<Vec<u8>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

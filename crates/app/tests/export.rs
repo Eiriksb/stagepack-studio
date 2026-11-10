@@ -77,7 +77,7 @@ fn a_powerpoint_export_passes_on_what_the_slides_said() {
 fn a_broken_talk_font_still_exports() {
     let (_dir, out) = target("talk.pdf");
     let mut broken = input(TALK);
-    broken.talk_fonts.push(b"not a font".to_vec());
+    broken.talk_fonts.push(std::sync::Arc::new(b"not a font".to_vec()));
     run_export(broken, ExportKind::Pdf, &out).unwrap();
     assert!(std::fs::read(&out).unwrap().starts_with(b"%PDF"));
 }
