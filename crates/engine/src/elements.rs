@@ -7,7 +7,7 @@ use taffy::prelude::{
     AlignItems, AlignSelf, Dimension, FlexDirection, JustifyContent, NodeId, Size, Style, auto, length, percent,
 };
 use tiny_skia::{Path, PathBuilder};
-use toolkit::{Color, Ctx, Element, Props, ShapeKind, Theme};
+use toolkit::{Color, Ctx, CtxData, Element, Props, ShapeKind, Theme};
 
 use crate::flow::{Content, Flow, TEXT_TAG, column, rounded_rect, rounded_rect_with};
 use crate::pictures::{icon_pixmap, path_pixmap};
@@ -155,13 +155,16 @@ impl Flow<'_, '_> {
         let attrs = tag.attrs.iter().filter(|attr| !PLACEMENT_ATTRS.contains(&attr.name.as_str()));
         // Backwards, so that the first of a repeated attribute wins, as it does in `Tag::attr`.
         let props = Props(attrs.rev().map(|attr| (attr.name.clone(), attr.value.clone())).collect());
-        let ctx = Ctx {
+        let data = CtxData {
             click_step: 0,
             time: 0.0,
             slide_width: SLIDE_WIDTH,
             slide_height: SLIDE_HEIGHT,
+            width: 0.0,
+            height: 0.0,
             theme: self.theme.clone(),
         };
+        let ctx = Ctx::new(data, &|_| None);
         Some((component.render)(&props, &ctx))
     }
 
@@ -238,7 +241,12 @@ impl Flow<'_, '_> {
             }
             Element::Picture { src, width, height } => Some(self.picture(src, "", *width, *height, align, boxed)),
             Element::Icon { name, size, color } => Some(self.icon(name, *size, *color, align)),
-            Element::Path { data, width, height, fill } => Some(self.path(data, *width, *height, *fill, align)),
+            Element::Path { data, width, height, fill, .. } => Some(self.path(data, *width, *height, *fill, align)),
+            Element::Canvas { .. } => None,
+            Element::Problem { message } => {
+                self.notice(message.clone());
+                Some(self.placeholder(message.clone(), size_when_empty(0.0, 0.0, boxed)))
+            }
             Element::Children => self.child_blocks(blocks, align),
             Element::Empty => None,
         }

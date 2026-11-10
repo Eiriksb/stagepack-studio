@@ -69,8 +69,8 @@ fn Icon(name: String, size: Option<f32>, color: Option<String>) -> Element {
 }
 
 #[component]
-fn Picture(src: String) -> Element {
-    picture(src, 0.0, 0.0)
+fn Picture(src: PictureFile) -> Element {
+    picture(src.0, 0.0, 0.0)
 }
 
 pub fn builtin_registry() -> Registry {

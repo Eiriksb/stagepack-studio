@@ -45,7 +45,7 @@ impl Color {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Theme {
     pub background: Color,
     pub text: Color,

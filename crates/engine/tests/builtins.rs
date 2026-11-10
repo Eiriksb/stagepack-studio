@@ -273,6 +273,11 @@ mod probe {
     pub fn Written() -> Element {
         text("Hi").size(100.0).bold().fill(Color::parse("red").unwrap())
     }
+
+    #[component]
+    pub fn Troubled() -> Element {
+        problem("No data")
+    }
 }
 
 fn probe_registry() -> Registry {
@@ -281,6 +286,7 @@ fn probe_registry() -> Registry {
     registry.add(probe::Stacked_component());
     registry.add(probe::Drawn_component());
     registry.add(probe::Written_component());
+    registry.add(probe::Troubled_component());
     registry
 }
 
@@ -465,6 +471,28 @@ fn a_path_from_a_component_is_drawn_and_a_bad_one_is_a_placeholder() {
     let (slide, _) = lay_out_with(injected, &[], &probe_registry());
     assert!(!has_picture(&slide.layers[1]));
     assert!(notice_about(&slide, "path"));
+}
+
+#[test]
+fn a_picture_asks_for_a_picture_file() {
+    let schema = (builtin_registry().get("Picture").unwrap().schema)();
+    assert!(matches!(&schema.props[0].kind, toolkit::PropKind::File(extensions) if extensions.iter().any(|e| e == "png")));
+}
+
+#[test]
+fn a_problem_is_a_labelled_placeholder_and_a_notice() {
+    let (slide, _) = lay_out_with("<Troubled />\n", &[], &probe_registry());
+    assert!(notice_about(&slide, "No data"));
+    let layer = &slide.layers[1];
+    assert_eq!(text_of(layer).trim_end(), "No data");
+    assert_eq!(strokes(layer).len(), 1, "the dashed outline");
+}
+
+#[test]
+fn a_problem_in_a_box_fills_the_box() {
+    let (slide, _) = lay_out_with("<Troubled x=\"0\" y=\"0\" w=\"800\" h=\"600\" />\n", &[], &probe_registry());
+    let (_, y, _, height) = text_boxes(&slide.layers[1])[0];
+    assert_eq!(y + height / 2.0, 300.0);
 }
 
 // Tags in the flow.
