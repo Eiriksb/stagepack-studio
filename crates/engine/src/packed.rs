@@ -2,8 +2,9 @@
 //! talk uses. A packed file is untrusted input, so it is checked when it opens (names, sizes,
 //! count) and read in bounded pieces afterwards.
 
-use crate::files::TalkFiles;
-use std::collections::HashMap;
+use crate::files::{FolderFiles, TalkFiles};
+use slides_format::{Block, Talk, parse_talk};
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -19,6 +20,9 @@ pub const FORMAT_VERSION: u32 = 1;
 const SLIDES_NAME: &str = "slides.md";
 const MANIFEST_LIMIT: u64 = 1024 * 1024;
 const PACKED_FOLDERS: [&str; 3] = ["components", "assets", "build"];
+/// The component that shows a picture from a file.
+const PICTURE_TAG: &str = "Picture";
+const PICTURE_SOURCE: &str = "src";
 /// Pictures and fonts are already compressed, so they are stored as they are.
 const STORED_EXTENSIONS: [&str; 9] = [
     "png", "jpg", "jpeg", "gif", "webp", "avif", "ico", "woff", "woff2",
@@ -297,6 +301,8 @@ impl TalkFiles for PackedFiles {
 pub struct PackReport {
     /// Things left out because they are symlinks or have names that can't be packed.
     pub skipped: Vec<String>,
+    /// Pictures the talk shows from outside the folders that are packed, by the path it uses.
+    pub outside_pictures: Vec<String>,
 }
 
 /// Collects what goes in a pack: relative names with the path to read each from.
@@ -352,6 +358,43 @@ fn collect(
     found.sort();
     skipped.sort();
     Ok(found)
+}
+
+/// Every path `talk` shows a picture from, in Markdown or through the picture component.
+fn picture_paths(talk: &Talk) -> BTreeSet<String> {
+    let mut paths = BTreeSet::new();
+    let mut blocks: Vec<&Block> = talk.slides.iter().flat_map(|slide| &slide.blocks).collect();
+    while let Some(block) = blocks.pop() {
+        match block {
+            Block::Picture { src, .. } => {
+                paths.insert(src.clone());
+            }
+            Block::List { items, .. } => blocks.extend(items.iter().flatten()),
+            Block::Tag(tag) => {
+                paths.extend(tag.attr(PICTURE_SOURCE).filter(|_| tag.name == PICTURE_TAG).map(str::to_string));
+                blocks.extend(&tag.children);
+            }
+            _ => {}
+        }
+    }
+    paths
+}
+
+/// The pictures the talk in `folder` shows from files that exist but aren't in a packed folder,
+/// sorted. Found in the talk's text, so nothing is decoded. A picture that is in a packed folder
+/// and still didn't go in has been reported as skipped.
+fn pictures_outside(folder: &Path) -> Vec<String> {
+    let Ok(source) = std::fs::read_to_string(folder.join(SLIDES_NAME)) else {
+        return Vec::new();
+    };
+    let files = FolderFiles::new(folder.to_path_buf());
+    let packed = |path: &str| path == SLIDES_NAME || PACKED_FOLDERS.contains(&path.split('/').next().unwrap_or(""));
+    let outside: BTreeSet<String> = picture_paths(&parse_talk(&source))
+        .iter()
+        .filter_map(|path| normalise(path))
+        .filter(|path| !packed(path) && files.stamp(path).is_some())
+        .collect();
+    outside.into_iter().collect()
 }
 
 fn io_other(e: zip::result::ZipError) -> std::io::Error {
@@ -437,7 +480,7 @@ pub fn pack_folder(folder: &Path, out: &Path, app_version: &str) -> Result<PackR
         zip.finish().map_err(io_other)?;
         Ok(())
     })?;
-    Ok(PackReport { skipped })
+    Ok(PackReport { skipped, outside_pictures: pictures_outside(folder) })
 }
 
 /// Unpacks a packed talk into `folder`, which must be missing or empty. `talk.json` isn't

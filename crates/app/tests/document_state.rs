@@ -385,6 +385,16 @@ fn saving_a_packed_copy_says_what_was_left_out() {
 }
 
 #[test]
+fn saving_a_packed_copy_names_a_picture_it_could_not_take() {
+    let (dir, doc) = talk("![](pics/photo.jpg)\n");
+    std::fs::create_dir(dir.path().join("pics")).unwrap();
+    std::fs::write(dir.path().join("pics/photo.jpg"), "a picture").unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let notices = doc.save_packed(&elsewhere.path().join("copy.sptx")).unwrap();
+    assert_eq!(notices, ["The picture pics/photo.jpg is outside assets/ and wasn't packed"]);
+}
+
+#[test]
 fn a_packed_talk_can_be_saved_as_a_folder() {
     let (dir, file) = packed_talk("talk.sptx", "# One\n");
     let doc = Document::open_packed(&file, Fonts::bundled_only()).unwrap();

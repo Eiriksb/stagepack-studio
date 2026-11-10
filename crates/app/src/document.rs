@@ -61,11 +61,15 @@ impl TalkPlace {
         };
         let report =
             pack_folder(folder, out, env!("CARGO_PKG_VERSION")).map_err(|e| e.to_string())?;
-        Ok(report
+        let left_out = report
             .skipped
             .into_iter()
-            .map(|name| format!("{name} was left out"))
-            .collect())
+            .map(|name| format!("{name} was left out"));
+        let outside = report
+            .outside_pictures
+            .into_iter()
+            .map(|name| format!("The picture {name} is outside assets/ and wasn't packed"));
+        Ok(left_out.chain(outside).collect())
     }
 
     /// Unpacks a packed talk into `folder`, which must be missing or empty.

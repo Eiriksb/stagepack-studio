@@ -609,6 +609,46 @@ fn names_that_windows_treats_specially_are_refused() {
     assert!(open_packed(&path).is_ok());
 }
 
+/// A folder holding the pictures `names` and a talk of `source`, and what packing it reports.
+fn pack_talk_with_pictures(source: &str, names: &[&str]) -> PackReport {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("slides.md"), source).unwrap();
+    for name in names {
+        let file = dir.path().join(name);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, "a picture").unwrap();
+    }
+    let elsewhere = tempfile::tempdir().unwrap();
+    pack_folder(dir.path(), &elsewhere.path().join("talk.sptx"), "0.1.0").unwrap()
+}
+
+#[test]
+fn a_picture_outside_the_packed_folders_is_reported_by_name() {
+    let source = "![](pics/a.jpg)\n\n<Picture src=\"pics/b.png\" x=\"0\" y=\"0\" w=\"99\" h=\"99\" />\n\n---\n\n![](assets/in.png)\n";
+    let report = pack_talk_with_pictures(source, &["pics/a.jpg", "pics/b.png", "assets/in.png"]);
+    assert_eq!(report.outside_pictures, ["pics/a.jpg", "pics/b.png"]);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+}
+
+#[test]
+fn a_picture_is_found_wherever_the_talk_shows_it() {
+    let source = "- item\n\n  ![](pics/list.jpg)\n\n<Box>\n\n<Picture src=\"pics/nested.jpg\" />\n\n![](pics/boxed.jpg)\n\n</Box>\n";
+    let report = pack_talk_with_pictures(source, &["pics/list.jpg", "pics/nested.jpg", "pics/boxed.jpg"]);
+    assert_eq!(report.outside_pictures, ["pics/boxed.jpg", "pics/list.jpg", "pics/nested.jpg"]);
+}
+
+#[test]
+fn a_picture_shown_twice_is_reported_once() {
+    let report = pack_talk_with_pictures("![](pics/a.jpg)\n\n---\n\n![](./pics/a.jpg)\n", &["pics/a.jpg"]);
+    assert_eq!(report.outside_pictures, ["pics/a.jpg"]);
+}
+
+#[test]
+fn only_a_picture_that_could_have_been_packed_is_reported() {
+    let report = pack_talk_with_pictures("![](pics/missing.jpg)\n\n![](../beside.jpg)\n\n![](https://example.com/a.jpg)\n", &[]);
+    assert!(report.outside_pictures.is_empty(), "{:?}", report.outside_pictures);
+}
+
 #[cfg(unix)]
 #[test]
 fn packing_skips_names_a_pack_could_not_open() {
