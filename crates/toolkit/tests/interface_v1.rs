@@ -12,6 +12,8 @@ use toolkit::prelude::*;
 const STACK: &str = r#"{"Stack":{"horizontal":true,"gap":8.0,"children":[{"Text":{"text":"Hi","size":48.0,"bold":true,"color":{"r":1,"g":2,"b":3,"a":255}}},"Children","Empty"]}}"#;
 const SHAPE: &str = r#"{"Shape":{"kind":"Rounded","width":10.0,"height":20.0,"fill":null,"outline":null,"outline_width":0.0,"radius":4.0,"padding":0.0,"child":null}}"#;
 const PATH: &str = r#"{"Path":{"data":"M0 0","width":5.0,"height":6.0,"fill":null,"stroke":{"r":0,"g":0,"b":0,"a":255},"stroke_width":2.0}}"#;
+const PICTURE: &str = r#"{"Picture":{"src":"assets/a.png","width":10.0,"height":20.0}}"#;
+const ICON: &str = r#"{"Icon":{"name":"star","size":64.0,"color":{"r":1,"g":2,"b":3,"a":255}}}"#;
 const CANVAS: &str = r#"{"Canvas":{"width":100.0,"height":50.0,"items":[{"x":1.0,"y":2.0,"width":0.0,"align":"Center","element":"Empty"}]}}"#;
 const PROBLEM: &str = r#"{"Problem":{"message":"No data"}}"#;
 const OUTPUT: &str = r#"{"element":"Empty","steps":3,"stepped":true,"animated":false}"#;
@@ -77,6 +79,54 @@ fn a_path_holds() {
             stroke_width: 2.0,
         },
     );
+}
+
+#[test]
+fn a_picture_holds() {
+    holds(PICTURE, Element::Picture { src: "assets/a.png".into(), width: 10.0, height: 20.0 });
+}
+
+#[test]
+fn an_icon_holds() {
+    holds(ICON, Element::Icon { name: "star".into(), size: 64.0, color: Some(Color::rgb(1, 2, 3)) });
+}
+
+#[test]
+fn every_kind_of_shape_holds() {
+    for (literal, kind) in [
+        (r#""Rect""#, ShapeKind::Rect),
+        (r#""Rounded""#, ShapeKind::Rounded),
+        (r#""Ellipse""#, ShapeKind::Ellipse),
+        (r#""Line""#, ShapeKind::Line),
+        (r#""Arrow""#, ShapeKind::Arrow),
+        (r#""Callout""#, ShapeKind::Callout),
+    ] {
+        holds(literal, kind);
+    }
+}
+
+#[test]
+fn every_text_alignment_holds() {
+    for (literal, align) in [
+        (r#""Left""#, TextAlign::Left),
+        (r#""Center""#, TextAlign::Center),
+        (r#""Right""#, TextAlign::Right),
+    ] {
+        holds(literal, align);
+    }
+}
+
+#[test]
+fn every_plain_kind_of_prop_holds() {
+    for (literal, kind) in [
+        (r#""Text""#, PropKind::Text),
+        (r#""Whole""#, PropKind::Whole),
+        (r#""Number""#, PropKind::Number),
+        (r#""Flag""#, PropKind::Flag),
+        (r#""Color""#, PropKind::Color),
+    ] {
+        holds(literal, kind);
+    }
 }
 
 #[test]
