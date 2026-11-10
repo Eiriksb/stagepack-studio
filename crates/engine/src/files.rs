@@ -44,3 +44,13 @@ impl TalkFiles for FolderFiles {
         Some((metadata.len(), metadata.modified().ok()?))
     }
 }
+
+impl TalkFiles for std::sync::Arc<dyn TalkFiles + Send + Sync> {
+    fn read(&self, path: &str) -> Option<Vec<u8>> {
+        (**self).read(path)
+    }
+
+    fn stamp(&self, path: &str) -> Option<(u64, SystemTime)> {
+        (**self).stamp(path)
+    }
+}
