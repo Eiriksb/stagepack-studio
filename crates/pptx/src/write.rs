@@ -172,6 +172,8 @@ impl SlideEnv<'_> {
                 let r_id = self.pkg.borrow_mut().rel(self.part, &part, REL::IMAGE, false);
                 Some((picture_xml_rotated(id, &format!("Picture {id}"), alt, &r_id, rect, rotate), false))
             }
+            // Written as a freeform shape by the next task.
+            NativeContent::Path { .. } => None,
         }
     }
 }
@@ -183,7 +185,7 @@ fn left_out_links(specs: &[LayerSpec]) -> Vec<String> {
         let paragraphs: Vec<&NativeParagraph> = match &element.content {
             NativeContent::Text { paragraphs, .. } | NativeContent::Shape { paragraphs, .. } => paragraphs.iter().collect(),
             NativeContent::Table { rows, .. } => rows.iter().flatten().flatten().collect(),
-            NativeContent::Picture { .. } => Vec::new(),
+            NativeContent::Picture { .. } | NativeContent::Path { .. } => Vec::new(),
         };
         for url in paragraphs.iter().flat_map(|p| &p.runs).filter_map(|run| run.link.as_deref()) {
             if link_target(url).is_none() && !left_out.iter().any(|seen| seen == url) {
@@ -200,7 +202,7 @@ fn has_fill(content: &NativeContent) -> bool {
         NativeContent::Shape { fill, outline, outline_width, .. } => {
             fill.is_some() || (outline.is_some() && outline_width.is_finite() && *outline_width > 0.0)
         }
-        NativeContent::Table { .. } | NativeContent::Picture { .. } => false,
+        NativeContent::Table { .. } | NativeContent::Picture { .. } | NativeContent::Path { .. } => false,
     }
 }
 

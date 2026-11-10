@@ -71,6 +71,18 @@ impl NativeParagraph {
     }
 }
 
+/// One step of a path, in slide units relative to the element's box.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PathStep {
+    Move(f32, f32),
+    Line(f32, f32),
+    /// A curve with one control point: `(control_x, control_y, x, y)`.
+    Quad(f32, f32, f32, f32),
+    /// A curve with two control points: `(c1_x, c1_y, c2_x, c2_y, x, y)`.
+    Cubic(f32, f32, f32, f32, f32, f32),
+    Close,
+}
+
 #[derive(Clone)]
 pub enum NativeContent {
     Text {
@@ -100,6 +112,13 @@ pub enum NativeContent {
         src: Option<String>,
         alt: String,
         pixmap: Arc<Pixmap>,
+    },
+    /// A vector path, drawn in the element's box.
+    Path {
+        steps: Vec<PathStep>,
+        fill: Option<Color>,
+        stroke: Option<Color>,
+        stroke_width: f32,
     },
 }
 
@@ -221,6 +240,7 @@ impl Walk<'_> {
                 };
                 self.push(rect, NativeContent::Picture { src, alt, pixmap: pixmap.clone() });
             }
+            (_, Some(Content::Path(look))) => self.push(rect, look.native()),
             (_, Some(Content::Shape(look))) => self.shape(node, rect, look),
             (_, Some(Content::Placeholder(label))) => self.label(label, rect),
             _ => self.visit_children(node, corner),

@@ -394,14 +394,3 @@ pub(crate) fn icon_pixmap(name: &str, size: f32, color: Color) -> Option<Arc<Pix
     let markup = format!("<svg xmlns=\"{SVG_NAMESPACE}\" viewBox=\"0 0 {ICON_VIEW_BOX} {ICON_VIEW_BOX}\">{body}</svg>");
     draw_svg(&markup, |_| size / ICON_VIEW_BOX).map(Arc::new)
 }
-
-/// Draws SVG path `data` in a box of the given size, or `None` if it can't be drawn.
-pub(crate) fn path_pixmap(data: &str, width: f32, height: f32, color: Color) -> Option<Arc<Pixmap>> {
-    // `data` comes from a component and goes inside markup, where these could end the attribute.
-    if data.contains(['<', '>', '&', '"', '\'']) {
-        return None;
-    }
-    let fill = svg_color(color);
-    let markup = format!("<svg xmlns=\"{SVG_NAMESPACE}\" width=\"{width}\" height=\"{height}\"><path d=\"{data}\" fill=\"{fill}\"/></svg>");
-    draw_svg(&markup, |_| 1.0).map(Arc::new)
-}

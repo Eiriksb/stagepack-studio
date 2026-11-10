@@ -296,9 +296,9 @@ fn each_thing_in_a_stack_is_its_own_element() {
 }
 
 #[test]
-fn a_path_is_a_picture_with_no_file() {
+fn a_path_is_a_path() {
     let slide = lay_out_using("<Traced x=\"0\" y=\"0\" w=\"10\" h=\"10\" />\n", &[], &probe_registry());
-    assert!(matches!(&slide.layers.last().unwrap().native[0].content, NativeContent::Picture { src: None, alt, .. } if alt.is_empty()));
+    assert!(matches!(&slide.layers.last().unwrap().native[0].content, NativeContent::Path { .. }));
 }
 
 #[test]

@@ -4,16 +4,16 @@
 
 use slides_format::{Block, Tag};
 use taffy::prelude::{
-    AlignItems, AlignSelf, Dimension, FlexDirection, JustifyContent, NodeId, Size, Style, auto, length, percent,
+    AlignItems, AlignSelf, Dimension, FlexDirection, JustifyContent, NodeId, Position, Size, Style, auto, length, percent,
 };
 use tiny_skia::{Path, PathBuilder};
-use toolkit::{Color, Ctx, CtxData, Element, Props, ShapeKind, Theme};
+use toolkit::{Color, Ctx, CtxData, Element, Placed, Props, ShapeKind, TextAlign, Theme};
 
 use crate::flow::{Content, Flow, TEXT_TAG, column, rounded_rect, rounded_rect_with};
-use crate::pictures::{icon_pixmap, path_pixmap};
+use crate::pictures::icon_pixmap;
 use crate::slide::{MAX_SIZE, SLIDE_HEIGHT, SLIDE_WIDTH, is_positioned};
 use crate::native::Semantic;
-use crate::{Align, DisplayItem, LayoutEnv, NativeContent, NativeElement, Notice, PLACEMENT_ATTRS, RegionDef, layout_by_name};
+use crate::{Align, DisplayItem, LayoutEnv, NativeContent, NativeElement, Notice, PLACEMENT_ATTRS, PathStep, RegionDef, layout_by_name};
 
 const DEFAULT_WIDTH: f32 = 400.0;
 const DEFAULT_HEIGHT: f32 = 200.0;
@@ -21,6 +21,9 @@ const DEFAULT_RADIUS: f32 = 24.0;
 const DEFAULT_LINE_WIDTH: f32 = 4.0;
 /// As with sizes, so one attribute can't make a layer that needs gigabytes.
 const MAX_LINE_WIDTH: f32 = 256.0;
+/// How far from its box a path's points can be. Further than any slide, and still small
+/// enough that drawing it can't overflow.
+const MAX_PATH_COORDINATE: f32 = 1.0e6;
 const CALLOUT_TAIL: f32 = 40.0;
 const MIN_ARROW_HEAD: f32 = 24.0;
 const ARROW_HEAD_PER_LINE_WIDTH: f32 = 6.0;
@@ -171,7 +174,7 @@ impl Flow<'_, '_> {
     /// The size `element` has of its own, if it has one.
     fn natural_size(&mut self, element: &Element) -> Option<(f32, f32)> {
         match element {
-            Element::Shape { width, height, .. } | Element::Path { width, height, .. } if *width > 0.0 && *height > 0.0 => {
+            Element::Shape { width, height, .. } | Element::Path { width, height, .. } | Element::Canvas { width, height, .. } if *width > 0.0 && *height > 0.0 => {
                 Some((*width, *height))
             }
             Element::Picture { src, .. } => {
@@ -241,8 +244,10 @@ impl Flow<'_, '_> {
             }
             Element::Picture { src, width, height } => Some(self.picture(src, "", *width, *height, align, boxed)),
             Element::Icon { name, size, color } => Some(self.icon(name, *size, *color, align)),
-            Element::Path { data, width, height, fill, .. } => Some(self.path(data, *width, *height, *fill, align)),
-            Element::Canvas { .. } => None,
+            Element::Path { data, width, height, fill, stroke, stroke_width } => {
+                Some(self.path(data, (*width, *height), (*fill, *stroke, *stroke_width), align))
+            }
+            Element::Canvas { width, height, items } => Some(self.canvas(*width, *height, items, blocks, align)),
             Element::Problem { message } => {
                 self.notice(message.clone());
                 Some(self.placeholder(message.clone(), size_when_empty(0.0, 0.0, boxed)))
@@ -311,17 +316,117 @@ impl Flow<'_, '_> {
         }
     }
 
-    fn path(&mut self, data: &str, width: f32, height: f32, fill: Option<Color>, align: Align) -> NodeId {
+    fn path(&mut self, data: &str, (width, height): (f32, f32), (fill, stroke, stroke_width): (Option<Color>, Option<Color>, f32), align: Align) -> NodeId {
         let (width, height) = (limited(width, MAX_SIZE).max(1.0), limited(height, MAX_SIZE).max(1.0));
         let size = Size { width: length(width), height: length(height) };
-        match path_pixmap(data, width, height, fill.unwrap_or(self.theme.text)) {
-            Some(path) => self.leaf(Style { size, align_self: along_column(align), ..Style::default() }, Content::Picture(path)),
+        let stroke_width = limited(stroke_width, MAX_LINE_WIDTH);
+        let stroke = stroke.filter(|_| stroke_width > 0.0);
+        // With neither, the path is still shown, in the text colour.
+        let fill = fill.or_else(|| stroke.is_none().then_some(self.theme.text));
+        match parse_path(data) {
+            Some(steps) => {
+                let style = Style { size, align_self: along_column(align), ..Style::default() };
+                self.leaf(style, Content::Path(PathLook { steps, fill, stroke, stroke_width }))
+            }
             None => {
                 self.notice("A component's path can't be drawn".to_string());
                 self.placeholder("path".to_string(), size)
             }
         }
     }
+
+    /// A node of a fixed size, with each of `items` at its own place in it.
+    fn canvas(&mut self, width: f32, height: f32, items: &[Placed], blocks: &[Block], align: Align) -> NodeId {
+        let nodes: Vec<NodeId> = items.iter().filter_map(|placed| self.placed(placed, blocks)).collect();
+        let style = Style {
+            size: Size { width: length(limited(width, MAX_SIZE)), height: length(limited(height, MAX_SIZE)) },
+            // Taller than the room there is, it still keeps its size.
+            flex_shrink: 0.0,
+            align_self: along_column(align),
+            ..Style::default()
+        };
+        self.node(style, &nodes)
+    }
+
+    /// `placed` as a node that stands alone in an export, or `None` if it has nothing in it.
+    fn placed(&mut self, placed: &Placed, blocks: &[Block]) -> Option<NodeId> {
+        let align = match placed.align {
+            TextAlign::Left => Align::Left,
+            TextAlign::Center => Align::Center,
+            TextAlign::Right => Align::Right,
+        };
+        let content = self.element(&placed.element, blocks, align, false)?;
+        let at = |value: f32| if value.is_finite() { length(value.clamp(-MAX_SIZE, MAX_SIZE)) } else { length(0.0) };
+        let style = Style {
+            position: Position::Absolute,
+            inset: taffy::Rect { left: at(placed.x), top: at(placed.y), right: auto(), bottom: auto() },
+            size: Size { width: side(placed.width, false), height: auto() },
+            flex_direction: FlexDirection::Column,
+            ..Style::default()
+        };
+        let node = self.node(style, &[content]);
+        self.note(node, Semantic::Stack);
+        Some(node)
+    }
+}
+
+/// The steps of SVG path `data`, with arcs and the rest as curves, or `None` if it can't
+/// be read, has nothing in it or reaches beyond what can be drawn.
+fn parse_path(data: &str) -> Option<Vec<PathStep>> {
+    use svgtypes::SimplePathSegment as Segment;
+    let mut steps = Vec::new();
+    for segment in svgtypes::SimplifyingPathParser::from(data) {
+        let n = |value: f64| value as f32;
+        steps.push(match segment.ok()? {
+            Segment::MoveTo { x, y } => PathStep::Move(n(x), n(y)),
+            Segment::LineTo { x, y } => PathStep::Line(n(x), n(y)),
+            Segment::Quadratic { x1, y1, x, y } => PathStep::Quad(n(x1), n(y1), n(x), n(y)),
+            Segment::CurveTo { x1, y1, x2, y2, x, y } => PathStep::Cubic(n(x1), n(y1), n(x2), n(y2), n(x), n(y)),
+            Segment::ClosePath => PathStep::Close,
+        });
+    }
+    let reachable = |value: f32| value.is_finite() && value.abs() <= MAX_PATH_COORDINATE;
+    let all_reachable = steps.iter().all(|step| match *step {
+        PathStep::Move(a, b) | PathStep::Line(a, b) => reachable(a) && reachable(b),
+        PathStep::Quad(a, b, c, d) => [a, b, c, d].into_iter().all(reachable),
+        PathStep::Cubic(a, b, c, d, e, f) => [a, b, c, d, e, f].into_iter().all(reachable),
+        PathStep::Close => true,
+    });
+    (!steps.is_empty() && all_reachable).then_some(steps)
+}
+
+/// What a path draws, with its steps relative to its box.
+pub(crate) struct PathLook {
+    steps: Vec<PathStep>,
+    fill: Option<Color>,
+    stroke: Option<Color>,
+    stroke_width: f32,
+}
+
+impl PathLook {
+    pub(crate) fn native(&self) -> NativeContent {
+        NativeContent::Path { steps: self.steps.clone(), fill: self.fill, stroke: self.stroke, stroke_width: self.stroke_width }
+    }
+}
+
+/// The drawing of a path whose box starts at (`x`, `y`).
+pub(crate) fn path_items(look: &PathLook, x: f32, y: f32) -> Vec<DisplayItem> {
+    let mut b = PathBuilder::new();
+    for step in &look.steps {
+        match *step {
+            PathStep::Move(a, c) => b.move_to(x + a, y + c),
+            PathStep::Line(a, c) => b.line_to(x + a, y + c),
+            PathStep::Quad(a, c, d, e) => b.quad_to(x + a, y + c, x + d, y + e),
+            PathStep::Cubic(a, c, d, e, f, g) => b.cubic_to(x + a, y + c, x + d, y + e, x + f, y + g),
+            PathStep::Close => b.close(),
+        }
+    }
+    let Some(path) = b.finish() else {
+        return Vec::new();
+    };
+    let fill = look.fill.map(|color| DisplayItem::Fill { path: path.clone(), color });
+    let stroke = look.stroke.map(|color| DisplayItem::Stroke { path, color, width: look.stroke_width });
+    fill.into_iter().chain(stroke).collect()
 }
 
 fn icon_side(size: f32) -> f32 {

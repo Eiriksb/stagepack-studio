@@ -12,7 +12,7 @@ use taffy::prelude::{
 use tiny_skia::{Path, PathBuilder, Pixmap};
 use toolkit::{Color, Theme};
 
-use crate::elements::{ShapeLook, shape_items};
+use crate::elements::{PathLook, ShapeLook, path_items, shape_items};
 use crate::native::{MAX_TABLE_CELLS, Semantic, native_elements};
 use crate::placeholder::placeholder_items;
 use crate::{
@@ -50,6 +50,7 @@ pub(crate) enum Content {
     Text(Leaf),
     Shape(ShapeLook),
     Picture(Arc<Pixmap>),
+    Path(PathLook),
     Placeholder(String),
 }
 
@@ -58,7 +59,7 @@ impl Content {
         match self {
             Content::Text(leaf) => leaf.measure(available, fonts),
             Content::Picture(picture) => measure_picture(picture, known, available),
-            Content::Shape(_) | Content::Placeholder(_) => Size::ZERO,
+            Content::Shape(_) | Content::Path(_) | Content::Placeholder(_) => Size::ZERO,
         }
     }
 }
@@ -501,6 +502,7 @@ impl<'a, 'env> Flow<'a, 'env> {
                 items.push(DisplayItem::Text { text, x: x + layout.padding.left, y: y + layout.padding.top });
             }
             Some(Content::Shape(look)) => items.extend(shape_items(look, x, y, w, h, self.theme)),
+            Some(Content::Path(look)) => items.extend(path_items(look, x, y)),
             Some(Content::Picture(picture)) if w > 0.0 && h > 0.0 => {
                 let src = match self.semantics.get(&node) {
                     Some(Semantic::File { src, .. }) => Some(src.clone()),

@@ -139,7 +139,7 @@ fn sp_xml(id: u32, rect: Rect, rotate: f32, sp: &Sp, ctx: &mut TextCtx) -> Strin
 }
 
 /// A text box or a shape at `rect`, which is where it goes on the slide. Tables and pictures
-/// are not shapes, and give `None`.
+/// are not shapes, and give `None`; nor, until Task 3, are paths.
 pub fn shape_xml(id: u32, rect: Rect, content: &NativeContent, ctx: &mut TextCtx) -> Option<String> {
     shape_xml_rotated(id, rect, 0.0, content, ctx)
 }
@@ -165,7 +165,7 @@ pub fn shape_xml_rotated(id: u32, rect: Rect, rotate: f32, content: &NativeConte
             let sp = Sp { kind: *kind, fill: *fill, outline, radius: *radius, paragraphs, inset: *inset, anchor };
             Some(sp_xml(id, rect, rotate, &sp, ctx))
         }
-        NativeContent::Table { .. } | NativeContent::Picture { .. } => None,
+        NativeContent::Table { .. } | NativeContent::Picture { .. } | NativeContent::Path { .. } => None,
     }
 }
 

@@ -463,9 +463,8 @@ fn stacks_and_text_from_a_component_are_laid_out() {
 fn a_path_from_a_component_is_drawn_and_a_bad_one_is_a_placeholder() {
     let good = "<Drawn data=\"M0 0H10V10H0Z\" />\n";
     let (slide, _) = lay_out_with(good, &[], &probe_registry());
-    let (pixmap, rect) = picture_of(&slide.layers[1]);
-    assert_eq!((rect.w, rect.h), (10.0, 10.0));
-    assert_eq!(pixmap.pixel(5, 5).unwrap().red(), 255);
+    assert!(!has_picture(&slide.layers[1]), "a path is a vector, not a picture");
+    assert_eq!(bounds(fills(&slide.layers[1])[0]), (0.0, 0.0, 10.0, 10.0));
 
     let injected = "<Drawn data='M0 0\"/&gt;&lt;image href=\"x.png' />\n";
     let (slide, _) = lay_out_with(injected, &[], &probe_registry());

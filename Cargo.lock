@@ -6721,6 +6721,7 @@ dependencies = [
  "resvg 0.46.0",
  "serde_json",
  "slides-format",
+ "svgtypes 0.16.2",
  "syntect",
  "taffy",
  "tempfile",
