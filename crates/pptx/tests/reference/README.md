@@ -113,3 +113,22 @@ an outline width is slide units (points x 2). `ctx` = `{ lang: "en-US", fonts, l
 | `background-color.xml`, `background-picture.xml` | `backgroundXml({ color: "#ffffff" })`, and with rId `"rId2"` |
 | `slide-one-shape.xml` | `slideXml(shapeXml({ ...box, fill: "#2563eb", paras: [], anchor: "t", inset: 0 }, 2, ctx), backgroundXml({ color: "#ffffff" }))` |
 | `guid.txt` | `guid("deck-table-default")`, newline, `guid("é🎉")` |
+
+## Animations, transitions and notes (`tests/timing.rs`)
+
+Made by a throwaway script (not kept) calling `src/ooxml/{timing,notes}.mjs`. `e(spid, kind, click, fill)` =
+`{ spid, kind, fill, click, dir: "in" }` (`fill` false unless said). The Rust `Effect` has `is_text` for `kind === "text"`,
+`has_fill` for `fill`, and an `Enter` that stands for the JavaScript fade (`dir: "in"` is the only direction here).
+`videos` are left out, as the Rust side has none. `Appear` and `FlyUp` have no JavaScript counterpart, so no reference file.
+`ctx` is as for the text files above.
+
+| File | Call |
+| --- | --- |
+| `timing-fade-one.xml` | `animationTimingXml({ effects: [e(4, "picture", 1)] })` |
+| `timing-two-clicks.xml` | `effects: [e(4, "text", 1), e(5, "picture", 2)]` |
+| `timing-text-groups.xml` | `effects: [e(4, "text", 1, true), e(5, "picture", 1), e(4, "text", 2), e(6, "text", 1)]` (grpId counts per shape, `animBg`, two effects in one click) |
+| `transition-fade.xml` | `transitionXml("fade")` |
+| `transition-push.xml` | `transitionXml({ push: "l" })` |
+| `notes-master.xml` | `notesMasterXml(ctx)` |
+| `notes-slide.xml` | `notesSlideXml("First line\n\n  second & <third>  \n\n\n\n", ctx)` |
+| `notes-slide-empty.xml` | `notesSlideXml("\n  \n", ctx)` |
