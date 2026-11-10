@@ -9,6 +9,7 @@ use gpui_kit::{
 };
 use slides_engine::Fonts;
 use stagepack_studio::document::Document;
+use stagepack_studio::present::{LayerLook, SlideLook};
 use stagepack_studio::slide_canvas::{SlideCanvas, letterbox};
 use stagepack_studio::workspace_view::{
     self, CANVAS_ID, EXPORT_MENU_ID, ExportPdf, ExportPowerPoint, FILE_MENU_ID, MARKDOWN_ID,
@@ -229,6 +230,226 @@ fn the_same_layer_twice_in_a_slide_is_one_image(cx: &mut TestAppContext) {
         assert!(!window.has_image_atlas_entry(&drawn[0]))
     })
     .unwrap();
+}
+
+const SHOWN: LayerLook = LayerLook {
+    visible: true,
+    opacity: 1.0,
+    offset_y: 0.0,
+};
+
+const HIDDEN: LayerLook = LayerLook {
+    visible: false,
+    opacity: 0.0,
+    offset_y: 0.0,
+};
+
+fn in_atlas(cx: &mut TestAppContext, handle: AnyWindowHandle, image: &RenderImage) -> bool {
+    cx.update_window(handle, |_, window, _| window.has_image_atlas_entry(image))
+        .unwrap()
+}
+
+fn set_looks(
+    cx: &mut TestAppContext,
+    handle: AnyWindowHandle,
+    canvas: &Entity<SlideCanvas>,
+    looks: Vec<LayerLook>,
+) {
+    cx.update(|cx| canvas.update(cx, |canvas, cx| canvas.set_looks(looks, cx)));
+    settle(cx, handle);
+}
+
+fn set_slide_look(
+    cx: &mut TestAppContext,
+    handle: AnyWindowHandle,
+    canvas: &Entity<SlideCanvas>,
+    look: SlideLook,
+) {
+    cx.update(|cx| canvas.update(cx, |canvas, cx| canvas.set_slide_look(look, cx)));
+    settle(cx, handle);
+}
+
+/// Puts up a background and a heading that the window has never painted, with `looks`.
+fn show_new_layers(
+    cx: &mut TestAppContext,
+    handle: AnyWindowHandle,
+    canvas: &Entity<SlideCanvas>,
+    looks: Vec<LayerLook>,
+) -> Vec<Arc<RenderImage>> {
+    let layers = document("# Other\n").layers(scale(cx, canvas));
+    cx.update(|cx| {
+        canvas.update(cx, |canvas, cx| {
+            canvas.set_layers(layers, cx);
+            canvas.set_looks(looks, cx);
+        })
+    });
+    settle(cx, handle);
+    images(cx, canvas)
+}
+
+#[gpui_kit::test]
+fn hidden_layers_are_not_painted_but_keep_their_images(cx: &mut TestAppContext) {
+    let (handle, view) = open_with_view(cx, "# One\n");
+    settle(cx, handle);
+    let canvas = slide_canvas(cx, &view);
+
+    let drawn = show_new_layers(cx, handle, &canvas, vec![SHOWN, HIDDEN]);
+    assert_eq!(drawn.len(), 2, "the hidden layer is still listed");
+    assert!(in_atlas(cx, handle, &drawn[0]));
+    assert!(
+        !in_atlas(cx, handle, &drawn[1]),
+        "a hidden layer isn't painted"
+    );
+
+    set_looks(cx, handle, &canvas, vec![SHOWN, SHOWN]);
+    assert!(
+        Arc::ptr_eq(&drawn[1], &images(cx, &canvas)[1]),
+        "showing it uses the image it already had"
+    );
+    assert!(in_atlas(cx, handle, &drawn[1]), "it's painted once shown");
+
+    set_looks(cx, handle, &canvas, vec![SHOWN, HIDDEN]);
+    assert!(
+        in_atlas(cx, handle, &drawn[1]),
+        "hiding it again leaves it in the atlas, ready to come back"
+    );
+}
+
+#[gpui_kit::test]
+fn a_layer_with_no_look_is_fully_visible(cx: &mut TestAppContext) {
+    let (handle, view) = open_with_view(cx, "# One\n");
+    settle(cx, handle);
+    let canvas = slide_canvas(cx, &view);
+
+    let drawn = show_new_layers(cx, handle, &canvas, vec![HIDDEN]);
+    assert!(!in_atlas(cx, handle, &drawn[0]));
+    assert!(in_atlas(cx, handle, &drawn[1]), "it has no look of its own");
+}
+
+#[gpui_kit::test]
+fn looks_beyond_the_last_layer_are_ignored(cx: &mut TestAppContext) {
+    let (handle, view) = open_with_view(cx, "# One\n");
+    settle(cx, handle);
+    let canvas = slide_canvas(cx, &view);
+
+    let drawn = show_new_layers(cx, handle, &canvas, vec![SHOWN, SHOWN, HIDDEN, HIDDEN]);
+    assert_eq!(drawn.len(), 2);
+    assert!(in_atlas(cx, handle, &drawn[0]));
+    assert!(in_atlas(cx, handle, &drawn[1]));
+}
+
+#[gpui_kit::test]
+fn layers_at_different_opacities_are_all_painted(cx: &mut TestAppContext) {
+    let (handle, view) = open_with_view(cx, "# One\n");
+    settle(cx, handle);
+    let canvas = slide_canvas(cx, &view);
+    let old = images(cx, &canvas);
+
+    let fading = LayerLook {
+        opacity: 0.5,
+        ..SHOWN
+    };
+    let drawn = show_new_layers(cx, handle, &canvas, vec![SHOWN, fading]);
+    assert!(in_atlas(cx, handle, &drawn[0]));
+    assert!(in_atlas(cx, handle, &drawn[1]));
+    assert!(
+        !in_atlas(cx, handle, &old[0]) && !in_atlas(cx, handle, &old[1]),
+        "the images no layer uses any more were released"
+    );
+}
+
+#[gpui_kit::test]
+fn a_layer_just_starting_to_fade_is_painted_already(cx: &mut TestAppContext) {
+    let (handle, view) = open_with_view(cx, "# One\n");
+    settle(cx, handle);
+    let canvas = slide_canvas(cx, &view);
+
+    let starting = LayerLook {
+        opacity: 0.0,
+        ..SHOWN
+    };
+    let drawn = show_new_layers(cx, handle, &canvas, vec![SHOWN, starting]);
+    assert!(in_atlas(cx, handle, &drawn[1]));
+}
+
+#[gpui_kit::test]
+fn with_every_layer_hidden_the_canvas_still_does_its_housekeeping(cx: &mut TestAppContext) {
+    let (handle, view) = open_with_view(cx, "# One\n");
+    settle(cx, handle);
+    let canvas = slide_canvas(cx, &view);
+    let (scale_before, old) = (scale(cx, &canvas), images(cx, &canvas));
+
+    show_new_layers(cx, handle, &canvas, vec![HIDDEN, HIDDEN]);
+    assert!(
+        !in_atlas(cx, handle, &old[0]) && !in_atlas(cx, handle, &old[1]),
+        "the images no layer uses any more were released"
+    );
+
+    cx.update_window(handle, |_, window, _| window.set_scale_factor(2.0 * 1.02))
+        .unwrap();
+    settle(cx, handle);
+    assert!(
+        scale(cx, &canvas) > scale_before * 1.01,
+        "the new size of the slide was measured"
+    );
+}
+
+#[gpui_kit::test]
+fn a_layer_moves_by_slide_units(cx: &mut TestAppContext) {
+    let (handle, view) = open_with_view(cx, "# One\n");
+    settle(cx, handle);
+    let canvas = slide_canvas(cx, &view);
+
+    // The background fills the slide, which is 1080 units high.
+    let moved_by = |offset_y| LayerLook { offset_y, ..SHOWN };
+    let drawn = show_new_layers(cx, handle, &canvas, vec![moved_by(1081.0), SHOWN]);
+    assert!(!in_atlas(cx, handle, &drawn[0]), "it has left the slide");
+
+    set_looks(cx, handle, &canvas, vec![moved_by(1075.0), SHOWN]);
+    assert!(in_atlas(cx, handle, &drawn[0]), "a strip of it is still on");
+}
+
+#[gpui_kit::test]
+fn a_pushed_slide_stays_inside_its_letterbox(cx: &mut TestAppContext) {
+    let (handle, view) = open_with_view(cx, "# One\n");
+    // Far wider than 16:9, so there's a bar at each side for the slide to be pushed into.
+    cx.simulate_window_resize(handle, size(px(1800.), px(500.)));
+    settle(cx, handle);
+    let canvas = slide_canvas(cx, &view);
+
+    let look = |offset_x| SlideLook {
+        opacity: 1.0,
+        offset_x,
+    };
+    set_slide_look(cx, handle, &canvas, look(1.0));
+    let drawn = show_new_layers(cx, handle, &canvas, vec![SHOWN, SHOWN]);
+    assert!(
+        !in_atlas(cx, handle, &drawn[0]),
+        "a whole slide along, the background has left the slide, though there's room in the bar"
+    );
+
+    set_slide_look(cx, handle, &canvas, look(0.99));
+    assert!(in_atlas(cx, handle, &drawn[0]), "a strip of it is still on");
+}
+
+#[gpui_kit::test]
+fn a_faded_slide_still_paints(cx: &mut TestAppContext) {
+    let (handle, view) = open_with_view(cx, "# One\n");
+    settle(cx, handle);
+    let canvas = slide_canvas(cx, &view);
+
+    set_slide_look(
+        cx,
+        handle,
+        &canvas,
+        SlideLook {
+            opacity: 0.25,
+            offset_x: 0.0,
+        },
+    );
+    let drawn = show_new_layers(cx, handle, &canvas, vec![SHOWN, SHOWN]);
+    assert!(in_atlas(cx, handle, &drawn[0]));
+    assert!(in_atlas(cx, handle, &drawn[1]));
 }
 
 #[gpui_kit::test]

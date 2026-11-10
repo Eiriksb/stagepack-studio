@@ -6,6 +6,8 @@ use std::sync::Arc;
 use gpui_kit::*;
 use slides_engine::{Layer, to_bgra_frame};
 
+use crate::present::{LayerLook, SlideLook};
+
 /// The width of a 16:9 slide, in slide units.
 const SLIDE_WIDTH: f32 = 1920.0;
 
@@ -23,9 +25,18 @@ struct Sprite {
     image: Arc<RenderImage>,
 }
 
+/// Showing layers next to each other that share an opacity. Each sprite comes with how far
+/// below its place it is, in slide units.
+struct Run {
+    opacity: f32,
+    sprites: Vec<(Sprite, f32)>,
+}
+
 #[derive(Default)]
 pub struct SlideCanvas {
     sprites: Vec<Sprite>,
+    looks: Vec<LayerLook>,
+    slide_look: SlideLook,
     /// Images no layer uses any more. Only a paint can release them, as it has the window.
     retired: Vec<Arc<RenderImage>>,
     scale: Option<f32>,
@@ -64,6 +75,20 @@ impl SlideCanvas {
         cx.notify();
     }
 
+    /// How each layer looks, first to last. A layer the list doesn't reach is fully visible.
+    /// A hidden layer paints nothing, but keeps its image, so that it can come back at once.
+    /// The looks outlast [`Self::set_layers`], so a redraw at a new size brings nothing back.
+    pub fn set_looks(&mut self, looks: Vec<LayerLook>, cx: &mut Context<Self>) {
+        self.looks = looks;
+        cx.notify();
+    }
+
+    /// How the whole slide looks.
+    pub fn set_slide_look(&mut self, look: SlideLook, cx: &mut Context<Self>) {
+        self.slide_look = look;
+        cx.notify();
+    }
+
     /// The scale to draw layers at: the slide's width in device pixels over 1920. `None`
     /// until the first paint has measured the slide.
     pub fn scale(&self) -> Option<f32> {
@@ -87,6 +112,26 @@ impl SlideCanvas {
             cx.emit(ScaleChanged);
         }
     }
+
+    /// The layers to paint, first to last.
+    fn runs(&self) -> Vec<Run> {
+        let mut runs: Vec<Run> = Vec::new();
+        for (index, sprite) in self.sprites.iter().enumerate() {
+            let look = self.looks.get(index).copied().unwrap_or_default();
+            if !look.visible {
+                continue;
+            }
+            let sprite = (sprite.clone(), look.offset_y);
+            match runs.last_mut() {
+                Some(run) if run.opacity == look.opacity => run.sprites.push(sprite),
+                _ => runs.push(Run {
+                    opacity: look.opacity,
+                    sprites: vec![sprite],
+                }),
+            }
+        }
+        runs
+    }
 }
 
 /// The largest 16:9 rectangle centred in `area`, on whole device pixels so that a layer
@@ -106,47 +151,86 @@ pub fn letterbox(area: Bounds<Pixels>, scale_factor: f32) -> Bounds<Pixels> {
     }
 }
 
+/// Where the slide sits in `area`, and the scale its layers belong at there: its width in
+/// device pixels over 1920. `None` if there's no room for it.
+fn fit(area: Bounds<Pixels>, scale_factor: f32) -> Option<(Bounds<Pixels>, f32)> {
+    let slide = letterbox(area, scale_factor);
+    let scale = f32::from(slide.size.width) * scale_factor / SLIDE_WIDTH;
+    (scale > 0.0).then_some((slide, scale))
+}
+
+fn paint_sprites(
+    sprites: Vec<(Sprite, f32)>,
+    area: Bounds<Pixels>,
+    drawn_at: Option<f32>,
+    offset_x: f32,
+    window: &mut Window,
+) {
+    let scale_factor = window.scale_factor();
+    let Some((slide, scale)) = fit(area, scale_factor) else {
+        return;
+    };
+    // From the device pixels the layers were drawn in to the window's own.
+    let to_window = drawn_at.map_or(1.0, |drawn_at| scale / drawn_at) / scale_factor;
+    let width = f32::from(slide.size.width);
+    for (Sprite { layer, image }, offset_y) in sprites {
+        let place = Bounds {
+            origin: slide.origin
+                + point(
+                    px(layer.x as f32 * to_window + offset_x * width),
+                    px(layer.y as f32 * to_window + offset_y * width / SLIDE_WIDTH),
+                ),
+            size: size(
+                px(layer.pixmap.width() as f32 * to_window),
+                px(layer.pixmap.height() as f32 * to_window),
+            ),
+        };
+        // Clipped to the slide, so that a layer on the move stays off the bars beside it.
+        // An image too large for the GPU is refused. The rest of the slide still shows.
+        window
+            .paint_image(slide, place, Corners::default(), image, 0, false)
+            .ok();
+    }
+}
+
 impl Render for SlideCanvas {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let sprites = self.sprites.clone();
         let retired = std::mem::take(&mut self.retired);
-        let drawn_at = self.scale;
         let this = cx.entity().downgrade();
-        canvas(
+        // A child of its own, as it has to happen even with no layer showing.
+        let housekeeping = canvas(
             |_, _, _| {},
             move |area, _, window, cx| {
                 for image in retired {
                     window.drop_image(image).ok();
                 }
-                let scale_factor = window.scale_factor();
-                let slide = letterbox(area, scale_factor);
-                let scale = f32::from(slide.size.width) * scale_factor / SLIDE_WIDTH;
-                if scale <= 0.0 {
-                    return;
+                if let Some((_, scale)) = fit(area, window.scale_factor()) {
+                    this.update(cx, |this, cx| this.measured(scale, cx)).ok();
                 }
-                // From the device pixels the layers were drawn in to the window's own.
-                let to_window = drawn_at.map_or(1.0, |drawn_at| scale / drawn_at) / scale_factor;
-                for Sprite { layer, image } in sprites {
-                    let place = Bounds {
-                        origin: slide.origin
-                            + point(
-                                px(layer.x as f32 * to_window),
-                                px(layer.y as f32 * to_window),
-                            ),
-                        size: size(
-                            px(layer.pixmap.width() as f32 * to_window),
-                            px(layer.pixmap.height() as f32 * to_window),
-                        ),
-                    };
-                    // An image too large for the GPU is refused. The rest of the slide still shows.
-                    window
-                        .paint_image(slide, place, Corners::default(), image, 0, false)
-                        .ok();
-                }
-                this.update(cx, |this, cx| this.measured(scale, cx)).ok();
             },
         )
         .absolute()
-        .size_full()
+        .size_full();
+
+        let drawn_at = self.scale;
+        let SlideLook { opacity, offset_x } = self.slide_look;
+        // An image takes its opacity from the element around it, and that's what the runs are for.
+        let runs = self.runs().into_iter().map(|run| {
+            div().absolute().size_full().opacity(run.opacity).child(
+                canvas(
+                    |_, _, _| {},
+                    move |area, _, window, _| {
+                        paint_sprites(run.sprites, area, drawn_at, offset_x, window)
+                    },
+                )
+                .size_full(),
+            )
+        });
+        div()
+            .absolute()
+            .size_full()
+            .opacity(opacity)
+            .child(housekeeping)
+            .children(runs)
     }
 }
