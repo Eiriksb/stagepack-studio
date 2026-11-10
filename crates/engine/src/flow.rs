@@ -15,7 +15,10 @@ use crate::placeholder::placeholder_items;
 use crate::{Align, DisplayItem, Fonts, LayoutEnv, Notice, Rect, RegionDef, ShapedText, TextRun, highlight, shape_text};
 
 const GAP: f32 = 24.0;
+/// The least a list is indented, however narrow its markers.
 const LIST_INDENT: f32 = 48.0;
+/// The least space between a list's widest marker and its text.
+const MARKER_GAP: f32 = 12.0;
 const CELL_PADDING: f32 = 12.0;
 const OUTLINE: f32 = 1.0;
 const CODE_SIZE: f32 = 32.0;
@@ -283,10 +286,19 @@ impl<'a, 'env> Flow<'a, 'env> {
     /// Each item is a row of its marker, in the indent, and a column of its blocks.
     /// A list always reads from the left, whatever the region's alignment.
     fn list(&mut self, ordered: bool, items: &[Vec<Block>]) -> NodeId {
+        let markers: Vec<Leaf> = (1..=items.len())
+            .map(|number| self.marker(if ordered { format!("{number}.") } else { "•".to_string() }))
+            .collect();
+        let widest = markers.iter().map(|marker| marker.shape(None, self.env.fonts).width).fold(0.0, f32::max);
+        let indent = LIST_INDENT.max(widest + MARKER_GAP);
         let mut rows = Vec::with_capacity(items.len());
-        for (index, item) in items.iter().enumerate() {
-            let label = if ordered { format!("{}.", index + 1) } else { "•".to_string() };
-            let marker = self.marker(label);
+        for (marker, item) in markers.into_iter().zip(items) {
+            let in_the_indent = Style {
+                size: Size { width: length(indent), height: auto() },
+                flex_shrink: 0.0,
+                ..Style::default()
+            };
+            let marker = self.leaf(in_the_indent, Content::Text(marker));
             let blocks: Vec<NodeId> = item.iter().filter_map(|block| self.block(block, Align::Left)).collect();
             let content = Style {
                 flex_grow: 1.0,
@@ -300,15 +312,10 @@ impl<'a, 'env> Flow<'a, 'env> {
         self.node(column(), &rows)
     }
 
-    fn marker(&mut self, label: String) -> NodeId {
+    fn marker(&self, label: String) -> Leaf {
         let span = Span { text: label, style: Default::default() };
         let run = self.run(&span, self.region_look());
-        let style = Style {
-            size: Size { width: length(LIST_INDENT), height: auto() },
-            flex_shrink: 0.0,
-            ..Style::default()
-        };
-        self.leaf(style, Content::Text(Leaf { runs: vec![run], align: Align::Left, wraps: false, frame: Frame::None }))
+        Leaf { runs: vec![run], align: Align::Left, wraps: false, frame: Frame::None }
     }
 
     /// Columns share the width evenly. Cells are placed by number, so a row with too

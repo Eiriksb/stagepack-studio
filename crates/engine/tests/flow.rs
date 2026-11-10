@@ -199,6 +199,23 @@ fn list_text_sits_past_its_marker() {
 }
 
 #[test]
+fn two_digit_markers_do_not_touch_their_text() {
+    let list: String = (1..=10).map(|n| format!("{n}. Item\n")).collect();
+    let (slide, _) = lay_out(&list);
+    let pieces: Vec<(f32, f32)> = slide.layers[1].items.iter().filter_map(|item| match item {
+        DisplayItem::Text { text, x, .. } => Some((*x, text.width)),
+        _ => None,
+    }).collect();
+    assert_eq!(pieces.len(), 20);
+    let (marker, body) = (pieces[18], pieces[19]);
+    assert!(body.0 >= marker.0 + marker.1 + 12.0 - 0.01, "the marker ends at {} and its text starts at {}", marker.0 + marker.1, body.0);
+    assert_eq!(pieces[1].0, body.0, "every item in a list has the same indent");
+
+    let (short, _) = lay_out("1. One\n2. Two\n");
+    assert_eq!(text_boxes(&short.layers[1])[1].0, 48.0, "a single digit keeps the usual indent");
+}
+
+#[test]
 fn a_nested_list_indents_again() {
     let (slide, _) = lay_out("- One\n  - Two\n");
     let boxes = text_boxes(&slide.layers[1]);
