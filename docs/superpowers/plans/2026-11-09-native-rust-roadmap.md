@@ -31,6 +31,8 @@ Windows checklist: open a fixture folder and compare with the golden images.
 
 ### B. Present and export
 
+File: `2026-11-10-native-rust-plan-b-present-export.md`.
+
 Coders can use early builds from here.
 
 - Full-screen presenting and the presenter view, with click steps, entrances and transitions (the presenting half of goals 7 and 8).
