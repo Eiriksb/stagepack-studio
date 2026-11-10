@@ -120,7 +120,7 @@ pub fn open_packed_limited(path: &Path, limits: PackLimits) -> Result<PackedFile
     let mut total = 0u64;
     for i in 0..zip.len() {
         let entry = zip.by_index_raw(i)?;
-        let name = entry.name().to_string();
+        let name = entry.name()?.to_string();
         if !safe_name(&name) || entry.is_symlink() {
             return Err(PackError::UnsafeName(name));
         }
