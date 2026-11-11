@@ -587,6 +587,21 @@ fn the_notes_caret_stops_blinking_when_left_alone(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn the_slide_has_an_edge_on_the_desk(cx: &mut TestAppContext) {
+    // A white slide on the light grey desk barely shows where it ends.
+    let (handle, view) = open(cx, TWO);
+    let canvas = cx.read(|cx| view.read(cx).slide_canvas().clone());
+    let edge = cx
+        .read(|cx| canvas.read(cx).edge())
+        .expect("the slide has an edge");
+    with_window(cx, handle, |window, _| {
+        let area = window.find(CANVAS_ID).bounds();
+        let slide = stagepack_studio::slide_canvas::letterbox(area, window.scale_factor());
+        assert_eq!(edge, slide.dilate(px(1.)), "just outside the slide");
+    });
+}
+
+#[gpui_kit::test]
 fn the_notes_field_says_what_it_is_for(cx: &mut TestAppContext) {
     let (handle, _) = open(cx, TWO);
     assert_eq!(NOTES_PLACEHOLDER, "Notes for this slide");

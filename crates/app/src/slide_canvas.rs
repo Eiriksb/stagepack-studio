@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::*;
 use slides_engine::{Layer, to_bgra_frame};
 
@@ -40,11 +41,28 @@ pub struct SlideCanvas {
     /// Images no layer uses any more. Only a paint can release them, as it has the window.
     retired: Vec<Arc<RenderImage>>,
     scale: Option<f32>,
+    /// Whether a line is drawn around the slide, as the editor does on its light desk.
+    framed: bool,
+    /// Where that line was last drawn.
+    edge: Option<Bounds<Pixels>>,
 }
 
 impl EventEmitter<ScaleChanged> for SlideCanvas {}
 
 impl SlideCanvas {
+    /// A canvas with a line around its slide, for the editor. A show's has none.
+    pub fn framed() -> Self {
+        SlideCanvas {
+            framed: true,
+            ..SlideCanvas::default()
+        }
+    }
+
+    /// Where the line around the slide was last drawn, just outside it, if it has one.
+    pub fn edge(&self) -> Option<Bounds<Pixels>> {
+        self.edge
+    }
+
     /// The layers to show, first to last, drawn at [`Self::scale`]. A layer that was
     /// already showing keeps its image.
     pub fn set_layers(&mut self, layers: Vec<Arc<Layer>>, cx: &mut Context<Self>) {
@@ -113,7 +131,10 @@ impl SlideCanvas {
             .collect()
     }
 
-    fn measured(&mut self, scale: f32, cx: &mut Context<Self>) {
+    fn measured(&mut self, slide: Bounds<Pixels>, scale: f32, cx: &mut Context<Self>) {
+        if self.framed {
+            self.edge = Some(slide.dilate(px(1.)));
+        }
         let stale = self
             .scale
             .is_none_or(|drawn_at| (scale / drawn_at - 1.0).abs() > REDRAW_CHANGE);
@@ -206,6 +227,7 @@ fn paint_sprites(
 impl Render for SlideCanvas {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let retired = std::mem::take(&mut self.retired);
+        let edge_color = self.framed.then(|| cx.theme().border);
         let this = cx.entity().downgrade();
         // A child of its own, as it has to happen even with no layer showing.
         let housekeeping = canvas(
@@ -214,8 +236,12 @@ impl Render for SlideCanvas {
                 for image in retired {
                     window.drop_image(image).ok();
                 }
-                if let Some((_, scale)) = fit(area, window.scale_factor()) {
-                    this.update(cx, |this, cx| this.measured(scale, cx)).ok();
+                if let Some((slide, scale)) = fit(area, window.scale_factor()) {
+                    if let Some(color) = edge_color {
+                        window.paint_quad(outline(slide.dilate(px(1.)), color, BorderStyle::Solid));
+                    }
+                    this.update(cx, |this, cx| this.measured(slide, scale, cx))
+                        .ok();
                 }
             },
         )

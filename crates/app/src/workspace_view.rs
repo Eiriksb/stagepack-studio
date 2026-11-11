@@ -376,7 +376,7 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let slide_canvas = cx.new(|_| SlideCanvas::default());
+        let slide_canvas = cx.new(|_| SlideCanvas::framed());
         let scale_changed = cx.subscribe(&slide_canvas, |this, _, _: &ScaleChanged, cx| {
             this.show_slide(cx)
         });

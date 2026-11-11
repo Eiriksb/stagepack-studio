@@ -294,6 +294,17 @@ fn reload(cx: &mut TestAppContext, show: &Rehearsal, source: &str) {
 }
 
 #[gpui_kit::test]
+fn a_shown_slide_has_no_edge(cx: &mut TestAppContext) {
+    // The editor draws a line around its slide, and a show doesn't.
+    let show = rehearse(cx, TWO_CLICKS);
+    let audience = show.canvas(cx);
+    assert_eq!(cx.read(|cx| audience.read(cx).edge()), None);
+    let presenter = show.presenter_view(cx);
+    let current = cx.read(|cx| presenter.read(cx).current().clone());
+    assert_eq!(cx.read(|cx| current.read(cx).edge()), None);
+}
+
+#[gpui_kit::test]
 fn right_reveals_then_moves_on(cx: &mut TestAppContext) {
     let show = rehearse(cx, TWO_CLICKS);
     assert_eq!(counter(cx, &show), "1 / 2");
