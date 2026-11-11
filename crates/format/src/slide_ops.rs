@@ -146,7 +146,10 @@ pub fn set_notes(talk: &Talk, index: usize, notes: &str) -> Change {
         return no_change();
     }
     let eol = eol_in(source);
-    let notes = with_line_endings(&escape_notes(&notes.replace("\r\n", "\n")), eol);
+    // The parser trims what an element holds, so space around the words means nothing. Kept,
+    // it would stay behind each time the words were replaced, as the notes field sends them
+    // after every key: a space typed between two words would be left at the end.
+    let notes = with_line_endings(&escape_notes(notes.replace("\r\n", "\n").trim()), eol);
     let edit = match &slide.notes {
         Some(old) if notes.trim().is_empty() => {
             let removal = without_notes(source, &split_slides(source)[index], remove_notes(source, slide), eol);

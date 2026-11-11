@@ -242,6 +242,22 @@ fn notes_are_added_changed_and_removed() {
 }
 
 #[test]
+fn notes_typed_a_letter_at_a_time_are_written_as_if_typed_at_once() {
+    // The notes field sends what it holds after every key, so the words often end in a
+    // space, or a new line, just before the next letter comes.
+    on_both(|e| {
+        let src = e("# A\n---\n# B\n");
+        let typed = "Say hi,  then\nsmile. ";
+        let mut text = src.clone();
+        for end in 1..=typed.len() {
+            text = applied(&text, &set_notes(&parse_talk(&text), 0, &e(&typed[..end])));
+        }
+        assert_eq!(text, applied(&src, &set_notes(&parse_talk(&src), 0, &e(typed))));
+        assert_eq!(text, e("# A\n\n<Notes>\nSay hi,  then\nsmile.\n</Notes>\n---\n# B\n"));
+    });
+}
+
+#[test]
 fn notes_with_markdown_in_them_come_back_as_written() {
     on_both(|e| {
         let src = e("# A\n");
