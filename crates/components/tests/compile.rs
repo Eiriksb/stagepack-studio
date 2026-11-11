@@ -118,7 +118,8 @@ fn stopping_a_compile_stops_what_it_started() {
 #[ignore = "needs the compiler bundle"]
 fn a_source_that_asks_for_gigabytes_is_stopped() {
     use std::time::{Duration, Instant};
-    let source = "use toolkit::prelude::*;\n\nstatic BIG: [u8; 1 << 30] = [7; 1 << 30];\n\n#[component]\nfn Score() -> Element {\n    text(BIG[3].to_string())\n}\n";
+    // From the review: this took 10.5 GB and 24 s, and wrote a 1 GB build.
+    let source = "use toolkit::prelude::*;\n\nstatic BIG: [u8; 1 << 30] = [7; 1 << 30];\n\n#[component]\nfn Score(team: String) -> Element {\n    text(format!(\"{team} {}\", BIG[team.len()]))\n}\n";
     let started = Instant::now();
     let errors = compile(&bundle(), FILE, source).unwrap_err();
     assert!(started.elapsed() < Duration::from_secs(30), "took {:?}", started.elapsed());
