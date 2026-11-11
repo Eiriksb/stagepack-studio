@@ -37,6 +37,8 @@ pub struct LayerSpec {
     pub native: Vec<NativeElement>,
     /// Whether this layer is the slide's title.
     pub is_title: bool,
+    /// Whether something in this layer changes with the moment the slide is at.
+    pub varies: bool,
 }
 
 /// A drawn element in device pixels, placed at (`x`, `y`) on the slide. It has no

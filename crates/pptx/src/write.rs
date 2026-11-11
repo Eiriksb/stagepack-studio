@@ -344,6 +344,11 @@ pub fn write_pptx(deck: &mut Deck, files: &dyn TalkFiles) -> Result<PptxOutput, 
     for (index, note) in notes.iter().enumerate() {
         notices.extend(deck.notices(index).into_iter().map(|n| format!("Slide {}: {n}", index + 1)));
         let timeline = deck.timeline(index);
+        notices.extend(
+            deck.varying_tags(index)
+                .into_iter()
+                .map(|tag| format!("Slide {}: {tag} changes as the talk plays, so PowerPoint shows it in its last state", index + 1)),
+        );
         let specs = deck.specs(index);
         notices.extend(left_out_links(specs).into_iter().map(|url| format!("Slide {}: the link {url:?} was left out: only http, https and mailto links are kept", index + 1)));
         let part = format!("/ppt/slides/slide{}.xml", index + 1);
@@ -440,6 +445,7 @@ mod tests {
             enter: Enter::default(),
             native: vec![element.clone()],
             is_title: false,
+            varies: false,
         };
         let pkg: SharedPackage = Rc::new(RefCell::new(Package::default()));
         let mut media = MediaStore::default();

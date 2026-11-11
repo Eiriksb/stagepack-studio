@@ -166,8 +166,8 @@ impl Flow<'_, '_> {
         // Backwards, so that the first of a repeated attribute wins, as it does in `Tag::attr`.
         let props = attrs.rev().map(|attr| (attr.name.clone(), attr.value.clone())).collect();
         let data = CtxData {
-            click_step: 0,
-            time: 0.0,
+            click_step: self.env.moment.step,
+            time: self.env.moment.time,
             slide_width: SLIDE_WIDTH,
             slide_height: SLIDE_HEIGHT,
             width: room.0,
@@ -178,7 +178,10 @@ impl Flow<'_, '_> {
             let (files, used) = (self.env.files, Cell::new(0));
             let assets = |path: &str| read_asset(files, path, &used);
             let ctx = Ctx::new(data, &assets);
-            return Some((component.render)(&Props(props), &ctx));
+            let element = (component.render)(&Props(props), &ctx);
+            let output = ctx.finish(element);
+            self.env.asks.note(&tag.name, output.steps, output.stepped, output.animated);
+            return Some(output.element);
         }
         let name = &tag.name;
         let Some(rendered) = self.env.components.render(name, &RenderInput { props, ctx: data }) else {
@@ -190,6 +193,7 @@ impl Flow<'_, '_> {
                 if self.env.components.is_out_of_date(name) {
                     self.notice(format!("{name} is out of date, so this is its last build"));
                 }
+                self.env.asks.note(name, output.steps, output.stepped, output.animated);
                 output.element
             }
             Rendered::NeedsBuilding => toolkit::problem(format!("{name} needs building")),

@@ -16,7 +16,7 @@ fn lay_out_using(source: &str, files: &[(&str, Vec<u8>)], registry: &Registry) -
     let mut fonts = Fonts::bundled_only();
     let talk = parse_talk(source);
     let files = MapFiles(files.iter().map(|(path, bytes)| (path.to_string(), bytes.clone())).collect());
-    layout_slide(&talk, 0, &mut LayoutEnv { fonts: &mut fonts, registry, files: &files, pictures: &mut PictureCache::default(), components: &mut TalkComponents::none() })
+    layout_slide(&talk, 0, &mut LayoutEnv { fonts: &mut fonts, registry, files: &files, pictures: &mut PictureCache::default(), components: &mut TalkComponents::none(), moment: Moment::START, asks: ComponentAsks::default() })
 }
 
 fn lay_out_with(source: &str, files: &[(&str, Vec<u8>)]) -> LaidOutSlide {

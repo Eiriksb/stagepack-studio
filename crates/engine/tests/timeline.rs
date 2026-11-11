@@ -8,7 +8,7 @@ fn lay_out(source: &str) -> LaidOutSlide {
     let mut fonts = Fonts::bundled_only();
     let talk = parse_talk(source);
     let registry = builtin_registry();
-    layout_slide(&talk, 0, &mut LayoutEnv { fonts: &mut fonts, registry: &registry, files: &NoFiles, pictures: &mut PictureCache::default(), components: &mut TalkComponents::none() })
+    layout_slide(&talk, 0, &mut LayoutEnv { fonts: &mut fonts, registry: &registry, files: &NoFiles, pictures: &mut PictureCache::default(), components: &mut TalkComponents::none(), moment: Moment::START, asks: ComponentAsks::default() })
 }
 
 fn deck(source: &str) -> Deck { Deck::open(Box::new(NoFiles), Fonts::bundled_only(), source.to_string()) }

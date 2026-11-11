@@ -33,9 +33,66 @@ pub struct LayerTiming {
 /// of `Deck::layers`, comes in.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SlideTimeline {
+    /// The most clicks any of its layers or components asks for.
     pub steps: u32,
     pub layers: Vec<LayerTiming>,
     pub transition: Transition,
+    /// Whether a component on it changes over time, and not only from click to click.
+    pub animated: bool,
+}
+
+/// A point in the playing of a slide: how many clicks it has had, and the seconds since it appeared.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Moment {
+    pub step: u32,
+    pub time: f32,
+}
+
+impl Moment {
+    /// The slide as it is on arriving at it.
+    pub const START: Moment = Moment { step: 0, time: 0.0 };
+}
+
+/// What the components of a slide, or of one layer, looked at to draw it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ComponentAsks {
+    /// The most clicks a component asked for.
+    pub steps: u32,
+    /// Whether one can differ from one click to the next.
+    pub stepped: bool,
+    /// Whether one can differ from one moment to the next.
+    pub animated: bool,
+    /// The components that can differ, once each, in the order they came.
+    pub tags: Vec<String>,
+}
+
+impl ComponentAsks {
+    /// Adds what component `tag` looked at.
+    pub(crate) fn note(&mut self, tag: &str, steps: u32, stepped: bool, animated: bool) {
+        self.steps = self.steps.max(steps);
+        self.stepped |= stepped;
+        self.animated |= animated;
+        if (stepped || animated) && !self.tags.iter().any(|known| known == tag) {
+            self.tags.push(tag.to_string());
+        }
+    }
+
+    /// Adds what the components of another part of the slide looked at.
+    pub(crate) fn add(&mut self, other: ComponentAsks) {
+        self.steps = self.steps.max(other.steps);
+        self.stepped |= other.stepped;
+        self.animated |= other.animated;
+        for tag in other.tags {
+            if !self.tags.contains(&tag) {
+                self.tags.push(tag);
+            }
+        }
+    }
+
+    /// Whether what they drew can change with the moment.
+    pub(crate) fn varies(&self) -> bool {
+        self.stepped || self.animated
+    }
 }
 
 /// The most clicks a slide can ask for.

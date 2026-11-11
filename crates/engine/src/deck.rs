@@ -9,9 +9,10 @@ use slides_components::Diagnostic;
 use slides_format::{Settings, Talk, parse_talk};
 use toolkit::{ComponentSchema, Registry};
 
+use crate::timeline::MAX_CLICK;
 use crate::{
-    ComponentInfo, DisplayItem, Fonts, Layer, LayerSpec, LayerTiming, LayoutEnv, PictureCache, SlideTimeline, TalkComponents, TalkFiles,
-    Transition, builtin_registry, layout_slide, render_layer, talk_theme,
+    ComponentAsks, ComponentInfo, DisplayItem, Fonts, Layer, LayerSpec, LayerTiming, LayoutEnv, Moment, PictureCache, SlideTimeline,
+    TalkComponents, TalkFiles, Transition, builtin_registry, layout_slide, render_layer, talk_theme,
 };
 
 /// How many scales of one slide are kept drawn. A zoom or a resize asks for many in a row.
@@ -31,6 +32,9 @@ struct LayerKey {
     /// elsewhere changes it, such as a list's indent, with the layer's text just as it was.
     drawing: u64,
     files_generation: u64,
+    /// The step and the bits of the time it was drawn at, for a layer that changes with
+    /// them. `drawing` doesn't see colours, so it can't tell those layers apart.
+    moment: Option<(u32, u32)>,
 }
 
 /// A slide laid out. The keys are made when the slide is, because `LayerSpec::source`
@@ -42,6 +46,15 @@ struct Laid {
     transition: Transition,
     /// Whether it shows a picture from a file of the talk, and so holds that picture in memory.
     holds_pictures: bool,
+    asks: ComponentAsks,
+}
+
+impl Laid {
+    /// The most clicks its layers or components ask for.
+    fn steps(&self) -> u32 {
+        let clicks = self.specs.iter().filter_map(|spec| spec.click).max().unwrap_or(0);
+        clicks.max(self.asks.steps).min(MAX_CLICK)
+    }
 }
 
 /// A number that differs when a layer's items sit or measure differently.
@@ -64,13 +77,16 @@ fn drawing_fingerprint(items: &[DisplayItem]) -> u64 {
 struct Drawn {
     /// The layers that came from the slide's text. The background isn't one of them.
     by_key: HashMap<LayerKey, Arc<Layer>>,
-    /// The layers in order, as long as nothing in the slide has changed.
-    ordered: Option<Vec<Arc<Layer>>>,
+    /// The layers in order at a moment, as long as nothing in the slide has changed.
+    ordered: Option<(Moment, Vec<Arc<Layer>>)>,
 }
 
 struct SlideState {
     text: String,
+    /// The slide laid out at `Moment::START`.
     laid: Option<Laid>,
+    /// The slide laid out at the one other moment it was last asked for, which differs from the start.
+    at_moment: Option<(Moment, Laid)>,
     drawn: HashMap<u32, Drawn>,
     /// The value of `Deck::layers_asked_for` when this slide's layers were last asked for.
     last_used: u64,
@@ -123,7 +139,7 @@ impl Deck {
         let talk = parse_talk(&source);
         let slides = slide_texts(&talk)
             .into_iter()
-            .map(|text| SlideState { text, laid: None, drawn: HashMap::new(), last_used: 0 })
+            .map(|text| SlideState { text, laid: None, at_moment: None, drawn: HashMap::new(), last_used: 0 })
             .collect();
         Deck {
             files,
@@ -169,6 +185,7 @@ impl Deck {
                     slides.push(SlideState {
                         text,
                         laid: previous.laid.take(),
+                        at_moment: previous.at_moment.take(),
                         drawn: std::mem::take(&mut previous.drawn),
                         last_used: previous.last_used,
                     });
@@ -180,7 +197,7 @@ impl Deck {
                     for scale in drawn.values_mut() {
                         scale.ordered = None;
                     }
-                    slides.push(SlideState { text, laid: None, drawn, last_used });
+                    slides.push(SlideState { text, laid: None, at_moment: None, drawn, last_used });
                 }
             }
         }
@@ -189,7 +206,7 @@ impl Deck {
         self.slides_holding_pictures = slides
             .iter()
             .enumerate()
-            .filter(|(_, slide)| slide.laid.as_ref().is_some_and(|laid| laid.holds_pictures))
+            .filter(|(_, slide)| slide.holds_pictures())
             .map(|(index, _)| index)
             .collect();
         self.slides = slides;
@@ -205,6 +222,7 @@ impl Deck {
         self.files_generation += 1;
         for slide in &mut self.slides {
             slide.laid = None;
+            slide.at_moment = None;
             for scale in slide.drawn.values_mut() {
                 scale.ordered = None;
             }
@@ -282,21 +300,25 @@ impl Deck {
         let laid = self.slides[index].laid.as_ref().expect("the slide was just laid out");
         let layers: Vec<LayerTiming> =
             laid.specs.iter().map(|spec| LayerTiming { click: spec.click, enter: spec.enter }).collect();
-        let steps = layers.iter().filter_map(|layer| layer.click).max().unwrap_or(0);
-        SlideTimeline { steps, layers, transition: laid.transition }
+        SlideTimeline { steps: laid.steps(), layers, transition: laid.transition, animated: laid.asks.animated }
     }
 
-    /// What each layer of the slide draws, before it is drawn at any scale.
+    /// The components on the slide that change as the talk plays, once each.
+    pub fn varying_tags(&mut self, index: usize) -> Vec<String> {
+        self.ensure_laid(index);
+        self.slides[index].laid.as_ref().expect("the slide was just laid out").asks.tags.clone()
+    }
+
+    /// What each layer of the slide draws in its whole state, before it is drawn at any scale.
     pub fn specs(&mut self, index: usize) -> &[LayerSpec] {
-        self.ensure_laid(index);
-        &self.slides[index].laid.as_ref().expect("the slide was just laid out").specs
+        let moment = self.ensure_whole(index);
+        &self.slides[index].laid_at(moment).specs
     }
 
-    /// A slide's specs with what they are drawn from: the fonts, and the talk's files.
+    /// A slide's specs in its whole state, with what they are drawn from: the fonts, and the talk's files.
     pub fn specs_fonts_and_files(&mut self, index: usize) -> (&[LayerSpec], &mut Fonts, &dyn TalkFiles) {
-        self.ensure_laid(index);
-        let laid = self.slides[index].laid.as_ref().expect("the slide was just laid out");
-        (&laid.specs, &mut self.fonts, &*self.files)
+        let moment = self.ensure_whole(index);
+        (&self.slides[index].laid_at(moment).specs, &mut self.fonts, &*self.files)
     }
 
     /// The talk's look.
@@ -308,12 +330,18 @@ impl Deck {
         &mut self.fonts
     }
 
-    /// The slide's layers, first to last, drawn at `scale`.
+    /// The slide's layers in its whole state, first to last, drawn at `scale`: its last step, at time 0.
     pub fn layers(&mut self, index: usize, scale: f32) -> Vec<Arc<Layer>> {
-        self.ensure_laid(index);
+        let whole = self.ensure_whole(index);
+        self.layers_at(index, whole, scale)
+    }
+
+    /// The slide's layers at `moment`, first to last, drawn at `scale`.
+    pub fn layers_at(&mut self, index: usize, moment: Moment, scale: f32) -> Vec<Arc<Layer>> {
+        let moment = self.ensure_laid_at(index, moment);
         self.layers_asked_for += 1;
         self.slides[index].last_used = self.layers_asked_for;
-        let layers = self.drawn_layers(index, scale);
+        let layers = self.drawn_layers(index, moment, scale);
         self.keep_within_budget(index);
         layers
     }
@@ -342,14 +370,21 @@ impl Deck {
         });
     }
 
-    fn drawn_layers(&mut self, index: usize, scale: f32) -> Vec<Arc<Layer>> {
+    /// The layers of slide `index` at `moment`, which `ensure_laid_at` gave.
+    fn drawn_layers(&mut self, index: usize, moment: Moment, scale: f32) -> Vec<Arc<Layer>> {
         let slide = &mut self.slides[index];
-        let laid = slide.laid.as_ref().expect("the slide was just laid out");
         if slide.drawn.len() >= KEPT_SCALES && !slide.drawn.contains_key(&scale.to_bits()) {
             slide.drawn.clear();
         }
-        let drawn = slide.drawn.entry(scale.to_bits()).or_default();
-        if let Some(ordered) = &drawn.ordered {
+        let SlideState { laid, at_moment, drawn, .. } = slide;
+        let laid = match at_moment {
+            Some((at, laid)) if *at == moment => &*laid,
+            _ => laid.as_ref().expect("the slide was just laid out"),
+        };
+        let drawn = drawn.entry(scale.to_bits()).or_default();
+        if let Some((at, ordered)) = &drawn.ordered
+            && *at == moment
+        {
             return ordered.clone();
         }
         let mut by_key = HashMap::new();
@@ -372,7 +407,7 @@ impl Deck {
             ordered.push(layer);
         }
         drawn.by_key = by_key;
-        drawn.ordered = Some(ordered.clone());
+        drawn.ordered = Some((moment, ordered.clone()));
         ordered
     }
 
@@ -388,23 +423,75 @@ impl Deck {
                 return;
             };
             self.slides[furthest].laid = None;
+            self.slides[furthest].at_moment = None;
             self.slides_holding_pictures.remove(&furthest);
             self.pictures.let_go_of_unused();
         }
     }
 
-    /// Lays out slide `index` if it isn't already, which is the one place pictures come into
-    /// memory, so that anything walking the slides stays within the budget.
+    /// Lays out slide `index` at `Moment::START` if it isn't already. This and `ensure_laid_at`
+    /// are the one place pictures come into memory, so that anything walking the slides stays
+    /// within the budget.
     fn ensure_laid(&mut self, index: usize) {
         if self.slides[index].laid.is_some() {
             return;
         }
+        let laid = self.lay_out(index, Moment::START);
+        self.slides[index].laid = Some(laid);
+        self.held_pictures_changed(index);
+    }
+
+    /// The moment slide `index` is the same at as at `moment`. In what the slide doesn't vary
+    /// by, that's the start: a slide no component steps through is at step 0, and one no
+    /// component animates is at time 0. A step past its last is its last.
+    fn moment_of(&mut self, index: usize, moment: Moment) -> Moment {
+        self.ensure_laid(index);
+        let laid = self.slides[index].laid.as_ref().expect("the slide was just laid out");
+        let step = if laid.asks.stepped { moment.step.min(laid.steps()) } else { 0 };
+        let time = if laid.asks.animated && moment.time.is_finite() { moment.time.max(0.0) } else { 0.0 };
+        Moment { step, time }
+    }
+
+    /// Lays out slide `index` in its whole state, and gives the moment that is.
+    fn ensure_whole(&mut self, index: usize) -> Moment {
+        self.ensure_laid(index);
+        let steps = self.slides[index].laid.as_ref().expect("the slide was just laid out").steps();
+        self.ensure_laid_at(index, Moment { step: steps, time: 0.0 })
+    }
+
+    /// Lays out slide `index` at `moment` if it isn't already, and gives the moment it is
+    /// laid out at, which `SlideState::laid_at` finds.
+    fn ensure_laid_at(&mut self, index: usize, moment: Moment) -> Moment {
+        let moment = self.moment_of(index, moment);
+        let slide = &self.slides[index];
+        let known = moment == Moment::START || slide.at_moment.as_ref().is_some_and(|(at, _)| *at == moment);
+        if !known {
+            let laid = self.lay_out(index, moment);
+            self.slides[index].at_moment = Some((moment, laid));
+            self.held_pictures_changed(index);
+        }
+        moment
+    }
+
+    /// Notes whether slide `index` now holds pictures, and lets go of others' if that's over budget.
+    fn held_pictures_changed(&mut self, index: usize) {
+        if self.slides[index].holds_pictures() {
+            self.slides_holding_pictures.insert(index);
+        } else {
+            self.slides_holding_pictures.remove(&index);
+        }
+        self.keep_pictures_within_budget(index);
+    }
+
+    fn lay_out(&mut self, index: usize, moment: Moment) -> Laid {
         let mut env = LayoutEnv {
             fonts: &mut self.fonts,
             registry: &self.registry,
             files: &*self.files,
             pictures: &mut self.pictures,
             components: &mut self.components,
+            moment,
+            asks: ComponentAsks::default(),
         };
         let laid = layout_slide(&self.talk, index, &mut env);
         let source = &self.talk.source;
@@ -425,6 +512,7 @@ impl Deck {
                     place: [rect.x, rect.y, rect.w, rect.h, spec.rotate].map(f32::to_bits),
                     drawing: drawing_fingerprint(&spec.items),
                     files_generation: self.files_generation,
+                    moment: spec.varies.then_some((moment.step, moment.time.to_bits())),
                 }
             })
             .collect();
@@ -434,10 +522,22 @@ impl Deck {
             .iter()
             .flat_map(|spec| &spec.items)
             .any(|item| matches!(item, DisplayItem::Picture { src: Some(_), .. }));
-        self.slides[index].laid = Some(Laid { specs: laid.layers, keys, notices, transition: laid.transition, holds_pictures });
-        if holds_pictures {
-            self.slides_holding_pictures.insert(index);
+        Laid { specs: laid.layers, keys, notices, transition: laid.transition, holds_pictures, asks: laid.asks }
+    }
+}
+
+impl SlideState {
+    /// Whether either of its layouts shows a picture from a file of the talk.
+    fn holds_pictures(&self) -> bool {
+        let at_moment = self.at_moment.as_ref().map(|(_, laid)| laid);
+        self.laid.iter().chain(at_moment).any(|laid| laid.holds_pictures)
+    }
+
+    /// The layout at `moment`, which `Deck::ensure_laid_at` made sure of.
+    fn laid_at(&self, moment: Moment) -> &Laid {
+        match &self.at_moment {
+            Some((at, laid)) if *at == moment => laid,
+            _ => self.laid.as_ref().expect("the slide was just laid out"),
         }
-        self.keep_pictures_within_budget(index);
     }
 }

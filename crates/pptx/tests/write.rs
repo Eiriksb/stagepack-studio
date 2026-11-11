@@ -430,3 +430,44 @@ fn only_web_and_mail_links_are_written() {
     assert!(out.notices.iter().any(|n| n.contains("file:///etc/passwd")), "{:?}", out.notices);
     assert!(out.notices.iter().any(|n| n.contains("javascript:")), "{:?}", out.notices);
 }
+
+mod probes {
+    use toolkit::prelude::*;
+
+    #[component]
+    pub fn Count(ctx: &Ctx) -> Element {
+        text(ctx.steps(3).to_string())
+    }
+
+    #[component]
+    pub fn Wedge() -> Element {
+        path("M0 0 L100 0 L100 100 Z", 100.0, 100.0).fill(Color::parse("red").unwrap())
+    }
+}
+
+fn export_with_probes(source: &str) -> PptxOutput {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = slides_engine::builtin_registry();
+    registry.add(probes::Count_component());
+    registry.add(probes::Wedge_component());
+    let files = || FolderFiles::new(dir.path().to_path_buf());
+    let mut deck = Deck::with_registry(Box::new(files()), Fonts::bundled_only(), source.to_string(), registry);
+    write_pptx(&mut deck, &files()).expect("the export succeeds")
+}
+
+#[test]
+fn a_component_that_varies_is_noted_when_exported() {
+    let out = export_with_probes("# Steps\n\n<Count />\n\n<Count />\n\n---\n\n# Still\n");
+    let wanted = "Slide 1: Count changes as the talk plays, so PowerPoint shows it in its last state";
+    assert_eq!(out.notices.iter().filter(|n| *n == wanted).count(), 1, "{:?}", out.notices);
+    assert!(!out.notices.iter().any(|n| n.starts_with("Slide 2:")), "{:?}", out.notices);
+    let xml = part(&out.bytes, "ppt/slides/slide1.xml");
+    assert!(xml.contains(">3<"), "the last step: {xml}");
+}
+
+#[test]
+fn a_slide_with_a_path_exports_a_freeform_through_write_pptx() {
+    let out = export_with_probes("<Wedge />\n");
+    let xml = part(&out.bytes, "ppt/slides/slide1.xml");
+    assert!(xml.contains("<a:custGeom>") && !xml.contains("<p:pic>"), "{xml}");
+}

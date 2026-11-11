@@ -10,7 +10,7 @@ use crate::timeline::{MAX_CLICK, RegionClick, read_region_timing, read_tag_timin
 use crate::native::placeholder_element;
 use crate::placeholder::placeholder_items;
 use crate::{
-    DisplayItem, Enter, Fonts, LayerSpec, LayoutDef, Notice, PictureCache, Rect, RegionDef, TalkComponents, TalkFiles, Transition, layout_by_name,
+    ComponentAsks, DisplayItem, Enter, Fonts, LayerSpec, LayoutDef, Moment, Notice, PictureCache, Rect, RegionDef, TalkComponents, TalkFiles, Transition, layout_by_name,
 };
 
 pub(crate) const SLIDE_WIDTH: f32 = 1920.0;
@@ -33,6 +33,10 @@ pub struct LayoutEnv<'a> {
     pub files: &'a dyn TalkFiles,
     pub pictures: &'a mut PictureCache,
     pub components: &'a mut TalkComponents,
+    /// The moment components are told the slide is at.
+    pub moment: Moment,
+    /// What the components drawn so far looked at.
+    pub asks: ComponentAsks,
 }
 
 pub struct LaidOutSlide {
@@ -40,6 +44,19 @@ pub struct LaidOutSlide {
     pub notices: Vec<Notice>,
     /// How the slide is played on arriving at it.
     pub transition: Transition,
+    /// What the slide's components looked at.
+    pub asks: ComponentAsks,
+}
+
+/// Runs `lay_out` with what components look at noted apart, then adds that to the rest,
+/// and says whether what it laid out changes with the moment.
+fn noting_asks<'e, T>(env: &mut LayoutEnv<'e>, lay_out: impl FnOnce(&mut LayoutEnv<'e>) -> T) -> (T, bool) {
+    let before = std::mem::take(&mut env.asks);
+    let laid = lay_out(env);
+    let asks = std::mem::replace(&mut env.asks, before);
+    let varies = asks.varies();
+    env.asks.add(asks);
+    (laid, varies)
 }
 
 /// The talk's look, which its first slide's settings decide.
@@ -66,6 +83,7 @@ pub fn layout_slide(talk: &Talk, index: usize, env: &mut LayoutEnv) -> LaidOutSl
     let slide = &talk.slides[index];
     let theme = talk_theme(talk);
     env.components.new_layout();
+    env.asks = ComponentAsks::default();
     let mut notices: Vec<Notice> = slide
         .inline_tags
         .iter()
@@ -75,7 +93,7 @@ pub fn layout_slide(talk: &Talk, index: usize, env: &mut LayoutEnv) -> LaidOutSl
     if let Some(error) = &slide.error {
         notices.push(Notice(error.message.clone()));
         layers.push(error_layer(slide, &error.message, &theme, env.fonts));
-        return LaidOutSlide { layers, notices, transition: Transition::None };
+        return LaidOutSlide { layers, notices, transition: Transition::None, asks: std::mem::take(&mut env.asks) };
     }
     let transition = read_transition(slide.settings.as_ref().and_then(|settings| settings.get("transition")), &mut notices);
     let layout = slide_layout(slide, &mut notices);
@@ -102,7 +120,8 @@ pub fn layout_slide(talk: &Talk, index: usize, env: &mut LayoutEnv) -> LaidOutSl
                     region.name
                 )));
             } else {
-                let pieces = flow_region_each(blocks, region, rect.w, &theme, env, &mut notices);
+                let (pieces, varies) =
+                    noting_asks(env, |env| flow_region_each(blocks, region, rect.w, &theme, env, &mut notices));
                 if !pieces.is_empty() {
                     for (step, piece) in pieces.into_iter().enumerate() {
                         let rect = Rect { x: rect.x + piece.rect.x, y: rect.y + piece.rect.y, ..piece.rect };
@@ -116,6 +135,7 @@ pub fn layout_slide(talk: &Talk, index: usize, env: &mut LayoutEnv) -> LaidOutSl
                             native: piece.native,
                             // A slide has one title, so only the first piece is it.
                             is_title: is_title && step == 0,
+                            varies,
                         });
                     }
                     continue;
@@ -123,17 +143,19 @@ pub fn layout_slide(talk: &Talk, index: usize, env: &mut LayoutEnv) -> LaidOutSl
                 click = Some(1);
             }
         }
-        let (items, native) = flow_region(blocks, region, rect.w, &theme, env, &mut notices);
-        layers.push(LayerSpec { source: Some(source), rect, rotate, items, click, enter: timing.enter, native, is_title });
+        let ((items, native), varies) = noting_asks(env, |env| flow_region(blocks, region, rect.w, &theme, env, &mut notices));
+        layers.push(LayerSpec { source: Some(source), rect, rotate, items, click, enter: timing.enter, native, is_title, varies });
     }
     for block in &slide.blocks {
         if let Block::Tag(tag) = block
             && is_positioned(tag)
         {
-            layers.push(positioned_layer(tag, &theme, env, &mut notices));
+            let (mut layer, varies) = noting_asks(env, |env| positioned_layer(tag, &theme, env, &mut notices));
+            layer.varies = varies;
+            layers.push(layer);
         }
     }
-    LaidOutSlide { layers, notices, transition }
+    LaidOutSlide { layers, notices, transition, asks: std::mem::take(&mut env.asks) }
 }
 
 /// The placement numbers a tag gives. One that can't be read counts as absent, and the
@@ -194,6 +216,7 @@ fn positioned_layer(tag: &Tag, theme: &Theme, env: &mut LayoutEnv, notices: &mut
         enter: place.enter,
         native,
         is_title: false,
+        varies: false,
     }
 }
 
@@ -209,6 +232,7 @@ fn error_layer(slide: &Slide, message: &str, theme: &Theme, fonts: &mut Fonts) -
         enter: Enter::Appear,
         native: vec![placeholder_element(message, rect, theme)],
         is_title: false,
+        varies: false,
     }
 }
 
@@ -297,5 +321,6 @@ fn background(theme: &Theme) -> LayerSpec {
         enter: Enter::Appear,
         native: Vec::new(),
         is_title: false,
+        varies: false,
     }
 }
