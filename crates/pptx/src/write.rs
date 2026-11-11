@@ -342,7 +342,7 @@ pub fn write_pptx(deck: &mut Deck, files: &dyn TalkFiles) -> Result<PptxOutput, 
     let mut slide_refs = Vec::new();
     let mut notes_count = 0;
     for (index, note) in notes.iter().enumerate() {
-        notices.extend(deck.notices(index).into_iter().map(|n| format!("Slide {}: {n}", index + 1)));
+        notices.extend(deck.notices_whole(index).into_iter().map(|n| format!("Slide {}: {n}", index + 1)));
         let timeline = deck.timeline(index);
         notices.extend(
             deck.varying_tags(index)

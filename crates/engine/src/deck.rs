@@ -289,9 +289,16 @@ impl Deck {
         self.talk.slides.first()?.settings.as_ref()?.get("title").map(str::to_string)
     }
 
+    /// What the slide says about itself at its start.
     pub fn notices(&mut self, index: usize) -> Vec<String> {
         self.ensure_laid(index);
         self.slides[index].laid.as_ref().map(|laid| laid.notices.clone()).unwrap_or_default()
+    }
+
+    /// What the slide says about itself in its whole state, which `specs` and `layers` draw.
+    pub fn notices_whole(&mut self, index: usize) -> Vec<String> {
+        let moment = self.ensure_whole(index);
+        self.slides[index].laid_at(moment).notices.clone()
     }
 
     /// The slide's notes, if it has any.

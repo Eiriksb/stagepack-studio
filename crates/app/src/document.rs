@@ -254,7 +254,8 @@ impl Document {
 
     /// What the user should hear about the current slide.
     pub fn notices(&mut self) -> Vec<String> {
-        self.deck.notices(self.current)
+        // The window shows the slide in its whole state, so these are its notices.
+        self.deck.notices_whole(self.current)
     }
 
     pub fn source(&self) -> &str {

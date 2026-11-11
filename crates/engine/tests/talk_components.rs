@@ -446,6 +446,12 @@ mod probes {
         text(ctx.asset_text("assets/a.txt").unwrap_or_else(|| "nothing".to_string()))
     }
 
+    /// Text at first, and a problem from its first click on.
+    #[component]
+    pub fn Late(ctx: &Ctx) -> Element {
+        if ctx.steps(1) >= 1 { toolkit::problem("Late trouble") } else { text("early") }
+    }
+
     /// A stack of 20,000 empty shapes.
     #[component]
     pub fn Crowd() -> Element {
@@ -484,6 +490,7 @@ fn probe_registry() -> Registry {
     registry.add(probes::Twice_component());
     registry.add(probes::Crowd_component());
     registry.add(probes::Echo_component());
+    registry.add(probes::Late_component());
     registry
 }
 
@@ -853,4 +860,14 @@ fn an_asset_that_appears_draws_a_talks_component_again() {
     files.put("assets/a.txt", "here");
     assert_eq!(deck.refresh_components(), [0]);
     assert!(shows(&mut deck, 0, "yes"), "{:?}", texts(&mut deck, 0));
+}
+
+#[test]
+fn the_whole_slides_notices_are_those_of_what_it_draws() {
+    let files = Files::default();
+    files.put("slides.md", "<Late />\n");
+    let mut deck = open_with(&files, probe_registry());
+    assert!(deck.notices(0).is_empty(), "at the start: {:?}", deck.notices(0));
+    assert_eq!(deck.notices_whole(0), ["Late trouble"]);
+    assert!(texts(&mut deck, 0).contains(&"Late trouble".to_string()), "the whole slide draws it");
 }
