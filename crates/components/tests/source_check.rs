@@ -100,6 +100,41 @@ fn a_way_around_the_scan_is_refused() {
         "---\n/*\n---\nconst X: &str = include_str!(\"x\");\n// */\n{}",
         above_a_component("")
     ));
+
+    // U+0558 is part of a name for the lexer here and unknown to rustc 1.98, which drops
+    // it, carries on and reads the file. It's the same for a literal's suffix.
+    let unknown = '\u{558}';
+    assert_refused(&in_a_component(&format!(r#"let a = include_str{unknown}!("x");"#)));
+    assert_refused(&in_a_component(&format!(r#"let a = {unknown}include_str!("x");"#)));
+    assert_refused(&above_a_component(&format!("mod{unknown} a;")));
+    assert_refused(&in_a_component(&format!(r#"let a = 1{unknown}include_str!("x");"#)));
+    assert_refused(&in_a_component(&format!(r#"let a = "b"{unknown}include_str!("x");"#)));
+    assert_refused(&in_a_component(&format!(r##"let a = r#"b"#{unknown}include_str!("x");"##)));
+    assert_refused(&in_a_component(&format!(r#"let a = 'b'{unknown}include_str!("x");"#)));
+}
+
+#[test]
+fn a_name_can_only_use_ascii() {
+    let refusals = check_source(FILE, "#[component]\nfn A() -> Element {\n    let æ = 1;\n    text(\"a\")\n}\n").unwrap_err();
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert_eq!(refusals[0].line, 3);
+    assert_eq!(refusals[0].message, "Names in a component can only use ASCII letters, digits and underscores");
+    // A lifetime is a name as well.
+    assert_refused(&in_a_component("let a: &'\u{558}b str = \"\";"));
+}
+
+#[test]
+fn text_in_any_language_is_fine_in_strings_and_comments() {
+    for body in [
+        "let a = \"æøå \u{558}\";",
+        "// æøå \u{558}",
+        "/* æøå \u{558} */",
+        "/// æøå \u{558}\nlet a = 1;",
+        "let a = 'æ';",
+        "let a = r#\"æ\u{558}\"#;",
+    ] {
+        assert_allowed(&in_a_component(body));
+    }
 }
 
 #[test]

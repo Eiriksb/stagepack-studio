@@ -6,10 +6,14 @@
 //! every group, including the input of macros. For that to be enough, what the tokens say
 //! has to be what `rustc` will do, which is why a file that won't lex is refused, a file
 //! `rustc` would read differently from the lexer here is refused, and so is `macro_rules`.
+//! Names are refused unless they're ASCII, literal suffixes and lifetimes included: the
+//! lexer here knows a newer Unicode than `rustc` does, and takes characters into a name
+//! that `rustc` drops, so `include_str` followed by U+0558 is one unknown name here, and
+//! `include_str` there.
 
 use std::str::FromStr;
 
-use proc_macro2::{Delimiter, Group, Ident, Span, TokenStream, TokenTree};
+use proc_macro2::{Delimiter, Group, Ident, Literal, Span, TokenStream, TokenTree};
 
 use crate::Diagnostic;
 
@@ -104,6 +108,19 @@ fn function_after(trees: &[TokenTree], start: usize) -> Option<&Ident> {
     None
 }
 
+const ONLY_ASCII_NAMES: &str = "Names in a component can only use ASCII letters, digits and underscores";
+
+/// The suffix of a literal, such as `u8` in `1u8`, which is a name too. For a number it's
+/// all of the literal, which is fine here, as only whether it's ASCII is asked.
+fn suffix_of(literal: &Literal) -> String {
+    let text = literal.to_string();
+    // A suffix can't hold a quote, so the last one closes the string or character.
+    match text.rfind(['"', '\'']) {
+        Some(end) => text[end + 1..].trim_start_matches('#').to_string(),
+        None => text,
+    }
+}
+
 struct Found {
     at: (u32, u32),
     message: String,
@@ -128,6 +145,10 @@ impl Scan {
 
     fn read_word(&mut self, ident: &Ident, trees: &[TokenTree], index: usize, place: Place) {
         let word = word_of(ident);
+        if !word.is_ascii() {
+            self.refuse(ident.span(), ONLY_ASCII_NAMES.to_string());
+            return;
+        }
         if let Some(reason) = why_never_allowed(&word) {
             self.refuse(ident.span(), format!("`{word}` can't be used in a component, as {reason}"));
         }
@@ -190,6 +211,9 @@ fn walk(stream: TokenStream) -> Scan {
                         scan.read_attribute(group, &trees, index);
                     }
                     levels.push((group.stream().into_iter().collect(), inside));
+                }
+                TokenTree::Literal(literal) if !suffix_of(literal).is_ascii() => {
+                    scan.refuse(literal.span(), ONLY_ASCII_NAMES.to_string());
                 }
                 TokenTree::Punct(_) | TokenTree::Literal(_) => {}
             }
