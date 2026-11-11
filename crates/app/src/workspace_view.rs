@@ -36,7 +36,7 @@ use crate::ribbon::{Panels, Ribbon};
 use crate::saving::{SaveError, SaveJob, SaveTarget, Saved};
 use crate::slide_canvas::{ScaleChanged, SlideCanvas};
 use crate::slide_strip::{
-    STRIP_CONTEXT, STRIP_MAX_WIDTH, STRIP_MIN_WIDTH, STRIP_WIDTH, SlideStrip,
+    self, STRIP_CONTEXT, STRIP_MAX_WIDTH, STRIP_MIN_WIDTH, STRIP_WIDTH, SlideStrip,
 };
 use crate::watcher::{self, Change};
 
@@ -156,6 +156,14 @@ pub struct SelectSlide {
     pub index: usize,
 }
 
+/// Moves slide `from` so that it's slide `to` afterwards.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = stagepack_studio, no_json)]
+pub struct MoveSlideTo {
+    pub from: usize,
+    pub to: usize,
+}
+
 /// The window's shortcuts, and a show's. Call once, after `gpui_kit::init`.
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -183,6 +191,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("f5", Present, Some(KEY_CONTEXT)),
         KeyBinding::new("shift-f5", Rehearse, Some(KEY_CONTEXT)),
     ]);
+    slide_strip::bind_keys(cx);
     present_view::bind_keys(cx);
 }
 
@@ -1145,6 +1154,9 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &ToggleHidden, _, cx| this.toggle_hidden(cx)))
             .on_action(cx.listener(|this, _: &MoveSlideUp, _, cx| this.move_slide(false, cx)))
             .on_action(cx.listener(|this, _: &MoveSlideDown, _, cx| this.move_slide(true, cx)))
+            .on_action(cx.listener(|this, action: &MoveSlideTo, _, cx| {
+                this.move_slide_to(action.from, action.to, cx)
+            }))
             .on_action(cx.listener(|this, _: &Undo, _, cx| this.step_history(Document::undo, cx)))
             .on_action(cx.listener(|this, _: &Redo, _, cx| this.step_history(Document::redo, cx)))
             .on_action(cx.listener(|this, _: &OpenFolder, _, cx| this.ask_to_open(true, cx)))

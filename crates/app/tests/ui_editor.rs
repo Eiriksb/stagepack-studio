@@ -6,8 +6,9 @@ use std::sync::Arc;
 
 use gpui_kit::test::{TestQueryExt, TestWindowExt};
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext, Bounds, Context, Entity, Point, RenderImage, TestAppContext,
-    Window, WindowBounds, WindowOptions, px, size,
+    AnyWindowHandle, App, AppContext, Bounds, Context, Entity, InputEvent as _, Modifiers,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, RenderImage,
+    TestAppContext, Window, WindowBounds, WindowOptions, point, px, size,
 };
 use slides_engine::{Fonts, pack_folder};
 use slides_format::is_hidden;
@@ -19,7 +20,7 @@ use stagepack_studio::ribbon::{
     SLIDE_LIST_TOGGLE_ID, TAB_ANIMATE_ID, TAB_HOME_ID, TAB_INSERT_ID, TAB_SLIDE_SHOW_ID,
     TAB_VIEW_ID, UNDO_ID,
 };
-use stagepack_studio::slide_strip::{STRIP_ID, strip_row_id};
+use stagepack_studio::slide_strip::{DRAG_PICTURE_ID, DROP_LINE_ID, STRIP_ID, strip_row_id};
 use stagepack_studio::workspace_view::{self, CANVAS_ID, MARKDOWN_ID, TITLE_ID, WorkspaceView};
 
 const THREE: &str = "---\ntitle: T\n---\n\n# One\n\n---\n\n# Two\n\n---\n\n# Three\n";
@@ -857,4 +858,445 @@ fn typing_blank_lines_and_spaces_in_notes_keeps_the_caret(cx: &mut TestAppContex
     settle(cx, handle);
     assert_eq!(notes_text(cx, &view), "a\n\n\n  bc");
     assert_eq!(notes_of(cx, &view, 0).as_deref(), Some("a\n\n\n  bc"));
+}
+
+/// Where in row `index` the pointer is, `down` of the way from its top.
+fn in_row(
+    cx: &mut TestAppContext,
+    handle: AnyWindowHandle,
+    index: usize,
+    down: f32,
+) -> Point<Pixels> {
+    with_window(cx, handle, |window, _| {
+        let row = window.find(strip_row_id(index)).bounds();
+        point(row.center().x, row.top() + row.size.height * down)
+    })
+}
+
+/// Presses on `from` and moves the pointer to `to` in steps, as a hand does, without letting
+/// go.
+fn press_and_move(
+    cx: &mut TestAppContext,
+    handle: AnyWindowHandle,
+    from: Point<Pixels>,
+    to: Point<Pixels>,
+) {
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let event = |position| MouseMoveEvent {
+            position,
+            pressed_button: None,
+            modifiers: Modifiers::default(),
+        };
+        window.dispatch_event(event(from).to_platform_input(), cx);
+        window.render_frame(cx);
+        window.dispatch_event(
+            MouseDownEvent {
+                button: MouseButton::Left,
+                position: from,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+    })
+    .unwrap();
+    move_to(cx, handle, from, to);
+}
+
+/// Moves the pointer, held down, from `from` to `to` in steps.
+fn move_to(
+    cx: &mut TestAppContext,
+    handle: AnyWindowHandle,
+    from: Point<Pixels>,
+    to: Point<Pixels>,
+) {
+    cx.update_window(handle, |_, window, cx| {
+        for step in 1..=8 {
+            let fraction = step as f32 / 8.;
+            let position = point(
+                from.x + (to.x - from.x) * fraction,
+                from.y + (to.y - from.y) * fraction,
+            );
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position,
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Modifiers::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+        }
+    })
+    .unwrap();
+    settle(cx, handle);
+}
+
+fn release(cx: &mut TestAppContext, handle: AnyWindowHandle, at: Point<Pixels>) {
+    cx.update_window(handle, |_, window, cx| {
+        window.dispatch_event(
+            MouseUpEvent {
+                button: MouseButton::Left,
+                position: at,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+    })
+    .unwrap();
+    settle(cx, handle);
+}
+
+/// Drags row `from` with the mouse and lets go `down` of the way into row `to`.
+fn drag_row(cx: &mut TestAppContext, handle: AnyWindowHandle, from: usize, to: usize, down: f32) {
+    let start = in_row(cx, handle, from, 0.5);
+    let end = in_row(cx, handle, to, down);
+    press_and_move(cx, handle, start, end);
+    release(cx, handle, end);
+}
+
+/// The headings of the slides, in the order the talk has them.
+fn order(cx: &TestAppContext, view: &Entity<WorkspaceView>) -> Vec<String> {
+    cx.read(|cx| {
+        let document = view.read(cx).document().unwrap().read(cx);
+        let talk = document.talk();
+        talk.slides
+            .iter()
+            .map(|slide| {
+                talk.source[slide.range.clone()]
+                    .lines()
+                    .find_map(|line| line.strip_prefix("# "))
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    })
+}
+
+fn can_undo(cx: &TestAppContext, view: &Entity<WorkspaceView>) -> bool {
+    document(cx, view).read_with(cx, |document, _| document.can_undo())
+}
+
+#[gpui_kit::test]
+fn dragging_a_row_down_moves_the_slide_there(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, THREE);
+    drag_row(cx, handle, 0, 2, 0.75);
+    assert_eq!(order(cx, &view), ["Two", "Three", "One"]);
+    assert_eq!(current(cx, &view), 2, "the moved slide is the one in hand");
+    assert_eq!(title(cx, handle), "• T · 3 / 3");
+    with_window(cx, handle, |window, _| {
+        assert_eq!(window.find(strip_row_id(2)).selected(), Some(true));
+    });
+
+    // Between two rows.
+    drag_row(cx, handle, 0, 2, 0.25);
+    assert_eq!(order(cx, &view), ["Three", "Two", "One"]);
+    assert_eq!(current(cx, &view), 1);
+}
+
+#[gpui_kit::test]
+fn dragging_a_row_up(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, THREE);
+    drag_row(cx, handle, 2, 0, 0.25);
+    assert_eq!(order(cx, &view), ["Three", "One", "Two"]);
+    assert_eq!(current(cx, &view), 0);
+    drag_row(cx, handle, 2, 1, 0.25);
+    assert_eq!(order(cx, &view), ["Three", "Two", "One"]);
+}
+
+#[gpui_kit::test]
+fn dropping_a_row_on_itself_changes_nothing(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, THREE);
+    // A little way within itself, and to the line just under it: either way it lands
+    // where it is.
+    drag_row(cx, handle, 1, 1, 0.8);
+    drag_row(cx, handle, 1, 2, 0.2);
+    drag_row(cx, handle, 1, 0, 0.8);
+    assert_eq!(source(cx, &view), THREE);
+    assert!(!can_undo(cx, &view), "no step to undo");
+    assert_eq!(title(cx, handle), "T · 1 / 3", "nothing unsaved");
+}
+
+#[gpui_kit::test]
+fn the_line_shows_where_it_will_land(cx: &mut TestAppContext) {
+    let (handle, _) = open(cx, THREE);
+    with_window(cx, handle, |window, _| {
+        assert!(window.try_find(DROP_LINE_ID).is_none(), "no drag, no line");
+        assert!(window.try_find(DRAG_PICTURE_ID).is_none());
+    });
+    let start = in_row(cx, handle, 0, 0.5);
+    let between = in_row(cx, handle, 2, 0.25);
+    press_and_move(cx, handle, start, between);
+    with_window(cx, handle, |window, _| {
+        let line = window.find(DROP_LINE_ID).bounds();
+        let row = window.find(strip_row_id(2)).bounds();
+        assert!(
+            (line.center().y - row.top()).abs() <= px(3.),
+            "between the second row and the third: {line:?} {row:?}"
+        );
+        let picture = window.find(DRAG_PICTURE_ID);
+        assert!(picture.visible());
+        assert!(
+            picture.bounds().contains(&between),
+            "the picture is under the pointer: {:?}",
+            picture.bounds()
+        );
+    });
+    let after = in_row(cx, handle, 2, 0.75);
+    move_to(cx, handle, between, after);
+    with_window(cx, handle, |window, _| {
+        let line = window.find(DROP_LINE_ID).bounds();
+        let row = window.find(strip_row_id(2)).bounds();
+        assert!(
+            (line.center().y - row.bottom()).abs() <= px(3.),
+            "after the last row: {line:?} {row:?}"
+        );
+    });
+    // Back over where it is, it would land where it is.
+    let home = in_row(cx, handle, 0, 0.6);
+    move_to(cx, handle, after, home);
+    with_window(cx, handle, |window, _| {
+        assert!(window.try_find(DROP_LINE_ID).is_none());
+        assert!(window.find(DRAG_PICTURE_ID).visible());
+    });
+    release(cx, handle, home);
+    with_window(cx, handle, |window, _| {
+        assert!(window.try_find(DROP_LINE_ID).is_none(), "gone when dropped");
+        assert!(window.try_find(DRAG_PICTURE_ID).is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn escape_cancels_a_drag(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, THREE);
+    let start = in_row(cx, handle, 0, 0.5);
+    let end = in_row(cx, handle, 2, 0.75);
+    press_and_move(cx, handle, start, end);
+    with_window(cx, handle, |window, _| {
+        assert!(window.find(DROP_LINE_ID).visible());
+    });
+    keys(cx, handle, "escape");
+    with_window(cx, handle, |window, _| {
+        assert!(window.try_find(DROP_LINE_ID).is_none());
+        assert!(window.try_find(DRAG_PICTURE_ID).is_none());
+    });
+    release(cx, handle, end);
+    assert_eq!(source(cx, &view), THREE);
+    assert!(!can_undo(cx, &view));
+}
+
+#[gpui_kit::test]
+fn letting_go_outside_the_list_changes_nothing(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, THREE);
+    let start = in_row(cx, handle, 0, 0.5);
+    let outside = with_window(cx, handle, |window, _| {
+        window.find(CANVAS_ID).bounds().center()
+    });
+    press_and_move(cx, handle, start, outside);
+    with_window(cx, handle, |window, _| {
+        assert!(window.try_find(DROP_LINE_ID).is_none(), "nowhere to land");
+    });
+    release(cx, handle, outside);
+    assert_eq!(source(cx, &view), THREE);
+    with_window(cx, handle, |window, _| {
+        assert!(window.try_find(DRAG_PICTURE_ID).is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn one_undo_puts_a_dragged_slide_back(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, THREE);
+    drag_row(cx, handle, 0, 2, 0.75);
+    assert_ne!(source(cx, &view), THREE);
+    with_window(cx, handle, |window, _| {
+        assert_eq!(window.find(UNDO_ID).description(), Some("Undo Move slide"));
+    });
+    keys(cx, handle, "ctrl-z");
+    assert_eq!(source(cx, &view), THREE, "the bytes it had");
+    assert!(!can_undo(cx, &view), "one step");
+    assert_eq!(current(cx, &view), 0, "back where it was, in hand");
+}
+
+#[gpui_kit::test]
+fn dragging_near_the_bottom_scrolls_the_list(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, &many_slides(30));
+    let start = in_row(cx, handle, 0, 0.5);
+    let bottom = with_window(cx, handle, |window, _| {
+        let strip = window.find(STRIP_ID).bounds();
+        point(strip.center().x, strip.bottom() - px(4.))
+    });
+    press_and_move(cx, handle, start, bottom);
+    // Held there, it goes on scrolling to the end, a little at a time.
+    for _ in 0..400 {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(20));
+        cx.run_until_parked();
+    }
+    settle(cx, handle);
+    with_window(cx, handle, |window, _| {
+        assert!(window.try_find(strip_row_id(0)).is_none(), "scrolled away");
+        assert!(window.try_find(strip_row_id(29)).is_some(), "to the end");
+        let line = window.find(DROP_LINE_ID).bounds();
+        let last = window.find(strip_row_id(29)).bounds();
+        assert!(
+            (line.center().y - last.bottom()).abs() <= px(3.),
+            "{line:?} {last:?}"
+        );
+    });
+    release(cx, handle, bottom);
+    assert_eq!(order(cx, &view).last().map(String::as_str), Some("Slide 0"));
+    assert_eq!(current(cx, &view), 29);
+}
+
+/// Opens the menu of row `row`.
+fn open_rows_menu(cx: &mut TestAppContext, handle: AnyWindowHandle, row: usize) {
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.right_click(strip_row_id(row), cx);
+    })
+    .unwrap();
+    settle(cx, handle);
+}
+
+/// Opens the menu of row `row` and picks its item `item`.
+fn pick_from_rows_menu(cx: &mut TestAppContext, handle: AnyWindowHandle, row: usize, item: usize) {
+    open_rows_menu(cx, handle, row);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.within("popup-menu").click(item, cx);
+    })
+    .unwrap();
+    settle(cx, handle);
+}
+
+const MENU: [&str; 6] = [
+    "New slide",
+    "Duplicate",
+    "Delete",
+    "Hide",
+    "Move up",
+    "Move down",
+];
+
+#[gpui_kit::test]
+fn the_rows_menu_does_each_thing(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, THREE);
+    open_rows_menu(cx, handle, 1);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let menu = window.within("popup-menu");
+        let items: Vec<_> = (0..MENU.len())
+            .map(|item| menu.find(item).label().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(items, MENU);
+        assert!(menu.try_find(MENU.len()).is_none(), "nothing else");
+        window.press("escape", cx);
+    })
+    .unwrap();
+    settle(cx, handle);
+    assert_eq!(current(cx, &view), 1, "the row's slide is the one in hand");
+
+    // Each acts on the row's own slide, not the one that was in hand.
+    click(cx, handle, strip_row_id(0));
+    pick_from_rows_menu(cx, handle, 1, 0);
+    assert_eq!(order(cx, &view), ["One", "Two", "", "Three"], "New slide");
+    assert_eq!(current(cx, &view), 2);
+
+    pick_from_rows_menu(cx, handle, 3, 1);
+    assert_eq!(
+        order(cx, &view),
+        ["One", "Two", "", "Three", "Three"],
+        "Duplicate"
+    );
+
+    pick_from_rows_menu(cx, handle, 2, 2);
+    assert_eq!(order(cx, &view), ["One", "Two", "Three", "Three"], "Delete");
+
+    pick_from_rows_menu(cx, handle, 0, 3);
+    assert!(hidden(cx, &view, 0), "Hide");
+    open_rows_menu(cx, handle, 0);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.within("popup-menu").find(3usize).label(),
+            Some("Show")
+        );
+        window.press("escape", cx);
+    })
+    .unwrap();
+    settle(cx, handle);
+    pick_from_rows_menu(cx, handle, 0, 3);
+    assert!(!hidden(cx, &view, 0), "Show");
+
+    pick_from_rows_menu(cx, handle, 1, 4);
+    assert_eq!(
+        order(cx, &view),
+        ["Two", "One", "Three", "Three"],
+        "Move up"
+    );
+    assert_eq!(current(cx, &view), 0);
+
+    pick_from_rows_menu(cx, handle, 0, 5);
+    assert_eq!(
+        order(cx, &view),
+        ["One", "Two", "Three", "Three"],
+        "Move down"
+    );
+    assert_eq!(current(cx, &view), 1);
+}
+
+#[gpui_kit::test]
+fn move_up_is_disabled_for_the_first_slide(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, THREE);
+    pick_from_rows_menu(cx, handle, 0, 4);
+    assert_eq!(source(cx, &view), THREE);
+    assert!(!can_undo(cx, &view));
+    with_window(cx, handle, |window, _| {
+        assert!(
+            window.try_find("popup-menu").is_some(),
+            "a disabled item doesn't take the click, so the menu stays"
+        );
+    });
+    keys(cx, handle, "escape");
+
+    // And Move down for the last, and Delete for the only one.
+    pick_from_rows_menu(cx, handle, 2, 5);
+    assert_eq!(source(cx, &view), THREE);
+    keys(cx, handle, "escape");
+    let (handle, view) = open(cx, "# Only\n");
+    pick_from_rows_menu(cx, handle, 0, 2);
+    assert_eq!(count(cx, &view), 1);
+    assert!(!can_undo(cx, &view));
+}
+
+#[gpui_kit::test]
+fn the_list_scrolled_to_its_end_draws_each_thumbnail_once(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, &many_slides(30));
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.scroll(
+            STRIP_ID,
+            gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-10_000.))),
+            cx,
+        );
+    })
+    .unwrap();
+    settle(cx, handle);
+    assert!(rows_on_screen(cx, handle, 30) < 30);
+    with_window(cx, handle, |window, _| {
+        assert!(window.try_find(strip_row_id(29)).is_some(), "at the end");
+    });
+    assert!(thumbnail(cx, &view, 29).is_some());
+    let drawn_at_the_end = drawn(cx, &view);
+    settle(cx, handle);
+    assert_eq!(drawn(cx, &view), drawn_at_the_end, "nothing drawn again");
+    assert!(drawn_at_the_end <= 30, "{drawn_at_the_end}");
 }

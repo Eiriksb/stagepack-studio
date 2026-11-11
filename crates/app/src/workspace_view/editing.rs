@@ -133,6 +133,21 @@ impl WorkspaceView {
         );
     }
 
+    /// Moves slide `from` so that it's slide `to` afterwards, if both are slides of the talk.
+    pub(super) fn move_slide_to(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        self.edit(
+            |document| {
+                let count = document.slide_count();
+                if from != to && from < count && to < count {
+                    document.move_slide(from, to)
+                } else {
+                    Ok(Vec::new())
+                }
+            },
+            cx,
+        );
+    }
+
     fn panels(&self) -> Panels {
         Panels {
             notes: self.show_notes,
