@@ -39,7 +39,8 @@ const TOP_PADDING: f32 = 16.0;
 const RIGHT_PADDING: f32 = 24.0;
 /// Between the plot and the labels beside and below it.
 const LABEL_MARGIN: f32 = 12.0;
-const TICKS: usize = 5;
+/// The most intervals between ticks on an axis.
+const MAX_INTERVALS: i64 = 6;
 
 const GROUP_SHARE: f32 = 0.8;
 const LINE_WIDTH: f32 = 6.0;
@@ -71,18 +72,6 @@ pub enum ChartKind {
 pub struct ChartData {
     pub labels: Vec<String>,
     pub series: Vec<(String, Vec<f64>)>,
-}
-
-/// The smallest of 1, 2, 5 or 10 times a power of ten at or above `value`, and 1 for 0.
-/// What isn't a positive, finite number counts as 0.
-pub fn nice_ceiling(value: f64) -> f64 {
-    if !(value > 0.0 && value.is_finite()) {
-        return 1.0;
-    }
-    // So that the power of ten, and ten times it, are finite and not 0.
-    let value = value.clamp(1e-300, 1e300);
-    let power = 10f64.powi(value.log10().floor() as i32);
-    [1.0, 2.0, 5.0, 10.0].into_iter().map(|step| step * power).find(|nice| *nice >= value * (1.0 - 1e-12)).unwrap_or(10.0 * power)
 }
 
 /// "1 label", "3 labels".
@@ -333,25 +322,61 @@ fn at_width(x: f32, y: f32, width: f32, element: Element) -> Placed {
     Placed { x, y, width, align: TextAlign::Left, element }
 }
 
-/// A tick's label: short, so that it fits beside the plot.
-fn tick_label(value: f64, top: f64) -> String {
-    if value == 0.0 {
-        return "0".to_string();
+/// A value axis: ticks at whole multiples of `step`, from `low` to `high`, with 0 among them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Axis {
+    pub low: f64,
+    pub high: f64,
+    pub step: f64,
+    /// The ticks, as whole multiples of `step`.
+    first: i64,
+    last: i64,
+    /// The decimals that write a tick exactly.
+    decimals: usize,
+}
+
+impl Axis {
+    /// The ticks' values, lowest first.
+    pub fn ticks(&self) -> Vec<f64> {
+        (self.first..=self.last).map(|index| index as f64 * self.step).collect()
     }
-    let trimmed = |text: String| {
-        if text.contains('.') { text.trim_end_matches('0').trim_end_matches('.').to_string() } else { text }
-    };
-    let scale = top.abs();
-    if scale < 0.01 {
-        let text = format!("{value:.2e}");
-        let (mantissa, exponent) = text.split_once('e').unwrap_or((&text, "0"));
-        return format!("{}e{exponent}", trimmed(mantissa.to_string()));
+
+    /// The ticks as they are written, without the noise of floating point.
+    pub fn labels(&self) -> Vec<String> {
+        self.ticks()
+            .into_iter()
+            .map(|value| {
+                let text = format!("{value:.*}", self.decimals);
+                // 2.5, 5 and 7.5 rather than 2.5, 5.0 and 7.5.
+                let text = if text.contains('.') { text.trim_end_matches('0').trim_end_matches('.') } else { &text };
+                // So that a tick a hair below 0 isn't written "-0".
+                if text == "-0" { "0".to_string() } else { text.to_string() }
+            })
+            .collect()
     }
-    let (divisor, suffix) = [(1e12, "T"), (1e9, "B"), (1e6, "M"), (1e4, "K")]
-        .into_iter()
-        .find(|(divisor, _)| scale >= *divisor)
-        .unwrap_or((1.0, ""));
-    format!("{}{suffix}", trimmed(format!("{:.3}", value / divisor)))
+}
+
+/// The axis for values from `smallest` to `largest`: the smallest step of 1, 2, 2.5 or 5
+/// times a power of ten that covers them, and 0, in at most 6 intervals.
+pub fn axis_for(smallest: f64, largest: f64) -> Axis {
+    let finite = |value: f64| if value.is_finite() { value } else { 0.0 };
+    let (low, high) = (finite(smallest).min(0.0), finite(largest).max(0.0));
+    // With nothing, or next to nothing, to show, the axis runs to 1.
+    let (low, high) = if high - low < 1e-290 { (0.0, 1.0) } else { (low, high) };
+    let start = ((high - low) / MAX_INTERVALS as f64).log10().floor() as i32 - 1;
+    for exponent in start..start + 3 {
+        for (mantissa, extra) in [(1.0, 0), (2.0, 0), (2.5, 1), (5.0, 0)] {
+            let step = mantissa * 10f64.powi(exponent);
+            let first = (low / step + 1e-9).floor();
+            let last = (high / step - 1e-9).ceil();
+            if last - first <= MAX_INTERVALS as f64 {
+                let decimals = (extra - exponent).max(0) as usize;
+                return Axis { low: first * step, high: last * step, step, first: first as i64, last: last as i64, decimals };
+            }
+        }
+    }
+    // Not reached: a step ten times the range's sixth always fits.
+    Axis { low: 0.0, high: 1.0, step: 1.0, first: 0, last: 1, decimals: 0 }
 }
 
 /// What the chart draws on, and where its plot is.
@@ -381,24 +406,14 @@ impl Plot {
     }
 }
 
-/// The axis runs from 0, or below it for a negative value, to a nice number at or above the largest.
-fn axis_range(data: &ChartData) -> (f64, f64) {
-    let values = data.series.iter().flat_map(|(_, values)| values.iter().copied());
-    let (low, high) = values.fold((0.0f64, 0.0f64), |(low, high), value| (low.min(value), high.max(value)));
-    let bottom = if low < 0.0 { -nice_ceiling(-low) } else { 0.0 };
-    let top = if high > 0.0 { nice_ceiling(high) } else if low < 0.0 { 0.0 } else { 1.0 };
-    (bottom, top)
-}
-
 /// Gridlines and their labels, and the line at 0.
-fn axes(plot: &Plot, theme: &Theme, items: &mut Vec<Placed>) {
+fn axes(plot: &Plot, axis: &Axis, labels: &[String], theme: &Theme, items: &mut Vec<Placed>) {
     let grid = tint(theme.text, theme.background, 0.18);
     let mut lines = String::new();
-    for tick in 0..TICKS {
-        let value = plot.low + (plot.high - plot.low) * tick as f64 / (TICKS - 1) as f64;
+    for (value, tick) in axis.ticks().into_iter().zip(labels) {
         let y = plot.y_of(value);
         lines.push_str(&format!("M{} {} L{} {} ", n(plot.left), n(y), n(plot.left + plot.plot_width), n(y)));
-        let text = label(tick_label(value, plot.high.abs().max(plot.low.abs())), tint(theme.text, theme.background, 0.8));
+        let text = label(tick.clone(), tint(theme.text, theme.background, 0.8));
         let room = plot.left - LABEL_MARGIN;
         items.push(at(0.0, y - TEXT_SIZE * LINE_HEIGHT / 2.0, text).right_aligned_in(room));
     }
@@ -617,13 +632,20 @@ fn bar_or_line(kind: ChartKind, data: &ChartData, title: Option<&str>, size: (f3
     let (width, height) = size;
     let several = data.series.len() > 1;
     let (left, top, plot_width, plot_height) = plot_area(width, height, title.is_some(), several);
-    let (low, high) = axis_range(data);
-    let plot = Plot { width, height, left, top, plot_width, plot_height, low, high };
+    let values = data.series.iter().flat_map(|(_, values)| values.iter().copied());
+    let (smallest, largest) = values.fold((0.0f64, 0.0f64), |(low, high), value| (low.min(value), high.max(value)));
+    let axis = axis_for(smallest, largest);
+    let ticks = axis.labels();
+    // Wider than usual for long tick labels, up to a third of the chart.
+    let widest = ticks.iter().map(|tick| text_width(tick, TEXT_SIZE) + 2.0 * LABEL_MARGIN).fold(left, f32::max);
+    let wider = widest.min(width / 3.0).max(left) - left;
+    let (left, plot_width) = (left + wider, (plot_width - wider).max(1.0));
+    let plot = Plot { width, height, left, top, plot_width, plot_height, low: axis.low, high: axis.high };
     let mut items = Vec::new();
     if let Some(title) = title {
         items.push(title_item(title, width, theme));
     }
-    axes(&plot, theme, &mut items);
+    axes(&plot, &axis, &ticks, theme, &mut items);
     match kind {
         ChartKind::Line => lines(data, &plot, shown, theme, &mut items),
         _ => bars(data, &plot, shown, theme, &mut items),

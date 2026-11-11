@@ -21,7 +21,7 @@ pub use chart::ChartKind;
 /// The chart's workings, for its tests.
 #[doc(hidden)]
 pub mod chart_parts {
-    pub use crate::chart::{ChartData, nice_ceiling, parse_csv, parse_inline, plot_area, series_color};
+    pub use crate::chart::{Axis, ChartData, axis_for, parse_csv, parse_inline, plot_area, series_color};
 }
 pub use deck::Deck;
 pub use display::*;

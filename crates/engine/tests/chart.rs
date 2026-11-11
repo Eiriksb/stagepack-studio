@@ -4,7 +4,7 @@ mod common;
 
 use std::collections::{BTreeMap, HashMap};
 
-use slides_engine::chart_parts::{nice_ceiling, parse_csv, parse_inline, plot_area, series_color, ChartData};
+use slides_engine::chart_parts::{axis_for, parse_csv, parse_inline, plot_area, series_color, ChartData};
 use slides_engine::*;
 use slides_format::parse_talk;
 use toolkit::{Color, Ctx, CtxData, Element, Placed, Props, ShapeKind, Theme};
@@ -140,19 +140,39 @@ fn native_rects(specs: &[LayerSpec]) -> usize {
 }
 
 #[test]
-fn nice_ceilings() {
-    assert_eq!(nice_ceiling(24.0), 50.0);
-    assert_eq!(nice_ceiling(10.0), 10.0);
-    assert_eq!(nice_ceiling(0.0), 1.0);
-    assert!((nice_ceiling(0.37) - 0.5).abs() < 1e-12);
-    assert_eq!(nice_ceiling(101.0), 200.0);
+fn ticks_are_round_numbers_and_include_zero() {
+    let axis = axis_for(10.0, 24.0);
+    assert_eq!((axis.low, axis.high, axis.step), (0.0, 25.0, 5.0));
+    assert_eq!(axis.labels(), ["0", "5", "10", "15", "20", "25"]);
+    let axis = axis_for(-5.0, 31.0);
+    assert_eq!((axis.low, axis.high, axis.step), (-10.0, 40.0, 10.0));
+    assert_eq!(axis.labels(), ["-10", "0", "10", "20", "30", "40"]);
+    let axis = axis_for(0.001, 0.004);
+    assert_eq!(axis.labels(), ["0", "0.001", "0.002", "0.003", "0.004"]);
+    let axis = axis_for(0.0, 1e12);
+    assert_eq!(axis.labels(), ["0", "200000000000", "400000000000", "600000000000", "800000000000", "1000000000000"]);
+    let axis = axis_for(0.0, 12.0);
+    assert_eq!(axis.labels(), ["0", "2", "4", "6", "8", "10", "12"]);
+    let axis = axis_for(0.0, 14.0);
+    assert_eq!(axis.labels(), ["0", "2.5", "5", "7.5", "10", "12.5", "15"]);
 }
 
 #[test]
-fn nice_ceilings_of_the_extremes_are_finite() {
-    for value in [f64::MAX, 1e300, 5e-324, 1e-310, f64::NAN, f64::INFINITY, -3.0] {
-        let ceiling = nice_ceiling(value);
-        assert!(ceiling.is_finite() && ceiling > 0.0, "{value}: {ceiling}");
+fn all_zero_gives_an_axis_to_one() {
+    let axis = axis_for(0.0, 0.0);
+    assert_eq!((axis.low, axis.high), (0.0, 1.0));
+    assert!(axis.ticks().contains(&0.0));
+}
+
+#[test]
+fn axes_of_the_extremes_are_finite_and_hold_zero() {
+    for (low, high) in [(-1e15, 1e15), (1e-300, 1e14), (0.0, 5e-324), (-3.0, -1.0), (f64::NAN, f64::INFINITY)] {
+        let axis = axis_for(low, high);
+        assert!(axis.low.is_finite() && axis.high.is_finite() && axis.high > axis.low, "{low} {high}: {axis:?}");
+        assert!(axis.low <= low.min(0.0) || low.is_nan());
+        assert!(axis.ticks().len() <= 7);
+        assert!(axis.labels().iter().any(|label| label == "0"), "{:?}", axis.labels());
+        assert!(axis.labels().iter().all(|label| !label.contains('e')), "{:?}", axis.labels());
     }
 }
 
@@ -249,7 +269,7 @@ fn bars_are_as_tall_as_their_values() {
     let (_, top, _, height) = plot_area(1200.0, 600.0, false, false);
     let bars = shapes(&element, ShapeKind::Rect);
     assert_eq!(bars.len(), 3);
-    for ((_, y, _, h), share) in bars.iter().zip([0.2, 0.48, 0.34]) {
+    for ((_, y, _, h), share) in bars.iter().zip([0.4, 0.96, 0.68]) {
         assert!(close(*h, height * share), "{h} is not {share} of {height}");
         assert!(close(y + h, top + height), "the bar stands on the axis");
     }
@@ -271,7 +291,7 @@ fn a_negative_value_goes_below_the_axis() {
     let bars = shapes(&element, ShapeKind::Rect);
     let (up, down) = (bars[0], bars[1]);
     assert!(close(up.1 + up.3, down.1), "both meet at zero");
-    // The axis runs from -5 to 10, so the bar below is half the one above.
+    // The bar below is half the one above, and both are measured from 0.
     assert!(close(down.3 * 2.0, up.3));
     assert!(texts(&element).iter().any(|label| label.starts_with('-')), "{:?}", texts(&element));
 }
