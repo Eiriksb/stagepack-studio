@@ -197,4 +197,9 @@ impl Registry {
     pub fn get(&self, name: &str) -> Option<NativeComponent> {
         self.components.get(name).copied()
     }
+
+    /// The names of the components it holds, in no particular order.
+    pub fn names(&self) -> Vec<&'static str> {
+        self.components.keys().copied().collect()
+    }
 }

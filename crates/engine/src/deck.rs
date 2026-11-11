@@ -239,6 +239,16 @@ impl Deck {
         (0..self.slides.len()).collect()
     }
 
+    /// The names of every component the talk can use: the built-ins and its own, sorted, for
+    /// a palette to offer.
+    pub fn available_components(&self) -> Vec<String> {
+        let own = self.components.infos().iter().map(|info| info.tag.clone());
+        let mut names: Vec<String> = self.registry.names().into_iter().map(String::from).chain(own).collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
     /// The talk's own components.
     pub fn components(&self) -> &[ComponentInfo] {
         self.components.infos()

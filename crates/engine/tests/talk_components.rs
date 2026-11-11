@@ -934,3 +934,11 @@ fn a_show_holds_the_layouts_of_at_most_two_slides_at_a_moment() {
     let _ = deck.layers_at(2, at(2.0), 0.1);
     assert_eq!(deck.moments_held(), 2);
 }
+
+#[test]
+fn the_components_available_are_the_built_ins_and_the_talks_own() {
+    let files = talk_with_hello("<Hello />\n", answering("Hello", &text_answer("Hi")));
+    files.put("components/apple.rs", source("Apple"));
+    let deck = open(&files);
+    assert_eq!(deck.available_components(), ["Apple", "Box", "Chart", "Hello", "Icon", "Picture", "Shape"]);
+}

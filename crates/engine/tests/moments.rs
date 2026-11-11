@@ -170,7 +170,10 @@ fn a_slide_with_nothing_varying_is_laid_out_once() {
 #[test]
 fn the_whole_slide_is_its_last_step() {
     let mut d = deck("<Count />\n");
+    // Another moment first, so that the whole slide isn't simply the last one laid out.
+    let _ = d.layers_at(0, at_step(1), 0.5);
     assert_eq!(texts_of(d.specs(0)), ["3"]);
+    let _ = d.layers_at(0, at_step(2), 0.5);
     let (specs, _, _) = d.specs_fonts_and_files(0);
     assert_eq!(texts_of(specs), ["3"]);
     let whole = d.layers(0, 0.5);
@@ -200,7 +203,10 @@ fn a_slide_that_moves_says_so() {
 #[test]
 fn a_slide_that_moves_is_still_at_time_zero_for_an_export() {
     let mut d = deck("<Clock />\n");
+    // Another moment first, so that time 0 isn't simply the last one laid out.
+    let _ = d.layers_at(0, Moment { step: 0, time: 1.5 }, 0.5);
     assert_eq!(texts_of(d.specs(0)), ["0"]);
+    assert!(d.notices_whole(0).is_empty());
 }
 
 #[test]
