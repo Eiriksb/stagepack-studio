@@ -452,6 +452,13 @@ mod probes {
         if ctx.steps(1) >= 1 { toolkit::problem("Late trouble") } else { text("early") }
     }
 
+    /// Reads a path that differs at every moment, and isn't there.
+    #[component]
+    pub fn Wanderer(ctx: &Ctx) -> Element {
+        let path = format!("assets/missing-{}.txt", ctx.time());
+        text(if ctx.asset(&path).is_some() { "found" } else { "missing" })
+    }
+
     /// A stack of 20,000 empty shapes.
     #[component]
     pub fn Crowd() -> Element {
@@ -491,6 +498,7 @@ fn probe_registry() -> Registry {
     registry.add(probes::Crowd_component());
     registry.add(probes::Echo_component());
     registry.add(probes::Late_component());
+    registry.add(probes::Wanderer_component());
     registry
 }
 
@@ -870,4 +878,32 @@ fn the_whole_slides_notices_are_those_of_what_it_draws() {
     assert!(deck.notices(0).is_empty(), "at the start: {:?}", deck.notices(0));
     assert_eq!(deck.notices_whole(0), ["Late trouble"]);
     assert!(texts(&mut deck, 0).contains(&"Late trouble".to_string()), "the whole slide draws it");
+}
+
+#[test]
+fn what_components_read_is_remembered_for_at_most_256_paths() {
+    let files = Files::default();
+    let slides = "<Wanderer />\n\n---\n\n<Chart kind=\"bar\" data=\"assets/sales.csv\" />\n";
+    files.put("slides.md", slides);
+    files.put("assets/sales.csv", "L,S\nA,1\n");
+    let mut deck = open_with(&files, probe_registry());
+    for frame in 0..1000 {
+        let _ = deck.layers_at(0, Moment { step: 0, time: frame as f32 }, 0.1);
+    }
+    assert!(deck.assets_remembered() <= 256, "{}", deck.assets_remembered());
+    // The chart's file is read once the record is full, so it isn't in it. Past what it can
+    // remember, any change might matter, so the chart still sees its new data.
+    assert!(!texts(&mut deck, 1).contains(&"B".to_string()));
+    files.put("assets/sales.csv", "L,S\nA,1\nB,2\n");
+    assert!(deck.update(slides.to_string()).contains(&1));
+    assert!(texts(&mut deck, 1).contains(&"B".to_string()), "{:?}", texts(&mut deck, 1));
+}
+
+#[test]
+fn a_path_over_256_bytes_is_not_read() {
+    let long = format!("assets/{}.txt", "a".repeat(260));
+    let files = talk_with_hello("<Hello />\n", reading("Hello", &long));
+    files.put(&long, "here");
+    let mut deck = open(&files);
+    assert!(shows(&mut deck, 0, "no"));
 }

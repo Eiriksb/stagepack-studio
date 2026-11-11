@@ -241,6 +241,12 @@ impl Deck {
         self.components.infos()
     }
 
+    /// How many of the talk's assets are remembered as read by its components.
+    #[doc(hidden)]
+    pub fn assets_remembered(&self) -> usize {
+        self.components.assets_remembered()
+    }
+
     /// What's wrong with the talk's own components, as found when they were last looked at.
     pub fn component_problems(&self) -> &[Diagnostic] {
         self.components.problems()

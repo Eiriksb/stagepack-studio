@@ -25,6 +25,9 @@ pub const MAX_SCHEMA_STRING_BYTES: usize = 64;
 /// The most props a schema can list.
 pub const MAX_PROPS: usize = 64;
 
+/// The longest path of an asset that can be read. Far longer than any real one.
+pub const MAX_ASSET_PATH_BYTES: usize = 256;
+
 /// How often the clock that stops a component ticks.
 const TICK: Duration = Duration::from_millis(10);
 const MAX_ASSET_READS: u32 = 64;
@@ -294,7 +297,7 @@ fn read_asset(mut caller: Caller<'_, State>, ptr: u32, len: u32) -> wasmtime::Re
     }
     state.asset_reads += 1;
     let len = len as usize;
-    if len > MAX_OUTPUT_BYTES {
+    if len > MAX_ASSET_PATH_BYTES {
         return Ok(0);
     }
     let Some(memory) = caller.get_export("memory").and_then(|export| export.into_memory()) else {

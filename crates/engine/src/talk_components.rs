@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
 
 use slides_components::{
-    Assets, BuildIndex, ComponentError, Diagnostic, INDEX_FILE, MAX_MODULE_BYTES, MEMORY_LIMIT_BYTES, WasmComponent, check_source, component_tag,
+    Assets, BuildIndex, ComponentError, Diagnostic, INDEX_FILE, MAX_ASSET_PATH_BYTES, MAX_MODULE_BYTES, MEMORY_LIMIT_BYTES, WasmComponent, check_source, component_tag,
     safe_stem, source_hash,
 };
 use toolkit::{ComponentSchema, Registry, RenderInput, RenderOutput, asset_path_allowed};
@@ -135,21 +135,41 @@ fn problem(file: &str, message: impl Into<String>) -> Diagnostic {
     Diagnostic::new(file, 0, message.into())
 }
 
+/// The most asset paths remembered as read, for a talk.
+pub const MAX_ASSETS_REMEMBERED: usize = 256;
+
 /// The assets components have read since the talk's files were last looked at, and what
 /// each file was then: `None` if there was no such file.
-pub(crate) type AssetsRead = Rc<RefCell<HashMap<String, Option<FileVersion>>>>;
+#[derive(Default)]
+pub(crate) struct AssetRecord {
+    paths: HashMap<String, Option<FileVersion>>,
+    /// Whether a path was read when the record was full, so that what it was isn't known.
+    overflowed: bool,
+}
+
+impl AssetRecord {
+    fn note(&mut self, path: &str, version: Option<FileVersion>) {
+        if self.paths.len() < MAX_ASSETS_REMEMBERED || self.paths.contains_key(path) {
+            self.paths.insert(path.to_string(), version);
+        } else {
+            self.overflowed = true;
+        }
+    }
+}
+
+pub(crate) type AssetsRead = Rc<RefCell<AssetRecord>>;
 
 /// The bytes of `path`, held to the rules for a render's reads: only from the talk's
 /// assets folder, no file over the limit, and no more than `ASSET_BUDGET` in all, counted
 /// in `used`. A file whose length is known is refused before it's read. What the file was
 /// is noted in `seen`, so that a change to it is found, unless the talk never changes.
 pub(crate) fn read_asset(files: &dyn TalkFiles, path: &str, used: &Cell<u64>, seen: &AssetsRead) -> Option<Vec<u8>> {
-    if !asset_path_allowed(path) {
+    if path.len() > MAX_ASSET_PATH_BYTES || !asset_path_allowed(path) {
         return None;
     }
     let note = |version: Option<FileVersion>| {
         if !files.never_changes() {
-            seen.borrow_mut().insert(path.to_string(), version);
+            seen.borrow_mut().note(path, version);
         }
     };
     let stamp = files.stamp(path).map(|(length, modified)| FileVersion::Stamp(length, modified));
@@ -266,6 +286,10 @@ impl TalkComponents {
         self.summary() != before || assets_changed
     }
 
+    pub(crate) fn assets_remembered(&self) -> usize {
+        self.assets_read.borrow().paths.len()
+    }
+
     /// The record of what components read, for a built-in's render to add to.
     pub(crate) fn assets_read(&self) -> &AssetsRead {
         &self.assets_read
@@ -273,11 +297,13 @@ impl TalkComponents {
 
     /// Whether a file a component read is different now, like a replaced picture. Then
     /// what was read is forgotten, as every slide is laid out again and reads it afresh.
+    /// A record that overflowed can't tell, so it counts as changed every time.
     fn assets_changed(&mut self) -> bool {
         let mut seen = self.assets_read.borrow_mut();
-        let changed = seen.iter().any(|(path, version)| FileVersion::of_file(path, &*self.files) != *version);
+        let changed =
+            seen.overflowed || seen.paths.iter().any(|(path, version)| FileVersion::of_file(path, &*self.files) != *version);
         if changed {
-            seen.clear();
+            *seen = AssetRecord::default();
         }
         changed
     }
