@@ -7,9 +7,9 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use crate::Diagnostic;
 use crate::sandbox::MAX_MODULE_BYTES;
 use crate::source_check::check_source;
-use crate::Diagnostic;
 
 pub const COMPILE_TIME_LIMIT: Duration = Duration::from_secs(60);
 
@@ -43,7 +43,10 @@ impl Bundle {
     }
 
     fn in_folder(root: PathBuf) -> Option<Bundle> {
-        root.join("bin").join(RUSTC).is_file().then_some(Bundle { root })
+        root.join("bin")
+            .join(RUSTC)
+            .is_file()
+            .then_some(Bundle { root })
     }
 }
 
@@ -53,7 +56,12 @@ pub fn compile(bundle: &Bundle, file: &str, source: &str) -> Result<Vec<u8>, Vec
     compile_with_limit(bundle, file, source, COMPILE_TIME_LIMIT)
 }
 
-pub fn compile_with_limit(bundle: &Bundle, file: &str, source: &str, limit: Duration) -> Result<Vec<u8>, Vec<Diagnostic>> {
+pub fn compile_with_limit(
+    bundle: &Bundle,
+    file: &str,
+    source: &str,
+    limit: Duration,
+) -> Result<Vec<u8>, Vec<Diagnostic>> {
     check_source(file, source)?;
     let failed = |message: String| vec![Diagnostic::new(file, 0, message)];
 
@@ -61,9 +69,13 @@ pub fn compile_with_limit(bundle: &Bundle, file: &str, source: &str, limit: Dura
         .prefix("component-build")
         .tempdir()
         .map_err(|error| failed(format!("A folder to build in couldn't be made: {error}")))?;
-    let root = std::path::absolute(&bundle.root).map_err(|error| failed(format!("The compiler couldn't be found: {error}")))?;
-    std::fs::write(scratch.path().join(SOURCE_NAME), source)
-        .map_err(|error| failed(format!("The source couldn't be copied to build it: {error}")))?;
+    let root = std::path::absolute(&bundle.root)
+        .map_err(|error| failed(format!("The compiler couldn't be found: {error}")))?;
+    std::fs::write(scratch.path().join(SOURCE_NAME), source).map_err(|error| {
+        failed(format!(
+            "The source couldn't be copied to build it: {error}"
+        ))
+    })?;
 
     let mut command = rustc_command(&root, scratch.path());
     let (status, errors) = match run_for(&mut command, limit, scratch.path()) {
@@ -81,17 +93,24 @@ pub fn compile_with_limit(bundle: &Bundle, file: &str, source: &str, limit: Dura
     if !status.success() {
         let mut found = diagnostics(file, &errors);
         if found.is_empty() {
-            found = failed(format!("The compiler stopped without giving a reason ({status})"));
+            found = failed(format!(
+                "The compiler stopped without giving a reason ({status})"
+            ));
         }
         return Err(found);
     }
     let output = scratch.path().join(OUTPUT_NAME);
-    let len = std::fs::metadata(&output).map_err(|error| failed(format!("The compiler's output couldn't be read: {error}")))?.len();
+    let len = std::fs::metadata(&output)
+        .map_err(|error| failed(format!("The compiler's output couldn't be read: {error}")))?
+        .len();
     if len > MAX_MODULE_BYTES as u64 {
         let limit = MAX_MODULE_BYTES / (1024 * 1024);
-        return Err(failed(format!("Its build is over the limit of {limit} MiB, so it can't be used")));
+        return Err(failed(format!(
+            "Its build is over the limit of {limit} MiB, so it can't be used"
+        )));
     }
-    std::fs::read(output).map_err(|error| failed(format!("The compiler's output couldn't be read: {error}")))
+    std::fs::read(output)
+        .map_err(|error| failed(format!("The compiler's output couldn't be read: {error}")))
 }
 
 fn joined(start: &str, path: &Path, end: &str) -> OsString {
@@ -115,7 +134,14 @@ fn rustc_command(root: &Path, scratch: &Path) -> Command {
         .env("TEMP", scratch)
         .arg("--sysroot")
         .arg(root)
-        .args(["--crate-name", "component", "--edition", "2024", "--crate-type", "cdylib"])
+        .args([
+            "--crate-name",
+            "component",
+            "--edition",
+            "2024",
+            "--crate-type",
+            "cdylib",
+        ])
         .args(["--target", "wasm32-unknown-unknown"])
         .args(["-C", "opt-level=1", "-C", "strip=debuginfo"])
         .arg("--remap-path-prefix")
@@ -175,7 +201,8 @@ fn run_for(command: &mut Command, limit: Duration, scratch: &Path) -> std::io::R
         let stop = match child.try_wait() {
             Ok(Some(status)) => {
                 // Not forever: something the compiler started may still hold the pipe open.
-                let text = errors.and_then(|errors| errors.recv_timeout(Duration::from_secs(1)).ok());
+                let text =
+                    errors.and_then(|errors| errors.recv_timeout(Duration::from_secs(1)).ok());
                 return Ok(Ran::Finished(status, text.unwrap_or_default()));
             }
             Err(error) => Err(error),
@@ -185,7 +212,9 @@ fn run_for(command: &mut Command, limit: Duration, scratch: &Path) -> std::io::R
                 let measure = polls.is_multiple_of(MEASURE_EVERY);
                 if measure && folder_size(scratch) > MAX_SCRATCH_BYTES {
                     Ok(Stop::Disk)
-                } else if measure && group_memory(child.id()).is_some_and(|bytes| bytes > MAX_BUILD_MEMORY_BYTES) {
+                } else if measure
+                    && group_memory(child.id()).is_some_and(|bytes| bytes > MAX_BUILD_MEMORY_BYTES)
+                {
                     Ok(Stop::Memory)
                 } else {
                     std::thread::sleep(POLL);
@@ -234,19 +263,29 @@ fn folder_size(folder: &Path) -> u64 {
 fn group_memory(group: u32) -> Option<u64> {
     let mut total = 0;
     for entry in std::fs::read_dir("/proc").ok()?.flatten() {
-        let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
             continue;
         };
         let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
             continue;
         };
         // The fields after the name, which ends at the last `)`: state, parent, group.
-        let in_group = stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().nth(2)).and_then(|field| field.parse::<u32>().ok());
+        let in_group = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().nth(2))
+            .and_then(|field| field.parse::<u32>().ok());
         if in_group != Some(group) {
             continue;
         }
         let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
-        let kib = status.lines().find_map(|line| line.strip_prefix("VmRSS:")).and_then(|value| value.split_whitespace().next()?.parse::<u64>().ok());
+        let kib = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmRSS:"))
+            .and_then(|value| value.split_whitespace().next()?.parse::<u64>().ok());
         total += kib.unwrap_or(0) * 1024;
     }
     Some(total)
@@ -268,17 +307,28 @@ fn diagnostics(file: &str, stderr: &str) -> Vec<Diagnostic> {
             continue;
         };
         // An internal error has a longer level than plain `error`.
-        if !value["level"].as_str().is_some_and(|level| level.starts_with("error")) {
+        if !value["level"]
+            .as_str()
+            .is_some_and(|level| level.starts_with("error"))
+        {
             continue;
         }
         let message = value["message"].as_str().unwrap_or_default().to_string();
-        let primary = value["spans"].as_array().and_then(|spans| spans.iter().find(|span| span["is_primary"] == true));
+        let primary = value["spans"]
+            .as_array()
+            .and_then(|spans| spans.iter().find(|span| span["is_primary"] == true));
         match primary {
             Some(span) => {
                 let name = span["file_name"].as_str().unwrap_or_default();
-                let names_the_source = Path::new(name).file_name().is_some_and(|last| last == SOURCE_NAME);
+                let names_the_source = Path::new(name)
+                    .file_name()
+                    .is_some_and(|last| last == SOURCE_NAME);
                 let line = span["line_start"].as_u64().unwrap_or(0) as u32;
-                found.push(Diagnostic::new(if names_the_source { file } else { name }, line, message));
+                found.push(Diagnostic::new(
+                    if names_the_source { file } else { name },
+                    line,
+                    message,
+                ));
             }
             // This one only counts the others, but something like a linker failure has no span either.
             None if message.starts_with("aborting due to") => {}
@@ -299,6 +349,11 @@ mod tests {
         std::fs::create_dir(folder.path().join("bin")).unwrap();
         std::fs::write(folder.path().join("bin").join(RUSTC), "").unwrap();
         let found = Bundle::in_folder(folder.path().to_path_buf());
-        assert_eq!(found, Some(Bundle { root: folder.path().to_path_buf() }));
+        assert_eq!(
+            found,
+            Some(Bundle {
+                root: folder.path().to_path_buf()
+            })
+        );
     }
 }
