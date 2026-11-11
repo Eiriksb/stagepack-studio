@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use slides_components::{BuildIndex, Bundle, Diagnostic, INDEX_FILE, component_tag, source_hash};
 use slides_engine::{ComponentState, FolderFiles, Fonts, TalkComponents};
 use stagepack_studio::builds::{BuildOutcome, Compile, behind, build_components};
-use stagepack_studio::cargo_file::write_cargo_file;
+use stagepack_studio::cargo_file::{write_cargo_file, write_cargo_file_with_cargo_home};
 use stagepack_studio::document::{Document, TalkPlace};
 use stagepack_studio::permissions::BuildPermissions;
 use tempfile::TempDir;
@@ -489,7 +489,7 @@ fn assert_refused_for(dir: &TempDir, name: &str) {
     let (_bundle_dir, bundle) = bundle_with_toolkit_source();
     let refused = write_cargo_file(dir.path(), &bundle).unwrap_err();
     assert!(refused.contains(name), "{name}: {refused}");
-    assert!(refused.contains("Cargo"), "{name}: {refused}");
+    assert!(refused.contains("code editor"), "{name}: {refused}");
     assert!(!dir.path().join("Cargo.toml").exists(), "{name}");
 }
 
@@ -529,6 +529,66 @@ fn a_linked_build_script_counts_too() {
     let dir = talk(&[("score.rs", &source("Score"))]);
     std::os::unix::fs::symlink(dir.path().join("nowhere.rs"), dir.path().join("build.rs")).unwrap();
     assert_refused_for(&dir, "build.rs");
+}
+
+#[test]
+fn a_talk_with_editor_or_cargo_leftovers_is_not_set_up() {
+    let folders = [".vscode", ".zed", ".helix", ".idea", ".fleet", "target"];
+    let files = ["rust-analyzer.toml", ".rust-analyzer.toml", "Cargo.lock"];
+    for name in folders {
+        let dir = talk(&[("score.rs", &source("Score"))]);
+        std::fs::create_dir(dir.path().join(name)).unwrap();
+        assert_refused_for(&dir, name);
+    }
+    for name in files {
+        let dir = talk(&[("score.rs", &source("Score"))]);
+        std::fs::write(dir.path().join(name), "").unwrap();
+        assert_refused_for(&dir, name);
+    }
+}
+
+/// A talk in `talk` inside a folder that holds `file`, given as a path below that folder.
+fn talk_below(file: &str) -> (TempDir, std::path::PathBuf) {
+    let outer = tempfile::tempdir().unwrap();
+    let found = outer.path().join(file);
+    std::fs::create_dir_all(found.parent().unwrap()).unwrap();
+    std::fs::write(&found, "[build]\n").unwrap();
+    let folder = outer.path().join("talks").join("talk");
+    std::fs::create_dir_all(folder.join("components")).unwrap();
+    std::fs::write(folder.join("slides.md"), "# One\n").unwrap();
+    std::fs::write(folder.join("components/score.rs"), source("Score")).unwrap();
+    (outer, folder)
+}
+
+#[test]
+fn settings_in_a_folder_above_the_talk_refuse() {
+    for file in [
+        ".cargo/config.toml",
+        ".cargo/config",
+        "rust-toolchain",
+        "rust-toolchain.toml",
+    ] {
+        let (_outer, folder) = talk_below(file);
+        let (_bundle_dir, bundle) = bundle_with_toolkit_source();
+
+        let refused = write_cargo_file_with_cargo_home(&folder, &bundle, None).unwrap_err();
+
+        let name = Path::new(file).file_name().unwrap().to_str().unwrap();
+        assert!(refused.contains(name), "{file}: {refused}");
+        assert!(refused.contains("code editor"), "{file}: {refused}");
+        assert!(!folder.join("Cargo.toml").exists(), "{file}");
+    }
+}
+
+#[test]
+fn the_cargo_home_above_the_talk_does_not_refuse() {
+    let (outer, folder) = talk_below(".cargo/config.toml");
+    let (_bundle_dir, bundle) = bundle_with_toolkit_source();
+    let cargo_home = outer.path().join(".cargo");
+
+    let written = write_cargo_file_with_cargo_home(&folder, &bundle, Some(&cargo_home));
+
+    assert_eq!(written, Ok(folder.join("Cargo.toml")));
 }
 
 #[test]

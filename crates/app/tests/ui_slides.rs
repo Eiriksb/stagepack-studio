@@ -1102,10 +1102,14 @@ fn a_talk_in_a_folder_can_be_set_up_for_a_code_editor(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     assert!(cargo_file.is_file());
-    assert!(
-        status(cx, talk.handle).is_some_and(|said| said.starts_with("Wrote Cargo.toml")),
-        "{:?}",
-        status(cx, talk.handle)
+    assert_eq!(
+        status(cx, talk.handle).as_deref(),
+        Some(
+            "Wrote Cargo.toml in the talk's folder. Open the folder in a code editor to check its \
+             components as you type. Only use a code editor on a talk you trust: Cargo and your \
+             editor now treat this folder as a Rust project, and files added later can make them \
+             run code."
+        )
     );
 }
 

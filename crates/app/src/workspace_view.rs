@@ -17,7 +17,7 @@ use slides_components::{Bundle, Diagnostic};
 use slides_engine::{ComponentState, Fonts};
 
 use crate::builds::{self, BuildOutcome, Compile};
-use crate::cargo_file::write_cargo_file;
+use crate::cargo_file::{self, write_cargo_file};
 use crate::document::{Document, OpenProblem, Reload, SLIDES_FILE, TalkPlace};
 use crate::export::{self, ExportKind, run_export, stagepack_executable};
 use crate::markdown_panel::MarkdownPanel;
@@ -682,7 +682,7 @@ impl WorkspaceView {
             return;
         };
         let said = match write_cargo_file(folder, bundle) {
-            Ok(_) => "Wrote Cargo.toml in the talk's folder. Open the folder in a code editor to check its components as you type.".to_string(),
+            Ok(_) => cargo_file::WRITTEN.to_string(),
             Err(problem) => problem,
         };
         self.say(said, cx);

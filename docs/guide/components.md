@@ -350,4 +350,13 @@ A talk is shared like any other file, so a component is held to some limits. The
 
 The app doesn't need anything else to build your components. But if you have Rust installed and want an editor that completes names and points out mistakes as you type, open the talk and choose **File → Set up for a code editor**. It writes a `Cargo.toml` at the top of the talk that points the editor at the toolkit the app came with. Then open the talk's folder in your editor.
 
-The app never writes this file unless you ask, and leaves one that's already there alone. It also won't set up a talk whose folder holds a `build.rs`, a `.cargo` folder, a `rust-toolchain` or `rust-toolchain.toml` file, or a `src` folder: Cargo would act on any of them as soon as your editor opens the folder, so a talk from someone else could run its own code on your computer, outside the limits above. The file it writes tells Cargo to look at nothing but the components. The editor may add a `target` folder and a `Cargo.lock`. Neither is needed by the app, and a packed talk leaves them out, along with `Cargo.toml`.
+The app never writes this file unless you ask, and leaves one that's already there alone.
+
+Once the file is there, Cargo and your editor treat the folder as a Rust project, and some files in it, or in a folder above it, can make them run programs on your computer, outside the limits above. So the app won't set a talk up while it holds any of these:
+
+- In the talk's folder: a `build.rs`, a `src` folder, a `.cargo` folder, a `rust-toolchain` or `rust-toolchain.toml` file, a `Cargo.lock`, a `target` folder, a `rust-analyzer.toml` or `.rust-analyzer.toml`, or an editor's settings folder: `.vscode`, `.zed`, `.helix`, `.idea` or `.fleet`.
+- In any folder above it: a `.cargo/config.toml`, `.cargo/config`, `rust-toolchain` or `rust-toolchain.toml`. Your own Cargo settings, in your Cargo home, don't count.
+
+The file it writes turns off the build script and every target Cargo would otherwise find by itself, so only the components are checked. But the app looks for those files only when it writes it. Anything added later, by a `git pull` for instance, isn't checked, so only use a code editor on a talk you trust.
+
+Your editor will add a `target` folder and a `Cargo.lock` as it works. Neither is needed by the app, and a packed talk leaves them out, along with `Cargo.toml`.

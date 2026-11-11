@@ -11,10 +11,15 @@ use slides_engine::{COMPONENTS_FOLDER, FolderFiles, TalkComponents, write_atomic
 
 const CARGO_FILE: &str = "Cargo.toml";
 
-/// What Cargo would find in a talk's folder and act on, each with why it's refused. A talk can
-/// come from anyone, and an editor checks the project as soon as it's opened, so with any of
-/// these the talk's own code or settings would run outside the sandbox.
-const REFUSED: [(&str, &str); 5] = [
+/// What the app says once it has written the file. The checks here are made only then, so it
+/// says plainly what they can't cover.
+pub const WRITTEN: &str = "Wrote Cargo.toml in the talk's folder. Open the folder in a code editor to check its components as you type. Only use a code editor on a talk you trust: Cargo and your editor now treat this folder as a Rust project, and files added later can make them run code.";
+
+/// What Cargo or an editor would find in a talk's folder and act on once it's a Rust project,
+/// each with why it's refused. A talk can come from anyone, and an editor checks the project as
+/// soon as it's opened, so with any of these the talk's own code or settings would run outside
+/// the sandbox.
+const REFUSED: [(&str, &str); 14] = [
     (
         "build.rs",
         "a build.rs, which Cargo would run on your computer",
@@ -35,7 +40,83 @@ const REFUSED: [(&str, &str); 5] = [
         "src",
         "a src folder, whose code Cargo would build and could run on your computer",
     ),
+    (
+        "Cargo.lock",
+        "a Cargo.lock, which could make Cargo fetch libraries the talk chose",
+    ),
+    (
+        "target",
+        "a target folder, which could hold builds Cargo would use in place of its own",
+    ),
+    (
+        ".vscode",
+        "a .vscode folder, whose settings could make your editor run programs on your computer",
+    ),
+    (
+        ".zed",
+        "a .zed folder, whose settings could make your editor run programs on your computer",
+    ),
+    (
+        ".helix",
+        "a .helix folder, whose settings could make your editor run programs on your computer",
+    ),
+    (
+        ".idea",
+        "an .idea folder, whose settings could make your editor run programs on your computer",
+    ),
+    (
+        ".fleet",
+        "a .fleet folder, whose settings could make your editor run programs on your computer",
+    ),
+    (
+        "rust-analyzer.toml",
+        "a rust-analyzer.toml, whose settings could make your editor run programs on your computer",
+    ),
+    (
+        ".rust-analyzer.toml",
+        "a .rust-analyzer.toml, whose settings could make your editor run programs on your computer",
+    ),
 ];
+
+/// What Cargo and rustup also read from every folder above the project.
+const REFUSED_ABOVE: [&str; 4] = [
+    ".cargo/config.toml",
+    ".cargo/config",
+    "rust-toolchain",
+    "rust-toolchain.toml",
+];
+
+/// The person's own Cargo home, which Cargo reads whatever folder it's in.
+fn default_cargo_home() -> Option<PathBuf> {
+    match std::env::var_os("CARGO_HOME") {
+        Some(home) => Some(PathBuf::from(home)),
+        None => dirs::home_dir().map(|home| home.join(".cargo")),
+    }
+}
+
+/// The first of [`REFUSED_ABOVE`] in a folder above `folder`, other than in `cargo_home`.
+fn found_above(folder: &Path, cargo_home: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    let folder = folder
+        .canonicalize()
+        .map_err(|error| format!("The talk's folder couldn't be found: {error}"))?;
+    let cargo_home = cargo_home.and_then(|home| home.canonicalize().ok());
+    for above in folder.ancestors().skip(1) {
+        for name in REFUSED_ABOVE {
+            let found = above.join(name);
+            if found.symlink_metadata().is_err() {
+                continue;
+            }
+            let in_cargo_home = name.starts_with(".cargo/")
+                && cargo_home.as_deref().is_some_and(|home| {
+                    above.join(".cargo").canonicalize().ok().as_deref() == Some(home)
+                });
+            if !in_cargo_home {
+                return Ok(Some(found));
+            }
+        }
+    }
+    Ok(None)
+}
 
 /// Where the bundle keeps the toolkit's source, beside the workspace that stands in for ours.
 fn toolkit_source(bundle: &Bundle) -> PathBuf {
@@ -111,6 +192,16 @@ fn cargo_text(toolkit: &str, stems: &[String]) -> String {
 /// and each of the talk's components as an example. A `Cargo.toml` already there is left
 /// alone. Gives the path written, or why nothing was.
 pub fn write_cargo_file(folder: &Path, bundle: &Bundle) -> Result<PathBuf, String> {
+    write_cargo_file_with_cargo_home(folder, bundle, default_cargo_home().as_deref())
+}
+
+/// As [`write_cargo_file`], with `cargo_home` as the person's Cargo home, whose settings
+/// don't count against a talk below it.
+pub fn write_cargo_file_with_cargo_home(
+    folder: &Path,
+    bundle: &Bundle,
+    cargo_home: Option<&Path>,
+) -> Result<PathBuf, String> {
     let out = folder.join(CARGO_FILE);
     // A link counts as a file, as writing would replace it.
     if out.symlink_metadata().is_ok() {
@@ -125,6 +216,13 @@ pub fn write_cargo_file(folder: &Path, bundle: &Bundle) -> Result<PathBuf, Strin
     {
         return Err(format!(
             "This talk has {what}, so it hasn't been set up for a code editor. Remove {name} first if you trust it isn't needed."
+        ));
+    }
+    if let Some(found) = found_above(folder, cargo_home)? {
+        return Err(format!(
+            "There's a {} above this talk, at {}. Cargo would read it, and it could make Cargo run other programs on your computer, so this talk hasn't been set up for a code editor.",
+            found.file_name().unwrap_or_default().to_string_lossy(),
+            found.display()
         ));
     }
     let toolkit = std::path::absolute(toolkit_source(bundle))
