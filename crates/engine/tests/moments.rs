@@ -53,6 +53,12 @@ mod probes {
     pub fn Reveal(ctx: &Ctx, src: String) -> Element {
         if ctx.steps(1) == 0 { text("soon") } else { picture(src, 0.0, 0.0) }
     }
+
+    /// Nothing at all before its click, and then some text.
+    #[component]
+    pub fn Late(ctx: &Ctx) -> Element {
+        if ctx.steps(1) == 0 { Element::Empty } else { text("late") }
+    }
 }
 
 fn registry() -> Registry {
@@ -62,6 +68,7 @@ fn registry() -> Registry {
     registry.add(probes::Tint_component());
     registry.add(probes::Rows_component());
     registry.add(probes::Reveal_component());
+    registry.add(probes::Late_component());
     registry
 }
 
@@ -245,4 +252,18 @@ fn pictures_held_at_a_moment_are_let_go_within_the_budget() {
 
     let back = picture_on(&mut d, 0).upgrade().expect("it's there again");
     assert_eq!((back.width(), back.height()), (256, 256));
+}
+
+#[test]
+fn timings_at_a_moment_match_its_layers() {
+    let source = "---\nregion.body: click=each\n---\n\n# T\n\nIntro\n\n<Late />\n\nOutro\n";
+    let mut d = deck(source);
+    let start = d.timings_at(0, at_step(0));
+    assert_eq!(start.len(), d.layers_at(0, at_step(0), 0.5).len());
+    let later = d.timings_at(0, at_step(1));
+    assert_eq!(later.len(), d.layers_at(0, at_step(1), 0.5).len());
+    assert_ne!(start.len(), later.len(), "the component's piece comes and goes");
+    let clicks = |timings: &[LayerTiming]| timings.iter().map(|timing| timing.click).collect::<Vec<_>>();
+    assert_eq!(clicks(&later).last(), Some(&Some(3)), "a piece more, and a click more for the last");
+    assert_eq!(clicks(&start), clicks(&d.timeline(0).layers), "the start is the timeline's");
 }

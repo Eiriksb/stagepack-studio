@@ -50,6 +50,11 @@ struct Laid {
 }
 
 impl Laid {
+    /// When each of its layers appears, in order.
+    fn timings(&self) -> Vec<LayerTiming> {
+        self.specs.iter().map(|spec| LayerTiming { click: spec.click, enter: spec.enter }).collect()
+    }
+
     /// The most clicks its layers or components ask for.
     fn steps(&self) -> u32 {
         let clicks = self.specs.iter().filter_map(|spec| spec.click).max().unwrap_or(0);
@@ -298,9 +303,15 @@ impl Deck {
     pub fn timeline(&mut self, index: usize) -> SlideTimeline {
         self.ensure_laid(index);
         let laid = self.slides[index].laid.as_ref().expect("the slide was just laid out");
-        let layers: Vec<LayerTiming> =
-            laid.specs.iter().map(|spec| LayerTiming { click: spec.click, enter: spec.enter }).collect();
-        SlideTimeline { steps: laid.steps(), layers, transition: laid.transition, animated: laid.asks.animated }
+        SlideTimeline { steps: laid.steps(), layers: laid.timings(), transition: laid.transition, animated: laid.asks.animated }
+    }
+
+    /// When each layer of the slide at `moment` appears, in the order of `layers_at` at that
+    /// moment. A component can give a layer at one step and none at another, so the layers at a
+    /// moment needn't be those of `timeline`.
+    pub fn timings_at(&mut self, index: usize, moment: Moment) -> Vec<LayerTiming> {
+        let moment = self.ensure_laid_at(index, moment);
+        self.slides[index].laid_at(moment).timings()
     }
 
     /// The components on the slide that change as the talk plays, once each.
