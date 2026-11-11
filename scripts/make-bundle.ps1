@@ -50,3 +50,7 @@ license = "MIT"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 '@ | Set-Content -Encoding ascii -Path "$Out/toolkit-src/Cargo.toml"
+
+# The guide for writing components, which ships with the app.
+New-Item -ItemType Directory -Force -Path "$Out/guide" | Out-Null
+Copy-Item 'docs/guide/components.md' "$Out/guide/"

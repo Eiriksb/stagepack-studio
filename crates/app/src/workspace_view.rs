@@ -13,10 +13,11 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use slides_components::Diagnostic;
+use slides_components::{Bundle, Diagnostic};
 use slides_engine::{ComponentState, Fonts};
 
 use crate::builds::{self, BuildOutcome, Compile};
+use crate::cargo_file::write_cargo_file;
 use crate::document::{Document, OpenProblem, Reload, SLIDES_FILE, TalkPlace};
 use crate::export::{self, ExportKind, run_export, stagepack_executable};
 use crate::markdown_panel::MarkdownPanel;
@@ -71,6 +72,7 @@ actions!(
         OpenPacked,
         SavePacked,
         SaveFolder,
+        SetUpForCodeEditor,
         ExportPowerPoint,
         ExportPdf,
         Present,
@@ -148,6 +150,8 @@ pub struct WorkspaceView {
     talk_folder: Option<PathBuf>,
     /// What builds the talk's components, if this copy of the app has a compiler.
     compile: Option<Compile>,
+    /// The compiler and toolkit that came with the app, for a code editor to be pointed at.
+    bundle: Option<Bundle>,
     /// Which folders are built whenever their components change, if the app has somewhere
     /// to keep that.
     permissions: Option<BuildPermissions>,
@@ -260,6 +264,7 @@ impl WorkspaceView {
             show: None,
             talk_folder,
             compile: builds::bundled_compiler(),
+            bundle: Bundle::find(),
             permissions,
             always_build: false,
             building: false,
@@ -279,6 +284,11 @@ impl WorkspaceView {
     /// Builds with `compile` in place of the app's own compiler.
     pub fn set_compile_for_test(&mut self, compile: Compile) {
         self.compile = Some(compile);
+    }
+
+    /// Uses `bundle`, or none, in place of the one that came with the app.
+    pub fn set_bundle_for_test(&mut self, bundle: Option<Bundle>) {
+        self.bundle = bundle;
     }
 
     /// Keeps which folders are always built in `permissions`, in place of the app's own.
@@ -666,6 +676,18 @@ impl WorkspaceView {
         );
     }
 
+    /// Writes a `Cargo.toml` for the talk's components, which only this asks for.
+    fn set_up_for_code_editor(&mut self, cx: &mut Context<Self>) {
+        let (Some(folder), Some(bundle)) = (&self.talk_folder, &self.bundle) else {
+            return;
+        };
+        let said = match write_cargo_file(folder, bundle) {
+            Ok(_) => "Wrote Cargo.toml in the talk's folder. Open the folder in a code editor to check its components as you type.".to_string(),
+            Err(problem) => problem,
+        };
+        self.say(said, cx);
+    }
+
     fn open_in_stagepack(&mut self, cx: &mut Context<Self>) {
         let Some(offer) = &self.stagepack_offer else {
             return;
@@ -677,7 +699,8 @@ impl WorkspaceView {
 }
 
 /// The File menu. `packed` says which form the open talk is in, and is `None` with no talk.
-fn file_menu(packed: Option<bool>) -> impl IntoElement {
+/// `for_code_editor` says whether it offers to set a folder talk up for a code editor.
+fn file_menu(packed: Option<bool>, for_code_editor: bool) -> impl IntoElement {
     Button::new(FILE_MENU_ID)
         .ghost()
         .small()
@@ -689,7 +712,11 @@ fn file_menu(packed: Option<bool>) -> impl IntoElement {
             match packed {
                 Some(false) => menu
                     .separator()
-                    .menu("Save as packed talk…", Box::new(SavePacked)),
+                    .menu("Save as packed talk…", Box::new(SavePacked))
+                    .when(for_code_editor, |menu| {
+                        menu.separator()
+                            .menu("Set up for a code editor", Box::new(SetUpForCodeEditor))
+                    }),
                 Some(true) => menu
                     .separator()
                     .menu("Save as folder…", Box::new(SaveFolder)),
@@ -859,6 +886,9 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &OpenPacked, _, cx| this.ask_to_open(false, cx)))
             .on_action(cx.listener(|this, _: &SavePacked, _, cx| this.save_packed(cx)))
             .on_action(cx.listener(|this, _: &SaveFolder, _, cx| this.save_folder(cx)))
+            .on_action(
+                cx.listener(|this, _: &SetUpForCodeEditor, _, cx| this.set_up_for_code_editor(cx)),
+            )
             .on_action(cx.listener(|this, _: &ExportPowerPoint, _, cx| {
                 this.export(ExportKind::PowerPoint, cx)
             }))
@@ -873,7 +903,7 @@ impl Render for WorkspaceView {
                     h_flex()
                         .gap_1()
                         .items_center()
-                        .child(file_menu(packed))
+                        .child(file_menu(packed, self.bundle.is_some()))
                         .child(export_menu(packed.is_some()))
                         .child(
                             Button::new(PRESENT_ID)

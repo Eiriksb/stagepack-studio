@@ -50,4 +50,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 END
 
+# The guide for writing components, which ships with the app.
+mkdir -p "$out/guide"
+cp docs/guide/components.md "$out/guide/"
+
 du -sm "$out" | cut -f1

@@ -3,10 +3,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use slides_components::{BuildIndex, Diagnostic, INDEX_FILE, component_tag, source_hash};
-use slides_engine::{ComponentState, FolderFiles, TalkComponents};
+use slides_components::{BuildIndex, Bundle, Diagnostic, INDEX_FILE, component_tag, source_hash};
+use slides_engine::{ComponentState, FolderFiles, Fonts, TalkComponents};
 use stagepack_studio::builds::{BuildOutcome, Compile, behind, build_components};
-use stagepack_studio::document::TalkPlace;
+use stagepack_studio::cargo_file::write_cargo_file;
+use stagepack_studio::document::{Document, TalkPlace};
 use stagepack_studio::permissions::BuildPermissions;
 use tempfile::TempDir;
 
@@ -410,5 +411,186 @@ fn a_packed_copy_says_which_builds_are_behind() {
     assert_eq!(
         notices,
         ["Score couldn't be built just now, so the packed talk carries its last good build"]
+    );
+}
+
+/// A bundle holding only the toolkit's source, which is all a Cargo file needs.
+fn bundle_with_toolkit_source() -> (TempDir, Bundle) {
+    let dir = tempfile::tempdir().unwrap();
+    let toolkit = dir.path().join("toolkit-src").join("toolkit");
+    std::fs::create_dir_all(&toolkit).unwrap();
+    std::fs::write(
+        toolkit.join("Cargo.toml"),
+        "[package]\nname = \"toolkit\"\n",
+    )
+    .unwrap();
+    let bundle = Bundle {
+        root: dir.path().to_path_buf(),
+    };
+    (dir, bundle)
+}
+
+/// How a path is written in a TOML string.
+fn toml_path(path: &Path) -> String {
+    path.to_str().unwrap().replace('\\', "\\\\")
+}
+
+#[test]
+fn the_cargo_file_lists_each_component() {
+    let dir = talk(&[
+        ("score.rs", &source("Score")),
+        ("clock.rs", &source("Clock")),
+        ("bad name.rs", &source("Bad")),
+    ]);
+    let (_bundle_dir, bundle) = bundle_with_toolkit_source();
+
+    let written = write_cargo_file(dir.path(), &bundle).unwrap();
+
+    assert_eq!(written, dir.path().join("Cargo.toml"));
+    let text = std::fs::read_to_string(&written).unwrap();
+    let toolkit = bundle.root.join("toolkit-src").join("toolkit");
+    assert!(text.contains("\n[workspace]\n"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "toolkit = {{ path = \"{}\" }}",
+            toml_path(&toolkit)
+        )),
+        "{text}"
+    );
+    let examples: Vec<&str> = text.split("[[example]]").skip(1).map(str::trim).collect();
+    assert_eq!(
+        examples,
+        [
+            "name = \"clock\"\npath = \"components/clock.rs\"\ncrate-type = [\"cdylib\"]",
+            "name = \"score\"\npath = \"components/score.rs\"\ncrate-type = [\"cdylib\"]",
+        ],
+        "{text}"
+    );
+}
+
+#[test]
+fn an_existing_cargo_file_is_left_alone() {
+    let dir = talk(&[("score.rs", &source("Score"))]);
+    std::fs::write(dir.path().join("Cargo.toml"), "# mine\n").unwrap();
+    let (_bundle_dir, bundle) = bundle_with_toolkit_source();
+
+    let refused = write_cargo_file(dir.path(), &bundle).unwrap_err();
+
+    assert!(refused.contains("Cargo.toml"), "{refused}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap(),
+        "# mine\n"
+    );
+}
+
+#[test]
+fn a_bundle_without_the_toolkit_source_writes_nothing() {
+    let dir = talk(&[("score.rs", &source("Score"))]);
+    let bundle = Bundle {
+        root: tempfile::tempdir().unwrap().path().to_path_buf(),
+    };
+
+    assert!(write_cargo_file(dir.path(), &bundle).is_err());
+    assert!(!dir.path().join("Cargo.toml").exists());
+}
+
+#[test]
+fn nothing_writes_a_cargo_file_unasked() {
+    let dir = talk(&[("score.rs", &source("Score"))]);
+    let (compile, _) = fake_compiler();
+
+    let document = Document::open(dir.path(), Fonts::with_system_fallback()).unwrap();
+    build_components(dir.path(), &compile);
+    drop(document);
+
+    assert!(dir.path().join("build/score.wasm").is_file());
+    assert!(!dir.path().join("Cargo.toml").exists());
+}
+
+/// The example talk that the guide for coders quotes.
+fn example_talk() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/components")
+}
+
+/// A copy of the folder `from` in `to`, files and folders only.
+fn copy_folder(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_folder(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs the compiler bundle"]
+fn the_example_talk_needs_building_then_builds_and_shows() {
+    assert!(
+        !example_talk().join("build").exists(),
+        "the example talk is kept unbuilt"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    copy_folder(&example_talk(), dir.path());
+    let unbuilt = states(dir.path());
+    assert_eq!(unbuilt.len(), 5, "{unbuilt:?}");
+    assert!(
+        unbuilt
+            .iter()
+            .all(|(_, state)| *state == ComponentState::NeedsBuilding),
+        "{unbuilt:?}"
+    );
+
+    let compile =
+        stagepack_studio::builds::bundled_compiler().expect("STUDIO_BUNDLE names a bundle");
+    let outcome = build_components(dir.path(), &compile);
+
+    assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
+    assert_eq!(outcome.built.len(), 5);
+    let mut document = Document::open(dir.path(), Fonts::with_system_fallback()).unwrap();
+    assert!(document.component_problems().is_empty());
+    for slide in 0..document.slide_count() {
+        assert!(!document.layers(0.25).is_empty(), "slide {}", slide + 1);
+        assert_eq!(
+            document.notices(),
+            Vec::<String>::new(),
+            "slide {}",
+            slide + 1
+        );
+        document.next();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "needs the compiler bundle"]
+fn the_cargo_file_works_with_cargo() {
+    let bundle = Bundle::find().expect("STUDIO_BUNDLE names a bundle");
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("talk");
+    copy_folder(&example_talk(), &folder);
+    write_cargo_file(&folder, &bundle).unwrap();
+
+    let cargo_safe = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/cargo-safe.sh");
+    let checked = std::process::Command::new(cargo_safe)
+        .current_dir(&folder)
+        .args(["check", "--examples", "--offline", "--quiet"])
+        .arg("--target-dir")
+        .arg(dir.path().join("target"))
+        // What the cargo running this test tells its tests, which isn't for this one.
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET")
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .output()
+        .unwrap();
+
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
     );
 }

@@ -8,7 +8,7 @@ use gpui_kit::{
     AnyWindowHandle, App, AppContext, Bounds, Context, Entity, Pixels, Point, RenderImage,
     TestAppContext, Window, WindowBounds, WindowOptions, point, px, size,
 };
-use slides_components::{Diagnostic, component_tag};
+use slides_components::{Bundle, Diagnostic, component_tag};
 use slides_engine::{ComponentState, Fonts};
 use stagepack_studio::builds::Compile;
 use stagepack_studio::document::Document;
@@ -18,7 +18,8 @@ use stagepack_studio::slide_canvas::{SlideCanvas, letterbox};
 use stagepack_studio::workspace_view::{
     self, BUILD_ALWAYS_ID, BUILD_ONCE_ID, CANVAS_ID, COMPONENT_PROBLEMS_ID, EXPORT_MENU_ID,
     ExportPdf, ExportPowerPoint, FILE_MENU_ID, MARKDOWN_ID, NOTICES_ID, OPEN_IN_STAGEPACK_ID,
-    OpenFolder, OpenPacked, PROBLEM_ID, STATUS_ID, SaveFolder, SavePacked, TITLE_ID, WorkspaceView,
+    OpenFolder, OpenPacked, PROBLEM_ID, STATUS_ID, SaveFolder, SavePacked, SetUpForCodeEditor,
+    TITLE_ID, WorkspaceView,
 };
 
 fn document(source: &str) -> Document {
@@ -1069,6 +1070,58 @@ fn a_talk_in_a_folder_can_be_packed_from_the_window(cx: &mut TestAppContext) {
     let copy = Document::open_packed(&out, Fonts::bundled_only()).unwrap();
     assert_eq!(copy.source(), "# One\n");
     assert_eq!(status(cx, talk.handle).as_deref(), Some("Saved copy.sptx."));
+}
+
+const SET_UP_FOR_CODE_EDITOR: &str = "Set up for a code editor";
+
+/// A bundle holding only the toolkit's source, which is all a Cargo file needs.
+fn bundle_with_toolkit_source() -> (tempfile::TempDir, Bundle) {
+    let dir = tempfile::tempdir().unwrap();
+    let toolkit = dir.path().join("toolkit-src").join("toolkit");
+    std::fs::create_dir_all(&toolkit).unwrap();
+    std::fs::write(toolkit.join("Cargo.toml"), "[package]\n").unwrap();
+    let bundle = Bundle {
+        root: dir.path().to_path_buf(),
+    };
+    (dir, bundle)
+}
+
+#[gpui_kit::test]
+fn a_talk_in_a_folder_can_be_set_up_for_a_code_editor(cx: &mut TestAppContext) {
+    let talk = open_saved_talk(cx, "# One\n");
+    let (_bundle_dir, bundle) = bundle_with_toolkit_source();
+    cx.update(|cx| {
+        talk.view
+            .update(cx, |view, _| view.set_bundle_for_test(Some(bundle)))
+    });
+    assert!(file_menu_has(cx, talk.handle, SET_UP_FOR_CODE_EDITOR));
+    let cargo_file = talk.file.with_file_name("Cargo.toml");
+    assert!(!cargo_file.exists());
+
+    cx.dispatch_action(talk.handle, SetUpForCodeEditor);
+    cx.run_until_parked();
+
+    assert!(cargo_file.is_file());
+    assert!(
+        status(cx, talk.handle).is_some_and(|said| said.starts_with("Wrote Cargo.toml")),
+        "{:?}",
+        status(cx, talk.handle)
+    );
+}
+
+#[gpui_kit::test]
+fn only_a_folder_talk_with_a_bundle_offers_a_code_editor(cx: &mut TestAppContext) {
+    let talk = open_saved_talk(cx, "# One\n");
+    cx.update(|cx| {
+        talk.view
+            .update(cx, |view, _| view.set_bundle_for_test(None))
+    });
+    assert!(!file_menu_has(cx, talk.handle, SET_UP_FOR_CODE_EDITOR));
+
+    let (_dir, handle, view) = open_packed_talk(cx, "# One\n");
+    let (_bundle_dir, bundle) = bundle_with_toolkit_source();
+    cx.update(|cx| view.update(cx, |view, _| view.set_bundle_for_test(Some(bundle))));
+    assert!(!file_menu_has(cx, handle, SET_UP_FOR_CODE_EDITOR));
 }
 
 const SLIDEV_TALK: &str =
