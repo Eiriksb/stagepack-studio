@@ -7156,6 +7156,7 @@ dependencies = [
  "slides-pdf",
  "slides-pptx",
  "tempfile",
+ "toml 0.8.23",
  "wat",
  "zip",
 ]

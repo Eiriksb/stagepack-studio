@@ -37,7 +37,12 @@ impl BuildPermissions {
 
     /// Where the app keeps its permissions: in its own data folder, if the system has one.
     pub fn default_file() -> Option<PathBuf> {
-        Some(dirs::data_dir()?.join(APP_FOLDER).join(FILE_NAME))
+        Some(BuildPermissions::app_folder()?.join(FILE_NAME))
+    }
+
+    /// The app's own data folder, if the system has one.
+    pub fn app_folder() -> Option<PathBuf> {
+        Some(dirs::data_dir()?.join(APP_FOLDER))
     }
 
     /// Whether the components in `folder` are built whenever they change.

@@ -24,4 +24,5 @@ slides-pptx = { path = "../pptx" }
 gpui-kit = { version = "=0.9.0", features = ["test-support"] }
 tempfile = "3"
 wat = "=1"
+toml = "=0.8.23"
 zip = { version = "=9.5.0", default-features = false, features = ["deflate"] }

@@ -355,15 +355,8 @@ A talk is shared like any other file, so a component is held to some limits. The
 
 ## Using a code editor
 
-The app doesn't need anything else to build your components. But if you have Rust installed and want an editor that completes names and points out mistakes as you type, open the talk and choose **File → Set up for a code editor**. It writes a `Cargo.toml` at the top of the talk that points the editor at the toolkit the app came with. Then open the talk's folder in your editor.
+The app doesn't need anything else to build your components. But if you have Rust installed and want an editor that completes names and points out mistakes as you type, open the talk and choose **File → Set up for a code editor**. The app then says where it has put a small Cargo project for the talk: a folder in the app's own data folder, named after the talk's folder, holding one `Cargo.toml`. That file points your editor at the toolkit the app came with, and at each of the talk's components by its full path.
 
-The app never writes this file unless you ask, and leaves one that's already there alone.
+Open that folder in your editor, beside the talk. The component files you edit are still the talk's own, in its `components` folder: the project only tells the editor where they are. Choose **Set up for a code editor** again after adding a component, and the file is written afresh to include it.
 
-Once the file is there, Cargo and your editor treat the folder as a Rust project, and some files in it, or in a folder above it, can make them run programs on your computer, outside the limits above. So the app won't set a talk up while it holds any of these:
-
-- In the talk's folder: a `build.rs`, a `src` folder, a `.cargo` folder, a `rust-toolchain` or `rust-toolchain.toml` file, a `Cargo.lock`, a `target` folder, a `rust-analyzer.toml` or `.rust-analyzer.toml`, or an editor's settings folder: `.vscode`, `.zed`, `.helix`, `.idea` or `.fleet`.
-- In any folder above it: a `.cargo/config.toml`, `.cargo/config`, `rust-toolchain` or `rust-toolchain.toml`. Your own Cargo settings, in your Cargo home, don't count.
-
-The file it writes turns off the build script and every target Cargo would otherwise find by itself, so only the components are checked. But the app looks for those files only when it writes it. Anything added later, by a `git pull` for instance, isn't checked, so only use a code editor on a talk you trust.
-
-Your editor will add a `target` folder and a `Cargo.lock` as it works. Neither is needed by the app, and a packed talk leaves them out, along with `Cargo.toml`.
+The app never puts a `Cargo.toml` in a talk. Cargo, rustup and editors look for their settings in the project's folder and every folder above it, so with the project kept out of the talk, nothing in the talk, or added to it later, can make them run anything. Don't add a `Cargo.toml` to a talk yourself, least of all one you got from someone else: it would make the talk's folder a Rust project, and files in it could then make Cargo or your editor run programs on your computer.

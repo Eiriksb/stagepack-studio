@@ -1090,26 +1090,27 @@ fn bundle_with_toolkit_source() -> (tempfile::TempDir, Bundle) {
 fn a_talk_in_a_folder_can_be_set_up_for_a_code_editor(cx: &mut TestAppContext) {
     let talk = open_saved_talk(cx, "# One\n");
     let (_bundle_dir, bundle) = bundle_with_toolkit_source();
+    let projects = tempfile::tempdir().unwrap();
+    let root = projects.path().to_path_buf();
     cx.update(|cx| {
-        talk.view
-            .update(cx, |view, _| view.set_bundle_for_test(Some(bundle)))
+        talk.view.update(cx, |view, _| {
+            view.set_bundle_for_test(Some(bundle));
+            view.set_editor_projects_for_test(root);
+        })
     });
     assert!(file_menu_has(cx, talk.handle, SET_UP_FOR_CODE_EDITOR));
-    let cargo_file = talk.file.with_file_name("Cargo.toml");
-    assert!(!cargo_file.exists());
 
     cx.dispatch_action(talk.handle, SetUpForCodeEditor);
     cx.run_until_parked();
 
-    assert!(cargo_file.is_file());
+    assert!(!talk.file.with_file_name("Cargo.toml").exists(), "nothing is written in the talk");
+    let made: Vec<PathBuf> = std::fs::read_dir(projects.path()).unwrap().map(|entry| entry.unwrap().path()).collect();
+    assert_eq!(made.len(), 1, "{made:?}");
+    assert!(made[0].join("Cargo.toml").is_file());
+    let project = made[0].canonicalize().unwrap();
     assert_eq!(
-        status(cx, talk.handle).as_deref(),
-        Some(
-            "Wrote Cargo.toml in the talk's folder. Open the folder in a code editor to check its \
-             components as you type. Only use a code editor on a talk you trust: Cargo and your \
-             editor now treat this folder as a Rust project, and files added later can make them \
-             run code."
-        )
+        status(cx, talk.handle),
+        Some(format!("Open {} in your code editor to get completions for this talk's components.", project.display()))
     );
 }
 

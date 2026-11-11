@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use slides_components::{BuildIndex, Bundle, Diagnostic, INDEX_FILE, component_tag, source_hash};
 use slides_engine::{ComponentState, FolderFiles, Fonts, TalkComponents};
 use stagepack_studio::builds::{BuildOutcome, Compile, behind, build_components};
-use stagepack_studio::cargo_file::{write_cargo_file, write_cargo_file_with_cargo_home};
+use stagepack_studio::cargo_file::write_cargo_file;
 use stagepack_studio::document::{Document, TalkPlace};
 use stagepack_studio::permissions::BuildPermissions;
 use tempfile::TempDir;
@@ -449,188 +449,129 @@ fn bundle_with_toolkit_source() -> (TempDir, Bundle) {
     (dir, bundle)
 }
 
-/// How a path is written in a TOML string.
-fn toml_path(path: &Path) -> String {
-    path.to_str().unwrap().replace('\\', "\\\\")
+/// Every file and folder in `folder` and below, relative to it.
+fn everything_in(folder: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(folder).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if entry.file_type().unwrap().is_dir() {
+            found.extend(everything_in(&entry.path()).into_iter().map(|below| format!("{name}/{below}")));
+        }
+        found.push(name);
+    }
+    found.sort();
+    found
+}
+
+/// The project written for the talk in `talk`, with projects kept in `projects`.
+fn set_up(talk: &Path, projects: &Path) -> (std::path::PathBuf, toml::Table) {
+    let (_bundle_dir, bundle) = bundle_with_toolkit_source();
+    let project = write_cargo_file(talk, &bundle, projects).unwrap();
+    let text = std::fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    (project, text.parse::<toml::Table>().unwrap_or_else(|error| panic!("{error}\n{text}")))
+}
+
+/// The name and path of each `[[example]]`.
+fn examples(cargo: &toml::Table) -> Vec<(String, String)> {
+    cargo
+        .get("example")
+        .and_then(|examples| examples.as_array())
+        .map(|examples| {
+            examples
+                .iter()
+                .map(|example| (example["name"].as_str().unwrap().to_string(), example["path"].as_str().unwrap().to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[test]
-fn the_cargo_file_lists_each_component() {
+fn the_cargo_file_lists_each_component_by_its_path() {
     let dir = talk(&[
         ("score.rs", &source("Score")),
         ("clock.rs", &source("Clock")),
         ("bad name.rs", &source("Bad")),
         ("chart.rs", &source("Chart")),
     ]);
-    let (_bundle_dir, bundle) = bundle_with_toolkit_source();
+    let projects = tempfile::tempdir().unwrap();
+    let (project, cargo) = set_up(dir.path(), projects.path());
 
-    let written = write_cargo_file(dir.path(), &bundle).unwrap();
-
-    assert_eq!(written, dir.path().join("Cargo.toml"));
-    let text = std::fs::read_to_string(&written).unwrap();
-    let toolkit = bundle.root.join("toolkit-src").join("toolkit");
-    assert!(text.contains("\n[workspace]\n"), "{text}");
-    assert!(
-        text.contains(&format!(
-            "toolkit = {{ path = \"{}\" }}",
-            toml_path(&toolkit)
-        )),
-        "{text}"
-    );
-    let examples: Vec<&str> = text.split("[[example]]").skip(1).map(str::trim).collect();
+    assert!(project.starts_with(projects.path().canonicalize().unwrap()), "{project:?}");
+    assert!(cargo.contains_key("workspace"));
+    let talk = dir.path().canonicalize().unwrap();
     assert_eq!(
-        examples,
+        examples(&cargo),
         [
-            "name = \"clock\"\npath = \"components/clock.rs\"\ncrate-type = [\"cdylib\"]",
-            "name = \"score\"\npath = \"components/score.rs\"\ncrate-type = [\"cdylib\"]",
-        ],
-        "{text}"
+            ("clock".to_string(), talk.join("components/clock.rs").to_str().unwrap().to_string()),
+            ("score".to_string(), talk.join("components/score.rs").to_str().unwrap().to_string()),
+        ]
     );
-}
-
-#[test]
-fn an_existing_cargo_file_is_left_alone() {
-    let dir = talk(&[("score.rs", &source("Score"))]);
-    std::fs::write(dir.path().join("Cargo.toml"), "# mine\n").unwrap();
-    let (_bundle_dir, bundle) = bundle_with_toolkit_source();
-
-    let refused = write_cargo_file(dir.path(), &bundle).unwrap_err();
-
-    assert!(refused.contains("Cargo.toml"), "{refused}");
-    assert_eq!(
-        std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap(),
-        "# mine\n"
-    );
-}
-
-/// Refuses with the talk in `dir` holding `name`, and writes nothing.
-fn assert_refused_for(dir: &TempDir, name: &str) {
-    let (_bundle_dir, bundle) = bundle_with_toolkit_source();
-    let refused = write_cargo_file(dir.path(), &bundle).unwrap_err();
-    assert!(refused.contains(name), "{name}: {refused}");
-    assert!(refused.contains("code editor"), "{name}: {refused}");
-    assert!(!dir.path().join("Cargo.toml").exists(), "{name}");
-}
-
-#[test]
-fn a_talk_with_a_build_script_is_not_set_up() {
-    let dir = talk(&[("score.rs", &source("Score"))]);
-    std::fs::write(dir.path().join("build.rs"), "fn main() {}\n").unwrap();
-    assert_refused_for(&dir, "build.rs");
-}
-
-#[test]
-fn a_talk_with_cargo_settings_is_not_set_up() {
-    let dir = talk(&[("score.rs", &source("Score"))]);
-    std::fs::create_dir(dir.path().join(".cargo")).unwrap();
-    assert_refused_for(&dir, ".cargo");
-}
-
-#[test]
-fn a_talk_that_picks_a_toolchain_is_not_set_up() {
-    for name in ["rust-toolchain", "rust-toolchain.toml"] {
-        let dir = talk(&[("score.rs", &source("Score"))]);
-        std::fs::write(dir.path().join(name), "[toolchain]\n").unwrap();
-        assert_refused_for(&dir, name);
+    let package = cargo["package"].as_table().unwrap();
+    for key in ["build", "autolib", "autobins", "autoexamples", "autotests", "autobenches"] {
+        assert_eq!(package[key].as_bool(), Some(false), "{key}");
     }
 }
 
 #[test]
-fn a_talk_with_a_src_folder_is_not_set_up() {
+fn setting_up_writes_nothing_in_the_talk() {
     let dir = talk(&[("score.rs", &source("Score"))]);
-    std::fs::create_dir(dir.path().join("src")).unwrap();
-    assert_refused_for(&dir, "src");
-}
-
-#[cfg(unix)]
-#[test]
-fn a_linked_build_script_counts_too() {
-    let dir = talk(&[("score.rs", &source("Score"))]);
-    std::os::unix::fs::symlink(dir.path().join("nowhere.rs"), dir.path().join("build.rs")).unwrap();
-    assert_refused_for(&dir, "build.rs");
+    let before = everything_in(dir.path());
+    let projects = tempfile::tempdir().unwrap();
+    set_up(dir.path(), projects.path());
+    assert_eq!(everything_in(dir.path()), before);
 }
 
 #[test]
-fn a_talk_with_editor_or_cargo_leftovers_is_not_set_up() {
-    let folders = [".vscode", ".zed", ".helix", ".idea", ".fleet", "target"];
-    let files = ["rust-analyzer.toml", ".rust-analyzer.toml", "Cargo.lock"];
-    for name in folders {
-        let dir = talk(&[("score.rs", &source("Score"))]);
-        std::fs::create_dir(dir.path().join(name)).unwrap();
-        assert_refused_for(&dir, name);
+fn the_cargo_file_is_written_again_with_a_new_component() {
+    let dir = talk(&[("score.rs", &source("Score"))]);
+    let projects = tempfile::tempdir().unwrap();
+    let (first, cargo) = set_up(dir.path(), projects.path());
+    assert_eq!(examples(&cargo).len(), 1);
+    std::fs::write(dir.path().join("components/clock.rs"), source("Clock")).unwrap();
+    let (again, cargo) = set_up(dir.path(), projects.path());
+    assert_eq!(again, first);
+    let names: Vec<String> = examples(&cargo).into_iter().map(|(name, _)| name).collect();
+    assert_eq!(names, ["clock", "score"]);
+}
+
+#[test]
+fn two_talks_of_the_same_name_have_projects_of_their_own() {
+    let (one, two) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let projects = tempfile::tempdir().unwrap();
+    let mut made = Vec::new();
+    for parent in [&one, &two] {
+        let folder = parent.path().join("talk");
+        std::fs::create_dir_all(folder.join("components")).unwrap();
+        std::fs::write(folder.join("components/score.rs"), source("Score")).unwrap();
+        made.push(set_up(&folder, projects.path()).0);
     }
-    for name in files {
-        let dir = talk(&[("score.rs", &source("Score"))]);
-        std::fs::write(dir.path().join(name), "").unwrap();
-        assert_refused_for(&dir, name);
+    assert_ne!(made[0], made[1]);
+    for project in &made {
+        assert!(project.file_name().unwrap().to_str().unwrap().starts_with("talk-"), "{project:?}");
     }
 }
 
-/// A talk in `talk` inside a folder that holds `file`, given as a path below that folder.
-fn talk_below(file: &str) -> (TempDir, std::path::PathBuf) {
+#[test]
+fn a_talk_path_with_a_quote_or_a_backslash_gives_good_toml() {
     let outer = tempfile::tempdir().unwrap();
-    let found = outer.path().join(file);
-    std::fs::create_dir_all(found.parent().unwrap()).unwrap();
-    std::fs::write(&found, "[build]\n").unwrap();
-    let folder = outer.path().join("talks").join("talk");
+    let name = if cfg!(windows) { "the \"best\" talk" } else { "the \"best\" \\ talk" };
+    let folder = outer.path().join(name);
     std::fs::create_dir_all(folder.join("components")).unwrap();
-    std::fs::write(folder.join("slides.md"), "# One\n").unwrap();
     std::fs::write(folder.join("components/score.rs"), source("Score")).unwrap();
-    (outer, folder)
+    let projects = tempfile::tempdir().unwrap();
+    let (_, cargo) = set_up(&folder, projects.path());
+    let path = folder.canonicalize().unwrap().join("components/score.rs");
+    assert_eq!(examples(&cargo), [("score".to_string(), path.to_str().unwrap().to_string())]);
 }
 
 #[test]
-fn settings_in_a_folder_above_the_talk_refuse() {
-    for file in [
-        ".cargo/config.toml",
-        ".cargo/config",
-        "rust-toolchain",
-        "rust-toolchain.toml",
-    ] {
-        let (_outer, folder) = talk_below(file);
-        let (_bundle_dir, bundle) = bundle_with_toolkit_source();
-
-        let refused = write_cargo_file_with_cargo_home(&folder, &bundle, None).unwrap_err();
-
-        let name = Path::new(file).file_name().unwrap().to_str().unwrap();
-        assert!(refused.contains(name), "{file}: {refused}");
-        assert!(refused.contains("code editor"), "{file}: {refused}");
-        assert!(!folder.join("Cargo.toml").exists(), "{file}");
-    }
-}
-
-#[test]
-fn the_cargo_home_above_the_talk_does_not_refuse() {
-    let (outer, folder) = talk_below(".cargo/config.toml");
-    let (_bundle_dir, bundle) = bundle_with_toolkit_source();
-    let cargo_home = outer.path().join(".cargo");
-
-    let written = write_cargo_file_with_cargo_home(&folder, &bundle, Some(&cargo_home));
-
-    assert_eq!(written, Ok(folder.join("Cargo.toml")));
-}
-
-#[test]
-fn the_cargo_file_finds_nothing_cargo_would_run_or_add() {
+fn a_projects_folder_inside_the_talk_is_refused() {
     let dir = talk(&[("score.rs", &source("Score"))]);
     let (_bundle_dir, bundle) = bundle_with_toolkit_source();
-
-    let text = std::fs::read_to_string(write_cargo_file(dir.path(), &bundle).unwrap()).unwrap();
-
-    let package = text.split("[workspace]").next().unwrap();
-    for line in [
-        "build = false",
-        "autolib = false",
-        "autobins = false",
-        "autoexamples = false",
-        "autotests = false",
-        "autobenches = false",
-    ] {
-        assert!(
-            package.lines().any(|written| written == line),
-            "{line}\n{text}"
-        );
-    }
+    let refused = write_cargo_file(dir.path(), &bundle, &dir.path().join("projects")).unwrap_err();
+    assert!(refused.contains("inside the talk"), "{refused}");
+    assert!(!dir.path().join("projects").join("Cargo.toml").exists());
 }
 
 #[test]
@@ -639,9 +580,9 @@ fn a_bundle_without_the_toolkit_source_writes_nothing() {
     let bundle = Bundle {
         root: tempfile::tempdir().unwrap().path().to_path_buf(),
     };
-
-    assert!(write_cargo_file(dir.path(), &bundle).is_err());
-    assert!(!dir.path().join("Cargo.toml").exists());
+    let projects = tempfile::tempdir().unwrap();
+    assert!(write_cargo_file(dir.path(), &bundle, projects.path()).is_err());
+    assert!(everything_in(projects.path()).iter().all(|name| !name.ends_with("Cargo.toml")));
 }
 
 #[test]
@@ -722,15 +663,25 @@ fn the_cargo_file_works_with_cargo() {
     let dir = tempfile::tempdir().unwrap();
     let folder = dir.path().join("talk");
     copy_folder(&example_talk(), &folder);
-    write_cargo_file(&folder, &bundle).unwrap();
-    // A build script that arrives later, as from a `git pull`, must not be run.
-    let marker = dir.path().join("build-script-ran");
-    let script = format!("fn main() {{ std::fs::write({marker:?}, \"ran\").unwrap(); }}\n");
+    // What a talk could carry to make Cargo or rustup run its own code: none takes effect,
+    // as the project isn't in the talk.
+    let marker = dir.path().join("talk-code-ran");
+    let script = format!("fn main() {{ std::fs::write({marker:?}, \"build.rs\").unwrap(); }}\n");
     std::fs::write(folder.join("build.rs"), script).unwrap();
+    let wrapper = folder.join("wrapper.sh");
+    std::fs::write(&wrapper, format!("#!/bin/sh\necho wrapper > {}\nexec \"$@\"\n", marker.display())).unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&wrapper, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    std::fs::create_dir(folder.join(".cargo")).unwrap();
+    std::fs::write(folder.join(".cargo/config.toml"), format!("[build]\nrustc-wrapper = {:?}\n", wrapper.to_str().unwrap())).unwrap();
+    std::fs::write(folder.join("rust-toolchain.toml"), "[toolchain]\nchannel = \"nightly-2001-01-01\"\n").unwrap();
+    let before = everything_in(&folder);
+
+    let project = write_cargo_file(&folder, &bundle, &dir.path().join("projects")).unwrap();
 
     let cargo_safe = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/cargo-safe.sh");
     let checked = std::process::Command::new(cargo_safe)
-        .current_dir(&folder)
+        .current_dir(&project)
         .args(["check", "--examples", "--offline", "--quiet"])
         .arg("--target-dir")
         .arg(dir.path().join("target"))
@@ -739,6 +690,9 @@ fn the_cargo_file_works_with_cargo() {
         .env_remove("CARGO_BUILD_TARGET")
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        .env_remove("RUSTC_WRAPPER")
         .output()
         .unwrap();
 
@@ -747,5 +701,6 @@ fn the_cargo_file_works_with_cargo() {
         "{}",
         String::from_utf8_lossy(&checked.stderr)
     );
-    assert!(!marker.exists(), "cargo ran the talk's build script");
+    assert!(!marker.exists(), "the talk's {} ran", std::fs::read_to_string(&marker).unwrap_or_default());
+    assert_eq!(everything_in(&folder), before, "cargo wrote nothing in the talk");
 }

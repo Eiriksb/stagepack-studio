@@ -1,121 +1,37 @@
-//! A `Cargo.toml` for a talk's components, written only when asked for, so that a code
+//! A Cargo project for a talk's components, written only when asked for, so that a code
 //! editor with Rust can check them and offer completions. The app itself never uses it: it
 //! builds with its own compiler and no Cargo.
+//!
+//! The project is written in the app's data folder, never in the talk. Cargo, rustup and
+//! editors look for their settings from the project's folder upwards, so nothing in or above
+//! a talk is ever consulted, whatever arrives in it later. Each `[[example]]` names a
+//! component's file in the talk by its absolute path.
 
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use slides_components::Bundle;
+use slides_components::{Bundle, source_hash};
 use slides_engine::{COMPONENTS_FOLDER, FolderFiles, TalkComponents, write_atomically};
 
 const CARGO_FILE: &str = "Cargo.toml";
+/// The folder of the app's data folder that holds a project for each talk set up.
+const PROJECTS_FOLDER: &str = "editor-projects";
+/// How many hex digits of the hash of a talk's path tell its project apart from another
+/// talk's of the same folder name.
+const PATH_HASH_DIGITS: usize = 12;
 
-/// What the app says once it has written the file. The checks here are made only then, so it
-/// says plainly what they can't cover.
-pub const WRITTEN: &str = "Wrote Cargo.toml in the talk's folder. Open the folder in a code editor to check its components as you type. Only use a code editor on a talk you trust: Cargo and your editor now treat this folder as a Rust project, and files added later can make them run code.";
-
-/// What Cargo or an editor would find in a talk's folder and act on once it's a Rust project,
-/// each with why it's refused. A talk can come from anyone, and an editor checks the project as
-/// soon as it's opened, so with any of these the talk's own code or settings would run outside
-/// the sandbox.
-const REFUSED: [(&str, &str); 14] = [
-    (
-        "build.rs",
-        "a build.rs, which Cargo would run on your computer",
-    ),
-    (
-        ".cargo",
-        "a .cargo folder, whose settings could make Cargo run other programs on your computer",
-    ),
-    (
-        "rust-toolchain",
-        "a rust-toolchain file, which could make Cargo use a compiler the talk chose",
-    ),
-    (
-        "rust-toolchain.toml",
-        "a rust-toolchain.toml, which could make Cargo use a compiler the talk chose",
-    ),
-    (
-        "src",
-        "a src folder, whose code Cargo would build and could run on your computer",
-    ),
-    (
-        "Cargo.lock",
-        "a Cargo.lock, which could make Cargo fetch libraries the talk chose",
-    ),
-    (
-        "target",
-        "a target folder, which could hold builds Cargo would use in place of its own",
-    ),
-    (
-        ".vscode",
-        "a .vscode folder, whose settings could make your editor run programs on your computer",
-    ),
-    (
-        ".zed",
-        "a .zed folder, whose settings could make your editor run programs on your computer",
-    ),
-    (
-        ".helix",
-        "a .helix folder, whose settings could make your editor run programs on your computer",
-    ),
-    (
-        ".idea",
-        "an .idea folder, whose settings could make your editor run programs on your computer",
-    ),
-    (
-        ".fleet",
-        "a .fleet folder, whose settings could make your editor run programs on your computer",
-    ),
-    (
-        "rust-analyzer.toml",
-        "a rust-analyzer.toml, whose settings could make your editor run programs on your computer",
-    ),
-    (
-        ".rust-analyzer.toml",
-        "a .rust-analyzer.toml, whose settings could make your editor run programs on your computer",
-    ),
-];
-
-/// What Cargo and rustup also read from every folder above the project.
-const REFUSED_ABOVE: [&str; 4] = [
-    ".cargo/config.toml",
-    ".cargo/config",
-    "rust-toolchain",
-    "rust-toolchain.toml",
-];
-
-/// The person's own Cargo home, which Cargo reads whatever folder it's in.
-fn default_cargo_home() -> Option<PathBuf> {
-    match std::env::var_os("CARGO_HOME") {
-        Some(home) => Some(PathBuf::from(home)),
-        None => dirs::home_dir().map(|home| home.join(".cargo")),
-    }
+/// What the app says once it has written the project at `project`.
+pub fn written(project: &Path) -> String {
+    format!(
+        "Open {} in your code editor to get completions for this talk's components.",
+        project.display()
+    )
 }
 
-/// The first of [`REFUSED_ABOVE`] in a folder above `folder`, other than in `cargo_home`.
-fn found_above(folder: &Path, cargo_home: Option<&Path>) -> Result<Option<PathBuf>, String> {
-    let folder = folder
-        .canonicalize()
-        .map_err(|error| format!("The talk's folder couldn't be found: {error}"))?;
-    let cargo_home = cargo_home.and_then(|home| home.canonicalize().ok());
-    for above in folder.ancestors().skip(1) {
-        for name in REFUSED_ABOVE {
-            let found = above.join(name);
-            if found.symlink_metadata().is_err() {
-                continue;
-            }
-            let in_cargo_home = name.starts_with(".cargo/")
-                && cargo_home.as_deref().is_some_and(|home| {
-                    above.join(".cargo").canonicalize().ok().as_deref() == Some(home)
-                });
-            if !in_cargo_home {
-                return Ok(Some(found));
-            }
-        }
-    }
-    Ok(None)
+/// Where the app keeps the projects it writes: in its own data folder, if the system has one.
+pub fn default_projects_root() -> Option<PathBuf> {
+    Some(crate::permissions::BuildPermissions::app_folder()?.join(PROJECTS_FOLDER))
 }
 
 /// Where the bundle keeps the toolkit's source, beside the workspace that stands in for ours.
@@ -138,33 +54,35 @@ fn toml_string(text: &str) -> String {
     quoted
 }
 
-/// The file names in `components`, without `.rs`, of the sources the talk's scan accepts.
-fn component_stems(folder: &Path) -> Vec<String> {
+/// The paths of the sources the talk in `folder` accepts, in `components`, by file name.
+fn component_files(folder: &Path) -> Vec<(String, PathBuf)> {
     let scan = TalkComponents::scan(Rc::new(FolderFiles::new(folder.to_path_buf())));
-    let mut stems: Vec<String> = scan
+    let mut files: Vec<(String, PathBuf)> = scan
         .infos()
         .iter()
         .filter_map(|info| {
-            info.file
+            let stem = info
+                .file
                 .strip_prefix(&format!("{COMPONENTS_FOLDER}/"))?
-                .strip_suffix(".rs")
-                .map(String::from)
+                .strip_suffix(".rs")?;
+            Some((stem.to_string(), folder.join(&info.file)))
         })
         .collect();
-    stems.sort();
-    stems
+    files.sort();
+    files
 }
 
-fn cargo_text(toolkit: &str, stems: &[String]) -> String {
+fn cargo_text(toolkit: &str, components: &[(String, String)]) -> String {
     let mut text = String::from(
-        "# Written by Stagepack Studio for a code editor, so it can check the components\n\
-         # and offer completions. The app doesn't use it: it builds them itself.\n\
+        "# Written by Stagepack Studio for a code editor, so it can check a talk's components\n\
+         # and offer completions. The app doesn't use it: it builds them itself. It's written\n\
+         # again each time the talk is set up for a code editor.\n\
          [package]\n\
          name = \"talk-components\"\n\
          version = \"0.0.0\"\n\
          edition = \"2024\"\n\
          publish = false\n\
-         # Nothing in the talk's folder but its components: a talk can come from anyone.\n\
+         # Nothing but the talk's components: a talk can come from anyone.\n\
          build = false\n\
          autolib = false\n\
          autobins = false\n\
@@ -178,65 +96,60 @@ fn cargo_text(toolkit: &str, stems: &[String]) -> String {
          [dependencies]\n",
     );
     text.push_str(&format!("toolkit = {{ path = {toolkit} }}\n"));
-    for stem in stems {
+    for (name, path) in components {
         text.push_str(&format!(
             "\n[[example]]\nname = {}\npath = {}\ncrate-type = [\"cdylib\"]\n",
-            toml_string(stem),
-            toml_string(&format!("{COMPONENTS_FOLDER}/{stem}.rs")),
+            toml_string(name),
+            toml_string(path),
         ));
     }
     text
 }
 
-/// Writes `Cargo.toml` at the top of the talk in `folder`, naming the bundle's toolkit source
-/// and each of the talk's components as an example. A `Cargo.toml` already there is left
-/// alone. Gives the path written, or why nothing was.
-pub fn write_cargo_file(folder: &Path, bundle: &Bundle) -> Result<PathBuf, String> {
-    write_cargo_file_with_cargo_home(folder, bundle, default_cargo_home().as_deref())
+/// The folder of the project for the talk at `talk`, whose path is already canonical: the
+/// talk's folder name and the start of the hash of its path, so that two talks of the same
+/// name have projects of their own.
+fn project_folder(projects_root: &Path, talk: &Path) -> PathBuf {
+    let name = talk.file_name().map_or_else(|| "talk".into(), |name| name.to_string_lossy());
+    let hash = source_hash(talk.as_os_str().as_encoded_bytes());
+    projects_root.join(format!("{name}-{}", &hash[..PATH_HASH_DIGITS]))
 }
 
-/// As [`write_cargo_file`], with `cargo_home` as the person's Cargo home, whose settings
-/// don't count against a talk below it.
-pub fn write_cargo_file_with_cargo_home(
-    folder: &Path,
-    bundle: &Bundle,
-    cargo_home: Option<&Path>,
-) -> Result<PathBuf, String> {
-    let out = folder.join(CARGO_FILE);
-    // A link counts as a file, as writing would replace it.
-    if out.symlink_metadata().is_ok() {
-        return Err(format!(
-            "This talk already has a {CARGO_FILE}, so it has been left as it is."
-        ));
-    }
-    // A link counts too, whether or not what it points at is there.
-    if let Some((name, what)) = REFUSED
-        .iter()
-        .find(|(name, _)| folder.join(name).symlink_metadata().is_ok())
-    {
-        return Err(format!(
-            "This talk has {what}, so it hasn't been set up for a code editor. Remove {name} first if you trust it isn't needed."
-        ));
-    }
-    if let Some(found) = found_above(folder, cargo_home)? {
-        return Err(format!(
-            "There's a {} above this talk, at {}. Cargo would read it, and it could make Cargo run other programs on your computer, so this talk hasn't been set up for a code editor.",
-            found.file_name().unwrap_or_default().to_string_lossy(),
-            found.display()
-        ));
+fn as_text(path: &Path) -> Result<&str, String> {
+    path.to_str()
+        .ok_or_else(|| format!("{} is in a folder whose name a Cargo file can't hold.", path.display()))
+}
+
+/// Writes `<projects_root>/<name>/Cargo.toml` for the talk in `talk_folder`, naming the
+/// bundle's toolkit source and each of the talk's components, by its path, as an example.
+/// It's written afresh each time, so that it lists the components the talk has now. Nothing
+/// is written in the talk. Gives the project's folder, or why nothing was written.
+pub fn write_cargo_file(talk_folder: &Path, bundle: &Bundle, projects_root: &Path) -> Result<PathBuf, String> {
+    let talk = talk_folder
+        .canonicalize()
+        .map_err(|error| format!("The talk's folder couldn't be found: {error}"))?;
+    std::fs::create_dir_all(projects_root)
+        .map_err(|error| format!("The folder for code editor projects couldn't be made: {error}"))?;
+    let root = projects_root
+        .canonicalize()
+        .map_err(|error| format!("The folder for code editor projects couldn't be found: {error}"))?;
+    if root.starts_with(&talk) {
+        return Err("The folder for code editor projects is inside the talk, so nothing was written.".into());
     }
     let toolkit = std::path::absolute(toolkit_source(bundle))
         .map_err(|error| format!("The toolkit's source couldn't be found: {error}"))?;
     if !toolkit.join(CARGO_FILE).is_file() {
-        return Err(
-            "This copy of the app has no source for the toolkit to point a code editor at.".into(),
-        );
+        return Err("This copy of the app has no source for the toolkit to point a code editor at.".into());
     }
-    let toolkit = toolkit
-        .to_str()
-        .ok_or("The toolkit's source is in a folder whose name a Cargo file can't hold.")?;
-    let text = cargo_text(&toml_string(toolkit), &component_stems(folder));
-    write_atomically(&out, |file| file.write_all(text.as_bytes()))
+    let components = component_files(&talk)
+        .into_iter()
+        .map(|(name, path)| Ok((name, as_text(&path)?.to_string())))
+        .collect::<Result<Vec<_>, String>>()?;
+    let text = cargo_text(&toml_string(as_text(&toolkit)?), &components);
+    let project = project_folder(&root, &talk);
+    std::fs::create_dir_all(&project)
+        .map_err(|error| format!("The project's folder couldn't be made: {error}"))?;
+    write_atomically(&project.join(CARGO_FILE), |file| file.write_all(text.as_bytes()))
         .map_err(|error: io::Error| format!("{CARGO_FILE} couldn't be written: {error}"))?;
-    Ok(out)
+    Ok(project)
 }

@@ -152,6 +152,8 @@ pub struct WorkspaceView {
     compile: Option<Compile>,
     /// The compiler and toolkit that came with the app, for a code editor to be pointed at.
     bundle: Option<Bundle>,
+    /// Where code editor projects are written, if the app has somewhere to keep them.
+    editor_projects: Option<PathBuf>,
     /// Which folders are built whenever their components change, if the app has somewhere
     /// to keep that.
     permissions: Option<BuildPermissions>,
@@ -265,6 +267,7 @@ impl WorkspaceView {
             talk_folder,
             compile: builds::bundled_compiler(),
             bundle: Bundle::find(),
+            editor_projects: cargo_file::default_projects_root(),
             permissions,
             always_build: false,
             building: false,
@@ -289,6 +292,11 @@ impl WorkspaceView {
     /// Uses `bundle`, or none, in place of the one that came with the app.
     pub fn set_bundle_for_test(&mut self, bundle: Option<Bundle>) {
         self.bundle = bundle;
+    }
+
+    /// Writes code editor projects in `folder`, in place of the app's data folder.
+    pub fn set_editor_projects_for_test(&mut self, folder: PathBuf) {
+        self.editor_projects = Some(folder);
     }
 
     /// Keeps which folders are always built in `permissions`, in place of the app's own.
@@ -676,13 +684,18 @@ impl WorkspaceView {
         );
     }
 
-    /// Writes a `Cargo.toml` for the talk's components, which only this asks for.
+    /// Writes a Cargo project for the talk's components, in the app's data folder, which only
+    /// this asks for.
     fn set_up_for_code_editor(&mut self, cx: &mut Context<Self>) {
         let (Some(folder), Some(bundle)) = (&self.talk_folder, &self.bundle) else {
             return;
         };
-        let said = match write_cargo_file(folder, bundle) {
-            Ok(_) => cargo_file::WRITTEN.to_string(),
+        let Some(projects) = self.editor_projects.clone() else {
+            self.say("This system has no data folder to keep a code editor project in.".to_string(), cx);
+            return;
+        };
+        let said = match write_cargo_file(folder, bundle, &projects) {
+            Ok(project) => cargo_file::written(&project),
             Err(problem) => problem,
         };
         self.say(said, cx);
