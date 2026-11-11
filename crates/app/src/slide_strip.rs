@@ -57,8 +57,9 @@ const THUMBNAILS_PER_TURN: usize = 2;
 const KEPT_AROUND: usize = 24;
 
 /// What's beside the thumbnail in a row: the padding either side, the slide's number, the
-/// gap and the thumbnail's frame.
-const NUMBER_WIDTH: Pixels = px(18.);
+/// gap and the thumbnail's frame. The number has room for three digits, and a fourth goes
+/// into the padding rather than onto a second line.
+const NUMBER_WIDTH: Pixels = px(24.);
 const ROW_PADDING_X: Pixels = px(8.);
 const ROW_PADDING_Y: Pixels = px(6.);
 const GAP: Pixels = px(6.);
@@ -80,6 +81,11 @@ const WIDTH_STEP: u32 = 16;
 /// The id of the row of slide `index`.
 pub fn strip_row_id(index: usize) -> ElementId {
     ("strip-row", index).into()
+}
+
+/// The id of the number beside slide `index`'s picture.
+pub fn strip_number_id(index: usize) -> ElementId {
+    ("strip-number", index).into()
 }
 
 /// What a dragged row carries: which slide it is.
@@ -560,7 +566,13 @@ impl SlideStrip {
                         } else {
                             theme.muted_foreground
                         })
-                        .child(number.to_string())
+                        .child(
+                            div()
+                                .id(strip_number_id(index))
+                                .test_support()
+                                .whitespace_nowrap()
+                                .child(number.to_string()),
+                        )
                         .when(hidden, |column| {
                             column.child(
                                 Icon::new(IconName::EyeOff)

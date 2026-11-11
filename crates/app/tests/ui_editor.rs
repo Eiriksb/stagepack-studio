@@ -20,7 +20,9 @@ use stagepack_studio::ribbon::{
     SLIDE_LIST_TOGGLE_ID, TAB_ANIMATE_ID, TAB_HOME_ID, TAB_INSERT_ID, TAB_SLIDE_SHOW_ID,
     TAB_VIEW_ID, UNDO_ID,
 };
-use stagepack_studio::slide_strip::{DRAG_PICTURE_ID, DROP_LINE_ID, STRIP_ID, strip_row_id};
+use stagepack_studio::slide_strip::{
+    DRAG_PICTURE_ID, DROP_LINE_ID, STRIP_ID, strip_number_id, strip_row_id,
+};
 use stagepack_studio::workspace_view::{self, CANVAS_ID, MARKDOWN_ID, TITLE_ID, WorkspaceView};
 
 const THREE: &str = "---\ntitle: T\n---\n\n# One\n\n---\n\n# Two\n\n---\n\n# Three\n";
@@ -1275,6 +1277,33 @@ fn move_up_is_disabled_for_the_first_slide(cx: &mut TestAppContext) {
     pick_from_rows_menu(cx, handle, 0, 2);
     assert_eq!(count(cx, &view), 1);
     assert!(!can_undo(cx, &view));
+}
+
+#[gpui_kit::test]
+fn a_slide_number_of_three_digits_stays_on_one_line(cx: &mut TestAppContext) {
+    let (handle, _view) = open(cx, &many_slides(120));
+    let one_line = with_window(cx, handle, |window, _| {
+        window.find(strip_number_id(0)).bounds()
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.scroll(
+            STRIP_ID,
+            gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
+            cx,
+        );
+    })
+    .unwrap();
+    settle(cx, handle);
+    with_window(cx, handle, |window, _| {
+        let row = window.find(strip_row_id(119)).bounds();
+        let number = window.find(strip_number_id(119)).bounds();
+        assert_eq!(
+            number.size.height, one_line.size.height,
+            "120 is on one line"
+        );
+        assert!(number.left() >= row.left(), "{number:?} inside {row:?}");
+    });
 }
 
 #[gpui_kit::test]
