@@ -3,11 +3,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use slides_components::Diagnostic;
 use slides_engine::{
-    Deck, FolderFiles, Fonts, Layer, LayerTiming, Moment, PackError, SlideTimeline, TalkFiles,
-    Transition, open_packed, pack_folder, read_talk_text, unpack_to_folder,
+    ComponentInfo, Deck, FolderFiles, Fonts, Layer, LayerTiming, Moment, PackError, SlideTimeline,
+    TalkFiles, Transition, open_packed, pack_folder, read_talk_text, unpack_to_folder,
 };
 
+use crate::builds;
 use crate::export::ExportInput;
 use crate::present::TalkShape;
 
@@ -55,7 +57,8 @@ pub enum TalkPlace {
 }
 
 impl TalkPlace {
-    /// Packs a talk kept in a folder into the file `out`, and says what had to be left out.
+    /// Packs a talk kept in a folder into the file `out`, and says what had to be left out
+    /// and which components it carries an older build of.
     pub fn save_packed(&self, out: &Path) -> Result<Vec<String>, String> {
         let TalkPlace::Folder(folder) = self else {
             return Err("This talk is already packed.".to_string());
@@ -70,7 +73,12 @@ impl TalkPlace {
             .outside_pictures
             .into_iter()
             .map(|name| format!("The picture {name} is outside assets/ and wasn't packed"));
-        Ok(left_out.chain(outside).collect())
+        let behind = builds::behind(folder).into_iter().map(|tag| {
+            format!(
+                "{tag} couldn't be built just now, so the packed talk carries its last good build"
+            )
+        });
+        Ok(left_out.chain(outside).chain(behind).collect())
     }
 
     /// Unpacks a packed talk into `folder`, which must be missing or empty.
@@ -251,6 +259,26 @@ impl Document {
 
     pub fn source(&self) -> &str {
         self.deck.source()
+    }
+
+    /// The talk's own components, and whether each is built.
+    pub fn components(&self) -> &[ComponentInfo] {
+        self.deck.components()
+    }
+
+    /// What's wrong with the talk's own components, as found when they were last looked at.
+    pub fn component_problems(&self) -> &[Diagnostic] {
+        self.deck.component_problems()
+    }
+
+    /// Looks at the talk's components again, after a build or a change to one of them.
+    pub fn reload_components(&mut self) -> Reload {
+        let changed = self.deck.refresh_components();
+        if changed.is_empty() {
+            Reload::Unchanged
+        } else {
+            Reload::Changed(changed)
+        }
     }
 
     /// Whether this talk came from a packed file, rather than a folder.

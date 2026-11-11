@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use gpui_kit::test::{TestQueryExt, TestWindowExt};
@@ -7,14 +8,17 @@ use gpui_kit::{
     AnyWindowHandle, App, AppContext, Bounds, Context, Entity, Pixels, Point, RenderImage,
     TestAppContext, Window, WindowBounds, WindowOptions, point, px, size,
 };
-use slides_engine::Fonts;
+use slides_components::{Diagnostic, component_tag};
+use slides_engine::{ComponentState, Fonts};
+use stagepack_studio::builds::Compile;
 use stagepack_studio::document::Document;
+use stagepack_studio::permissions::BuildPermissions;
 use stagepack_studio::present::{LayerLook, SlideLook};
 use stagepack_studio::slide_canvas::{SlideCanvas, letterbox};
 use stagepack_studio::workspace_view::{
-    self, CANVAS_ID, EXPORT_MENU_ID, ExportPdf, ExportPowerPoint, FILE_MENU_ID, MARKDOWN_ID,
-    NOTICES_ID, OPEN_IN_STAGEPACK_ID, OpenFolder, OpenPacked, PROBLEM_ID, STATUS_ID, SaveFolder,
-    SavePacked, TITLE_ID, WorkspaceView,
+    self, BUILD_ALWAYS_ID, BUILD_ONCE_ID, CANVAS_ID, COMPONENT_PROBLEMS_ID, EXPORT_MENU_ID,
+    ExportPdf, ExportPowerPoint, FILE_MENU_ID, MARKDOWN_ID, NOTICES_ID, OPEN_IN_STAGEPACK_ID,
+    OpenFolder, OpenPacked, PROBLEM_ID, STATUS_ID, SaveFolder, SavePacked, TITLE_ID, WorkspaceView,
 };
 
 fn document(source: &str) -> Document {
@@ -1195,4 +1199,381 @@ fn the_slide_sits_on_whole_device_pixels() {
         letterbox(area(0., 0., 1501., 720.), 2.0).origin.x,
         px(110.5)
     );
+}
+
+// Building a talk's own components.
+
+const NO_COMPILER: &str = "This copy of the app has no compiler, so components can't be built.";
+
+const BUILD_BAR: &str = "Some components in this talk need building to show as they're written.";
+
+/// A slide with the talk's own `Score` on it.
+const SCORE_SLIDE: &str = "# One\n\n<Score />\n";
+
+/// The source of a component called `tag`.
+fn component_source(tag: &str) -> String {
+    format!(
+        "use toolkit::prelude::*;\n\n#[component]\nfn {tag}() -> Element {{\n    text(\"{tag}\")\n}}\n"
+    )
+}
+
+/// A module that calls itself `tag`, and renders a line of text.
+fn component_module(tag: &str) -> Vec<u8> {
+    let schema = format!(r#"{{"name":"{tag}","props":[],"children":false}}"#);
+    let answer = r#"{"element":{"Text":{"text":"built","size":null,"bold":false,"color":null}},"animated":false}"#;
+    let packed = |at: u64, text: &str| ((at << 32) | text.len() as u64) as i64;
+    let data = |at: u32, text: &str| {
+        let escaped: String = text.bytes().map(|byte| format!("\\{byte:02x}")).collect();
+        format!(r#"(data (i32.const {at}) "{escaped}")"#)
+    };
+    let text = format!(
+        r#"(module
+  (memory (export "memory") 8)
+  (global $heap (mut i32) (i32.const 262144))
+  {}
+  {}
+  (func (export "abi_version") (result i32) (i32.const 1))
+  (func (export "alloc") (param $len i32) (result i32)
+    (local $at i32)
+    (local.set $at (global.get $heap))
+    (global.set $heap (i32.add (global.get $heap) (local.get $len)))
+    (local.get $at))
+  (func (export "schema") (result i64) (i64.const {}))
+  (func (export "render") (param $ptr i32) (param $len i32) (result i64) (i64.const {})))"#,
+        data(1024, &schema),
+        data(8192, answer),
+        packed(1024, &schema),
+        packed(8192, answer),
+    );
+    wat::parse_str(&text).unwrap_or_else(|error| panic!("{error}\n{text}"))
+}
+
+/// A compiler that counts its calls, refuses a source marked broken at line 12, and otherwise
+/// gives a module named for the source's component.
+fn counting_compiler() -> (Compile, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let compile: Compile = Arc::new(move |file: &str, source: &str| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        if source.contains("// broken") {
+            return Err(vec![Diagnostic {
+                file: file.to_string(),
+                line: 12,
+                message: "expected `;`".to_string(),
+            }]);
+        }
+        Ok(component_module(
+            &component_tag(source).expect("a component"),
+        ))
+    });
+    (compile, calls)
+}
+
+/// A talk folder whose slide shows `Score`, with `components/score.rs` holding `score`.
+fn component_talk_folder(score: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("slides.md"), SCORE_SLIDE).unwrap();
+    std::fs::create_dir(dir.path().join("components")).unwrap();
+    std::fs::write(dir.path().join("components/score.rs"), score).unwrap();
+    dir
+}
+
+struct ComponentTalk {
+    folder: tempfile::TempDir,
+    /// Where the app keeps its permissions, for this test.
+    permissions: PathBuf,
+    _app_data: tempfile::TempDir,
+    calls: Arc<AtomicUsize>,
+    handle: AnyWindowHandle,
+    view: Entity<WorkspaceView>,
+}
+
+impl ComponentTalk {
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn click(&self, cx: &mut TestAppContext, id: &'static str) {
+        cx.update_window(self.handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click(id, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        settle(cx, self.handle);
+    }
+
+    fn shows(&self, cx: &mut TestAppContext, id: &'static str) -> bool {
+        cx.update_window(self.handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find(id).is_some_and(|found| found.visible())
+        })
+        .unwrap()
+    }
+
+    fn says(&self, cx: &mut TestAppContext, line: &str) -> bool {
+        cx.update_window(self.handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find_by_label(line).is_some()
+        })
+        .unwrap()
+    }
+
+    fn score_state(&self, cx: &TestAppContext) -> ComponentState {
+        let document = cx
+            .read(|cx| self.view.read(cx).document().cloned())
+            .unwrap();
+        cx.read(|cx| {
+            document
+                .read(cx)
+                .components()
+                .iter()
+                .find(|info| info.tag == "Score")
+                .map(|info| info.state)
+                .expect("Score is one of the talk's components")
+        })
+    }
+
+    /// Saves a new source for `Score`, as the watcher would see it, and lets the wait pass.
+    fn change_score(&self, cx: &mut TestAppContext, source: &str) {
+        std::fs::write(self.folder.path().join("components/score.rs"), source).unwrap();
+        cx.update(|cx| {
+            self.view
+                .update(cx, |view, cx| view.components_changed_soon(cx))
+        });
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        settle(cx, self.handle);
+    }
+
+    fn always_allowed(&self) -> bool {
+        BuildPermissions::load(self.permissions.clone()).always(self.folder.path())
+    }
+}
+
+/// Opens the talk in `folder` with a counting compiler, and permissions of its own, already
+/// allowing the folder if `allowed`.
+fn open_component_talk_in(
+    cx: &mut TestAppContext,
+    folder: tempfile::TempDir,
+    allowed: bool,
+) -> ComponentTalk {
+    let app_data = tempfile::tempdir().unwrap();
+    let permissions = app_data.path().join("permissions.json");
+    if allowed {
+        BuildPermissions::load(permissions.clone())
+            .set_always(folder.path())
+            .unwrap();
+    }
+    let (compile, calls) = counting_compiler();
+    let talk = Document::open(folder.path(), Fonts::bundled_only()).unwrap();
+    let file = permissions.clone();
+    let (handle, view) = open_view(cx, move |window, cx| {
+        let mut view = WorkspaceView::open_with(talk, window, cx);
+        view.set_compile_for_test(compile);
+        view.set_permissions_for_test(BuildPermissions::load(file));
+        view
+    });
+    settle(cx, handle);
+    ComponentTalk {
+        folder,
+        permissions,
+        _app_data: app_data,
+        calls,
+        handle,
+        view,
+    }
+}
+
+fn open_component_talk(cx: &mut TestAppContext, score: &str) -> ComponentTalk {
+    open_component_talk_in(cx, component_talk_folder(score), false)
+}
+
+#[gpui_kit::test]
+fn opening_a_talk_starts_no_build(cx: &mut TestAppContext) {
+    // Even in a folder that's always built.
+    let talk = open_component_talk_in(cx, component_talk_folder(&component_source("Score")), true);
+    cx.executor().advance_clock(Duration::from_secs(5));
+    cx.run_until_parked();
+    settle(cx, talk.handle);
+    assert_eq!(talk.calls(), 0);
+    assert_eq!(talk.score_state(cx), ComponentState::NeedsBuilding);
+    assert!(!talk.folder.path().join("build").exists());
+}
+
+#[gpui_kit::test]
+fn the_bar_offers_both_choices(cx: &mut TestAppContext) {
+    let talk = open_component_talk(cx, &component_source("Score"));
+    assert!(talk.shows(cx, BUILD_ONCE_ID));
+    assert!(talk.shows(cx, BUILD_ALWAYS_ID));
+    assert!(talk.says(cx, BUILD_BAR));
+    assert_eq!(talk.calls(), 0);
+}
+
+#[gpui_kit::test]
+fn a_talk_with_everything_built_shows_no_bar(cx: &mut TestAppContext) {
+    let (handle, _view) = open_with_view(cx, "# One\n");
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find(BUILD_ONCE_ID).is_none());
+        assert!(window.try_find(BUILD_ALWAYS_ID).is_none());
+        assert!(window.try_find(COMPONENT_PROBLEMS_ID).is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn build_once_builds_and_shows_the_component(cx: &mut TestAppContext) {
+    let talk = open_component_talk(cx, &component_source("Score"));
+    let canvas = slide_canvas(cx, &talk.view);
+    let before = images(cx, &canvas);
+
+    talk.click(cx, BUILD_ONCE_ID);
+
+    assert_eq!(talk.calls(), 1);
+    assert_eq!(talk.score_state(cx), ComponentState::UpToDate);
+    assert!(!talk.shows(cx, BUILD_ONCE_ID), "nothing is left to build");
+    let after = images(cx, &canvas);
+    assert!(
+        before.len() != after.len() || before.iter().zip(&after).any(|(a, b)| !Arc::ptr_eq(a, b)),
+        "the slide was drawn again"
+    );
+    assert!(!talk.always_allowed());
+
+    let mut changed = component_source("Score");
+    changed.push_str("// changed\n");
+    talk.change_score(cx, &changed);
+    assert_eq!(talk.calls(), 1, "once was only once");
+    assert_eq!(talk.score_state(cx), ComponentState::OutOfDate);
+    assert!(talk.shows(cx, BUILD_ONCE_ID));
+}
+
+#[gpui_kit::test]
+fn build_always_is_remembered_and_builds_on_change(cx: &mut TestAppContext) {
+    let talk = open_component_talk(cx, &component_source("Score"));
+
+    talk.click(cx, BUILD_ALWAYS_ID);
+
+    assert_eq!(talk.calls(), 1);
+    assert!(talk.always_allowed());
+    assert_eq!(talk.score_state(cx), ComponentState::UpToDate);
+    assert!(!talk.shows(cx, BUILD_ALWAYS_ID));
+
+    let mut changed = component_source("Score");
+    changed.push_str("// changed\n");
+    talk.change_score(cx, &changed);
+    assert_eq!(talk.calls(), 2);
+    assert_eq!(talk.score_state(cx), ComponentState::UpToDate);
+}
+
+#[gpui_kit::test]
+fn changes_close_together_build_once(cx: &mut TestAppContext) {
+    let talk = open_component_talk_in(cx, component_talk_folder(&component_source("Score")), true);
+    for edit in ["// one\n", "// two\n"] {
+        let mut changed = component_source("Score");
+        changed.push_str(edit);
+        std::fs::write(talk.folder.path().join("components/score.rs"), changed).unwrap();
+        cx.update(|cx| {
+            talk.view
+                .update(cx, |view, cx| view.components_changed_soon(cx))
+        });
+        cx.executor().advance_clock(Duration::from_millis(60));
+        cx.run_until_parked();
+    }
+    assert_eq!(talk.calls(), 0, "the folder isn't quiet yet");
+    cx.executor().advance_clock(Duration::from_millis(40));
+    cx.run_until_parked();
+    assert_eq!(talk.calls(), 1);
+}
+
+#[gpui_kit::test]
+fn a_change_in_a_folder_not_allowed_starts_no_build(cx: &mut TestAppContext) {
+    let talk = open_component_talk(cx, &component_source("Score"));
+    let mut changed = component_source("Score");
+    changed.push_str("// changed\n");
+    talk.change_score(cx, &changed);
+    cx.executor().advance_clock(Duration::from_secs(5));
+    cx.run_until_parked();
+    assert_eq!(talk.calls(), 0);
+    assert!(talk.shows(cx, BUILD_ONCE_ID));
+}
+
+#[gpui_kit::test]
+fn a_packed_talk_offers_no_build(cx: &mut TestAppContext) {
+    let folder = component_talk_folder(&component_source("Score"));
+    let elsewhere = tempfile::tempdir().unwrap();
+    let file = elsewhere.path().join("talk.sptx");
+    slides_engine::pack_folder(folder.path(), &file, "test").unwrap();
+    let (compile, calls) = counting_compiler();
+    let (handle, view) = open_view(cx, move |window, cx| {
+        let mut view = WorkspaceView::open(file, window, cx);
+        view.set_compile_for_test(compile);
+        view
+    });
+    settle(cx, handle);
+    let document = cx.read(|cx| view.read(cx).document().cloned()).unwrap();
+    cx.read(|cx| {
+        let document = document.read(cx);
+        assert!(document.is_packed());
+        assert_eq!(document.components().len(), 1, "it does have a component");
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find(BUILD_ONCE_ID).is_none());
+        assert!(window.try_find(BUILD_ALWAYS_ID).is_none());
+        assert!(window.try_find_by_label(NO_COMPILER).is_none());
+    })
+    .unwrap();
+    cx.update(|cx| view.update(cx, |view, cx| view.components_changed_soon(cx)));
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[gpui_kit::test]
+fn a_problem_shows_its_file_and_line(cx: &mut TestAppContext) {
+    let broken = format!("{}// broken\n", component_source("Score"));
+    let talk = open_component_talk(cx, &broken);
+
+    talk.click(cx, BUILD_ONCE_ID);
+
+    assert!(talk.shows(cx, COMPONENT_PROBLEMS_ID));
+    assert!(talk.says(cx, "components/score.rs:12: expected `;`"));
+    assert_eq!(talk.score_state(cx), ComponentState::NeedsBuilding);
+
+    talk.change_score(cx, &component_source("Score"));
+    talk.click(cx, BUILD_ONCE_ID);
+    assert!(
+        !talk.says(cx, "components/score.rs:12: expected `;`"),
+        "a successful build clears its own"
+    );
+    assert!(!talk.shows(cx, COMPONENT_PROBLEMS_ID));
+}
+
+#[gpui_kit::test]
+fn a_problem_the_scan_finds_shows_too(cx: &mut TestAppContext) {
+    let folder = component_talk_folder(&component_source("Score"));
+    std::fs::write(folder.path().join("components/bad name.rs"), "").unwrap();
+    let talk = open_component_talk_in(cx, folder, false);
+    assert!(talk.shows(cx, COMPONENT_PROBLEMS_ID));
+    assert!(talk.says(
+        cx,
+        "components/bad name.rs: A component's file name can have only letters, digits, _ and -, and at most 64 of them"
+    ));
+}
+
+#[gpui_kit::test]
+fn no_compiler_says_so(cx: &mut TestAppContext) {
+    // No bundle is set up for the tests, so this window finds no compiler.
+    let folder = component_talk_folder(&component_source("Score"));
+    let talk = Document::open(folder.path(), Fonts::bundled_only()).unwrap();
+    let (handle, _view) = open_view(cx, |window, cx| WorkspaceView::open_with(talk, window, cx));
+    settle(cx, handle);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find_by_label(NO_COMPILER).is_some());
+        assert!(window.try_find(BUILD_ONCE_ID).is_none());
+        assert!(window.try_find(BUILD_ALWAYS_ID).is_none());
+    })
+    .unwrap();
 }

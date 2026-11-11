@@ -1,4 +1,5 @@
-//! The window's content: the title bar, the slide, its notices and the talk's Markdown.
+//! The window's content: the title bar, the slide, its notices and the talk's Markdown, and
+//! the bar that offers to build the talk's components.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -13,14 +14,17 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use notify::RecommendedWatcher;
-use slides_engine::Fonts;
+use slides_components::Diagnostic;
+use slides_engine::{ComponentState, Fonts};
 
-use crate::document::{Document, OpenProblem, Reload, SLIDES_FILE};
+use crate::builds::{self, BuildOutcome, Compile};
+use crate::document::{Document, OpenProblem, Reload, SLIDES_FILE, TalkPlace};
 use crate::export::{self, ExportKind, run_export, stagepack_executable};
 use crate::markdown_panel::MarkdownPanel;
+use crate::permissions::BuildPermissions;
 use crate::present_view::{self, Presentation, start_show};
 use crate::slide_canvas::{ScaleChanged, SlideCanvas};
-use crate::watcher;
+use crate::watcher::{self, Change};
 
 pub const CANVAS_ID: &str = "canvas";
 pub const TITLE_ID: &str = "title";
@@ -32,6 +36,10 @@ pub const FILE_MENU_ID: &str = "file-menu";
 pub const EXPORT_MENU_ID: &str = "export-menu";
 pub const PRESENT_ID: &str = "present";
 pub const OPEN_IN_STAGEPACK_ID: &str = "open-in-stagepack";
+pub const BUILD_BAR_ID: &str = "build-bar";
+pub const BUILD_ONCE_ID: &str = "build-once";
+pub const BUILD_ALWAYS_ID: &str = "build-always";
+pub const COMPONENT_PROBLEMS_ID: &str = "component-problems";
 
 /// The key context of the window's content, where its shortcuts apply.
 pub const KEY_CONTEXT: &str = "Workspace";
@@ -48,6 +56,11 @@ const SLIDEV_TALK: &str =
     "This is a Slidev talk made for Stagepack, so this app can't open it yet.";
 
 const PACKED_EXTENSION: &str = "sptx";
+
+const NEEDS_BUILDING: &str =
+    "Some components in this talk need building to show as they're written.";
+const BUILDING: &str = "Building components…";
+const NO_COMPILER: &str = "This copy of the app has no compiler, so components can't be built.";
 
 actions!(
     stagepack_studio,
@@ -132,6 +145,23 @@ pub struct WorkspaceView {
     pending_reload: Option<Task<()>>,
     /// The show of this talk, if one has been started.
     show: Option<WeakEntity<Presentation>>,
+    /// Where the talk is kept, if it's kept in a folder. A packed talk is never built.
+    talk_folder: Option<PathBuf>,
+    /// What builds the talk's components, if this copy of the app has a compiler.
+    compile: Option<Compile>,
+    /// Which folders are built whenever their components change, if the app has somewhere
+    /// to keep that.
+    permissions: Option<BuildPermissions>,
+    /// Whether this talk's folder is one of them.
+    always_build: bool,
+    /// Whether a build is running.
+    building: bool,
+    /// Whether another build was asked for while one ran.
+    build_again: bool,
+    /// What the last build couldn't do.
+    build_problems: Vec<Diagnostic>,
+    /// The look at the components waiting for them to go quiet.
+    pending_components: Option<Task<()>>,
     _scale_changed: Subscription,
 }
 
@@ -208,7 +238,14 @@ impl WorkspaceView {
             .as_ref()
             .map(|document| document.update(cx, |document, _| document.notices()))
             .unwrap_or_default();
-        Self {
+        let talk_folder = document
+            .as_ref()
+            .and_then(|document| match document.read(cx).place() {
+                TalkPlace::Folder(folder) => Some(folder.clone()),
+                TalkPlace::Packed(_) => None,
+            });
+        let permissions = BuildPermissions::default_file().map(BuildPermissions::load);
+        let mut view = Self {
             document,
             problem,
             stagepack_offer: None,
@@ -222,8 +259,39 @@ impl WorkspaceView {
             watch_problem: None,
             pending_reload: None,
             show: None,
+            talk_folder,
+            compile: builds::bundled_compiler(),
+            permissions,
+            always_build: false,
+            building: false,
+            build_again: false,
+            build_problems: Vec::new(),
+            pending_components: None,
             _scale_changed: scale_changed,
-        }
+        };
+        view.always_build = view.is_always_built();
+        view
+    }
+
+    pub fn document(&self) -> Option<&Entity<Document>> {
+        self.document.as_ref()
+    }
+
+    /// Builds with `compile` in place of the app's own compiler.
+    pub fn set_compile_for_test(&mut self, compile: Compile) {
+        self.compile = Some(compile);
+    }
+
+    /// Keeps which folders are always built in `permissions`, in place of the app's own.
+    pub fn set_permissions_for_test(&mut self, permissions: BuildPermissions) {
+        self.permissions = Some(permissions);
+        self.always_build = self.is_always_built();
+    }
+
+    fn is_always_built(&self) -> bool {
+        let permissions = self.permissions.as_ref();
+        let folder = self.talk_folder.as_deref();
+        folder.is_some_and(|folder| permissions.is_some_and(|p| p.always(folder)))
     }
 
     pub fn slide_canvas(&self) -> &Entity<SlideCanvas> {
@@ -281,8 +349,8 @@ impl WorkspaceView {
     /// Watches `folder`, and reloads the talk from its file whenever that changes.
     pub fn follow_saves(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
         let (changed, mut changes) = mpsc::unbounded();
-        let watcher = watcher::watch(&folder, move || {
-            changed.unbounded_send(()).ok();
+        let watcher = watcher::watch(&folder, move |change| {
+            changed.unbounded_send(change).ok();
         });
         match watcher {
             Ok(watcher) => self.watcher = Some(watcher),
@@ -297,12 +365,13 @@ impl WorkspaceView {
         }
         let file = folder.join(SLIDES_FILE);
         cx.spawn(async move |this, cx| {
-            while changes.next().await.is_some() {
+            while let Some(change) = changes.next().await {
                 let file = file.clone();
-                if this
-                    .update(cx, |this, cx| this.reload_soon(file, cx))
-                    .is_err()
-                {
+                let followed = this.update(cx, |this, cx| match change {
+                    Change::Slides => this.reload_soon(file, cx),
+                    Change::Component => this.components_changed_soon(cx),
+                });
+                if followed.is_err() {
                     break;
                 }
             }
@@ -352,6 +421,106 @@ impl WorkspaceView {
             // The title counts the slides, and the talk may have gained some.
             cx.notify();
         }
+    }
+
+    /// Looks at the talk's components again once they have been quiet for a moment, and
+    /// builds them if the folder is always built. A change elsewhere never builds.
+    pub fn components_changed_soon(&mut self, cx: &mut Context<Self>) {
+        // Replacing the task cancels the one waiting, so the wait starts again from now.
+        self.pending_components = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(RELOAD_DELAY).await;
+            this.update(cx, |this, cx| {
+                this.refresh_components(cx);
+                if this.always_build {
+                    this.build_components(cx);
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// Shows the talk's components as they are now on disk.
+    fn refresh_components(&mut self, cx: &mut Context<Self>) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        let reload = document.update(cx, |document, cx| {
+            let reload = document.reload_components();
+            if matches!(reload, Reload::Changed(_)) {
+                // A show of the talk has to know.
+                cx.notify();
+            }
+            reload
+        });
+        // A component that's built now has nothing left to say about its last build.
+        let document = document.read(cx);
+        let built: Vec<String> = document
+            .components()
+            .iter()
+            .filter(|info| info.state == ComponentState::UpToDate)
+            .map(|info| info.file.clone())
+            .collect();
+        self.build_problems
+            .retain(|problem| !built.contains(&problem.file));
+        let current = document.current();
+        if let Reload::Changed(slides) = reload
+            && slides.contains(&current)
+        {
+            self.show_slide(cx);
+        }
+        cx.notify();
+    }
+
+    /// Builds the talk's components that need it, on a background task, unless the talk is
+    /// packed or there's no compiler. A build asked for while one runs follows it.
+    fn build_components(&mut self, cx: &mut Context<Self>) {
+        let (Some(folder), Some(compile)) = (self.talk_folder.clone(), self.compile.clone()) else {
+            return;
+        };
+        if self.building {
+            self.build_again = true;
+            return;
+        }
+        self.building = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_spawn(async move { builds::build_components(&folder, &compile) })
+                .await;
+            this.update(cx, |this, cx| this.finish_build(outcome, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    fn finish_build(&mut self, outcome: BuildOutcome, cx: &mut Context<Self>) {
+        self.building = false;
+        self.build_problems = outcome.problems;
+        self.refresh_components(cx);
+        if std::mem::take(&mut self.build_again) {
+            self.build_components(cx);
+        }
+    }
+
+    /// Remembers that this folder is always built, and builds it.
+    fn build_always(&mut self, cx: &mut Context<Self>) {
+        let Some(folder) = self.talk_folder.clone() else {
+            return;
+        };
+        let remembered = match &mut self.permissions {
+            Some(permissions) => permissions
+                .set_always(&folder)
+                .map_err(|error| format!("This folder couldn't be remembered: {error}")),
+            None => Err("This computer has no place for the app to remember this folder.".into()),
+        };
+        match remembered {
+            Ok(()) => self.always_build = true,
+            Err(problem) => self.say(
+                format!("{problem} Its components are built just this once."),
+                cx,
+            ),
+        }
+        self.build_components(cx);
     }
 
     /// Starts a show of the talk, unless one is running already.
@@ -556,8 +725,113 @@ fn footer_line(id: &'static str, line: SharedString, color: Hsla) -> impl IntoEl
         .child(line)
 }
 
+/// How a problem with a component reads: its file, its line if it has one, and what's wrong.
+fn problem_line(problem: &Diagnostic) -> SharedString {
+    if problem.line == 0 {
+        format!("{}: {}", problem.file, problem.message).into()
+    } else {
+        format!("{}:{}: {}", problem.file, problem.line, problem.message).into()
+    }
+}
+
+impl WorkspaceView {
+    /// The bar that offers to build the talk's components, when any need it.
+    fn build_bar(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
+        self.talk_folder.as_ref()?;
+        let needs_building = self
+            .document
+            .as_ref()?
+            .read(cx)
+            .components()
+            .iter()
+            .any(|info| info.state != ComponentState::UpToDate);
+        if !(needs_building || self.building) {
+            return None;
+        }
+        let sentence = |text: &'static str| {
+            div()
+                .id(text)
+                .test_support()
+                .aria_label(text)
+                .text_sm()
+                .child(text)
+        };
+        let bar = h_flex()
+            .id(BUILD_BAR_ID)
+            .test_support()
+            .w_full()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .items_center()
+            .bg(cx.theme().secondary)
+            .border_t_1()
+            .border_color(cx.theme().border);
+        Some(if self.building {
+            bar.child(sentence(BUILDING))
+        } else if self.compile.is_none() {
+            bar.child(sentence(NO_COMPILER))
+        } else {
+            bar.child(sentence(NEEDS_BUILDING))
+                .child(
+                    Button::new(BUILD_ONCE_ID)
+                        .small()
+                        .primary()
+                        .label("Build components")
+                        .on_click(cx.listener(|this, _, _, cx| this.build_components(cx))),
+                )
+                .when(!self.always_build, |bar| {
+                    bar.child(
+                        Button::new(BUILD_ALWAYS_ID)
+                            .small()
+                            .ghost()
+                            .label("Always build this folder")
+                            .on_click(cx.listener(|this, _, _, cx| this.build_always(cx))),
+                    )
+                })
+        })
+    }
+
+    /// What's wrong with the talk's components, one line each.
+    fn component_problems(&self, cx: &App) -> Option<impl IntoElement> {
+        let document = self.document.as_ref()?.read(cx);
+        let lines: Vec<SharedString> = document
+            .component_problems()
+            .iter()
+            .chain(&self.build_problems)
+            .map(problem_line)
+            .collect();
+        if lines.is_empty() {
+            return None;
+        }
+        Some(
+            v_flex()
+                .id(COMPONENT_PROBLEMS_ID)
+                .test_support()
+                .w_full()
+                .max_h(px(120.))
+                .overflow_y_scroll()
+                .px_2()
+                .py_1()
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .text_xs()
+                .text_color(cx.theme().danger)
+                .children(lines.into_iter().enumerate().map(|(index, line)| {
+                    div()
+                        .id(("component-problem", index))
+                        .test_support()
+                        .aria_label(line.clone())
+                        .child(line)
+                })),
+        )
+    }
+}
+
 impl Render for WorkspaceView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let build_bar = self.build_bar(cx);
+        let component_problems = self.component_problems(cx);
         let document = self.document.as_ref().map(|document| document.read(cx));
         let title: SharedString = document
             .map_or_else(|| "Untitled".to_string(), Document::title)
@@ -673,6 +947,8 @@ impl Render for WorkspaceView {
                         )
                     }),
             )
+            .children(component_problems)
+            .children(build_bar)
             .when(!notices.is_empty(), |this| {
                 this.child(footer_line(
                     NOTICES_ID,

@@ -19,12 +19,15 @@ use crate::flow::TEXT_TAG;
 /// How long the components on one slide can take to render, together, each time it's laid out.
 pub const SLIDE_RENDER_BUDGET: Duration = Duration::from_secs(1);
 
-const COMPONENTS_FOLDER: &str = "components";
+/// Where a talk keeps its components' sources: each a `.rs` file directly in this folder.
+pub const COMPONENTS_FOLDER: &str = "components";
 const SOURCE_EXTENSION: &str = ".rs";
-const MAX_COMPONENTS: usize = 256;
-const MAX_SOURCE_BYTES: u64 = 1024 * 1024;
-/// Far more than an index of `MAX_COMPONENTS` entries needs.
-const MAX_INDEX_BYTES: u64 = 1024 * 1024;
+/// The most components a talk can have.
+pub const MAX_COMPONENTS: usize = 256;
+/// The most bytes a component's source can have.
+pub const MAX_SOURCE_BYTES: u64 = 1024 * 1024;
+/// The most bytes a talk's index of builds can have: far more than `MAX_COMPONENTS` entries need.
+pub const MAX_INDEX_BYTES: u64 = 1024 * 1024;
 /// What one render can read of the talk's assets, in one file and in all of them together.
 const ASSET_BUDGET: u64 = MEMORY_LIMIT_BYTES as u64;
 /// The tags the format itself uses, which a component can't have either.
