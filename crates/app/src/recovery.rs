@@ -2,6 +2,9 @@
 //! of a talk with unsaved changes in the app's own data folder, and offers it back if the app
 //! stopped before they were saved. A working copy is someone's unsaved work, so its folder and
 //! files are the user's alone.
+//!
+//! Each talk has a folder named for the hash of its path, and each window that keeps a copy of
+//! it has a slot of its own in there: `<root>/<key>/<slot>/slides.md` and `about.json`.
 
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -17,7 +20,7 @@ use crate::permissions::BuildPermissions;
 /// The working copies' folder in the app's data folder.
 const FOLDER: &str = "recovery";
 const ABOUT_FILE: &str = "about.json";
-/// How many hex characters of the hash of a talk's path name its working copy's folder.
+/// How many hex characters name a talk's folder (from the hash of its path) and a slot.
 const KEY_LENGTH: usize = 16;
 /// The largest working copy that is read back.
 const MAX_TEXT_BYTES: u64 = 64 * 1024 * 1024;
@@ -45,12 +48,16 @@ pub struct Found {
     /// Whether the talk's file still holds the text the edits started from.
     pub base_matches: bool,
     pub when: SystemTime,
+    /// The folder it's kept in.
+    slot: PathBuf,
 }
 
 /// Where the working copies are kept.
 #[derive(Clone, Debug)]
 pub struct Recovery {
     root: PathBuf,
+    /// This window's own folder within each talk's.
+    slot: String,
 }
 
 /// The SHA-256 of `text`, in lowercase hex.
@@ -63,8 +70,18 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 impl Recovery {
+    /// Working copies under `root`, in a slot of their own: each window that keeps them makes
+    /// its own, so two windows on one talk never write over each other's.
     pub fn new(root: PathBuf) -> Recovery {
-        Recovery { root }
+        Recovery {
+            root,
+            slot: random_name(),
+        }
+    }
+
+    /// The same place, with a slot of its own, for another window.
+    pub fn for_another_window(&self) -> Recovery {
+        Recovery::new(self.root.clone())
     }
 
     /// Where the app keeps working copies: in its own data folder, if the system has one.
@@ -72,8 +89,8 @@ impl Recovery {
         Some(BuildPermissions::app_folder()?.join(FOLDER))
     }
 
-    /// Keeps `text` as the working copy of the talk at `place`, whose edits started from the
-    /// text with the SHA-256 `base_hash`. Each file is written whole or not at all.
+    /// Keeps `text` as this slot's working copy of the talk at `place`, whose edits started
+    /// from the text with the SHA-256 `base_hash`. Each file is written whole or not at all.
     pub fn keep(&self, place: &TalkPlace, base_hash: &str, text: &str) -> io::Result<()> {
         if text.len() as u64 > MAX_TEXT_BYTES {
             return Err(io::Error::other(
@@ -81,9 +98,16 @@ impl Recovery {
             ));
         }
         let talk = canonical(place);
-        let folder = self.root.join(key(&talk));
+        let key_folder = self.root.join(key(&talk));
+        let folder = key_folder.join(&self.slot);
+        refuse_link(&key_folder)?;
+        refuse_link(&folder)?;
         create_private(&folder)?;
+        // Made just now, but something may have put a link there meanwhile.
+        refuse_link(&key_folder)?;
+        refuse_link(&folder)?;
         make_private(&self.root)?;
+        make_private(&key_folder)?;
         make_private(&folder)?;
         let about = About {
             talk,
@@ -93,33 +117,51 @@ impl Recovery {
                 .map_or(0, |since| since.as_secs()),
         };
         let about = serde_json::to_vec_pretty(&about).map_err(io::Error::other)?;
+        // The text first and what it's about last: stopped between the two, the new text has
+        // the base it had before, which can only make the talk look changed since when it
+        // isn't. The other way round, older text would be taken as made from the file as it is.
         write_private(&folder.join(SLIDES_FILE), text.as_bytes())?;
         write_private(&folder.join(ABOUT_FILE), &about)
     }
 
-    /// Removes the working copy of the talk at `place`, if there is one.
+    /// Removes this slot's working copy of the talk at `place`, if there is one.
     pub fn clear(&self, place: &TalkPlace) {
-        let folder = self.root.join(key(&canonical(place)));
-        // A link here is removed, not followed.
-        std::fs::remove_dir_all(folder).ok();
+        let key_folder = self.root.join(key(&canonical(place)));
+        remove_slot(&key_folder.join(&self.slot));
     }
 
-    /// The working copy of the talk at `place`, if there's one that can be read.
+    /// Removes `found`, a working copy found with [`Self::find`], whichever slot it's in.
+    pub fn discard(&self, found: &Found) {
+        remove_slot(&found.slot);
+    }
+
+    /// The newest working copy of the talk at `place` that can be read, in any slot.
     pub fn find(&self, place: &TalkPlace) -> Option<Found> {
         let talk = canonical(place);
-        let folder = self.root.join(key(&talk));
-        let about: About =
-            serde_json::from_slice(&read_small(&folder.join(ABOUT_FILE), MAX_ABOUT_BYTES)?).ok()?;
-        if about.talk != talk {
+        let key_folder = self.root.join(key(&talk));
+        if refuse_link(&key_folder).is_err() {
             return None;
         }
-        let text =
-            String::from_utf8(read_small(&folder.join(SLIDES_FILE), MAX_TEXT_BYTES)?).ok()?;
-        let base_matches = on_disk(place).is_some_and(|disk| hash_text(&disk) == about.base_sha256);
+        let newest = slots(&key_folder)
+            .into_iter()
+            .filter_map(|slot| {
+                let (about, written) = read_about(&slot)?;
+                (about.talk == talk).then_some((about, written, slot))
+            })
+            .filter_map(|(about, written, slot)| {
+                let when = kept_at(&about)?;
+                let text =
+                    String::from_utf8(read_small(&slot.join(SLIDES_FILE), MAX_TEXT_BYTES)?).ok()?;
+                Some((when, written, about.base_sha256, text, slot))
+            })
+            .max_by_key(|(when, written, ..)| (*when, *written))?;
+        let (when, _, base, text, slot) = newest;
+        let base_matches = on_disk(place).is_some_and(|disk| hash_text(&disk) == base);
         Some(Found {
             text,
             base_matches,
-            when: SystemTime::UNIX_EPOCH + Duration::from_secs(about.kept_at),
+            when,
+            slot,
         })
     }
 
@@ -130,26 +172,86 @@ impl Recovery {
             return;
         };
         let now = SystemTime::now();
+        let is_old = |kept: SystemTime| now.duration_since(kept).is_ok_and(|age| age > older_than);
         for entry in entries.flatten() {
-            let path = entry.path();
-            let is_working_copy = entry.file_name().to_str().is_some_and(is_key)
+            let is_talk = entry.file_name().to_str().is_some_and(is_hex_name)
                 && entry.file_type().is_ok_and(|kind| kind.is_dir());
-            if !is_working_copy {
+            if !is_talk {
                 continue;
             }
-            let about: Option<About> = read_small(&path.join(ABOUT_FILE), MAX_ABOUT_BYTES)
-                .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-            let kept = match about {
-                Some(about) => Some(SystemTime::UNIX_EPOCH + Duration::from_secs(about.kept_at)),
-                None => entry.metadata().and_then(|meta| meta.modified()).ok(),
-            };
-            let old =
-                kept.is_some_and(|kept| now.duration_since(kept).is_ok_and(|age| age > older_than));
-            if old {
-                std::fs::remove_dir_all(&path).ok();
+            for slot in slots(&entry.path()) {
+                let kept = read_about(&slot)
+                    .and_then(|(about, _)| kept_at(&about))
+                    .or_else(|| {
+                        std::fs::metadata(&slot)
+                            .and_then(|meta| meta.modified())
+                            .ok()
+                    });
+                if kept.is_some_and(is_old) {
+                    remove_slot(&slot);
+                }
             }
         }
     }
+}
+
+/// The working copies' folders in the talk's folder `key_folder`.
+fn slots(key_folder: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(key_folder) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_name().to_str().is_some_and(is_hex_name))
+        // Not a link, and not a file.
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
+        .collect()
+}
+
+/// What the working copy in `slot` says about itself, and when that was written.
+fn read_about(slot: &Path) -> Option<(About, SystemTime)> {
+    let file = slot.join(ABOUT_FILE);
+    let about = serde_json::from_slice(&read_small(&file, MAX_ABOUT_BYTES)?).ok()?;
+    let written = std::fs::metadata(&file)
+        .and_then(|meta| meta.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    Some((about, written))
+}
+
+/// When the copy was kept, unless it says a time no clock can hold.
+fn kept_at(about: &About) -> Option<SystemTime> {
+    SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(about.kept_at))
+}
+
+/// Removes the working copy in `slot`, and its talk's folder once that's empty. A link is
+/// removed, not followed.
+fn remove_slot(slot: &Path) {
+    std::fs::remove_dir_all(slot).ok();
+    if let Some(key_folder) = slot.parent() {
+        // Only when nothing is left in it.
+        std::fs::remove_dir(key_folder).ok();
+    }
+}
+
+fn refuse_link(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            Err(io::Error::other("a link is where a working copy would go"))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// A name no other window's slot has.
+fn random_name() -> String {
+    use std::hash::{BuildHasher as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u32(std::process::id());
+    if let Ok(since) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+        hasher.write_u128(since.as_nanos());
+    }
+    format!("{:016x}", hasher.finish())
 }
 
 /// The talk's path, as one path however it's written, if it's there to be found.
@@ -166,7 +268,7 @@ fn key(talk: &Path) -> String {
     key
 }
 
-fn is_key(name: &str) -> bool {
+fn is_hex_name(name: &str) -> bool {
     name.len() == KEY_LENGTH
         && name
             .bytes()

@@ -11,7 +11,7 @@ use stagepack_studio::document::{Document, TalkPlace};
 use stagepack_studio::recovery::{KEEP_FOR, Recovery, hash_text};
 use stagepack_studio::workspace_view::{
     self, CLOSE_DONT_SAVE_ID, DISCARD_RECOVERY_ID, RECOVER_ID, RECOVERY_CHANGED_SINCE, RECOVERY_ID,
-    RECOVERY_OFFER, TITLE_ID, WorkspaceView,
+    RECOVERY_OFFER, SAVE_AS_FOLDER_ID, STATUS_ID, TITLE_ID, WorkspaceView,
 };
 
 const ONE: &str = "---\ntitle: T\n---\n\n# One\n";
@@ -21,6 +21,8 @@ const EDITED: &str = "---\ntitle: T\n---\n\n# One\n\n---\n\n# Two\n";
 struct Setup {
     _app_data: tempfile::TempDir,
     root: PathBuf,
+    /// One slot, as one window has.
+    recovery: Recovery,
     _dir: tempfile::TempDir,
     folder: PathBuf,
 }
@@ -32,8 +34,10 @@ impl Setup {
         let folder = dir.path().join("talk");
         std::fs::create_dir(&folder).unwrap();
         std::fs::write(folder.join("slides.md"), source).unwrap();
+        let root = app_data.path().join("recovery");
         Setup {
-            root: app_data.path().join("recovery"),
+            recovery: Recovery::new(root.clone()),
+            root,
             _app_data: app_data,
             _dir: dir,
             folder,
@@ -41,7 +45,7 @@ impl Setup {
     }
 
     fn recovery(&self) -> Recovery {
-        Recovery::new(self.root.clone())
+        self.recovery.clone()
     }
 
     fn place(&self) -> TalkPlace {
@@ -52,16 +56,47 @@ impl Setup {
         self.folder.join("slides.md")
     }
 
-    /// The working copy's folder, the only one under the root.
+    /// The talk's folder under the root, the only one there.
+    fn key_folder(&self) -> PathBuf {
+        only_entry(&self.root)
+    }
+
+    /// The working copy's own folder, the only one in the talk's.
     fn kept_folder(&self) -> PathBuf {
-        let mut entries: Vec<PathBuf> = std::fs::read_dir(&self.root)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .collect();
-        assert_eq!(entries.len(), 1, "{entries:?}");
-        entries.remove(0)
+        only_entry(&self.key_folder())
     }
 }
+
+fn only_entry(folder: &Path) -> PathBuf {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(folder)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    entries.remove(0)
+}
+
+/// Every working copy's folder under `root`.
+fn kept_folders(root: &Path) -> Vec<PathBuf> {
+    let Ok(keys) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    keys.flatten()
+        .filter(|key| key.path().is_dir())
+        .flat_map(|key| std::fs::read_dir(key.path()).unwrap().flatten())
+        .map(|slot| slot.path())
+        .collect()
+}
+
+fn is_hex_name(path: &Path) -> bool {
+    let name = path.file_name().unwrap().to_string_lossy();
+    name.len() == 16
+        && name
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+}
+
+impl Setup {}
 
 /// Keeps `text` as the working copy of the talk in `setup`, made from what its file holds.
 fn keep(setup: &Setup, text: &str) {
@@ -84,13 +119,8 @@ fn a_working_copy_is_kept_and_found() {
     assert!(found.when >= before && found.when <= SystemTime::now() + Duration::from_secs(2));
 
     let kept = setup.kept_folder();
-    let key = kept.file_name().unwrap().to_string_lossy().into_owned();
-    assert_eq!(key.len(), 16);
-    assert!(
-        key.chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-        "{key}"
-    );
+    assert!(is_hex_name(&setup.key_folder()), "{kept:?}");
+    assert!(is_hex_name(&kept), "{kept:?}");
     assert_eq!(
         std::fs::read_to_string(kept.join("slides.md")).unwrap(),
         EDITED
@@ -117,6 +147,7 @@ fn a_working_copy_is_private() {
     let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
     let kept = setup.kept_folder();
     assert_eq!(mode(&setup.root), 0o700);
+    assert_eq!(mode(&setup.key_folder()), 0o700);
     assert_eq!(mode(&kept), 0o700);
     assert_eq!(mode(&kept.join("slides.md")), 0o600);
     assert_eq!(mode(&kept.join("about.json")), 0o600);
@@ -184,8 +215,68 @@ fn a_broken_about_file_is_ignored() {
     std::fs::write(&about, json.to_string()).unwrap();
     assert!(setup.recovery().find(&setup.place()).is_none());
 
+    // A time no clock can hold.
+    let json = serde_json::json!({
+        "talk": setup.folder.canonicalize().unwrap(),
+        "base_sha256": hash_text(ONE),
+        "kept_at": 18446744073709551615u64,
+    });
+    std::fs::write(&about, json.to_string()).unwrap();
+    assert!(setup.recovery().find(&setup.place()).is_none());
+    setup.recovery().sweep(KEEP_FOR);
+
     std::fs::remove_file(&about).unwrap();
     assert!(setup.recovery().find(&setup.place()).is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_working_copy_is_never_written_through_a_link() {
+    let setup = Setup::new(ONE);
+    keep(&setup, EDITED);
+    let key = setup.key_folder();
+    std::fs::remove_dir_all(&key).unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), &key).unwrap();
+
+    let kept = setup
+        .recovery()
+        .keep(&setup.place(), &hash_text(ONE), EDITED);
+
+    assert!(kept.is_err());
+    assert_eq!(std::fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn each_window_keeps_its_own_copy() {
+    let setup = Setup::new(ONE);
+    let other = Recovery::new(setup.root.clone());
+    let base = hash_text(ONE);
+    setup
+        .recovery()
+        .keep(&setup.place(), &base, "# Mine\n")
+        .unwrap();
+    // Kept later.
+    std::thread::sleep(Duration::from_millis(20));
+    other.keep(&setup.place(), &base, "# Theirs\n").unwrap();
+    assert_eq!(kept_folders(&setup.root).len(), 2);
+
+    // The newest is found first.
+    assert_eq!(
+        setup.recovery().find(&setup.place()).unwrap().text,
+        "# Theirs\n"
+    );
+    other.clear(&setup.place());
+    assert_eq!(
+        setup.recovery().find(&setup.place()).unwrap().text,
+        "# Mine\n"
+    );
+
+    // Letting a found copy go removes that one.
+    let found = other.find(&setup.place()).unwrap();
+    other.discard(&found);
+    assert!(setup.recovery().find(&setup.place()).is_none());
+    assert_eq!(std::fs::read_dir(&setup.root).unwrap().count(), 0);
 }
 
 #[test]
@@ -229,6 +320,10 @@ fn old_working_copies_are_swept() {
 
     assert!(recovery.find(&old.place()).is_none());
     assert!(!about.exists());
+    assert!(
+        !about.parent().unwrap().parent().unwrap().exists(),
+        "its talk's folder goes too"
+    );
     assert_eq!(recovery.find(&recent_place).unwrap().text, EDITED);
     assert!(old.root.join("not-a-working-copy").exists());
 }
@@ -238,9 +333,9 @@ impl Setup {
     fn kept_folder_by(&self, recovery: &Recovery) -> PathBuf {
         assert!(recovery.find(&self.place()).is_some());
         let canonical = self.folder.canonicalize().unwrap();
-        std::fs::read_dir(&self.root)
-            .unwrap()
-            .map(|entry| entry.unwrap().path().join("about.json"))
+        kept_folders(&self.root)
+            .into_iter()
+            .map(|slot| slot.join("about.json"))
             .filter(|about| about.is_file())
             .find(|about| {
                 let json: serde_json::Value =
@@ -255,6 +350,17 @@ impl Setup {
 
 fn open_view(cx: &mut TestAppContext, setup: &Setup) -> (AnyWindowHandle, Entity<WorkspaceView>) {
     let talk = Document::open(&setup.folder, Fonts::bundled_only()).unwrap();
+    open_view_on(cx, setup, move |window, cx| {
+        WorkspaceView::open_with(talk, window, cx)
+    })
+}
+
+fn open_view_on(
+    cx: &mut TestAppContext,
+    setup: &Setup,
+    build: impl FnOnce(&mut gpui_kit::Window, &mut gpui_kit::Context<WorkspaceView>) -> WorkspaceView
+    + 'static,
+) -> (AnyWindowHandle, Entity<WorkspaceView>) {
     let recovery = setup.recovery();
     let (handle, view) = cx.update(|cx: &mut App| {
         gpui_kit::init(cx);
@@ -271,7 +377,7 @@ fn open_view(cx: &mut TestAppContext, setup: &Setup) -> (AnyWindowHandle, Entity
             cx,
             |window, cx| {
                 cx.new(|cx| {
-                    let mut view = WorkspaceView::open_with(talk, window, cx);
+                    let mut view = build(window, cx);
                     view.set_recovery_for_test(recovery, cx);
                     view
                 })
@@ -555,4 +661,227 @@ fn a_working_copy_that_is_what_the_file_holds_is_not_offered(cx: &mut TestAppCon
     keep(&setup, ONE);
     let (handle, _view) = open_view(cx, &setup);
     assert_eq!(bar(cx, handle), None);
+}
+
+fn is_open(cx: &TestAppContext, handle: AnyWindowHandle) -> bool {
+    cx.read(|cx| {
+        cx.windows()
+            .iter()
+            .any(|w| w.window_id() == handle.window_id())
+    })
+}
+
+fn status(cx: &mut TestAppContext, handle: AnyWindowHandle) -> Option<String> {
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window
+            .try_find(STATUS_ID)
+            .map(|status| status.label().unwrap().to_string())
+    })
+    .unwrap()
+}
+
+fn offered(cx: &mut TestAppContext, setup: &Setup) -> Option<String> {
+    let (handle, view) = open_view(cx, setup);
+    let offered = bar(cx, handle).map(|_| {
+        click(cx, handle, RECOVER_ID);
+        source_of(cx, &view)
+    });
+    crash(cx, handle);
+    offered
+}
+
+#[gpui_kit::test]
+fn the_offered_copy_is_kept_until_answered(cx: &mut TestAppContext) {
+    let (setup, edited) = left_unsaved(cx);
+    let (handle, view) = open_view(cx, &setup);
+    assert!(bar(cx, handle).is_some());
+    // Edits before answering, back to saved and saved again: none of it touches last time's.
+    add_slide(cx, &view);
+    add_slide(cx, &view);
+    wait(cx, 1_000);
+    let meanwhile = source_of(cx, &view);
+    undo(cx, &view);
+    undo(cx, &view);
+    wait(cx, 1_000);
+    add_slide(cx, &view);
+    add_slide(cx, &view);
+    wait(cx, 1_000);
+    crash(cx, handle);
+
+    // Newest first, and neither is dropped.
+    assert_eq!(offered(cx, &setup).as_deref(), Some(meanwhile.as_str()));
+    let (handle, _view) = open_view(cx, &setup);
+    click(cx, handle, DISCARD_RECOVERY_ID);
+    crash(cx, handle);
+    assert_eq!(offered(cx, &setup), Some(edited));
+}
+
+#[gpui_kit::test]
+fn saving_with_the_bar_up_leaves_last_times_copy(cx: &mut TestAppContext) {
+    let (setup, edited) = left_unsaved(cx);
+    let (handle, view) = open_view(cx, &setup);
+    // Not what last time's copy holds, which would have nothing to offer once saved.
+    add_slide(cx, &view);
+    add_slide(cx, &view);
+    wait(cx, 1_000);
+    cx.simulate_keystrokes(handle, "ctrl-s");
+    cx.run_until_parked();
+    crash(cx, handle);
+    assert_eq!(offered(cx, &setup), Some(edited));
+}
+
+#[gpui_kit::test]
+fn bringing_them_back_takes_their_place(cx: &mut TestAppContext) {
+    let (setup, edited) = left_unsaved(cx);
+    let (handle, _view) = open_view(cx, &setup);
+    click(cx, handle, RECOVER_ID);
+    // Kept as this window's own straight away, and last time's let go after.
+    assert_eq!(kept_folders(&setup.root).len(), 1);
+    assert_eq!(setup.recovery().find(&setup.place()).unwrap().text, edited);
+    cx.simulate_keystrokes(handle, "ctrl-s");
+    cx.run_until_parked();
+    assert!(setup.recovery().find(&setup.place()).is_none());
+}
+
+#[gpui_kit::test(iterations = 30)]
+fn a_save_never_leaves_an_older_copy_behind(cx: &mut TestAppContext) {
+    let setup = Setup::new(ONE);
+    let (handle, view) = open_view(cx, &setup);
+    add_slide(cx, &view);
+    // The wait for the working copy is over just as the save starts.
+    cx.executor().advance_clock(Duration::from_millis(1_000));
+    cx.simulate_keystrokes(handle, "ctrl-s");
+    cx.run_until_parked();
+    wait(cx, 2_000);
+    assert!(
+        kept_folders(&setup.root).is_empty(),
+        "{:?}",
+        kept_folders(&setup.root)
+    );
+}
+
+#[gpui_kit::test(iterations = 30)]
+fn dont_save_never_leaves_a_copy_behind(cx: &mut TestAppContext) {
+    let setup = Setup::new(ONE);
+    let (handle, view) = open_view(cx, &setup);
+    add_slide(cx, &view);
+    wait(cx, 1_000);
+    add_slide(cx, &view);
+    cx.executor().advance_clock(Duration::from_millis(1_000));
+    assert!(!VisualTestContext::from_window(handle, cx).simulate_close());
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(CLOSE_DONT_SAVE_ID, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(!is_open(cx, handle));
+    assert!(
+        kept_folders(&setup.root).is_empty(),
+        "{:?}",
+        kept_folders(&setup.root)
+    );
+}
+
+#[gpui_kit::test]
+fn a_failed_keep_says_so_and_tries_again(cx: &mut TestAppContext) {
+    let setup = Setup::new(ONE);
+    // Nowhere a folder can be made.
+    std::fs::create_dir_all(setup.root.parent().unwrap()).unwrap();
+    std::fs::write(&setup.root, "in the way").unwrap();
+    let (handle, view) = open_view(cx, &setup);
+    add_slide(cx, &view);
+    wait(cx, 1_000);
+    let said = status(cx, handle).expect("it says so");
+    assert!(
+        said.starts_with("Unsaved changes couldn't be kept safe"),
+        "{said}"
+    );
+    assert!(!said.contains("error") && !said.contains('('), "{said}");
+
+    std::fs::remove_file(&setup.root).unwrap();
+    wait(cx, 9_000);
+    assert!(setup.recovery().find(&setup.place()).is_none());
+    wait(cx, 1_000);
+    assert_eq!(
+        setup.recovery().find(&setup.place()).unwrap().text,
+        source_of(cx, &view)
+    );
+}
+
+#[gpui_kit::test]
+fn save_as_clears_the_old_places_copy(cx: &mut TestAppContext) {
+    let setup = Setup::new(ONE);
+    let (handle, view) = open_view(cx, &setup);
+    add_slide(cx, &view);
+    wait(cx, 1_000);
+    assert!(setup.recovery().find(&setup.place()).is_some());
+    let elsewhere = tempfile::tempdir().unwrap();
+    let out = elsewhere.path().join("copy");
+
+    cx.simulate_keystrokes(handle, "ctrl-shift-s");
+    click(cx, handle, SAVE_AS_FOLDER_ID);
+    assert!(cx.did_prompt_for_new_path());
+    let chosen = out.clone();
+    cx.simulate_new_path_selection(move |_| Some(chosen));
+    cx.run_until_parked();
+
+    assert_eq!(
+        std::fs::read_to_string(out.join("slides.md")).unwrap(),
+        source_of(cx, &view)
+    );
+    assert!(setup.recovery().find(&setup.place()).is_none());
+    assert!(setup.recovery().find(&TalkPlace::Folder(out)).is_none());
+    assert!(kept_folders(&setup.root).is_empty());
+}
+
+#[gpui_kit::test]
+fn a_packed_talks_copy_is_found_again(cx: &mut TestAppContext) {
+    let setup = Setup::new(ONE);
+    let file = setup.folder.parent().unwrap().join("talk.sptx");
+    slides_engine::pack_folder(&setup.folder, &file, "test").unwrap();
+    let open = |cx: &mut TestAppContext| {
+        let file = file.clone();
+        open_view_on(cx, &setup, move |window, cx| {
+            WorkspaceView::open(file, window, cx)
+        })
+    };
+    let (handle, view) = open(cx);
+    add_slide(cx, &view);
+    wait(cx, 1_000);
+    let edited = source_of(cx, &view);
+    crash(cx, handle);
+
+    let place = TalkPlace::Packed(file.clone());
+    let found = setup.recovery().find(&place).expect("kept");
+    assert!(
+        found.base_matches,
+        "the base is what the pack's slides read as"
+    );
+    let (handle, view) = open(cx);
+    assert_eq!(bar(cx, handle).as_deref(), Some(RECOVERY_OFFER));
+    click(cx, handle, RECOVER_ID);
+    assert_eq!(source_of(cx, &view), edited);
+}
+
+#[gpui_kit::test]
+fn two_windows_on_the_same_talk_keep_their_own(cx: &mut TestAppContext) {
+    let setup = Setup::new(ONE);
+    let (first, first_view) = open_view(cx, &setup);
+    let (_second, second_view) = open_view(cx, &setup);
+    add_slide(cx, &first_view);
+    add_slide(cx, &second_view);
+    add_slide(cx, &second_view);
+    wait(cx, 1_000);
+    assert_eq!(kept_folders(&setup.root).len(), 2);
+
+    cx.simulate_keystrokes(first, "ctrl-s");
+    cx.run_until_parked();
+    wait(cx, 1_000);
+
+    assert_eq!(
+        setup.recovery().find(&setup.place()).unwrap().text,
+        source_of(cx, &second_view)
+    );
 }
