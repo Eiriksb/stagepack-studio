@@ -141,7 +141,7 @@ fn thumbnail(
     view: &Entity<WorkspaceView>,
     index: usize,
 ) -> Option<Arc<RenderImage>> {
-    cx.read(|cx| view.read(cx).slide_strip().read(cx).thumbnail(index))
+    cx.read(|cx| view.read(cx).slide_strip().read(cx).thumbnail(index, cx))
 }
 
 fn with_window<R>(
@@ -709,4 +709,152 @@ fn a_packed_talk_can_be_edited_the_same_way(cx: &mut TestAppContext) {
     keys(cx, handle, "ctrl-z");
     keys(cx, handle, "ctrl-z");
     assert_eq!(source(cx, &view), TWO);
+}
+
+/// The rows the list has on screen.
+fn rows_on_screen(cx: &mut TestAppContext, handle: AnyWindowHandle, count: usize) -> usize {
+    with_window(cx, handle, |window, _| {
+        (0..count)
+            .filter(|index| window.try_find(strip_row_id(*index)).is_some())
+            .count()
+    })
+}
+
+fn drawn(cx: &TestAppContext, view: &Entity<WorkspaceView>) -> usize {
+    cx.read(|cx| view.read(cx).slide_strip().read(cx).thumbnails_drawn())
+}
+
+fn many_slides(count: usize) -> String {
+    (0..count)
+        .map(|n| format!("# Slide {n}\n"))
+        .collect::<Vec<_>>()
+        .join("\n---\n\n")
+}
+
+#[gpui_kit::test]
+fn a_full_memory_budget_does_not_keep_the_list_drawing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("slides.md"), many_slides(30)).unwrap();
+    let mut talk = Document::open(dir.path(), Fonts::bundled_only()).unwrap();
+    // No room for more than the slide being drawn.
+    talk.set_memory_budget(1);
+    let (handle, view) = open_view(cx, |window, cx| WorkspaceView::open_with(talk, window, cx));
+    // Opening has settled, so the drawing stopped.
+    let rows = rows_on_screen(cx, handle, 30);
+    assert!(rows > 2, "{rows} rows");
+    assert!(
+        drawn(cx, &view) <= rows,
+        "{} drawn for {rows} rows",
+        drawn(cx, &view)
+    );
+    for index in 0..rows {
+        assert!(
+            thumbnail(cx, &view, index).is_some(),
+            "row {index} shows its slide"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn thumbnails_are_drawn_once_at_the_size_the_list_shows_them(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, &many_slides(30));
+    let rows = rows_on_screen(cx, handle, 30);
+    assert_eq!(drawn(cx, &view), rows, "none drawn at a guessed size first");
+    // 220 wide, less the row's padding, number, gap and frame, at a scale factor of 2,
+    // rounded up to 16 device pixels.
+    let image = thumbnail(cx, &view, 0).unwrap();
+    assert_eq!(i32::from(image.size(0).width), 352);
+}
+
+#[gpui_kit::test]
+fn a_row_shows_its_own_slide_after_one_before_it_is_deleted(cx: &mut TestAppContext) {
+    let talk = "# One\n\n---\n\n# Two\n\n---\n\n<Box x=\"0\" y=\"0\" w=\"1920\" h=\"1080\" fill=\"#ff0000\" />\n\n---\n\n# Four\n\n---\n\n# Five\n";
+    let (handle, view) = open(cx, talk);
+    let third = thumbnail(cx, &view, 2).unwrap();
+    click(cx, handle, strip_row_id(1));
+    click(cx, handle, DELETE_ID);
+    assert_eq!(count(cx, &view), 4);
+    let second = thumbnail(cx, &view, 1).unwrap();
+    assert_eq!(
+        second.as_bytes(0),
+        third.as_bytes(0),
+        "row 2 shows what was slide 3"
+    );
+    let fourth = thumbnail(cx, &view, 3).unwrap();
+    assert_ne!(fourth.as_bytes(0), third.as_bytes(0));
+}
+
+#[gpui_kit::test]
+fn the_undo_keys_in_the_notes_field_act_on_its_text(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, TWO);
+    keys(cx, handle, "ctrl-m");
+    keys(cx, handle, "ctrl-z");
+    assert_eq!(count(cx, &view), 2);
+    click(cx, handle, NOTES_ID);
+    for key in ["ctrl-shift-z", "ctrl-y", "ctrl-z"] {
+        keys(cx, handle, key);
+        assert_eq!(count(cx, &view), 2, "{key} left the talk alone");
+        assert_eq!(source(cx, &view), TWO, "{key}");
+    }
+    with_window(cx, handle, |window, _| assert!(!disabled(window, REDO_ID)));
+}
+
+#[gpui_kit::test]
+fn delete_and_backspace_leave_the_slides_alone_outside_the_list(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, THREE);
+    click(cx, handle, CANVAS_ID);
+    keys(cx, handle, "delete");
+    keys(cx, handle, "backspace");
+    assert_eq!(count(cx, &view), 3, "with the slide in hand");
+    click(cx, handle, NOTES_ID);
+    keys(cx, handle, "delete");
+    keys(cx, handle, "backspace");
+    assert_eq!(count(cx, &view), 3, "with the notes in hand");
+    assert_eq!(source(cx, &view), THREE);
+}
+
+#[gpui_kit::test]
+fn a_refused_notes_edit_is_said_and_the_field_shows_the_notes_again(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, TWO);
+    // More than a slide can hold, as a paste might bring.
+    let pasted = "words ".repeat(8 * 1024);
+    let field = cx.read(|cx| view.read(cx).notes_panel().read(cx).field().clone());
+    cx.update_window(handle, |_, window, cx| {
+        field.update(cx, |field, cx| field.replace_all(pasted, window, cx))
+    })
+    .unwrap();
+    settle(cx, handle);
+    assert_eq!(source(cx, &view), TWO, "nothing was made");
+    let status = with_window(cx, handle, |window, _| {
+        window
+            .find(workspace_view::STATUS_ID)
+            .label()
+            .map(str::to_string)
+    });
+    assert_eq!(
+        status.as_deref(),
+        Some("That change would have broken another slide, so it wasn't made.")
+    );
+    assert_eq!(
+        notes_text(cx, &view),
+        "",
+        "the field shows the slide's notes again"
+    );
+}
+
+#[gpui_kit::test]
+fn typing_blank_lines_and_spaces_in_notes_keeps_the_caret(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, TWO);
+    click(cx, handle, NOTES_ID);
+    with_window(cx, handle, |window, cx| window.input("a", cx));
+    for _ in 0..3 {
+        with_window(cx, handle, |window, cx| window.press("enter", cx));
+        settle(cx, handle);
+    }
+    with_window(cx, handle, |window, cx| window.input("  b", cx));
+    settle(cx, handle);
+    with_window(cx, handle, |window, cx| window.input("c", cx));
+    settle(cx, handle);
+    assert_eq!(notes_text(cx, &view), "a\n\n\n  bc");
+    assert_eq!(notes_of(cx, &view, 0).as_deref(), Some("a\n\n\n  bc"));
 }

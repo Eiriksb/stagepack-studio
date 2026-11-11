@@ -309,6 +309,17 @@ impl Document {
         self.deck.thumbnail(index, width)
     }
 
+    /// What slide `index` is at the moment: a number that changes whenever anything that
+    /// decides how it looks does. `None` if the talk has no such slide.
+    pub fn slide_version(&self, index: usize) -> Option<u64> {
+        self.deck.slide_version(index)
+    }
+
+    /// How many pixel bytes the talk's drawn slides and thumbnails can add up to.
+    pub fn set_memory_budget(&mut self, bytes: usize) {
+        self.deck.set_memory_budget(bytes);
+    }
+
     /// Slide `index`'s thumbnail `width` wide, if it's drawn already: asking draws nothing.
     pub fn drawn_thumbnail(&self, index: usize, width: u32) -> Option<Arc<Pixmap>> {
         self.deck.drawn_thumbnail(index, width)

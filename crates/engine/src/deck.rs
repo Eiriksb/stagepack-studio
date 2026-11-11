@@ -108,6 +108,9 @@ struct SlideState {
     /// It's apart from `last_used`, so that a list of thumbnails scrolled through doesn't make
     /// the slides in it seem more wanted than the one on screen.
     thumbnail_used: u64,
+    /// Differs from every other slide's, and from what this one had before it last changed:
+    /// what a picture of the slide was drawn from.
+    version: u64,
 }
 
 pub struct Deck {
@@ -134,6 +137,8 @@ pub struct Deck {
     slides_holding_pictures: BTreeSet<usize>,
     /// The slides a show goes through, worked out when the talk is read.
     shown: Vec<usize>,
+    /// The last version given to a slide.
+    versions_made: u64,
 }
 
 /// The talk's settings, as far as they decide how a slide looks: not where they sit.
@@ -166,9 +171,10 @@ impl Deck {
         let files: Rc<dyn TalkFiles> = Rc::from(files);
         let components = TalkComponents::scan_for(files.clone(), &registry);
         let talk = parse_talk(&source);
-        let slides = slide_texts(&talk)
+        let slides: Vec<SlideState> = slide_texts(&talk)
             .into_iter()
-            .map(|text| SlideState {
+            .zip(1..)
+            .map(|(text, version)| SlideState {
                 text,
                 laid: None,
                 at_moment: None,
@@ -176,6 +182,7 @@ impl Deck {
                 thumbnail: None,
                 last_used: 0,
                 thumbnail_used: 0,
+                version,
             })
             .collect();
         Deck {
@@ -188,12 +195,13 @@ impl Deck {
             theme: theme_key(&talk),
             shown: shown_slides_of(&talk),
             talk,
-            slides,
             backgrounds: HashMap::new(),
             memory_budget: DEFAULT_MEMORY_BUDGET,
             layers_asked_for: 0,
             last_asked: None,
             slides_holding_pictures: BTreeSet::new(),
+            versions_made: slides.len() as u64,
+            slides,
         }
     }
 
@@ -229,6 +237,7 @@ impl Deck {
                         thumbnail: previous.thumbnail.take(),
                         last_used: previous.last_used,
                         thumbnail_used: previous.thumbnail_used,
+                        version: previous.version,
                     });
                 }
                 previous => {
@@ -238,7 +247,9 @@ impl Deck {
                     for scale in drawn.values_mut() {
                         scale.ordered = None;
                     }
-                    slides.push(SlideState { text, laid: None, at_moment: None, drawn, thumbnail: None, last_used, thumbnail_used });
+                    self.versions_made += 1;
+                    let version = self.versions_made;
+                    slides.push(SlideState { text, laid: None, at_moment: None, drawn, thumbnail: None, last_used, thumbnail_used, version });
                 }
             }
         }
@@ -269,6 +280,8 @@ impl Deck {
             for scale in slide.drawn.values_mut() {
                 scale.ordered = None;
             }
+            self.versions_made += 1;
+            slide.version = self.versions_made;
         }
         self.slides_holding_pictures.clear();
         (0..self.slides.len()).collect()
@@ -287,6 +300,8 @@ impl Deck {
             slide.at_moment = None;
             slide.thumbnail = None;
             slide.drawn.clear();
+            self.versions_made += 1;
+            slide.version = self.versions_made;
         }
         self.slides_holding_pictures.clear();
     }
@@ -401,6 +416,13 @@ impl Deck {
         self.slides[index].thumbnail = Some((width, pixmap.clone()));
         self.keep_within_budget(index);
         Some(pixmap)
+    }
+
+    /// What slide `index` is at the moment, as a number that changes whenever anything that
+    /// decides how it looks does, or `None` if the talk has no such slide. A picture of the
+    /// slide made at one version shows it as long as the version stays.
+    pub fn slide_version(&self, index: usize) -> Option<u64> {
+        self.slides.get(index).map(|slide| slide.version)
     }
 
     /// Slide `index`'s thumbnail `width` wide, if one has been drawn since the slide last

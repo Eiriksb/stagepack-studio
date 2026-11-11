@@ -519,3 +519,19 @@ fn asking_for_a_thumbnail_already_drawn_draws_nothing() {
     d.update(TALK.replace("One", "Changed"));
     assert!(d.drawn_thumbnail(0, 160).is_none(), "the slide changed");
 }
+
+#[test]
+fn a_slide_keeps_its_version_until_it_changes() {
+    let mut d = deck(TALK);
+    let before: Vec<_> = (0..3).map(|index| d.slide_version(index).unwrap()).collect();
+    assert!(d.slide_version(3).is_none());
+    assert_eq!(before.iter().collect::<std::collections::HashSet<_>>().len(), 3, "each its own");
+    d.update(TALK.replace("Two", "Changed"));
+    assert_eq!(d.slide_version(0), Some(before[0]));
+    assert_ne!(d.slide_version(1), Some(before[1]));
+    assert_eq!(d.slide_version(2), Some(before[2]));
+    // Taking a slide out moves the ones after it to where its text differs.
+    d.update("# One\n\n---\n\n# Three\n".to_string());
+    assert_eq!(d.slide_version(0), Some(before[0]));
+    assert_ne!(d.slide_version(1), Some(before[2]));
+}

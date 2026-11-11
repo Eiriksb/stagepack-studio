@@ -51,17 +51,22 @@ impl WorkspaceView {
         let Some(document) = self.document.clone() else {
             return;
         };
-        let made = document.update(cx, |document, cx| {
+        let (made, changed) = document.update(cx, |document, cx| {
+            let before = talk_state(document);
             let made = change(document);
-            if matches!(&made, Ok(changed) if !changed.is_empty()) {
+            // Whether the talk changed, as its text or its history did: what the edit says
+            // to draw again is about pictures, and can be empty for a change all the same.
+            let changed = talk_state(document) != before;
+            if changed {
                 cx.notify();
             }
-            made
+            (made, changed)
         });
-        match made {
-            Ok(changed) if !changed.is_empty() => self.edited(cx),
-            Ok(_) => {}
-            Err(refused) => self.say(refused.to_string(), cx),
+        if changed {
+            self.edited(cx);
+        }
+        if let Err(refused) = made {
+            self.say(refused.to_string(), cx);
         }
     }
 
@@ -170,17 +175,11 @@ impl WorkspaceView {
     ) -> impl IntoElement {
         let has_talk = self.document.is_some();
         let slide_and_notes = v_resizable("slide-and-notes")
-            .child(
-                resizable_panel().child(
-                    // Room around the slide, so that it sits on the desk rather than against
-                    // the tools.
-                    div()
-                        .size_full()
-                        .p_4()
-                        .bg(cx.theme().muted)
-                        .child(canvas),
-                ),
-            )
+            .child(resizable_panel().child(
+                // Room around the slide, so that it sits on the desk rather than against
+                // the tools.
+                div().size_full().p_4().bg(cx.theme().muted).child(canvas),
+            ))
             .child(
                 resizable_panel()
                     .size(NOTES_HEIGHT)
@@ -221,4 +220,19 @@ impl WorkspaceView {
             )
             .bg(cx.theme().background)
     }
+}
+
+/// What tells one state of the talk from another: its text, and where its history stands.
+fn talk_state(
+    document: &Document,
+) -> (u64, bool, bool, Option<&'static str>, Option<&'static str>) {
+    let mut hasher = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(document.source(), &mut hasher);
+    (
+        std::hash::Hasher::finish(&hasher),
+        document.can_undo(),
+        document.can_redo(),
+        document.undo_label(),
+        document.redo_label(),
+    )
 }

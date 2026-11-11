@@ -54,8 +54,10 @@ pub fn strip_row_id(index: usize) -> ElementId {
     ("strip-row", index).into()
 }
 
+/// A row's picture, and what it's a picture of: the slide's version, at a width.
 struct Thumbnail {
-    pixmap: Arc<Pixmap>,
+    version: u64,
+    width: u32,
     image: Arc<RenderImage>,
 }
 
@@ -65,6 +67,8 @@ pub struct SlideStrip {
     scroll: VirtualListScrollHandle,
     /// The list's width, as last measured.
     width: Pixels,
+    /// Whether the list has measured itself yet.
+    measured: bool,
     scale_factor: f32,
     /// The rows' sizes, kept while the number of slides and their height stay as they are.
     row_sizes: Rc<Vec<Size<Pixels>>>,
@@ -92,6 +96,7 @@ impl SlideStrip {
             focus_handle: cx.focus_handle(),
             scroll: VirtualListScrollHandle::new(),
             width: STRIP_WIDTH,
+            measured: false,
             scale_factor: 1.0,
             row_sizes: Rc::new(Vec::new()),
             thumbnails: HashMap::new(),
@@ -108,10 +113,13 @@ impl SlideStrip {
         &self.focus_handle
     }
 
-    /// The image row `index` shows, once its thumbnail is drawn.
-    pub fn thumbnail(&self, index: usize) -> Option<Arc<RenderImage>> {
+    /// The picture row `index` shows: one of its slide as the slide is now, once drawn. A
+    /// picture of what the slide was isn't shown, as it may be of another slide altogether.
+    pub fn thumbnail(&self, index: usize, cx: &App) -> Option<Arc<RenderImage>> {
+        let version = self.document.as_ref()?.read(cx).slide_version(index)?;
         self.thumbnails
             .get(&index)
+            .filter(|thumbnail| thumbnail.version == version)
             .map(|thumbnail| thumbnail.image.clone())
     }
 
@@ -140,7 +148,8 @@ impl SlideStrip {
     }
 
     fn measured(&mut self, width: Pixels, scale_factor: f32, cx: &mut Context<Self>) {
-        if width != self.width || scale_factor != self.scale_factor {
+        if !self.measured || width != self.width || scale_factor != self.scale_factor {
+            self.measured = true;
             self.width = width;
             self.scale_factor = scale_factor;
             cx.notify();
@@ -148,12 +157,13 @@ impl SlideStrip {
     }
 
     /// Takes in what the rows on screen show, and has what's missing drawn.
+    /// Takes in which rows are on screen, lets go of the pictures of rows far from them, and
+    /// has the ones on screen that don't show their slide as it is now drawn.
     fn rows_shown(&mut self, rows: Range<usize>, cx: &mut Context<Self>) {
         self.visible = rows.clone();
         let Some(document) = self.document.clone() else {
             return;
         };
-        let width = self.drawn_width();
         let count = document.read(cx).slide_count();
         let keep = rows.start.saturating_sub(KEPT_AROUND)..(rows.end + KEPT_AROUND).min(count);
         let gone: Vec<usize> = self
@@ -170,23 +180,8 @@ impl SlideStrip {
             // The next render lets go of their images.
             cx.notify();
         }
-        let mut missing = false;
-        for index in rows {
-            match document.read(cx).drawn_thumbnail(index, width) {
-                Some(pixmap) => {
-                    let current = self
-                        .thumbnails
-                        .get(&index)
-                        .is_some_and(|thumbnail| Arc::ptr_eq(&thumbnail.pixmap, &pixmap));
-                    if !current {
-                        // Drawn already, for another row of the list or before it scrolled away.
-                        self.show_thumbnail(index, pixmap);
-                    }
-                }
-                None => missing = true,
-            }
-        }
-        if missing && !self.drawing {
+        // Until the list has measured itself, any size drawn at would be a guess.
+        if self.measured && !self.drawing && !self.missing(cx).is_empty() {
             self.drawing = true;
             cx.spawn(async move |this, cx| {
                 loop {
@@ -203,7 +198,27 @@ impl SlideStrip {
         }
     }
 
-    /// Draws a few of the thumbnails the rows on screen are missing, and says whether any are
+    /// The rows on screen whose picture isn't of their slide as it is now, at the size shown.
+    /// The list's own pictures are the record of what's drawn: the deck may let go of its
+    /// copies to stay within its memory, and that's no reason to draw them again.
+    fn missing(&self, cx: &App) -> Vec<usize> {
+        let Some(document) = &self.document else {
+            return Vec::new();
+        };
+        let document = document.read(cx);
+        let width = self.drawn_width();
+        let rows = self.visible.start.min(document.slide_count())
+            ..self.visible.end.min(document.slide_count());
+        rows.filter(|index| {
+            let version = document.slide_version(*index);
+            !self.thumbnails.get(index).is_some_and(|thumbnail| {
+                Some(thumbnail.version) == version && thumbnail.width == width
+            })
+        })
+        .collect()
+    }
+
+    /// Draws a few of the pictures the rows on screen are missing, and says whether any are
     /// still missing.
     fn draw_some(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(document) = self.document.clone() else {
@@ -211,16 +226,15 @@ impl SlideStrip {
             return false;
         };
         let width = self.drawn_width();
-        let count = document.read(cx).slide_count();
-        let rows = self.visible.start.min(count)..self.visible.end.min(count);
-        let missing: Vec<usize> = rows
-            .filter(|&index| document.read(cx).drawn_thumbnail(index, width).is_none())
-            .collect();
+        let missing = self.missing(cx);
         for &index in missing.iter().take(THUMBNAILS_PER_TURN) {
-            let drawn = document.update(cx, |document, _| document.thumbnail(index, width));
-            if let Some(pixmap) = drawn {
+            let drawn = document.update(cx, |document, _| {
+                let version = document.slide_version(index)?;
+                Some((version, document.thumbnail(index, width)?))
+            });
+            if let Some((version, pixmap)) = drawn {
                 self.drawn += 1;
-                self.show_thumbnail(index, pixmap);
+                self.show_thumbnail(index, version, width, pixmap);
             }
         }
         cx.notify();
@@ -231,10 +245,17 @@ impl SlideStrip {
         more
     }
 
-    fn show_thumbnail(&mut self, index: usize, pixmap: Arc<Pixmap>) {
+    fn show_thumbnail(&mut self, index: usize, version: u64, width: u32, pixmap: Arc<Pixmap>) {
         let image = Arc::new(RenderImage::new(vec![to_bgra_frame(&pixmap)]));
         self.retire(index);
-        self.thumbnails.insert(index, Thumbnail { pixmap, image });
+        self.thumbnails.insert(
+            index,
+            Thumbnail {
+                version,
+                width,
+                image,
+            },
+        );
     }
 
     fn retire(&mut self, index: usize) {
@@ -260,10 +281,7 @@ impl SlideStrip {
             } else {
                 format!("Slide {number}").into()
             };
-            let image = self
-                .thumbnails
-                .get(&index)
-                .map(|thumbnail| thumbnail.image.clone());
+            let image = self.thumbnail(index, cx);
             h_flex()
                 .id(strip_row_id(index))
                 .test_support()

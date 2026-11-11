@@ -62,6 +62,11 @@ impl NotesPanel {
         panel
     }
 
+    /// The field the notes are typed into.
+    pub fn field(&self) -> &Entity<TextareaState> {
+        &self.field
+    }
+
     /// What the field holds.
     pub fn text(&self, cx: &App) -> String {
         self.field.read(cx).value().to_string()

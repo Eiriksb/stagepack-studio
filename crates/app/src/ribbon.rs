@@ -182,8 +182,8 @@ impl Ribbon {
             .disabled(!has_talk)
             .menu_accessibility_label("Choose a layout")
             .dropdown_menu(|menu, _, _| {
-                LAYOUTS.iter().fold(menu, |menu, (name, layout)| {
-                    menu.menu(*name, Box::new(AddSlide { layout: *layout }))
+                LAYOUTS.iter().fold(menu, |menu, &(name, layout)| {
+                    menu.menu(name, Box::new(AddSlide { layout }))
                 })
             });
         let (hide_label, hide_icon) = if hidden {

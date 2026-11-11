@@ -10,6 +10,7 @@ use std::time::Duration;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input;
 use gpui_kit::component::menu::DropdownMenu as _;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui_kit::component::{
@@ -72,6 +73,9 @@ pub const DISCARD_RECOVERY_ID: &str = "discard-recovery";
 
 /// The key context of the window's content, where its shortcuts apply.
 pub const KEY_CONTEXT: &str = "Workspace";
+
+/// The key context of the kit's text fields.
+const INPUT_CONTEXT: &str = "Input";
 
 /// How the desktop tells this app's windows from another's.
 pub(crate) const APP_ID: &str = "stagepack-studio";
@@ -165,6 +169,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-z", Undo, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-shift-z", Redo, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-y", Redo, Some(KEY_CONTEXT)),
+        // A text field takes Ctrl+Z and Ctrl+Y for its own text. This is its Redo too, so that
+        // it never reaches the window's.
+        KeyBinding::new("ctrl-shift-z", input::Redo, Some(INPUT_CONTEXT)),
         KeyBinding::new("up", PreviousSlide, Some(STRIP_CONTEXT)),
         KeyBinding::new("down", NextSlide, Some(STRIP_CONTEXT)),
         KeyBinding::new("delete", DeleteSlide, Some(STRIP_CONTEXT)),
@@ -369,11 +376,17 @@ impl WorkspaceView {
         let ribbon = cx.new(|cx| Ribbon::new(document.clone(), panels, cx));
         let slide_strip = cx.new(|cx| SlideStrip::new(document.clone(), cx));
         let notes_panel = cx.new(|cx| NotesPanel::new(document.clone(), window, cx));
-        let notes_edited = cx.subscribe(&notes_panel, |this, _, edited: &NotesEdited, cx| {
-            let NotesEdited { index, text } = edited;
-            let index = *index;
-            this.edit(|document| document.set_notes(index, text), cx);
-        });
+        let notes_edited = cx.subscribe_in(
+            &notes_panel,
+            window,
+            |this, notes_panel, edited: &NotesEdited, window, cx| {
+                let NotesEdited { index, text } = edited;
+                let index = *index;
+                this.edit(|document| document.set_notes(index, text), cx);
+                // Notes that weren't taken as typed show as the talk has them.
+                notes_panel.update(cx, |panel, cx| panel.follow_slide(window, cx));
+            },
+        );
         // The title says whether there are unsaved changes, whatever made them, and the
         // working copy follows them.
         let document_changed = document.as_ref().map(|document| {
