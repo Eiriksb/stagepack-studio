@@ -391,3 +391,16 @@ fn a_save_over_an_outside_change_does_not_write_and_asks() {
     save(&mut doc);
     assert_eq!(read(&dir.path().join("slides.md")), mine);
 }
+
+#[test]
+fn saving_over_an_emptied_file_goes_ahead() {
+    let (dir, mut doc) = talk(TWO_SLIDES);
+    doc.add_slide("content").unwrap();
+    // An editor halfway through its own save, or a file emptied outside the app.
+    std::fs::write(dir.path().join("slides.md"), "").unwrap();
+
+    save(&mut doc);
+
+    assert_eq!(read(&dir.path().join("slides.md")), doc.source());
+    assert!(!doc.has_unsaved_changes());
+}

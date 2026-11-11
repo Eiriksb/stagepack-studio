@@ -119,8 +119,11 @@ impl SaveJob {
         }
         let (moved_to, notices) = match (&from, to) {
             (TalkPlace::Folder(folder), None) => {
-                // A file that can't be read is written anyway: it may have been deleted.
+                // A file that can't be read is written anyway: it may have been deleted. An
+                // empty one is an editor halfway through a save, as a reload takes it, and
+                // nothing would ever ask about it, so it's written too.
                 if let Ok(found) = read_talk_text(&folder.join(SLIDES_FILE))
+                    && !found.is_empty()
                     && found != on_disk
                     && found != text
                 {
