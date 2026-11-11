@@ -123,7 +123,7 @@ fn Callout(title: String, children: Children, ctx: &Ctx) -> Element {
 }
 ```
 
-An argument called `children` of type `Children` is where the content goes: `children.into()` turns it into an element. It has no form field, because you edit it on the slide. Leave a blank line after the opening tag and before the closing one, so the content is read as Markdown:
+An argument called `children` of type `Children` is where the content goes: `children.into()` turns it into an element. Place it once: the content can only be in one place, and a component that places it twice gives an answer that can't be read. It has no form field, because you edit it on the slide. Leave a blank line after the opening tag and before the closing one, so the content is read as Markdown:
 
 ```markdown
 <Callout title="Remember">
@@ -332,10 +332,13 @@ When a component can't be shown, a labelled box takes its place and says why:
 | *Score: used too much memory* | It used more than 64 MiB. |
 | *Score: stopped working* | It stopped partway, as Rust does when something goes wrong it can't carry on from, such as reading past the end of a list. |
 | *Score: gave an answer that can't be read* | What it drew was too large or too deep. See the limits below. |
-| *Score: can't be loaded*, or *too large to run* | Its build is damaged, or larger than 16 MiB. Build it again. |
+| *Score: can't be loaded*, or *too large to run* | Its build is damaged or larger than 4 MiB, or the talk's components have already loaded 16 MiB between them. Build it again, or use fewer large components. |
 | *Score: built by a newer version of this app* | Someone built it with a newer app than yours. Build it again here, or update the app. |
 | *Score: not run, as this slide's components took too long* | The components on this slide took more than a second between them, so the rest were skipped. |
-| Your own words | The component gave back `problem("...")`. |
+| *There is no component called Score* | The talk has no component of that name, and nor does the app. Check the spelling, and that its file is in `components`. |
+| *This slide has too much on it to show* | The slide, with everything its components drew, came to more than the app can lay out in time. Show less on it. |
+| *Nested too deeply* | Lists, tags and what components drew sit more than 64 levels inside each other. |
+| Your own words | The component gave back `problem("...")`. Only the first 200 characters are shown. |
 
 A note under the slide saying *Score is out of date, so this is its last build* means that you changed the file since its last build.
 
@@ -348,10 +351,12 @@ A talk is shared like any other file, so a component is held to some limits. The
 - **`include!`, `include_str!`, `include_bytes!`, `env!`, `option_env!`, `#[path]`, `mod name;` and `#![feature]` are refused**, because a talk's source could otherwise copy a private file from your computer into its build, which then travels with the talk. A `mod` with its body in `{ }` is fine.
 - **One `#[component]` per file.** The file's component is its tag, and each file is built on its own.
 - **Only the toolkit, no outside crates** (a crate is a Rust library). A component is one file with no project around it, so there's nowhere to name another one, and building never downloads anything.
-- **Files are read only from the talk's `assets` folder.** A component can't see anything else on the computer of whoever opens the talk. `ctx.asset_text` gives nothing for a path outside it.
-- **A component's elements can be nested at most 40 levels deep, and it can give back at most 20,000 elements.** Past that, what it drew can't be read back safely or laid out in time.
+- **Files are read only from the talk's `assets` folder.** A component can't see anything else on the computer of whoever opens the talk. `ctx.asset_text` gives nothing for a path outside it, or for a path longer than 256 bytes.
+- **One drawing can read at most 64 MiB of files between them.** A read past that gives nothing.
+- **A component's elements can be nested at most 40 levels deep, and it can give back at most 20,000 elements and 256 KiB of text**, counting its text, problems, icon names, picture paths and path data together. It can place the content between its tags once. Past that, what it drew can't be read back safely or laid out in time.
 - **Each drawing has 250 ms and 64 MiB.** A component that never finishes or keeps taking memory is stopped, so it can't freeze the app.
-- **A source file is at most 1 MiB, and a talk has at most 256 components.** These keep a talk from taking a long time to open.
+- **A source file is at most 1 MiB, a build at most 4 MiB, and a talk has at most 256 components.** These keep a talk from taking a long time to open. A talk loads at most 16 MiB of builds between them, and loading that much takes several seconds the first time.
+- **Building is stopped after 60 seconds, or once it has written 64 MiB, or, on Linux, once it uses 4 GiB of memory.** A real component builds in a second or two.
 
 ## Using a code editor
 
