@@ -11,7 +11,9 @@ pub use color::{Color, Theme};
 pub use element::{at, canvas, icon, path, picture, problem, shape, text, Children, Element, Placed, ShapeKind, TextAlign};
 #[doc(hidden)]
 pub use element::stack;
-pub use interface::{asset_path_allowed, ComponentSchema, CtxData, PropField, PropKind, RenderInput, RenderOutput, ABI_VERSION};
+pub use interface::{
+    asset_path_allowed, ComponentSchema, CtxData, PropField, PropKind, RenderInput, RenderOutput, ABI_VERSION, RESERVED_NAMES,
+};
 pub use props::{Ctx, DataFile, NativeComponent, PictureFile, Prop, Props, Registry};
 pub use toolkit_macros::{component, Prop};
 

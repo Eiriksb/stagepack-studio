@@ -75,7 +75,7 @@ impl<'a> Ctx<'a> {
 
     /// `element`, with what the component read to make it.
     pub fn finish(self, element: Element) -> RenderOutput {
-        RenderOutput { element, steps: self.steps.get(), stepped: self.stepped.get(), animated: self.animated.get() }
+        RenderOutput::new(element, self.steps.get(), self.stepped.get(), self.animated.get())
     }
 }
 
@@ -117,8 +117,9 @@ impl Prop for f32 {
     fn kind() -> PropKind {
         PropKind::Number
     }
+    /// A value that isn't finite, such as `inf` or `1e999`, is 0 too.
     fn from_attr(value: Option<&str>) -> Self {
-        value.and_then(|v| v.trim().parse().ok()).unwrap_or(0.0)
+        value.and_then(|v| v.trim().parse::<f32>().ok()).filter(|v| v.is_finite()).unwrap_or(0.0)
     }
 }
 

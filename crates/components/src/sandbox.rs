@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use toolkit::{asset_path_allowed, ComponentSchema, Element, PropKind, RenderInput, RenderOutput, ABI_VERSION};
+use toolkit::{asset_path_allowed, ComponentSchema, Element, PropKind, RenderInput, RenderOutput, ABI_VERSION, RESERVED_NAMES};
 use wasmtime::{
     Caller, Config, Engine, ExternType, Instance, Linker, Memory, Module, ResourceLimiter, Store, Trap, TypedFunc,
 };
@@ -151,8 +151,10 @@ fn engine() -> &'static Engine {
 /// Checks what the module asks for and offers before anything of it runs.
 fn check_shape(module: &Module) -> Result<(), ComponentError> {
     let malformed = |message: String| Err(ComponentError::Malformed(message));
+    // A function of the toolkit's that this version doesn't know is from a later one. It
+    // loads as a trap, so that the module can still say which version it needs.
     for import in module.imports() {
-        if (import.module(), import.name()) != READ_ASSET || !matches!(import.ty(), ExternType::Func(_)) {
+        if import.module() != READ_ASSET.0 || !matches!(import.ty(), ExternType::Func(_)) {
             return malformed(format!("it asks for {}.{}, which components can't have", import.module(), import.name()));
         }
     }
@@ -224,6 +226,8 @@ impl Running {
         linker
             .func_wrap(READ_ASSET.0, READ_ASSET.1, read_asset)
             .expect("read_asset is defined once");
+        // `check_shape` let through only functions of the toolkit's.
+        linker.define_unknown_imports_as_traps(module).map_err(|error| ComponentError::Malformed(error.to_string()))?;
         let instance = match linker.instantiate(&mut store, module) {
             Ok(instance) => instance,
             Err(error) if error.downcast_ref::<Trap>().is_some() || store.data().limits.refused_growth => {
@@ -329,6 +333,9 @@ fn read_asset(mut caller: Caller<'_, State>, ptr: u32, len: u32) -> wasmtime::Re
 /// Holds a schema's strings and props to what a form can show.
 fn check_schema(schema: &ComponentSchema) -> Result<(), ComponentError> {
     let malformed = |message: String| Err(ComponentError::Malformed(message));
+    if let Some(prop) = schema.props.iter().find(|prop| RESERVED_NAMES.contains(&prop.name.as_str())) {
+        return malformed(format!("its schema has a prop called {}, a name kept for the slide", prop.name));
+    }
     if schema.props.len() > MAX_PROPS {
         return malformed(format!("its schema has more than {MAX_PROPS} props"));
     }

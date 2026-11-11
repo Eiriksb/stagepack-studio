@@ -167,15 +167,8 @@ impl Flow<'_, '_> {
         let attrs = tag.attrs.iter().filter(|attr| !PLACEMENT_ATTRS.contains(&attr.name.as_str()));
         // Backwards, so that the first of a repeated attribute wins, as it does in `Tag::attr`.
         let props = attrs.rev().map(|attr| (attr.name.clone(), attr.value.clone())).collect();
-        let data = CtxData {
-            click_step: self.env.moment.step,
-            time: self.env.moment.time,
-            slide_width: SLIDE_WIDTH,
-            slide_height: SLIDE_HEIGHT,
-            width: room.0,
-            height: room.1,
-            theme: self.theme.clone(),
-        };
+        let moment = self.env.moment;
+        let data = CtxData::new(moment.step, moment.time, SLIDE_WIDTH, SLIDE_HEIGHT, room.0, room.1, self.theme.clone());
         if let Some(component) = self.env.registry.get(&tag.name) {
             let (files, used) = (self.env.files, Cell::new(0));
             let assets = |path: &str| read_asset(files, path, &used);
@@ -186,7 +179,7 @@ impl Flow<'_, '_> {
             return Some(output.element);
         }
         let name = &tag.name;
-        let Some(rendered) = self.env.components.render(name, &RenderInput { props, ctx: data }) else {
+        let Some(rendered) = self.env.components.render(name, &RenderInput::new(props, data)) else {
             self.notice(format!("There is no component called {name}"));
             return None;
         };
@@ -304,7 +297,8 @@ impl Flow<'_, '_> {
             }
             Element::Children if self.place_children() => self.child_blocks(blocks, align),
             Element::Children => None,
-            Element::Empty => None,
+            // Empty, and whatever a later version adds that this one can't draw.
+            _ => None,
         }
     }
 
@@ -405,6 +399,7 @@ impl Flow<'_, '_> {
             TextAlign::Left => Align::Left,
             TextAlign::Center => Align::Center,
             TextAlign::Right => Align::Right,
+            _ => Align::Left,
         };
         let content = self.element(&placed.element, blocks, align, false)?;
         let at = |value: f32| if value.is_finite() { length(value.clamp(-MAX_SIZE, MAX_SIZE)) } else { length(0.0) };

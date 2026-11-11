@@ -325,7 +325,9 @@ fn stroked(data: String, (width, height): (f32, f32), color: Color, line_width: 
 
 /// `element` at (`x`, `y`), laid out `width` wide.
 fn at_width(x: f32, y: f32, width: f32, element: Element) -> Placed {
-    Placed { x, y, width, align: TextAlign::Left, element }
+    let mut placed = at(x, y, element);
+    placed.width = width;
+    placed
 }
 
 /// A value axis: ticks at whole multiples of `step`, from `low` to `high`, with 0 among them.

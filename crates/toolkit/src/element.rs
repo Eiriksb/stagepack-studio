@@ -2,6 +2,7 @@ use crate::color::Color;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum ShapeKind {
     Rect,
     Rounded,
@@ -12,6 +13,7 @@ pub enum ShapeKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum Element {
     Text { text: String, size: Option<f32>, bold: bool, color: Option<Color> },
     Stack { horizontal: bool, gap: f32, children: Vec<Element> },
@@ -50,6 +52,7 @@ pub enum Element {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum TextAlign {
     #[default]
     Left,
@@ -59,6 +62,7 @@ pub enum TextAlign {
 
 /// Something on a canvas, with its top-left corner at (`x`, `y`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Placed {
     pub x: f32,
     pub y: f32,
@@ -193,6 +197,30 @@ impl Element {
     pub fn gap(mut self, value: f32) -> Element {
         if let Element::Stack { gap, .. } = &mut self {
             *gap = value;
+        }
+        self
+    }
+
+    /// The space a shape keeps clear between its edge and what is inside. Other elements are unchanged.
+    pub fn padding(mut self, value: f32) -> Element {
+        if let Element::Shape { padding, .. } = &mut self {
+            *padding = value;
+        }
+        self
+    }
+
+    /// What is inside a shape. Other elements are unchanged.
+    pub fn child(mut self, inside: Element) -> Element {
+        if let Element::Shape { child, .. } = &mut self {
+            *child = Some(Box::new(inside));
+        }
+        self
+    }
+
+    /// The corner radius of a `Rounded` shape or a callout. Other elements are unchanged.
+    pub fn radius(mut self, value: f32) -> Element {
+        if let Element::Shape { radius, .. } = &mut self {
+            *radius = value;
         }
         self
     }

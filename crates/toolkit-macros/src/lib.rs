@@ -5,6 +5,9 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{Data, DeriveInput, Fields, FnArg, ItemFn, Pat, Path, Type, parse_macro_input};
 
+/// The names kept for the slide, which `toolkit::RESERVED_NAMES` also holds.
+const RESERVED_NAMES: [&str; 16] = include!("reserved_names.rs");
+
 enum Kind {
     Ctx,
     Children,
@@ -50,15 +53,15 @@ pub fn component(_args: TokenStream, input: TokenStream) -> TokenStream {
             }
             Kind::Attribute => {
                 let attr = pat.ident.to_string().trim_start_matches("r#").replace('_', "-");
+                if RESERVED_NAMES.contains(&attr.as_str()) {
+                    let message = format!("`{attr}` is kept for the slide, for where a tag is placed and when it appears, so a component's argument can't have that name");
+                    return syn::Error::new_spanned(&pat.ident, message).to_compile_error().into();
+                }
                 call_args.push(quote! {
                     <#ty as ::toolkit::Prop>::from_attr(props.0.get(#attr).map(::std::string::String::as_str))
                 });
                 fields.push(quote! {
-                    ::toolkit::PropField {
-                        name: ::std::string::String::from(#attr),
-                        kind: <#ty as ::toolkit::Prop>::kind(),
-                        optional: <#ty as ::toolkit::Prop>::OPTIONAL,
-                    }
+                    ::toolkit::PropField::new(#attr, <#ty as ::toolkit::Prop>::kind(), <#ty as ::toolkit::Prop>::OPTIONAL)
                 });
             }
         }
@@ -72,11 +75,7 @@ pub fn component(_args: TokenStream, input: TokenStream) -> TokenStream {
         #[allow(non_snake_case)]
         pub fn #constructor() -> ::toolkit::NativeComponent {
             fn schema() -> ::toolkit::ComponentSchema {
-                ::toolkit::ComponentSchema {
-                    name: ::std::string::String::from(#tag),
-                    props: ::std::vec![#(#fields),*],
-                    children: #children,
-                }
+                ::toolkit::ComponentSchema::new(#tag, ::std::vec![#(#fields),*], #children)
             }
             fn render(props: &::toolkit::Props, ctx: &::toolkit::Ctx) -> ::toolkit::Element {
                 #name(#(#call_args),*)

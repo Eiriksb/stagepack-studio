@@ -96,7 +96,8 @@ fn geometry_xml(kind: ShapeKind, rect: Rect, radius: f32) -> String {
         ShapeKind::Ellipse => "ellipse",
         ShapeKind::Line | ShapeKind::Arrow => "line",
         ShapeKind::Callout => "wedgeRoundRectCallout",
-        ShapeKind::Rect | ShapeKind::Rounded => "rect",
+        // Rect and Rounded, and whatever a later version adds that this one doesn't know.
+        _ => "rect",
     };
     format!("<a:prstGeom prst=\"{preset}\"><a:avLst/></a:prstGeom>")
 }

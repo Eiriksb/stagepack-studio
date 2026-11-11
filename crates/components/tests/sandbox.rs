@@ -88,10 +88,7 @@ fn text_answer(text: &str) -> String {
 }
 
 fn input() -> RenderInput {
-    RenderInput {
-        props: BTreeMap::new(),
-        ctx: CtxData { click_step: 0, time: 0.0, slide_width: 1920.0, slide_height: 1080.0, width: 800.0, height: 0.0, theme: Theme::default() },
-    }
+    RenderInput::new(BTreeMap::new(), CtxData::new(0, 0.0, 1920.0, 1080.0, 800.0, 0.0, Theme::default()))
 }
 
 fn no_assets() -> Assets {
@@ -422,14 +419,10 @@ const SCORE_V1: &[u8] = include_bytes!("fixtures/v1/score.wasm");
 #[test]
 fn a_component_built_for_version_one_still_runs() {
     let component = load(SCORE_V1);
-    let field = |name: &str, kind: PropKind| PropField { name: name.into(), kind, optional: false };
+    let field = |name: &str, kind: PropKind| PropField::new(name, kind, false);
     assert_eq!(
         *component.schema(),
-        ComponentSchema {
-            name: "Score".into(),
-            props: vec![field("team", PropKind::Text), field("points", PropKind::Whole), field("colour", PropKind::Color)],
-            children: false,
-        }
+        ComponentSchema::new("Score", vec![field("team", PropKind::Text), field("points", PropKind::Whole), field("colour", PropKind::Color)], false)
     );
 
     let mut input = input();
@@ -451,12 +444,7 @@ fn a_component_built_for_version_one_still_runs() {
     let team = Element::Text { text: "Oslo".into(), size: Some(48.0), bold: false, color: None };
     assert_eq!(
         output,
-        RenderOutput {
-            element: Element::Stack { horizontal: true, gap: 24.0, children: vec![team, badge] },
-            steps: 0,
-            stepped: false,
-            animated: false,
-        }
+        RenderOutput::new(Element::Stack { horizontal: true, gap: 24.0, children: vec![team, badge] }, 0, false, false)
     );
 }
 
@@ -526,4 +514,40 @@ fn a_schema_has_at_most_64_props() {
 #[test]
 fn a_module_over_four_mebibytes_is_too_large() {
     assert_eq!(MAX_MODULE_BYTES, 4 * 1024 * 1024);
+}
+
+#[test]
+fn a_schema_with_a_name_kept_for_the_slide_is_refused() {
+    for name in ["x", "click", "slot"] {
+        assert_malformed(WasmComponent::load(&with_schema(&schema_json("Test", &[(name, r#""Text""#)]))));
+    }
+}
+
+const LATER: &str = r#"(import "toolkit" "draw_later" (func $later (param i32) (result i32)))"#;
+
+#[test]
+fn a_toolkit_function_this_version_does_not_know_loads_and_traps_if_called() {
+    let answer = text_answer("hi");
+    let extra = data(ANSWER_AT, answer.as_bytes());
+    let render = format!("(i64.const {})", packed(ANSWER_AT, answer.len()));
+    let wasm = wat(Wat { imports: LATER, extra: &extra, render: &render, ..Wat::default() });
+    assert_eq!(render_with(&wasm).unwrap().element, toolkit::text("hi"));
+    let calling = wat(Wat { imports: LATER, render: "(drop (call $later (i32.const 1))) (i64.const 0)", ..Wat::default() });
+    assert_eq!(render_with(&calling), Err(ComponentError::Crashed));
+}
+
+fn render_with(wasm: &[u8]) -> Result<RenderOutput, ComponentError> {
+    WasmComponent::load(wasm)?.render(&input(), no_assets())
+}
+
+#[test]
+fn a_toolkit_function_of_a_newer_version_says_so() {
+    let wasm = wat(Wat { abi_version: Some(2), imports: LATER, render: "(i64.const 0)", ..Wat::default() });
+    assert_eq!(WasmComponent::load(&wasm).err(), Some(ComponentError::NewerVersion(2)));
+}
+
+#[test]
+fn a_toolkit_import_that_is_not_a_function_is_refused() {
+    let imports = r#"(import "toolkit" "later" (global i32))"#;
+    assert_malformed(WasmComponent::load(&wat(Wat { imports, render: "(i64.const 0)", ..Wat::default() })));
 }

@@ -14,7 +14,7 @@ fn Score(team: String, points: u32, ready: bool, colour: Color, note: Option<Str
 }
 
 fn data(click_step: u32) -> CtxData {
-    CtxData { click_step, time: 0.5, slide_width: 1920.0, slide_height: 1080.0, width: 800.0, height: 0.0, theme: Theme::default() }
+    CtxData::new(click_step, 0.5, 1920.0, 1080.0, 800.0, 0.0, Theme::default())
 }
 
 fn no_assets(_: &str) -> Option<Vec<u8>> {
@@ -134,7 +134,7 @@ fn a_ctx_gives_back_what_it_was_made_with() {
 #[test]
 fn a_component_that_asks_for_nothing_varies_by_nothing() {
     let output = ctx().finish(Element::Empty);
-    assert_eq!(output, RenderOutput { element: Element::Empty, steps: 0, stepped: false, animated: false });
+    assert_eq!(output, RenderOutput::new(Element::Empty, 0, false, false));
 }
 
 #[test]
@@ -195,7 +195,8 @@ fn an_asset_path_is_held_to_the_assets_folder() {
 
 #[test]
 fn something_placed_has_its_own_width_until_it_is_given_one() {
-    assert_eq!(at(1.0, 2.0, text("a")), Placed { x: 1.0, y: 2.0, width: 0.0, align: TextAlign::Left, element: text("a") });
+    let placed = at(1.0, 2.0, text("a"));
+    assert_eq!((placed.x, placed.y, placed.width, placed.align, placed.element), (1.0, 2.0, 0.0, TextAlign::Left, text("a")));
     let centered = at(1.0, 2.0, text("a")).centered_in(40.0);
     assert_eq!((centered.width, centered.align), (40.0, TextAlign::Center));
     let right = at(1.0, 2.0, text("a")).right_aligned_in(40.0);
@@ -222,4 +223,33 @@ fn colours_parse() {
     assert_eq!(Color::parse("#ff0000"), Color::parse("red"));
     assert_eq!(Color::parse("#0f0"), Some(Color { r: 0, g: 255, b: 0, a: 255 }));
     assert_eq!(Color::parse("nonsense"), None);
+}
+
+#[test]
+fn a_number_that_is_not_finite_is_zero() {
+    for written in ["inf", "-inf", "NaN", "infinity", "1e999"] {
+        assert_eq!(f32::from_attr(Some(written)), 0.0, "{written}");
+    }
+    assert_eq!(f32::from_attr(Some("2.5")), 2.5);
+}
+
+#[test]
+fn a_shape_is_built_without_naming_its_fields() {
+    let built = shape(ShapeKind::Rounded, 120.0, 80.0).padding(8.0).radius(12.0).child(text("3"));
+    let mut expected = shape(ShapeKind::Rounded, 120.0, 80.0);
+    if let Element::Shape { padding, radius, child, .. } = &mut expected {
+        *padding = 8.0;
+        *radius = 12.0;
+        *child = Some(Box::new(text("3")));
+    }
+    assert_eq!(built, expected);
+    // Anything else is left as it is.
+    assert_eq!(text("a").padding(8.0).radius(2.0).child(text("b")), text("a"));
+}
+
+#[test]
+fn the_names_kept_for_the_slide_cover_its_placement() {
+    for name in ["x", "y", "w", "h", "rotate", "click", "enter", "z", "opacity", "id", "class", "style", "exit", "key", "ref", "slot"] {
+        assert!(toolkit::RESERVED_NAMES.contains(&name), "{name}");
+    }
 }

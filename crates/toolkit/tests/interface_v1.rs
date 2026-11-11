@@ -136,7 +136,7 @@ fn a_canvas_holds() {
         Element::Canvas {
             width: 100.0,
             height: 50.0,
-            items: vec![Placed { x: 1.0, y: 2.0, width: 0.0, align: TextAlign::Center, element: Element::Empty }],
+            items: vec![at(1.0, 2.0, Element::Empty).centered_in(0.0)],
         },
     );
 }
@@ -148,22 +148,22 @@ fn a_problem_holds() {
 
 #[test]
 fn an_output_holds() {
-    holds(OUTPUT, RenderOutput { element: Element::Empty, steps: 3, stepped: true, animated: false });
+    holds(OUTPUT, RenderOutput::new(Element::Empty, 3, true, false));
 }
 
 #[test]
 fn a_schema_holds() {
     holds(
         SCHEMA,
-        ComponentSchema {
-            name: "Score".into(),
-            props: vec![
-                PropField { name: "team".into(), kind: PropKind::Text, optional: false },
-                PropField { name: "kind".into(), kind: PropKind::Choice(vec!["bar".into(), "line".into()]), optional: true },
-                PropField { name: "logo".into(), kind: PropKind::File(vec!["png".into()]), optional: false },
+        ComponentSchema::new(
+            "Score",
+            vec![
+                PropField::new("team", PropKind::Text, false),
+                PropField::new("kind", PropKind::Choice(vec!["bar".into(), "line".into()]), true),
+                PropField::new("logo", PropKind::File(vec!["png".into()]), false),
             ],
-            children: true,
-        },
+            true,
+        ),
     );
 }
 
@@ -171,31 +171,31 @@ fn a_schema_holds() {
 fn an_input_holds() {
     holds(
         INPUT,
-        RenderInput {
-            props: BTreeMap::from([("team".to_string(), "A".to_string())]),
-            ctx: CtxData {
-                click_step: 1,
-                time: 0.5,
-                slide_width: 1920.0,
-                slide_height: 1080.0,
-                width: 800.0,
-                height: 0.0,
-                theme: Theme {
+        RenderInput::new(
+            BTreeMap::from([("team".to_string(), "A".to_string())]),
+            CtxData::new(
+                1,
+                0.5,
+                1920.0,
+                1080.0,
+                800.0,
+                0.0,
+                Theme {
                     background: Color::rgb(255, 255, 255),
                     text: Color::rgb(30, 41, 59),
                     accent: Color::rgb(37, 99, 235),
                     font: "Inter".into(),
                     mono_font: "JetBrains Mono".into(),
                 },
-            },
-        },
+            ),
+        ),
     );
 }
 
 #[test]
 fn an_output_with_fields_left_out_takes_their_defaults() {
     let output: RenderOutput = serde_json::from_str(r#"{"element":"Empty"}"#).unwrap();
-    assert_eq!(output, RenderOutput { element: Element::Empty, steps: 0, stepped: false, animated: false });
+    assert_eq!(output, RenderOutput::new(Element::Empty, 0, false, false));
 }
 
 #[test]
@@ -207,5 +207,28 @@ fn a_path_with_no_stroke_written_takes_the_defaults() {
 #[test]
 fn something_placed_with_fields_left_out_takes_their_defaults() {
     let placed: Placed = serde_json::from_str(r#"{"x":1.0,"y":2.0,"element":"Empty"}"#).unwrap();
-    assert_eq!(placed, Placed { x: 1.0, y: 2.0, width: 0.0, align: TextAlign::Left, element: Element::Empty });
+    assert_eq!(placed, at(1.0, 2.0, Element::Empty));
+}
+
+#[test]
+fn an_input_with_a_field_this_version_does_not_know_still_parses() {
+    let input = INPUT.replacen(r#"{"props""#, r#"{"later":[1,2],"props""#, 1).replacen(r#""click_step""#, r#""later":{"a":1},"click_step""#, 1);
+    let parsed: RenderInput = serde_json::from_str(&input).unwrap();
+    assert_eq!(parsed, serde_json::from_str::<RenderInput>(INPUT).unwrap());
+    let ctx = r#"{"click_step":1,"time":0.5,"slide_width":1920.0,"slide_height":1080.0,"width":800.0,"height":0.0,"later":true,"theme":{"background":{"r":255,"g":255,"b":255,"a":255},"text":{"r":30,"g":41,"b":59,"a":255},"accent":{"r":37,"g":99,"b":235,"a":255},"font":"Inter","mono_font":"JetBrains Mono"}}"#;
+    assert_eq!(serde_json::from_str::<CtxData>(ctx).unwrap(), parsed.ctx);
+}
+
+#[test]
+fn an_output_with_a_field_this_version_does_not_know_still_parses() {
+    let output = OUTPUT.replacen(r#"{"element""#, r#"{"later":"x","element""#, 1);
+    assert_eq!(serde_json::from_str::<RenderOutput>(&output).unwrap(), serde_json::from_str::<RenderOutput>(OUTPUT).unwrap());
+}
+
+#[test]
+fn a_schema_with_a_field_this_version_does_not_know_still_parses() {
+    let schema = SCHEMA.replacen(r#"{"name":"Score""#, r#"{"later":1,"name":"Score""#, 1).replacen(r#""optional":false}"#, r#""optional":false,"later":null}"#, 1);
+    assert_eq!(serde_json::from_str::<ComponentSchema>(&schema).unwrap(), serde_json::from_str::<ComponentSchema>(SCHEMA).unwrap());
+    let field = r#"{"name":"team","kind":"Text","optional":false,"default":"A"}"#;
+    assert_eq!(serde_json::from_str::<PropField>(field).unwrap().name, "team");
 }

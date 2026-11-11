@@ -57,6 +57,8 @@ On a slide, it's used like this:
 
 Each attribute in the tag is given to the argument of the same name. An argument written with `_`, such as `outline_width`, is written with `-` in the tag: `outline-width="4"`.
 
+Some names are kept for the slide, for where a tag is placed and when it appears, and for what a later version may add: `x`, `y`, `w`, `h`, `rotate`, `click`, `enter`, `z`, `opacity`, `id`, `class`, `style`, `exit`, `key`, `ref` and `slot`. An argument can't have one of them, and building a component that tries says so.
+
 ## Arguments and their form fields
 
 The app knows the type of each argument, so a form for the tag can show a field to suit each one. A component never fails because of a missing or wrong value: it uses the value given here instead.
@@ -95,6 +97,11 @@ These change an element, written after it with a dot:
 - `.outline(colour)`: a line around a shape.
 - `.stroke(colour, width)`: the line along a path.
 - `.gap(24.0)`: the space between the elements in a row or a column.
+- `.child(element)`: what's inside a shape, such as `shape(ShapeKind::Rounded, 120.0, 80.0).child(text("3"))`.
+- `.padding(8.0)`: the space a shape keeps clear between its edge and what's inside it.
+- `.radius(12.0)`: how round the corners of a `Rounded` shape or a `Callout` are.
+
+Build elements with these, rather than by writing out an `Element`'s fields: a later version of the toolkit can add fields, and code that names them all would stop compiling.
 
 `row![a, b, c]` puts elements side by side, and `col![a, b, c]` puts them one under the other.
 

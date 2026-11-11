@@ -254,9 +254,18 @@ fn a_picture_fills_the_box_it_is_given() {
 mod probe {
     use toolkit::prelude::*;
 
-    #[component]
-    pub fn Probe(x: String, rotate: String, click: String, note: String) -> Element {
-        text(format!("[{x}][{rotate}][{click}][{note}]"))
+    /// Says which attributes reach it. Written by hand, as `#[component]` can't take
+    /// an argument named for the slide's placement.
+    #[allow(non_snake_case)]
+    pub fn Probe_component() -> NativeComponent {
+        fn schema() -> ComponentSchema {
+            ComponentSchema::new("Probe", Vec::new(), false)
+        }
+        fn render(props: &Props, _: &Ctx) -> Element {
+            let get = |name: &str| props.0.get(name).cloned().unwrap_or_default();
+            text(format!("[{}][{}][{}][{}]", get("x"), get("rotate"), get("click"), get("note")))
+        }
+        NativeComponent { name: "Probe", schema, render }
     }
 
     #[component]
@@ -1018,4 +1027,11 @@ fn a_box_with_a_fill_pads_its_text() {
     let tight = filled.replace("fill=", "padding=\"0\" fill=");
     let (slide, _) = lay_out(&tight, &[]);
     assert_eq!(first_text_position(slide.layers.last().unwrap()), (0.0, 0.0));
+}
+
+#[test]
+fn the_names_kept_for_the_slide_hold_every_placement_attribute() {
+    for name in PLACEMENT_ATTRS {
+        assert!(toolkit::RESERVED_NAMES.contains(&name), "{name}");
+    }
 }

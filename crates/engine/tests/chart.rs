@@ -30,15 +30,7 @@ fn chart_at(attrs: &[(&str, &str)], width: f32, height: f32, step: u32, assets: 
     let props = Props(attrs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<_, _>>());
     let assets: HashMap<String, Vec<u8>> = assets.iter().map(|(p, t)| (p.to_string(), t.as_bytes().to_vec())).collect();
     let read = |path: &str| assets.get(path).cloned();
-    let data = CtxData {
-        click_step: step,
-        time: 0.0,
-        slide_width: 1920.0,
-        slide_height: 1080.0,
-        width,
-        height,
-        theme: Theme::default(),
-    };
+    let data = CtxData::new(step, 0.0, 1920.0, 1080.0, width, height, Theme::default());
     let ctx = Ctx::new(data, &read);
     let element = (chart.render)(&props, &ctx);
     let output = ctx.finish(element);

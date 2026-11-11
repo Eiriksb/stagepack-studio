@@ -113,10 +113,10 @@ fn bundle() -> Bundle {
 
 fn render(component: &WasmComponent, attrs: &[(&str, &str)], click_step: u32, time: f32) -> RenderOutput {
     let props: BTreeMap<String, String> = attrs.iter().map(|(name, value)| (name.to_string(), value.to_string())).collect();
-    let ctx = CtxData { click_step, time, slide_width: 1920.0, slide_height: 1080.0, width: 1600.0, height: 0.0, theme: Theme::default() };
+    let ctx = CtxData::new(click_step, time, 1920.0, 1080.0, 1600.0, 0.0, Theme::default());
     let assets = talk();
     let read = Rc::new(move |path: &str| asset_path_allowed(path).then(|| std::fs::read(assets.join(path)).ok()).flatten());
-    component.render(&RenderInput { props, ctx }, read).unwrap()
+    component.render(&RenderInput::new(props, ctx), read).unwrap()
 }
 
 /// Whether anything in `element` is a labelled box saying what's wrong.
