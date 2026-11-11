@@ -403,6 +403,16 @@ fn a_building_line_and_pie_add_a_point_or_slice_per_click() {
     assert_eq!(paths(&pie).iter().filter(|(data, ..)| data.contains('A')).count(), 1);
 }
 
+/// The example talk's chart, which the check by hand presses through one bar at a time.
+#[test]
+fn the_example_talk_builds_its_chart_one_bar_per_click() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/components");
+    let source = std::fs::read_to_string(root.join("slides.md")).unwrap();
+    let mut d = Deck::open(Box::new(FolderFiles::new(root)), Fonts::bundled_only(), source);
+    let last = d.slide_count() - 1;
+    assert_eq!(d.timeline(last).steps, 4, "a click for each of the 4 rows of assets/sales.csv");
+}
+
 #[test]
 fn not_building_adds_no_clicks() {
     let mut d = deck("<Chart kind=\"bar\" labels=\"A, B, C\" values=\"10, 24, 17\" />\n", &[]);

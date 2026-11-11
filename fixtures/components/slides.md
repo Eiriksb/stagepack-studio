@@ -47,4 +47,4 @@ What's written between the tags goes **below the title**.
 
 # The same data, as a chart
 
-<Chart kind="bar" data="assets/sales.csv" title="Sales" />
+<Chart kind="bar" data="assets/sales.csv" title="Sales" build="true" />
