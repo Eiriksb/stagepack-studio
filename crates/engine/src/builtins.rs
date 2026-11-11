@@ -75,7 +75,7 @@ fn Picture(src: PictureFile) -> Element {
 
 pub fn builtin_registry() -> Registry {
     let mut registry = Registry::default();
-    for component in [boxed::Box_component(), Shape_component(), Icon_component(), Picture_component()] {
+    for component in [boxed::Box_component(), Shape_component(), Icon_component(), Picture_component(), crate::chart::Chart_component()] {
         registry.add(component);
     }
     registry

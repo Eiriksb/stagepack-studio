@@ -1,4 +1,5 @@
 mod builtins;
+mod chart;
 mod deck;
 mod display;
 mod elements;
@@ -16,6 +17,12 @@ mod talk_components;
 mod text;
 mod timeline;
 pub use builtins::builtin_registry;
+pub use chart::ChartKind;
+/// The chart's workings, for its tests.
+#[doc(hidden)]
+pub mod chart_parts {
+    pub use crate::chart::{ChartData, nice_ceiling, parse_csv, parse_inline, plot_area, series_color};
+}
 pub use deck::Deck;
 pub use display::*;
 pub use files::*;
