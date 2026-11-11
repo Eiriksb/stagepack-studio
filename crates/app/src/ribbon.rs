@@ -186,10 +186,11 @@ impl Ribbon {
                     menu.menu(name, Box::new(AddSlide { layout }))
                 })
             });
+        // "Slide" in both, so that Show isn't read as starting the show.
         let (hide_label, hide_icon) = if hidden {
-            ("Show", IconName::Eye)
+            ("Show slide", IconName::Eye)
         } else {
-            ("Hide", IconName::EyeOff)
+            ("Hide slide", IconName::EyeOff)
         };
         let hide_tip = if hidden {
             "Put this slide back in the show"

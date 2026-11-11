@@ -229,7 +229,7 @@ fn the_window_has_its_tabs_and_the_home_tab_is_open(cx: &mut TestAppContext) {
             assert!(window.find(id).visible(), "{id}");
         }
         assert_eq!(window.find(NEW_SLIDE_ID).label(), Some("New slide"));
-        assert_eq!(window.find(HIDE_ID).label(), Some("Hide"));
+        assert_eq!(window.find(HIDE_ID).label(), Some("Hide slide"));
         assert!(
             window.find_by_label("Slides").visible(),
             "the group's caption"
@@ -405,7 +405,7 @@ fn duplicate_delete_and_hide_work_from_the_ribbon(cx: &mut TestAppContext) {
     with_window(cx, handle, |window, _| {
         assert_eq!(
             window.find(HIDE_ID).label(),
-            Some("Show"),
+            Some("Show slide"),
             "a hidden slide is shown again"
         );
         assert_eq!(
@@ -416,7 +416,7 @@ fn duplicate_delete_and_hide_work_from_the_ribbon(cx: &mut TestAppContext) {
     click(cx, handle, HIDE_ID);
     assert!(!hidden(cx, &view, 1));
     with_window(cx, handle, |window, _| {
-        assert_eq!(window.find(HIDE_ID).label(), Some("Hide"));
+        assert_eq!(window.find(HIDE_ID).label(), Some("Hide slide"));
         assert_eq!(window.find(strip_row_id(1)).label(), Some("Slide 2"));
     });
 
@@ -1213,7 +1213,7 @@ const MENU: [&str; 6] = [
     "New slide",
     "Duplicate",
     "Delete",
-    "Hide",
+    "Hide slide",
     "Move up",
     "Move down",
 ];
@@ -1259,7 +1259,7 @@ fn the_rows_menu_does_each_thing(cx: &mut TestAppContext) {
         window.render_frame(cx);
         assert_eq!(
             window.within("popup-menu").find(3usize).label(),
-            Some("Show")
+            Some("Show slide")
         );
         window.press("escape", cx);
     })

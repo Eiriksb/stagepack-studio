@@ -613,7 +613,10 @@ impl SlideStrip {
                         .menu("New slide", Box::new(NewSlide))
                         .menu("Duplicate", Box::new(DuplicateSlide))
                         .menu_with_disabled("Delete", Box::new(DeleteSlide), count < 2)
-                        .menu(if hidden { "Show" } else { "Hide" }, Box::new(ToggleHidden))
+                        .menu(
+                            if hidden { "Show slide" } else { "Hide slide" },
+                            Box::new(ToggleHidden),
+                        )
                         .menu_with_disabled("Move up", Box::new(MoveSlideUp), index == 0)
                         .menu_with_disabled(
                             "Move down",
