@@ -3,7 +3,7 @@
 //! talk's components, and saving the talk.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -280,7 +280,7 @@ pub struct WorkspaceView {
     offered: Option<Found>,
     /// The copy from last time that was brought back, until this window's own copy or a save
     /// holds what it did.
-    adopted: Option<Found>,
+    adopted: saving::Adopted,
     /// The last change to the working copies, which the next one waits for.
     working_copy_chain: Option<Task<()>>,
     /// How many clears of this window's copy have been asked for.
@@ -436,7 +436,7 @@ impl WorkspaceView {
             kept: None,
             pending_working_copy: None,
             offered: None,
-            adopted: None,
+            adopted: saving::Adopted::default(),
             working_copy_chain: None,
             clears: Arc::new(AtomicU64::new(0)),
             window_handle: window.window_handle(),

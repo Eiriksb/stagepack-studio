@@ -462,7 +462,8 @@ fn click(cx: &mut TestAppContext, handle: AnyWindowHandle, id: &'static str) {
     settle(cx, handle);
 }
 
-/// Closes the window as a crash would: without asking, and without anything cleared.
+/// Closes the window as a crash would: without asking, and without anything cleared. The
+/// caller drops any handle it has on the view first, as nothing of a stopped app is left.
 fn crash(cx: &mut TestAppContext, handle: AnyWindowHandle) {
     cx.update_window(handle, |_, window, _| window.remove_window())
         .unwrap();
@@ -537,11 +538,17 @@ fn edits_made_in_the_window_are_kept_like_any_other(cx: &mut TestAppContext) {
 
     click(cx, handle, NEW_SLIDE_ID);
     wait(cx, 1_000);
-    assert_eq!(recovery.find(&setup.place()).unwrap().text, source_of(cx, &view));
+    assert_eq!(
+        recovery.find(&setup.place()).unwrap().text,
+        source_of(cx, &view)
+    );
 
     click(cx, handle, HIDE_ID);
     wait(cx, 1_000);
-    assert_eq!(recovery.find(&setup.place()).unwrap().text, source_of(cx, &view));
+    assert_eq!(
+        recovery.find(&setup.place()).unwrap().text,
+        source_of(cx, &view)
+    );
 
     click(cx, handle, NOTES_ID);
     cx.update_window(handle, |_, window, cx| window.input("Kept", cx))
@@ -732,6 +739,8 @@ fn the_offered_copy_is_kept_until_answered(cx: &mut TestAppContext) {
     add_slide(cx, &view);
     add_slide(cx, &view);
     wait(cx, 1_000);
+    // A window that stopped holds nothing.
+    drop(view);
     crash(cx, handle);
 
     // Newest first, and neither is dropped.
@@ -876,6 +885,7 @@ fn a_packed_talks_copy_is_found_again(cx: &mut TestAppContext) {
     add_slide(cx, &view);
     wait(cx, 1_000);
     let edited = source_of(cx, &view);
+    drop(view);
     crash(cx, handle);
 
     let place = TalkPlace::Packed(file.clone());
@@ -908,5 +918,63 @@ fn two_windows_on_the_same_talk_keep_their_own(cx: &mut TestAppContext) {
     assert_eq!(
         setup.recovery().find(&setup.place()).unwrap().text,
         source_of(cx, &second_view)
+    );
+}
+
+/// What every working copy under `root` holds.
+fn kept_texts(root: &Path) -> Vec<String> {
+    kept_folders(root)
+        .into_iter()
+        .filter_map(|slot| std::fs::read_to_string(slot.join("slides.md")).ok())
+        .collect()
+}
+
+#[gpui_kit::test]
+fn a_live_windows_copy_is_never_offered_or_let_go(cx: &mut TestAppContext) {
+    let setup = Setup::new(ONE);
+    let (_first, first_view) = open_view(cx, &setup);
+    add_slide(cx, &first_view);
+    wait(cx, 1_000);
+    let live = source_of(cx, &first_view);
+
+    // Another window on the talk is offered nothing.
+    let (second, _) = open_view(cx, &setup);
+    assert_eq!(bar(cx, second), None);
+    crash(cx, second);
+
+    // A copy from an earlier crash is offered instead, and answering it leaves the live one.
+    keep(&setup, "# Earlier\n");
+    let (third, _) = open_view(cx, &setup);
+    assert_eq!(bar(cx, third).as_deref(), Some(RECOVERY_OFFER));
+    click(cx, third, DISCARD_RECOVERY_ID);
+    crash(cx, third);
+    assert_eq!(kept_texts(&setup.root), std::slice::from_ref(&live));
+
+    keep(&setup, "# Earlier\n");
+    let (fourth, fourth_view) = open_view(cx, &setup);
+    click(cx, fourth, RECOVER_ID);
+    assert_eq!(source_of(cx, &fourth_view), "# Earlier\n");
+    let mut texts = kept_texts(&setup.root);
+    texts.sort();
+    assert_eq!(texts, ["# Earlier\n".to_string(), live]);
+}
+
+#[gpui_kit::test(iterations = 30)]
+fn a_save_just_after_bringing_them_back_leaves_nothing(cx: &mut TestAppContext) {
+    let (setup, _) = left_unsaved(cx);
+    let (handle, _view) = open_view(cx, &setup);
+    // Both asked for in one go, before either has run.
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(RECOVER_ID, cx);
+    })
+    .unwrap();
+    cx.simulate_keystrokes(handle, "ctrl-s");
+    cx.run_until_parked();
+    wait(cx, 2_000);
+    assert!(
+        kept_folders(&setup.root).is_empty(),
+        "{:?}",
+        kept_texts(&setup.root)
     );
 }

@@ -24,22 +24,33 @@ pub(super) struct Kept {
     on_disk: String,
 }
 
+/// The copy from last time that was brought back, until this window's own copy or a save
+/// holds what it did. The jobs take it when they run, not when they're asked for.
+pub(super) type Adopted = Arc<Mutex<Option<Found>>>;
+
+fn take_adopted(adopted: &Adopted) -> Option<Found> {
+    adopted
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+}
+
 /// A change to the working copies, made on a background task, one after another.
 enum WorkingCopyJob {
-    /// Keeps this window's copy, then lets go of `adopted`, a copy from last time it now
-    /// holds. Made only if no clear has been asked for since it was.
+    /// Keeps this window's copy, then lets go of the adopted copy, which it now holds. Made
+    /// only if no clear has been asked for since it was, as one has then let it all go.
     Keep {
         recovery: Recovery,
         place: TalkPlace,
         on_disk: String,
         text: String,
-        adopted: Option<Found>,
+        adopted: Adopted,
     },
-    /// Removes this window's copy, and `adopted`.
+    /// Removes this window's copy, and the adopted one too if `adopted` is given.
     Clear {
         recovery: Recovery,
         place: TalkPlace,
-        adopted: Option<Found>,
+        adopted: Option<Adopted>,
     },
     /// Removes a copy from last time.
     Discard(Recovery, Found),
@@ -47,8 +58,9 @@ enum WorkingCopyJob {
 
 impl WorkingCopyJob {
     /// Makes the change. `at` is how many clears had been asked for when it was asked for,
-    /// and `clears` how many have been by now. A keep that fails gives back what it held.
-    fn run(self, clears: &AtomicU64, at: u64) -> Result<(), Option<Found>> {
+    /// and `clears` how many have been by now. A keep that fails leaves the adopted copy
+    /// where it is, for the next keep or clear.
+    fn run(self, clears: &AtomicU64, at: u64) -> Result<(), ()> {
         match self {
             WorkingCopyJob::Keep {
                 recovery,
@@ -57,13 +69,13 @@ impl WorkingCopyJob {
                 text,
                 adopted,
             } => {
-                if clears.load(Ordering::SeqCst) != at {
-                    return Ok(());
+                if clears.load(Ordering::SeqCst) == at {
+                    recovery
+                        .keep(&place, &hash_text(&on_disk), &text)
+                        .map_err(|_| ())?;
                 }
-                if recovery.keep(&place, &hash_text(&on_disk), &text).is_err() {
-                    return Err(adopted);
-                }
-                if let Some(adopted) = adopted {
+                // Kept, or overtaken by a clear: either way it's no longer needed.
+                if let Some(adopted) = take_adopted(&adopted) {
                     recovery.discard(&adopted);
                 }
             }
@@ -73,7 +85,7 @@ impl WorkingCopyJob {
                 adopted,
             } => {
                 recovery.clear(&place);
-                if let Some(adopted) = adopted {
+                if let Some(adopted) = adopted.as_ref().and_then(take_adopted) {
                     recovery.discard(&adopted);
                 }
             }
@@ -129,7 +141,10 @@ impl WorkspaceView {
             // A show of the talk has to know.
             cx.notify();
         });
-        self.adopted = Some(found);
+        *self
+            .adopted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(found);
         self.pending_working_copy = None;
         if let Some(job) = self.working_copy_job(cx) {
             self.enqueue_working_copy_job(job, cx);
@@ -188,19 +203,15 @@ impl WorkspaceView {
             let outcome = cx
                 .background_spawn(async move { job.run(&clears, at) })
                 .await;
-            if let Err(adopted) = outcome {
-                this.update(cx, |this, cx| this.keep_failed(adopted, cx))
-                    .ok();
+            if outcome.is_err() {
+                this.update(cx, |this, cx| this.keep_failed(cx)).ok();
             }
         }));
     }
 
     /// Says that the working copy couldn't be written, and tries again in a while.
-    fn keep_failed(&mut self, adopted: Option<Found>, cx: &mut Context<Self>) {
+    fn keep_failed(&mut self, cx: &mut Context<Self>) {
         self.kept = None;
-        if self.adopted.is_none() {
-            self.adopted = adopted;
-        }
         self.say(KEEP_FAILED, cx);
         let unsaved = self
             .document
@@ -239,7 +250,7 @@ impl WorkspaceView {
             place,
             on_disk: kept.on_disk.clone(),
             text: kept.text.clone(),
-            adopted: self.adopted.take(),
+            adopted: self.adopted.clone(),
         };
         self.kept = Some(kept);
         Some(job)
@@ -253,12 +264,11 @@ impl WorkspaceView {
         let Some(recovery) = self.recovery.clone() else {
             return;
         };
-        let adopted = self.adopted.take();
         self.enqueue_working_copy_job(
             WorkingCopyJob::Clear {
                 recovery,
                 place,
-                adopted,
+                adopted: Some(self.adopted.clone()),
             },
             cx,
         );
@@ -269,6 +279,10 @@ impl WorkspaceView {
     fn close_after_working_copies(&mut self, cx: &mut Context<Self>) {
         self.close_anyway = true;
         self.pending_working_copy = None;
+        // Taken, so the close waits for it. A job asked for after this has nothing before it
+        // to wait for, but none that matters can be: with `close_anyway` set no keep is
+        // started, and a clear or discard that comes anyway removes copies of changes the
+        // window is letting go, in whatever order.
         let chain = self.working_copy_chain.take();
         cx.spawn(async move |this, cx| {
             if let Some(chain) = chain {

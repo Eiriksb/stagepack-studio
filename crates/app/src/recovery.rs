@@ -6,8 +6,10 @@
 //! Each talk has a folder named for the hash of its path, and each window that keeps a copy of
 //! it has a slot of its own in there: `<root>/<key>/<slot>/slides.md` and `about.json`.
 
+use std::collections::BTreeSet;
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -58,6 +60,36 @@ pub struct Recovery {
     root: PathBuf,
     /// This window's own folder within each talk's.
     slot: String,
+    /// Holds the slot among the live ones, while a window has it.
+    live: Option<Arc<LiveSlot>>,
+}
+
+/// The slots open windows in this app are keeping their copies in. Their copies aren't left
+/// over from a crash, so another window is never offered one, and never lets one go.
+static LIVE_SLOTS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// A slot among the live ones, until the last copy of the [`Recovery`] holding it goes.
+#[derive(Debug)]
+struct LiveSlot(String);
+
+impl LiveSlot {
+    fn new(slot: &str) -> LiveSlot {
+        live_slots().insert(slot.to_string());
+        LiveSlot(slot.to_string())
+    }
+}
+
+impl Drop for LiveSlot {
+    fn drop(&mut self) {
+        live_slots().remove(&self.0);
+    }
+}
+
+fn live_slots() -> std::sync::MutexGuard<'static, BTreeSet<String>> {
+    // A set of names is whole even if a thread panicked holding it.
+    LIVE_SLOTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The SHA-256 of `text`, in lowercase hex.
@@ -76,12 +108,19 @@ impl Recovery {
         Recovery {
             root,
             slot: random_name(),
+            live: None,
         }
     }
 
-    /// The same place, with a slot of its own, for another window.
+    /// The same place, with a slot of its own for a window, which is live for as long as the
+    /// window holds it: no other window finds the copies in it.
     pub fn for_another_window(&self) -> Recovery {
-        Recovery::new(self.root.clone())
+        let slot = random_name();
+        Recovery {
+            root: self.root.clone(),
+            live: Some(Arc::new(LiveSlot::new(&slot))),
+            slot,
+        }
     }
 
     /// Where the app keeps working copies: in its own data folder, if the system has one.
@@ -135,15 +174,29 @@ impl Recovery {
         remove_slot(&found.slot);
     }
 
-    /// The newest working copy of the talk at `place` that can be read, in any slot.
+    /// The newest working copy of the talk at `place` that can be read, in any slot. For a
+    /// window's own, that's in any slot but those other open windows hold.
     pub fn find(&self, place: &TalkPlace) -> Option<Found> {
         let talk = canonical(place);
         let key_folder = self.root.join(key(&talk));
         if refuse_link(&key_folder).is_err() {
             return None;
         }
+        let others_live: BTreeSet<String> = match &self.live {
+            Some(_) => live_slots()
+                .iter()
+                .filter(|slot| **slot != self.slot)
+                .cloned()
+                .collect(),
+            None => BTreeSet::new(),
+        };
         let newest = slots(&key_folder)
             .into_iter()
+            .filter(|slot| {
+                slot.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_none_or(|name| !others_live.contains(name))
+            })
             .filter_map(|slot| {
                 let (about, written) = read_about(&slot)?;
                 (about.talk == talk).then_some((about, written, slot))
