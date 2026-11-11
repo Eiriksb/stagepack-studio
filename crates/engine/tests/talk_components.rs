@@ -867,6 +867,21 @@ fn a_changed_asset_draws_a_built_in_again() {
 }
 
 #[test]
+fn a_changed_asset_is_noticed_though_another_slide_read_it_since() {
+    let files = Files::default();
+    let slides = "<Echo />\n\n---\n\n<Echo />\n";
+    files.put("slides.md", slides);
+    files.put("assets/a.txt", "first");
+    let mut deck = open_with(&files, probe_registry());
+    assert_eq!(texts(&mut deck, 0), ["first"]);
+    files.put("assets/a.txt", "second");
+    // The second slide is laid out for the first time now, and reads the file as it has become.
+    assert_eq!(texts(&mut deck, 1), ["second"]);
+    assert!(deck.update(slides.to_string()).contains(&0), "the first slide still shows what the file was");
+    assert_eq!(texts(&mut deck, 0), ["second"]);
+}
+
+#[test]
 fn an_asset_that_appears_draws_a_talks_component_again() {
     let files = talk_with_hello("<Hello />\n", reading("Hello", "assets/a.txt"));
     let mut deck = open(&files);

@@ -571,7 +571,7 @@ fn a_projects_folder_inside_the_talk_is_refused() {
     let (_bundle_dir, bundle) = bundle_with_toolkit_source();
     let refused = write_cargo_file(dir.path(), &bundle, &dir.path().join("projects")).unwrap_err();
     assert!(refused.contains("inside the talk"), "{refused}");
-    assert!(!dir.path().join("projects").join("Cargo.toml").exists());
+    assert!(!dir.path().join("projects").exists(), "a refusal leaves nothing behind in the talk");
 }
 
 #[test]

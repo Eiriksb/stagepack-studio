@@ -128,6 +128,10 @@ pub fn write_cargo_file(talk_folder: &Path, bundle: &Bundle, projects_root: &Pat
     let talk = talk_folder
         .canonicalize()
         .map_err(|error| format!("The talk's folder couldn't be found: {error}"))?;
+    // Before anything is made, so that a refusal leaves nothing behind in the talk.
+    if std::path::absolute(projects_root).is_ok_and(|root| root.starts_with(&talk) || root.starts_with(talk_folder)) {
+        return Err("The folder for code editor projects is inside the talk, so nothing was written.".into());
+    }
     std::fs::create_dir_all(projects_root)
         .map_err(|error| format!("The folder for code editor projects couldn't be made: {error}"))?;
     let root = projects_root

@@ -148,8 +148,13 @@ pub(crate) struct AssetRecord {
 }
 
 impl AssetRecord {
+    /// The first version seen is the one kept: a slide laid out since may have read the file as
+    /// it has become, and the slides laid out before it still show what it was.
     fn note(&mut self, path: &str, version: Option<FileVersion>) {
-        if self.paths.len() < MAX_ASSETS_REMEMBERED || self.paths.contains_key(path) {
+        if self.paths.contains_key(path) {
+            return;
+        }
+        if self.paths.len() < MAX_ASSETS_REMEMBERED {
             self.paths.insert(path.to_string(), version);
         } else {
             self.overflowed = true;

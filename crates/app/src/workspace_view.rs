@@ -441,7 +441,7 @@ impl WorkspaceView {
     }
 
     /// Looks at the talk's components again once they have been quiet for a moment, and
-    /// builds them if the folder is always built. A change elsewhere never builds.
+    /// builds them if the folder is always built. A change to an asset comes this way too.
     pub fn components_changed_soon(&mut self, cx: &mut Context<Self>) {
         // Replacing the task cancels the one waiting, so the wait starts again from now.
         self.pending_components = Some(cx.spawn(async move |this, cx| {
