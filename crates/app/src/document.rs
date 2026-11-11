@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use slides_components::Diagnostic;
 use slides_engine::{
-    ComponentInfo, Deck, FolderFiles, Fonts, Layer, LayerTiming, Moment, PackError, SlideTimeline,
-    TalkFiles, Transition, layout_by_name, open_packed, read_talk_text,
+    ComponentInfo, Deck, FolderFiles, Fonts, Layer, LayerTiming, Moment, PackError, Pixmap,
+    SlideTimeline, TalkFiles, Transition, layout_by_name, open_packed, read_talk_text,
 };
 use slides_format::{Change, SourceEdit, Talk, split_slides};
 
@@ -291,9 +291,27 @@ impl Document {
         self.deck.timeline(index)
     }
 
-    /// The notes of slide `index`, if it has any.
+    /// The notes of slide `index`, if it has any. A slide that isn't in the talk has none.
     pub fn notes_of(&self, index: usize) -> Option<String> {
-        self.deck.notes(index)
+        (index < self.slide_count())
+            .then(|| self.deck.notes(index))
+            .flatten()
+    }
+
+    /// Whether slide `index` is left out of shows.
+    pub fn is_hidden(&self, index: usize) -> bool {
+        self.deck.is_hidden(index)
+    }
+
+    /// Slide `index` drawn `width` device pixels wide, to stand for it in a list, or `None` if
+    /// the talk has no such slide.
+    pub fn thumbnail(&mut self, index: usize, width: u32) -> Option<Arc<Pixmap>> {
+        self.deck.thumbnail(index, width)
+    }
+
+    /// Slide `index`'s thumbnail `width` wide, if it's drawn already: asking draws nothing.
+    pub fn drawn_thumbnail(&self, index: usize, width: u32) -> Option<Arc<Pixmap>> {
+        self.deck.drawn_thumbnail(index, width)
     }
 
     /// What the user should hear about the current slide.

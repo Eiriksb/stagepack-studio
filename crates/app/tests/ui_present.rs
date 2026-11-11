@@ -18,7 +18,8 @@ use stagepack_studio::present_view::{
     PresenterView, TIMER_ID, start_show,
 };
 use stagepack_studio::slide_canvas::SlideCanvas;
-use stagepack_studio::workspace_view::{self, PRESENT_ID, TITLE_ID, WorkspaceView};
+use stagepack_studio::ribbon::{PRESENT_ID, REHEARSE_ID, TAB_SLIDE_SHOW_ID};
+use stagepack_studio::workspace_view::{self, TITLE_ID, WorkspaceView};
 
 const END_OF_THE_TALK: &str = "End of the talk";
 
@@ -1050,15 +1051,32 @@ fn shift_f5_opens_both_as_ordinary_windows(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn the_present_button_starts_a_show(cx: &mut TestAppContext) {
+fn the_slide_show_tab_starts_a_show(cx: &mut TestAppContext) {
     let editor = open_editor(cx, THREE_SLIDES);
     cx.update_window(editor.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(TAB_SLIDE_SHOW_ID, cx);
         window.render_frame(cx);
         window.click(PRESENT_ID, cx);
     })
     .unwrap();
     cx.run_until_parked();
     assert_eq!(show_windows(cx, &editor).len(), 1);
+}
+
+#[gpui_kit::test]
+fn the_slide_show_tab_starts_a_rehearsal(cx: &mut TestAppContext) {
+    let editor = open_editor(cx, THREE_SLIDES);
+    cx.update_window(editor.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(TAB_SLIDE_SHOW_ID, cx);
+        window.render_frame(cx);
+        window.click(REHEARSE_ID, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(show_windows(cx, &editor).len(), 2, "the audience's and the presenter's");
+    assert!(window_with(cx, &editor, AUDIENCE_ID).is_some());
 }
 
 #[gpui_kit::test]

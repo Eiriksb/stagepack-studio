@@ -8,7 +8,9 @@ use gpui_kit::{
 };
 use slides_engine::Fonts;
 use stagepack_studio::document::{Document, TalkPlace};
+use stagepack_studio::notes_panel::NOTES_ID;
 use stagepack_studio::recovery::{KEEP_FOR, Recovery, hash_text};
+use stagepack_studio::ribbon::{HIDE_ID, NEW_SLIDE_ID};
 use stagepack_studio::workspace_view::{
     self, CLOSE_DONT_SAVE_ID, DISCARD_RECOVERY_ID, RECOVER_ID, RECOVERY_CHANGED_SINCE, RECOVERY_ID,
     RECOVERY_OFFER, SAVE_AS_FOLDER_ID, STATUS_ID, TITLE_ID, WorkspaceView,
@@ -525,6 +527,29 @@ fn the_working_copy_follows_edits_after_a_moment(cx: &mut TestAppContext) {
     wait(cx, 1_000);
     assert!(recovery.find(&setup.place()).is_none());
     assert_eq!(std::fs::read_to_string(setup.file()).unwrap(), ONE);
+}
+
+#[gpui_kit::test]
+fn edits_made_in_the_window_are_kept_like_any_other(cx: &mut TestAppContext) {
+    let setup = Setup::new(ONE);
+    let (handle, view) = open_view(cx, &setup);
+    let recovery = setup.recovery();
+
+    click(cx, handle, NEW_SLIDE_ID);
+    wait(cx, 1_000);
+    assert_eq!(recovery.find(&setup.place()).unwrap().text, source_of(cx, &view));
+
+    click(cx, handle, HIDE_ID);
+    wait(cx, 1_000);
+    assert_eq!(recovery.find(&setup.place()).unwrap().text, source_of(cx, &view));
+
+    click(cx, handle, NOTES_ID);
+    cx.update_window(handle, |_, window, cx| window.input("Kept", cx))
+        .unwrap();
+    wait(cx, 1_000);
+    let kept = recovery.find(&setup.place()).unwrap().text;
+    assert!(kept.contains("Kept"), "{kept}");
+    assert_eq!(kept, source_of(cx, &view));
 }
 
 #[gpui_kit::test]

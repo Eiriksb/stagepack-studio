@@ -131,8 +131,12 @@ fn a_talk_is_drawn_at_the_device_width_of_its_slide(cx: &mut TestAppContext) {
     let (handle, view) = open_with_view(cx, "# One\n");
     settle(cx, handle);
     let canvas = slide_canvas(cx, &view);
-    // The window is 1280 wide, with room to spare in height, at a scale factor of 2.
-    assert_eq!(scale(cx, &canvas), 2560. / 1920.);
+    // The slide fills its place as a 16:9 box can, at a scale factor of 2.
+    let area = cx
+        .update_window(handle, |_, window, _| window.find(CANVAS_ID).bounds())
+        .unwrap();
+    let slide = letterbox(area, 2.0);
+    assert_eq!(scale(cx, &canvas), f32::from(slide.size.width) * 2.0 / 1920.);
     let drawn = images(cx, &canvas);
     assert_eq!(drawn.len(), 2, "background and title");
     cx.update_window(handle, |_, window, _| {
@@ -545,9 +549,9 @@ fn a_folder_that_cannot_be_opened_says_why(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn ctrl_m_shows_the_markdown(cx: &mut TestAppContext) {
+fn ctrl_shift_m_shows_the_markdown(cx: &mut TestAppContext) {
     let handle = open_talk(cx, "# One\n");
-    cx.simulate_keystrokes(handle, "ctrl-m");
+    cx.simulate_keystrokes(handle, "ctrl-shift-m");
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
         assert!(window.find(MARKDOWN_ID).visible());
@@ -556,10 +560,10 @@ fn ctrl_m_shows_the_markdown(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn ctrl_m_hides_the_markdown_again(cx: &mut TestAppContext) {
+fn ctrl_shift_m_hides_the_markdown_again(cx: &mut TestAppContext) {
     let handle = open_talk(cx, "# One\n");
-    cx.simulate_keystrokes(handle, "ctrl-m");
-    cx.simulate_keystrokes(handle, "ctrl-m");
+    cx.simulate_keystrokes(handle, "ctrl-shift-m");
+    cx.simulate_keystrokes(handle, "ctrl-shift-m");
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
         assert!(window.try_find(MARKDOWN_ID).is_none());
@@ -570,13 +574,16 @@ fn ctrl_m_hides_the_markdown_again(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn the_markdown_is_to_the_right_of_the_slide(cx: &mut TestAppContext) {
     let handle = open_talk(cx, "# One\n");
-    cx.simulate_keystrokes(handle, "ctrl-m");
+    cx.simulate_keystrokes(handle, "ctrl-shift-m");
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
         let (canvas, panel) = (window.find(CANVAS_ID), window.find(MARKDOWN_ID));
-        assert_eq!(panel.bounds().left(), canvas.bounds().right());
-        assert_eq!(panel.bounds().top(), canvas.bounds().top());
-        assert_eq!(panel.bounds().bottom(), canvas.bounds().bottom());
+        assert!(panel.bounds().left() >= canvas.bounds().right());
+        assert!(panel.bounds().top() <= canvas.bounds().top());
+        assert!(
+            panel.bounds().bottom() >= canvas.bounds().bottom(),
+            "beside the notes too"
+        );
         assert_eq!(panel.bounds().right(), px(1280.));
     })
     .unwrap();
@@ -585,7 +592,7 @@ fn the_markdown_is_to_the_right_of_the_slide(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn the_markdown_shows_the_lines_of_the_file(cx: &mut TestAppContext) {
     let handle = open_talk(cx, "\n# One\n\nSome words\n");
-    cx.simulate_keystrokes(handle, "ctrl-m");
+    cx.simulate_keystrokes(handle, "ctrl-shift-m");
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
         let (heading, words) = (
@@ -604,7 +611,7 @@ fn the_markdown_shows_the_lines_of_the_file(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn an_empty_talk_can_show_its_markdown(cx: &mut TestAppContext) {
     let handle = open_talk(cx, "");
-    cx.simulate_keystrokes(handle, "ctrl-m");
+    cx.simulate_keystrokes(handle, "ctrl-shift-m");
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
         assert!(window.find(MARKDOWN_ID).visible());
@@ -627,7 +634,7 @@ fn open_saved_talk(cx: &mut TestAppContext, source: &str) -> SavedTalk {
     let talk = Document::open(folder.path(), Fonts::bundled_only()).unwrap();
     let (handle, view) = open_view(cx, |window, cx| WorkspaceView::open_with(talk, window, cx));
     settle(cx, handle);
-    cx.simulate_keystrokes(handle, "ctrl-m");
+    cx.simulate_keystrokes(handle, "ctrl-shift-m");
     settle(cx, handle);
     SavedTalk {
         _folder: folder,
