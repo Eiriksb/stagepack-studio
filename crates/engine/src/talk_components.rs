@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
 
 use slides_components::{
-    Assets, BuildIndex, ComponentError, Diagnostic, INDEX_FILE, MAX_MODULE_BYTES, MEMORY_LIMIT_BYTES, WasmComponent, component_tag,
+    Assets, BuildIndex, ComponentError, Diagnostic, INDEX_FILE, MAX_MODULE_BYTES, MEMORY_LIMIT_BYTES, WasmComponent, check_source, component_tag,
     safe_stem, source_hash,
 };
 use toolkit::{ComponentSchema, Registry, RenderInput, RenderOutput, asset_path_allowed};
@@ -81,8 +81,9 @@ struct Runnable {
 /// What the index of builds came to: nothing if there's none, or why it can't be used.
 type IndexRead = Result<BuildIndex, String>;
 
-/// What a source said, kept with the stamp it had so that it isn't read again unchanged.
-type SourceRead = Result<(String, String), String>;
+/// What a source said, or why it can't be used, kept with the stamp it had so that it isn't
+/// read again unchanged.
+type SourceRead = Result<(String, String), Diagnostic>;
 
 /// What reading a file came to, and the stamp the file had then.
 struct Seen<T> {
@@ -110,6 +111,10 @@ pub struct TalkComponents {
     index_seen: HashMap<String, Seen<Option<IndexRead>>>,
     /// What each build was found to be in the scan under way.
     identities_this_scan: HashMap<String, Option<String>>,
+    /// The sources the scan under way refused, by file name without `.rs`, and their paths.
+    refused_sources: HashMap<String, String>,
+    /// The sources past `MAX_COMPONENTS` in the scan under way, by file name without `.rs`.
+    left_out_sources: HashSet<String>,
     /// The time renders have taken since the slide being laid out was started.
     spent: Duration,
     /// The nodes made since the slide being laid out was started.
@@ -185,6 +190,8 @@ impl TalkComponents {
             builds_seen: HashMap::new(),
             index_seen: HashMap::new(),
             identities_this_scan: HashMap::new(),
+            refused_sources: HashMap::new(),
+            left_out_sources: HashSet::new(),
             spent: Duration::ZERO,
             nodes: 0,
         };
@@ -219,6 +226,8 @@ impl TalkComponents {
         self.problems.clear();
         self.runnable.clear();
         self.identities_this_scan.clear();
+        self.refused_sources.clear();
+        self.left_out_sources.clear();
         let index = self.read_index();
         let named = self.add_sources(&index, registry);
         self.add_builds_with_no_source(&index, &named, registry);
@@ -379,17 +388,20 @@ impl TalkComponents {
     fn read_source(&mut self, path: &str) -> SourceRead {
         let files = self.files.clone();
         remembered(&mut self.sources_seen, &*files, path, || {
-            let too_large = || Err("It is over the limit of 1 MiB for a component's source".to_string());
+            let too_large = || Err(problem(path, "It is over the limit of 1 MiB for a component's source"));
             if files.len(path).is_some_and(|len| len > MAX_SOURCE_BYTES) {
                 return too_large();
             }
-            let bytes = files.read(path).ok_or("It can't be read")?;
+            let bytes = files.read(path).ok_or_else(|| problem(path, "It can't be read"))?;
             if bytes.len() as u64 > MAX_SOURCE_BYTES {
                 return too_large();
             }
-            let text = std::str::from_utf8(&bytes).map_err(|_| "It isn't UTF-8 text")?;
-            let tag = component_tag(text).ok_or("No component was found in it")?;
-            Ok((tag, source_hash(&bytes)))
+            let text = std::str::from_utf8(&bytes).map_err(|_| problem(path, "It isn't UTF-8 text"))?;
+            match component_tag(text) {
+                Some(tag) => Ok((tag, source_hash(&bytes))),
+                // Most often it can't be read as Rust, which the check says, and where.
+                None => Err(check_source(path, text).err().and_then(|found| found.into_iter().next()).unwrap_or_else(|| problem(path, "No component was found in it"))),
+            }
         })
     }
 
@@ -404,7 +416,11 @@ impl TalkComponents {
                 COMPONENTS_FOLDER,
                 format!("A talk can have at most {MAX_COMPONENTS} components, so the last {left_out} are left out"),
             ));
-            paths.truncate(MAX_COMPONENTS);
+            for left_out in paths.drain(MAX_COMPONENTS..) {
+                if let Some(stem) = left_out.strip_prefix(&format!("{COMPONENTS_FOLDER}/")).and_then(|name| name.strip_suffix(SOURCE_EXTENSION)) {
+                    self.left_out_sources.insert(stem.to_string());
+                }
+            }
         }
         let mut claimed: HashMap<String, String> = HashMap::new();
         let mut named = HashSet::new();
@@ -416,8 +432,12 @@ impl TalkComponents {
             }
             let (tag, hash) = match self.read_source(&path) {
                 Ok(read) => read,
-                Err(message) => {
-                    self.problems.push(problem(&path, message));
+                Err(refused) => {
+                    self.problems.push(refused);
+                    // Its build, if it has one, still runs, out of date.
+                    if let Some(stem) = stem {
+                        self.refused_sources.insert(stem.to_string(), path.clone());
+                    }
                     continue;
                 }
             };
@@ -473,9 +493,15 @@ impl TalkComponents {
                 self.problems.push(problem(INDEX_FILE, format!("A talk can have at most {MAX_COMPONENTS} components, so some builds are left out")));
                 return;
             }
-            self.infos.push(ComponentInfo { tag: entry.tag.clone(), file: path.clone(), state: ComponentState::UpToDate });
+            // A build whose source is there but refused is from an older source, as far as can be told.
+            let (state, file) = match self.refused_sources.get(&entry.file) {
+                Some(source) => (ComponentState::OutOfDate, source.clone()),
+                None if self.left_out_sources.contains(&entry.file) => (ComponentState::OutOfDate, path.clone()),
+                None => (ComponentState::UpToDate, path.clone()),
+            };
+            self.infos.push(ComponentInfo { tag: entry.tag.clone(), file, state });
             let build = Build { path, identity };
-            self.runnable.insert(entry.tag.clone(), Runnable { state: ComponentState::UpToDate, build: Some(build) });
+            self.runnable.insert(entry.tag.clone(), Runnable { state, build: Some(build) });
         }
     }
 }

@@ -10,7 +10,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use slides_components::{
-    BuildEntry, BuildIndex, Bundle, Diagnostic, INDEX_FILE, MAX_MODULE_BYTES, component_tag,
+    BuildEntry, BuildIndex, Bundle, Diagnostic, INDEX_FILE, MAX_MODULE_BYTES, check_source, component_tag,
     source_hash,
 };
 use slides_engine::{
@@ -110,12 +110,17 @@ fn build_one(
         return Err(too_large());
     }
     let Ok(source) = std::str::from_utf8(&bytes) else {
-        return Ok(false);
+        return Err(problem(file, "It isn't UTF-8 text"));
     };
     // The tag comes from the source as it's built, which must still be the one the scan
     // accepted: not a built-in's name, and not another source's.
-    if component_tag(source).as_deref() != Some(info.tag.as_str()) {
-        return Ok(false);
+    match component_tag(source) {
+        Some(tag) if tag == info.tag => {}
+        Some(_) => return Ok(false),
+        // The scan kept its last build's tag, and the check says what's wrong, and where.
+        None => {
+            return Err(check_source(file, source).err().unwrap_or_else(|| problem(file, "No component was found in it")));
+        }
     }
     let module = compile(file, source)?;
     if module.len() > MAX_MODULE_BYTES {

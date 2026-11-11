@@ -794,3 +794,30 @@ fn modules_that_fail_to_load_still_count_against_the_talks_budget() {
     }
     assert!(notices.iter().any(|notice| notice == "E: too large to run"), "{notices:?}");
 }
+
+// A source that's refused, with a build of it.
+
+#[test]
+fn a_source_that_cannot_be_read_for_its_tag_runs_its_last_build_out_of_date() {
+    let files = talk_with_hello("<Hello />\n", answering("Hello", &text_answer("Hi")));
+    // An unclosed quote on line 5.
+    files.put("components/hello.rs", "use toolkit::prelude::*;\n\n#[component]\nfn Hello() -> Element {\n    text(\"Hello)\n}\n");
+    let mut deck = open(&files);
+    assert_eq!(info(&deck, "Hello").state, ComponentState::OutOfDate);
+    assert_eq!(info(&deck, "Hello").file, "components/hello.rs");
+    let problem = deck.component_problems().iter().find(|problem| problem.file == "components/hello.rs").cloned().unwrap();
+    assert!(problem.line > 0, "{problem:?}");
+    assert!(problem.message.contains("unclosed quote"), "{problem:?}");
+    assert!(shows(&mut deck, 0, "Hi"), "it still runs its last build");
+    assert!(deck.notices(0).iter().any(|notice| notice == "Hello is out of date, so this is its last build"));
+}
+
+#[test]
+fn a_refused_source_with_a_build_is_out_of_date() {
+    let files = talk_with_hello("<Hello />\n", answering("Hello", &text_answer("Hi")));
+    files.put("components/hello.rs", vec![0xff, 0xfe, 0x00]);
+    let mut deck = open(&files);
+    assert_eq!(info(&deck, "Hello").state, ComponentState::OutOfDate);
+    assert!(has_problem(&deck, "components/hello.rs"));
+    assert!(shows(&mut deck, 0, "Hi"));
+}

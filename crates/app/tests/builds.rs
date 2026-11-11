@@ -201,6 +201,25 @@ fn a_failed_build_keeps_the_last_good_one() {
 }
 
 #[test]
+fn a_source_that_cannot_be_read_says_where_when_built() {
+    let dir = talk(&[("score.rs", &source("Score"))]);
+    let (compile, calls) = fake_compiler();
+    build_components(dir.path(), &compile);
+    let unclosed = "use toolkit::prelude::*;\n\n#[component]\nfn Score() -> Element {\n    text(\"Score)\n}\n";
+    std::fs::write(dir.path().join("components/score.rs"), unclosed).unwrap();
+    assert_eq!(states(dir.path()), [("Score".to_string(), ComponentState::OutOfDate)]);
+
+    let outcome = build_components(dir.path(), &compile);
+    assert!(outcome.built.is_empty());
+    assert_eq!(outcome.problems.len(), 1, "{:?}", outcome.problems);
+    assert_eq!(outcome.problems[0].file, "components/score.rs");
+    assert!(outcome.problems[0].line > 0, "{:?}", outcome.problems);
+    assert!(outcome.problems[0].message.contains("unclosed quote"), "{:?}", outcome.problems);
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "it isn't given to the compiler");
+    assert_eq!(states(dir.path()), [("Score".to_string(), ComponentState::OutOfDate)]);
+}
+
+#[test]
 fn one_failure_does_not_stop_the_others() {
     let dir = talk(&[("a.rs", &broken("First")), ("b.rs", &source("Second"))]);
     let (compile, calls) = fake_compiler();
