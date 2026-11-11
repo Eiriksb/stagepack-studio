@@ -41,7 +41,7 @@ fn main() {
         .with_assets(AppAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
-            workspace_view::bind_keys(cx);
+            workspace_view::init(cx);
             match path {
                 Some(path) => open_talk(path, recovery, cx),
                 None => ask_for_folder(recovery, cx),

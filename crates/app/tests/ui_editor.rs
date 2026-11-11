@@ -34,7 +34,7 @@ fn open_view(
 ) -> (AnyWindowHandle, Entity<WorkspaceView>) {
     let opened = cx.update(|cx: &mut App| {
         gpui_kit::init(cx);
-        workspace_view::bind_keys(cx);
+        workspace_view::init(cx);
         let bounds = Bounds {
             origin: Point::default(),
             size: size(px(1280.), px(800.)),
@@ -554,6 +554,36 @@ fn typing_in_notes_changes_the_slides_notes_and_one_undo_takes_it_back(cx: &mut 
     );
     assert_eq!(source(cx, &view), TWO);
     assert_eq!(notes_text(cx, &view), "", "and the field shows it");
+}
+
+#[gpui_kit::test]
+fn the_notes_caret_stops_blinking_when_left_alone(cx: &mut TestAppContext) {
+    // A blinking caret draws the whole window twice a second, for as long as the field has
+    // the keyboard, so it stops after a while, as GTK's does.
+    let (handle, view) = open(cx, TWO);
+    click(cx, handle, NOTES_ID);
+    let field = cx.read(|cx| view.read(cx).notes_panel().read(cx).field().clone());
+    let redraws = std::rc::Rc::new(std::cell::Cell::new(0));
+    let counter = redraws.clone();
+    let _watching = cx.update(|cx| cx.observe(&field, move |_, _| counter.set(counter.get() + 1)));
+    let wait = |cx: &mut TestAppContext, seconds: u64| {
+        for _ in 0..seconds * 4 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(250));
+            cx.run_until_parked();
+        }
+    };
+    wait(cx, 2);
+    assert!(redraws.get() > 0, "it blinks at first");
+    wait(cx, 10);
+    redraws.set(0);
+    wait(cx, 10);
+    assert_eq!(redraws.get(), 0, "then it stays still");
+    with_window(cx, handle, |window, cx| window.input("a", cx));
+    settle(cx, handle);
+    redraws.set(0);
+    wait(cx, 2);
+    assert!(redraws.get() > 0, "and typing starts it again");
 }
 
 #[gpui_kit::test]

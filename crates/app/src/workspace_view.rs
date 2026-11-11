@@ -164,7 +164,20 @@ pub struct MoveSlideTo {
     pub to: usize,
 }
 
-/// The window's shortcuts, and a show's. Call once, after `gpui_kit::init`.
+/// How long a text field's caret blinks after the last key, click or focus, before it holds
+/// still. Each blink draws the whole window, so a caret left blinking keeps an idle editor
+/// busy. GTK stops after the same time.
+pub const CARET_BLINKS_FOR: Duration = Duration::from_secs(10);
+
+/// The window's settings and shortcuts, and a show's. Call once, after `gpui_kit::init`.
+pub fn init(cx: &mut App) {
+    gpui_kit::component::Theme::update(cx, |theme| {
+        theme.cursor_blink = theme.cursor_blink.with_idle_timeout(CARET_BLINKS_FOR);
+    });
+    bind_keys(cx);
+}
+
+/// The window's shortcuts, and a show's. [`init`] binds them.
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("right", NextSlide, Some(KEY_CONTEXT)),
