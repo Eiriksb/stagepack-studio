@@ -722,6 +722,24 @@ fn notes_typed_after_something_else_are_a_step_of_their_own() {
 }
 
 #[test]
+fn notes_typed_then_taken_back_then_typed_again_are_a_step_of_their_own() {
+    let (_d, mut doc) = talk(FOUR_SLIDES);
+    doc.select(1);
+    doc.delete_current().unwrap();
+    assert_eq!(doc.slide_count(), 3);
+    doc.set_notes(1, "a").unwrap();
+    doc.set_notes(1, "").unwrap();
+    doc.set_notes(1, "b").unwrap();
+    assert_eq!(doc.undo_label(), Some("Edit notes"));
+    doc.undo().unwrap();
+    assert_eq!(doc.notes_of(1), None);
+    assert_eq!(doc.slide_count(), 3, "the slide stays deleted");
+    assert_eq!(doc.undo_label(), Some("Delete slide"));
+    doc.undo().unwrap();
+    assert_eq!(doc.source(), FOUR_SLIDES);
+}
+
+#[test]
 fn hiding_and_showing_say_so() {
     let (_d, mut doc) = talk(FOUR_SLIDES);
     doc.select(1);
@@ -743,7 +761,7 @@ fn an_edit_that_would_break_a_slide_is_refused() {
     });
     let refused = doc.edit("Edit", change, 0).unwrap_err();
     assert_eq!(refused, EditRefused::WouldBreakASlide);
-    assert_eq!(refused.to_string(), "That change would have broken another slide, so it wasn't made.");
+    assert_eq!(refused.to_string(), "That change would have broken a slide, so it wasn't made.");
     assert_eq!(doc.source(), "# One\n\n---\n\n# Two\n");
     assert!(!doc.can_undo());
     assert!(doc.talk().slides.iter().all(|slide| slide.error.is_none()));

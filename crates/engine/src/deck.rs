@@ -212,13 +212,17 @@ impl Deck {
     /// A changed slide is laid out again when next asked for, but keeps the pixels of
     /// any element that stayed the same.
     pub fn update(&mut self, source: String) -> Vec<usize> {
+        self.update_parsed(parse_talk(&source))
+    }
+
+    /// As [`Self::update`], with the talk's new text already read.
+    pub fn update_parsed(&mut self, talk: Talk) -> Vec<usize> {
         let pictures_replaced = self.pictures.drop_replaced(&*self.files);
         let components_changed = self.components.rescan(&self.registry);
         let files_changed = pictures_replaced || components_changed;
         if files_changed {
             self.files_generation += 1;
         }
-        let talk = parse_talk(&source);
         let same_look = !files_changed
             && settings_pairs(self.talk.slides.first().and_then(|s| s.settings.as_ref()))
                 == settings_pairs(talk.slides.first().and_then(|s| s.settings.as_ref()));

@@ -1,5 +1,7 @@
 //! An open talk, and which of its slides is showing.
 
+use std::cell::Cell;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -8,10 +10,10 @@ use slides_engine::{
     ComponentInfo, Deck, FolderFiles, Fonts, Layer, LayerTiming, Moment, PackError, Pixmap,
     SlideTimeline, TalkFiles, Transition, layout_by_name, open_packed, read_talk_text,
 };
-use slides_format::{Change, SourceEdit, Talk, split_slides};
+use slides_format::{Change, SourceEdit, Talk, parse_talk, split_slides};
 
 use crate::export::ExportInput;
-use crate::history::History;
+use crate::history::{History, RunId};
 use crate::present::TalkShape;
 use crate::saving::{SaveJob, SaveTarget, Saved};
 
@@ -43,17 +45,20 @@ pub enum EditRefused {
     WouldBreakASlide,
     /// The talk would have ended up with more or fewer slides than the edit was meant to give.
     WouldChangeTheSlides,
+    /// Working the change out went wrong.
+    CouldNotBeMade,
 }
 
 impl std::fmt::Display for EditRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             EditRefused::WouldBreakASlide => {
-                "That change would have broken another slide, so it wasn't made."
+                "That change would have broken a slide, so it wasn't made."
             }
             EditRefused::WouldChangeTheSlides => {
                 "That change would have joined or split slides, so it wasn't made."
             }
+            EditRefused::CouldNotBeMade => "That change couldn't be made, so nothing was changed.",
         })
     }
 }
@@ -69,6 +74,35 @@ const HIDE_SLIDE: &str = "Hide slide";
 const SHOW_SLIDE: &str = "Show slide";
 const EDIT_NOTES: &str = "Edit notes";
 const RECOVER_CHANGES: &str = "Recover changes";
+const LOAD_CHANGED_FILE: &str = "Load the changed file";
+
+thread_local! {
+    /// Whether the next change worked out on this thread panics, for tests.
+    static PANIC_IN_NEXT_CHANGE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Makes the next change a [`Document`] command works out on this thread panic, as a fault in
+/// the format crate would, so tests can see that it's refused. Only for tests.
+#[doc(hidden)]
+pub fn panic_in_next_change() {
+    PANIC_IN_NEXT_CHANGE.with(|flag| flag.set(true));
+}
+
+/// What `work` gives, or [`EditRefused::CouldNotBeMade`] if it panics. It's the format crate's
+/// work on a talk, which reads only what it's given, so nothing is left half done.
+fn guarded<T>(work: impl FnOnce() -> T) -> Result<T, EditRefused> {
+    catch_unwind(AssertUnwindSafe(work)).map_err(|_| EditRefused::CouldNotBeMade)
+}
+
+/// What `build` makes of `talk`: the change a command works out, guarded as [`guarded`] is.
+fn built<T>(talk: &Talk, build: impl FnOnce(&Talk) -> T) -> Result<T, EditRefused> {
+    guarded(|| {
+        if PANIC_IN_NEXT_CHANGE.with(|flag| flag.replace(false)) {
+            panic!("a change that panics, for a test");
+        }
+        build(talk)
+    })
+}
 
 /// The layout a slide has when its settings name none.
 const DEFAULT_LAYOUT: &str = "content";
@@ -128,9 +162,9 @@ pub struct Document {
     place_name: String,
     current: usize,
     history: History,
-    /// The slide whose notes the last step was typed into, while nothing else has happened
-    /// since: more typing there joins that step.
-    typing_notes: Option<usize>,
+    /// The slide whose notes are being typed into, and the history's run they're typed in:
+    /// more typing there joins that run while it's open.
+    typing_notes: Option<(usize, RunId)>,
     /// What the talk's file held when the app last wrote or read it, so that the app's own
     /// save isn't taken for someone else's change.
     on_disk: String,
@@ -356,6 +390,16 @@ impl Document {
         self.make(label, change, slides, current, current)
     }
 
+    /// The change `build` works out from the talk as it is, for one of the commands. A command
+    /// that's refused ends any typing in the notes.
+    fn build<T>(&mut self, build: impl FnOnce(&Talk) -> T) -> Result<T, EditRefused> {
+        let built = built(self.talk(), build);
+        if built.is_err() {
+            self.typing_notes = None;
+        }
+        built
+    }
+
     /// Makes `change` as [`Self::edit`] does. `before` is the slide it's about in the text
     /// as it is, and `after` the one it's about once made, which becomes the current slide.
     fn make(
@@ -366,35 +410,54 @@ impl Document {
         before: usize,
         after: usize,
     ) -> Result<Vec<usize>, EditRefused> {
+        let made = self.try_make(label, change, slides, before, after);
+        if made.is_err() {
+            self.typing_notes = None;
+        }
+        made
+    }
+
+    /// [`Self::make`], but for ending the typing when it's refused.
+    fn try_make(
+        &mut self,
+        label: &'static str,
+        change: Change,
+        slides: isize,
+        before: usize,
+        after: usize,
+    ) -> Result<Vec<usize>, EditRefused> {
         if change.is_empty() {
             return Ok(Vec::new());
         }
-        let old = self.source().to_string();
+        let old = self.source();
         let old_count = self.slide_count();
-        let broken_before = broken_bodies(self.talk());
-        let undo = change.inverse(&old);
-        let mut changed = self.deck.update(change.apply(&old));
-        let refused = if old_count.checked_add_signed(slides) != Some(self.slide_count()) {
-            Some(EditRefused::WouldChangeTheSlides)
-        } else if broken_bodies(self.talk())
+        let broken_before = guarded(|| broken_bodies(self.talk()))?;
+        // The candidate is worked out and read before the deck takes it, so a refusal, or a
+        // panic, leaves the deck untouched.
+        let (undo, candidate) = guarded(|| (change.inverse(old), parse_talk(&change.apply(old))))?;
+        if old_count.checked_add_signed(slides) != Some(candidate.slides.len()) {
+            return Err(EditRefused::WouldChangeTheSlides);
+        }
+        if guarded(|| broken_bodies(&candidate))?
             .iter()
             .any(|body| !broken_before.contains(body))
         {
-            Some(EditRefused::WouldBreakASlide)
-        } else {
-            None
+            return Err(EditRefused::WouldBreakASlide);
+        }
+        let old = old.to_string();
+        let mut changed = self.deck.update_parsed(candidate);
+        let typing = label == EDIT_NOTES;
+        let run = self
+            .typing_notes
+            .filter(|&(slide, _)| typing && slide == after)
+            .map(|(_, run)| run);
+        let run = match run {
+            Some(run) if self.history.extend(run, &old, self.deck.source()) => {
+                Some(run).filter(|&run| self.history.is_open(run))
+            }
+            _ => self.history.record(label, undo, before, after, typing),
         };
-        if let Some(refused) = refused {
-            self.deck.update(old);
-            return Err(refused);
-        }
-        let joins_typing = label == EDIT_NOTES && self.typing_notes == Some(after);
-        if joins_typing && self.history.can_undo() {
-            self.history.extend_last(&old, self.deck.source());
-        } else {
-            self.history.record(label, undo, before, after);
-        }
-        self.typing_notes = (label == EDIT_NOTES).then_some(after);
+        self.typing_notes = run.map(|run| (after, run));
         self.show(after, &mut changed);
         Ok(changed)
     }
@@ -460,6 +523,13 @@ impl Document {
     /// returns the slides to show again. It's taken as it is, whatever it does to the slides,
     /// and one undo gives back the text as it was. Nothing is written until the talk is saved.
     pub fn recover(&mut self, text: String) -> Vec<usize> {
+        self.replace_all(RECOVER_CHANGES, text)
+    }
+
+    /// Takes `text` as the talk's whole text, as one step named `label`, and returns the
+    /// slides to show again. A whole-text step's ranges fit any text, so the steps before it
+    /// can still be undone.
+    fn replace_all(&mut self, label: &'static str, text: String) -> Vec<usize> {
         let old = self.source().to_string();
         if text == old {
             return Vec::new();
@@ -471,7 +541,7 @@ impl Document {
         let undo = change.inverse(&old);
         let mut changed = self.deck.update(change.apply(&old));
         let at = self.current;
-        self.history.record(RECOVER_CHANGES, undo, at, at);
+        self.history.record(label, undo, at, at, false);
         self.typing_notes = None;
         self.show(at, &mut changed);
         changed
@@ -488,14 +558,14 @@ impl Document {
             format!("layout: {layout}\n---\n\n# \n")
         };
         let at = self.current;
-        let change = slides_format::insert_slide(self.talk(), Some(at), &text);
+        let change = self.build(|talk| slides_format::insert_slide(talk, Some(at), &text))?;
         self.make(ADD_SLIDE, change, 1, at, at + 1)
     }
 
     /// Puts a copy of the current slide straight after it, and makes the copy current.
     pub fn duplicate_current(&mut self) -> Result<Vec<usize>, EditRefused> {
         let at = self.current;
-        let change = slides_format::duplicate_slide(self.talk(), at);
+        let change = self.build(|talk| slides_format::duplicate_slide(talk, at))?;
         self.make(DUPLICATE_SLIDE, change, 1, at, at + 1)
     }
 
@@ -503,7 +573,7 @@ impl Document {
     /// current, or the one before when it was last.
     pub fn delete_current(&mut self) -> Result<Vec<usize>, EditRefused> {
         let at = self.current;
-        let Some(change) = slides_format::delete_slide(self.talk(), at) else {
+        let Some(change) = self.build(|talk| slides_format::delete_slide(talk, at))? else {
             return Ok(Vec::new());
         };
         let after = at.min(self.slide_count() - 2);
@@ -512,14 +582,14 @@ impl Document {
 
     /// Moves slide `from` so that `to` is its place afterwards, and makes it current.
     pub fn move_slide(&mut self, from: usize, to: usize) -> Result<Vec<usize>, EditRefused> {
-        let change = slides_format::move_slide(self.talk(), from, to);
+        let change = self.build(|talk| slides_format::move_slide(talk, from, to))?;
         self.make(MOVE_SLIDE, change, 0, from, to)
     }
 
     /// Leaves the current slide out of shows, or puts it back in.
     pub fn set_current_hidden(&mut self, hidden: bool) -> Result<Vec<usize>, EditRefused> {
         let at = self.current;
-        let change = slides_format::set_hidden(self.talk(), at, hidden);
+        let change = self.build(|talk| slides_format::set_hidden(talk, at, hidden))?;
         let label = if hidden { HIDE_SLIDE } else { SHOW_SLIDE };
         self.make(label, change, 0, at, at)
     }
@@ -527,7 +597,7 @@ impl Document {
     /// Sets the notes of slide `index`, and makes it current. Notes typed into one slide
     /// with nothing else done in between are one step to undo.
     pub fn set_notes(&mut self, index: usize, notes: &str) -> Result<Vec<usize>, EditRefused> {
-        let change = slides_format::set_notes(self.talk(), index, notes);
+        let change = self.build(|talk| slides_format::set_notes(talk, index, notes))?;
         self.make(EDIT_NOTES, change, 0, index, index)
     }
 
@@ -611,15 +681,16 @@ impl Document {
     }
 
     /// Loads `text`, what the file holds after a change from outside, in place of the edits
-    /// made here, which can't be undone after it.
+    /// made here. It's one step, which brings the edits back when it's undone.
     pub fn take_theirs(&mut self, text: String) {
         self.outside = None;
         if text.is_empty() {
             return;
         }
-        self.history = History::new();
-        self.typing_notes = None;
-        self.take(text);
+        self.on_disk = text.clone();
+        self.replace_all(LOAD_CHANGED_FILE, text);
+        // What the file holds is what's here now.
+        self.history.mark_saved();
     }
 
     /// Keeps the edits made here over the file's change, which isn't asked about again. The

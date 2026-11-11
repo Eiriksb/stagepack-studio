@@ -881,7 +881,7 @@ fn a_refused_notes_edit_is_said_and_the_field_shows_the_notes_again(cx: &mut Tes
     });
     assert_eq!(
         status.as_deref(),
-        Some("That change would have broken another slide, so it wasn't made.")
+        Some("That change would have broken a slide, so it wasn't made.")
     );
     assert_eq!(
         notes_text(cx, &view),

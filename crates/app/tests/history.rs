@@ -1,5 +1,5 @@
 use slides_format::{Change, SourceEdit};
-use stagepack_studio::history::History;
+use stagepack_studio::history::{History, RunId};
 
 /// Replaces `range` of `text` with `with`, records the undo, and returns the new text.
 fn edit(
@@ -13,8 +13,25 @@ fn edit(
         range,
         text: with.to_string(),
     });
-    history.record(label, change.inverse(text), 0, 0);
+    history.record(label, change.inverse(text), 0, 0, false);
     change.apply(text)
+}
+
+/// As [`edit`], opening a run that later edits can join.
+fn edit_run(
+    history: &mut History,
+    text: &str,
+    range: std::ops::Range<usize>,
+    with: &str,
+) -> (String, RunId) {
+    let change = Change::single(SourceEdit {
+        range,
+        text: with.to_string(),
+    });
+    let run = history
+        .record("Edit notes", change.inverse(text), 0, 0, true)
+        .expect("a run");
+    (change.apply(text), run)
 }
 
 fn undo(history: &mut History, text: &str) -> String {
@@ -177,26 +194,93 @@ fn a_step_says_which_slide_to_show() {
         range: 0..1,
         text: "x".into(),
     });
-    history.record("Move slide", change.inverse("abc"), 4, 1);
+    history.record("Move slide", change.inverse("abc"), 4, 1, false);
     let undone = history.undo("xbc").unwrap();
     assert_eq!(undone.current, 4);
     assert_eq!(history.redo("abc").unwrap().current, 1);
 }
 
 #[test]
-fn an_edit_made_straight_after_can_join_the_last_step() {
+fn an_edit_made_straight_after_can_join_its_run() {
     let mut history = History::new();
-    edit(&mut history, "Edit notes", "Say hi", 6..6, "!");
-    history.extend_last("Say hi!", "Say hi!!");
-    assert_eq!(undo(&mut history, "Say hi!!"), "Say hi");
+    let (text, run) = edit_run(&mut history, "Say hi", 6..6, "!");
+    assert!(history.extend(run, &text, "Say hi!!"));
+    assert!(history.extend(run, "Say hi!!", "Say hi!!!"));
+    assert_eq!(undo(&mut history, "Say hi!!!"), "Say hi");
     assert!(!history.can_undo());
-    assert_eq!(redo(&mut history, "Say hi"), "Say hi!!");
+    assert_eq!(redo(&mut history, "Say hi"), "Say hi!!!");
+}
+
+#[test]
+fn a_run_ends_with_anything_else() {
+    let mut history = History::new();
+    let (text, run) = edit_run(&mut history, "Say hi", 6..6, "!");
+    let other = edit(&mut history, "Hide slide", &text, 0..0, "x");
+    assert!(
+        !history.extend(run, &other, "xSay hi!!"),
+        "another step came after it"
+    );
+
+    let mut history = History::new();
+    let (text, run) = edit_run(&mut history, "Say hi", 6..6, "!");
+    let back = undo(&mut history, &text);
+    let again = redo(&mut history, &back);
+    assert!(
+        !history.extend(run, &again, "Say hi!!"),
+        "undone and done again"
+    );
+}
+
+#[test]
+fn a_run_that_comes_back_to_where_it_started_is_gone_and_ended() {
+    let mut history = History::new();
+    let before = edit(&mut history, "Delete slide", "abc", 0..1, "");
+    let (text, run) = edit_run(&mut history, &before, 2..2, "a");
+    assert!(
+        history.extend(run, &text, &before),
+        "typed, then taken back"
+    );
+    assert_eq!(history.undo_label(), Some("Delete slide"));
+    assert!(
+        !history.extend(run, &before, "bcb"),
+        "the run's step has gone, and the run with it"
+    );
+    assert_eq!(history.undo_label(), Some("Delete slide"));
+}
+
+#[test]
+fn saving_in_the_middle_of_a_run_ends_it() {
+    let mut history = History::new();
+    let (text, run) = edit_run(&mut history, "Say hi", 6..6, "!");
+    history.mark_saved();
+    assert!(
+        !history.extend(run, &text, "Say hi!!"),
+        "what was saved stays a step of its own"
+    );
+    let (more, _) = edit_run(&mut history, &text, 7..7, "!");
+    assert!(!history.is_saved());
+    assert_eq!(undo(&mut history, &more), "Say hi!");
+    assert!(history.is_saved(), "back at what was saved");
+}
+
+#[test]
+fn a_run_that_comes_back_to_the_saved_text_reads_saved() {
+    let mut history = History::new();
+    let (text, run) = edit_run(&mut history, "Say hi", 6..6, "!");
+    assert!(!history.is_saved());
+    assert!(history.extend(run, &text, "Say hi"));
+    assert!(history.is_saved());
+    assert!(!history.can_undo());
 }
 
 #[test]
 fn an_empty_change_records_nothing() {
     let mut history = History::new();
-    history.record("Edit", Change { edits: Vec::new() }, 0, 0);
+    assert!(
+        history
+            .record("Edit", Change { edits: Vec::new() }, 0, 0, true)
+            .is_none()
+    );
     assert!(!history.can_undo());
     assert!(history.is_saved());
 }

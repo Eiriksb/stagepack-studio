@@ -267,9 +267,10 @@ fn an_outside_change_while_unsaved_asks() {
 }
 
 #[test]
-fn loading_theirs_drops_mine_and_empties_the_history() {
+fn loading_theirs_is_a_step_that_undo_takes_back() {
     let (_dir, mut doc) = talk(TWO_SLIDES);
     doc.add_slide("content").unwrap();
+    let mine = doc.source().to_string();
     let theirs = format!("{TWO_SLIDES}\n---\n\n# Three\n");
     doc.reload(Some(theirs.clone()));
 
@@ -278,8 +279,18 @@ fn loading_theirs_drops_mine_and_empties_the_history() {
     assert_eq!(doc.source(), theirs);
     assert!(doc.outside_change().is_none());
     assert!(!doc.has_unsaved_changes());
-    assert!(!doc.can_undo() && !doc.can_redo());
     assert_eq!(doc.slide_count(), 3);
+    assert_eq!(doc.undo_label(), Some("Load the changed file"));
+
+    doc.undo().unwrap();
+    assert_eq!(doc.source(), mine, "the edits are back");
+    assert!(doc.has_unsaved_changes());
+    doc.undo().unwrap();
+    assert_eq!(doc.source(), TWO_SLIDES, "and the steps before them still undo");
+    doc.redo().unwrap();
+    doc.redo().unwrap();
+    assert_eq!(doc.source(), theirs);
+    assert!(!doc.has_unsaved_changes());
 }
 
 #[test]

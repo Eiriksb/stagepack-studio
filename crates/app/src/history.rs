@@ -33,6 +33,11 @@ impl Entry {
     }
 }
 
+/// A run of edits that join one step, such as notes typed a key at a time. It's open from the
+/// step [`History::record`] opens it with until anything else happens to the history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunId(u64);
+
 fn size_of(change: &Change) -> usize {
     change.edits.iter().map(|edit| edit.text.len()).sum()
 }
@@ -46,6 +51,10 @@ pub struct History {
     /// How many steps from the start the saved text is, while it can still be reached.
     saved: Option<usize>,
     bytes: usize,
+    /// The run the last step is, while later edits can still join it.
+    run: Option<RunId>,
+    /// The number the next run gets.
+    next_run: u64,
 }
 
 impl Default for History {
@@ -63,6 +72,8 @@ impl History {
             dropped: 0,
             saved: Some(0),
             bytes: 0,
+            run: None,
+            next_run: 0,
         }
     }
 
@@ -74,9 +85,20 @@ impl History {
     /// Records an edit, named `label`, by the change `undo` that takes it back. `before` is
     /// the slide to show once it's undone, and `after` the one to show once it's made again.
     /// Whatever could be redone can't be any more. An empty change records nothing.
-    pub fn record(&mut self, label: &'static str, undo: Change, before: usize, after: usize) {
+    ///
+    /// Any run that was open ends. With `open_run`, the step starts a run of its own, which
+    /// later edits can join with [`Self::extend`].
+    pub fn record(
+        &mut self,
+        label: &'static str,
+        undo: Change,
+        before: usize,
+        after: usize,
+        open_run: bool,
+    ) -> Option<RunId> {
+        self.run = None;
         if undo.is_empty() {
-            return;
+            return None;
         }
         if !self.redo.is_empty() {
             for entry in self.redo.drain(..) {
@@ -95,33 +117,50 @@ impl History {
         self.bytes += entry.bytes();
         self.undo.push_back(entry);
         self.trim();
+        if !open_run || self.undo.is_empty() {
+            return None;
+        }
+        let run = RunId(self.next_run);
+        self.next_run += 1;
+        self.run = Some(run);
+        Some(run)
     }
 
-    /// Takes an edit made straight after the last step, which turned the text `before` into
-    /// `after`, into that step, so that one undo takes both back.
-    pub fn extend_last(&mut self, before: &str, after: &str) {
-        if self.is_saved() {
-            // The text it was saved as is the one between the two, and no step leads there now.
-            self.saved = None;
+    /// Takes an edit that turned the text `before` into `after` into the step of `run`, so
+    /// that one undo takes both back, and says whether it did: only while the run is open.
+    /// An edit that brings the text back to where the run started takes its step away, and
+    /// ends the run.
+    pub fn extend(&mut self, run: RunId, before: &str, after: &str) -> bool {
+        if self.run != Some(run) {
+            return false;
         }
         let Some(last) = self.undo.back_mut() else {
-            return;
+            self.run = None;
+            return false;
         };
         let start = last.change.apply(before);
         let joined = one_edit(after, &start);
         self.bytes -= last.bytes();
         if joined.is_empty() {
             self.undo.pop_back();
+            self.run = None;
         } else {
             last.change = joined;
             self.bytes += size_of(&last.change);
         }
         self.trim();
+        true
+    }
+
+    /// Whether `run` is open, so that edits can still join it.
+    pub fn is_open(&self, run: RunId) -> bool {
+        self.run == Some(run)
     }
 
     /// Takes the last step back. `source` is the talk's text now, which the step's change
     /// is made to.
     pub fn undo(&mut self, source: &str) -> Option<Step> {
+        self.run = None;
         let mut entry = self.undo.pop_back()?;
         let change = std::mem::replace(&mut entry.change, Change { edits: Vec::new() });
         self.bytes -= size_of(&change);
@@ -135,6 +174,7 @@ impl History {
 
     /// Makes the last step undone again. `source` is the talk's text now.
     pub fn redo(&mut self, source: &str) -> Option<Step> {
+        self.run = None;
         let mut entry = self.redo.pop()?;
         let change = std::mem::replace(&mut entry.change, Change { edits: Vec::new() });
         self.bytes -= size_of(&change);
@@ -164,13 +204,16 @@ impl History {
         self.redo.last().map(|entry| entry.label)
     }
 
-    /// The text as it is now is the one saved.
+    /// The text as it is now is the one saved. A run ends here, so that the saved text stays
+    /// one a step leads to.
     pub fn mark_saved(&mut self) {
+        self.run = None;
         self.saved = Some(self.position());
     }
 
     /// The saved text is one no step leads to: the file was written or changed from elsewhere.
     pub fn forget_saved(&mut self) {
+        self.run = None;
         self.saved = None;
     }
 
@@ -187,6 +230,10 @@ impl History {
             };
             self.bytes -= oldest.bytes();
             self.dropped += 1;
+            if self.undo.is_empty() {
+                // The run's own step has gone.
+                self.run = None;
+            }
             if self.saved.is_some_and(|saved| saved < self.dropped) {
                 self.saved = None;
             }
