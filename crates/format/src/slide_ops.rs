@@ -16,7 +16,7 @@ use std::ops::Range;
 
 use crate::attrs::scan_open_tag;
 use crate::edit::{Change, SourceEdit, eol_in, set_setting};
-use crate::model::{Block, Slide, Talk};
+use crate::model::{Block, Notes, Slide, Talk};
 use crate::parse::parse_talk;
 use crate::notes::escape_notes;
 use crate::settings::parse_entry;
@@ -152,7 +152,8 @@ pub fn set_notes(talk: &Talk, index: usize, notes: &str) -> Change {
     let notes = with_line_endings(&escape_notes(notes.replace("\r\n", "\n").trim()), eol);
     let edit = match &slide.notes {
         Some(old) if notes.trim().is_empty() => {
-            let removal = without_notes(source, &split_slides(source)[index], remove_notes(source, slide), eol);
+            let raw = &split_slides(source)[index];
+            let removal = without_notes(source, raw, remove_notes(source, raw, old), eol);
             let after = parse_talk(&removal.apply(source));
             if after.slides.len() == talk.slides.len() && blocks_alike(&after.slides[index].blocks, &slide.blocks) {
                 return removal;
@@ -278,11 +279,11 @@ fn only_settings_lines(text: &str) -> bool {
 /// The edit that takes the slide's `<Notes>` element away: its whole lines, the spaces or
 /// tabs before and after it included, and the blank line before it when nothing but the
 /// slide's end or another blank line comes after it, so the blocks on either side stay
-/// apart.
-fn remove_notes(source: &str, slide: &Slide) -> SourceEdit {
-    let Some(notes) = &slide.notes else { return SourceEdit { range: 0..0, text: String::new() } };
+/// apart. It never reaches back past the start of the slide's content.
+fn remove_notes(source: &str, raw: &RawSlide, notes: &Notes) -> SourceEdit {
+    let content_start = raw.body.start.max(raw.range.start).max(bom_len(source));
     let is_space = |c: char| c == ' ' || c == '\t';
-    let line_start = source[..notes.range.start].rfind('\n').map_or(0, |i| i + 1).max(slide.range.start);
+    let line_start = source[..notes.range.start].rfind('\n').map_or(0, |i| i + 1).max(content_start);
     let indent = &source[line_start..notes.range.start];
     let mut start = if indent.chars().all(is_space) { line_start } else { notes.range.start };
     let trailing = source[notes.range.end..].len() - source[notes.range.end..].trim_start_matches(is_space).len();
@@ -292,8 +293,8 @@ fn remove_notes(source: &str, slide: &Slide) -> SourceEdit {
     if ending_after > 0 || end + trailing == source.len() {
         end += trailing + ending_after;
     }
-    let next_line = &source[end..line_end(source, end).min(slide.range.end)];
-    let ends_or_blank_after = end >= slide.range.end || next_line.trim().is_empty();
+    let next_line = &source[end..line_end(source, end).min(raw.range.end)];
+    let ends_or_blank_after = end >= raw.range.end || next_line.trim().is_empty();
     let before = &source[..start];
     if ends_or_blank_after && (before.ends_with("\r\n\r\n") || before.ends_with("\n\n")) {
         start -= ending_len(before);
@@ -302,7 +303,9 @@ fn remove_notes(source: &str, slide: &Slide) -> SourceEdit {
         // The element ended the file, with no line ending after it: so does the line before.
         start -= ending_len(&source[..start]);
     }
-    SourceEdit { range: start.max(slide.range.start)..end, text: String::new() }
+    // A slide whose content starts with its notes keeps the line ending of its `---` or
+    // settings block, which `start` may have stepped back over.
+    SourceEdit { range: start.max(content_start)..end, text: String::new() }
 }
 
 fn with_line_endings(text: &str, eol: &str) -> String {
@@ -417,7 +420,7 @@ fn as_it_is(parts: &Parts) -> Vec<Piece> {
 
 /// A slide as the first of the talk: it carries the talk's settings, and starts the file
 /// with no `---` unless it has a settings block or nothing else.
-fn as_first(item: &Item, all: &[Parts], talk: &[Range<usize>], eol: &str) -> Vec<Piece> {
+fn as_first(source: &str, item: &Item, all: &[Parts], talk: &[Range<usize>], eol: &str) -> Vec<Piece> {
     let rule = || Piece::New(format!("---{eol}"));
     let talk_pieces = || talk.iter().map(|range| Piece::Old(range.clone()));
     let index = match item {
@@ -442,7 +445,9 @@ fn as_first(item: &Item, all: &[Parts], talk: &[Range<usize>], eol: &str) -> Vec
             out
         }
         Head::Rule(rule_line) if !talk.is_empty() => {
-            let mut out = vec![Piece::Old(rule_line.clone())];
+            // A bare `---` that ends the file has no line ending for the talk's lines to follow.
+            let open = if source[rule_line.clone()].ends_with('\n') { Piece::Old(rule_line.clone()) } else { rule() };
+            let mut out = vec![open];
             out.extend(talk_pieces());
             out.extend([rule(), content]);
             out
@@ -490,7 +495,7 @@ fn rearrange(talk: &Talk, order: &[Item]) -> Change {
     let mut slides: Vec<Vec<Piece>> = order
         .iter()
         .enumerate()
-        .map(|(at, item)| if at == 0 { as_first(item, &all, &talk_settings, eol) } else { as_later(item, &all, eol) })
+        .map(|(at, item)| if at == 0 { as_first(source, item, &all, &talk_settings, eol) } else { as_later(item, &all, eol) })
         .collect();
     if order.len() > 1 && joined(source, &slides[0]).is_empty() {
         slides[0].push(Piece::New(format!("---{eol}")));

@@ -399,6 +399,50 @@ fn a_slide_of_key_value_lines_stays_a_slide() {
 }
 
 #[test]
+fn notes_that_start_a_last_slide_with_no_final_newline_are_removed() {
+    on_both(|e| {
+        for (src, want) in [
+            ("# A\n---\n<Notes>\nx\n</Notes>", "# A\n---\n"),
+            ("# A\n---\n\n<Notes>\nx\n</Notes>", "# A\n---\n"),
+            ("# A\n---\nlayout: section\n---\n<Notes>\nx\n</Notes>", "# A\n---\nlayout: section\n---\n"),
+        ] {
+            let (src, want) = (e(src), e(want));
+            let talk = parse_talk(&src);
+            let change = set_notes(&talk, 1, "");
+            let removed = applied(&src, &change);
+            assert_eq!(removed, want, "from {src:?}");
+            let after = parse_talk(&removed);
+            assert_eq!(after.slides.len(), 2);
+            assert!(after.slides[1].notes.is_none());
+            assert_eq!(after.slides[1].settings.is_some(), talk.slides[1].settings.is_some());
+            assert_eq!(change.inverse(&src).apply(&removed), src);
+        }
+    });
+}
+
+#[test]
+fn a_bare_break_at_the_end_becomes_the_first_slide_with_the_talks_settings_on_their_own_lines() {
+    on_both(|e| {
+        let src = e("---\ntitle: T\n---\n# A\n---");
+        let talk = parse_talk(&src);
+        let cases: Vec<(Change, String, usize)> = vec![
+            (move_slide(&talk, 1, 0), e("---\ntitle: T\n---\n---\n# A\n"), 2),
+            (move_slide(&talk, 0, 1), e("---\ntitle: T\n---\n---\n# A\n"), 2),
+            (delete_slide(&talk, 0).unwrap(), e("---\ntitle: T\n---\n"), 1),
+        ];
+        for (change, want, count) in cases {
+            let after = applied(&src, &change);
+            assert_eq!(after, want);
+            let parsed = parse_talk(&after);
+            assert_eq!(parsed.slides.len(), count, "{after:?}");
+            let title = parsed.slides[0].settings.as_ref().unwrap().entries.iter().find(|entry| entry.key == "title").map(|entry| entry.value.clone());
+            assert_eq!(title.as_deref(), Some("T"));
+            assert_eq!(change.inverse(&src).apply(&after), src);
+        }
+    });
+}
+
+#[test]
 fn a_change_and_its_inverse_give_back_the_same_bytes() {
     let src = "abcdef";
     let change = Change {
@@ -462,6 +506,17 @@ struct GenTalk {
     final_newline: bool,
     /// Whether a first slide with no settings starts with a `---` all the same.
     opening_rule: bool,
+    /// A last slide with no marker in it, after the others.
+    tail: Option<Tail>,
+}
+
+/// A last slide that holds nothing a marker could go in.
+#[derive(Clone, Debug)]
+enum Tail {
+    /// A bare `---` and nothing after it.
+    Empty,
+    /// Notes and nothing else, with a blank line before them or not, and its own settings.
+    NotesOnly { blank_before: bool, settings: Vec<(String, String)> },
 }
 
 /// Every slide holds the marker `mk<n>x`, `n` its place in the generated talk.
@@ -513,6 +568,23 @@ impl GenTalk {
             out.push('\n');
             if slide.blank_after {
                 out.push('\n');
+            }
+        }
+        match &self.tail {
+            None => {}
+            Some(Tail::Empty) => out.push_str("---\n"),
+            Some(Tail::NotesOnly { blank_before, settings }) => {
+                out.push_str("---\n");
+                if !settings.is_empty() {
+                    for (key, value) in settings {
+                        out.push_str(&format!("{key}: {value}\n"));
+                    }
+                    out.push_str("---\n");
+                }
+                if *blank_before {
+                    out.push('\n');
+                }
+                out.push_str("<Notes>\nSay hi\n</Notes>\n");
             }
         }
         if !self.final_newline {
@@ -572,12 +644,20 @@ fn gen_slide() -> impl Strategy<Value = GenSlide> {
         })
 }
 
+fn tail() -> impl Strategy<Value = Option<Tail>> {
+    prop_oneof![
+        2 => Just(None),
+        1 => Just(Some(Tail::Empty)),
+        1 => (any::<bool>(), slide_settings()).prop_map(|(blank_before, settings)| Some(Tail::NotesOnly { blank_before, settings })),
+    ]
+}
+
 fn gen_talk() -> impl Strategy<Value = GenTalk> {
-    (prop::collection::vec(gen_slide(), 1..=8), talk_settings(), any::<[bool; 4]>()).prop_map(
-        |(mut slides, talk, [crlf, bom, final_newline, opening_rule])| {
+    (prop::collection::vec(gen_slide(), 1..=8), talk_settings(), any::<[bool; 4]>(), tail()).prop_map(
+        |(mut slides, talk, [crlf, bom, final_newline, opening_rule], tail)| {
             let own = std::mem::take(&mut slides[0].settings);
             slides[0].settings = talk.into_iter().chain(own).collect();
-            GenTalk { slides, crlf, bom, final_newline, opening_rule }
+            GenTalk { slides, crlf, bom, final_newline, opening_rule, tail }
         },
     )
 }
@@ -655,8 +735,18 @@ fn markers_in(text: &str) -> Vec<usize> {
         .collect()
 }
 
+/// Each slide's marker, or `NONE` for the generated talk's last slide that holds none.
 fn slide_markers(talk: &Talk) -> Vec<usize> {
-    talk.slides.iter().map(|s| *markers_in(&talk.source[s.range.clone()]).first().unwrap_or(&usize::MAX)).collect()
+    talk.slides.iter().map(|s| *markers_in(&talk.source[s.range.clone()]).first().unwrap_or(&NONE)).collect()
+}
+
+/// The marker of a slide with none in it.
+const NONE: usize = usize::MAX;
+
+/// The markers that slides at `order`, places in `before` or `NEW`, should have.
+fn markers_of(order: &[usize], before: &Talk) -> Vec<usize> {
+    let markers = slide_markers(before);
+    order.iter().map(|&index| if index == NEW { NEW } else { markers[index] }).collect()
 }
 
 fn talk_entries(talk: &Talk) -> Vec<(String, String)> {
@@ -758,7 +848,7 @@ proptest! {
         let before = parse_talk(&source);
         let Some((change, expected, named)) = run(&before, &op) else { return Ok(()) };
         let after = parse_talk(&change.apply(&source));
-        prop_assert_eq!(slide_markers(&after), expected.clone());
+        prop_assert_eq!(slide_markers(&after), markers_of(&expected, &before));
         for (new_index, &old_index) in expected.iter().enumerate() {
             if old_index == NEW || named.contains(&old_index) {
                 continue;
@@ -810,7 +900,7 @@ proptest! {
         let Some((change, expected, _)) = run(&talk, &op) else { return Ok(()) };
         let after = parse_talk(&change.apply(&source));
         prop_assert_eq!(after.slides.len(), expected.len());
-        prop_assert_eq!(slide_markers(&after), expected);
+        prop_assert_eq!(slide_markers(&after), markers_of(&expected, &talk));
         prop_assert!(after.slides.iter().all(|s| s.error.is_none()), "{:?}", after.slides.iter().map(|s| &s.error).collect::<Vec<_>>());
         match op {
             Op::Hide(i, hidden) => prop_assert_eq!(is_hidden(&after.slides[i % talk.slides.len()]), hidden),
