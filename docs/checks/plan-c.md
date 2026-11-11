@@ -87,7 +87,7 @@ The app's Export and *Save as packed talk* ask where to save through the system'
 
 ## Windows and PowerPoint check, by hand
 
-The `plan-c` branch isn't pushed yet. This check starts once it has been merged into `main` and pushed. It needs a Windows PC with Rust 1.98.0, the `wasm32-unknown-unknown` target (`rustup target add wasm32-unknown-unknown`), the MSVC build tools and desktop PowerPoint, and a second Windows account with no Rust installed.
+The work has been merged into `main` and pushed, so this check starts from a clone of `main`. It needs a Windows PC with Rust 1.98.0, the `wasm32-unknown-unknown` target (`rustup target add wasm32-unknown-unknown`), the MSVC build tools and desktop PowerPoint, and a second Windows account with no Rust installed.
 
 1. `git clone https://github.com/Eiriksb/stagepack-studio.git`, and work in that folder on `main`.
 2. `cargo test --workspace`. If only golden tests fail, the images differ slightly from Linux, so send back which ones.
