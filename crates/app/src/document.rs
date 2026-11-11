@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use slides_engine::{
-    Deck, FolderFiles, Fonts, Layer, PackError, SlideTimeline, TalkFiles, Transition, open_packed,
-    pack_folder, read_talk_text, unpack_to_folder,
+    Deck, FolderFiles, Fonts, Layer, LayerTiming, Moment, PackError, SlideTimeline, TalkFiles,
+    Transition, open_packed, pack_folder, read_talk_text, unpack_to_folder,
 };
 
 use crate::export::ExportInput;
@@ -221,6 +221,17 @@ impl Document {
     /// `scale`.
     pub fn layers_of(&mut self, index: usize, scale: f32) -> Vec<Arc<Layer>> {
         self.deck.layers(index, scale)
+    }
+
+    /// The layers of slide `index` at `moment`, first to last, drawn at `scale`.
+    pub fn layers_at(&mut self, index: usize, moment: Moment, scale: f32) -> Vec<Arc<Layer>> {
+        self.deck.layers_at(index, moment, scale)
+    }
+
+    /// When each layer of slide `index` at `moment` appears, in the order of [`Self::layers_at`]
+    /// at that moment.
+    pub fn timings_at(&mut self, index: usize, moment: Moment) -> Vec<LayerTiming> {
+        self.deck.timings_at(index, moment)
     }
 
     /// When each layer of slide `index` appears, in the order of [`Self::layers_of`].

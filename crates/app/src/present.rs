@@ -11,6 +11,15 @@ pub const TRANSITION_SECONDS: f32 = 0.5;
 /// How far below its place a layer flying up starts, in slide units.
 pub const FLY_UNITS: f32 = 80.0;
 
+/// How many times a second a slide that moves is drawn anew.
+pub const MOMENTS_PER_SECOND: f32 = 30.0;
+
+/// `seconds` into a slide, held to the moment before it, so that everything asking about the
+/// same time asks about the same moment.
+pub fn moment_time(seconds: f32) -> f32 {
+    (seconds.max(0.0) * MOMENTS_PER_SECOND).floor() / MOMENTS_PER_SECOND
+}
+
 /// How far along an animation is, `t` of the way through its time: quick to start, gentle
 /// to land.
 pub fn ease(t: f32) -> f32 {

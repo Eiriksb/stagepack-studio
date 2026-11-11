@@ -1,15 +1,18 @@
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+
+use tempfile::TempDir;
 
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
     AnyWindowHandle, App, AppContext, Bounds, Entity, Point, RenderImage, TestAppContext,
     WindowBounds, WindowOptions, px, size,
 };
-use slides_engine::Fonts;
+use slides_engine::{Fonts, Layer, Moment, to_bgra_frame};
 use stagepack_studio::document::Document;
-use stagepack_studio::present::{LayerLook, SlideLook, ease};
+use stagepack_studio::present::{LayerLook, Place, SlideLook, ease};
 use stagepack_studio::present_view::{
     AUDIENCE_ID, AudienceView, COUNTER_ID, CURRENT_ID, NEXT_ID, NOTES_ID, Presentation,
     PresenterView, TIMER_ID, start_show,
@@ -38,10 +41,53 @@ const NO_TRANSITION: &str = "# One\n\n---\n\n# Two\n";
 
 const THREE_SLIDES: &str = "# One\n\n---\n\n# Two\n\n---\n\n# Three\n";
 
-fn talk(source: &str) -> Document {
+/// A bar chart that builds a bar a click, then a slide of its own.
+const BUILDS: &str = "<Chart kind=\"bar\" labels=\"A, B, C\" values=\"10, 24, 17\" build=\"true\" />\n\n\
+                      ---\n\n# Two\n";
+
+/// A slide with the talk's own `Clock` on it, which moves, then a still one.
+const MOVES: &str = "# One\n\n<Clock />\n\n---\n\n# Two\n";
+
+/// A folder holding a talk of `source`, with `Clock` built into it.
+fn talk_folder(source: &str) -> TempDir {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("slides.md"), source).unwrap();
-    Document::open(dir.path(), Fonts::bundled_only()).unwrap()
+    std::fs::create_dir(dir.path().join("build")).unwrap();
+    std::fs::write(dir.path().join("build/clock.wasm"), moving_module()).unwrap();
+    let index = r#"{"format":1,"components":[{"tag":"Clock","file":"clock","source_hash":"built elsewhere"}]}"#;
+    std::fs::write(dir.path().join("build/index.json"), index).unwrap();
+    dir
+}
+
+/// A component called `Clock` whose every render says it moves.
+fn moving_module() -> Vec<u8> {
+    let schema = r#"{"name":"Clock","props":[],"children":false}"#;
+    let answer = r#"{"element":{"Text":{"text":"tick","size":null,"bold":false,"color":null}},"animated":true}"#;
+    let packed = |at: u64, text: &str| ((at << 32) | text.len() as u64) as i64;
+    let data = |at: u32, text: &str| {
+        let escaped: String = text.bytes().map(|byte| format!("\\{byte:02x}")).collect();
+        format!(r#"(data (i32.const {at}) "{escaped}")"#)
+    };
+    let text = format!(
+        r#"(module
+  (memory (export "memory") 8)
+  (global $heap (mut i32) (i32.const 262144))
+  {}
+  {}
+  (func (export "abi_version") (result i32) (i32.const 1))
+  (func (export "alloc") (param $len i32) (result i32)
+    (local $at i32)
+    (local.set $at (global.get $heap))
+    (global.set $heap (i32.add (global.get $heap) (local.get $len)))
+    (local.get $at))
+  (func (export "schema") (result i64) (i64.const {}))
+  (func (export "render") (param $ptr i32) (param $len i32) (result i64) (i64.const {})))"#,
+        data(1024, schema),
+        data(8192, answer),
+        packed(1024, schema),
+        packed(8192, answer),
+    );
+    wat::parse_str(&text).unwrap_or_else(|error| panic!("{error}\n{text}"))
 }
 
 fn set_up(cx: &mut TestAppContext) {
@@ -62,6 +108,7 @@ fn settle(cx: &mut TestAppContext, handle: AnyWindowHandle) {
 
 /// A show with both windows open, painted and ready for keys.
 struct Rehearsal {
+    _folder: TempDir,
     document: Entity<Document>,
     show: Entity<Presentation>,
     audience: AnyWindowHandle,
@@ -94,7 +141,8 @@ impl Rehearsal {
 
 fn rehearse(cx: &mut TestAppContext, source: &str) -> Rehearsal {
     set_up(cx);
-    let opened = talk(source);
+    let folder = talk_folder(source);
+    let opened = Document::open(folder.path(), Fonts::bundled_only()).unwrap();
     let document = cx.new(|_| opened);
     let show = cx.update(|cx| start_show(document.clone(), true, cx));
     let (audience, presenter) = cx.read(|cx| {
@@ -105,6 +153,7 @@ fn rehearse(cx: &mut TestAppContext, source: &str) -> Rehearsal {
         )
     });
     let rehearsal = Rehearsal {
+        _folder: folder,
         document,
         show,
         audience,
@@ -146,6 +195,53 @@ fn wait(cx: &mut TestAppContext, show: &Rehearsal, millis: u64) {
 fn frames_asked_for(cx: &mut TestAppContext, window: AnyWindowHandle) -> usize {
     cx.update_window(window, |_, window, cx| window.simulate_next_frame(cx))
         .unwrap()
+}
+
+/// A number for what an image's pixels are, which differs when they do.
+fn fingerprint(image: &RenderImage) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    image.as_bytes(0).expect("one frame").hash(&mut hasher);
+    hasher.finish()
+}
+
+/// What each image on `canvas` shows, first to last, by [`fingerprint`].
+fn pixels(cx: &TestAppContext, canvas: &Entity<SlideCanvas>) -> Vec<u64> {
+    let images = images(cx, canvas);
+    images.iter().map(|image| fingerprint(image)).collect()
+}
+
+/// What a layer shows as, by [`fingerprint`].
+fn pixels_of(layer: &Layer) -> u64 {
+    fingerprint(&RenderImage::new(vec![to_bgra_frame(&layer.pixmap)]))
+}
+
+/// The pixels of slide `slide`'s layers at `step`, drawn for `canvas`.
+fn pixels_at(
+    cx: &mut TestAppContext,
+    show: &Rehearsal,
+    canvas: &Entity<SlideCanvas>,
+    slide: usize,
+    step: u32,
+) -> Vec<u64> {
+    let scale = cx
+        .read(|cx| canvas.read(cx).scale())
+        .expect("it has measured itself");
+    let moment = Moment { step, time: 0.0 };
+    let layers = cx.update(|cx| {
+        show.document
+            .update(cx, |document, _| document.layers_at(slide, moment, scale))
+    });
+    layers.iter().map(|layer| pixels_of(layer)).collect()
+}
+
+fn place(cx: &TestAppContext, show: &Rehearsal) -> Place {
+    cx.read(|cx| show.show.read(cx).place())
+}
+
+/// The show's time now.
+fn time(cx: &TestAppContext, show: &Rehearsal) -> f32 {
+    let now = cx.executor().now();
+    cx.read(|cx| show.show.read(cx).time_at(now))
 }
 
 fn images(cx: &TestAppContext, canvas: &Entity<SlideCanvas>) -> Vec<Arc<RenderImage>> {
@@ -390,6 +486,136 @@ fn a_still_slide_asks_for_no_frames(cx: &mut TestAppContext) {
     show.settle(cx);
     assert_eq!(frames_asked_for(cx, show.audience), 0);
     assert_eq!(frames_asked_for(cx, show.presenter), 0);
+}
+
+#[gpui_kit::test]
+fn a_chart_that_builds_takes_a_press_for_each_bar(cx: &mut TestAppContext) {
+    let show = rehearse(cx, BUILDS);
+    for step in 1..=3 {
+        press(cx, show.presenter, "right");
+        assert_eq!(place(cx, &show), Place { slide: 0, step }, "bar {step}");
+    }
+    assert_eq!(counter(cx, &show), "1 / 2");
+    press(cx, show.presenter, "right");
+    assert_eq!(counter(cx, &show), "2 / 2");
+}
+
+#[gpui_kit::test]
+fn each_press_draws_the_new_step(cx: &mut TestAppContext) {
+    let show = rehearse(cx, BUILDS);
+    let canvas = show.canvas(cx);
+    let mut seen = Vec::new();
+    for step in 0..=3 {
+        if step > 0 {
+            press(cx, show.audience, "right");
+            show.settle(cx);
+        }
+        let chart = pixels(cx, &canvas).remove(1);
+        assert_eq!(
+            chart,
+            pixels_at(cx, &show, &canvas, 0, step).remove(1),
+            "step {step}"
+        );
+        assert!(
+            !seen.contains(&chart),
+            "step {step} looks like one before it"
+        );
+        seen.push(chart);
+    }
+}
+
+#[gpui_kit::test]
+fn going_back_shows_the_step_before(cx: &mut TestAppContext) {
+    let show = rehearse(cx, BUILDS);
+    let canvas = show.canvas(cx);
+    press(cx, show.audience, "right");
+    show.settle(cx);
+    let first_bar = pixels(cx, &canvas);
+    press(cx, show.audience, "right");
+    show.settle(cx);
+    assert_ne!(pixels(cx, &canvas), first_bar);
+
+    press(cx, show.audience, "left");
+    show.settle(cx);
+    assert_eq!(pixels(cx, &canvas), first_bar);
+}
+
+#[gpui_kit::test]
+fn the_next_step_shows_what_the_next_press_brings(cx: &mut TestAppContext) {
+    let show = rehearse(cx, BUILDS);
+    let view = show.presenter_view(cx);
+    let upcoming = cx.read(|cx| view.read(cx).upcoming().clone());
+    assert_eq!(pixels(cx, &upcoming), pixels_at(cx, &show, &upcoming, 0, 1));
+    assert_ne!(pixels(cx, &upcoming), pixels_at(cx, &show, &upcoming, 0, 0));
+
+    press(cx, show.presenter, "right");
+    show.settle(cx);
+    assert_eq!(pixels(cx, &upcoming), pixels_at(cx, &show, &upcoming, 0, 2));
+}
+
+#[gpui_kit::test]
+fn a_slide_that_moves_keeps_asking_for_frames(cx: &mut TestAppContext) {
+    let show = rehearse(cx, MOVES);
+    let canvas = show.canvas(cx);
+    for _ in 0..3 {
+        assert!(frames_asked_for_after_the_last(cx, show.audience) > 0);
+        assert!(frames_asked_for_after_the_last(cx, show.presenter) > 0);
+    }
+    let before = images(cx, &canvas);
+    wait(cx, &show, 100);
+    assert!(
+        !Arc::ptr_eq(&before[2], &images(cx, &canvas)[2]),
+        "the clock was drawn again for its new time"
+    );
+    assert!(
+        Arc::ptr_eq(&before[1], &images(cx, &canvas)[1]),
+        "the heading wasn't"
+    );
+
+    press(cx, show.audience, "right");
+    assert_eq!(
+        frames_asked_for_after_the_last(cx, show.audience),
+        0,
+        "the next slide is still"
+    );
+    assert_eq!(frames_asked_for_after_the_last(cx, show.presenter), 0);
+}
+
+#[gpui_kit::test]
+fn the_time_starts_again_on_each_slide(cx: &mut TestAppContext) {
+    let show = rehearse(cx, MOVES);
+    assert_eq!(time(cx, &show), 0.0);
+    wait(cx, &show, 500);
+    assert_eq!(time(cx, &show), 0.5);
+    wait(cx, &show, 20);
+    assert_eq!(time(cx, &show), 0.5, "held to thirtieths of a second");
+
+    press(cx, show.audience, "right");
+    show.settle(cx);
+    assert_eq!(time(cx, &show), 0.0);
+    wait(cx, &show, 100);
+    assert!(
+        (time(cx, &show) - 3.0 / 30.0).abs() < 1e-6,
+        "{}",
+        time(cx, &show)
+    );
+}
+
+#[gpui_kit::test]
+fn a_save_during_a_moving_slide_keeps_the_show_on_a_real_slide(cx: &mut TestAppContext) {
+    let show = rehearse(cx, "# One\n\n---\n\n# Two\n\n<Clock />\n");
+    press(cx, show.presenter, "right");
+    show.settle(cx);
+    wait(cx, &show, 100);
+    assert!(frames_asked_for_after_the_last(cx, show.audience) > 0);
+
+    reload(cx, &show, "# One\n");
+
+    assert_eq!(counter(cx, &show), "1 / 1");
+    assert_eq!(images(cx, &show.canvas(cx)).len(), 2);
+    wait(cx, &show, 100);
+    assert_eq!(frames_asked_for_after_the_last(cx, show.audience), 0);
+    assert_eq!(frames_asked_for_after_the_last(cx, show.presenter), 0);
 }
 
 #[gpui_kit::test]

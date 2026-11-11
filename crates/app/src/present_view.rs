@@ -6,12 +6,12 @@ use std::time::{Duration, Instant};
 use gpui_kit::component::{ActiveTheme as _, TitleBar, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use slides_engine::{Enter, LayerTiming, Transition};
+use slides_engine::{Enter, LayerTiming, Moment, Transition};
 
 use crate::document::Document;
 use crate::present::{
     ENTER_SECONDS, Moved, Place, ScreenInfo, Session, TRANSITION_SECONDS, WindowPlan,
-    choose_windows, clock_text, layer_look, slide_looks,
+    choose_windows, clock_text, layer_look, moment_time, slide_looks,
 };
 use crate::slide_canvas::{ScaleChanged, SlideCanvas};
 use crate::workspace_view::APP_ID;
@@ -59,6 +59,8 @@ struct Reveal {
 #[derive(Clone, Copy)]
 struct Arrival {
     left: Place,
+    /// The time the slide left was at, which it stays at as it goes.
+    left_time: f32,
     transition: Transition,
     /// When its first frame was drawn. Until then none of it has been seen, however long
     /// getting the slide ready takes.
@@ -91,6 +93,8 @@ pub struct Presentation {
     started_at: Instant,
     reveal: Option<Reveal>,
     arrival: Option<Arrival>,
+    /// When the slide the show is on was first drawn. Until then its time hasn't started.
+    slide_began: Option<Instant>,
     audience: Option<ShowWindow<AudienceView>>,
     presenter: Option<ShowWindow<PresenterView>>,
     ended: bool,
@@ -112,6 +116,7 @@ impl Presentation {
             started_at: cx.background_executor().now(),
             reveal: None,
             arrival: None,
+            slide_began: None,
             audience: None,
             presenter: None,
             ended: false,
@@ -135,9 +140,25 @@ impl Presentation {
         self.ended
     }
 
+    /// Where the show is.
+    pub fn place(&self) -> Place {
+        self.session.place()
+    }
+
+    /// The seconds since the slide the show is on appeared, at `now`: from the first frame of
+    /// its transition, or of the slide itself if it has none. They're held to steps of
+    /// 1/[`MOMENTS_PER_SECOND`](crate::present::MOMENTS_PER_SECOND) s, so that both windows
+    /// ask for the same moment and share its layout.
+    pub fn time_at(&self, now: Instant) -> f32 {
+        self.slide_began.map_or(0.0, |began| {
+            moment_time(now.saturating_duration_since(began).as_secs_f32())
+        })
+    }
+
     /// Goes forward by a click, or to the next slide once this one's clicks have all come.
     pub fn next(&mut self, cx: &mut Context<Self>) {
         let left = self.session.place();
+        let left_time = self.time_at(cx.background_executor().now());
         let moved = self
             .document
             .update(cx, |document, _| self.session.next(document));
@@ -146,8 +167,10 @@ impl Presentation {
             Moved::Revealed { step } => self.reveal = Some(Reveal { step, began }),
             Moved::Arrived { transition, .. } => {
                 self.reveal = None;
+                self.slide_began = None;
                 self.arrival = (transition != Transition::None).then_some(Arrival {
                     left,
+                    left_time,
                     transition,
                     began: None,
                 });
@@ -159,13 +182,22 @@ impl Presentation {
 
     /// Goes back by a click, or to the end of the slide before, with nothing moving.
     pub fn previous(&mut self, cx: &mut Context<Self>) {
+        let left = self.session.place().slide;
         let moved = self
             .document
             .update(cx, |document, _| self.session.previous(document));
         if moved != Moved::Stayed {
             self.reveal = None;
             self.arrival = None;
+            self.slide_changed_from(left);
             cx.notify();
+        }
+    }
+
+    /// Starts the time again if the show is no longer on slide `left`.
+    fn slide_changed_from(&mut self, left: usize) {
+        if self.session.place().slide != left {
+            self.slide_began = None;
         }
     }
 
@@ -211,11 +243,13 @@ impl Presentation {
     }
 
     fn talk_changed(&mut self, cx: &mut Context<Self>) {
+        let left = self.session.place().slide;
         self.document
             .update(cx, |document, _| self.session.refit(document));
         // What was on its way in may be gone by now.
         self.reveal = None;
         self.arrival = None;
+        self.slide_changed_from(left);
         cx.notify();
     }
 
@@ -240,30 +274,46 @@ impl Presentation {
         (seconds < TRANSITION_SECONDS).then_some((arrival, seconds))
     }
 
-    /// Starts the clock of the slide being arrived at, if this is its first frame.
+    /// Starts the clock of the slide being arrived at, and the slide's own time, if this is its
+    /// first frame.
     fn first_frame_drawn(&mut self, now: Instant) {
         if let Some(arrival) = &mut self.arrival {
             arrival.began.get_or_insert(now);
         }
+        self.slide_began.get_or_insert(now);
+    }
+
+    /// Whether the slide the show is on moves, and so needs drawing anew as time passes.
+    fn slide_moves(&self, cx: &mut App) -> bool {
+        let slide = self.session.place().slide;
+        self.document
+            .update(cx, |document, _| document.timeline_of(slide).animated)
     }
 }
 
-/// Puts a moment of the talk on `canvas`, and returns when each of its layers comes in. Before
-/// the canvas has measured itself there's no scale to draw at, and nothing is drawn: its first
-/// paint brings the caller back through [`ScaleChanged`].
+/// Puts a moment of the talk on `canvas`: `place`, `time` seconds after its slide appeared. It
+/// returns when each of its layers comes in. Before the canvas has measured itself there's no
+/// scale to draw at, and nothing is drawn: its first paint brings the caller back through
+/// [`ScaleChanged`].
 fn show_on(
     canvas: &Entity<SlideCanvas>,
     document: &Entity<Document>,
     place: Place,
+    time: f32,
     cx: &mut App,
 ) -> Vec<LayerTiming> {
     let Some(scale) = canvas.read(cx).scale() else {
         return Vec::new();
     };
+    let moment = Moment {
+        step: place.step,
+        time,
+    };
+    // Both from the one layout, as a component can give a layer at one moment and none at another.
     let (layers, timings) = document.update(cx, |document, _| {
         (
-            document.layers_of(place.slide, scale),
-            document.timeline_of(place.slide).layers,
+            document.layers_at(place.slide, moment, scale),
+            document.timings_at(place.slide, moment),
         )
     });
     let looks = timings
@@ -275,6 +325,28 @@ fn show_on(
         canvas.set_looks(looks, cx);
     });
     timings
+}
+
+/// Puts the show's place on `canvas` again if its time at `now` isn't `drawn_time`, the time
+/// the canvas was last drawn at, and returns when each layer comes in if it did.
+fn catch_up(
+    show: &Entity<Presentation>,
+    canvas: &Entity<SlideCanvas>,
+    drawn_time: &mut f32,
+    now: Instant,
+    cx: &mut App,
+) -> Option<Vec<LayerTiming>> {
+    let show = show.read(cx);
+    let (document, place, time) = (
+        show.document.clone(),
+        show.session.place(),
+        show.time_at(now),
+    );
+    if time == *drawn_time {
+        return None;
+    }
+    *drawn_time = time;
+    Some(show_on(canvas, &document, place, time, cx))
 }
 
 /// The root of a show's window, with the show's keys, and a title bar if `title` says what
@@ -308,6 +380,9 @@ pub struct AudienceView {
     /// The slide on `current`.
     slide: usize,
     timings: Vec<LayerTiming>,
+    /// Whether the slide on `current` moves, and the time it was last drawn at.
+    moves: bool,
+    drawn_time: f32,
     rehearsing: bool,
     focus_handle: FocusHandle,
     _watching: [Subscription; 3],
@@ -339,6 +414,8 @@ impl AudienceView {
             leaving,
             slide: 0,
             timings: Vec::new(),
+            moves: false,
+            drawn_time: 0.0,
             rehearsing,
             focus_handle,
             _watching: watching,
@@ -358,19 +435,28 @@ impl AudienceView {
     fn show_place(&mut self, cx: &mut Context<Self>) {
         let now = cx.background_executor().now();
         let show = self.show.read(cx);
-        let (document, place, arrival) = (
+        let (document, place, arrival, time) = (
             show.document.clone(),
             show.session.place(),
             show.arrival_at(now),
+            show.time_at(now),
         );
         if arrival.is_some() && place.slide != self.slide {
             std::mem::swap(&mut self.current, &mut self.leaving);
         }
         self.slide = place.slide;
-        self.timings = show_on(&self.current, &document, place, cx);
+        self.moves = self.show.update(cx, |show, cx| show.slide_moves(cx));
+        self.timings = show_on(&self.current, &document, place, time, cx);
+        self.drawn_time = time;
         if let Some((arrival, _)) = arrival {
             // It has this already, unless the window has just changed size.
-            show_on(&self.leaving, &document, arrival.left, cx);
+            show_on(
+                &self.leaving,
+                &document,
+                arrival.left,
+                arrival.left_time,
+                cx,
+            );
         }
         cx.notify();
     }
@@ -379,6 +465,12 @@ impl AudienceView {
     fn animate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let now = cx.background_executor().now();
         self.show.update(cx, |show, _| show.first_frame_drawn(now));
+        if self.moves
+            && let Some(timings) =
+                catch_up(&self.show, &self.current, &mut self.drawn_time, now, cx)
+        {
+            self.timings = timings;
+        }
         let show = self.show.read(cx);
         let step = show.session.place().step;
         let arrival = show.arrival_at(now);
@@ -407,7 +499,7 @@ impl AudienceView {
                 canvas.set_layers(Vec::new(), cx);
             }
         });
-        if arrival.is_some() || revealing.is_some() {
+        if arrival.is_some() || revealing.is_some() || self.moves {
             window.request_animation_frame();
         }
     }
@@ -445,6 +537,9 @@ pub struct PresenterView {
     notes_scroll: ScrollHandle,
     /// The slide whose notes are showing.
     slide: usize,
+    /// Whether the slide on `current` moves, and the time it was last drawn at.
+    moves: bool,
+    drawn_time: f32,
     at_the_end: bool,
     rehearsing: bool,
     focus_handle: FocusHandle,
@@ -487,6 +582,8 @@ impl PresenterView {
             notes: SharedString::default(),
             notes_scroll: ScrollHandle::new(),
             slide: 0,
+            moves: false,
+            drawn_time: 0.0,
             at_the_end: false,
             rehearsing,
             focus_handle,
@@ -508,10 +605,18 @@ impl PresenterView {
     }
 
     fn show_place(&mut self, cx: &mut Context<Self>) {
-        let upcoming = self.show.update(cx, |show, cx| show.upcoming(cx));
+        let now = cx.background_executor().now();
+        let (upcoming, moves) = self
+            .show
+            .update(cx, |show, cx| (show.upcoming(cx), show.slide_moves(cx)));
         self.at_the_end = upcoming.is_none();
+        self.moves = moves;
         let show = self.show.read(cx);
-        let (document, place) = (show.document.clone(), show.session.place());
+        let (document, place, time) = (
+            show.document.clone(),
+            show.session.place(),
+            show.time_at(now),
+        );
         self.notes = document
             .read(cx)
             .notes_of(place.slide)
@@ -521,16 +626,29 @@ impl PresenterView {
             self.slide = place.slide;
             self.notes_scroll.set_offset(Point::default());
         }
-        show_on(&self.current, &document, place, cx);
+        show_on(&self.current, &document, place, time, cx);
+        self.drawn_time = time;
         match upcoming {
+            // What the next press brings, as it first looks.
             Some(upcoming) => {
-                show_on(&self.upcoming, &document, upcoming, cx);
+                show_on(&self.upcoming, &document, upcoming, 0.0, cx);
             }
             None => self
                 .upcoming
                 .update(cx, |canvas, cx| canvas.set_layers(Vec::new(), cx)),
         }
         cx.notify();
+    }
+
+    /// Draws the slide on `current` again if it moves and its time has changed since, and asks
+    /// for another frame while it moves.
+    fn animate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.moves {
+            return;
+        }
+        let now = cx.background_executor().now();
+        catch_up(&self.show, &self.current, &mut self.drawn_time, now, cx);
+        window.request_animation_frame();
     }
 }
 
@@ -546,7 +664,8 @@ fn readout(id: &'static str, text: String) -> impl IntoElement {
 }
 
 impl Render for PresenterView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.animate(window, cx);
         let show = self.show.read(cx);
         let elapsed = cx
             .background_executor()
