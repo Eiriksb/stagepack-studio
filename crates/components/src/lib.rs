@@ -2,10 +2,12 @@
 //! running them in a sandbox.
 
 mod compile;
+mod index;
 mod sandbox;
 mod source_check;
 
 pub use compile::{compile, compile_with_limit, Bundle, COMPILE_TIME_LIMIT};
+pub use index::{safe_stem, source_hash, BuildEntry, BuildIndex, INDEX_FILE};
 pub use sandbox::{
     Assets, ComponentError, WasmComponent, MAX_ELEMENTS, MAX_ELEMENT_DEPTH, MAX_MODULE_BYTES, MAX_OUTPUT_BYTES, MEMORY_LIMIT_BYTES,
     RENDER_TIME_LIMIT,

@@ -9,7 +9,9 @@ use crate::flow::{flow_region, flow_region_each};
 use crate::timeline::{MAX_CLICK, RegionClick, read_region_timing, read_tag_timing, read_transition};
 use crate::native::placeholder_element;
 use crate::placeholder::placeholder_items;
-use crate::{DisplayItem, Enter, Fonts, LayerSpec, LayoutDef, Notice, PictureCache, Rect, RegionDef, TalkFiles, Transition, layout_by_name};
+use crate::{
+    DisplayItem, Enter, Fonts, LayerSpec, LayoutDef, Notice, PictureCache, Rect, RegionDef, TalkComponents, TalkFiles, Transition, layout_by_name,
+};
 
 pub(crate) const SLIDE_WIDTH: f32 = 1920.0;
 pub(crate) const SLIDE_HEIGHT: f32 = 1080.0;
@@ -30,6 +32,7 @@ pub struct LayoutEnv<'a> {
     pub registry: &'a Registry,
     pub files: &'a dyn TalkFiles,
     pub pictures: &'a mut PictureCache,
+    pub components: &'a mut TalkComponents,
 }
 
 pub struct LaidOutSlide {
@@ -62,7 +65,12 @@ pub fn talk_theme(talk: &Talk) -> Theme {
 pub fn layout_slide(talk: &Talk, index: usize, env: &mut LayoutEnv) -> LaidOutSlide {
     let slide = &talk.slides[index];
     let theme = talk_theme(talk);
-    let mut notices = Vec::new();
+    env.components.new_layout();
+    let mut notices: Vec<Notice> = slide
+        .inline_tags
+        .iter()
+        .map(|name| Notice(format!("{name} is in the middle of a line. A component goes on a line of its own")))
+        .collect();
     let mut layers = vec![background(&theme)];
     if let Some(error) = &slide.error {
         notices.push(Notice(error.message.clone()));

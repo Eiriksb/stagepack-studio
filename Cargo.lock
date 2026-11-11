@@ -6988,7 +6988,9 @@ name = "slides-components"
 version = "0.1.0"
 dependencies = [
  "proc-macro2",
+ "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.21",
  "toolkit",
@@ -7004,6 +7006,7 @@ dependencies = [
  "image",
  "resvg 0.46.0",
  "serde_json",
+ "slides-components",
  "slides-format",
  "svgtypes 0.16.2",
  "syntect",
@@ -7011,6 +7014,7 @@ dependencies = [
  "tempfile",
  "tiny-skia",
  "toolkit",
+ "wat",
  "zip",
 ]
 

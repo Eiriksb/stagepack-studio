@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::ops::Range;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::thread;
@@ -57,7 +58,7 @@ pub fn parse_talk(source: &str) -> Talk {
 }
 
 fn empty_slide(raw: &RawSlide) -> Slide {
-    Slide { range: raw.range.clone(), settings: raw.settings.clone(), blocks: Vec::new(), notes: None, error: None }
+    Slide { range: raw.range.clone(), settings: raw.settings.clone(), blocks: Vec::new(), notes: None, error: None, inline_tags: Vec::new() }
 }
 
 fn refused_slide(raw: &RawSlide, message: &str) -> Slide {
@@ -75,23 +76,26 @@ fn read_slide(source: &str, raw: &RawSlide) -> Slide {
     }
     // A slide that trips a bug in the `markdown` crate shouldn't take the rest of the talk with it.
     match catch_unwind(AssertUnwindSafe(|| read_body(source, raw.body.clone()))) {
-        Ok(Ok((blocks, notes))) => Slide { blocks, notes, ..empty_slide(raw) },
+        Ok(Ok((blocks, notes, inline_tags))) => Slide { blocks, notes, inline_tags, ..empty_slide(raw) },
         Ok(Err(message)) => refused_slide(raw, &message),
         Err(_) => refused_slide(raw, UNREADABLE),
     }
 }
 
-fn read_body(source: &str, body: Range<usize>) -> Result<(Vec<Block>, Option<Notes>), String> {
+/// A slide's blocks, its notes, and the tags in the middle of a line.
+type Body = (Vec<Block>, Option<Notes>, Vec<String>);
+
+fn read_body(source: &str, body: Range<usize>) -> Result<Body, String> {
     let root = markdown::to_mdast(&source[body.clone()], &options()).map_err(|message| message.to_string())?;
     if nests_too_deep(&root) {
         return Err(TOO_DEEP.to_string());
     }
-    let ctx = Ctx { source, base: body.start };
+    let ctx = Ctx { source, base: body.start, inline_tags: RefCell::new(Vec::new()) };
     let (mut blocks, mut notes) = (Vec::new(), None);
     for node in root.children().into_iter().flatten() {
         ctx.block(node, &mut blocks, &mut notes);
     }
-    Ok((blocks, notes))
+    Ok((blocks, notes, ctx.inline_tags.into_inner()))
 }
 
 /// Whether a line starts with more quote and list markers than a slide can nest. Markers
@@ -161,6 +165,8 @@ struct Ctx<'a> {
     source: &'a str,
     /// Where the parsed text starts in the file.
     base: usize,
+    /// The tags found in the middle of a line, other than `<Text>`.
+    inline_tags: RefCell<Vec<String>>,
 }
 
 impl Ctx<'_> {
@@ -283,6 +289,12 @@ impl Ctx<'_> {
             Node::Image(i) => push_span(out, &i.alt, style),
             Node::MdxJsxTextElement(element) => {
                 let mut inner = style.clone();
+                if let Some(name) = element.name.as_deref().filter(|name| *name != "Text") {
+                    let mut found = self.inline_tags.borrow_mut();
+                    if !found.iter().any(|known| known == name) {
+                        found.push(name.to_string());
+                    }
+                }
                 if element.name.as_deref() == Some("Text") {
                     for attribute in &element.attributes {
                         let AttributeContent::Property(p) = attribute else { continue };

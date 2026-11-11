@@ -307,6 +307,29 @@ impl TalkFiles for PackedFiles {
     fn read(&self, path: &str) -> Option<Vec<u8>> {
         self.read_checked(&normalise(path)?).ok().flatten()
     }
+
+    /// The size the entry states, which was held to the pack's limits when it opened.
+    fn len(&self, path: &str) -> Option<u64> {
+        let &i = self.index.get(&normalise(path)?)?;
+        let zip = self.zip.lock().unwrap_or_else(|e| e.into_inner());
+        let size = zip.by_index_data(i).ok()?.size();
+        Some(size)
+    }
+
+    fn names_in(&self, folder: &str) -> Vec<String> {
+        let Some(folder) = normalise(folder) else {
+            return Vec::new();
+        };
+        let prefix = format!("{folder}/");
+        let mut names: Vec<String> = self
+            .index
+            .keys()
+            .filter(|name| name.strip_prefix(&prefix).is_some_and(|rest| !rest.contains('/')))
+            .cloned()
+            .collect();
+        names.sort();
+        names
+    }
 }
 
 pub struct PackReport {

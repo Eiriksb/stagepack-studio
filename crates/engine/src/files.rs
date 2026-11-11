@@ -18,6 +18,16 @@ pub trait TalkFiles {
     fn stamp(&self, _path: &str) -> Option<(u64, SystemTime)> {
         None
     }
+
+    /// The length of `path` in bytes, found without reading it, or `None` if it can't be.
+    fn len(&self, _path: &str) -> Option<u64> {
+        None
+    }
+
+    /// The files directly in `folder`, as paths relative to the talk, in name order.
+    fn names_in(&self, _folder: &str) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// A talk kept in a folder on disk.
@@ -97,6 +107,27 @@ impl TalkFiles for FolderFiles {
         let metadata = std::fs::metadata(self.resolve(path)?).ok()?;
         Some((metadata.len(), metadata.modified().ok()?))
     }
+
+    fn len(&self, path: &str) -> Option<u64> {
+        let metadata = std::fs::metadata(self.resolve(path)?).ok()?;
+        metadata.is_file().then_some(metadata.len())
+    }
+
+    /// Only regular files, and not links to them.
+    fn names_in(&self, folder: &str) -> Vec<String> {
+        let Some(entries) = self.resolve(folder).and_then(|dir| std::fs::read_dir(dir).ok()) else {
+            return Vec::new();
+        };
+        let folder = folder.trim_end_matches('/');
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .map(|name| format!("{folder}/{name}"))
+            .collect();
+        names.sort();
+        names
+    }
 }
 
 impl TalkFiles for std::sync::Arc<dyn TalkFiles + Send + Sync> {
@@ -106,5 +137,13 @@ impl TalkFiles for std::sync::Arc<dyn TalkFiles + Send + Sync> {
 
     fn stamp(&self, path: &str) -> Option<(u64, SystemTime)> {
         (**self).stamp(path)
+    }
+
+    fn len(&self, path: &str) -> Option<u64> {
+        (**self).len(path)
+    }
+
+    fn names_in(&self, folder: &str) -> Vec<String> {
+        (**self).names_in(folder)
     }
 }

@@ -121,6 +121,8 @@ pub(crate) struct Flow<'a, 'env> {
     /// What the tree's nodes are, for export.
     semantics: HashMap<NodeId, Semantic>,
     region: &'a RegionDef,
+    /// How wide the flow is, which a component is told as the room it has.
+    pub(crate) width: f32,
     pub(crate) theme: &'a Theme,
     pub(crate) env: &'a mut LayoutEnv<'env>,
     notices: &'a mut Vec<Notice>,
@@ -149,7 +151,7 @@ pub(crate) fn flow_region(
     env: &mut LayoutEnv,
     notices: &mut Vec<Notice>,
 ) -> (Vec<DisplayItem>, Vec<NativeElement>) {
-    let mut flow = Flow::new(region, theme, env, notices);
+    let mut flow = Flow::new(region, width, theme, env, notices);
     let children: Vec<NodeId> = blocks.iter().filter_map(|block| flow.block(block, region.align)).collect();
     let root = flow.node(Style { size: Size { width: length(width), height: auto() }, ..column() }, &children);
     flow.finish(root, width)
@@ -174,7 +176,7 @@ pub(crate) fn flow_region_each(
     env: &mut LayoutEnv,
     notices: &mut Vec<Notice>,
 ) -> Vec<Piece> {
-    let mut flow = Flow::new(region, theme, env, notices);
+    let mut flow = Flow::new(region, width, theme, env, notices);
     let placed: Vec<(&Block, NodeId)> =
         blocks.iter().filter_map(|block| flow.block(block, region.align).map(|node| (*block, node))).collect();
     let children: Vec<NodeId> = placed.iter().map(|(_, node)| *node).collect();
@@ -215,6 +217,7 @@ impl<'a, 'env> Flow<'a, 'env> {
 
     pub(crate) fn new(
         region: &'a RegionDef,
+        width: f32,
         theme: &'a Theme,
         env: &'a mut LayoutEnv<'env>,
         notices: &'a mut Vec<Notice>,
@@ -222,7 +225,7 @@ impl<'a, 'env> Flow<'a, 'env> {
         let mut tree = TaffyTree::new();
         // Slide units aren't pixels. Rounding would also leave text a sliver narrower than it was measured at.
         tree.disable_rounding();
-        Flow { tree, semantics: HashMap::new(), region, theme, env, notices, nesting: 0, text_tag_style: TextStyle::default() }
+        Flow { tree, semantics: HashMap::new(), region, width, theme, env, notices, nesting: 0, text_tag_style: TextStyle::default() }
     }
 
     /// Lays out the tree under `root`, `width` wide, and returns its drawing and what it is.

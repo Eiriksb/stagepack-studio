@@ -2,14 +2,16 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::rc::Rc;
 use std::sync::Arc;
 
+use slides_components::Diagnostic;
 use slides_format::{Settings, Talk, parse_talk};
-use toolkit::Registry;
+use toolkit::{ComponentSchema, Registry};
 
 use crate::{
-    DisplayItem, Fonts, Layer, LayerSpec, LayerTiming, LayoutEnv, PictureCache, SlideTimeline, TalkFiles, Transition, builtin_registry,
-    layout_slide, render_layer, talk_theme,
+    ComponentInfo, DisplayItem, Fonts, Layer, LayerSpec, LayerTiming, LayoutEnv, PictureCache, SlideTimeline, TalkComponents, TalkFiles,
+    Transition, builtin_registry, layout_slide, render_layer, talk_theme,
 };
 
 /// How many scales of one slide are kept drawn. A zoom or a resize asks for many in a row.
@@ -20,7 +22,7 @@ const DEFAULT_MEMORY_BUDGET: usize = 512 * 1024 * 1024;
 
 /// What makes a drawn layer the same as one drawn before: the text it came from, the
 /// look of the talk and the slide's layout, where it sits and how it turns, and the
-/// pictures of the talk at that moment.
+/// pictures and components of the talk at that moment.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct LayerKey {
     text: String,
@@ -28,7 +30,7 @@ struct LayerKey {
     /// Where and how big what the layer draws is. Text moves inside a layer when something
     /// elsewhere changes it, such as a list's indent, with the layer's text just as it was.
     drawing: u64,
-    picture_generation: u64,
+    files_generation: u64,
 }
 
 /// A slide laid out. The keys are made when the slide is, because `LayerSpec::source`
@@ -75,12 +77,14 @@ struct SlideState {
 }
 
 pub struct Deck {
-    files: Box<dyn TalkFiles>,
+    files: Rc<dyn TalkFiles>,
     fonts: Fonts,
     registry: Registry,
+    components: TalkComponents,
     pictures: PictureCache,
-    /// Goes up each time a picture in the talk is found to have been replaced.
-    picture_generation: u64,
+    /// Goes up each time a picture in the talk is found to have been replaced, or its
+    /// components to have changed.
+    files_generation: u64,
     talk: Talk,
     /// The talk's look, as text that can be part of a key.
     theme: String,
@@ -109,6 +113,13 @@ fn theme_key(talk: &Talk) -> String {
 
 impl Deck {
     pub fn open(files: Box<dyn TalkFiles>, fonts: Fonts, source: String) -> Deck {
+        Deck::with_registry(files, fonts, source, builtin_registry())
+    }
+
+    /// A deck whose talk can use the components in `registry`, as well as its own.
+    pub fn with_registry(files: Box<dyn TalkFiles>, fonts: Fonts, source: String, registry: Registry) -> Deck {
+        let files: Rc<dyn TalkFiles> = Rc::from(files);
+        let components = TalkComponents::scan_for(files.clone(), &registry);
         let talk = parse_talk(&source);
         let slides = slide_texts(&talk)
             .into_iter()
@@ -117,9 +128,10 @@ impl Deck {
         Deck {
             files,
             fonts,
-            registry: builtin_registry(),
+            registry,
+            components,
             pictures: PictureCache::default(),
-            picture_generation: 0,
+            files_generation: 0,
             theme: theme_key(&talk),
             talk,
             slides,
@@ -131,17 +143,20 @@ impl Deck {
     }
 
     /// Takes the talk's new text and returns the slides that changed: those whose text
-    /// differs from what was at the same place, or all of them if the talk's settings did
-    /// or one of its picture files has been replaced, even with the text just as it was.
+    /// differs from what was at the same place, or all of them if the talk's settings did,
+    /// one of its picture files has been replaced or its components have changed, even with
+    /// the text just as it was.
     /// A changed slide is laid out again when next asked for, but keeps the pixels of
     /// any element that stayed the same.
     pub fn update(&mut self, source: String) -> Vec<usize> {
         let pictures_replaced = self.pictures.drop_replaced(&*self.files);
-        if pictures_replaced {
-            self.picture_generation += 1;
+        let components_changed = self.components.rescan(&self.registry);
+        let files_changed = pictures_replaced || components_changed;
+        if files_changed {
+            self.files_generation += 1;
         }
         let talk = parse_talk(&source);
-        let same_look = !pictures_replaced
+        let same_look = !files_changed
             && settings_pairs(self.talk.slides.first().and_then(|s| s.settings.as_ref()))
                 == settings_pairs(talk.slides.first().and_then(|s| s.settings.as_ref()));
         let mut old = std::mem::take(&mut self.slides);
@@ -179,6 +194,41 @@ impl Deck {
             .collect();
         self.slides = slides;
         changed
+    }
+
+    /// Looks at the talk's components again, and returns the slides to show again: all of
+    /// them if anything about the components has changed, and none if not.
+    pub fn refresh_components(&mut self) -> Vec<usize> {
+        if !self.components.rescan(&self.registry) {
+            return Vec::new();
+        }
+        self.files_generation += 1;
+        for slide in &mut self.slides {
+            slide.laid = None;
+            for scale in slide.drawn.values_mut() {
+                scale.ordered = None;
+            }
+        }
+        self.slides_holding_pictures.clear();
+        (0..self.slides.len()).collect()
+    }
+
+    /// The talk's own components.
+    pub fn components(&self) -> &[ComponentInfo] {
+        self.components.infos()
+    }
+
+    /// What's wrong with the talk's own components, as found when they were last looked at.
+    pub fn component_problems(&self) -> &[Diagnostic] {
+        self.components.problems()
+    }
+
+    /// What the component `tag` takes, for a form: a built-in, or one of the talk's own.
+    pub fn component_schema(&mut self, tag: &str) -> Option<ComponentSchema> {
+        match self.registry.get(tag) {
+            Some(component) => Some((component.schema)()),
+            None => self.components.schema(tag),
+        }
     }
 
     /// How many pixel bytes the drawn layers of the whole deck can add up to, from the
@@ -354,6 +404,7 @@ impl Deck {
             registry: &self.registry,
             files: &*self.files,
             pictures: &mut self.pictures,
+            components: &mut self.components,
         };
         let laid = layout_slide(&self.talk, index, &mut env);
         let source = &self.talk.source;
@@ -373,7 +424,7 @@ impl Deck {
                     text: format!("{theme}\n{layout}\n{}\n{text}", spec.source.is_some()),
                     place: [rect.x, rect.y, rect.w, rect.h, spec.rotate].map(f32::to_bits),
                     drawing: drawing_fingerprint(&spec.items),
-                    picture_generation: self.picture_generation,
+                    files_generation: self.files_generation,
                 }
             })
             .collect();

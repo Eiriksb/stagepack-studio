@@ -86,7 +86,7 @@ fn lay_out(source: &str) -> LaidOutSlide {
     let mut fonts = Fonts::bundled_only();
     let talk = parse_talk(source);
     let registry = registry();
-    layout_slide(&talk, 0, &mut LayoutEnv { fonts: &mut fonts, registry: &registry, files: &NoFiles, pictures: &mut PictureCache::default() })
+    layout_slide(&talk, 0, &mut LayoutEnv { fonts: &mut fonts, registry: &registry, files: &NoFiles, pictures: &mut PictureCache::default(), components: &mut TalkComponents::none() })
 }
 
 fn bounds(path: &tiny_skia::Path) -> (f32, f32, f32, f32) {

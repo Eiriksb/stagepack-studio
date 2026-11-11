@@ -110,6 +110,9 @@ pub struct Slide {
     pub blocks: Vec<Block>,
     pub notes: Option<Notes>,
     pub error: Option<SlideError>,
+    /// The tags, other than `<Text>`, that sit in the middle of a line, where nothing is
+    /// drawn for them. Each is named once.
+    pub inline_tags: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

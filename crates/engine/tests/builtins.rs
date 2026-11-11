@@ -23,7 +23,7 @@ fn lay_out_with(source: &str, files: &[(&str, Vec<u8>)], registry: &Registry) ->
     let slide = layout_slide(
         &talk,
         0,
-        &mut LayoutEnv { fonts: &mut fonts, registry, files: &files, pictures: &mut PictureCache::default() },
+        &mut LayoutEnv { fonts: &mut fonts, registry, files: &files, pictures: &mut PictureCache::default(), components: &mut TalkComponents::none() },
     );
     (slide, fonts)
 }
@@ -723,7 +723,7 @@ fn a_picture_is_only_read_once() {
     let mut fonts = Fonts::bundled_only();
     let mut pictures = PictureCache::default();
     for _ in 0..2 {
-        layout_slide(&talk, 0, &mut LayoutEnv { fonts: &mut fonts, registry: &registry, files: &files, pictures: &mut pictures });
+        layout_slide(&talk, 0, &mut LayoutEnv { fonts: &mut fonts, registry: &registry, files: &files, pictures: &mut pictures, components: &mut TalkComponents::none() });
     }
     assert_eq!(files.reads.get(), 1);
 }
@@ -736,7 +736,7 @@ fn a_picture_that_could_not_be_read_is_tried_again() {
     let mut fonts = Fonts::bundled_only();
     let mut pictures = PictureCache::default();
     for _ in 0..2 {
-        layout_slide(&talk, 0, &mut LayoutEnv { fonts: &mut fonts, registry: &registry, files: &files, pictures: &mut pictures });
+        layout_slide(&talk, 0, &mut LayoutEnv { fonts: &mut fonts, registry: &registry, files: &files, pictures: &mut pictures, components: &mut TalkComponents::none() });
     }
     assert_eq!(files.reads.get(), 2);
 }

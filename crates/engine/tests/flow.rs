@@ -9,7 +9,7 @@ fn lay_out(source: &str) -> (LaidOutSlide, Fonts) {
     let mut fonts = Fonts::bundled_only();
     let talk = parse_talk(source);
     let registry = builtin_registry();
-    let slide = layout_slide(&talk, 0, &mut LayoutEnv { fonts: &mut fonts, registry: &registry, files: &NoFiles, pictures: &mut PictureCache::default() });
+    let slide = layout_slide(&talk, 0, &mut LayoutEnv { fonts: &mut fonts, registry: &registry, files: &NoFiles, pictures: &mut PictureCache::default(), components: &mut TalkComponents::none() });
     (slide, fonts)
 }
 

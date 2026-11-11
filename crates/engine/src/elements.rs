@@ -2,21 +2,28 @@
 //! component's children lay out with the same code as the rest of the slide, and into
 //! drawing.
 
+use std::cell::Cell;
+
 use slides_format::{Block, Tag};
 use taffy::prelude::{
     AlignItems, AlignSelf, Dimension, FlexDirection, JustifyContent, NodeId, Position, Size, Style, auto, length, percent,
 };
 use tiny_skia::{Path, PathBuilder};
-use toolkit::{Color, Ctx, CtxData, Element, Placed, Props, ShapeKind, TextAlign, Theme};
+use toolkit::{Color, Ctx, CtxData, Element, Placed, Props, RenderInput, ShapeKind, TextAlign, Theme};
 
 use crate::flow::{Content, Flow, TEXT_TAG, column, rounded_rect, rounded_rect_with};
 use crate::pictures::icon_pixmap;
 use crate::slide::{MAX_SIZE, SLIDE_HEIGHT, SLIDE_WIDTH, is_positioned};
 use crate::native::Semantic;
+use crate::talk_components::{Rendered, read_asset};
 use crate::{Align, DisplayItem, LayoutEnv, NativeContent, NativeElement, Notice, PLACEMENT_ATTRS, PathStep, RegionDef, layout_by_name};
 
 const DEFAULT_WIDTH: f32 = 400.0;
 const DEFAULT_HEIGHT: f32 = 200.0;
+/// The width a positioned tag that gives none is told it has.
+const POSITIONED_ROOM: f32 = 1200.0;
+/// What's said for a component that didn't run, as the slide's components had used up their time.
+const NOT_RUN: &str = "not run, as this slide's components took too long";
 const DEFAULT_RADIUS: f32 = 24.0;
 const DEFAULT_LINE_WIDTH: f32 = 4.0;
 /// As with sizes, so one attribute can't make a layer that needs gigabytes.
@@ -127,8 +134,9 @@ pub(crate) fn lay_out_positioned_tag(
     env: &mut LayoutEnv,
     notices: &mut Vec<Notice>,
 ) -> ((f32, f32), Vec<DisplayItem>, Vec<NativeElement>) {
-    let mut flow = Flow::new(positioned_tag_region(), theme, env, notices);
-    let element = flow.render_tag(tag);
+    let room = (wanted.0.unwrap_or(POSITIONED_ROOM), wanted.1.unwrap_or(0.0));
+    let mut flow = Flow::new(positioned_tag_region(), room.0, theme, env, notices);
+    let element = flow.render_tag(tag, room);
     let natural = element.as_ref().and_then(|element| flow.natural_size(element));
     let (w, h) = box_size(wanted, natural);
     let content = match element {
@@ -146,29 +154,48 @@ pub(crate) fn lay_out_positioned_tag(
 }
 
 impl Flow<'_, '_> {
-    /// What a tag's component returned, or `None`, with a notice, if there's no such component.
-    fn render_tag(&mut self, tag: &Tag) -> Option<Element> {
+    /// What a tag's component returned, or `None`, with a notice, if there's no such
+    /// component. It looks for a built-in first, then for one of the talk's own. `room` is
+    /// the width and height of the box the tag sits in, where a height of 0 grows with it.
+    /// A talk's component that can't give an element gives a problem in its place.
+    fn render_tag(&mut self, tag: &Tag, room: (f32, f32)) -> Option<Element> {
         if tag.name == TEXT_TAG {
             return Some(Element::Children);
         }
-        let Some(component) = self.env.registry.get(&tag.name) else {
-            self.notice(format!("There is no component called {}", tag.name));
-            return None;
-        };
         let attrs = tag.attrs.iter().filter(|attr| !PLACEMENT_ATTRS.contains(&attr.name.as_str()));
         // Backwards, so that the first of a repeated attribute wins, as it does in `Tag::attr`.
-        let props = Props(attrs.rev().map(|attr| (attr.name.clone(), attr.value.clone())).collect());
+        let props = attrs.rev().map(|attr| (attr.name.clone(), attr.value.clone())).collect();
         let data = CtxData {
             click_step: 0,
             time: 0.0,
             slide_width: SLIDE_WIDTH,
             slide_height: SLIDE_HEIGHT,
-            width: 0.0,
-            height: 0.0,
+            width: room.0,
+            height: room.1,
             theme: self.theme.clone(),
         };
-        let ctx = Ctx::new(data, &|_| None);
-        Some((component.render)(&props, &ctx))
+        if let Some(component) = self.env.registry.get(&tag.name) {
+            let (files, used) = (self.env.files, Cell::new(0));
+            let assets = |path: &str| read_asset(files, path, &used);
+            let ctx = Ctx::new(data, &assets);
+            return Some((component.render)(&Props(props), &ctx));
+        }
+        let name = &tag.name;
+        let Some(rendered) = self.env.components.render(name, &RenderInput { props, ctx: data }) else {
+            self.notice(format!("There is no component called {name}"));
+            return None;
+        };
+        Some(match rendered {
+            Rendered::Output(output) => {
+                if self.env.components.is_out_of_date(name) {
+                    self.notice(format!("{name} is out of date, so this is its last build"));
+                }
+                output.element
+            }
+            Rendered::NeedsBuilding => toolkit::problem(format!("{name} needs building")),
+            Rendered::Failed(error) => toolkit::problem(format!("{name}: {}", error.short())),
+            Rendered::OutOfTime => toolkit::problem(format!("{name}: {NOT_RUN}")),
+        })
     }
 
     /// The size `element` has of its own, if it has one.
@@ -191,7 +218,7 @@ impl Flow<'_, '_> {
         if is_positioned(tag) {
             self.notice(format!("{} is inside another tag, so the place it asks for is ignored", tag.name));
         }
-        match self.render_tag(tag) {
+        match self.render_tag(tag, (self.width, 0.0)) {
             Some(element) => self.with_text_style_of(tag, |flow| flow.element(&element, &tag.children, align, false)),
             None => Some(self.block_placeholder(tag.name.clone())),
         }
