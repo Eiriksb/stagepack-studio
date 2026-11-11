@@ -17,6 +17,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 slides-components = { path = "../components" }
 slides-engine = { path = "../engine" }
+slides-format = { path = "../format" }
 slides-pdf = { path = "../pdf" }
 slides-pptx = { path = "../pptx" }
 

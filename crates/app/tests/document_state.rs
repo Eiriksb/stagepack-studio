@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use slides_engine::{Fonts, Layer, pack_folder};
-use stagepack_studio::document::{Document, OpenProblem, Reload};
+use stagepack_studio::document::{Document, EditRefused, OpenProblem, Reload};
 use stagepack_studio::export::{ExportKind, run_export};
 use zip::ZipArchive;
 use zip::write::SimpleFileOptions;
@@ -577,4 +577,196 @@ fn an_export_of_a_packed_talk_reads_the_pack() {
             .any(|name| name.starts_with("ppt/media/")),
         "the picture is in the file"
     );
+}
+
+/// An edit to make, and what Undo calls it.
+type NamedEdit = (&'static str, fn(&mut Document));
+
+const FOUR_SLIDES: &str = "---\r\ntitle: Review\r\n---\r\n\r\n# One\r\n\r\n---\r\n\r\n# Two  \r\n\r\n---\r\n\r\n# Three\r\n\r\n---\r\n\r\n# Four\r\n";
+
+#[test]
+fn undo_goes_back_through_every_kind_of_change() {
+    let (_d, mut doc) = talk(FOUR_SLIDES);
+    let mut texts = vec![doc.source().to_string()];
+    let mut labels = Vec::new();
+    let steps: [NamedEdit; 6] = [
+        ("Add slide", |doc| drop(doc.add_slide("title").unwrap())),
+        ("Duplicate slide", |doc| drop(doc.duplicate_current().unwrap())),
+        ("Move slide", |doc| drop(doc.move_slide(0, 3).unwrap())),
+        ("Hide slide", |doc| drop(doc.set_current_hidden(true).unwrap())),
+        ("Edit notes", |doc| drop(doc.set_notes(1, "Say this").unwrap())),
+        ("Delete slide", |doc| drop(doc.delete_current().unwrap())),
+    ];
+    for (label, step) in steps {
+        step(&mut doc);
+        assert_ne!(doc.source(), texts.last().unwrap(), "{label} changed nothing");
+        assert_eq!(doc.undo_label(), Some(label));
+        texts.push(doc.source().to_string());
+        labels.push(label);
+    }
+    assert!(doc.has_unsaved_changes());
+    for (text, label) in texts.iter().rev().skip(1).zip(labels.iter().rev()) {
+        assert_eq!(doc.undo_label(), Some(*label));
+        assert!(doc.undo().is_some());
+        assert_eq!(doc.source(), text, "after undoing {label}");
+        assert_eq!(doc.redo_label(), Some(*label));
+    }
+    assert!(!doc.can_undo());
+    assert!(!doc.has_unsaved_changes(), "back to the text as it was opened");
+    for (text, label) in texts.iter().skip(1).zip(&labels) {
+        assert!(doc.redo().is_some());
+        assert_eq!(doc.source(), text, "after redoing {label}");
+    }
+    assert!(!doc.can_redo());
+    assert!(doc.undo().is_some());
+    assert_eq!(doc.source(), texts[texts.len() - 2]);
+}
+
+#[test]
+fn the_current_slide_follows_what_changed() {
+    let (_d, mut doc) = talk(FOUR_SLIDES);
+    doc.select(2);
+    doc.delete_current().unwrap();
+    doc.select(0);
+    doc.undo().unwrap();
+    assert_eq!(doc.current(), 2);
+    assert!(doc.notes_of(2).is_none());
+
+    doc.move_slide(3, 1).unwrap();
+    assert_eq!(doc.current(), 1, "where the slide went");
+    doc.select(0);
+    doc.undo().unwrap();
+    assert_eq!(doc.current(), 3, "where the slide came back to");
+    doc.redo().unwrap();
+    assert_eq!(doc.current(), 1);
+}
+
+#[test]
+fn adding_a_slide_makes_it_the_current_one() {
+    let (_d, mut doc) = talk(FOUR_SLIDES);
+    doc.select(1);
+    let shown = doc.add_slide("section").unwrap();
+    assert_eq!(doc.current(), 2);
+    assert_eq!(doc.slide_count(), 5);
+    assert!(shown.contains(&2), "{shown:?}");
+    assert!(doc.source().contains("# Two  \r\n\r\n---\r\nlayout: section\r\n---\r\n"), "{:?}", doc.source());
+    assert_eq!(doc.talk().slides[2].settings.as_ref().unwrap().get("layout"), Some("section"));
+    doc.undo().unwrap();
+    assert_eq!(doc.source(), FOUR_SLIDES);
+    assert_eq!(doc.current(), 1, "the slide it was added after");
+}
+
+#[test]
+fn a_content_slide_needs_no_settings() {
+    let (_d, mut doc) = talk("# One\n");
+    doc.add_slide("content").unwrap();
+    assert_eq!(doc.source(), "# One\n---\n# \n");
+    assert!(doc.talk().slides[1].settings.is_none());
+}
+
+#[test]
+fn deleting_the_last_slide_moves_to_the_one_before() {
+    let (_d, mut doc) = talk(FOUR_SLIDES);
+    doc.select(3);
+    doc.delete_current().unwrap();
+    assert_eq!(doc.current(), 2);
+    assert_eq!(doc.slide_count(), 3);
+}
+
+#[test]
+fn the_only_slide_cannot_be_deleted() {
+    let (_d, mut doc) = talk("# One\n");
+    assert_eq!(doc.delete_current().unwrap(), Vec::<usize>::new());
+    assert_eq!(doc.source(), "# One\n");
+    assert!(!doc.can_undo());
+    assert!(!doc.has_unsaved_changes());
+}
+
+#[test]
+fn a_reload_from_disk_empties_the_history() {
+    let (_d, mut doc) = talk(FOUR_SLIDES);
+    doc.set_current_hidden(true).unwrap();
+    assert!(matches!(doc.reload(Some(doc.source().to_string())), Reload::Unchanged));
+    assert!(doc.can_undo(), "the same text keeps the history");
+
+    doc.reload(Some("# Other\n".into()));
+    assert!(!doc.can_undo());
+    assert!(!doc.can_redo());
+    assert!(!doc.has_unsaved_changes());
+    assert_eq!(doc.source(), "# Other\n");
+}
+
+#[test]
+fn typing_notes_in_a_row_is_one_step() {
+    let (_d, mut doc) = talk(FOUR_SLIDES);
+    for typed in ["S", "Sa", "Say", "Say t", "Say this"] {
+        doc.set_notes(1, typed).unwrap();
+    }
+    assert_eq!(doc.notes_of(1).as_deref(), Some("Say this"));
+    doc.undo().unwrap();
+    assert_eq!(doc.source(), FOUR_SLIDES);
+    assert!(!doc.can_undo());
+    doc.redo().unwrap();
+    assert_eq!(doc.notes_of(1).as_deref(), Some("Say this"));
+}
+
+#[test]
+fn notes_typed_after_something_else_are_a_step_of_their_own() {
+    let (_d, mut doc) = talk(FOUR_SLIDES);
+    doc.set_notes(1, "One").unwrap();
+    doc.set_notes(2, "Two").unwrap();
+    doc.set_notes(1, "One more").unwrap();
+    doc.undo().unwrap();
+    assert_eq!(doc.notes_of(1).as_deref(), Some("One"));
+    assert_eq!(doc.notes_of(2).as_deref(), Some("Two"));
+}
+
+#[test]
+fn hiding_and_showing_say_so() {
+    let (_d, mut doc) = talk(FOUR_SLIDES);
+    doc.select(1);
+    doc.set_current_hidden(true).unwrap();
+    assert_eq!(doc.undo_label(), Some("Hide slide"));
+    assert_eq!(doc.shown_count(), 3);
+    doc.set_current_hidden(false).unwrap();
+    assert_eq!(doc.undo_label(), Some("Show slide"));
+    assert_eq!(doc.source(), FOUR_SLIDES);
+}
+
+#[test]
+fn an_edit_that_would_break_a_slide_is_refused() {
+    let (_d, mut doc) = talk("# One\n\n---\n\n# Two\n");
+    // A slide too large to read.
+    let change = slides_format::Change::single(slides_format::SourceEdit {
+        range: 5..5,
+        text: "x".repeat(40 * 1024),
+    });
+    let refused = doc.edit("Edit", change, 0).unwrap_err();
+    assert_eq!(refused, EditRefused::WouldBreakASlide);
+    assert_eq!(refused.to_string(), "That change would have broken another slide, so it wasn't made.");
+    assert_eq!(doc.source(), "# One\n\n---\n\n# Two\n");
+    assert!(!doc.can_undo());
+    assert!(doc.talk().slides.iter().all(|slide| slide.error.is_none()));
+}
+
+#[test]
+fn an_edit_that_would_merge_slides_is_refused() {
+    let (_d, mut doc) = talk("# One\n\n---\n\n# Two\n");
+    let change = slides_format::Change::single(slides_format::SourceEdit { range: 7..11, text: String::new() });
+    let refused = doc.edit("Edit", change, 0).unwrap_err();
+    assert_eq!(refused, EditRefused::WouldChangeTheSlides);
+    assert_eq!(doc.source(), "# One\n\n---\n\n# Two\n");
+    assert_eq!(doc.slide_count(), 2);
+    assert!(!doc.can_undo());
+}
+
+#[test]
+fn a_slide_that_was_already_broken_can_still_be_moved() {
+    let big = "x".repeat(40 * 1024);
+    let (_d, mut doc) = talk(&format!("# One\n\n---\n\n{big}\n"));
+    assert!(doc.talk().slides[1].error.is_some());
+    doc.move_slide(1, 0).unwrap();
+    assert!(doc.talk().slides[0].error.is_some());
+    doc.duplicate_current().unwrap();
+    assert_eq!(doc.slide_count(), 3);
 }

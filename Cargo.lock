@@ -7153,6 +7153,7 @@ dependencies = [
  "serde_json",
  "slides-components",
  "slides-engine",
+ "slides-format",
  "slides-pdf",
  "slides-pptx",
  "tempfile",

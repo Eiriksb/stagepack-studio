@@ -6,11 +6,14 @@ use std::sync::Arc;
 use slides_components::Diagnostic;
 use slides_engine::{
     ComponentInfo, Deck, FolderFiles, Fonts, Layer, LayerTiming, Moment, PackError, SlideTimeline,
-    TalkFiles, Transition, open_packed, pack_folder, read_talk_text, unpack_to_folder,
+    TalkFiles, Transition, layout_by_name, open_packed, pack_folder, read_talk_text,
+    unpack_to_folder,
 };
+use slides_format::{Change, Talk, split_slides};
 
 use crate::builds;
 use crate::export::ExportInput;
+use crate::history::History;
 use crate::present::TalkShape;
 
 pub(crate) const SLIDES_FILE: &str = "slides.md";
@@ -30,6 +33,42 @@ pub enum Reload {
     /// The read gave nothing to use, so the talk stays as it was.
     KeptLastGood,
 }
+
+/// Why an edit wasn't made. Nothing of it was applied, and there's nothing to undo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditRefused {
+    /// A slide that could be read would have become one that can't.
+    WouldBreakASlide,
+    /// The talk would have ended up with more or fewer slides than the edit was meant to give.
+    WouldChangeTheSlides,
+}
+
+impl std::fmt::Display for EditRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            EditRefused::WouldBreakASlide => {
+                "That change would have broken another slide, so it wasn't made."
+            }
+            EditRefused::WouldChangeTheSlides => {
+                "That change would have joined or split slides, so it wasn't made."
+            }
+        })
+    }
+}
+
+impl std::error::Error for EditRefused {}
+
+/// What Undo shows for each kind of edit.
+const ADD_SLIDE: &str = "Add slide";
+const DUPLICATE_SLIDE: &str = "Duplicate slide";
+const DELETE_SLIDE: &str = "Delete slide";
+const MOVE_SLIDE: &str = "Move slide";
+const HIDE_SLIDE: &str = "Hide slide";
+const SHOW_SLIDE: &str = "Show slide";
+const EDIT_NOTES: &str = "Edit notes";
+
+/// The layout a slide has when its settings name none.
+const DEFAULT_LAYOUT: &str = "content";
 
 /// Why a packed file didn't open.
 #[derive(Debug, PartialEq, Eq)]
@@ -117,6 +156,10 @@ pub struct Document {
     /// What to call the talk if it has no title setting.
     place_name: String,
     current: usize,
+    history: History,
+    /// The slide whose notes the last step was typed into, while nothing else has happened
+    /// since: more typing there joins that step.
+    typing_notes: Option<usize>,
 }
 
 impl Document {
@@ -181,6 +224,8 @@ impl Document {
             files,
             talk_fonts,
             current: 0,
+            history: History::new(),
+            typing_notes: None,
         }
     }
 
@@ -206,12 +251,21 @@ impl Document {
 
     pub fn next(&mut self) {
         if self.current + 1 < self.slide_count() {
-            self.current += 1;
+            self.select(self.current + 1);
         }
     }
 
     pub fn previous(&mut self) {
-        self.current = self.current.saturating_sub(1);
+        self.select(self.current.saturating_sub(1));
+    }
+
+    /// Makes slide `index` the current one, or the last if there's no such slide.
+    pub fn select(&mut self, index: usize) {
+        let index = index.min(self.slide_count() - 1);
+        if index != self.current {
+            self.current = index;
+            self.typing_notes = None;
+        }
     }
 
     /// What the talk is called: its title setting, or else the name of its folder or file.
@@ -274,6 +328,181 @@ impl Document {
         self.deck.source()
     }
 
+    /// The talk as it is now: its slides, and where each sits in the text.
+    pub fn talk(&self) -> &Talk {
+        self.deck.talk()
+    }
+
+    /// Makes `change` to the talk's text, named `label` for Undo, and returns the slides to
+    /// show again. `slides` is how the number of slides is meant to change: 0, 1 or -1.
+    ///
+    /// The change is refused, and nothing applied or recorded, if it would leave a slide that
+    /// could be read as one that can't, or change the number of slides by anything else. An
+    /// empty change does nothing.
+    pub fn edit(
+        &mut self,
+        label: &'static str,
+        change: Change,
+        slides: isize,
+    ) -> Result<Vec<usize>, EditRefused> {
+        let current = self.current;
+        self.make(label, change, slides, current, current)
+    }
+
+    /// Makes `change` as [`Self::edit`] does. `before` is the slide it's about in the text
+    /// as it is, and `after` the one it's about once made, which becomes the current slide.
+    fn make(
+        &mut self,
+        label: &'static str,
+        change: Change,
+        slides: isize,
+        before: usize,
+        after: usize,
+    ) -> Result<Vec<usize>, EditRefused> {
+        if change.is_empty() {
+            return Ok(Vec::new());
+        }
+        let old = self.source().to_string();
+        let old_count = self.slide_count();
+        let broken_before = broken_bodies(self.talk());
+        let undo = change.inverse(&old);
+        let mut changed = self.deck.update(change.apply(&old));
+        let refused = if old_count.checked_add_signed(slides) != Some(self.slide_count()) {
+            Some(EditRefused::WouldChangeTheSlides)
+        } else if broken_bodies(self.talk())
+            .iter()
+            .any(|body| !broken_before.contains(body))
+        {
+            Some(EditRefused::WouldBreakASlide)
+        } else {
+            None
+        };
+        if let Some(refused) = refused {
+            self.deck.update(old);
+            return Err(refused);
+        }
+        let joins_typing = label == EDIT_NOTES && self.typing_notes == Some(after);
+        if joins_typing && self.history.can_undo() {
+            self.history.extend_last(&old, self.deck.source());
+        } else {
+            self.history.record(label, undo, before, after);
+        }
+        self.typing_notes = (label == EDIT_NOTES).then_some(after);
+        self.show(after, &mut changed);
+        Ok(changed)
+    }
+
+    /// Makes `index` the current slide after an edit, and adds it to `changed` if it isn't
+    /// there: its text may be as it was, but it's now the slide to show.
+    fn show(&mut self, index: usize, changed: &mut Vec<usize>) {
+        let index = index.min(self.slide_count() - 1);
+        if index != self.current {
+            self.current = index;
+            if !changed.contains(&index) {
+                changed.push(index);
+            }
+        }
+    }
+
+    /// Takes the last edit back, and returns the slides to show again: `None` if there was
+    /// nothing to undo.
+    pub fn undo(&mut self) -> Option<Vec<usize>> {
+        let step = self.history.undo(self.deck.source())?;
+        Some(self.take_step(step))
+    }
+
+    /// Makes the last undone edit again, and returns the slides to show again: `None` if
+    /// there was nothing to redo.
+    pub fn redo(&mut self) -> Option<Vec<usize>> {
+        let step = self.history.redo(self.deck.source())?;
+        Some(self.take_step(step))
+    }
+
+    fn take_step(&mut self, step: crate::history::Step) -> Vec<usize> {
+        let source = step.change.apply(self.deck.source());
+        let mut changed = self.deck.update(source);
+        self.typing_notes = None;
+        self.show(step.current, &mut changed);
+        changed
+    }
+
+    pub fn can_undo(&self) -> bool {
+        self.history.can_undo()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.history.can_redo()
+    }
+
+    /// What Undo would take back, such as "Add slide".
+    pub fn undo_label(&self) -> Option<&'static str> {
+        self.history.undo_label()
+    }
+
+    /// What Redo would make again.
+    pub fn redo_label(&self) -> Option<&'static str> {
+        self.history.redo_label()
+    }
+
+    /// Whether the talk has edits that its file doesn't.
+    pub fn has_unsaved_changes(&self) -> bool {
+        !self.history.is_saved()
+    }
+
+    /// Adds a slide with the layout called `layout` after the current one, with an empty
+    /// heading, and makes it the current slide. A name that isn't a layout's is taken as the
+    /// default one.
+    pub fn add_slide(&mut self, layout: &str) -> Result<Vec<usize>, EditRefused> {
+        let layout = layout_by_name(layout).map_or(DEFAULT_LAYOUT, |layout| layout.name);
+        let text = if layout == DEFAULT_LAYOUT {
+            "# \n".to_string()
+        } else {
+            format!("layout: {layout}\n---\n\n# \n")
+        };
+        let at = self.current;
+        let change = slides_format::insert_slide(self.talk(), Some(at), &text);
+        self.make(ADD_SLIDE, change, 1, at, at + 1)
+    }
+
+    /// Puts a copy of the current slide straight after it, and makes the copy current.
+    pub fn duplicate_current(&mut self) -> Result<Vec<usize>, EditRefused> {
+        let at = self.current;
+        let change = slides_format::duplicate_slide(self.talk(), at);
+        self.make(DUPLICATE_SLIDE, change, 1, at, at + 1)
+    }
+
+    /// Removes the current slide, unless it's the only one. The one after it becomes
+    /// current, or the one before when it was last.
+    pub fn delete_current(&mut self) -> Result<Vec<usize>, EditRefused> {
+        let at = self.current;
+        let Some(change) = slides_format::delete_slide(self.talk(), at) else {
+            return Ok(Vec::new());
+        };
+        let after = at.min(self.slide_count() - 2);
+        self.make(DELETE_SLIDE, change, -1, at, after)
+    }
+
+    /// Moves slide `from` so that `to` is its place afterwards, and makes it current.
+    pub fn move_slide(&mut self, from: usize, to: usize) -> Result<Vec<usize>, EditRefused> {
+        let change = slides_format::move_slide(self.talk(), from, to);
+        self.make(MOVE_SLIDE, change, 0, from, to)
+    }
+
+    /// Leaves the current slide out of shows, or puts it back in.
+    pub fn set_current_hidden(&mut self, hidden: bool) -> Result<Vec<usize>, EditRefused> {
+        let at = self.current;
+        let change = slides_format::set_hidden(self.talk(), at, hidden);
+        let label = if hidden { HIDE_SLIDE } else { SHOW_SLIDE };
+        self.make(label, change, 0, at, at)
+    }
+
+    /// Sets the notes of slide `index`, and makes it current. Notes typed into one slide
+    /// with nothing else done in between are one step to undo.
+    pub fn set_notes(&mut self, index: usize, notes: &str) -> Result<Vec<usize>, EditRefused> {
+        let change = slides_format::set_notes(self.talk(), index, notes);
+        self.make(EDIT_NOTES, change, 0, index, index)
+    }
+
     /// The talk's own components, and whether each is built.
     pub fn components(&self) -> &[ComponentInfo] {
         self.deck.components()
@@ -331,6 +560,11 @@ impl Document {
         let same_text = source == self.source();
         // Even the same text goes through: a picture it shows may have been replaced.
         let mut changed = self.deck.update(source);
+        if !same_text {
+            // Its steps are ranges of the text it had, which no longer fit.
+            self.history = History::new();
+            self.typing_notes = None;
+        }
         if same_text && changed.is_empty() {
             return Reload::Unchanged;
         }
@@ -359,6 +593,20 @@ impl TalkShape for Document {
     fn transition(&mut self, slide: usize) -> Transition {
         self.timeline_of(self.shown_slide(slide)).transition
     }
+}
+
+/// What the slides of `talk` that can't be read hold, past any settings, without the blank
+/// lines around it. A slide like that moves, or is copied, as it is, and is still one of these.
+fn broken_bodies(talk: &Talk) -> Vec<String> {
+    if talk.slides.iter().all(|slide| slide.error.is_none()) {
+        return Vec::new();
+    }
+    split_slides(&talk.source)
+        .iter()
+        .zip(&talk.slides)
+        .filter(|(_, slide)| slide.error.is_some())
+        .map(|(raw, _)| talk.source[raw.body.clone()].trim().to_string())
+        .collect()
 }
 
 /// The folder's own name, even for a path like `talk/..`.

@@ -362,6 +362,11 @@ impl Deck {
         &self.talk.source
     }
 
+    /// The talk as it was last read: its slides, and where each sits in the text.
+    pub fn talk(&self) -> &Talk {
+        &self.talk
+    }
+
     pub fn title(&self) -> Option<String> {
         self.talk.slides.first()?.settings.as_ref()?.get("title").map(str::to_string)
     }

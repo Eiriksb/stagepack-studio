@@ -4,6 +4,7 @@ pub mod builds;
 pub mod cargo_file;
 pub mod document;
 pub mod export;
+pub mod history;
 pub mod markdown_panel;
 pub mod permissions;
 pub mod present;
