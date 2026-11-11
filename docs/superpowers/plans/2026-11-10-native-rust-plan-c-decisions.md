@@ -1,0 +1,102 @@
+# Plan C: decisions made while building
+
+The calls made during plan C without asking the owner, and the smaller findings and notes left for later. Each decision says what it costs if it's wrong. They are in the order they were made, so a later one can replace an earlier one: the final review's rulings on the Cargo project, the module size and the build limits replace the task-level ones. The final review triaged every smaller finding, and those it wanted fixed were fixed in its fix wave, so some entries below are closed. `docs/checks/plan-c.md` has what ran.
+
+## Rulings
+
+- **Setup.** No linked worktree, the plan's Global Constraints name branch plan-c in this checkout. A worktree would rebuild the 31 GB GPUI cache. Cost if wrong: The owner's uncommitted roadmap edit shares the checkout, and it stays unstaged.
+- **Setup.** The form on screen waits for plan D3, plan C delivers the schema and Deck::component_schema. Nothing can be selected on a slide yet, and the roadmap's D3 names the palette with its forms. Cost if wrong: The success test's form arrives one stage later.
+- **Setup.** The guide's worked example is bars.rs, a small bar chart built the way Chart is, and the spec sentence now says so. Chart itself is too long to teach from. Cost if wrong: A sentence in the spec.
+- **Pre-flight.** T1's macro must recognise &Ctx and &Ctx<'_> by the path's last segment. Is_ident is false once there are generic arguments. Cost if wrong: A compile error at once.
+- **Pre-flight.** In T5 abi_version and schema at load run under the same store limits and epoch deadline as a render. They are the talk's code too. Cost if wrong: None.
+- **Pre-flight.** T7 may touch every place that builds a LayerSpec, tests included, beyond its file list. The new field makes that unavoidable. Cost if wrong: None.
+- **Pre-flight.** T9 and T10 may add wat to crates/app/Cargo.toml as a dev-dependency. Their tests write WAT modules. Cost if wrong: None.
+- **Task 1.** MAX_ELEMENT_DEPTH is 40, not 64, in Task 5. Serde_json's default limit stops a parse at about 43 nested stacks, and turning that limit off would run an unbounded parse on a module's output inside the app. Cost if wrong: A component nested 41 levels deep shows a labelled box.
+- **Task 1.** Picture takes PictureFile, beyond the brief. A picture argument is what makes a form show a file picker, and a slide draws the same. Cost if wrong: None.
+- **Task 2.** A path whose coordinates pass 1e6, or aren't finite, is a placeholder with a notice. Beyond the brief, and it keeps a hostile path from making absurd extents. Cost if wrong: A drawing that large can't be shown.
+- **Task 3.** A_slide_with_a_path_exports_a_freeform goes through element_xml for now, and Task 7 adds the end-to-end test through write_pptx. Deck has no way to register a path-making component until Task 6's Deck::with_registry. Cost if wrong: One more test later.
+- **Task 4.** Macro_rules is refused in a component, beyond the plan's list. A macro can rebuild mod a; or #[path] from pieces the token scan can't see, which the implementer showed reading a file on rustc 1.98. Cost if wrong: Coders can't write their own macros in a component, and the guide must say so (carry to Task 11).
+- **Task 4.** Only rustc's time is limited, not its memory. A compile only ever follows a deliberate yes, and the app has no portable way to cap a child's memory. Cost if wrong: A hostile component someone chose to build can use a lot of memory for up to 60 seconds.
+- **Task 4.** Names in a component are ASCII only (carry to Task 11's guide). Unicode-ident and rustc disagree on 12,860 code points, and rustc drops an unknown one and still expands the macro. Cost if wrong: A coder can't use non-ASCII identifiers, and strings are unaffected.
+- **Task 5.** The automated finding about asset reads is closed in Task 6, where the real assets closure is written: it checks a file's length before reading and refuses over 64 MiB, and a render's reads total at most 64 MiB. The sandbox only sees bytes after the closure has read them, and the reviewer's probe showed the 250 ms limit does hold across host calls, give or take one read. Cost if wrong: One over-large read per render before the refusal.
+- **Task 6.** Only render time counts against a slide's 1 s budget, not loading a module. Loading happens once per module and takes 1.6 s in a debug build, so counting it would show components as not run on first layout. Cost if wrong: A talk of many large modules is slow to show its first slide.
+- **Task 6.** A component the budget stopped says "{tag}: not run, as this slide's components took too long". The plan gave no wording. Cost if wrong: A sentence.
+- **Task 7.** The PowerPoint notice keeps its "Slide N: " prefix. Every other per-slide export notice has it. Cost if wrong: None.
+- **Task 7.** Task 9 must take a moment's layer timings from the same layout as its layers, through a new Deck::timings_at(index, moment), not pair layers_at with timeline().layers. In a click=each region a component that returns Empty at one step and something at another changes the number of pieces, since flow.block gives no node for an empty element. Cost if wrong: One extra method.
+- **Task 8.** Axis ticks are whole multiples of a step of 1, 2, 2.5 or 5 times a power of ten, with 0 always a tick, replacing the plan's five evenly spaced ticks. The plan's rule drew 8.75, 22.5 and 36.25 with no 0. Cost if wrong: An axis can run a little past the data.
+- **Task 8.** A line draws its points only when they're at least 24 apart, and a pie shows the first series with a legend of labels and percentages. A 1000-point line of dots is a smear, and a pie has one series by nature. Cost if wrong: Small visual choices.
+- **Task 10.** The watcher is not recursive, against the plan's word. It watches the talk folder and its components folder only, and follows no link, as a whole-tree watch can run out of inotify watches on a hostile or simply large talk. Cost if wrong: None, only slides.md and components/*.rs ever counted.
+- **Setup.** A subagent's commit keeps the attribution line its own session gives it (Opus 5.5 for opus-run implementers), and commits made by the controller use Fable 5.2. The line should name the model that wrote the commit. Cost if wrong: A trailer to amend.
+- **Task 11.** The Cargo file is written with build = false and autolib = false, and refused while the talk holds build.rs, .cargo, rust-toolchain(.toml) or src. Cargo would otherwise run a received talk's code natively as soon as an editor checked the project. Cost if wrong: A coder with their own build.rs must remove it first.
+- **Task 11.** The Cargo file's checks run at write time only, and the app and guide say plainly to use a code editor only on a talk you trust. Cargo and editors read config from the folder, its parents and files that arrive later, which no write-time check can cover, and the action is an opt-in menu item for coders. Cost if wrong: Someone sets up an untrusted talk for their editor, pulls a planted .cargo/config.toml later, and their editor runs its command. A stricter design would write the Cargo project outside the talk folder.
+- **Task 11.** MUST FIX in the final wave. The Cargo file check becomes an allow-list, not a list of refused names: write_cargo_file refuses when the talk folder holds any entry other than slides.md, talk.json, components, assets, build, .git, .gitignore, .gitattributes, and files named README* or LICENSE*, naming the first unexpected entry — an automated review found rust-project.json and .devcontainer missing from the refused names, and a deny-list will always miss the next tool's config. Cost if wrong: A coder with other files in their talk folder must move them before setting up an editor.
+- **Task 12.** Always build this folder is only offered while something needs building, and the slide changes size when the build bar comes and goes. Recorded by the real run, not changed. Cost if wrong: A coder with everything built can't turn Always on until their next edit. Final review to weigh.
+- **Final.** One layout budget per slide. 50,000 flow nodes, depth 64 in total across Markdown and components, Children placed at most once, 256 KiB of text per answer — a talk that was only opened took 101 s and 12 GB, and overflowed a 1 MiB stack. Cost if wrong: A very dense slide shows a box saying it has too much on it.
+- **Final.** A module is at most 4 MiB and a talk loads at most 16 MiB of them, down from 16 MiB each. Loading took 11.7 s for a 15 MiB module on the UI thread, and a real component is about 180 KB. Cost if wrong: A very large component can't run. Loading stays on the UI thread, up to about 12 s once at the limit.
+- **Final.** A build is stopped past 64 MiB of scratch space, and on Linux past 4 GiB of memory, narrowing Task 4's ruling. A three-line source took 10.5 GB. Cost if wrong: Windows still has no memory cap on a build.
+- **Final.** The Cargo project is written outside the talk folder, in the app's data folder, superseding the allow-list ruling and the write-time checks. Cargo and editors read settings from the project folder upwards, so nothing in or above a talk is consulted, now or later. Cost if wrong: A coder opens a second folder in their editor to get completions.
+- **Final.** Thirteen-plus argument names are kept for the slide and are a compile error in a component (x, y, w, h, rotate, click, enter, z, opacity, id, class, style, exit, key, ref, slot). A placement attribute added later would otherwise steal a prop from talks already written. Cost if wrong: A coder picks another name.
+- **Final.** The toolkit's interface types are non_exhaustive and get builders, and an unknown toolkit import loads as a trap. Nothing has shipped, and both keep later versions from breaking old sources and old apps. Cost if wrong: None now.
+- **Final.** A changed asset refreshes the components that read it, and the app watches assets/ one level deep. A chart kept its old numbers after its CSV was edited. Cost if wrong: One more watch.
+- **Final.** Left alone — where Always build is offered, the slide resizing with the build bar, unclipped canvas items, built-ins' colours as text in their schemas, asks taken from the start layout, the time budget depending on load.
+- **Final.** The re-review's two Important items and three of its minors are fixed by the controller, not parked. An asset change missed when another slide read the file first, the guide's promise about code editors, a folder left in the talk by a refused project, a stale comment and a stale count — each a few lines, with a failing test first for the code. Cost if wrong: These few lines had no reviewer but the tests.
+- **Final.** The guide says plainly that the code editor project protects only Cargo run from the project's folder, and that completions in an editor are untried. Cargo finds settings from the working folder upwards, and an editor reads settings from any folder opened as a project. Cost if wrong: None, it's what is true.
+
+## Smaller findings and notes
+
+- **Task 1.** A non-finite float makes a component's whole answer unreadable: f32::from_attr accepts "NaN" and "inf", and serde_json writes those as null, which a non-optional f32 refuses. It fails safe as a labelled box.
+- **Task 1.** The JSON depth ceiling depends on the element: about 42 levels of Stack, 31 of Canvas, 63 of Shape, against serde_json's 128.
+- **Task 1.** The macro's wasm half is first exercised by Task 4's ignored tests and Task 5's score.wasm fixture; confirm scripts/test-components.sh runs.
+- **Task 2.** An_absurd_canvas_is_held_to_the_limits only checks the layer's rect, and would pass with item clamping removed.
+- **Task 2.** No test for a Quad step, or for a stroke of width 0 falling back to the text-colour fill.
+- **Task 2.** Items aren't clipped to their canvas, and an item with no width can wrap at the canvas edge.
+- **Task 3.** Freeform_xml doesn't validate its stroke width, its caller write.rs does.
+- **Task 3.** The test name points_are_never_negative_in_a_box_of_no_size promises more than it checks; only box extents are held to zero.
+- **Task 4.** The refusal list has been checked against rustc 1.98 only, and needs another look whenever the bundled compiler changes.
+- **Task 4.** Make-bundle.ps1 has not even been parsed, as this machine has no PowerShell.
+- **Task 4.** Make-bundle.sh and .ps1 read rustc's sysroot before cd "$repo"; if a rust-toolchain file is added later, a run from another folder would mix toolchains.
+- **Task 4.** Compile_with_limit has no source-size cap, and the 1 MiB limit is applied by Task 6's scan; Task 10's build path must only compile what that scan accepted (carry to Task 10).
+- **Task 4.** Cargo fmt --check flags code in crates/components/src/compile.rs.
+- **Setup.** From 2026-11-11 commits end with Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>.
+- **Task 5.** Module::new isn't time-limited; a 16 MiB module could take seconds to compile on the thread that calls load. Loading takes about 1.6 s in a debug build and 100 ms in release for score.wasm.
+- **Task 5.** An input over u32::MAX maps to TooLarge, which describes the component, not the app's input.
+- **Task 5.** A new Linker is built for every run.
+- **Task 6.** Build/index.json is re-read and re-parsed on every Deck::update, even for a folder talk with a stamp.
+- **Task 6.** A refused source (unsafe name, too large, not UTF-8, past the 256 cap, no component) leaves its tag's build running as a build with no source, marked UpToDate. Worth fixing in the final wave.
+- **Task 6.** The build cache is keyed on length and modified time only; a same-length replacement within the timestamp's precision goes unnoticed.
+- **Task 6.** Rescan stats every remembered path again in its retain calls.
+- **Task 7.** A_slide_that_moves_is_still_at_time_zero_for_an_export and the_whole_slide_is_its_last_step never ask for another moment first, so they can't fail the way they should.
+- **Task 7.** No test that going back to an earlier moment redraws that moment's pixels (step 0, step 2, step 0). Traced by hand as correct.
+- **Task 7.** Steps past what a component asked for get new layer keys and redraw identical pixels.
+- **Task 7.** LayoutEnv.asks is a public field callers must supply though layout_slide overwrites it; ComponentAsks::note and add repeat their logic.
+- **Task 7.** Notices and steps come only from the layout at Moment::START, so a notice raised only at a later step isn't reported.
+- **Task 7.** An animated slide is laid out again in full for each new time, so a show pays one layout per frame on such a slide.
+- **Task 8.** Sandbox::a_schema_that_never_returns_is_stopped failed its under-2-seconds timing once under full parallel load; it passes alone.
+- **Task 8.** The chart quotes untrusted text in its messages with no length cap ("x" isn't a number, the data path); use shortened(). Fix in the final wave.
+- **Task 8.** No byte cap on a chart's CSV before parsing, so a 64 MiB file is copied and scanned on every layout; refuse over 1 MiB. Fix in the final wave.
+- **Task 8.** A building line chart with crowded points draws nothing on its first click.
+- **Task 8.** No component-level test for a 1e15 value, 16 series by 1000 points, or a very long label.
+- **Task 9.** Only the audience view starts a slide's time, so a presenter-only show asks for frames forever at time 0; have PresenterView::animate call first_frame_drawn too. Fix in the final wave.
+- **Task 9.** On a moving slide each window renders at the display's refresh rate though layouts change at 30 Hz; weigh a 30 Hz timer in Task 12's real run.
+- **Task 9.** No test that the presenter's current canvas is redrawn as time passes, or that a save which keeps a moving slide leaves it moving.
+- **Task 9.** The next-step thumbnail evicts the single at_moment layout once per place change.
+- **Task 10.** Commit 7449ff1 was amended to ddedcd8, message only, for the attribution line.
+- **Task 10.** If writing the index fails after the .wasm was written, build/ has changed; the component then shows as out of date.
+- **Task 10.** The WAT module builder and counting fake compiler are duplicated in builds.rs and ui_slides.rs tests.
+- **Task 10.** Deck::refresh_components runs on the UI thread after each change and build, reading and hashing up to 256 sources.
+- **Task 10.** Permission is by path: an allowed folder deleted and replaced by someone else's talk at the same path stays allowed. Opening still never builds. Say so in the guide (Task 11).
+- **Task 10.** Public beyond the brief: BUILD_BAR_ID, set_permissions_for_test, document(), components_changed_soon; and the engine's component limits are now public.
+- **Task 10.** "one build at a time" has no direct test, and the Always choice is cached per window.
+- **Task 10.** The watcher's call skips silently if the on_change mutex is poisoned; the_folder_below_is_not_watched doesn't prove the watch count dropped.
+- **Task 11.** The guide doesn't mention that a render's asset reads total at most 64 MiB, or that a path with huge coordinates becomes a placeholder; its table of labelled boxes omits "There is no component called X".
+- **Task 11.** Score.rs draws its badge on a canvas, as the design's badge() helper was never defined; the_cargo_file_works_with_cargo lives in crates/app/tests/builds.rs and runs offline.
+- **Task 11.** The above-the-talk refusal says every file found "could make Cargo run other programs", which is loose for rust-toolchain.
+- **Task 12.** The clock slide used 0.88 of a core in a show under software rendering, against 0.05 on a still slide; memory stayed at 335 MB.
+- **Task 12.** Docs/checks/plan-c.md lists on-screen line and pie charts as not exercised, and the Windows check only looks at them as exports.
+- **Final.** In a click=each region, a top-level list over the node budget shows only the notice, no box.
+- **Final.** With Always build on, any change in assets starts a build pass, and a source that fails to compile is recompiled on every asset save.
+- **Final.** The compiler runs in its own process group, so if the app dies mid-build, rustc keeps running with nobody enforcing its limits; group_memory reads every process's stat every 50 ms during a build.
+- **Final.** A talk folder name over about 242 bytes can't get a code editor project; on Windows the project's paths are \\?\ paths, untried in an editor.
+- **Final.** The assets watch isn't recursive, so a change in a subfolder of assets is noticed only at the next update; sources past the 256 cap show a build bar that does nothing for them; the footer joins every notice with no cap on how many.
+- **Final.** Rust-analyzer hasn't been tried with component files outside the Cargo project's folder.
+- **Final.** Plan D: built-ins' colour and kind arguments are text in their schemas; component_schema gives None for an unbuilt component.

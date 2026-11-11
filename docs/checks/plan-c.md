@@ -6,12 +6,12 @@ After a review of the whole branch, a final wave of fixes added the limits under
 
 ## Tests on Linux
 
-At 1406cf7, `scripts/cargo-safe.sh test --workspace` passed: 920 tests, 0 failed, 8 ignored, no warnings. `scripts/cargo-safe.sh clippy --workspace --all-targets` gave no warnings.
+At ece0f34, `scripts/cargo-safe.sh test --workspace` passed: 921 tests, 0 failed, 8 ignored, no warnings. `scripts/cargo-safe.sh clippy --workspace --all-targets` gave no warnings.
 
 | Crate | Tests |
 | --- | --- |
 | slides-components | 64, and 5 ignored (sandbox 36, source_check 19, compile 4 and 4 ignored, examples 2 and 1 ignored, unit 3) |
-| slides-engine | 377, and 1 ignored (builtins 85, native 45, packed 42, talk_components 41, chart 39 and 1 ignored, flow 29, deck 26, moments 15, timeline 13, files 12, canvas 11, render 11, text 8) |
+| slides-engine | 378, and 1 ignored (builtins 85, native 45, packed 42, talk_components 42, chart 39 and 1 ignored, flow 29, deck 26, moments 15, timeline 13, files 12, canvas 11, render 11, text 8) |
 | slides-format | 60 (parse 35, edit 18, split 7) |
 | slides-pdf | 18 |
 | slides-pptx | 107 (elements 36, write 31, parts 20, timing 10, fonts 9, unit 1) |
@@ -91,7 +91,7 @@ The `plan-c` branch isn't pushed yet. This check starts once it has been merged 
 
 1. `git clone https://github.com/Eiriksb/stagepack-studio.git`, and work in that folder on `main`.
 2. `cargo test --workspace`. If only golden tests fail, the images differ slightly from Linux, so send back which ones.
-3. Build the bundle: `powershell -ExecutionPolicy Bypass -File scripts\make-bundle.ps1 -Out target\bundle`. This script has never run, so send back any error it gives, word for word. Then, in a Command Prompt in the same folder, `set STUDIO_BUNDLE=%CD%\target\bundle` and `cargo test --workspace -- --ignored`, and say whether those seven pass.
+3. Build the bundle: `powershell -ExecutionPolicy Bypass -File scripts\make-bundle.ps1 -Out target\bundle`. This script has never run, so send back any error it gives, word for word. Then, in a Command Prompt in the same folder, `set STUDIO_BUNDLE=%CD%\target\bundle` and `cargo test --workspace -- --ignored`, and say whether those eight pass.
 4. `cargo build --release -p stagepack-studio`. Make a folder such as `C:\StudioCheck`, and copy `target\release\stagepack-studio.exe` into it, and `target\bundle` into it as `C:\StudioCheck\bundle`. Copy `fixtures\components` to `C:\StudioCheck\components`.
 5. Sign in to the account with no Rust. Check that `rustc --version` in a new Command Prompt says it's not recognised. Run `C:\StudioCheck\stagepack-studio.exe C:\StudioCheck\components`. The bar should offer *Build components*. Press it, and say how many seconds it takes for the scores on slide 2 to appear, or what the panel says instead. Then press F5, and Right through the talk: the three lines come one per click, the clock's hand turns, and the chart adds a bar per click. Press Escape.
 6. In the same folder, make `C:\StudioCheck\charts\slides.md` holding:
