@@ -13,7 +13,6 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use notify::RecommendedWatcher;
 use slides_components::Diagnostic;
 use slides_engine::{ComponentState, Fonts};
 
@@ -138,7 +137,7 @@ pub struct WorkspaceView {
     show_markdown: bool,
     focus_handle: FocusHandle,
     /// Keeps the talk's folder watched for as long as the window is open.
-    watcher: Option<RecommendedWatcher>,
+    watcher: Option<watcher::TalkWatcher>,
     /// Why saved changes won't show up, if the folder couldn't be watched.
     watch_problem: Option<String>,
     /// The reload waiting for the file to go quiet.

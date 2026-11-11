@@ -85,6 +85,14 @@ fn problem(file: &str, message: impl Into<String>) -> Vec<Diagnostic> {
     }]
 }
 
+fn source_too_large(file: &str) -> Vec<Diagnostic> {
+    let limit = MAX_SOURCE_BYTES / (1024 * 1024);
+    problem(
+        file,
+        format!("It is over the limit of {limit} MiB for a component's source"),
+    )
+}
+
 /// Builds the component `info`, from `components/<stem>.rs`. Returns whether it was built: a
 /// source that changed into something else since the scan is left for the next one.
 fn build_one(
@@ -95,12 +103,7 @@ fn build_one(
     compile: &Compile,
 ) -> Result<bool, Vec<Diagnostic>> {
     let file = info.file.as_str();
-    let too_large = || {
-        problem(
-            file,
-            "It is over the limit of 1 MiB for a component's source",
-        )
-    };
+    let too_large = || source_too_large(file);
     if files.len(file).is_some_and(|len| len > MAX_SOURCE_BYTES) {
         return Err(too_large());
     }
@@ -165,8 +168,22 @@ fn write_build(folder: &Path, entry: &BuildEntry, module: &[u8]) -> io::Result<(
     index.format = INDEX_FORMAT;
     let json = serde_json::to_vec_pretty(&index).map_err(io::Error::other)?;
 
+    build_folder_is_the_talks(folder)?;
     write_atomically(&wasm, |out| out.write_all(module))?;
+    build_folder_is_the_talks(folder)?;
     write_atomically(&index_file, |out| out.write_all(&json))
+}
+
+/// Fails unless the talk's `build` folder is where it seems to be, and not a link, even one to
+/// somewhere else within the talk. Asked again right before each write, in case `build` was
+/// swapped for a link since it was first looked at.
+fn build_folder_is_the_talks(folder: &Path) -> io::Result<()> {
+    let expected = folder.canonicalize()?.join(BUILD_FOLDER);
+    if folder.join(BUILD_FOLDER).canonicalize()? == expected {
+        Ok(())
+    } else {
+        Err(not_followed("build isn't a folder of the talk's own"))
+    }
 }
 
 fn not_followed(why: &str) -> io::Error {
@@ -210,4 +227,45 @@ pub fn behind(folder: &Path) -> Vec<String> {
         .filter(|info| info.state == ComponentState::OutOfDate)
         .map(|info| info.tag)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_build_folder_must_be_the_talks_own() {
+        let talk = tempfile::tempdir().unwrap();
+        std::fs::create_dir(talk.path().join("build")).unwrap();
+        assert!(build_folder_is_the_talks(talk.path()).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_build_folder_swapped_for_a_link_is_refused() {
+        // A link made after the first check, even to a folder within the talk.
+        for inside in [false, true] {
+            let talk = tempfile::tempdir().unwrap();
+            let elsewhere = tempfile::tempdir().unwrap();
+            let target = if inside {
+                std::fs::create_dir(talk.path().join("assets")).unwrap();
+                talk.path().join("assets")
+            } else {
+                elsewhere.path().to_path_buf()
+            };
+            std::os::unix::fs::symlink(&target, talk.path().join("build")).unwrap();
+            assert!(
+                build_folder_is_the_talks(talk.path()).is_err(),
+                "inside: {inside}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_limit_on_a_source_is_said_as_it_is() {
+        assert_eq!(
+            source_too_large("components/a.rs")[0].message,
+            "It is over the limit of 1 MiB for a component's source"
+        );
+    }
 }

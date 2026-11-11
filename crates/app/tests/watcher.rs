@@ -75,11 +75,7 @@ fn reading_the_file_is_not_a_change() {
 }
 
 /// A talk folder with a `components` folder, watched, and the changes it reports.
-fn watched_talk() -> (
-    tempfile::TempDir,
-    notify::RecommendedWatcher,
-    Receiver<Change>,
-) {
+fn watched_talk() -> (tempfile::TempDir, watcher::TalkWatcher, Receiver<Change>) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("slides.md"), "a").unwrap();
     std::fs::create_dir(dir.path().join("components")).unwrap();
@@ -136,5 +132,64 @@ fn reading_a_component_is_not_a_change() {
     expect_change(&rx);
     drain(&rx);
     std::fs::read_to_string(&file).unwrap();
+    assert!(rx.recv_timeout(Duration::from_millis(800)).is_err());
+}
+
+#[test]
+fn a_components_folder_made_later_is_watched() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("slides.md"), "a").unwrap();
+    let (tx, rx) = channel();
+    let _watcher = watcher::watch(dir.path(), move |change| {
+        let _ = tx.send(change);
+    })
+    .unwrap();
+
+    std::fs::create_dir(dir.path().join("components")).unwrap();
+    assert_eq!(expect_change(&rx), Change::Component);
+    drain(&rx);
+    std::fs::write(dir.path().join("components/score.rs"), "fn a() {}").unwrap();
+    assert_eq!(expect_change(&rx), Change::Component);
+}
+
+#[test]
+fn a_components_folder_put_back_is_watched_again() {
+    let (dir, _watcher, rx) = watched_talk();
+    std::fs::remove_dir(dir.path().join("components")).unwrap();
+    expect_change(&rx);
+    drain(&rx);
+    std::fs::create_dir(dir.path().join("components")).unwrap();
+    expect_change(&rx);
+    drain(&rx);
+    std::fs::write(dir.path().join("components/score.rs"), "fn a() {}").unwrap();
+    assert_eq!(expect_change(&rx), Change::Component);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_linked_components_folder_is_not_watched() {
+    let elsewhere = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("slides.md"), "a").unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), dir.path().join("components")).unwrap();
+    let (tx, rx) = channel();
+    let _watcher = watcher::watch(dir.path(), move |change| {
+        let _ = tx.send(change);
+    })
+    .unwrap();
+
+    std::fs::write(elsewhere.path().join("score.rs"), "fn a() {}").unwrap();
+    assert!(rx.recv_timeout(Duration::from_millis(800)).is_err());
+}
+
+#[test]
+fn the_folder_below_is_not_watched() {
+    // A talk with a large tree mustn't use up the system's watches.
+    let (dir, _watcher, rx) = watched_talk();
+    std::fs::create_dir(dir.path().join("assets")).unwrap();
+    drain(&rx);
+    std::fs::write(dir.path().join("assets/slides.md"), "a").unwrap();
+    std::fs::create_dir(dir.path().join("assets/components")).unwrap();
+    std::fs::write(dir.path().join("assets/components/score.rs"), "a").unwrap();
     assert!(rx.recv_timeout(Duration::from_millis(800)).is_err());
 }
