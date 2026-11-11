@@ -118,8 +118,9 @@ fn a_rust_file_elsewhere_does_not() {
     std::fs::create_dir(dir.path().join("components/deeper")).unwrap();
     std::fs::write(dir.path().join("components/deeper/score.rs"), "fn a() {}").unwrap();
     std::fs::write(dir.path().join("components/notes.txt"), "a").unwrap();
-    std::fs::create_dir(dir.path().join("assets")).unwrap();
-    std::fs::write(dir.path().join("assets/slides.md"), "a").unwrap();
+    // Not `assets`, as anything there is something a component can read.
+    std::fs::create_dir(dir.path().join("notes")).unwrap();
+    std::fs::write(dir.path().join("notes/slides.md"), "a").unwrap();
     assert!(rx.recv_timeout(Duration::from_millis(800)).is_err());
 }
 
@@ -186,10 +187,51 @@ fn a_linked_components_folder_is_not_watched() {
 fn the_folder_below_is_not_watched() {
     // A talk with a large tree mustn't use up the system's watches.
     let (dir, _watcher, rx) = watched_talk();
-    std::fs::create_dir(dir.path().join("assets")).unwrap();
+    std::fs::create_dir(dir.path().join("notes")).unwrap();
     drain(&rx);
-    std::fs::write(dir.path().join("assets/slides.md"), "a").unwrap();
-    std::fs::create_dir(dir.path().join("assets/components")).unwrap();
-    std::fs::write(dir.path().join("assets/components/score.rs"), "a").unwrap();
+    std::fs::write(dir.path().join("notes/slides.md"), "a").unwrap();
+    std::fs::create_dir(dir.path().join("notes/components")).unwrap();
+    std::fs::write(dir.path().join("notes/components/score.rs"), "a").unwrap();
+    assert!(rx.recv_timeout(Duration::from_millis(800)).is_err());
+}
+
+#[test]
+fn a_change_to_an_asset_counts() {
+    let (dir, _watcher, rx) = watched_talk();
+    std::fs::create_dir(dir.path().join("assets")).unwrap();
+    assert_eq!(expect_change(&rx), Change::Component, "the folder itself, made");
+    drain(&rx);
+    std::fs::write(dir.path().join("assets/sales.csv"), "a,1").unwrap();
+    assert_eq!(expect_change(&rx), Change::Component);
+    drain(&rx);
+    let temporary = dir.path().join("assets/.sales.csv.tmp");
+    std::fs::write(&temporary, "a,2").unwrap();
+    std::fs::rename(&temporary, dir.path().join("assets/sales.csv")).unwrap();
+    assert_eq!(expect_change(&rx), Change::Component);
+}
+
+#[test]
+fn reading_an_asset_is_not_a_change() {
+    let (dir, _watcher, rx) = watched_talk();
+    std::fs::create_dir(dir.path().join("assets")).unwrap();
+    std::fs::write(dir.path().join("assets/sales.csv"), "a,1").unwrap();
+    drain(&rx);
+    std::fs::read(dir.path().join("assets/sales.csv")).unwrap();
+    assert!(rx.recv_timeout(Duration::from_millis(800)).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_linked_assets_folder_is_not_watched() {
+    let elsewhere = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("slides.md"), "a").unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), dir.path().join("assets")).unwrap();
+    let (tx, rx) = channel();
+    let _watcher = watcher::watch(dir.path(), move |change| {
+        let _ = tx.send(change);
+    })
+    .unwrap();
+    std::fs::write(elsewhere.path().join("sales.csv"), "a,1").unwrap();
     assert!(rx.recv_timeout(Duration::from_millis(800)).is_err());
 }

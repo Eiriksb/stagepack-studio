@@ -2,7 +2,7 @@
 //! the builds in the sandbox. A talk is untrusted, so whatever it says about its builds
 //! is checked, and every file it names is read within limits.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
@@ -15,6 +15,7 @@ use toolkit::{ComponentSchema, Registry, RenderInput, RenderOutput, asset_path_a
 
 use crate::TalkFiles;
 use crate::flow::TEXT_TAG;
+use crate::pictures::FileVersion;
 
 /// How long the components on one slide can take to render, together, each time it's laid out.
 pub const SLIDE_RENDER_BUDGET: Duration = Duration::from_secs(1);
@@ -119,6 +120,7 @@ pub struct TalkComponents {
     spent: Duration,
     /// The nodes made since the slide being laid out was started.
     nodes: usize,
+    assets_read: AssetsRead,
 }
 
 struct NoFiles;
@@ -133,18 +135,36 @@ fn problem(file: &str, message: impl Into<String>) -> Diagnostic {
     Diagnostic::new(file, 0, message.into())
 }
 
+/// The assets components have read since the talk's files were last looked at, and what
+/// each file was then: `None` if there was no such file.
+pub(crate) type AssetsRead = Rc<RefCell<HashMap<String, Option<FileVersion>>>>;
+
 /// The bytes of `path`, held to the rules for a render's reads: only from the talk's
 /// assets folder, no file over the limit, and no more than `ASSET_BUDGET` in all, counted
-/// in `used`. A file whose length is known is refused before it's read.
-pub(crate) fn read_asset(files: &dyn TalkFiles, path: &str, used: &Cell<u64>) -> Option<Vec<u8>> {
+/// in `used`. A file whose length is known is refused before it's read. What the file was
+/// is noted in `seen`, so that a change to it is found, unless the talk never changes.
+pub(crate) fn read_asset(files: &dyn TalkFiles, path: &str, used: &Cell<u64>, seen: &AssetsRead) -> Option<Vec<u8>> {
     if !asset_path_allowed(path) {
         return None;
     }
+    let note = |version: Option<FileVersion>| {
+        if !files.never_changes() {
+            seen.borrow_mut().insert(path.to_string(), version);
+        }
+    };
+    let stamp = files.stamp(path).map(|(length, modified)| FileVersion::Stamp(length, modified));
     let left = ASSET_BUDGET.saturating_sub(used.get());
     if files.len(path).is_some_and(|len| len > left) {
+        if stamp.is_some() {
+            note(stamp);
+        }
         return None;
     }
-    let bytes = files.read(path)?;
+    let Some(bytes) = files.read(path) else {
+        note(stamp);
+        return None;
+    };
+    note(stamp.or_else(|| Some(FileVersion::of_bytes(&bytes))));
     let len = bytes.len() as u64;
     if len > left {
         return None;
@@ -154,10 +174,10 @@ pub(crate) fn read_asset(files: &dyn TalkFiles, path: &str, used: &Cell<u64>) ->
 }
 
 /// The assets one render of a talk's component can read.
-fn assets_for_a_render(files: &Rc<dyn TalkFiles>) -> Assets {
-    let files = files.clone();
+fn assets_for_a_render(files: &Rc<dyn TalkFiles>, seen: &AssetsRead) -> Assets {
+    let (files, seen) = (files.clone(), seen.clone());
     let used = Cell::new(0);
-    Rc::new(move |path: &str| read_asset(&*files, path, &used))
+    Rc::new(move |path: &str| read_asset(&*files, path, &used, &seen))
 }
 
 /// Whether `tag` is already taken, by the format or by a component every talk has.
@@ -194,6 +214,7 @@ impl TalkComponents {
             left_out_sources: HashSet::new(),
             spent: Duration::ZERO,
             nodes: 0,
+            assets_read: AssetsRead::default(),
         };
         components.rescan(registry);
         components
@@ -221,6 +242,7 @@ impl TalkComponents {
     /// Looks at the talk's components again, keeping each module already loaded whose bytes
     /// are the same. Returns whether anything is different.
     pub(crate) fn rescan(&mut self, registry: &Registry) -> bool {
+        let assets_changed = self.assets_changed();
         let before = self.summary();
         self.infos.clear();
         self.problems.clear();
@@ -241,7 +263,23 @@ impl TalkComponents {
         self.sources_seen.retain(|path, _| still_there(path));
         self.builds_seen.retain(|path, _| still_there(path));
         self.index_seen.retain(|path, _| still_there(path));
-        self.summary() != before
+        self.summary() != before || assets_changed
+    }
+
+    /// The record of what components read, for a built-in's render to add to.
+    pub(crate) fn assets_read(&self) -> &AssetsRead {
+        &self.assets_read
+    }
+
+    /// Whether a file a component read is different now, like a replaced picture. Then
+    /// what was read is forgotten, as every slide is laid out again and reads it afresh.
+    fn assets_changed(&mut self) -> bool {
+        let mut seen = self.assets_read.borrow_mut();
+        let changed = seen.iter().any(|(path, version)| FileVersion::of_file(path, &*self.files) != *version);
+        if changed {
+            seen.clear();
+        }
+        changed
     }
 
     fn summary(&self) -> Summary {
@@ -278,7 +316,7 @@ impl TalkComponents {
         if self.spent >= SLIDE_RENDER_BUDGET {
             return Some(Rendered::OutOfTime);
         }
-        let assets = assets_for_a_render(&self.files);
+        let assets = assets_for_a_render(&self.files, &self.assets_read);
         let component = match self.component(tag, &build) {
             Ok(component) => component,
             Err(error) => return Some(Rendered::Failed(error)),

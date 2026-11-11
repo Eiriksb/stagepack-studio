@@ -440,6 +440,12 @@ mod probes {
         toolkit::col![Element::from(Children), Element::from(Children)]
     }
 
+    /// Shows what `assets/a.txt` says.
+    #[component]
+    pub fn Echo(ctx: &Ctx) -> Element {
+        text(ctx.asset_text("assets/a.txt").unwrap_or_else(|| "nothing".to_string()))
+    }
+
     /// A stack of 20,000 empty shapes.
     #[component]
     pub fn Crowd() -> Element {
@@ -477,6 +483,7 @@ fn probe_registry() -> Registry {
     registry.add(probes::Hoarder_component());
     registry.add(probes::Twice_component());
     registry.add(probes::Crowd_component());
+    registry.add(probes::Echo_component());
     registry
 }
 
@@ -820,4 +827,30 @@ fn a_refused_source_with_a_build_is_out_of_date() {
     assert_eq!(info(&deck, "Hello").state, ComponentState::OutOfDate);
     assert!(has_problem(&deck, "components/hello.rs"));
     assert!(shows(&mut deck, 0, "Hi"));
+}
+
+// An asset a component reads.
+
+#[test]
+fn a_changed_asset_draws_a_built_in_again() {
+    let files = Files::default();
+    files.put("slides.md", "<Echo />\n");
+    files.put("assets/a.txt", "first");
+    let mut deck = open_with(&files, probe_registry());
+    assert_eq!(texts(&mut deck, 0), ["first"]);
+    assert!(deck.update("<Echo />\n".to_string()).is_empty(), "nothing has changed yet");
+    files.put("assets/a.txt", "second");
+    assert_eq!(deck.update("<Echo />\n".to_string()), [0]);
+    assert_eq!(texts(&mut deck, 0), ["second"]);
+}
+
+#[test]
+fn an_asset_that_appears_draws_a_talks_component_again() {
+    let files = talk_with_hello("<Hello />\n", reading("Hello", "assets/a.txt"));
+    let mut deck = open(&files);
+    assert!(shows(&mut deck, 0, "no"));
+    assert!(deck.refresh_components().is_empty());
+    files.put("assets/a.txt", "here");
+    assert_eq!(deck.refresh_components(), [0]);
+    assert!(shows(&mut deck, 0, "yes"), "{:?}", texts(&mut deck, 0));
 }

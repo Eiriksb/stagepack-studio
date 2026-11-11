@@ -170,8 +170,8 @@ impl Flow<'_, '_> {
         let moment = self.env.moment;
         let data = CtxData::new(moment.step, moment.time, SLIDE_WIDTH, SLIDE_HEIGHT, room.0, room.1, self.theme.clone());
         if let Some(component) = self.env.registry.get(&tag.name) {
-            let (files, used) = (self.env.files, Cell::new(0));
-            let assets = |path: &str| read_asset(files, path, &used);
+            let (files, used, seen) = (self.env.files, Cell::new(0), self.env.components.assets_read().clone());
+            let assets = |path: &str| read_asset(files, path, &used, &seen);
             let ctx = Ctx::new(data, &assets);
             let element = (component.render)(&Props(props), &ctx);
             let output = ctx.finish(element);

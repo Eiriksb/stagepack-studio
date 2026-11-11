@@ -39,21 +39,21 @@ const SVG_NAMESPACE: &str = "http://www.w3.org/2000/svg";
 
 /// What tells a file from a later version of itself: its stamp, or a hash of its bytes
 /// where there's no stamp to go by.
-#[derive(PartialEq)]
-enum FileVersion {
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum FileVersion {
     Stamp(u64, SystemTime),
     Hash(u64),
 }
 
 impl FileVersion {
-    fn of_bytes(bytes: &[u8]) -> FileVersion {
+    pub(crate) fn of_bytes(bytes: &[u8]) -> FileVersion {
         let mut hasher = DefaultHasher::new();
         hasher.write(bytes);
         FileVersion::Hash(hasher.finish())
     }
 
     /// The version of `path` as it is now, or `None` if it can't be read.
-    fn of_file(path: &str, files: &dyn TalkFiles) -> Option<FileVersion> {
+    pub(crate) fn of_file(path: &str, files: &dyn TalkFiles) -> Option<FileVersion> {
         match files.stamp(path) {
             Some((length, modified)) => Some(FileVersion::Stamp(length, modified)),
             None => files.read(path).map(|bytes| FileVersion::of_bytes(&bytes)),

@@ -1,7 +1,7 @@
 //! Tells the app when the talk's file, or one of its components, has changed.
 //!
-//! Only two folders are watched, each on its own: the talk's folder, and its `components`
-//! folder if that is a real folder. A talk's tree can be any size, and watching all of it could
+//! Only three folders are watched, each on its own: the talk's folder, and its `components`
+//! and `assets` folders if they are real folders. A talk's tree can be any size, and watching all of it could
 //! use up the system's watches, so that even `slides.md` would stop being followed. A link is
 //! never followed.
 
@@ -21,7 +21,8 @@ pub enum Change {
     /// Its `slides.md`.
     Slides,
     /// A component's source: a `.rs` file directly in its `components` folder, or that folder
-    /// itself.
+    /// itself. Or what a component can read: anything directly in its `assets` folder, or
+    /// that folder itself.
     Component,
 }
 
@@ -31,7 +32,11 @@ type OnChange = Arc<Mutex<dyn Fn(Change) + Send>>;
 pub struct TalkWatcher {
     _folder: RecommendedWatcher,
     _components: Arc<Mutex<Option<RecommendedWatcher>>>,
+    _assets: Arc<Mutex<Option<RecommendedWatcher>>>,
 }
+
+/// The folder of what a component can read.
+const ASSETS_FOLDER: &str = "assets";
 
 /// Calls `on_change`, on a watcher's own thread, whenever `slides.md` in `folder` or a
 /// component's source changes, until the returned watcher is dropped. Nothing else counts, so
@@ -51,8 +56,11 @@ pub fn watch(
         &components_folder,
         on_change.clone(),
     )));
+    let assets_folder = folder.join(ASSETS_FOLDER);
+    let assets = Arc::new(Mutex::new(watch_assets(&assets_folder, on_change.clone())));
 
     let slot = components.clone();
+    let assets_slot = assets.clone();
     let tell = on_change.clone();
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<Event>| {
         let Ok(event) = event else {
@@ -81,11 +89,19 @@ pub fn watch(
             }
             call(&tell, Change::Component);
         }
+        if names(ASSETS_FOLDER) {
+            let fresh = watch_assets(&assets_folder, tell.clone());
+            if let Ok(mut slot) = assets_slot.lock() {
+                *slot = fresh;
+            }
+            call(&tell, Change::Component);
+        }
     })?;
     watcher.watch(folder, RecursiveMode::NonRecursive)?;
     Ok(TalkWatcher {
         _folder: watcher,
         _components: components,
+        _assets: assets,
     })
 }
 
@@ -117,6 +133,24 @@ fn is_real_folder(path: &Path) -> bool {
 
 /// A watch on the sources directly in `folder`, if it's a real folder and not a link.
 fn watch_components(folder: &Path, on_change: OnChange) -> Option<RecommendedWatcher> {
+    watch_one_level(folder, on_change, |path| {
+        path.extension() == Some(OsStr::new("rs"))
+    })
+}
+
+/// A watch on what's directly in `folder`, the talk's assets, if it's a real folder and not
+/// a link. A file in a folder below isn't seen.
+fn watch_assets(folder: &Path, on_change: OnChange) -> Option<RecommendedWatcher> {
+    watch_one_level(folder, on_change, |_| true)
+}
+
+/// A watch on the entries directly in `folder` that `counts`, if it's a real folder and not
+/// a link.
+fn watch_one_level(
+    folder: &Path,
+    on_change: OnChange,
+    counts: fn(&Path) -> bool,
+) -> Option<RecommendedWatcher> {
     if !is_real_folder(folder) {
         return None;
     }
@@ -125,13 +159,13 @@ fn watch_components(folder: &Path, on_change: OnChange) -> Option<RecommendedWat
         let Ok(event) = event else {
             return;
         };
-        let a_source = event.paths.iter().any(|path| {
-            path.extension() == Some(OsStr::new("rs"))
+        let counted = event.paths.iter().any(|path| {
+            counts(path)
                 && path
                     .parent()
                     .is_some_and(|parent| roots.iter().any(|root| root == parent))
         });
-        if a_source && !just_read(&event) {
+        if counted && !just_read(&event) {
             call(&on_change, Change::Component);
         }
     })
