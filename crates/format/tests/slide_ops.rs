@@ -278,6 +278,53 @@ fn notes_cannot_end_their_own_element() {
 }
 
 #[test]
+fn indented_notes_are_removed_with_their_whole_lines() {
+    on_both(|e| {
+        let src = e("# A\n\n  <Notes>\n  hi\n  </Notes>\n---\n# B\n");
+        let removed = applied(&src, &set_notes(&parse_talk(&src), 0, ""));
+        assert_eq!(removed, e("# A\n---\n# B\n"));
+        assert_eq!(parse_talk(&removed).slides.len(), 2);
+
+        let src = e("# A\n\n <Notes>\n hi\n </Notes>  \n\n---\n# B\n");
+        let removed = applied(&src, &set_notes(&parse_talk(&src), 0, ""));
+        assert_eq!(removed, e("# A\n\n---\n# B\n"));
+
+        let src = e("# A\n\n  <Notes>\n  hi\n  </Notes>");
+        assert_eq!(applied(&src, &set_notes(&parse_talk(&src), 0, "")), e("# A"));
+    });
+}
+
+#[test]
+fn notes_removed_from_the_middle_of_a_slide_keep_its_paragraphs_apart() {
+    on_both(|e| {
+        let src = e("Para one\n\n<Notes>\nx\n</Notes>\nPara two\n---\n# B\n");
+        let removed = applied(&src, &set_notes(&parse_talk(&src), 0, ""));
+        assert_eq!(removed, e("Para one\n\nPara two\n---\n# B\n"));
+        assert_eq!(parse_talk(&removed).slides[0].blocks.len(), 2);
+
+        let src = e("Para one\n\n<Notes>\nx\n</Notes>\n\nPara two\n");
+        assert_eq!(applied(&src, &set_notes(&parse_talk(&src), 0, "")), e("Para one\n\nPara two\n"));
+
+        let src = e("# One\n<Notes>\nx\n</Notes>\nPara two\n");
+        assert_eq!(applied(&src, &set_notes(&parse_talk(&src), 0, "")), e("# One\nPara two\n"));
+    });
+}
+
+#[test]
+fn notes_between_two_lists_stay_empty_rather_than_join_them() {
+    on_both(|e| {
+        let src = e("# A\n\n- one\n\n<Notes>\nx\n</Notes>\n\n- two\n");
+        let emptied = applied(&src, &set_notes(&parse_talk(&src), 0, ""));
+        assert_eq!(emptied, e("# A\n\n- one\n\n<Notes>\n</Notes>\n\n- two\n"));
+        let slide = &parse_talk(&emptied).slides[0];
+        assert_eq!(slide.blocks.len(), 3);
+        assert_eq!(slide.notes.as_ref().unwrap().text, "");
+        let again = applied(&emptied, &set_notes(&parse_talk(&emptied), 0, "y"));
+        assert_eq!(again, e("# A\n\n- one\n\n<Notes>\ny\n</Notes>\n\n- two\n"));
+    });
+}
+
+#[test]
 fn hand_written_notes_read_as_before() {
     on_both(|e| {
         let src = e("# A\n\n<Notes>\nSee C:\\path and \\n and a\\b\n</Notes>\n");
@@ -372,9 +419,23 @@ struct GenSlide {
     blocks: Vec<String>,
     notes: Option<String>,
     blank_after: bool,
+    notes_layout: NotesLayout,
     /// A slide of `key: value` lines only, which reads as a settings block if a break
     /// comes straight after a `---` and it.
     key_values: bool,
+}
+
+/// Where a slide's notes go, and how they are written.
+#[derive(Clone, Debug)]
+struct NotesLayout {
+    /// After the heading and this many of the slide's other blocks, as far as there are any.
+    after_blocks: usize,
+    /// Every line of the element two spaces in.
+    indented: bool,
+    /// No blank line between the heading and the element, when the element follows it.
+    tight_before: bool,
+    /// No blank line between the element and a block after it.
+    tight_after: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -417,10 +478,21 @@ impl GenTalk {
             } else {
                 let mut blocks = slide.blocks.clone();
                 blocks.insert(0, format!("# Slide {}", marker(n)));
+                let layout = &slide.notes_layout;
+                let at = 1 + layout.after_blocks.min(blocks.len() - 1);
                 if let Some(notes) = &slide.notes {
-                    blocks.push(format!("<Notes>\n{notes}\n</Notes>"));
+                    let element = format!("<Notes>\n{notes}\n</Notes>");
+                    let indent = if layout.indented { "  " } else { "" };
+                    blocks.insert(at, element.lines().map(|line| format!("{indent}{line}")).collect::<Vec<_>>().join("\n"));
                 }
-                out.push_str(&blocks.join("\n\n"));
+                for (i, block) in blocks.iter().enumerate() {
+                    if i > 0 {
+                        let notes_here = slide.notes.is_some() && (i == at || i == at + 1);
+                        let tight = notes_here && if i == at { at == 1 && layout.tight_before } else { layout.tight_after };
+                        out.push_str(if tight { "\n" } else { "\n\n" });
+                    }
+                    out.push_str(block);
+                }
             }
             out.push('\n');
             if slide.blank_after {
@@ -466,9 +538,22 @@ fn gen_slide() -> impl Strategy<Value = GenSlide> {
         prop::collection::vec(block(), 0..3),
         prop::option::of(prop::sample::select(vec!["Say **this**".to_string(), "- a point\n- another".to_string()])),
         any::<bool>(),
+        (0..3usize, any::<[bool; 3]>()).prop_map(|(after_blocks, [indented, tight_before, tight_after])| NotesLayout {
+            after_blocks,
+            indented,
+            tight_before,
+            tight_after,
+        }),
         prop::bool::weighted(0.25),
     )
-        .prop_map(|(settings, blocks, notes, blank_after, key_values)| GenSlide { settings, blocks, notes, blank_after, key_values })
+        .prop_map(|(settings, blocks, notes, blank_after, notes_layout, key_values)| GenSlide {
+            settings,
+            blocks,
+            notes,
+            blank_after,
+            notes_layout,
+            key_values,
+        })
 }
 
 fn gen_talk() -> impl Strategy<Value = GenTalk> {
@@ -576,6 +661,32 @@ fn comparable(talk: &Talk, index: usize, loose_head: bool) -> String {
     talk.source[range].trim_start_matches('\u{feff}').to_string()
 }
 
+/// `blocks` with every byte range in them, at any depth, made empty: what they say, not
+/// where they are.
+fn without_ranges(blocks: &[Block]) -> Vec<Block> {
+    blocks
+        .iter()
+        .map(|block| match block.clone() {
+            Block::Heading { level, spans, .. } => Block::Heading { level, spans, range: 0..0 },
+            Block::Paragraph { spans, .. } => Block::Paragraph { spans, range: 0..0 },
+            Block::List { ordered, items, .. } => {
+                Block::List { ordered, items: items.iter().map(|item| without_ranges(item)).collect(), range: 0..0 }
+            }
+            Block::Table { rows, .. } => Block::Table { rows, range: 0..0 },
+            Block::Code { language, code, .. } => Block::Code { language, code, range: 0..0 },
+            Block::Picture { src, alt, .. } => Block::Picture { src, alt, range: 0..0 },
+            Block::Region { name, .. } => Block::Region { name, range: 0..0 },
+            Block::Tag(tag) => Block::Tag(Tag {
+                attrs: tag.attrs.iter().map(|attr| Attr { name_range: 0..0, value_range: 0..0, ..attr.clone() }).collect(),
+                children: without_ranges(&tag.children),
+                range: 0..0,
+                open_end: 0,
+                ..tag
+            }),
+        })
+        .collect()
+}
+
 /// The talk's line ending: the first in the file, or `\n` when there is none.
 fn talk_eol(source: &str) -> &'static str {
     match source.find('\n') {
@@ -602,6 +713,16 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
     #[test]
+    fn notes_operations_keep_the_slides_other_blocks(generated in gen_talk(), index in 0..8usize, typed in typed_notes()) {
+        let source = generated.text();
+        let before = parse_talk(&source);
+        let index = index % before.slides.len();
+        let after = parse_talk(&set_notes(&before, index, &typed).apply(&source));
+        prop_assert_eq!(after.slides.len(), before.slides.len());
+        prop_assert_eq!(without_ranges(&after.slides[index].blocks), without_ranges(&before.slides[index].blocks));
+    }
+
+    #[test]
     fn anything_typed_in_notes_reads_back_as_typed(generated in gen_talk(), index in 0..8usize, typed in typed_notes()) {
         let source = generated.text();
         let before = parse_talk(&source);
@@ -610,9 +731,9 @@ proptest! {
         prop_assert_eq!(after.slides.len(), before.slides.len());
         prop_assert!(after.slides.iter().all(|s| s.error.is_none()), "{:?}", after.slides.iter().map(|s| &s.error).collect::<Vec<_>>());
         prop_assert_eq!(slide_markers(&after), slide_markers(&before));
-        let read = after.slides[index].notes.as_ref().map(|n| n.text.as_str());
-        let want = typed.trim();
-        prop_assert_eq!(read, (!want.is_empty()).then_some(want));
+        // Empty notes read as no element, or as an element left with nothing in it.
+        let read = after.slides[index].notes.as_ref().map(|n| n.text.as_str()).unwrap_or("");
+        prop_assert_eq!(read, typed.trim());
     }
 
     #[test]
@@ -678,9 +799,8 @@ proptest! {
         match op {
             Op::Hide(i, hidden) => prop_assert_eq!(is_hidden(&after.slides[i % talk.slides.len()]), hidden),
             Op::Notes(i, notes) => {
-                let read = after.slides[i % talk.slides.len()].notes.as_ref().map(|n| n.text.clone());
-                let want = (!notes.is_empty()).then(|| notes.clone());
-                prop_assert_eq!(read, want);
+                let read = after.slides[i % talk.slides.len()].notes.as_ref().map_or(String::new(), |n| n.text.clone());
+                prop_assert_eq!(read, notes);
             }
             _ => {}
         }

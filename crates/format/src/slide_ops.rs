@@ -16,7 +16,8 @@ use std::ops::Range;
 
 use crate::attrs::scan_open_tag;
 use crate::edit::{Change, SourceEdit, eol_in, set_setting};
-use crate::model::{Slide, Talk};
+use crate::model::{Block, Slide, Talk};
+use crate::parse::parse_talk;
 use crate::notes::escape_notes;
 use crate::settings::parse_entry;
 use crate::split::{RawSlide, split_slides};
@@ -130,7 +131,9 @@ pub fn remove_setting(source: &str, slide: &Slide, key: &str) -> Option<SourceEd
 
 /// Sets what slide `index`'s `<Notes>` hold: the words inside an existing element are
 /// replaced, an element is added at the end of a slide with none, and the element goes
-/// when `notes` is empty. Line endings become the talk's.
+/// when `notes` is empty. Where taking the element away would join the blocks on either
+/// side of it, such as two lists, it stays with nothing in it instead, and reads as empty
+/// notes. Line endings become the talk's.
 ///
 /// The notes are escaped where they would otherwise be read as something else, a tag, a
 /// code fence or a slide break, and the parser reads them back unescaped (see
@@ -145,7 +148,18 @@ pub fn set_notes(talk: &Talk, index: usize, notes: &str) -> Change {
     let eol = eol_in(source);
     let notes = with_line_endings(&escape_notes(&notes.replace("\r\n", "\n")), eol);
     let edit = match &slide.notes {
-        Some(_) if notes.trim().is_empty() => return without_notes(source, &split_slides(source)[index], remove_notes(source, slide), eol),
+        Some(old) if notes.trim().is_empty() => {
+            let removal = without_notes(source, &split_slides(source)[index], remove_notes(source, slide), eol);
+            let after = parse_talk(&removal.apply(source));
+            if after.slides.len() == talk.slides.len() && blocks_alike(&after.slides[index].blocks, &slide.blocks) {
+                return removal;
+            }
+            // The element is all that keeps the blocks around it apart, as with two lists:
+            // it stays, with nothing in it.
+            let (_, inner_start) = scan_open_tag(source, old.range.start);
+            let inner_end = source[inner_start.min(old.range.end)..old.range.end].rfind("</Notes").map_or(old.range.end, |at| inner_start + at);
+            SourceEdit { range: inner_start..inner_end, text: eol.to_string() }
+        }
         Some(old) => {
             let (_, inner_start) = scan_open_tag(source, old.range.start);
             match source[inner_start.min(old.range.end)..old.range.end].rfind("</Notes") {
@@ -154,8 +168,14 @@ pub fn set_notes(talk: &Talk, index: usize, notes: &str) -> Change {
                     let words = &source[inner.clone()];
                     let lead = words.len() - words.trim_start().len();
                     let core = inner.start + lead..inner.start + words.trim_end().len();
+                    // An indented `</Notes>` would be taken into a list the notes end with, so
+                    // the closing tag goes to the start of its line.
+                    let last_line = words.rfind('\n').map(|i| inner.start + i + 1);
+                    let closing_indent = last_line.filter(|&at| at < inner.end && source[at..inner.end].chars().all(|c| c == ' ' || c == '\t'));
                     if core.start >= core.end {
                         SourceEdit { range: inner, text: format!("{eol}{notes}{eol}") }
+                    } else if let Some(at) = closing_indent {
+                        SourceEdit { range: core.start..inner.end, text: format!("{notes}{}", &source[core.end..at]) }
                     } else {
                         SourceEdit { range: core, text: notes }
                     }
@@ -213,6 +233,32 @@ fn without_notes(source: &str, raw: &RawSlide, mut removal: SourceEdit, eol: &st
     Change { edits: vec![blank, removal] }
 }
 
+/// Whether two lists of blocks say the same, wherever they are in the file.
+fn blocks_alike(a: &[Block], b: &[Block]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| block_alike(a, b))
+}
+
+fn block_alike(a: &Block, b: &Block) -> bool {
+    match (a, b) {
+        (Block::Heading { level: l1, spans: s1, .. }, Block::Heading { level: l2, spans: s2, .. }) => l1 == l2 && s1 == s2,
+        (Block::Paragraph { spans: s1, .. }, Block::Paragraph { spans: s2, .. }) => s1 == s2,
+        (Block::List { ordered: o1, items: i1, .. }, Block::List { ordered: o2, items: i2, .. }) => {
+            o1 == o2 && i1.len() == i2.len() && i1.iter().zip(i2).all(|(x, y)| blocks_alike(x, y))
+        }
+        (Block::Table { rows: r1, .. }, Block::Table { rows: r2, .. }) => r1 == r2,
+        (Block::Code { language: l1, code: c1, .. }, Block::Code { language: l2, code: c2, .. }) => l1 == l2 && c1 == c2,
+        (Block::Picture { src: s1, alt: a1, .. }, Block::Picture { src: s2, alt: a2, .. }) => s1 == s2 && a1 == a2,
+        (Block::Region { name: n1, .. }, Block::Region { name: n2, .. }) => n1 == n2,
+        (Block::Tag(t1), Block::Tag(t2)) => {
+            t1.name == t2.name
+                && t1.attrs.len() == t2.attrs.len()
+                && t1.attrs.iter().zip(&t2.attrs).all(|(x, y)| x.name == y.name && x.value == y.value)
+                && blocks_alike(&t1.children, &t2.children)
+        }
+        _ => false,
+    }
+}
+
 /// Whether `text`, a slide that starts with a `---` line, would be read as a settings block
 /// if a break came after it: a slide of `key: value` lines only.
 fn reads_as_settings(text: &str) -> bool {
@@ -226,18 +272,27 @@ fn only_settings_lines(text: &str) -> bool {
     lines.next().is_some_and(|first| parse_entry(first, 0).is_some()) && lines.all(|line| line.trim().is_empty() || parse_entry(line, 0).is_some())
 }
 
-/// The edit that takes the slide's `<Notes>` element away with its line, and the blank
-/// line before it.
+/// The edit that takes the slide's `<Notes>` element away: its whole lines, the spaces or
+/// tabs before and after it included, and the blank line before it when nothing but the
+/// slide's end or another blank line comes after it, so the blocks on either side stay
+/// apart.
 fn remove_notes(source: &str, slide: &Slide) -> SourceEdit {
     let Some(notes) = &slide.notes else { return SourceEdit { range: 0..0, text: String::new() } };
-    let mut start = notes.range.start;
+    let is_space = |c: char| c == ' ' || c == '\t';
+    let line_start = source[..notes.range.start].rfind('\n').map_or(0, |i| i + 1).max(slide.range.start);
+    let indent = &source[line_start..notes.range.start];
+    let mut start = if indent.chars().all(is_space) { line_start } else { notes.range.start };
+    let trailing = source[notes.range.end..].len() - source[notes.range.end..].trim_start_matches(is_space).len();
     let mut end = notes.range.end;
-    let after = &source[end..];
+    let after = &source[end + trailing..];
     let ending_after = if after.starts_with("\r\n") { 2 } else { usize::from(after.starts_with('\n')) };
-    end += ending_after;
+    if ending_after > 0 || end + trailing == source.len() {
+        end += trailing + ending_after;
+    }
+    let next_line = &source[end..line_end(source, end).min(slide.range.end)];
+    let ends_or_blank_after = end >= slide.range.end || next_line.trim().is_empty();
     let before = &source[..start];
-    let blank_before = |text: &str| text.ends_with("\r\n\r\n") || text.ends_with("\n\n");
-    if blank_before(before) {
+    if ends_or_blank_after && (before.ends_with("\r\n\r\n") || before.ends_with("\n\n")) {
         start -= ending_len(before);
     }
     if ending_after == 0 && end == source.len() {
@@ -341,7 +396,7 @@ fn talk_lines(first: &Parts) -> Vec<Range<usize>> {
     }
 }
 
-/// The pieces of slide `index` exactly as it is.
+/// The pieces of a slide exactly as it is.
 fn as_it_is(parts: &Parts) -> Vec<Piece> {
     let mut out = Vec::new();
     match &parts.head {
