@@ -28,6 +28,12 @@ pub trait TalkFiles {
     fn names_in(&self, _folder: &str) -> Vec<String> {
         Vec::new()
     }
+
+    /// Whether these files stay as they are for as long as they're open, so that what was
+    /// read of them once can be kept without asking again.
+    fn never_changes(&self) -> bool {
+        false
+    }
 }
 
 /// A talk kept in a folder on disk.
@@ -145,5 +151,9 @@ impl TalkFiles for std::sync::Arc<dyn TalkFiles + Send + Sync> {
 
     fn names_in(&self, folder: &str) -> Vec<String> {
         (**self).names_in(folder)
+    }
+
+    fn never_changes(&self) -> bool {
+        (**self).never_changes()
     }
 }

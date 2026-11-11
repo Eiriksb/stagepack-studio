@@ -330,6 +330,11 @@ impl TalkFiles for PackedFiles {
         names.sort();
         names
     }
+
+    /// A pack is read from the file as it was opened, and isn't written to.
+    fn never_changes(&self) -> bool {
+        true
+    }
 }
 
 pub struct PackReport {

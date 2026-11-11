@@ -552,3 +552,75 @@ fn a_renders_reads_stop_at_the_budget() {
         assert_eq!(reads.get(), 2 * (3 + read_past_the_budget), "length known: {len_known}");
     }
 }
+
+/// Files that count each path's reads, and give no stamp.
+struct Counted<T: TalkFiles> {
+    inner: T,
+    reads: Rc<RefCell<BTreeMap<String, u32>>>,
+}
+
+impl<T: TalkFiles> Counted<T> {
+    fn new(inner: T) -> (Counted<T>, Rc<RefCell<BTreeMap<String, u32>>>) {
+        let reads = Rc::new(RefCell::new(BTreeMap::new()));
+        (Counted { inner, reads: reads.clone() }, reads)
+    }
+}
+
+impl<T: TalkFiles> TalkFiles for Counted<T> {
+    fn read(&self, path: &str) -> Option<Vec<u8>> {
+        *self.reads.borrow_mut().entry(path.to_string()).or_default() += 1;
+        self.inner.read(path)
+    }
+
+    fn len(&self, path: &str) -> Option<u64> {
+        self.inner.len(path)
+    }
+
+    fn names_in(&self, folder: &str) -> Vec<String> {
+        self.inner.names_in(folder)
+    }
+
+    fn never_changes(&self) -> bool {
+        self.inner.never_changes()
+    }
+}
+
+#[test]
+fn a_huge_index_reads_each_build_once_and_is_cut_short() {
+    let files = Files::default();
+    files.put("slides.md", "<T0 />\n");
+    files.put("build/x.wasm", answering("T0", &text_answer("Zero")));
+    let tags: Vec<String> = (0..2500).map(|n| format!("T{n}")).collect();
+    let mut entries: Vec<(&str, &str, &str)> = tags.iter().map(|tag| (tag.as_str(), "x", "")).collect();
+    entries.extend(std::iter::repeat_n(("Box", "x", ""), 2500));
+    files.put(INDEX_FILE, index(&entries));
+    let (counted, reads) = Counted::new(files);
+    let mut deck = Deck::open(Box::new(counted), Fonts::bundled_only(), "<T0 />\n".into());
+    assert_eq!(reads.borrow().get("build/x.wasm").copied(), Some(1), "one scan reads a build once");
+    assert_eq!(deck.components().len(), 256);
+    assert!(has_problem(&deck, INDEX_FILE), "{:?}", deck.component_problems());
+    assert!(shows(&mut deck, 0, "Zero"), "{:?}", texts(&mut deck, 0));
+}
+
+#[test]
+fn a_packed_talks_builds_are_not_read_again_by_an_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("talk");
+    std::fs::create_dir_all(folder.join("components")).unwrap();
+    std::fs::create_dir_all(folder.join("build")).unwrap();
+    std::fs::write(folder.join("slides.md"), "<Hello />\n").unwrap();
+    std::fs::write(folder.join("components/hello.rs"), source("Hello")).unwrap();
+    std::fs::write(folder.join("build/hello.wasm"), answering("Hello", &text_answer("From the pack"))).unwrap();
+    std::fs::write(folder.join(INDEX_FILE), index(&[("Hello", "hello", &source("Hello"))])).unwrap();
+    let out = dir.path().join("talk.slides");
+    pack_folder(&folder, &out, "0.1.0").unwrap();
+
+    let (counted, reads) = Counted::new(open_packed(&out).unwrap());
+    let mut deck = Deck::open(Box::new(counted), Fonts::bundled_only(), "<Hello />\n".into());
+    assert!(shows(&mut deck, 0, "From the pack"));
+    let before = reads.borrow().clone();
+    assert_eq!(deck.update("<Hello />\n".into()), Vec::<usize>::new());
+    assert_eq!(deck.update("<Hello />\n\n# More\n".into()), vec![0]);
+    assert!(shows(&mut deck, 0, "From the pack"));
+    assert_eq!(*reads.borrow(), before, "nothing of the pack is read again");
+}

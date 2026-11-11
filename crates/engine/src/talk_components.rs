@@ -70,6 +70,9 @@ struct Runnable {
     build: Option<Build>,
 }
 
+/// What the index of builds came to: nothing if there's none, or why it can't be used.
+type IndexRead = Result<BuildIndex, String>;
+
 /// What a source said, kept with the stamp it had so that it isn't read again unchanged.
 type SourceRead = Result<(String, String), String>;
 
@@ -93,6 +96,9 @@ pub struct TalkComponents {
     loaded: HashMap<String, Loaded>,
     sources_seen: HashMap<String, Seen<SourceRead>>,
     builds_seen: HashMap<String, Seen<Option<String>>>,
+    index_seen: HashMap<String, Seen<Option<IndexRead>>>,
+    /// What each build was found to be in the scan under way.
+    identities_this_scan: HashMap<String, Option<String>>,
     /// The time renders have taken since the slide being laid out was started.
     spent: Duration,
 }
@@ -164,6 +170,8 @@ impl TalkComponents {
             loaded: HashMap::new(),
             sources_seen: HashMap::new(),
             builds_seen: HashMap::new(),
+            index_seen: HashMap::new(),
+            identities_this_scan: HashMap::new(),
             spent: Duration::ZERO,
         };
         components.rescan(registry);
@@ -196,6 +204,7 @@ impl TalkComponents {
         self.infos.clear();
         self.problems.clear();
         self.runnable.clear();
+        self.identities_this_scan.clear();
         let index = self.read_index();
         let named = self.add_sources(&index, registry);
         self.add_builds_with_no_source(&index, &named, registry);
@@ -205,8 +214,10 @@ impl TalkComponents {
             runnable.values().filter_map(|runnable| runnable.build.as_ref()).any(|build| build.path == *path && build.identity == loaded.identity)
         });
         let files = self.files.clone();
-        self.sources_seen.retain(|path, _| files.stamp(path).is_some());
-        self.builds_seen.retain(|path, _| files.stamp(path).is_some());
+        let still_there = |path: &String| files.never_changes() || files.stamp(path).is_some();
+        self.sources_seen.retain(|path, _| still_there(path));
+        self.builds_seen.retain(|path, _| still_there(path));
+        self.index_seen.retain(|path, _| still_there(path));
         self.summary() != before
     }
 
@@ -272,21 +283,21 @@ impl TalkComponents {
     /// The talk's index of builds, or an empty one if it has none or it can't be read.
     fn read_index(&mut self) -> BuildIndex {
         let empty = BuildIndex { format: 0, components: Vec::new() };
-        if self.files.len(INDEX_FILE).is_some_and(|len| len > MAX_INDEX_BYTES) {
-            self.problems.push(problem(INDEX_FILE, "It is too large to read, so no component counts as built"));
-            return empty;
-        }
-        let Some(bytes) = self.files.read(INDEX_FILE) else {
-            return empty;
-        };
-        let index = if bytes.len() as u64 > MAX_INDEX_BYTES {
-            Err("it is too large to read".to_string())
-        } else {
-            serde_json::from_slice::<BuildIndex>(&bytes).map_err(|error| error.to_string())
-        };
+        let files = self.files.clone();
+        let index = remembered(&mut self.index_seen, &*files, INDEX_FILE, || {
+            if files.len(INDEX_FILE).is_some_and(|len| len > MAX_INDEX_BYTES) {
+                return Some(Err("it is too large to read".to_string()));
+            }
+            let bytes = files.read(INDEX_FILE)?;
+            if bytes.len() as u64 > MAX_INDEX_BYTES {
+                return Some(Err("it is too large to read".to_string()));
+            }
+            Some(serde_json::from_slice::<BuildIndex>(&bytes).map_err(|error| error.to_string()))
+        });
         let mut index = match index {
-            Ok(index) => index,
-            Err(reason) => {
+            None => return empty,
+            Some(Ok(index)) => index,
+            Some(Err(reason)) => {
                 self.problems.push(problem(INDEX_FILE, format!("It can't be read, so no component counts as built: {reason}")));
                 return empty;
             }
@@ -302,18 +313,32 @@ impl TalkComponents {
         for name in unsafe_names {
             self.problems.push(problem(INDEX_FILE, format!("It names a build {name:?}, which isn't a name a build can have")));
         }
+        if index.components.len() > MAX_COMPONENTS {
+            let left_out = index.components.len() - MAX_COMPONENTS;
+            self.problems.push(problem(
+                INDEX_FILE,
+                format!("A talk can have at most {MAX_COMPONENTS} components, so the last {left_out} builds it lists are left out"),
+            ));
+            index.components.truncate(MAX_COMPONENTS);
+        }
         index
     }
 
     /// What the build at `path` is, to tell whether it changes, or `None` if there's no such file.
+    /// Each build is looked at once in a scan, however many entries name it.
     fn build_identity(&mut self, path: &str) -> Option<String> {
+        if let Some(identity) = self.identities_this_scan.get(path) {
+            return identity.clone();
+        }
         let files = self.files.clone();
-        remembered(&mut self.builds_seen, &*files, path, || {
+        let identity = remembered(&mut self.builds_seen, &*files, path, || {
             if let Some(len) = files.len(path).filter(|len| *len > MAX_MODULE_BYTES as u64) {
                 return Some(format!("{len} bytes, too large to run"));
             }
             files.read(path).map(|bytes| source_hash(&bytes))
-        })
+        });
+        self.identities_this_scan.insert(path.to_string(), identity.clone());
+        identity
     }
 
     /// The tag and hash of the source at `path`, or why it can't be used.
@@ -422,9 +447,11 @@ impl TalkComponents {
 }
 
 /// What `read` makes of the file at `path`, from `seen` if the file's stamp is the one it
-/// had then. A file with no stamp is read every time.
+/// had then. Files that never change are read once, and any other file with no stamp is
+/// read every time.
 fn remembered<T: Clone>(seen: &mut HashMap<String, Seen<T>>, files: &dyn TalkFiles, path: &str, read: impl FnOnce() -> T) -> T {
-    let Some(stamp) = files.stamp(path) else {
+    let stamp = if files.never_changes() { Some((0, SystemTime::UNIX_EPOCH)) } else { files.stamp(path) };
+    let Some(stamp) = stamp else {
         seen.remove(path);
         return read();
     };
