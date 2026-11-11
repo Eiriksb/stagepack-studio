@@ -1,12 +1,24 @@
 //! Adding, removing, moving and hiding slides, and their notes, as source edits. A slide's
 //! bytes move as they are: only the break lines where slides now meet or part, and the
 //! talk's settings when another slide becomes first, are written or taken away.
+//!
+//! A slide of nothing but `key: value` lines straight after its `---` would be read as a
+//! settings block as soon as another break follows it, and take that break for its close.
+//! Wherever an operation leaves such a slide with a break after it, it adds a blank line
+//! after the slide's `---`, which keeps it a slide.
+//!
+//! Two things are left as they are. A slide with a code fence it never closes already
+//! takes in the slides after it, and does so wherever it moves. And a slide's own entry
+//! with one of the `TALK_SETTINGS` keys stays its own until that slide is first; once it
+//! has been first, it is one of the talk's settings and goes with them.
 
 use std::ops::Range;
 
 use crate::attrs::scan_open_tag;
 use crate::edit::{Change, SourceEdit, eol_in, set_setting};
 use crate::model::{Slide, Talk};
+use crate::notes::escape_notes;
+use crate::settings::parse_entry;
 use crate::split::{RawSlide, split_slides};
 
 /// The settings that belong to the whole talk. They live in the first slide's settings
@@ -85,7 +97,8 @@ fn setting_entry<'a>(slide: &'a Slide, key: &str) -> Option<&'a crate::settings:
 
 /// Takes the setting `key` out of the slide's block, with its whole line. When it was the
 /// only entry the block goes too, but for the `---` that starts any slide but the first,
-/// or a first slide with nothing after its block.
+/// or a first slide with nothing after its block. A slide left with nothing but
+/// `key: value` lines keeps a blank line after its `---`, so it isn't read as settings.
 pub fn remove_setting(source: &str, slide: &Slide, key: &str) -> Option<SourceEdit> {
     let settings = slide.settings.as_ref()?;
     let entry = setting_entry(slide, key)?;
@@ -104,20 +117,25 @@ pub fn remove_setting(source: &str, slide: &Slide, key: &str) -> Option<SourceEd
     } else {
         open_end
     };
-    Some(SourceEdit { range: start..settings.range.end, text: String::new() })
+    // A slide of `key: value` lines would be read as the settings block in its place, so a
+    // blank line is left after the `---` to keep it a slide.
+    let followed = slide.range.end < source.len();
+    let text = if followed && only_settings_lines(&source[settings.range.end..slide.range.end]) {
+        eol_in(source).to_string()
+    } else {
+        String::new()
+    };
+    Some(SourceEdit { range: start..settings.range.end, text })
 }
 
 /// Sets what slide `index`'s `<Notes>` hold: the words inside an existing element are
 /// replaced, an element is added at the end of a slide with none, and the element goes
 /// when `notes` is empty. Line endings become the talk's.
 ///
-/// Notes are read back as they are written, so nothing can be escaped invisibly, and the
-/// `markdown` crate refuses a zero-width character after `<` as much as `</Notes` itself.
-/// So `</Notes` is written `\</Notes`: the backslash makes the `<` plain text, and is what
-/// the notes read back with. One that already has an odd number of backslashes before it
-/// is harmless already, and kept as it is. Nothing else is changed: notes that hold a tag
-/// of their own, or a line that is only `---`, are written as they are. A slide that can't
-/// be read is left alone.
+/// The notes are escaped where they would otherwise be read as something else, a tag, a
+/// code fence or a slide break, and the parser reads them back unescaped (see
+/// `escape_notes`), so `Notes::text` gives back what was typed. A slide that can't be read
+/// is left alone.
 pub fn set_notes(talk: &Talk, index: usize, notes: &str) -> Change {
     let source = talk.source.as_str();
     let Some(slide) = talk.slides.get(index) else { return no_change() };
@@ -125,9 +143,9 @@ pub fn set_notes(talk: &Talk, index: usize, notes: &str) -> Change {
         return no_change();
     }
     let eol = eol_in(source);
-    let notes = harmless(&with_line_endings(notes, eol));
+    let notes = with_line_endings(&escape_notes(&notes.replace("\r\n", "\n")), eol);
     let edit = match &slide.notes {
-        Some(_) if notes.trim().is_empty() => remove_notes(source, slide),
+        Some(_) if notes.trim().is_empty() => return without_notes(source, &split_slides(source)[index], remove_notes(source, slide), eol),
         Some(old) => {
             let (_, inner_start) = scan_open_tag(source, old.range.start);
             match source[inner_start.min(old.range.end)..old.range.end].rfind("</Notes") {
@@ -178,6 +196,36 @@ fn add_notes(source: &str, raw: &RawSlide, notes: &str, eol: &str) -> SourceEdit
     SourceEdit { range: at..at, text }
 }
 
+/// `removal` of a slide's notes, and a blank line after the slide's `---` if what's left of
+/// it would otherwise read as a settings block.
+fn without_notes(source: &str, raw: &RawSlide, mut removal: SourceEdit, eol: &str) -> Change {
+    let head_start = if raw.range.start == 0 { bom_len(source) } else { raw.range.start };
+    let after_a_rule = raw.settings.is_none() && raw.body.start > head_start;
+    let left = format!("{}{}", &source[raw.body.start..removal.range.start], &source[removal.range.end..raw.range.end]);
+    if !(after_a_rule && raw.range.end < source.len() && only_settings_lines(&left)) {
+        return Change::single(removal);
+    }
+    if removal.range.start == raw.body.start {
+        removal.text = eol.to_string();
+        return Change::single(removal);
+    }
+    let blank = SourceEdit { range: raw.body.start..raw.body.start, text: eol.to_string() };
+    Change { edits: vec![blank, removal] }
+}
+
+/// Whether `text`, a slide that starts with a `---` line, would be read as a settings block
+/// if a break came after it: a slide of `key: value` lines only.
+fn reads_as_settings(text: &str) -> bool {
+    text.split_once('\n').is_some_and(|(first, rest)| first.trim_end_matches('\r').trim_end_matches(' ') == "---" && only_settings_lines(rest))
+}
+
+/// Whether the lines of `text` would be read as a settings block's entries, if they came
+/// straight after a `---` and a break came after them.
+fn only_settings_lines(text: &str) -> bool {
+    let mut lines = text.lines();
+    lines.next().is_some_and(|first| parse_entry(first, 0).is_some()) && lines.all(|line| line.trim().is_empty() || parse_entry(line, 0).is_some())
+}
+
 /// The edit that takes the slide's `<Notes>` element away with its line, and the blank
 /// line before it.
 fn remove_notes(source: &str, slide: &Slide) -> SourceEdit {
@@ -197,23 +245,6 @@ fn remove_notes(source: &str, slide: &Slide) -> SourceEdit {
         start -= ending_len(&source[..start]);
     }
     SourceEdit { range: start.max(slide.range.start)..end, text: String::new() }
-}
-
-/// `notes` with every `</Notes` that would end the element written `\</Notes`.
-fn harmless(notes: &str) -> String {
-    let mut out = String::with_capacity(notes.len());
-    let mut rest = notes;
-    while let Some(at) = rest.find("</Notes") {
-        out.push_str(&rest[..at]);
-        let backslashes = out.bytes().rev().take_while(|&byte| byte == b'\\').count();
-        if backslashes % 2 == 0 {
-            out.push('\\');
-        }
-        out.push_str("</Notes");
-        rest = &rest[at + "</Notes".len()..];
-    }
-    out.push_str(rest);
-    out
 }
 
 fn with_line_endings(text: &str, eol: &str) -> String {
@@ -366,7 +397,7 @@ fn as_first(item: &Item, all: &[Parts], talk: &[Range<usize>], eol: &str) -> Vec
 /// A slide anywhere but first: it starts with a `---`, and has none of the talk's settings.
 fn as_later(item: &Item, all: &[Parts], eol: &str) -> Vec<Piece> {
     let index = match item {
-        Item::New(text) => return vec![Piece::New(format!("---{eol}{text}"))],
+        Item::New(text) => return vec![Piece::New(format!("---{eol}")), Piece::New(text.clone())],
         Item::Slide(index) | Item::Copy(index) => *index,
     };
     let parts = &all[index];
@@ -410,6 +441,10 @@ fn rearrange(talk: &Talk, order: &[Item]) -> Change {
     for slide in &mut slides[..last] {
         if !joined(source, slide).ends_with('\n') {
             slide.push(Piece::New(eol.to_string()));
+        }
+        // Every slide's head is its first piece, so the blank line goes straight after it.
+        if reads_as_settings(&joined(source, slide)) {
+            slide.insert(1, Piece::New(eol.to_string()));
         }
     }
     // A new last slide ends as the file did.

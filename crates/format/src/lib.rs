@@ -3,6 +3,7 @@
 mod attrs;
 mod edit;
 mod model;
+mod notes;
 mod parse;
 mod settings;
 mod slide_ops;

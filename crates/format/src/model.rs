@@ -93,6 +93,7 @@ impl Block {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Notes {
+    /// The words as they were typed: unescaped, with `\n` line endings.
     pub text: String,
     /// The whole `<Notes>` element.
     pub range: Range<usize>,

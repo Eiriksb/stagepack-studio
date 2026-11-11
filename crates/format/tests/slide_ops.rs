@@ -245,8 +245,8 @@ fn notes_are_added_changed_and_removed() {
 fn notes_with_markdown_in_them_come_back_as_written() {
     on_both(|e| {
         let src = e("# A\n");
-        let notes = e("**Bold** and _this_\n\n- one\n- two\n\n`code` and > a quote and 2 < 3");
-        let edited = applied(&src, &set_notes(&parse_talk(&src), 0, &notes));
+        let notes = "**Bold** and _this_\n\n- one\n- two\n\n`code` and > a quote and 2 < 3";
+        let edited = applied(&src, &set_notes(&parse_talk(&src), 0, &e(notes)));
         let slide = &parse_talk(&edited).slides[0];
         assert_eq!(slide.error, None);
         assert_eq!(slide.notes.as_ref().unwrap().text, notes);
@@ -257,18 +257,31 @@ fn notes_with_markdown_in_them_come_back_as_written() {
 fn notes_cannot_end_their_own_element() {
     on_both(|e| {
         let src = e("# A\n---\n# B\n");
-        for (typed, kept) in [
-            ("Type </Notes> here", "Type \\</Notes> here"),
-            ("</Notes>", "\\</Notes>"),
-            ("Already \\</Notes> safe", "Already \\</Notes> safe"),
-            ("Two \\\\</Notes> slashes", "Two \\\\\\</Notes> slashes"),
+        for typed in [
+            "Type </Notes> here",
+            "</Notes>",
+            "Already \\</Notes> escaped",
+            "Two \\\\</Notes> slashes",
+            "A <b>tag</b> and <Box> and {braces} and > this",
+            "C:\\path\\to\\file",
+            "Before\n---\nafter, and a rule with spaces:\n---  \nend",
+            "```\nan open fence\n  ~~~\nand another",
+            "- ```\n1. a list that trips the parser",
         ] {
             let edited = applied(&src, &set_notes(&parse_talk(&src), 0, typed));
             let talk = parse_talk(&edited);
             assert_eq!(talk.slides.len(), 2, "{typed}");
             assert_eq!(talk.slides[0].error, None, "{typed}");
-            assert_eq!(talk.slides[0].notes.as_ref().unwrap().text, kept);
+            assert_eq!(talk.slides[0].notes.as_ref().unwrap().text, typed);
         }
+    });
+}
+
+#[test]
+fn hand_written_notes_read_as_before() {
+    on_both(|e| {
+        let src = e("# A\n\n<Notes>\nSee C:\\path and \\n and a\\b\n</Notes>\n");
+        assert_eq!(parse_talk(&src).slides[0].notes.as_ref().unwrap().text, "See C:\\path and \\n and a\\b");
     });
 }
 
@@ -283,6 +296,42 @@ fn a_break_inside_a_code_fence_is_not_a_slide() {
         assert_eq!(parse_talk(&moved).slides.len(), 2);
         let copied = applied(&src, &duplicate_slide(&talk, 0));
         assert_eq!(parse_talk(&copied).slides.len(), 3);
+    });
+}
+
+/// A talk, an operation on it, the text it should give, and how many slides that has.
+type Case = (String, Box<dyn Fn(&Talk) -> Change>, String, usize);
+
+#[test]
+fn a_slide_of_key_value_lines_stays_a_slide() {
+    on_both(|e| {
+        let cases: Vec<Case> = vec![
+            // An existing slide of such lines gets something after it.
+            (e("# A\n---\nQuestions: ask me\n"), Box::new(|t| insert_slide(t, Some(1), "# New\n")), e("# A\n---\n\nQuestions: ask me\n---\n# New\n"), 3),
+            (e("# A\n---\nQuestions: ask me\n"), Box::new(|t| duplicate_slide(t, 1)), e("# A\n---\n\nQuestions: ask me\n---\nQuestions: ask me\n"), 3),
+            (e("# A\n---\n# B\n---\nQ: x\n"), Box::new(|t| move_slide(t, 2, 1)), e("# A\n---\n\nQ: x\n---\n# B\n"), 3),
+            (e("# A\n---\nQ: x\n"), Box::new(|t| move_slide(t, 0, 1)), e("Q: x\n---\n# A\n"), 2),
+            // A new slide of such lines.
+            (e("# A\n---\n# B\n"), Box::new(|t| insert_slide(t, Some(0), "Q: x\nR: y\n")), e("# A\n---\n\nQ: x\nR: y\n---\n# B\n"), 3),
+            // A first slide of such lines that moves away.
+            (e("Q: x\n---\n# B\n---\n# C\n"), Box::new(|t| move_slide(t, 0, 1)), e("# B\n---\n\nQ: x\n---\n# C\n"), 3),
+            (e("---\ntitle: T\n---\nQ: x\n---\n# B\n"), Box::new(|t| move_slide(t, 0, 1)), e("---\ntitle: T\n---\n# B\n---\nQ: x\n"), 2),
+            (e("---\ntitle: T\n---\nQ: x\n---\n# B\n---\n# C\n"), Box::new(|t| move_slide(t, 0, 1)), e("---\ntitle: T\n---\n# B\n---\n\nQ: x\n---\n# C\n"), 3),
+            // Deleting never needs it, but must not lose such a slide.
+            (e("# A\n---\n\nQ: x\n---\n# C\n"), Box::new(|t| delete_slide(t, 0).unwrap()), e("\nQ: x\n---\n# C\n"), 2),
+            (e("# A\n---\n# B\n---\nQ: x\n"), Box::new(|t| delete_slide(t, 1).unwrap()), e("# A\n---\nQ: x\n"), 2),
+            // Taking away its settings block, or its notes.
+            (e("# A\n---\nhidden: true\n---\nQ: x\n---\n# C\n"), Box::new(|t| set_hidden(t, 1, false)), e("# A\n---\n\nQ: x\n---\n# C\n"), 3),
+            (e("# A\n---\nQ: x\n\n<Notes>\nhi\n</Notes>\n---\n# C\n"), Box::new(|t| set_notes(t, 1, "")), e("# A\n---\n\nQ: x\n---\n# C\n"), 3),
+        ];
+        for (src, op, want, count) in cases {
+            let before = parse_talk(&src);
+            let change = op(&before);
+            let after = change.apply(&src);
+            assert_eq!(after, want, "from {src:?}");
+            assert_eq!(parse_talk(&after).slides.len(), count, "{after:?}");
+            assert_eq!(change.inverse(&src).apply(&after), src);
+        }
     });
 }
 
@@ -323,6 +372,9 @@ struct GenSlide {
     blocks: Vec<String>,
     notes: Option<String>,
     blank_after: bool,
+    /// A slide of `key: value` lines only, which reads as a settings block if a break
+    /// comes straight after a `---` and it.
+    key_values: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -356,12 +408,20 @@ impl GenTalk {
             } else if n > 0 || self.opening_rule {
                 out.push_str("---\n");
             }
-            let mut blocks = slide.blocks.clone();
-            blocks.insert(0, format!("# Slide {}", marker(n)));
-            if let Some(notes) = &slide.notes {
-                blocks.push(format!("<Notes>\n{notes}\n</Notes>"));
+            if slide.key_values {
+                let after_a_rule = slide.settings.is_empty() && (n > 0 || self.opening_rule);
+                if after_a_rule && n + 1 < self.slides.len() {
+                    out.push('\n');
+                }
+                out.push_str(&format!("Note: {}\nOther: thing", marker(n)));
+            } else {
+                let mut blocks = slide.blocks.clone();
+                blocks.insert(0, format!("# Slide {}", marker(n)));
+                if let Some(notes) = &slide.notes {
+                    blocks.push(format!("<Notes>\n{notes}\n</Notes>"));
+                }
+                out.push_str(&blocks.join("\n\n"));
             }
-            out.push_str(&blocks.join("\n\n"));
             out.push('\n');
             if slide.blank_after {
                 out.push('\n');
@@ -406,8 +466,9 @@ fn gen_slide() -> impl Strategy<Value = GenSlide> {
         prop::collection::vec(block(), 0..3),
         prop::option::of(prop::sample::select(vec!["Say **this**".to_string(), "- a point\n- another".to_string()])),
         any::<bool>(),
+        prop::bool::weighted(0.25),
     )
-        .prop_map(|(settings, blocks, notes, blank_after)| GenSlide { settings, blocks, notes, blank_after })
+        .prop_map(|(settings, blocks, notes, blank_after, key_values)| GenSlide { settings, blocks, notes, blank_after, key_values })
 }
 
 fn gen_talk() -> impl Strategy<Value = GenTalk> {
@@ -422,7 +483,8 @@ fn gen_talk() -> impl Strategy<Value = GenTalk> {
 
 #[derive(Clone, Debug)]
 enum Op {
-    Insert(Option<usize>),
+    /// After which slide, and whether the new one is of `key: value` lines only.
+    Insert(Option<usize>, bool),
     Delete(usize),
     Duplicate(usize),
     Move(usize, usize),
@@ -432,7 +494,7 @@ enum Op {
 
 fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
-        prop::option::of(0..8usize).prop_map(Op::Insert),
+        (prop::option::of(0..8usize), any::<bool>()).prop_map(|(after, key_values)| Op::Insert(after, key_values)),
         (0..8usize).prop_map(Op::Delete),
         (0..8usize).prop_map(Op::Duplicate),
         (0..8usize, 0..8usize).prop_map(|(a, b)| Op::Move(a, b)),
@@ -451,11 +513,12 @@ fn run(talk: &Talk, op: &Op) -> Option<(Change, Vec<usize>, Vec<usize>)> {
     let n = talk.slides.len();
     let order: Vec<usize> = (0..n).collect();
     Some(match op {
-        Op::Insert(after) => {
+        Op::Insert(after, key_values) => {
             let after = after.map(|a| a % n);
             let mut expected = order;
             expected.insert(after.map_or(0, |a| a + 1), NEW);
-            (insert_slide(talk, after, &format!("# Slide {}\n\nNew\n", marker(NEW))), expected, vec![NEW])
+            let text = if *key_values { format!("Note: {}\nOther: new\n", marker(NEW)) } else { format!("# Slide {}\n\nNew\n", marker(NEW)) };
+            (insert_slide(talk, after, &text), expected, vec![NEW])
         }
         Op::Delete(i) => {
             let i = i % n;
@@ -521,8 +584,36 @@ fn talk_eol(source: &str) -> &'static str {
     }
 }
 
+/// Text someone might type into the notes box, with everything the parser could take for
+/// something else.
+fn typed_notes() -> impl Strategy<Value = String> {
+    prop::collection::vec(
+        prop::sample::select(vec![
+            "a", "Z", "é", "🎉", " ", "  ", ".", "*", "_", "#", "-", "&", ":", "|", "[x](y)", "\n", "\n\n", "<", ">", "{", "}",
+            "\\", "`", "```", "~~~", "\n---\n", "\n---  \n", "\n  ```\n", "<b>", "</b>", "</Notes>", "<Notes>", "<Box x=\"1\">",
+            "\\<", "\\-", "\n> ", "\n- ", "\n1. ", "key: value", "a```b", "````",
+        ]),
+        0..24,
+    )
+    .prop_map(|parts| parts.concat())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
+
+    #[test]
+    fn anything_typed_in_notes_reads_back_as_typed(generated in gen_talk(), index in 0..8usize, typed in typed_notes()) {
+        let source = generated.text();
+        let before = parse_talk(&source);
+        let index = index % before.slides.len();
+        let after = parse_talk(&set_notes(&before, index, &typed).apply(&source));
+        prop_assert_eq!(after.slides.len(), before.slides.len());
+        prop_assert!(after.slides.iter().all(|s| s.error.is_none()), "{:?}", after.slides.iter().map(|s| &s.error).collect::<Vec<_>>());
+        prop_assert_eq!(slide_markers(&after), slide_markers(&before));
+        let read = after.slides[index].notes.as_ref().map(|n| n.text.as_str());
+        let want = typed.trim();
+        prop_assert_eq!(read, (!want.is_empty()).then_some(want));
+    }
 
     #[test]
     fn slide_operations_leave_other_slides_bytes_alone(generated in gen_talk(), op in op()) {
@@ -538,11 +629,24 @@ proptest! {
             let loose = new_index == 0 || old_index == 0;
             let (now, was) = (comparable(&after, new_index, loose), comparable(&before, old_index, loose));
             let eol = talk_eol(&before.source);
-            if old_index == before.slides.len() - 1 && !before.source.ends_with('\n') && now != was {
-                prop_assert_eq!(now, was + eol, "the last line of a slide that was last gets its line ending");
-            } else {
-                prop_assert_eq!(now, was, "slide {}", old_index);
+            // What the slide may have become: the same bytes, or with the line ending a last
+            // slide needs when it stops being last, or, for a slide of `key: value` lines,
+            // with a blank line after its `---` that keeps it from reading as settings.
+            let mut allowed = vec![was.clone()];
+            if old_index == before.slides.len() - 1 && !before.source.ends_with('\n') {
+                allowed.push(was.clone() + eol);
             }
+            if was.contains("Note: mk") {
+                let blanked: Vec<String> = allowed
+                    .iter()
+                    .map(|text| match (loose, text.find('\n')) {
+                        (false, Some(at)) => format!("{}{eol}{}", &text[..=at], &text[at + 1..]),
+                        _ => format!("{eol}{text}"),
+                    })
+                    .collect();
+                allowed.extend(blanked);
+            }
+            prop_assert!(allowed.contains(&now), "slide {}: {:?} is none of {:?}", old_index, now, allowed);
         }
         prop_assert_eq!(talk_entries(&after), talk_entries(&before));
         prop_assert_eq!(after.source.starts_with('\u{feff}'), generated.bom);
@@ -574,9 +678,8 @@ proptest! {
         match op {
             Op::Hide(i, hidden) => prop_assert_eq!(is_hidden(&after.slides[i % talk.slides.len()]), hidden),
             Op::Notes(i, notes) => {
-                let eol = talk_eol(&source);
                 let read = after.slides[i % talk.slides.len()].notes.as_ref().map(|n| n.text.clone());
-                let want = (!notes.is_empty()).then(|| notes.replace("</Notes", "\\</Notes").replace('\n', eol));
+                let want = (!notes.is_empty()).then(|| notes.clone());
                 prop_assert_eq!(read, want);
             }
             _ => {}

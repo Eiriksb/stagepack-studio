@@ -8,6 +8,7 @@ use markdown::{Constructs, ParseOptions};
 
 use crate::attrs::scan_open_tag;
 use crate::model::*;
+use crate::notes::unescape_notes;
 use crate::split::{RawSlide, split_slides};
 
 /// How many levels a slide can nest and still be read.
@@ -246,7 +247,7 @@ impl Ctx<'_> {
                             .rfind("</Notes")
                             .map_or(range.end, |i| open_end + i);
                         *notes = Some(Notes {
-                            text: self.source[open_end.min(end)..end].trim().to_string(),
+                            text: unescape_notes(self.source[open_end.min(end)..end].trim()),
                             range,
                         });
                     }
