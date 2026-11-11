@@ -44,11 +44,13 @@ Windows checklist: present on two screens, and open the exported PowerPoint in d
 
 ### C. Custom components
 
+File: `2026-11-10-native-rust-plan-c-components.md`.
+
 - The toolkit's public shape, the `#[component]` macro and the WebAssembly interface.
 - The compiler bundle, compile on save, the problems panel and the source check.
 - The sandbox: Wasmtime, memory and time caps, and the labelled box for a failed component.
 - The compile permission rules: source hashes, *Build components* and *Always build this folder*.
-- Forms from argument types, and `children`.
+- Forms from argument types, and `children`. Plan C delivers the schema and the fields a form will show; the form on screen is in D3.
 - The optional `Cargo.toml`, the guide and examples.
 - A ready-made `<Chart>` for bar, line and pie charts (goal 17, owner's decision, 2026-11-10). It's built on the toolkit, so it's also the first real test of it. PowerPoint export needs a freeform shape for its lines and slices.
 
