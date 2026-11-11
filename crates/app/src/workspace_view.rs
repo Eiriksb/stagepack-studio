@@ -24,7 +24,7 @@ use crate::markdown_panel::MarkdownPanel;
 use crate::permissions::BuildPermissions;
 use crate::present_view::{self, Presentation, start_show};
 use crate::recovery::{Found, Recovery, hash_text};
-use crate::saving::{SaveJob, SaveTarget, Saved};
+use crate::saving::{SaveError, SaveJob, SaveTarget, Saved};
 use crate::slide_canvas::{ScaleChanged, SlideCanvas};
 use crate::watcher::{self, Change};
 
@@ -249,9 +249,9 @@ pub struct WorkspaceView {
     saving: bool,
     /// Whether another save was asked for while one ran.
     save_again: bool,
-    /// A read of the file that came in while a save ran, which waits for it: the save may be
-    /// what changed the file.
-    reload_after_save: Option<Option<String>>,
+    /// Whether a read of the file came in while a save ran. It's read again once the save
+    /// is done: what came in may be older than what the save wrote.
+    reload_after_save: bool,
     /// Whether the window closes once the running save is done.
     close_after_save: bool,
     /// Whether the window may close with unsaved changes, as asked.
@@ -389,7 +389,7 @@ impl WorkspaceView {
             pending_components: None,
             saving: false,
             save_again: false,
-            reload_after_save: None,
+            reload_after_save: false,
             close_after_save: false,
             close_anyway: false,
             recovery: None,
@@ -683,12 +683,17 @@ impl WorkspaceView {
         }));
     }
 
+    /// Takes `contents` as a read of the talk's file that has just come in.
+    pub fn reload_for_test(&mut self, contents: Option<String>, cx: &mut Context<Self>) {
+        self.reload(contents, cx);
+    }
+
     fn reload(&mut self, contents: Option<String>, cx: &mut Context<Self>) {
         let Some(document) = self.document.clone() else {
             return;
         };
         if self.saving {
-            self.reload_after_save = Some(contents);
+            self.reload_after_save = true;
             return;
         }
         let reload = document.update(cx, |document, cx| {
@@ -1055,7 +1060,12 @@ impl WorkspaceView {
         .detach();
     }
 
-    fn finish_save(&mut self, outcome: Result<Saved, String>, name: String, cx: &mut Context<Self>) {
+    fn finish_save(
+        &mut self,
+        outcome: Result<Saved, SaveError>,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
         self.saving = false;
         let Some(document) = self.document.clone() else {
             return;
@@ -1081,19 +1091,34 @@ impl WorkspaceView {
                     self.moved(cx);
                 }
                 self.say(said, cx);
-                if std::mem::take(&mut self.close_after_save) {
-                    self.close_anyway = true;
-                    self.close_window(cx);
-                    return;
+                if self.close_after_save {
+                    if !document.read(cx).has_unsaved_changes() {
+                        self.close_after_save = false;
+                        self.close_anyway = true;
+                        self.close_window(cx);
+                        return;
+                    }
+                    // Edited while it saved: those are saved too before the window goes.
+                    self.save_again = true;
                 }
+            }
+            Err(SaveError::ChangedOutside(theirs)) => {
+                self.close_after_save = false;
+                self.save_again = false;
+                self.say(SaveError::ChangedOutside(String::new()).to_string(), cx);
+                // Asked about as any change from outside is: nothing has been written.
+                self.reload(Some(theirs), cx);
             }
             Err(problem) => {
                 self.close_after_save = false;
-                self.say(problem, cx);
+                self.say(problem.to_string(), cx);
             }
         }
-        if let Some(contents) = self.reload_after_save.take() {
-            self.reload(contents, cx);
+        if std::mem::take(&mut self.reload_after_save)
+            && let Some(folder) = &self.talk_folder
+        {
+            let file = folder.join(SLIDES_FILE);
+            self.reload_soon(file, cx);
         }
         if std::mem::take(&mut self.save_again) && document.read(cx).has_unsaved_changes() {
             self.save(cx);
@@ -1113,7 +1138,9 @@ impl WorkspaceView {
         self.build_problems.clear();
         self.pending_reload = None;
         self.pending_components = None;
-        let followed = self.watcher.take().is_some() || self.watch_problem.take().is_some();
+        let watched = self.watcher.take().is_some();
+        let tried_to_watch = self.watch_problem.take().is_some();
+        let followed = watched || tried_to_watch;
         if followed && let Some(folder) = self.talk_folder.clone() {
             self.follow_saves(folder, cx);
         }

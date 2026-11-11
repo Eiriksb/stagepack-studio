@@ -53,6 +53,8 @@ pub enum PackError {
     UnsafeName(String),
     TooLarge(String),
     Corrupt(String),
+    /// A talk was to be written in or under its own folder.
+    InsideTheTalk,
     Io(std::io::Error),
 }
 
@@ -68,6 +70,7 @@ impl fmt::Display for PackError {
             PackError::UnsafeName(name) => write!(f, "This file holds a file name that isn't safe to use: {name:?}."),
             PackError::TooLarge(what) => write!(f, "This talk is too large to open: {what}."),
             PackError::Corrupt(what) => write!(f, "This file is damaged or isn't a talk: {what}."),
+            PackError::InsideTheTalk => write!(f, "A talk can't be saved inside its own folder. Choose a place outside it."),
             PackError::Io(e) => write!(f, "The file couldn't be read or written: {e}."),
         }
     }
@@ -748,6 +751,10 @@ pub fn repack_with_slides(
 /// refusals and limits, and the names it left out are returned. `from` isn't touched, and a
 /// failure leaves `to` as it was.
 pub fn copy_talk_folder(from: &Path, to: &Path, slides: &str) -> Result<Vec<String>, PackError> {
+    if lies_within(to, from) {
+        // A copy in the talk's own folders would travel in every pack made from it.
+        return Err(PackError::InsideTheTalk);
+    }
     let mut skipped = Vec::new();
     let files = collect(from, &mut skipped)?;
     let limits = PackLimits::default();
@@ -758,6 +765,49 @@ pub fn copy_talk_folder(from: &Path, to: &Path, slides: &str) -> Result<Vec<Stri
         clear_away(to, existed);
     }
     result.map(|()| skipped)
+}
+
+/// Whether `path`, which needn't exist yet, is `folder` or lies anywhere under it. Both are
+/// compared as the system resolves them, links and all: a path that doesn't exist is resolved
+/// from the nearest folder above it that does.
+pub fn lies_within(path: &Path, folder: &Path) -> bool {
+    let Ok(folder) = folder.canonicalize() else {
+        return false;
+    };
+    let Ok(path) = std::path::absolute(path) else {
+        return false;
+    };
+    // The part of `path` that doesn't exist yet, last part first.
+    let mut rest = Vec::new();
+    let mut existing = path.as_path();
+    let resolved = loop {
+        if let Ok(resolved) = existing.canonicalize() {
+            break resolved;
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                existing = parent;
+            }
+            // `..` or the root: resolve what's left by its parts below.
+            _ => match existing.parent() {
+                Some(parent) => {
+                    rest.push(std::ffi::OsString::from(".."));
+                    existing = parent;
+                }
+                None => return false,
+            },
+        }
+    };
+    let mut full = resolved;
+    for part in rest.iter().rev() {
+        if part == ".." {
+            full.pop();
+        } else if part != "." {
+            full.push(part);
+        }
+    }
+    full.starts_with(&folder)
 }
 
 /// `slides.md` is written last, as in [`unpack_into`].

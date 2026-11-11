@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use slides_engine::{
-    FolderFiles, TalkFiles, copy_talk_folder, open_packed, pack_folder_with_slides,
-    repack_with_slides, unpack_with_slides, write_atomically,
+    FolderFiles, PackError, TalkFiles, copy_talk_folder, lies_within, open_packed,
+    pack_folder_with_slides, read_talk_text, repack_with_slides, unpack_with_slides,
+    write_atomically,
 };
 
 use crate::builds;
@@ -27,8 +28,39 @@ pub enum SaveTarget {
 /// A save of the talk as it was when the job was made.
 pub struct SaveJob {
     text: String,
+    /// What the talk's file held when the app last wrote or read it.
+    on_disk: String,
     from: TalkPlace,
     to: Option<SaveTarget>,
+}
+
+/// Why a save didn't write anything.
+#[derive(Debug)]
+pub enum SaveError {
+    /// It couldn't, for the reason given, in words for the person saving.
+    Failed(String),
+    /// The talk's file has been changed outside the app since it was last read, and holds
+    /// this. It's asked about before anything is written over it.
+    ChangedOutside(String),
+}
+
+impl std::fmt::Display for SaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SaveError::Failed(problem) => f.write_str(problem),
+            SaveError::ChangedOutside(_) => {
+                f.write_str("The talk wasn't saved, as it was changed outside the app.")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SaveError {}
+
+impl From<String> for SaveError {
+    fn from(problem: String) -> SaveError {
+        SaveError::Failed(problem)
+    }
 }
 
 /// The talk's files, as a job hands them over from its own thread.
@@ -56,16 +88,44 @@ impl Saved {
 }
 
 impl SaveJob {
-    pub(crate) fn new(text: String, from: TalkPlace, to: Option<SaveTarget>) -> SaveJob {
-        SaveJob { text, from, to }
+    pub(crate) fn new(
+        text: String,
+        on_disk: String,
+        from: TalkPlace,
+        to: Option<SaveTarget>,
+    ) -> SaveJob {
+        SaveJob {
+            text,
+            on_disk,
+            from,
+            to,
+        }
     }
 
     /// Writes the talk out. A failure says why, in words for the person saving, and leaves
     /// what was there as it was.
-    pub fn run(self) -> Result<Saved, String> {
-        let SaveJob { text, from, to } = self;
+    pub fn run(self) -> Result<Saved, SaveError> {
+        let SaveJob {
+            text,
+            on_disk,
+            from,
+            to,
+        } = self;
+        if let (TalkPlace::Folder(folder), Some(SaveTarget::Folder(to) | SaveTarget::Packed(to))) =
+            (&from, &to)
+            && lies_within(to, folder)
+        {
+            return Err(failed(to, PackError::InsideTheTalk).into());
+        }
         let (moved_to, notices) = match (&from, to) {
             (TalkPlace::Folder(folder), None) => {
+                // A file that can't be read is written anyway: it may have been deleted.
+                if let Ok(found) = read_talk_text(&folder.join(SLIDES_FILE))
+                    && found != on_disk
+                    && found != text
+                {
+                    return Err(SaveError::ChangedOutside(found));
+                }
                 write_slides(folder, &text)?;
                 (None, Vec::new())
             }

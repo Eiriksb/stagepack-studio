@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use slides_engine::{Fonts, TalkFiles as _, open_packed, pack_folder};
 use stagepack_studio::document::{Document, Reload};
-use stagepack_studio::saving::SaveTarget;
+use stagepack_studio::saving::{SaveError, SaveTarget};
 
 const TWO_SLIDES: &str = "---\ntitle: Review\n---\n\n# One\n\n---\n\n# Two\n";
 
@@ -105,7 +105,7 @@ fn a_failed_save_leaves_the_talk_unsaved_and_the_file_as_it_was() {
     let outcome = doc.save_job().run();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let problem = outcome.err().expect("the save fails");
+    let problem = outcome.err().expect("the save fails").to_string();
     assert!(!problem.is_empty());
     assert!(doc.has_unsaved_changes());
     assert_eq!(read(&dir.path().join("slides.md")), TWO_SLIDES);
@@ -214,7 +214,7 @@ fn save_as_into_a_folder_with_things_in_it_says_why_and_leaves_them() {
     std::fs::create_dir(&folder).unwrap();
     std::fs::write(folder.join("keep.txt"), "mine").unwrap();
     let problem = doc.save_as_job(SaveTarget::Folder(folder.clone())).run().err();
-    assert!(problem.is_some_and(|problem| !problem.is_empty()));
+    assert!(problem.is_some_and(|problem| !problem.to_string().is_empty()));
     assert_eq!(snapshot(&folder), [("keep.txt".to_string(), b"mine".to_vec())]);
 }
 
@@ -303,6 +303,7 @@ fn keeping_mine_then_saving_writes_mine() {
     doc.redo();
     // A new change is.
     let again = format!("{theirs}\n---\n\n# Four\n");
+    std::fs::write(dir.path().join("slides.md"), &again).unwrap();
     assert!(matches!(doc.reload(Some(again)), Reload::Conflict));
     doc.keep_mine();
 
@@ -326,4 +327,67 @@ fn edits_made_while_a_save_runs_stay_unsaved() {
     // And the file it wrote isn't taken for someone else's.
     let reload = doc.reload(Some(read(&dir.path().join("slides.md"))));
     assert!(!matches!(reload, Reload::Conflict));
+}
+
+/// Whether `folder` holds anything at all.
+fn has_anything(folder: &Path) -> bool {
+    std::fs::read_dir(folder).is_ok_and(|mut entries| entries.next().is_some())
+}
+
+#[test]
+fn save_as_inside_the_talks_own_folder_is_refused() {
+    let (dir, doc) = talk(TWO_SLIDES);
+    std::fs::create_dir(dir.path().join("assets")).unwrap();
+    let before = snapshot(dir.path());
+
+    for target in [
+        SaveTarget::Folder(dir.path().join("assets/copy")),
+        SaveTarget::Folder(dir.path().join("new/deeper")),
+        SaveTarget::Packed(dir.path().join("assets/copy.sptx")),
+        SaveTarget::Packed(dir.path().join("slides.md")),
+        SaveTarget::Packed(dir.path().join("assets/../talk.sptx")),
+    ] {
+        let problem = doc.save_as_job(target.clone()).run().err();
+        let problem = problem.unwrap_or_else(|| panic!("{target:?} is refused")).to_string();
+        assert!(problem.contains("inside"), "{problem}");
+        assert_eq!(snapshot(dir.path()), before, "{target:?}");
+    }
+    assert!(!has_anything(&dir.path().join("assets")));
+}
+
+#[test]
+fn save_as_beside_the_talks_folder_is_fine() {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("talk");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(folder.join("slides.md"), TWO_SLIDES).unwrap();
+    let doc = Document::open(&folder, Fonts::bundled_only()).unwrap();
+    // A name that starts like the talk's folder isn't inside it.
+    doc.save_as_job(SaveTarget::Folder(dir.path().join("talk-copy"))).run().unwrap();
+    doc.save_as_job(SaveTarget::Packed(dir.path().join("talk.sptx"))).run().unwrap();
+}
+
+#[test]
+fn a_save_over_an_outside_change_does_not_write_and_asks() {
+    let (dir, mut doc) = talk(TWO_SLIDES);
+    doc.add_slide("content").unwrap();
+    let mine = doc.source().to_string();
+    let theirs = format!("{TWO_SLIDES}\n---\n\n# Theirs\n");
+    std::fs::write(dir.path().join("slides.md"), &theirs).unwrap();
+
+    let refused = doc.save_job().run().err();
+
+    assert!(
+        matches!(&refused, Some(SaveError::ChangedOutside(found)) if *found == theirs),
+        "{:?}",
+        refused.map(|e| e.to_string())
+    );
+    assert_eq!(read(&dir.path().join("slides.md")), theirs, "nothing was written");
+    assert!(doc.has_unsaved_changes());
+
+    // The window then asks, and keeping mine lets the next save go ahead.
+    assert!(matches!(doc.reload(Some(theirs)), Reload::Conflict));
+    doc.keep_mine();
+    save(&mut doc);
+    assert_eq!(read(&dir.path().join("slides.md")), mine);
 }

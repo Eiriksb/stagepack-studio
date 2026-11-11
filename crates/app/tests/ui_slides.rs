@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use gpui_kit::test::{TestQueryExt, TestWindowExt};
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext, Bounds, Context, Entity, Pixels, Point, RenderImage,
+    Action as _, AnyWindowHandle, App, AppContext, Bounds, Context, Entity, Pixels, Point, RenderImage,
     TestAppContext, VisualTestContext, Window, WindowBounds, WindowOptions, point, px, size,
 };
 use slides_components::{Bundle, Diagnostic, component_tag};
@@ -20,7 +20,7 @@ use stagepack_studio::workspace_view::{
     CLOSE_SAVE_ID, COMPONENT_PROBLEMS_ID, EXPORT_MENU_ID, ExportPdf, ExportPowerPoint,
     FILE_MENU_ID, KEEP_MINE_ID, LOAD_THEIRS_ID, MARKDOWN_ID, NOTICES_ID, OPEN_IN_STAGEPACK_ID,
     OUTSIDE_CHANGE, OUTSIDE_CHANGE_ID, OpenFolder, OpenPacked, PROBLEM_ID, SAVE_AS_FOLDER_ID,
-    SAVE_AS_PACKED_ID, STATUS_ID, SaveAs, SetUpForCodeEditor, TITLE_ID, WorkspaceView,
+    SAVE_AS_PACKED_ID, STATUS_ID, Save, SaveAs, SetUpForCodeEditor, TITLE_ID, WorkspaceView,
 };
 
 fn document(source: &str) -> Document {
@@ -1897,4 +1897,77 @@ fn save_as_a_packed_talk_keeps_it_there(cx: &mut TestAppContext) {
         "---\ntitle: T\n---\n\n# One\n"
     );
     cx.read(|cx| assert!(cx.windows().len() == 1 && talk.view.read(cx).document().unwrap().read(cx).is_packed()));
+}
+
+/// Asks for a save, and leaves it running: nothing waiting is run yet.
+fn start_saving(cx: &mut TestAppContext, handle: AnyWindowHandle) {
+    cx.update_window(handle, |_, window, cx| window.dispatch_action(Save.boxed_clone(), cx))
+        .unwrap();
+}
+
+#[gpui_kit::test]
+fn closing_with_save_while_a_save_runs_writes_the_last_edits(cx: &mut TestAppContext) {
+    let talk = open_saved_talk(cx, "---\ntitle: T\n---\n\n# One\n");
+    add_slide(cx, &talk.view);
+    start_saving(cx, talk.handle);
+    add_slide(cx, &talk.view);
+    // Closing while that save runs, before anything waiting has run.
+    assert!(!VisualTestContext::from_window(talk.handle, cx).simulate_close());
+    cx.update_window(talk.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(CLOSE_SAVE_ID, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    assert_eq!(std::fs::read_to_string(&talk.file).unwrap(), source_of(cx, &talk.view));
+    assert!(source_of(cx, &talk.view).matches("# ").count() >= 3, "both slides were added");
+    assert!(!is_open(cx, talk.handle));
+}
+
+#[gpui_kit::test]
+fn a_read_held_back_by_a_save_is_read_again_after_it(cx: &mut TestAppContext) {
+    let first = "---\ntitle: T\n---\n\n# One\n";
+    let talk = open_saved_talk(cx, first);
+    add_slide(cx, &talk.view);
+    let mine = source_of(cx, &talk.view);
+
+    start_saving(cx, talk.handle);
+    // A read from before the save comes in while it runs.
+    cx.update(|cx| {
+        talk.view
+            .update(cx, |view, cx| view.reload_for_test(Some(first.to_string()), cx))
+    });
+    wait(cx, &talk, 200);
+
+    assert_eq!(std::fs::read_to_string(&talk.file).unwrap(), mine);
+    assert_eq!(source_of(cx, &talk.view), mine, "the old read isn't taken");
+    assert!(!shows_the_bar(cx, talk.handle));
+    assert_eq!(title(cx, talk.handle), "T · 2 / 2");
+}
+
+#[gpui_kit::test]
+fn saving_over_an_outside_change_asks_first(cx: &mut TestAppContext) {
+    let talk = open_saved_talk(cx, "---\ntitle: T\n---\n\n# One\n");
+    add_slide(cx, &talk.view);
+    let mine = source_of(cx, &talk.view);
+    let theirs = "---\ntitle: T\n---\n\n# Theirs\n";
+    // Changed outside, and the save asked for before the watcher has said so.
+    std::fs::write(&talk.file, theirs).unwrap();
+
+    cx.simulate_keystrokes(talk.handle, "ctrl-s");
+    settle(cx, talk.handle);
+
+    assert_eq!(std::fs::read_to_string(&talk.file).unwrap(), theirs, "nothing was written");
+    assert!(shows_the_bar(cx, talk.handle));
+    assert_eq!(source_of(cx, &talk.view), mine);
+
+    cx.update_window(talk.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(KEEP_MINE_ID, cx);
+    })
+    .unwrap();
+    cx.simulate_keystrokes(talk.handle, "ctrl-s");
+    assert_eq!(std::fs::read_to_string(&talk.file).unwrap(), mine);
+    assert!(!shows_the_bar(cx, talk.handle));
 }

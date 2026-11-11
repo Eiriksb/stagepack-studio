@@ -922,3 +922,16 @@ fn a_folder_is_packed_with_the_new_slides() {
         "# One\n\n---\n\n# Two\n"
     );
 }
+
+#[test]
+fn a_folder_is_not_copied_into_itself() {
+    let dir = talk_folder();
+    let before = snapshot(dir.path());
+    for inside in ["assets/copy", "copy", "assets/../copy"] {
+        let to = dir.path().join(inside);
+        assert!(matches!(copy_talk_folder(dir.path(), &to, "# Copy\n"), Err(PackError::InsideTheTalk)), "{inside}");
+        assert_eq!(snapshot(dir.path()), before, "{inside}");
+    }
+    assert!(lies_within(&dir.path().join("not/there/yet"), dir.path()));
+    assert!(!lies_within(&dir.path().with_extension("copy"), dir.path()));
+}

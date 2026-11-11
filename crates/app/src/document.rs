@@ -533,12 +533,22 @@ impl Document {
 
     /// A save of the talk as it is now, where it's kept: for a folder, only its `slides.md`.
     pub fn save_job(&self) -> SaveJob {
-        SaveJob::new(self.source().to_string(), self.place.clone(), None)
+        SaveJob::new(
+            self.source().to_string(),
+            self.on_disk.clone(),
+            self.place.clone(),
+            None,
+        )
     }
 
     /// A save of the talk as it is now, somewhere new.
     pub fn save_as_job(&self, target: SaveTarget) -> SaveJob {
-        SaveJob::new(self.source().to_string(), self.place.clone(), Some(target))
+        SaveJob::new(
+            self.source().to_string(),
+            self.on_disk.clone(),
+            self.place.clone(),
+            Some(target),
+        )
     }
 
     /// Takes in a save that worked. The talk is saved if its text is still what was written,
