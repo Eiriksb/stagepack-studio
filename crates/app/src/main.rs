@@ -1,11 +1,17 @@
 use std::path::PathBuf;
 
 use gpui_kit::*;
+use stagepack_studio::recovery::{KEEP_FOR, Recovery};
 use stagepack_studio::workspace_view;
 
 fn main() {
     // `stagepack-studio <folder or .sptx file>` opens that talk; with no argument, ask.
     let path = std::env::args_os().nth(1).map(PathBuf::from);
+    let recovery = Recovery::default_root().map(Recovery::new);
+    if let Some(recovery) = recovery.clone() {
+        // Working copies of talks not opened again in a long while.
+        std::thread::spawn(move || recovery.sweep(KEEP_FOR));
+    }
 
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
@@ -13,17 +19,17 @@ fn main() {
             gpui_kit::init(cx);
             workspace_view::bind_keys(cx);
             match path {
-                Some(path) => open_talk(path, cx),
-                None => ask_for_folder(cx),
+                Some(path) => open_talk(path, recovery, cx),
+                None => ask_for_folder(recovery, cx),
             }
         });
 }
 
-fn open_talk(path: PathBuf, cx: &mut App) {
-    workspace_view::open_talk_window(path, cx).expect("Failed to open the window");
+fn open_talk(path: PathBuf, recovery: Option<Recovery>, cx: &mut App) {
+    workspace_view::open_talk_window(path, recovery, cx).expect("Failed to open the window");
 }
 
-fn ask_for_folder(cx: &mut App) {
+fn ask_for_folder(recovery: Option<Recovery>, cx: &mut App) {
     let chosen = cx.prompt_for_paths(PathPromptOptions {
         files: false,
         directories: true,
@@ -40,7 +46,7 @@ fn ask_for_folder(cx: &mut App) {
             _ => None,
         };
         cx.update(|cx| match folder {
-            Some(folder) => open_talk(folder, cx),
+            Some(folder) => open_talk(folder, recovery, cx),
             None => cx.quit(),
         });
     })

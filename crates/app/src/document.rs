@@ -8,7 +8,7 @@ use slides_engine::{
     ComponentInfo, Deck, FolderFiles, Fonts, Layer, LayerTiming, Moment, PackError, SlideTimeline,
     TalkFiles, Transition, layout_by_name, open_packed, read_talk_text,
 };
-use slides_format::{Change, Talk, split_slides};
+use slides_format::{Change, SourceEdit, Talk, split_slides};
 
 use crate::export::ExportInput;
 use crate::history::History;
@@ -68,6 +68,7 @@ const MOVE_SLIDE: &str = "Move slide";
 const HIDE_SLIDE: &str = "Hide slide";
 const SHOW_SLIDE: &str = "Show slide";
 const EDIT_NOTES: &str = "Edit notes";
+const RECOVER_CHANGES: &str = "Recover changes";
 
 /// The layout a slide has when its settings name none.
 const DEFAULT_LAYOUT: &str = "content";
@@ -424,6 +425,27 @@ impl Document {
     /// Whether the talk has edits that its file doesn't.
     pub fn has_unsaved_changes(&self) -> bool {
         !self.history.is_saved()
+    }
+
+    /// Takes `text`, the working copy of edits that weren't saved, as the talk's text, and
+    /// returns the slides to show again. It's taken as it is, whatever it does to the slides,
+    /// and one undo gives back the text as it was. Nothing is written until the talk is saved.
+    pub fn recover(&mut self, text: String) -> Vec<usize> {
+        let old = self.source().to_string();
+        if text == old {
+            return Vec::new();
+        }
+        let change = Change::single(SourceEdit {
+            range: 0..old.len(),
+            text,
+        });
+        let undo = change.inverse(&old);
+        let mut changed = self.deck.update(change.apply(&old));
+        let at = self.current;
+        self.history.record(RECOVER_CHANGES, undo, at, at);
+        self.typing_notes = None;
+        self.show(at, &mut changed);
+        changed
     }
 
     /// Adds a slide with the layout called `layout` after the current one, with an empty

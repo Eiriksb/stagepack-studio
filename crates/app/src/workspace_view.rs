@@ -23,6 +23,7 @@ use crate::export::{self, ExportKind, run_export, stagepack_executable};
 use crate::markdown_panel::MarkdownPanel;
 use crate::permissions::BuildPermissions;
 use crate::present_view::{self, Presentation, start_show};
+use crate::recovery::{Found, Recovery, hash_text};
 use crate::saving::{SaveJob, SaveTarget, Saved};
 use crate::slide_canvas::{ScaleChanged, SlideCanvas};
 use crate::watcher::{self, Change};
@@ -50,6 +51,9 @@ pub const SAVE_AS_CANCEL_ID: &str = "save-as-cancel";
 pub const CLOSE_SAVE_ID: &str = "close-save";
 pub const CLOSE_DONT_SAVE_ID: &str = "close-dont-save";
 pub const CLOSE_CANCEL_ID: &str = "close-cancel";
+pub const RECOVERY_ID: &str = "recovery";
+pub const RECOVER_ID: &str = "recover";
+pub const DISCARD_RECOVERY_ID: &str = "discard-recovery";
 
 /// The key context of the window's content, where its shortcuts apply.
 pub const KEY_CONTEXT: &str = "Workspace";
@@ -59,6 +63,9 @@ pub(crate) const APP_ID: &str = "stagepack-studio";
 
 /// How long the file has to stay quiet before it's read, as one save can be several writes.
 const RELOAD_DELAY: Duration = Duration::from_millis(100);
+
+/// How long after the last edit the working copy of unsaved changes is brought up to date.
+const WORKING_COPY_DELAY: Duration = Duration::from_secs(1);
 
 const MARKDOWN_WIDTH: Pixels = px(380.);
 
@@ -74,6 +81,9 @@ const NO_COMPILER: &str = "This copy of the app has no compiler, so components c
 
 pub const OUTSIDE_CHANGE: &str = "This talk was changed outside the app.";
 const UNSAVED_ON_CLOSE: &str = "This talk has changes that haven't been saved.";
+
+pub const RECOVERY_OFFER: &str = "Changes from last time weren't saved.";
+pub const RECOVERY_CHANGED_SINCE: &str = "The talk has also changed since then.";
 
 /// What the title shows before the talk's name while it has unsaved changes.
 pub const UNSAVED_MARK: &str = "• ";
@@ -112,12 +122,19 @@ pub fn bind_keys(cx: &mut App) {
     present_view::bind_keys(cx);
 }
 
-/// Opens the talk at `path`, a folder or a packed file, in a window of its own.
-pub fn open_talk_window(path: PathBuf, cx: &mut App) -> Result<()> {
+/// Opens the talk at `path`, a folder or a packed file, in a window of its own. Its unsaved
+/// changes are kept safe in `recovery`, if there's one.
+pub fn open_talk_window(path: PathBuf, recovery: Option<Recovery>, cx: &mut App) -> Result<()> {
     let path = std::path::absolute(&path).unwrap_or(path);
     let options = WorkspaceView::window_options(cx);
     gpui_kit::open_window(options, cx, |window, cx| {
-        cx.new(|cx| WorkspaceView::open(path, window, cx))
+        cx.new(|cx| {
+            let mut view = WorkspaceView::open(path, window, cx);
+            if let Some(recovery) = recovery {
+                view.use_recovery(recovery, cx);
+            }
+            view
+        })
     })?;
     cx.activate(true);
     Ok(())
@@ -143,6 +160,42 @@ const SAVING: Wording = Wording {
 enum SaveKind {
     Folder,
     Packed,
+}
+
+/// The working copy last written for the talk, so the same one isn't written again.
+#[derive(PartialEq)]
+struct Kept {
+    place: PathBuf,
+    text: String,
+    on_disk: String,
+}
+
+/// What brings the working copy up to date, on a background task.
+enum WorkingCopyJob {
+    Keep {
+        recovery: Recovery,
+        place: TalkPlace,
+        on_disk: String,
+        text: String,
+    },
+    Clear(Recovery, TalkPlace),
+}
+
+impl WorkingCopyJob {
+    fn run(self) -> std::io::Result<()> {
+        match self {
+            WorkingCopyJob::Keep {
+                recovery,
+                place,
+                on_disk,
+                text,
+            } => recovery.keep(&place, &hash_text(&on_disk), &text),
+            WorkingCopyJob::Clear(recovery, place) => {
+                recovery.clear(&place);
+                Ok(())
+            }
+        }
+    }
 }
 
 /// A file this app can't show but an installed Stagepack can.
@@ -203,6 +256,14 @@ pub struct WorkspaceView {
     close_after_save: bool,
     /// Whether the window may close with unsaved changes, as asked.
     close_anyway: bool,
+    /// Where working copies of unsaved changes are kept, if anywhere.
+    recovery: Option<Recovery>,
+    /// The working copy this window last wrote, while it's there.
+    kept: Option<Kept>,
+    /// The update of the working copy waiting for the edits to stop for a moment.
+    pending_working_copy: Option<Task<()>>,
+    /// Unsaved changes from last time, while nobody has said whether to bring them back.
+    offered: Option<Found>,
     /// The window this is the content of.
     window_handle: AnyWindowHandle,
     _scale_changed: Subscription,
@@ -278,10 +339,14 @@ impl WorkspaceView {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
         let document = document.map(|document| cx.new(|_| document));
-        // The title says whether there are unsaved changes, whatever made them.
-        let document_changed = document
-            .as_ref()
-            .map(|document| cx.observe(document, |_, _, cx| cx.notify()));
+        // The title says whether there are unsaved changes, whatever made them, and the
+        // working copy follows them.
+        let document_changed = document.as_ref().map(|document| {
+            cx.observe(document, |this, _, cx| {
+                this.keep_working_copy_soon(cx);
+                cx.notify();
+            })
+        });
         let view = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
             view.update(cx, |view, cx| view.should_close(window, cx))
@@ -327,6 +392,10 @@ impl WorkspaceView {
             reload_after_save: None,
             close_after_save: false,
             close_anyway: false,
+            recovery: None,
+            kept: None,
+            pending_working_copy: None,
+            offered: None,
             window_handle: window.window_handle(),
             _scale_changed: scale_changed,
             _document_changed: document_changed,
@@ -358,6 +427,149 @@ impl WorkspaceView {
     pub fn set_permissions_for_test(&mut self, permissions: BuildPermissions) {
         self.permissions = Some(permissions);
         self.always_build = self.is_always_built();
+    }
+
+    /// Keeps working copies in `recovery`, in place of the app's data folder.
+    pub fn set_recovery_for_test(&mut self, recovery: Recovery, cx: &mut Context<Self>) {
+        self.use_recovery(recovery, cx);
+    }
+
+    /// Keeps working copies of unsaved changes in `recovery`, and offers back the one left
+    /// there for this talk, if any.
+    fn use_recovery(&mut self, recovery: Recovery, cx: &mut Context<Self>) {
+        self.recovery = Some(recovery.clone());
+        let Some(document) = &self.document else {
+            return;
+        };
+        let place = document.read(cx).place().clone();
+        cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_spawn(async move { recovery.find(&place) })
+                .await;
+            this.update(cx, |this, cx| this.offer(found, cx)).ok();
+        })
+        .detach();
+    }
+
+    fn offer(&mut self, found: Option<Found>, cx: &mut Context<Self>) {
+        let (Some(found), Some(document)) = (found, &self.document) else {
+            return;
+        };
+        let document = document.read(cx);
+        if found.text == document.source() {
+            // Nothing in it that isn't here.
+            if self.kept.is_none() {
+                let place = document.place().clone();
+                self.run_working_copy_job(self.clear_job(place), cx);
+            }
+            return;
+        }
+        self.offered = Some(found);
+        cx.notify();
+    }
+
+    /// Takes back the unsaved changes from last time, as one edit to undo.
+    fn bring_back(&mut self, cx: &mut Context<Self>) {
+        let (Some(found), Some(document)) = (self.offered.take(), self.document.clone()) else {
+            return;
+        };
+        document.update(cx, |document, cx| {
+            document.recover(found.text);
+            // A show of the talk has to know.
+            cx.notify();
+        });
+        let source = document.read(cx).source().to_string();
+        self.markdown_panel
+            .update(cx, |panel, cx| panel.set_source(&source, cx));
+        self.show_slide(cx);
+    }
+
+    /// Lets the unsaved changes from last time go.
+    fn discard_recovered(&mut self, cx: &mut Context<Self>) {
+        if self.offered.take().is_none() {
+            return;
+        }
+        // Once there are edits here, the working copy is theirs, not last time's.
+        if self.kept.is_none()
+            && let Some(document) = &self.document
+        {
+            let place = document.read(cx).place().clone();
+            self.run_working_copy_job(self.clear_job(place), cx);
+        }
+        cx.notify();
+    }
+
+    /// Brings the working copy up to date once the edits have stopped for a moment.
+    fn keep_working_copy_soon(&mut self, cx: &mut Context<Self>) {
+        if self.recovery.is_none() {
+            return;
+        }
+        // Replacing the task cancels the one waiting, so the wait starts again from now.
+        self.pending_working_copy = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(WORKING_COPY_DELAY).await;
+            let Ok(Some(job)) = this.update(cx, |this, cx| this.working_copy_job(cx)) else {
+                return;
+            };
+            let outcome = cx.background_spawn(async move { job.run() }).await;
+            if let Err(error) = outcome {
+                this.update(cx, |this, cx| {
+                    this.kept = None;
+                    this.say(
+                        format!("Unsaved changes couldn't be kept safe in case the app stops: {error}"),
+                        cx,
+                    );
+                })
+                .ok();
+            }
+        }));
+    }
+
+    /// What brings the working copy in line with the talk: one while it has unsaved changes,
+    /// and none once it hasn't.
+    fn working_copy_job(&mut self, cx: &App) -> Option<WorkingCopyJob> {
+        let recovery = self.recovery.clone()?;
+        let document = self.document.as_ref()?.read(cx);
+        let place = document.place().clone();
+        if !document.has_unsaved_changes() {
+            self.kept.take()?;
+            return self.clear_job(place);
+        }
+        let (TalkPlace::Folder(path) | TalkPlace::Packed(path)) = &place;
+        let kept = Kept {
+            place: path.clone(),
+            text: document.source().to_string(),
+            on_disk: document.stamp_on_disk().to_string(),
+        };
+        if self.kept.as_ref() == Some(&kept) {
+            return None;
+        }
+        let job = WorkingCopyJob::Keep {
+            recovery,
+            place,
+            on_disk: kept.on_disk.clone(),
+            text: kept.text.clone(),
+        };
+        self.kept = Some(kept);
+        Some(job)
+    }
+
+    fn clear_job(&self, place: TalkPlace) -> Option<WorkingCopyJob> {
+        Some(WorkingCopyJob::Clear(self.recovery.clone()?, place))
+    }
+
+    fn run_working_copy_job(&self, job: Option<WorkingCopyJob>, cx: &mut Context<Self>) {
+        if let Some(job) = job {
+            cx.background_spawn(async move { job.run().ok() }).detach();
+        }
+    }
+
+    /// Removes the working copy of the talk at `place` now, as its changes are saved or let go.
+    fn forget_working_copy(&mut self, place: TalkPlace) {
+        self.kept = None;
+        self.pending_working_copy = None;
+        if let Some(recovery) = &self.recovery {
+            recovery.clear(&place);
+        }
     }
 
     fn is_always_built(&self) -> bool {
@@ -650,10 +862,11 @@ impl WorkspaceView {
             multiple: false,
             prompt: Some("Open".into()),
         });
+        let recovery = self.recovery.clone();
         cx.spawn(async move |this, cx| {
             let opened = match chosen.await {
                 Ok(Ok(Some(mut paths))) if !paths.is_empty() => cx
-                    .update(|cx| open_talk_window(paths.remove(0), cx))
+                    .update(|cx| open_talk_window(paths.remove(0), recovery, cx))
                     .map_err(|error| format!("Could not open a window for that talk: {error}")),
                 Ok(Err(error)) => Err(format!("Could not show the Open dialog: {error}")),
                 _ => Ok(()),
@@ -855,10 +1068,15 @@ impl WorkspaceView {
                     format!("{} {name}. {}", SAVING.done, saved.notices().join(" · "))
                 };
                 let moved = saved.moved();
+                let saved_from = document.read(cx).place().clone();
                 document.update(cx, |document, cx| {
                     document.saved(saved);
                     cx.notify();
                 });
+                // What it kept is in the file now. Anything edited since is kept again.
+                let job = self.clear_job(saved_from);
+                self.kept = None;
+                self.run_working_copy_job(job, cx);
                 if moved {
                     self.moved(cx);
                 }
@@ -906,6 +1124,8 @@ impl WorkspaceView {
     fn keep_mine(&mut self, cx: &mut Context<Self>) {
         if let Some(document) = &self.document {
             document.update(cx, |document, _| document.keep_mine());
+            // The edits now start from what the file holds.
+            self.keep_working_copy_soon(cx);
             cx.notify();
         }
     }
@@ -937,6 +1157,13 @@ impl WorkspaceView {
             .as_ref()
             .is_some_and(|document| document.read(cx).has_unsaved_changes());
         if self.close_anyway || !unsaved {
+            if !unsaved
+                && self.kept.is_some()
+                && let Some(document) = &self.document
+            {
+                let place = document.read(cx).place().clone();
+                self.forget_working_copy(place);
+            }
             return true;
         }
         if !window.has_active_dialog(cx) {
@@ -972,6 +1199,10 @@ impl WorkspaceView {
                             Button::new(CLOSE_DONT_SAVE_ID)
                                 .label("Don't save")
                                 .on_click(answer(|view, cx| {
+                                    if let Some(document) = &view.document {
+                                        let place = document.read(cx).place().clone();
+                                        view.forget_working_copy(place);
+                                    }
                                     view.close_anyway = true;
                                     view.close_window(cx);
                                 })),
@@ -1189,6 +1420,45 @@ impl WorkspaceView {
         )
     }
 
+    /// The bar that offers back the unsaved changes from last time.
+    fn recovery_bar(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
+        let found = self.offered.as_ref()?;
+        let said: SharedString = if found.base_matches {
+            RECOVERY_OFFER.into()
+        } else {
+            format!("{RECOVERY_OFFER} {RECOVERY_CHANGED_SINCE}").into()
+        };
+        Some(
+            h_flex()
+                .id(RECOVERY_ID)
+                .test_support()
+                .aria_label(said.clone())
+                .w_full()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .items_center()
+                .bg(cx.theme().secondary)
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .child(div().text_sm().child(said))
+                .child(
+                    Button::new(RECOVER_ID)
+                        .small()
+                        .primary()
+                        .label("Bring them back")
+                        .on_click(cx.listener(|this, _, _, cx| this.bring_back(cx))),
+                )
+                .child(
+                    Button::new(DISCARD_RECOVERY_ID)
+                        .small()
+                        .ghost()
+                        .label("Discard")
+                        .on_click(cx.listener(|this, _, _, cx| this.discard_recovered(cx))),
+                ),
+        )
+    }
+
     /// What's wrong with the talk's components, one line each.
     fn component_problems(&self, cx: &App) -> Option<impl IntoElement> {
         let document = self.document.as_ref()?.read(cx);
@@ -1227,6 +1497,7 @@ impl WorkspaceView {
 impl Render for WorkspaceView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let build_bar = self.build_bar(cx);
+        let recovery_bar = self.recovery_bar(cx);
         let outside_change_bar = self.outside_change_bar(cx);
         let component_problems = self.component_problems(cx);
         let document = self.document.as_ref().map(|document| document.read(cx));
@@ -1353,6 +1624,7 @@ impl Render for WorkspaceView {
                         )
                     }),
             )
+            .children(recovery_bar)
             .children(outside_change_bar)
             .children(component_problems)
             .children(build_bar)
