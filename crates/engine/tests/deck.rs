@@ -397,7 +397,7 @@ fn a_hidden_slide_is_left_out_of_a_show() {
     let d = deck(ONE_HIDDEN);
     assert!(d.is_hidden(1));
     assert!(!d.is_hidden(0) && !d.is_hidden(2));
-    assert_eq!(d.shown_slides(), vec![0, 2]);
+    assert_eq!(d.shown_slides(), [0, 2]);
     assert_eq!(d.slide_count(), 3, "the slide is still in the talk");
 }
 
@@ -405,7 +405,7 @@ fn a_hidden_slide_is_left_out_of_a_show() {
 fn a_talk_with_every_slide_hidden_still_shows_them() {
     let d = deck("---\nhidden: true\n---\n\n# One\n\n---\nhidden: true\n---\n\n# Two\n");
     assert!(d.is_hidden(0) && d.is_hidden(1));
-    assert_eq!(d.shown_slides(), vec![0, 1]);
+    assert_eq!(d.shown_slides(), [0, 1]);
 }
 
 /// A slide with one red box covering the middle of it.
@@ -419,7 +419,7 @@ fn pixel(pixmap: &tiny_skia::Pixmap, x: u32, y: u32) -> [u8; 4] {
 #[test]
 fn a_thumbnail_is_the_whole_slide_at_the_width_asked_for() {
     let mut d = deck(RED_BOX);
-    let thumbnail = d.thumbnail(0, 320);
+    let thumbnail = d.thumbnail(0, 320).unwrap();
     assert_eq!((thumbnail.width(), thumbnail.height()), (320, 180));
     assert_eq!(pixel(&thumbnail, 160, 90), [255, 0, 0, 255], "inside the box");
     assert_ne!(pixel(&thumbnail, 5, 5), [255, 0, 0, 255], "outside it");
@@ -429,28 +429,28 @@ fn a_thumbnail_is_the_whole_slide_at_the_width_asked_for() {
 #[test]
 fn a_thumbnail_is_kept_until_its_slide_changes() {
     let mut d = deck(TALK);
-    let (one, two) = (d.thumbnail(0, 160), d.thumbnail(1, 160));
-    assert!(Arc::ptr_eq(&one, &d.thumbnail(0, 160)));
+    let (one, two) = (d.thumbnail(0, 160).unwrap(), d.thumbnail(1, 160).unwrap());
+    assert!(Arc::ptr_eq(&one, &d.thumbnail(0, 160).unwrap()));
     assert_eq!(d.update(TALK.replace("Two", "Changed")), vec![1]);
-    assert!(Arc::ptr_eq(&one, &d.thumbnail(0, 160)), "slide 0 didn't change");
-    let again = d.thumbnail(1, 160);
+    assert!(Arc::ptr_eq(&one, &d.thumbnail(0, 160).unwrap()), "slide 0 didn't change");
+    let again = d.thumbnail(1, 160).unwrap();
     assert!(!Arc::ptr_eq(&two, &again), "slide 1 did");
-    assert!(Arc::ptr_eq(&again, &d.thumbnail(1, 160)));
+    assert!(Arc::ptr_eq(&again, &d.thumbnail(1, 160).unwrap()));
 }
 
 #[test]
 fn a_thumbnail_at_another_width_is_drawn_again() {
     let mut d = deck(TALK);
-    let small = d.thumbnail(0, 160);
-    let large = d.thumbnail(0, 320);
+    let small = d.thumbnail(0, 160).unwrap();
+    let large = d.thumbnail(0, 320).unwrap();
     assert_eq!((small.width(), large.width()), (160, 320));
-    assert_eq!(d.thumbnail(0, 320).width(), 320);
+    assert_eq!(d.thumbnail(0, 320).unwrap().width(), 320);
 }
 
 #[test]
 fn thumbnails_stay_within_the_memory_budget() {
     let mut d = deck(&long_talk(20));
-    let one = d.thumbnail(0, 160).data().len();
+    let one = d.thumbnail(0, 160).unwrap().data().len();
     let budget = 3 * one;
     d.set_memory_budget(budget);
     for index in 0..20 {
@@ -464,7 +464,7 @@ fn thumbnails_stay_within_the_memory_budget() {
 fn a_thumbnail_counts_against_the_drawn_layers_budget() {
     let mut d = deck(TALK);
     assert_eq!(d.drawn_bytes(), 0);
-    let thumbnail = d.thumbnail(0, 160);
+    let thumbnail = d.thumbnail(0, 160).unwrap();
     assert!(d.drawn_bytes() >= thumbnail.data().len());
 }
 
@@ -472,5 +472,50 @@ fn a_thumbnail_counts_against_the_drawn_layers_budget() {
 fn a_thumbnail_of_a_slide_that_builds_shows_its_last_step() {
     let source = "<Box x=\"600\" y=\"300\" w=\"720\" h=\"480\" fill=\"#ff0000\" click=\"2\" />\n";
     let mut d = deck(source);
-    assert_eq!(pixel(&d.thumbnail(0, 320), 160, 90), [255, 0, 0, 255]);
+    assert_eq!(pixel(&d.thumbnail(0, 320).unwrap(), 160, 90), [255, 0, 0, 255]);
+}
+
+#[test]
+fn a_thumbnail_of_a_slide_that_is_not_there_is_none() {
+    let mut d = deck(TALK);
+    assert!(d.thumbnail(3, 160).is_none());
+    assert!(d.thumbnail(usize::MAX, 160).is_none());
+    assert!(d.thumbnail(2, 160).is_some(), "the last slide is there");
+}
+
+#[test]
+fn a_long_pass_of_thumbnails_gives_way_before_the_slide_on_screen() {
+    let mut d = deck(&long_talk(30));
+    let on_screen = d.layers(0, SCALE);
+    let thumbnail = d.thumbnail(1, 160).unwrap().data().len();
+    let budget = bytes(&on_screen[0]) + bytes(&on_screen[1]) + 3 * thumbnail;
+    d.set_memory_budget(budget);
+    for index in 0..30 {
+        d.thumbnail(index, 160);
+        assert!(d.drawn_bytes() <= budget, "slide {index}: {} bytes with a budget of {budget}", d.drawn_bytes());
+    }
+    assert!(Arc::ptr_eq(&on_screen[1], &d.layers(0, SCALE)[1]), "the slide on screen kept its layers");
+}
+
+#[test]
+fn the_slides_a_show_goes_through_are_worked_out_once_per_update() {
+    let mut d = deck(ONE_HIDDEN);
+    let (first, again) = (d.shown_slides(), d.shown_slides());
+    assert_eq!(first.as_ptr(), again.as_ptr(), "the same list, not a new one");
+    assert_eq!(d.shown_slides(), [0, 2]);
+    d.update(ONE_HIDDEN.replace("hidden: true", "hidden: false"));
+    assert_eq!(d.shown_slides(), [0, 1, 2]);
+}
+
+#[test]
+fn asking_for_a_thumbnail_already_drawn_draws_nothing() {
+    let mut d = deck(TALK);
+    assert!(d.drawn_thumbnail(0, 160).is_none(), "none drawn yet");
+    assert_eq!(d.drawn_bytes(), 0, "and asking drew none");
+    let drawn = d.thumbnail(0, 160).unwrap();
+    assert!(Arc::ptr_eq(&drawn, &d.drawn_thumbnail(0, 160).unwrap()));
+    assert!(d.drawn_thumbnail(0, 320).is_none(), "not at that width");
+    assert!(d.drawn_thumbnail(7, 160).is_none(), "no such slide");
+    d.update(TALK.replace("One", "Changed"));
+    assert!(d.drawn_thumbnail(0, 160).is_none(), "the slide changed");
 }

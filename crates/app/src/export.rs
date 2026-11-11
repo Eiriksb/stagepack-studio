@@ -73,6 +73,7 @@ fn make(input: ExportInput, kind: ExportKind) -> Result<(Vec<u8>, Vec<String>), 
             let bytes = write_pdf(&mut deck)?;
             let notices = deck
                 .shown_slides()
+                .to_vec()
                 .into_iter()
                 .flat_map(|index| {
                     deck.notices_whole(index)

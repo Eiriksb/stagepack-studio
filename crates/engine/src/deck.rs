@@ -104,6 +104,10 @@ struct SlideState {
     thumbnail: Option<(u32, Arc<Pixmap>)>,
     /// The value of `Deck::layers_asked_for` when this slide's layers were last asked for.
     last_used: u64,
+    /// The value of `Deck::layers_asked_for` when this slide's thumbnail was last asked for.
+    /// It's apart from `last_used`, so that a list of thumbnails scrolled through doesn't make
+    /// the slides in it seem more wanted than the one on screen.
+    thumbnail_used: u64,
 }
 
 pub struct Deck {
@@ -128,6 +132,8 @@ pub struct Deck {
     last_asked: Option<usize>,
     /// The slides whose `laid` holds pictures, which are the ones that can give memory back.
     slides_holding_pictures: BTreeSet<usize>,
+    /// The slides a show goes through, worked out when the talk is read.
+    shown: Vec<usize>,
 }
 
 /// The talk's settings, as far as they decide how a slide looks: not where they sit.
@@ -143,6 +149,13 @@ fn theme_key(talk: &Talk) -> String {
     format!("{:?}", talk_theme(talk))
 }
 
+/// All but the hidden slides of `talk`, or all of them if every slide is hidden, so that a
+/// show is never empty.
+fn shown_slides_of(talk: &Talk) -> Vec<usize> {
+    let shown: Vec<usize> = (0..talk.slides.len()).filter(|&index| !is_hidden(&talk.slides[index])).collect();
+    if shown.is_empty() { (0..talk.slides.len()).collect() } else { shown }
+}
+
 impl Deck {
     pub fn open(files: Box<dyn TalkFiles>, fonts: Fonts, source: String) -> Deck {
         Deck::with_registry(files, fonts, source, builtin_registry())
@@ -155,7 +168,15 @@ impl Deck {
         let talk = parse_talk(&source);
         let slides = slide_texts(&talk)
             .into_iter()
-            .map(|text| SlideState { text, laid: None, at_moment: None, drawn: HashMap::new(), thumbnail: None, last_used: 0 })
+            .map(|text| SlideState {
+                text,
+                laid: None,
+                at_moment: None,
+                drawn: HashMap::new(),
+                thumbnail: None,
+                last_used: 0,
+                thumbnail_used: 0,
+            })
             .collect();
         Deck {
             files,
@@ -165,6 +186,7 @@ impl Deck {
             pictures: PictureCache::default(),
             files_generation: 0,
             theme: theme_key(&talk),
+            shown: shown_slides_of(&talk),
             talk,
             slides,
             backgrounds: HashMap::new(),
@@ -206,20 +228,22 @@ impl Deck {
                         drawn: std::mem::take(&mut previous.drawn),
                         thumbnail: previous.thumbnail.take(),
                         last_used: previous.last_used,
+                        thumbnail_used: previous.thumbnail_used,
                     });
                 }
                 previous => {
                     changed.push(index);
-                    let last_used = previous.as_ref().map_or(0, |p| p.last_used);
+                    let (last_used, thumbnail_used) = previous.as_ref().map_or((0, 0), |p| (p.last_used, p.thumbnail_used));
                     let mut drawn = previous.map(|p| std::mem::take(&mut p.drawn)).unwrap_or_default();
                     for scale in drawn.values_mut() {
                         scale.ordered = None;
                     }
-                    slides.push(SlideState { text, laid: None, at_moment: None, drawn, thumbnail: None, last_used });
+                    slides.push(SlideState { text, laid: None, at_moment: None, drawn, thumbnail: None, last_used, thumbnail_used });
                 }
             }
         }
         self.theme = theme_key(&talk);
+        self.shown = shown_slides_of(&talk);
         self.talk = talk;
         self.slides_holding_pictures = slides
             .iter()
@@ -342,23 +366,27 @@ impl Deck {
     }
 
     /// The slides a show goes through, in order: all but the hidden ones, or all of them if
-    /// every slide is hidden, so that a show is never empty.
-    pub fn shown_slides(&self) -> Vec<usize> {
-        let shown: Vec<usize> = (0..self.talk.slides.len()).filter(|index| !self.is_hidden(*index)).collect();
-        if shown.is_empty() { (0..self.talk.slides.len()).collect() } else { shown }
+    /// every slide is hidden, so that a show is never empty. It's worked out as the talk is
+    /// read, so asking costs nothing.
+    pub fn shown_slides(&self) -> &[usize] {
+        &self.shown
     }
 
     /// The whole slide, its last step, drawn onto one pixmap `width` wide and 9/16 as tall, to
-    /// stand for the slide in a list. It is kept until the slide changes, and the slides asked
-    /// for longest ago give theirs up when the deck is over its memory budget.
-    pub fn thumbnail(&mut self, index: usize, width: u32) -> Arc<Pixmap> {
+    /// stand for the slide in a list, or `None` if the talk has no slide `index`. It is kept
+    /// until the slide changes, and the slides asked for longest ago give theirs up when the
+    /// deck is over its memory budget.
+    pub fn thumbnail(&mut self, index: usize, width: u32) -> Option<Arc<Pixmap>> {
+        if index >= self.slides.len() {
+            return None;
+        }
         let width = width.clamp(1, MAX_THUMBNAIL_WIDTH);
         self.layers_asked_for += 1;
-        self.slides[index].last_used = self.layers_asked_for;
+        self.slides[index].thumbnail_used = self.layers_asked_for;
         if let Some((made_for, pixmap)) = &self.slides[index].thumbnail
             && *made_for == width
         {
-            return pixmap.clone();
+            return Some(pixmap.clone());
         }
         let moment = self.ensure_whole(index);
         let height = (u64::from(width) * 9 / 16).max(1) as u32;
@@ -372,7 +400,17 @@ impl Deck {
         let pixmap = Arc::new(pixmap);
         self.slides[index].thumbnail = Some((width, pixmap.clone()));
         self.keep_within_budget(index);
-        pixmap
+        Some(pixmap)
+    }
+
+    /// Slide `index`'s thumbnail `width` wide, if one has been drawn since the slide last
+    /// changed. Asking draws nothing, so a list can find what it still has to draw.
+    pub fn drawn_thumbnail(&self, index: usize, width: u32) -> Option<Arc<Pixmap>> {
+        let width = width.clamp(1, MAX_THUMBNAIL_WIDTH);
+        match &self.slides.get(index)?.thumbnail {
+            Some((made_for, pixmap)) if *made_for == width => Some(pixmap.clone()),
+            _ => None,
+        }
     }
 
     pub fn source(&self) -> &str {
@@ -478,9 +516,25 @@ impl Deck {
         }
     }
 
-    /// Forgets whole slides' drawn layers, the slide asked for longest ago first, until the
-    /// deck is within its budget. Slide `requested` stays, however much it takes alone.
+    /// Forgets what's drawn until the deck is within its budget: first the thumbnails, the one
+    /// asked for longest ago first, as they are small and quick to draw again, and then whole
+    /// slides' drawn layers, the slide asked for longest ago first. Slide `requested` keeps
+    /// what it has, however much it takes alone, and so do the layers of the slide asked for
+    /// last, which is the one on screen.
     fn keep_within_budget(&mut self, requested: usize) {
+        let on_screen = self.last_asked;
+        self.drop_unused_backgrounds();
+        while self.drawn_bytes() > self.memory_budget {
+            let thumbnails = self
+                .slides
+                .iter_mut()
+                .enumerate()
+                .filter(|(index, slide)| *index != requested && slide.thumbnail.is_some());
+            let Some((_, oldest)) = thumbnails.min_by_key(|(_, slide)| slide.thumbnail_used) else {
+                break;
+            };
+            oldest.thumbnail = None;
+        }
         loop {
             self.drop_unused_backgrounds();
             if self.drawn_bytes() <= self.memory_budget {
@@ -490,12 +544,11 @@ impl Deck {
                 .slides
                 .iter_mut()
                 .enumerate()
-                .filter(|(index, slide)| *index != requested && (!slide.drawn.is_empty() || slide.thumbnail.is_some()));
+                .filter(|(index, slide)| *index != requested && Some(*index) != on_screen && !slide.drawn.is_empty());
             let Some((_, oldest)) = others.min_by_key(|(_, slide)| slide.last_used) else {
                 return;
             };
             oldest.drawn.clear();
-            oldest.thumbnail = None;
         }
     }
 

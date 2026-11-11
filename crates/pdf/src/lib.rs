@@ -46,7 +46,7 @@ pub fn write_pdf(deck: &mut Deck) -> Result<Vec<u8>, String> {
         document.set_metadata(krilla::metadata::Metadata::new().title(title));
     }
     let (mut font_cache, mut image_cache) = (FontCache::new(), ImageCache::new());
-    for index in deck.shown_slides() {
+    for index in deck.shown_slides().to_vec() {
         let settings = PageSettings::from_wh(PAGE_WIDTH, PAGE_HEIGHT).ok_or("the page size is invalid")?;
         let mut page = document.start_page_with(settings);
         let mut surface = page.surface();
