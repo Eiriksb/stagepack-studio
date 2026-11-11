@@ -85,8 +85,11 @@ fn a_compile_that_fills_the_disk_is_stopped() {
     let source = "#[component]\nfn Score() -> Element { text(\"a\") }\n";
     let started = Instant::now();
     let errors = compile(&bundle, FILE, source).unwrap_err();
-    assert!(started.elapsed() < Duration::from_secs(20), "took {:?}", started.elapsed());
+    // The message says the disk limit stopped it, and not the time limit. The bound is only
+    // that it wasn't left to the end of the compiler's 60 s sleep: writing the gigabyte can be
+    // slow on a loaded machine.
     assert_eq!(errors[0].message, "Building components/score.rs used too much disk space", "{errors:?}");
+    assert!(started.elapsed() < Duration::from_secs(50), "took {:?}", started.elapsed());
 }
 
 #[cfg(unix)]
