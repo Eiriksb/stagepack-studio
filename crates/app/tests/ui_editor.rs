@@ -1374,3 +1374,122 @@ fn the_list_scrolled_to_its_end_draws_each_thumbnail_once(cx: &mut TestAppContex
     assert_eq!(drawn(cx, &view), drawn_at_the_end, "nothing drawn again");
     assert!(drawn_at_the_end <= 30, "{drawn_at_the_end}");
 }
+
+#[gpui_kit::test]
+fn a_reload_during_a_drag_ends_it_and_the_drop_moves_nothing(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, THREE);
+    let start = in_row(cx, handle, 0, 0.5);
+    let end = in_row(cx, handle, 2, 0.75);
+    press_and_move(cx, handle, start, end);
+    // The talk changes on disk while the first slide is held: another is put before it.
+    let changed =
+        "---\ntitle: T\n---\n\n# Zero\n\n---\n\n# One\n\n---\n\n# Two\n\n---\n\n# Three\n";
+    view.update(cx, |view, cx| {
+        view.reload_for_test(Some(changed.to_string()), cx)
+    });
+    settle(cx, handle);
+    with_window(cx, handle, |window, _| {
+        assert!(window.try_find(DROP_LINE_ID).is_none(), "the drag is over");
+        assert!(window.try_find(DRAG_PICTURE_ID).is_none());
+    });
+    release(cx, handle, end);
+    assert_eq!(source(cx, &view), changed, "nothing moved");
+    assert!(!can_undo(cx, &view));
+}
+
+#[gpui_kit::test]
+fn an_undo_during_a_drag_ends_it_and_the_drop_moves_nothing(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, THREE);
+    // A new slide after the first, so that undoing it puts another slide where row 1 is.
+    keys(cx, handle, "ctrl-m");
+    let before_undo = order(cx, &view);
+    assert_eq!(before_undo, ["One", "", "Two", "Three"]);
+    let start = in_row(cx, handle, 2, 0.5);
+    let end = in_row(cx, handle, 3, 0.75);
+    press_and_move(cx, handle, start, end);
+    keys(cx, handle, "ctrl-z");
+    assert_eq!(order(cx, &view), ["One", "Two", "Three"]);
+    with_window(cx, handle, |window, _| {
+        assert!(window.try_find(DROP_LINE_ID).is_none(), "the drag is over");
+        assert!(window.try_find(DRAG_PICTURE_ID).is_none());
+    });
+    release(cx, handle, end);
+    assert_eq!(order(cx, &view), ["One", "Two", "Three"], "nothing moved");
+    assert_eq!(source(cx, &view), THREE);
+    assert!(
+        document(cx, &view).read_with(cx, |document, _| document.can_redo()),
+        "the undone slide can still be had back"
+    );
+}
+
+#[gpui_kit::test]
+fn a_talk_cut_to_one_slide_shows_its_picture(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, TWO);
+    assert!(thumbnail(cx, &view, 0).is_some() && thumbnail(cx, &view, 1).is_some());
+    // The first is deleted, so the one row left shows another slide.
+    click(cx, handle, DELETE_ID);
+    assert_eq!(count(cx, &view), 1);
+    settle(cx, handle);
+    assert!(
+        thumbnail(cx, &view, 0).is_some(),
+        "the slide left has its picture"
+    );
+}
+
+#[gpui_kit::test]
+fn a_window_that_shows_one_row_draws_its_picture(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, THREE);
+    assert!(rows_on_screen(cx, handle, 3) > 1);
+    cx.simulate_window_resize(handle, size(px(1280.), px(200.)));
+    settle(cx, handle);
+    with_window(cx, handle, |window, _| {
+        let strip = window.find(STRIP_ID).bounds();
+        let row = window.find(strip_row_id(0)).bounds();
+        assert!(
+            strip.size.height < row.size.height,
+            "only the first row shows: {strip:?} {row:?}"
+        );
+    });
+    // The first slide changes, so its picture has to be drawn again.
+    let changed = THREE.replace("# One", "# One, again");
+    view.update(cx, |view, cx| view.reload_for_test(Some(changed), cx));
+    settle(cx, handle);
+    assert!(thumbnail(cx, &view, 0).is_some(), "drawn as it is now");
+}
+
+#[gpui_kit::test]
+fn a_drop_during_scrolling_lands_where_the_line_was(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, &many_slides(30));
+    let start = in_row(cx, handle, 0, 0.5);
+    let bottom = with_window(cx, handle, |window, _| {
+        let strip = window.find(STRIP_ID).bounds();
+        point(strip.center().x, strip.bottom() - px(4.))
+    });
+    press_and_move(cx, handle, start, bottom);
+    // Partway down the list.
+    for _ in 0..60 {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(20));
+        cx.run_until_parked();
+    }
+    settle(cx, handle);
+    let gap = with_window(cx, handle, |window, _| {
+        let line = window.find(DROP_LINE_ID).bounds().center().y;
+        (1..30)
+            .find(|index| {
+                window
+                    .try_find(strip_row_id(*index))
+                    .is_some_and(|row| (row.bounds().top() - line).abs() <= px(3.))
+            })
+            .expect("the line is at the top of a row")
+    });
+    assert!(gap > 6 && gap < 29, "partway: {gap}");
+    release(cx, handle, bottom);
+    let order = order(cx, &view);
+    assert_eq!(
+        order[gap - 1],
+        "Slide 0",
+        "just above the row the line was over"
+    );
+    assert_eq!(current(cx, &view), gap - 1);
+}

@@ -97,6 +97,10 @@ struct DraggedSlide {
 /// land in, counted from the top, if it's over the list.
 struct Drag {
     from: usize,
+    /// The slide's version when the drag began, and how many slides there were. If either
+    /// changes, the row may hold another slide than the one in the picture, so the drag ends.
+    version: Option<u64>,
+    count: usize,
     pointer: Point<Pixels>,
     gap: Option<usize>,
 }
@@ -147,6 +151,11 @@ pub struct SlideStrip {
     drag: Option<Drag>,
     /// Whether the list is scrolling under a dragged slide.
     scrolling: bool,
+    /// Whether a drag ended by the talk changing under it is still for the window to stop.
+    drag_ended: bool,
+    /// The rows the list last laid out. It also lays out a row by itself to measure it, before
+    /// the rows on screen, so the last of a frame is the one that's on screen.
+    laid_out: Option<Range<usize>>,
     _document_changed: Option<Subscription>,
 }
 
@@ -154,7 +163,7 @@ impl SlideStrip {
     pub fn new(document: Option<Entity<Document>>, cx: &mut Context<Self>) -> Self {
         let document_changed = document
             .as_ref()
-            .map(|document| cx.observe(document, |_, _, cx| cx.notify()));
+            .map(|document| cx.observe(document, |this, _, cx| this.document_changed(cx)));
         SlideStrip {
             document,
             focus_handle: cx.focus_handle(),
@@ -172,6 +181,8 @@ impl SlideStrip {
             bounds: Bounds::default(),
             drag: None,
             scrolling: false,
+            drag_ended: false,
+            laid_out: None,
             _document_changed: document_changed,
         }
     }
@@ -368,8 +379,14 @@ impl SlideStrip {
     fn start_drag(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         // The list takes the keyboard, so that Escape reaches it.
         window.focus(&self.focus_handle, cx);
+        let (version, count) = self.document.as_ref().map_or((None, 0), |document| {
+            let document = document.read(cx);
+            (document.slide_version(index), document.slide_count())
+        });
         self.drag = Some(Drag {
             from: index,
+            version,
+            count,
             pointer: window.mouse_position(),
             gap: None,
         });
@@ -446,11 +463,30 @@ impl SlideStrip {
 
     /// Moves a slide dragged from row `from` to the gap the pointer is over.
     fn dropped(&mut self, from: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // A drag the talk changed under is over, whatever the window still carries.
+        if self.drag.as_ref().is_none_or(|drag| drag.from != from) {
+            return;
+        }
         let gap = self.gap_at(window.mouse_position().y, cx);
         self.end_drag(cx);
         if let Some(to) = landing(from, gap) {
             window.dispatch_action(Box::new(MoveSlideTo { from, to }), cx);
         }
+    }
+
+    /// Ends a drag whose slide may no longer be in its row: one whose version, or the number
+    /// of slides, has changed since it began, as by a reload or an undo.
+    fn document_changed(&mut self, cx: &mut Context<Self>) {
+        if let (Some(drag), Some(document)) = (&self.drag, &self.document) {
+            let document = document.read(cx);
+            if document.slide_version(drag.from) != drag.version
+                || document.slide_count() != drag.count
+            {
+                self.drag = None;
+                self.drag_ended = true;
+            }
+        }
+        cx.notify();
     }
 
     fn end_drag(&mut self, cx: &mut Context<Self>) {
@@ -484,14 +520,8 @@ impl SlideStrip {
     }
 
     fn rows(&mut self, rows: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        // The list lays out the first row on screen by itself before the rest, to measure
-        // it. That's not all that's on screen, and taken for it, it would let go of the
-        // pictures of the rows further down only to draw them again, for ever.
-        let measuring =
-            rows.len() == 1 && rows.start == self.visible.start && self.visible.len() > 1;
-        if !measuring {
-            self.rows_shown(rows.clone(), cx);
-        }
+        // What's on screen is taken in once the frame is laid out: see `laid_out`.
+        self.laid_out = Some(rows.clone());
         let Some(document) = self.document.as_ref().map(|document| document.read(cx)) else {
             return Vec::new();
         };
@@ -668,6 +698,9 @@ impl Render for SlideStrip {
         if self.drag.is_some() && !cx.has_active_drag() {
             self.drag = None;
         }
+        if std::mem::take(&mut self.drag_ended) {
+            cx.stop_active_drag(window);
+        }
         let drop_line = self.drop_line();
         let this = cx.entity().downgrade();
         v_flex()
@@ -703,7 +736,6 @@ impl Render for SlideStrip {
                     self.row_sizes.clone(),
                     |this, rows, _, cx| this.rows(rows, cx),
                 )
-                .with_item_to_measure_index(self.visible.start)
                 .track_scroll(&self.scroll)
                 .size_full(),
             )
@@ -712,8 +744,14 @@ impl Render for SlideStrip {
                     |_, _, _| {},
                     move |bounds, _, window, cx| {
                         let scale_factor = window.scale_factor();
-                        this.update(cx, |this, cx| this.measured(bounds, scale_factor, cx))
-                            .ok();
+                        // Laid out after the list, so the list's rows on screen are known.
+                        this.update(cx, |this, cx| {
+                            this.measured(bounds, scale_factor, cx);
+                            if let Some(rows) = this.laid_out.take() {
+                                this.rows_shown(rows, cx);
+                            }
+                        })
+                        .ok();
                     },
                 )
                 .absolute()
