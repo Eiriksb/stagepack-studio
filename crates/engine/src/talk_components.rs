@@ -94,7 +94,8 @@ struct Seen<T> {
 struct Loaded {
     identity: String,
     component: Result<WasmComponent, ComponentError>,
-    /// The bytes it counts against `MAX_TALK_MODULE_BYTES`: none if it didn't load.
+    /// The bytes it counts against `MAX_TALK_MODULE_BYTES`, whether or not it loaded, as
+    /// trying took time too. None if it was never tried.
     bytes: u64,
 }
 
@@ -285,10 +286,7 @@ impl TalkComponents {
     /// The loaded module of `build`, loading it if it isn't already, and only if it says it is `tag`.
     fn component(&mut self, tag: &str, build: &Build) -> Result<&WasmComponent, ComponentError> {
         if !self.loaded.contains_key(&build.path) {
-            let (component, bytes) = match self.load(&build.path) {
-                Ok((component, bytes)) => (Ok(component), bytes),
-                Err(error) => (Err(error), 0),
-            };
+            let (component, bytes) = self.load(&build.path);
             self.loaded.insert(build.path.clone(), Loaded { identity: build.identity.clone(), component, bytes });
         }
         let component = self.loaded[&build.path].component.as_ref().map_err(Clone::clone)?;
@@ -299,18 +297,21 @@ impl TalkComponents {
         Ok(component)
     }
 
-    /// The module at `path`, and its size, if it fits in what the talk has left to load.
-    fn load(&self, path: &str) -> Result<(WasmComponent, u64), ComponentError> {
+    /// The module at `path`, if it fits in what the talk has left to load, and the bytes it
+    /// counts against that: its length once it's been tried, whether or not it loaded.
+    fn load(&self, path: &str) -> (Result<WasmComponent, ComponentError>, u64) {
         let left = MAX_TALK_MODULE_BYTES.saturating_sub(self.loaded.values().map(|loaded| loaded.bytes).sum());
         let limit = left.min(MAX_MODULE_BYTES as u64);
         if self.files.len(path).is_some_and(|len| len > limit) {
-            return Err(ComponentError::TooLarge);
+            return (Err(ComponentError::TooLarge), 0);
         }
-        let bytes = self.files.read(path).ok_or_else(|| ComponentError::Malformed("its build can't be read".into()))?;
+        let Some(bytes) = self.files.read(path) else {
+            return (Err(ComponentError::Malformed("its build can't be read".into())), 0);
+        };
         if bytes.len() as u64 > limit {
-            return Err(ComponentError::TooLarge);
+            return (Err(ComponentError::TooLarge), 0);
         }
-        Ok((WasmComponent::load(&bytes)?, bytes.len() as u64))
+        (WasmComponent::load(&bytes), bytes.len() as u64)
     }
 
     /// The talk's index of builds, or an empty one if it has none or it can't be read.

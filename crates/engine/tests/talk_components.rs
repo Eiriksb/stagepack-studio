@@ -774,3 +774,23 @@ fn a_long_problem_is_shortened_in_its_notice() {
     assert_eq!(notices[0].chars().count(), 200);
     assert!(notices[0].ends_with('…'));
 }
+
+#[test]
+fn modules_that_fail_to_load_still_count_against_the_talks_budget() {
+    let files = Files::default();
+    let tags = ["A", "B", "C", "D", "E"];
+    files.put("slides.md", tags.map(|tag| format!("<{tag} />\n\n")).concat());
+    // Each is compiled before it's found to have none of what a component exports.
+    for tag in tags {
+        files.put(&format!("build/{}.wasm", tag.to_lowercase()), padded(wat::parse_str("(module)").unwrap(), 3_500_000));
+    }
+    let entries: Vec<(String, String)> = tags.iter().map(|tag| (tag.to_string(), tag.to_lowercase())).collect();
+    let entries: Vec<(&str, &str, &str)> = entries.iter().map(|(tag, file)| (tag.as_str(), file.as_str(), "x")).collect();
+    files.put(INDEX_FILE, index(&entries));
+    let mut deck = open(&files);
+    let notices = deck.notices(0);
+    for tag in &tags[..4] {
+        assert!(notices.iter().any(|notice| *notice == format!("{tag}: can't be loaded")), "{notices:?}");
+    }
+    assert!(notices.iter().any(|notice| notice == "E: too large to run"), "{notices:?}");
+}
