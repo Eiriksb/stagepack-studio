@@ -2,22 +2,48 @@
 
 The run was on the `plan-c` branch at commit 6e9d8bc, on a 16-core Linux laptop, with Rust 1.98.0, in a release build, on 2026-11-11. It found one thing to fix, in the example talk, which is fixed at d23a628, and the tests were run there. The branch hasn't been merged or pushed yet. Nothing here has run on Windows.
 
+After a review of the whole branch, a final wave of fixes added the limits under [The final fix wave](#the-final-fix-wave). The tests were run again after it, at 1406cf7, and the real-window check was repeated in part. The counts below are from then.
+
 ## Tests on Linux
 
-At d23a628, `scripts/cargo-safe.sh test --workspace` passed: 879 tests, 0 failed, 7 ignored, no warnings. `scripts/cargo-safe.sh clippy --workspace --all-targets` gave no warnings.
+At 1406cf7, `scripts/cargo-safe.sh test --workspace` passed: 920 tests, 0 failed, 8 ignored, no warnings. `scripts/cargo-safe.sh clippy --workspace --all-targets` gave no warnings.
 
 | Crate | Tests |
 | --- | --- |
-| slides-components | 51, and 4 ignored (sandbox 27, source_check 18, examples 2 and 1 ignored, compile 1 and 3 ignored, unit 3) |
-| slides-engine | 358, and 1 ignored (builtins 84, native 45, packed 42, chart 37 and 1 ignored, flow 29, deck 26, talk_components 25, moments 15, timeline 13, files 12, canvas 11, render 11, text 8) |
+| slides-components | 64, and 5 ignored (sandbox 36, source_check 19, compile 4 and 4 ignored, examples 2 and 1 ignored, unit 3) |
+| slides-engine | 377, and 1 ignored (builtins 85, native 45, packed 42, talk_components 41, chart 39 and 1 ignored, flow 29, deck 26, moments 15, timeline 13, files 12, canvas 11, render 11, text 8) |
 | slides-format | 60 (parse 35, edit 18, split 7) |
 | slides-pdf | 18 |
 | slides-pptx | 107 (elements 36, write 31, parts 20, timing 10, fonts 9, unit 1) |
-| stagepack-studio (app) | 247, and 2 ignored (ui_slides 67, ui_present 45, document_state 40, present 33, builds 30 and 2 ignored, export 16, watcher 12, unit 3, ui_layout 1) |
-| toolkit | 38 (component 21, interface_v1 17) |
+| stagepack-studio (app) | 248, and 2 ignored (ui_slides 68, ui_present 46, document_state 40, present 33, builds 26 and 2 ignored, export 16, watcher 15, unit 3, ui_layout 1) |
+| toolkit | 46 (component 24, interface_v1 20, doc 2) |
 | toolkit-macros | 0 |
 
-Six of the ignored tests need the compiler bundle. The seventh, `charts_for_a_look`, writes pictures for a person to look at. `scripts/test-components.sh` builds the bundle and runs all seven, and all seven passed.
+Seven of the ignored tests need the compiler bundle. The eighth, `charts_for_a_look`, writes pictures for a person to look at. `scripts/test-components.sh` builds the bundle and runs all eight, and all eight passed.
+
+## The final fix wave
+
+A talk that was only opened could freeze the app, use up its memory or overflow its stack. These limits were added, and they narrow the plan's Global Constraints where the two differ:
+
+- **A module is at most 4 MiB**, not the plan's 16 MiB, and **a talk loads at most 16 MiB of modules** between them, counted as each is first tried, whether or not it loads. Past that, a component shows *{tag}: too large to run*. A real component is about 180 KB.
+- **Loading stays on the thread that asks**, which is the window's. That's a known cost: a talk at the 16 MiB limit can hold the window for up to about 12 seconds, once, when its modules are first loaded. The review measured 11.7 s for one 15.2 MiB module and 1.46 s for a 1.9 MiB one.
+- **A slide's layout makes at most 50,000 nodes**, and past that the block being laid out becomes a box saying *This slide has too much on it to show*. **Lists, tags and what components draw nest 64 levels at most, all counted together.** A component places the content between its tags once, and a second place is an answer that can't be read.
+- **One answer holds at most 256 KiB of text**, counting text, problems, icon names, picture paths and path data. A notice keeps 200 characters, a diagnostic 500, and the problems panel lists 20 lines and how many more. A chart refuses a CSV over 1 MiB.
+- **A build is stopped once its scratch folder passes 64 MiB, and, on Linux only, once the compiler's process group uses more than 4 GiB of memory.** Other systems have no memory limit on a build yet. Stopping a build stops its whole process group on Unix, the linker included.
+- **The Cargo project for a code editor is written in the app's data folder**, in `editor-projects/<talk folder name>-<12 hex digits>`, never in the talk. The checks of a talk's files for it are gone, as nothing in or above a talk is consulted.
+- **What components read in `assets` is remembered**, up to 256 paths, and a change to one of those files draws the slides again. The app watches `assets` too, without going into its folders.
+
+In a release build, the review's talks now take: a 2 KB talk whose component placed its content 19,990 times, 3.9 ms to lay out, where it took 101 s and 12.3 GB, and the same nested two deep, 6.6 ms, where it took 8 s and 1.1 GB. Both show a box saying the component gave an answer that can't be read. Components nested 38 deep in tags nested 15 deep lay out with a 1 MiB stack, with a box saying the content is nested too deeply, where they overflowed it. A 4 MB text answer is refused in 10 ms. The review's three-line source with a 1 GiB static is stopped after 4.1 s, for using too much memory, where it used 10.5 GB.
+
+## Real-window check after the fixes
+
+In the same way as below, on Xephyr with a scratch copy of `fixtures/components` and a scratch data folder, with the release build at 1406cf7. Screenshots are under `target/check/f/`, which is not committed, and each was looked at.
+
+- *Build components* built all five components, and the scores showed.
+- With the editor on the chart's slide, `assets/sales.csv` was replaced with five rows of other numbers. Within two seconds the chart showed the five new bars, with no change to `slides.md`.
+- In the show, both windows' clocks turned about 60° in 10 s. Over 20 s on the clock slide the app used 0.72 of a core, against 0.88 before the fixes, with the same software drawing, so most of it is still drawing. Its memory was 296 MB.
+- The chart started with its axes and added one bar per press, Q1 to Q5.
+- *Set up for a code editor* wrote one `Cargo.toml` in the scratch data folder's `editor-projects/talk-98b2fac846d3`, and nothing in the talk. The status line says where, though a path this long is cut short at the window's edge.
 
 ## The bundle
 
@@ -53,7 +79,8 @@ The app's Export and *Save as packed talk* ask where to save through the system'
 - `scripts/make-bundle.ps1` has never even been parsed, as this machine has no PowerShell. It's untested.
 - Real PowerPoint. It hasn't opened a freeform shape or a chart, so whether the chart's lines and pie slices can be selected and recoloured is not known. The export has only been opened in LibreOffice.
 - The form on screen for a component's arguments. It isn't built yet, and is plan D3. This plan delivers the schema and the fields a form will show.
-- The Cargo file for a code editor. Its checks run only when it's written, so a planted `.cargo/config.toml` or `build.rs` that arrives later is not caught. The app and the guide say to use a code editor only on a talk you trust. *Set up for a code editor* wasn't used in this run.
+- A code editor on the Cargo project. Cargo checks it, with a `build.rs`, a `.cargo/config.toml` naming a `rustc-wrapper` and a `rust-toolchain.toml` in the talk, none of which take effect. Whether rust-analyzer gives completions for components named by a path outside the project's folder hasn't been tried, as this machine has no rust-analyzer.
+- A build's memory limit anywhere but Linux.
 - The native Save dialog, through Export and *Save as packed talk*.
 - Building with a real GPU, and the processor cost of an animated component there.
 - The line and pie charts in the app. Only the bar chart was shown in the run, though the tests draw all three.
@@ -81,5 +108,5 @@ The `plan-c` branch isn't pushed yet. This check starts once it has been merged 
    <Chart kind="pie" labels="North, South, East" values="5, 3, 2" title="Share" />
    ```
 
-   Open it with `stagepack-studio.exe C:\StudioCheck\charts`, and use Export, then PowerPoint, to write `charts.pptx`. Do the same for `C:\StudioCheck\components`, to write `components.pptx`.
+   Open it with `stagepack-studio.exe C:\StudioCheck\charts`. Say whether the line chart on slide 1 shows a line through four points with the axis numbers, and whether the pie on slide 2 shows three slices with a legend of names and percentages. Then use Export, then PowerPoint, to write `charts.pptx`. Do the same for `C:\StudioCheck\components`, to write `components.pptx`.
 7. Open both in desktop PowerPoint. Say whether PowerPoint offers to repair either file. In `charts.pptx`, click the line and say whether it can be selected on its own and given another colour, then do the same for one pie slice. In `components.pptx`, say whether the chart's bars are separate shapes that can be recoloured, whether the clock's hand shows, and whether the callout's title *Remember* is on one line.
