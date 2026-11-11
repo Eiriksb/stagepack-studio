@@ -389,3 +389,88 @@ fn a_picture_replaced_and_read_again_before_the_save_is_still_noticed() {
 
     assert_eq!(deck.update(talk_of_pictures(2)), vec![0, 1], "drawn layers of the old picture have to go");
 }
+
+const ONE_HIDDEN: &str = "# One\n\n---\nhidden: true\n---\n\n# Two\n\n---\n\n# Three\n";
+
+#[test]
+fn a_hidden_slide_is_left_out_of_a_show() {
+    let d = deck(ONE_HIDDEN);
+    assert!(d.is_hidden(1));
+    assert!(!d.is_hidden(0) && !d.is_hidden(2));
+    assert_eq!(d.shown_slides(), vec![0, 2]);
+    assert_eq!(d.slide_count(), 3, "the slide is still in the talk");
+}
+
+#[test]
+fn a_talk_with_every_slide_hidden_still_shows_them() {
+    let d = deck("---\nhidden: true\n---\n\n# One\n\n---\nhidden: true\n---\n\n# Two\n");
+    assert!(d.is_hidden(0) && d.is_hidden(1));
+    assert_eq!(d.shown_slides(), vec![0, 1]);
+}
+
+/// A slide with one red box covering the middle of it.
+const RED_BOX: &str = "<Box x=\"600\" y=\"300\" w=\"720\" h=\"480\" fill=\"#ff0000\" />\n";
+
+fn pixel(pixmap: &tiny_skia::Pixmap, x: u32, y: u32) -> [u8; 4] {
+    let p = pixmap.pixel(x, y).unwrap();
+    [p.red(), p.green(), p.blue(), p.alpha()]
+}
+
+#[test]
+fn a_thumbnail_is_the_whole_slide_at_the_width_asked_for() {
+    let mut d = deck(RED_BOX);
+    let thumbnail = d.thumbnail(0, 320);
+    assert_eq!((thumbnail.width(), thumbnail.height()), (320, 180));
+    assert_eq!(pixel(&thumbnail, 160, 90), [255, 0, 0, 255], "inside the box");
+    assert_ne!(pixel(&thumbnail, 5, 5), [255, 0, 0, 255], "outside it");
+    assert_eq!(pixel(&thumbnail, 5, 5)[3], 255, "the theme's background is drawn, so it's opaque");
+}
+
+#[test]
+fn a_thumbnail_is_kept_until_its_slide_changes() {
+    let mut d = deck(TALK);
+    let (one, two) = (d.thumbnail(0, 160), d.thumbnail(1, 160));
+    assert!(Arc::ptr_eq(&one, &d.thumbnail(0, 160)));
+    assert_eq!(d.update(TALK.replace("Two", "Changed")), vec![1]);
+    assert!(Arc::ptr_eq(&one, &d.thumbnail(0, 160)), "slide 0 didn't change");
+    let again = d.thumbnail(1, 160);
+    assert!(!Arc::ptr_eq(&two, &again), "slide 1 did");
+    assert!(Arc::ptr_eq(&again, &d.thumbnail(1, 160)));
+}
+
+#[test]
+fn a_thumbnail_at_another_width_is_drawn_again() {
+    let mut d = deck(TALK);
+    let small = d.thumbnail(0, 160);
+    let large = d.thumbnail(0, 320);
+    assert_eq!((small.width(), large.width()), (160, 320));
+    assert_eq!(d.thumbnail(0, 320).width(), 320);
+}
+
+#[test]
+fn thumbnails_stay_within_the_memory_budget() {
+    let mut d = deck(&long_talk(20));
+    let one = d.thumbnail(0, 160).data().len();
+    let budget = 3 * one;
+    d.set_memory_budget(budget);
+    for index in 0..20 {
+        d.thumbnail(index, 160);
+        let drawn = d.drawn_bytes();
+        assert!(drawn >= one && drawn <= budget, "slide {index}: {drawn} bytes drawn with a budget of {budget}");
+    }
+}
+
+#[test]
+fn a_thumbnail_counts_against_the_drawn_layers_budget() {
+    let mut d = deck(TALK);
+    assert_eq!(d.drawn_bytes(), 0);
+    let thumbnail = d.thumbnail(0, 160);
+    assert!(d.drawn_bytes() >= thumbnail.data().len());
+}
+
+#[test]
+fn a_thumbnail_of_a_slide_that_builds_shows_its_last_step() {
+    let source = "<Box x=\"600\" y=\"300\" w=\"720\" h=\"480\" fill=\"#ff0000\" click=\"2\" />\n";
+    let mut d = deck(source);
+    assert_eq!(pixel(&d.thumbnail(0, 320), 160, 90), [255, 0, 0, 255]);
+}

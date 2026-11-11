@@ -250,8 +250,15 @@ pub fn graphic_frame_xml(id: u32, name: &str, rect: Rect, uri: &str, inner: &str
 /// A slide: its background (`background_xml`, or nothing), the shapes in drawing order, and its
 /// transition and timing (`transition_xml` and `animation_timing_xml`, or nothing), in that order.
 pub fn slide_xml(shapes: &str, background: &str, timing: &str, transition: &str) -> String {
+    slide_xml_shown_or_not(shapes, background, timing, transition, false)
+}
+
+/// `slide_xml`, for a slide that PowerPoint skips when it shows the deck if `hidden`, as it does
+/// for a slide the user has hidden.
+pub fn slide_xml_shown_or_not(shapes: &str, background: &str, timing: &str, transition: &str, hidden: bool) -> String {
+    let hidden = if hidden { "show=\"0\" " } else { "" };
     format!(
-        "{XML_DECL}<p:sld {NS_PML}><p:cSld>{background}<p:spTree>{SP_TREE_HEADER}{shapes}</p:spTree></p:cSld>\
+        "{XML_DECL}<p:sld {hidden}{NS_PML}><p:cSld>{background}<p:spTree>{SP_TREE_HEADER}{shapes}</p:spTree></p:cSld>\
          <p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr>{transition}{timing}</p:sld>"
     )
 }

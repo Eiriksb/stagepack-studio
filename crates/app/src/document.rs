@@ -192,6 +192,18 @@ impl Document {
         self.deck.slide_count()
     }
 
+    /// How many slides a show goes through: all but the hidden ones.
+    pub fn shown_count(&self) -> usize {
+        self.deck.shown_slides().len()
+    }
+
+    /// The talk's own index of the slide a show calls `position`, counting only the slides it
+    /// shows. This is the one place a show's slides are mapped to the talk's.
+    pub fn shown_slide(&self, position: usize) -> usize {
+        let shown = self.deck.shown_slides();
+        shown.get(position).or(shown.last()).copied().unwrap_or(0)
+    }
+
     pub fn next(&mut self) {
         if self.current + 1 < self.slide_count() {
             self.current += 1;
@@ -334,17 +346,18 @@ impl Document {
     }
 }
 
+/// A show's slides are the talk's shown ones, so `slide` here is a position among those.
 impl TalkShape for Document {
     fn slide_count(&self) -> usize {
-        self.deck.slide_count()
+        self.shown_count()
     }
 
     fn steps(&mut self, slide: usize) -> u32 {
-        self.timeline_of(slide).steps
+        self.timeline_of(self.shown_slide(slide)).steps
     }
 
     fn transition(&mut self, slide: usize) -> Transition {
-        self.timeline_of(slide).transition
+        self.timeline_of(self.shown_slide(slide)).transition
     }
 }
 

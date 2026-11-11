@@ -298,7 +298,7 @@ impl Presentation {
     fn slide_moves(&self, cx: &mut App) -> bool {
         let slide = self.session.place().slide;
         self.document
-            .update(cx, |document, _| document.timeline_of(slide).animated)
+            .update(cx, |document, _| document.timeline_of(document.shown_slide(slide)).animated)
     }
 }
 
@@ -322,9 +322,10 @@ fn show_on(
     };
     // Both from the one layout, as a component can give a layer at one moment and none at another.
     let (layers, timings) = document.update(cx, |document, _| {
+        let slide = document.shown_slide(place.slide);
         (
-            document.layers_at(place.slide, moment, scale),
-            document.timings_at(place.slide, moment),
+            document.layers_at(slide, moment, scale),
+            document.timings_at(slide, moment),
         )
     });
     let looks = timings
@@ -662,9 +663,9 @@ impl PresenterView {
             show.session.place(),
             show.time_at(now),
         );
-        self.notes = document
-            .read(cx)
-            .notes_of(place.slide)
+        let talk = document.read(cx);
+        self.notes = talk
+            .notes_of(talk.shown_slide(place.slide))
             .unwrap_or_default()
             .into();
         if place.slide != self.slide {
@@ -724,7 +725,7 @@ impl Render for PresenterView {
         let counter = format!(
             "{} / {}",
             show.session.place().slide + 1,
-            show.document.read(cx).slide_count()
+            show.document.read(cx).shown_count()
         );
         let at_the_end = self.at_the_end;
         let title = self.rehearsing.then_some("Presenter");

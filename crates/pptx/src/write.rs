@@ -23,7 +23,7 @@ use crate::presentation::{
     EmbeddedFont, Presentation, SlideRef, app_xml, core_xml, pres_props_xml, presentation_xml, view_props_xml,
 };
 use crate::shapes::{
-    Ph, background_xml, freeform_xml, graphic_frame_xml, picture_xml_rotated, placeholder_xml_rotated, shape_xml_rotated, slide_xml,
+    Ph, background_xml, freeform_xml, graphic_frame_xml, picture_xml_rotated, placeholder_xml_rotated, shape_xml_rotated, slide_xml_shown_or_not,
 };
 use crate::table::{TABLE_URI, table_styles_xml, table_xml};
 use crate::text::{Anchor, Autofit, BodyOptions, TextCtx, link_target};
@@ -377,7 +377,7 @@ pub fn write_pptx(deck: &mut Deck, files: &dyn TalkFiles) -> Result<PptxOutput, 
         drop(env);
 
         let background = background_xml(theme.background, None);
-        let xml = slide_xml(&shapes, &background, &animation_timing_xml(&effects), &transition_xml(timeline.transition));
+        let xml = slide_xml_shown_or_not(&shapes, &background, &animation_timing_xml(&effects), &transition_xml(timeline.transition), deck.is_hidden(index));
         {
             let mut p = pkg.borrow_mut();
             p.add_xml(&part, CT::SLIDE, &xml);

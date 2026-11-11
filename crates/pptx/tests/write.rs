@@ -471,3 +471,16 @@ fn a_slide_with_a_path_exports_a_freeform_through_write_pptx() {
     let xml = part(&out.bytes, "ppt/slides/slide1.xml");
     assert!(xml.contains("<a:custGeom>") && !xml.contains("<p:pic>"), "{xml}");
 }
+
+const ONE_HIDDEN: &str = "# One\n\n---\nhidden: true\n---\n\n# Two\n\n---\n\n# Three\n";
+
+#[test]
+fn a_hidden_slide_is_hidden_in_powerpoint_too() {
+    let out = export(ONE_HIDDEN);
+    assert!(has_part(&out.bytes, "ppt/slides/slide2.xml"), "the slide is kept");
+    assert!(part(&out.bytes, "ppt/slides/slide2.xml").contains("<p:sld show=\"0\" "));
+    for shown in [1, 3] {
+        assert!(!part(&out.bytes, &format!("ppt/slides/slide{shown}.xml")).contains("show="), "slide {shown}");
+    }
+    assert!(part(&out.bytes, "ppt/presentation.xml").matches("<p:sldId ").count() == 3);
+}

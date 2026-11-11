@@ -268,3 +268,23 @@ fn a_jpeg_marked_as_turned_looks_as_it_does_on_the_slide() {
     let Some(difference) = page_difference(&mut deck, &pdf, 1, dir.path()) else { return };
     assert!(difference < 6.0, "differs by {difference}");
 }
+
+#[test]
+fn a_hidden_slide_is_left_out_of_a_pdf() {
+    let mut deck = open_source("# One\n\n---\nhidden: true\n---\n\n# Two\n\n---\n\n# Three\n");
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = write_to(&mut deck, dir.path(), "hidden.pdf");
+    let Some(info) = run("pdfinfo", &[&pdf]) else { return };
+    assert!(info.contains("Pages:           2"), "{info}");
+    let Some(text) = run("pdftotext", &[&pdf, "-"]) else { return };
+    assert!(text.contains("One") && text.contains("Three") && !text.contains("Two"), "{text}");
+}
+
+#[test]
+fn a_pdf_of_a_talk_with_every_slide_hidden_still_has_its_pages() {
+    let mut deck = open_source("---\nhidden: true\n---\n\n# One\n\n---\nhidden: true\n---\n\n# Two\n");
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = write_to(&mut deck, dir.path(), "all-hidden.pdf");
+    let Some(info) = run("pdfinfo", &[&pdf]) else { return };
+    assert!(info.contains("Pages:           2"), "{info}");
+}

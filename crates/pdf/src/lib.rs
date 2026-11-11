@@ -38,15 +38,15 @@ struct Drawing<'a> {
     image_cache: &'a mut ImageCache,
 }
 
-/// Writes the whole talk. What can't be drawn, such as a glyph from a missing font, is left
-/// out; only a failure of the PDF writer is an error.
+/// Writes the talk's shown slides, a page each. What can't be drawn, such as a glyph from a
+/// missing font, is left out; only a failure of the PDF writer is an error.
 pub fn write_pdf(deck: &mut Deck) -> Result<Vec<u8>, String> {
     let mut document = Document::new();
     if let Some(title) = deck.title() {
         document.set_metadata(krilla::metadata::Metadata::new().title(title));
     }
     let (mut font_cache, mut image_cache) = (FontCache::new(), ImageCache::new());
-    for index in 0..deck.slide_count() {
+    for index in deck.shown_slides() {
         let settings = PageSettings::from_wh(PAGE_WIDTH, PAGE_HEIGHT).ok_or("the page size is invalid")?;
         let mut page = document.start_page_with(settings);
         let mut surface = page.surface();

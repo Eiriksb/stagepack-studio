@@ -1105,3 +1105,30 @@ fn the_show_leaves_the_editor_on_its_own_slide(cx: &mut TestAppContext) {
     assert_eq!(label(cx, presenter, COUNTER_ID), "2 / 2");
     assert_eq!(label(cx, editor.handle, TITLE_ID), "T · 1 / 2");
 }
+
+/// The second slide is hidden.
+const MIDDLE_HIDDEN: &str = "# One\n\n---\nhidden: true\n---\n\n# Two\n\n---\n\n# Three\n";
+
+#[gpui_kit::test]
+fn a_hidden_slide_is_left_out_of_a_show(cx: &mut TestAppContext) {
+    let show = rehearse(cx, MIDDLE_HIDDEN);
+    assert_eq!(counter(cx, &show), "1 / 2", "the count is of shown slides");
+    let canvas = show.canvas(cx);
+    press(cx, show.presenter, "right");
+    show.settle(cx);
+    assert_eq!(counter(cx, &show), "2 / 2");
+    let on_screen = pixels(cx, &canvas);
+    assert_eq!(on_screen, pixels_at(cx, &show, &canvas, 2, 0), "the third slide of the talk");
+    assert_ne!(on_screen, pixels_at(cx, &show, &canvas, 1, 0), "not the hidden one");
+    press(cx, show.presenter, "right");
+    assert_eq!(counter(cx, &show), "2 / 2", "that was the last");
+    press(cx, show.presenter, "left");
+    show.settle(cx);
+    assert_eq!(counter(cx, &show), "1 / 2", "going back skips it too");
+}
+
+#[gpui_kit::test]
+fn a_show_of_a_talk_with_every_slide_hidden_still_has_its_slides(cx: &mut TestAppContext) {
+    let show = rehearse(cx, "---\nhidden: true\n---\n\n# One\n\n---\nhidden: true\n---\n\n# Two\n");
+    assert_eq!(counter(cx, &show), "1 / 2");
+}

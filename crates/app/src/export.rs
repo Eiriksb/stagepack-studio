@@ -71,7 +71,9 @@ fn make(input: ExportInput, kind: ExportKind) -> Result<(Vec<u8>, Vec<String>), 
         }
         ExportKind::Pdf => {
             let bytes = write_pdf(&mut deck)?;
-            let notices = (0..deck.slide_count())
+            let notices = deck
+                .shown_slides()
+                .into_iter()
                 .flat_map(|index| {
                     deck.notices_whole(index)
                         .into_iter()

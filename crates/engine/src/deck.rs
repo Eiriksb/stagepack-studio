@@ -5,14 +5,17 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use tiny_skia::Pixmap;
+
 use slides_components::Diagnostic;
-use slides_format::{Settings, Talk, parse_talk};
+use slides_format::{Settings, Talk, is_hidden, parse_talk};
 use toolkit::{ComponentSchema, Registry};
 
+use crate::slide::SLIDE_WIDTH;
 use crate::timeline::MAX_CLICK;
 use crate::{
     ComponentAsks, ComponentInfo, DisplayItem, Fonts, Layer, LayerSpec, LayerTiming, LayoutEnv, Moment, PictureCache, SlideTimeline,
-    TalkComponents, TalkFiles, Transition, builtin_registry, layout_slide, render_layer, talk_theme,
+    TalkComponents, TalkFiles, Transition, builtin_registry, compose, layout_slide, render_layer, talk_theme,
 };
 
 /// How many scales of one slide are kept drawn. A zoom or a resize asks for many in a row.
@@ -20,6 +23,9 @@ const KEPT_SCALES: usize = 4;
 
 /// What the drawn layers of a whole deck can add up to, in pixel bytes, unless it's told otherwise.
 const DEFAULT_MEMORY_BUDGET: usize = 512 * 1024 * 1024;
+
+/// The widest a thumbnail can be, which is more than a list of slides will ask for.
+const MAX_THUMBNAIL_WIDTH: u32 = 4096;
 
 /// What makes a drawn layer the same as one drawn before: the text it came from, the
 /// look of the talk and the slide's layout, where it sits and how it turns, and the
@@ -93,6 +99,9 @@ struct SlideState {
     /// The slide laid out at the one other moment it was last asked for, which differs from the start.
     at_moment: Option<(Moment, Laid)>,
     drawn: HashMap<u32, Drawn>,
+    /// The whole slide on one small pixmap, and the width it was made for. It lasts until the
+    /// slide changes, and counts against the memory budget with the drawn layers.
+    thumbnail: Option<(u32, Arc<Pixmap>)>,
     /// The value of `Deck::layers_asked_for` when this slide's layers were last asked for.
     last_used: u64,
 }
@@ -146,7 +155,7 @@ impl Deck {
         let talk = parse_talk(&source);
         let slides = slide_texts(&talk)
             .into_iter()
-            .map(|text| SlideState { text, laid: None, at_moment: None, drawn: HashMap::new(), last_used: 0 })
+            .map(|text| SlideState { text, laid: None, at_moment: None, drawn: HashMap::new(), thumbnail: None, last_used: 0 })
             .collect();
         Deck {
             files,
@@ -195,6 +204,7 @@ impl Deck {
                         laid: previous.laid.take(),
                         at_moment: previous.at_moment.take(),
                         drawn: std::mem::take(&mut previous.drawn),
+                        thumbnail: previous.thumbnail.take(),
                         last_used: previous.last_used,
                     });
                 }
@@ -205,7 +215,7 @@ impl Deck {
                     for scale in drawn.values_mut() {
                         scale.ordered = None;
                     }
-                    slides.push(SlideState { text, laid: None, at_moment: None, drawn, last_used });
+                    slides.push(SlideState { text, laid: None, at_moment: None, drawn, thumbnail: None, last_used });
                 }
             }
         }
@@ -231,6 +241,7 @@ impl Deck {
         for slide in &mut self.slides {
             slide.laid = None;
             slide.at_moment = None;
+            slide.thumbnail = None;
             for scale in slide.drawn.values_mut() {
                 scale.ordered = None;
             }
@@ -299,11 +310,52 @@ impl Deck {
     /// The pixel bytes the deck is holding in drawn layers. A layer the slides share counts once.
     pub fn drawn_bytes(&self) -> usize {
         let slide_layers = self.slides.iter().flat_map(|slide| slide.drawn.values()).flat_map(|drawn| drawn.by_key.values());
-        slide_layers.chain(self.backgrounds.values()).map(|layer| layer.pixmap.data().len()).sum()
+        let layers: usize = slide_layers.chain(self.backgrounds.values()).map(|layer| layer.pixmap.data().len()).sum();
+        let thumbnails: usize = self.slides.iter().filter_map(|slide| slide.thumbnail.as_ref()).map(|(_, pixmap)| pixmap.data().len()).sum();
+        layers + thumbnails
     }
 
     pub fn slide_count(&self) -> usize {
         self.slides.len()
+    }
+
+    /// Whether slide `index` is left out of shows and PDFs. A slide that isn't in the talk isn't.
+    pub fn is_hidden(&self, index: usize) -> bool {
+        self.talk.slides.get(index).is_some_and(is_hidden)
+    }
+
+    /// The slides a show goes through, in order: all but the hidden ones, or all of them if
+    /// every slide is hidden, so that a show is never empty.
+    pub fn shown_slides(&self) -> Vec<usize> {
+        let shown: Vec<usize> = (0..self.talk.slides.len()).filter(|index| !self.is_hidden(*index)).collect();
+        if shown.is_empty() { (0..self.talk.slides.len()).collect() } else { shown }
+    }
+
+    /// The whole slide, its last step, drawn onto one pixmap `width` wide and 9/16 as tall, to
+    /// stand for the slide in a list. It is kept until the slide changes, and the slides asked
+    /// for longest ago give theirs up when the deck is over its memory budget.
+    pub fn thumbnail(&mut self, index: usize, width: u32) -> Arc<Pixmap> {
+        let width = width.clamp(1, MAX_THUMBNAIL_WIDTH);
+        self.layers_asked_for += 1;
+        self.slides[index].last_used = self.layers_asked_for;
+        if let Some((made_for, pixmap)) = &self.slides[index].thumbnail
+            && *made_for == width
+        {
+            return pixmap.clone();
+        }
+        let moment = self.ensure_whole(index);
+        let height = (u64::from(width) * 9 / 16).max(1) as u32;
+        let scale = width as f32 / SLIDE_WIDTH;
+        let mut pixmap = Pixmap::new(width, height).expect("a thumbnail has an area and a modest size");
+        // Each layer is drawn and put on at once rather than kept: a thumbnail is small, and the
+        // layers of the slide at the size the editor shows it are not to be pushed out by it.
+        for spec in &self.slides[index].laid_at(moment).specs {
+            compose(&mut pixmap, &[render_layer(spec, scale, &mut self.fonts)]);
+        }
+        let pixmap = Arc::new(pixmap);
+        self.slides[index].thumbnail = Some((width, pixmap.clone()));
+        self.keep_within_budget(index);
+        pixmap
     }
 
     pub fn source(&self) -> &str {
@@ -412,11 +464,16 @@ impl Deck {
             if self.drawn_bytes() <= self.memory_budget {
                 return;
             }
-            let others = self.slides.iter_mut().enumerate().filter(|(index, slide)| *index != requested && !slide.drawn.is_empty());
+            let others = self
+                .slides
+                .iter_mut()
+                .enumerate()
+                .filter(|(index, slide)| *index != requested && (!slide.drawn.is_empty() || slide.thumbnail.is_some()));
             let Some((_, oldest)) = others.min_by_key(|(_, slide)| slide.last_used) else {
                 return;
             };
             oldest.drawn.clear();
+            oldest.thumbnail = None;
         }
     }
 
