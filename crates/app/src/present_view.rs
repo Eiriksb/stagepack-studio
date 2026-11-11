@@ -10,8 +10,8 @@ use slides_engine::{Enter, LayerTiming, Moment, Transition};
 
 use crate::document::Document;
 use crate::present::{
-    ENTER_SECONDS, Moved, Place, ScreenInfo, Session, TRANSITION_SECONDS, WindowPlan,
-    choose_windows, clock_text, layer_look, moment_time, slide_looks,
+    ENTER_SECONDS, MOMENTS_PER_SECOND, Moved, Place, ScreenInfo, Session, TRANSITION_SECONDS,
+    WindowPlan, choose_windows, clock_text, layer_look, moment_time, slide_looks,
 };
 use crate::slide_canvas::{ScaleChanged, SlideCanvas};
 use crate::workspace_view::APP_ID;
@@ -283,6 +283,17 @@ impl Presentation {
         self.slide_began.get_or_insert(now);
     }
 
+    /// How long until the slide's time reaches its next moment, which is when a slide that
+    /// moves looks different.
+    fn until_next_moment(&self, now: Instant) -> Duration {
+        let moment = 1.0 / MOMENTS_PER_SECOND;
+        let elapsed = self
+            .slide_began
+            .map_or(0.0, |began| now.saturating_duration_since(began).as_secs_f32());
+        let left = moment - elapsed % moment;
+        Duration::from_secs_f32(left.max(0.001))
+    }
+
     /// Whether the slide the show is on moves, and so needs drawing anew as time passes.
     fn slide_moves(&self, cx: &mut App) -> bool {
         let slide = self.session.place().slide;
@@ -349,6 +360,30 @@ fn catch_up(
     Some(show_on(canvas, &document, place, time, cx))
 }
 
+/// Notifies the view once the slide's time reaches its next moment, unless that's already
+/// on its way. A slide that moves changes 30 times a second, so a frame for every one the
+/// display could show would mostly draw the same picture again.
+fn redraw_at_next_moment<V: 'static>(
+    pending: &mut Option<Task<()>>,
+    show: &Entity<Presentation>,
+    now: Instant,
+    cx: &mut Context<V>,
+    clear: fn(&mut V) -> &mut Option<Task<()>>,
+) {
+    if pending.is_some() {
+        return;
+    }
+    let wait = show.read(cx).until_next_moment(now);
+    *pending = Some(cx.spawn(async move |this, cx| {
+        cx.background_executor().timer(wait).await;
+        this.update(cx, |view, cx| {
+            *clear(view) = None;
+            cx.notify();
+        })
+        .ok();
+    }));
+}
+
 /// The root of a show's window, with the show's keys, and a title bar if `title` says what
 /// to put on one. A full-screen window has none.
 fn window_root(
@@ -383,6 +418,8 @@ pub struct AudienceView {
     /// Whether the slide on `current` moves, and the time it was last drawn at.
     moves: bool,
     drawn_time: f32,
+    /// The wait for the next moment of a slide that moves.
+    next_moment: Option<Task<()>>,
     rehearsing: bool,
     focus_handle: FocusHandle,
     _watching: [Subscription; 3],
@@ -416,6 +453,7 @@ impl AudienceView {
             timings: Vec::new(),
             moves: false,
             drawn_time: 0.0,
+            next_moment: None,
             rehearsing,
             focus_handle,
             _watching: watching,
@@ -499,8 +537,12 @@ impl AudienceView {
                 canvas.set_layers(Vec::new(), cx);
             }
         });
-        if arrival.is_some() || revealing.is_some() || self.moves {
+        if arrival.is_some() || revealing.is_some() {
             window.request_animation_frame();
+        } else if self.moves {
+            redraw_at_next_moment(&mut self.next_moment, &self.show, now, cx, |view: &mut Self| {
+                &mut view.next_moment
+            });
         }
     }
 }
@@ -540,6 +582,8 @@ pub struct PresenterView {
     /// Whether the slide on `current` moves, and the time it was last drawn at.
     moves: bool,
     drawn_time: f32,
+    /// The wait for the next moment of a slide that moves.
+    next_moment: Option<Task<()>>,
     at_the_end: bool,
     rehearsing: bool,
     focus_handle: FocusHandle,
@@ -584,6 +628,7 @@ impl PresenterView {
             slide: 0,
             moves: false,
             drawn_time: 0.0,
+            next_moment: None,
             at_the_end: false,
             rehearsing,
             focus_handle,
@@ -640,15 +685,19 @@ impl PresenterView {
         cx.notify();
     }
 
-    /// Draws the slide on `current` again if it moves and its time has changed since, and asks
-    /// for another frame while it moves.
-    fn animate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Draws the slide on `current` again if it moves and its time has changed since, and
+    /// comes back at its next moment while it moves.
+    fn animate(&mut self, cx: &mut Context<Self>) {
+        // A show seen only by the presenter starts the slide's time here.
+        let now = cx.background_executor().now();
+        self.show.update(cx, |show, _| show.first_frame_drawn(now));
         if !self.moves {
             return;
         }
-        let now = cx.background_executor().now();
         catch_up(&self.show, &self.current, &mut self.drawn_time, now, cx);
-        window.request_animation_frame();
+        redraw_at_next_moment(&mut self.next_moment, &self.show, now, cx, |view: &mut Self| {
+            &mut view.next_moment
+        });
     }
 }
 
@@ -664,8 +713,8 @@ fn readout(id: &'static str, text: String) -> impl IntoElement {
 }
 
 impl Render for PresenterView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.animate(window, cx);
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.animate(cx);
         let show = self.show.read(cx);
         let elapsed = cx
             .background_executor()

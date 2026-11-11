@@ -115,6 +115,8 @@ pub struct Deck {
     backgrounds: HashMap<(String, u32), Arc<Layer>>,
     memory_budget: usize,
     layers_asked_for: u64,
+    /// The slide whose layers were asked for last.
+    last_asked: Option<usize>,
     /// The slides whose `laid` holds pictures, which are the ones that can give memory back.
     slides_holding_pictures: BTreeSet<usize>,
 }
@@ -159,6 +161,7 @@ impl Deck {
             backgrounds: HashMap::new(),
             memory_budget: DEFAULT_MEMORY_BUDGET,
             layers_asked_for: 0,
+            last_asked: None,
             slides_holding_pictures: BTreeSet::new(),
         }
     }
@@ -239,6 +242,12 @@ impl Deck {
     /// The talk's own components.
     pub fn components(&self) -> &[ComponentInfo] {
         self.components.infos()
+    }
+
+    /// How many slides hold a layout at a moment other than their start.
+    #[doc(hidden)]
+    pub fn moments_held(&self) -> usize {
+        self.slides.iter().filter(|slide| slide.at_moment.is_some()).count()
     }
 
     /// How many of the talk's assets are remembered as read by its components.
@@ -362,12 +371,27 @@ impl Deck {
 
     /// The slide's layers at `moment`, first to last, drawn at `scale`.
     pub fn layers_at(&mut self, index: usize, moment: Moment, scale: f32) -> Vec<Arc<Layer>> {
+        self.keep_moments_of(index);
         let moment = self.ensure_laid_at(index, moment);
         self.layers_asked_for += 1;
         self.slides[index].last_used = self.layers_asked_for;
         let layers = self.drawn_layers(index, moment, scale);
         self.keep_within_budget(index);
         layers
+    }
+
+    /// Forgets the layouts at a moment of every slide but `index` and the one asked for just
+    /// before it, so that a show, with its current slide and the next one, holds two.
+    fn keep_moments_of(&mut self, index: usize) {
+        let before = self.last_asked.replace(index);
+        if before == Some(index) {
+            return;
+        }
+        for (other, slide) in self.slides.iter_mut().enumerate() {
+            if other != index && Some(other) != before && slide.at_moment.take().is_some() && !slide.holds_pictures() {
+                self.slides_holding_pictures.remove(&other);
+            }
+        }
     }
 
     /// Forgets whole slides' drawn layers, the slide asked for longest ago first, until the

@@ -459,6 +459,12 @@ mod probes {
         text(if ctx.asset(&path).is_some() { "found" } else { "missing" })
     }
 
+    /// The slide's time.
+    #[component]
+    pub fn Ticking(ctx: &Ctx) -> Element {
+        text(ctx.time().to_string())
+    }
+
     /// A stack of 20,000 empty shapes.
     #[component]
     pub fn Crowd() -> Element {
@@ -499,6 +505,7 @@ fn probe_registry() -> Registry {
     registry.add(probes::Echo_component());
     registry.add(probes::Late_component());
     registry.add(probes::Wanderer_component());
+    registry.add(probes::Ticking_component());
     registry
 }
 
@@ -906,4 +913,24 @@ fn a_path_over_256_bytes_is_not_read() {
     files.put(&long, "here");
     let mut deck = open(&files);
     assert!(shows(&mut deck, 0, "no"));
+}
+
+#[test]
+fn a_show_holds_the_layouts_of_at_most_two_slides_at_a_moment() {
+    let files = Files::default();
+    let slides = ["<Ticking />\n"; 5].join("\n---\n\n");
+    files.put("slides.md", slides);
+    let mut deck = open_with(&files, probe_registry());
+    let at = |time: f32| Moment { step: 0, time };
+    for slide in 0..5 {
+        let _ = deck.layers_at(slide, at(1.0), 0.1);
+        // The next one, as a presenter's thumbnail would.
+        let _ = deck.layers_at((slide + 1) % 5, at(0.5), 0.1);
+        assert!(deck.moments_held() <= 2, "after slide {slide}: {}", deck.moments_held());
+    }
+    // Going back and forth between two keeps both.
+    let _ = deck.layers_at(2, at(2.0), 0.1);
+    let _ = deck.layers_at(3, at(2.0), 0.1);
+    let _ = deck.layers_at(2, at(2.0), 0.1);
+    assert_eq!(deck.moments_held(), 2);
 }

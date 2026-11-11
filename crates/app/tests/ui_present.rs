@@ -554,12 +554,14 @@ fn the_next_step_shows_what_the_next_press_brings(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn a_slide_that_moves_keeps_asking_for_frames(cx: &mut TestAppContext) {
+fn a_slide_that_moves_is_drawn_at_each_moment_without_asking_for_frames(cx: &mut TestAppContext) {
     let show = rehearse(cx, MOVES);
     let canvas = show.canvas(cx);
     for _ in 0..3 {
-        assert!(frames_asked_for_after_the_last(cx, show.audience) > 0);
-        assert!(frames_asked_for_after_the_last(cx, show.presenter) > 0);
+        // It waits for its next moment, a thirtieth of a second on, instead.
+        assert_eq!(frames_asked_for_after_the_last(cx, show.audience), 0);
+        assert_eq!(frames_asked_for_after_the_last(cx, show.presenter), 0);
+        assert!(redrawn_at_the_next_moment(cx, &show, &canvas));
     }
     let before = images(cx, &canvas);
     wait(cx, &show, 100);
@@ -571,14 +573,40 @@ fn a_slide_that_moves_keeps_asking_for_frames(cx: &mut TestAppContext) {
         Arc::ptr_eq(&before[1], &images(cx, &canvas)[1]),
         "the heading wasn't"
     );
+    let presenter = show.presenter_view(cx);
+    let presenters = cx.read(|cx| presenter.read(cx).current().clone());
+    let before = images(cx, &presenters);
+    wait(cx, &show, 34);
+    assert!(
+        !Arc::ptr_eq(&before[2], &images(cx, &presenters)[2]),
+        "the presenter's clock moves too"
+    );
 
     press(cx, show.audience, "right");
-    assert_eq!(
-        frames_asked_for_after_the_last(cx, show.audience),
-        0,
-        "the next slide is still"
-    );
+    show.settle(cx);
+    assert!(!redrawn_at_the_next_moment(cx, &show, &canvas), "the next slide is still");
+    assert_eq!(frames_asked_for_after_the_last(cx, show.audience), 0);
     assert_eq!(frames_asked_for_after_the_last(cx, show.presenter), 0);
+}
+
+/// Whether the clock on `canvas`, its third image, is drawn anew a moment from now.
+fn redrawn_at_the_next_moment(cx: &mut TestAppContext, show: &Rehearsal, canvas: &Entity<SlideCanvas>) -> bool {
+    let before = images(cx, canvas);
+    wait(cx, show, 34);
+    let after = images(cx, canvas);
+    before.len() != after.len() || before.iter().zip(&after).any(|(a, b)| !Arc::ptr_eq(a, b))
+}
+
+#[gpui_kit::test]
+fn a_show_drawn_only_by_the_presenter_starts_the_slides_time(cx: &mut TestAppContext) {
+    let show = rehearse(cx, "# Still\n\n---\n\n# One\n\n<Clock />\n");
+    press(cx, show.presenter, "right");
+    // Only the presenter's window is drawn from here on.
+    settle(cx, show.presenter);
+    cx.executor().advance_clock(Duration::from_millis(500));
+    cx.run_until_parked();
+    settle(cx, show.presenter);
+    assert_eq!(time(cx, &show), 0.5);
 }
 
 #[gpui_kit::test]
@@ -607,13 +635,14 @@ fn a_save_during_a_moving_slide_keeps_the_show_on_a_real_slide(cx: &mut TestAppC
     press(cx, show.presenter, "right");
     show.settle(cx);
     wait(cx, &show, 100);
-    assert!(frames_asked_for_after_the_last(cx, show.audience) > 0);
+    assert!(redrawn_at_the_next_moment(cx, &show, &show.canvas(cx)));
 
     reload(cx, &show, "# One\n");
 
     assert_eq!(counter(cx, &show), "1 / 1");
     assert_eq!(images(cx, &show.canvas(cx)).len(), 2);
     wait(cx, &show, 100);
+    assert!(!redrawn_at_the_next_moment(cx, &show, &show.canvas(cx)));
     assert_eq!(frames_asked_for_after_the_last(cx, show.audience), 0);
     assert_eq!(frames_asked_for_after_the_last(cx, show.presenter), 0);
 }
