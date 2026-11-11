@@ -5,7 +5,7 @@ use std::ops::Range;
 
 use crate::model::{Attr, Slide, Tag};
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceEdit {
     pub range: Range<usize>,
     pub text: String,
@@ -27,6 +27,51 @@ impl SourceEdit {
             range: self.range.start..self.range.start + self.text.len(),
             text: source[self.range.clone()].to_string(),
         }
+    }
+}
+
+/// Several source edits made as one: what one visual change to a talk does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Change {
+    /// Ranges in the text before any edit is applied, sorted, and not overlapping.
+    pub edits: Vec<SourceEdit>,
+}
+
+impl Change {
+    pub fn single(edit: SourceEdit) -> Change {
+        Change { edits: vec![edit] }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.edits.is_empty()
+    }
+
+    pub fn apply(&self, source: &str) -> String {
+        let mut out = String::with_capacity(source.len());
+        let mut at = 0;
+        for edit in &self.edits {
+            out.push_str(&source[at..edit.range.start]);
+            out.push_str(&edit.text);
+            at = edit.range.end;
+        }
+        out.push_str(&source[at..]);
+        out
+    }
+
+    /// The change that undoes this one. Its ranges are in the text after this change is
+    /// applied.
+    pub fn inverse(&self, source: &str) -> Change {
+        let mut shift = 0isize;
+        let edits = self
+            .edits
+            .iter()
+            .map(|edit| {
+                let start = edit.range.start.wrapping_add_signed(shift);
+                shift += edit.text.len() as isize - edit.range.len() as isize;
+                SourceEdit { range: start..start + edit.text.len(), text: source[edit.range.clone()].to_string() }
+            })
+            .collect();
+        Change { edits }
     }
 }
 
@@ -86,7 +131,8 @@ pub fn set_attr(source: &str, tag: &Tag, name: &str, value: &str) -> SourceEdit 
     SourceEdit { range: at..at, text: format!(" {name}=\"{}\"", escape(value, '"')) }
 }
 
-fn eol_in(text: &str) -> &'static str {
+/// The first line ending in `text`, or `\n` when it has none.
+pub(crate) fn eol_in(text: &str) -> &'static str {
     match text.find('\n') {
         Some(i) if text[..i].ends_with('\r') => "\r\n",
         _ => "\n",
