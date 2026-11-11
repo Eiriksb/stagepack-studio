@@ -8,3 +8,9 @@ license.workspace = true
 proc-macro2 = { version = "=1.0.107", features = ["span-locations"] }
 serde_json = { workspace = true }
 tempfile = "3"
+thiserror = { workspace = true }
+toolkit = { path = "../toolkit" }
+wasmtime = { version = "=50.0.1", default-features = false, features = ["anyhow", "cranelift", "runtime", "std"] }
+
+[dev-dependencies]
+wat = "=1"
