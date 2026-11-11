@@ -14,5 +14,8 @@ thiserror = { workspace = true }
 toolkit = { path = "../toolkit" }
 wasmtime = { version = "=50.0.1", default-features = false, features = ["anyhow", "cranelift", "runtime", "std"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.191"
+
 [dev-dependencies]
 wat = "=1"
