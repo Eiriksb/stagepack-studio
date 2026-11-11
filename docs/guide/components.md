@@ -70,7 +70,7 @@ The app knows the type of each argument, so a form for the tag can show a field 
 | `Color` | `#rgb`, `#rrggbb`, or a name such as `red` | Colour picker | Black |
 | `PictureFile` | The path of a picture in the talk | File picker for pictures | Empty path |
 | `DataFile` | The path of a CSV file in the talk | File picker for CSV files | Empty path |
-| `Option<String>`, or `Option` of any type above | A value that can be left out | The same field, marked optional | `None`, which means "not given" |
+| `Option<String>`, or `Option` of any type above | A value that can be left out | The same field, marked optional | `None`, which means "not given", when the attribute is left out. A value that is there but wrong gives that type's usual fallback, such as `Some(0)` for `Option<u32>` |
 
 For a fixed list of choices, write an `enum` above the component with `#[derive(Prop)]` on it, and use it as an argument's type. The form shows a dropdown, and the first choice is used when the value is missing or wrong. A choice written `LineChart` in Rust is written `line-chart` in the tag.
 
@@ -174,9 +174,10 @@ fn Clock(size: f32, ctx: &Ctx) -> Element {
     let tip_y = middle - turned.cos() * middle * 0.8;
     // A line from the middle to the tip, in the words of an SVG path.
     let hand = format!("M {middle} {middle} L {tip_x} {tip_y}");
+    let white = Color::rgb(255, 255, 255);
 ```
 
-`TAU` is a full turn, so `turned` goes once round in 60 seconds. `format!` makes text with values put in where the names are in `{ }`.
+The function goes on to draw the face and the hand, shown under [Placing things by hand](#placing-things-by-hand). `TAU` is a full turn, so `turned` goes once round in 60 seconds. `format!` makes text with values put in where the names are in `{ }`. `Color::rgb(255, 255, 255)` is a colour by its red, green and blue, each from 0 to 255: this one is white.
 
 ## Placing things by hand
 
@@ -213,7 +214,7 @@ fn badge(points: u32, colour: Color) -> Element {
 }
 ```
 
-`Color::rgb(255, 255, 255)` is a colour by its red, green and blue, each from 0 to 255. `points.to_string()` turns the number into text.
+`points.to_string()` turns the number into text.
 
 ## A worked example: a bar chart
 
@@ -242,7 +243,7 @@ const HEIGHT: f32 = 600.0;
 const LABEL_ROOM: f32 = 48.0;
 ```
 
-It reads the file with `ctx.asset_text`, which gives the text of a file in the talk's `assets` folder. If the file can't be read, it gives back a labelled box saying so, rather than nothing:
+It reads the file with `ctx.asset_text`, which gives the text of a file in the talk's `assets` folder. A path given to `ctx.asset_text`, `ctx.asset` or `picture` always starts with `assets/`, as in `assets/sales.csv`, and is written with `/` between folders on every computer. Any other path gives nothing, or a labelled box for a picture. If the file can't be read, it gives back a labelled box saying so, rather than nothing:
 
 ```rust
 fn Bars(data: DataFile, ctx: &Ctx) -> Element {
@@ -309,6 +310,8 @@ Opening a talk never builds anything. A talk can come from anyone, and building 
 
 The app remembers *Always build this folder* by the folder's path, not by what's in it. So don't turn it on for a folder that you'll later replace with someone else's talk: their components would then be built without asking you.
 
+If this copy of the app has no compiler, the bar says *This copy of the app has no compiler, so components can't be built.* instead, and offers no buttons. Components that were already built still show.
+
 If a component doesn't build, its errors appear below the slide with the file and line, and the slide keeps showing its last good build.
 
 ## Labelled boxes
@@ -347,4 +350,4 @@ A talk is shared like any other file, so a component is held to some limits. The
 
 The app doesn't need anything else to build your components. But if you have Rust installed and want an editor that completes names and points out mistakes as you type, open the talk and choose **File → Set up for a code editor**. It writes a `Cargo.toml` at the top of the talk that points the editor at the toolkit the app came with. Then open the talk's folder in your editor.
 
-The app never writes this file unless you ask, and leaves one that's already there alone. The editor may add a `target` folder and a `Cargo.lock`. Neither is needed by the app, and a packed talk leaves them out, along with `Cargo.toml`.
+The app never writes this file unless you ask, and leaves one that's already there alone. It also won't set up a talk whose folder holds a `build.rs`, a `.cargo` folder, a `rust-toolchain` or `rust-toolchain.toml` file, or a `src` folder: Cargo would act on any of them as soon as your editor opens the folder, so a talk from someone else could run its own code on your computer, outside the limits above. The file it writes tells Cargo to look at nothing but the components. The editor may add a `target` folder and a `Cargo.lock`. Neither is needed by the app, and a packed talk leaves them out, along with `Cargo.toml`.

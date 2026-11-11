@@ -441,6 +441,7 @@ fn the_cargo_file_lists_each_component() {
         ("score.rs", &source("Score")),
         ("clock.rs", &source("Clock")),
         ("bad name.rs", &source("Bad")),
+        ("chart.rs", &source("Chart")),
     ]);
     let (_bundle_dir, bundle) = bundle_with_toolkit_source();
 
@@ -481,6 +482,76 @@ fn an_existing_cargo_file_is_left_alone() {
         std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap(),
         "# mine\n"
     );
+}
+
+/// Refuses with the talk in `dir` holding `name`, and writes nothing.
+fn assert_refused_for(dir: &TempDir, name: &str) {
+    let (_bundle_dir, bundle) = bundle_with_toolkit_source();
+    let refused = write_cargo_file(dir.path(), &bundle).unwrap_err();
+    assert!(refused.contains(name), "{name}: {refused}");
+    assert!(refused.contains("Cargo"), "{name}: {refused}");
+    assert!(!dir.path().join("Cargo.toml").exists(), "{name}");
+}
+
+#[test]
+fn a_talk_with_a_build_script_is_not_set_up() {
+    let dir = talk(&[("score.rs", &source("Score"))]);
+    std::fs::write(dir.path().join("build.rs"), "fn main() {}\n").unwrap();
+    assert_refused_for(&dir, "build.rs");
+}
+
+#[test]
+fn a_talk_with_cargo_settings_is_not_set_up() {
+    let dir = talk(&[("score.rs", &source("Score"))]);
+    std::fs::create_dir(dir.path().join(".cargo")).unwrap();
+    assert_refused_for(&dir, ".cargo");
+}
+
+#[test]
+fn a_talk_that_picks_a_toolchain_is_not_set_up() {
+    for name in ["rust-toolchain", "rust-toolchain.toml"] {
+        let dir = talk(&[("score.rs", &source("Score"))]);
+        std::fs::write(dir.path().join(name), "[toolchain]\n").unwrap();
+        assert_refused_for(&dir, name);
+    }
+}
+
+#[test]
+fn a_talk_with_a_src_folder_is_not_set_up() {
+    let dir = talk(&[("score.rs", &source("Score"))]);
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    assert_refused_for(&dir, "src");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_linked_build_script_counts_too() {
+    let dir = talk(&[("score.rs", &source("Score"))]);
+    std::os::unix::fs::symlink(dir.path().join("nowhere.rs"), dir.path().join("build.rs")).unwrap();
+    assert_refused_for(&dir, "build.rs");
+}
+
+#[test]
+fn the_cargo_file_finds_nothing_cargo_would_run_or_add() {
+    let dir = talk(&[("score.rs", &source("Score"))]);
+    let (_bundle_dir, bundle) = bundle_with_toolkit_source();
+
+    let text = std::fs::read_to_string(write_cargo_file(dir.path(), &bundle).unwrap()).unwrap();
+
+    let package = text.split("[workspace]").next().unwrap();
+    for line in [
+        "build = false",
+        "autolib = false",
+        "autobins = false",
+        "autoexamples = false",
+        "autotests = false",
+        "autobenches = false",
+    ] {
+        assert!(
+            package.lines().any(|written| written == line),
+            "{line}\n{text}"
+        );
+    }
 }
 
 #[test]
@@ -573,6 +644,10 @@ fn the_cargo_file_works_with_cargo() {
     let folder = dir.path().join("talk");
     copy_folder(&example_talk(), &folder);
     write_cargo_file(&folder, &bundle).unwrap();
+    // A build script that arrives later, as from a `git pull`, must not be run.
+    let marker = dir.path().join("build-script-ran");
+    let script = format!("fn main() {{ std::fs::write({marker:?}, \"ran\").unwrap(); }}\n");
+    std::fs::write(folder.join("build.rs"), script).unwrap();
 
     let cargo_safe = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/cargo-safe.sh");
     let checked = std::process::Command::new(cargo_safe)
@@ -593,4 +668,5 @@ fn the_cargo_file_works_with_cargo() {
         "{}",
         String::from_utf8_lossy(&checked.stderr)
     );
+    assert!(!marker.exists(), "cargo ran the talk's build script");
 }

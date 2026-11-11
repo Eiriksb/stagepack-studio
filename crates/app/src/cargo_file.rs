@@ -11,6 +11,32 @@ use slides_engine::{COMPONENTS_FOLDER, FolderFiles, TalkComponents, write_atomic
 
 const CARGO_FILE: &str = "Cargo.toml";
 
+/// What Cargo would find in a talk's folder and act on, each with why it's refused. A talk can
+/// come from anyone, and an editor checks the project as soon as it's opened, so with any of
+/// these the talk's own code or settings would run outside the sandbox.
+const REFUSED: [(&str, &str); 5] = [
+    (
+        "build.rs",
+        "a build.rs, which Cargo would run on your computer",
+    ),
+    (
+        ".cargo",
+        "a .cargo folder, whose settings could make Cargo run other programs on your computer",
+    ),
+    (
+        "rust-toolchain",
+        "a rust-toolchain file, which could make Cargo use a compiler the talk chose",
+    ),
+    (
+        "rust-toolchain.toml",
+        "a rust-toolchain.toml, which could make Cargo use a compiler the talk chose",
+    ),
+    (
+        "src",
+        "a src folder, whose code Cargo would build and could run on your computer",
+    ),
+];
+
 /// Where the bundle keeps the toolkit's source, beside the workspace that stands in for ours.
 fn toolkit_source(bundle: &Bundle) -> PathBuf {
     bundle.root.join("toolkit-src").join("toolkit")
@@ -57,6 +83,9 @@ fn cargo_text(toolkit: &str, stems: &[String]) -> String {
          version = \"0.0.0\"\n\
          edition = \"2024\"\n\
          publish = false\n\
+         # Nothing in the talk's folder but its components: a talk can come from anyone.\n\
+         build = false\n\
+         autolib = false\n\
          autobins = false\n\
          autoexamples = false\n\
          autotests = false\n\
@@ -87,6 +116,15 @@ pub fn write_cargo_file(folder: &Path, bundle: &Bundle) -> Result<PathBuf, Strin
     if out.symlink_metadata().is_ok() {
         return Err(format!(
             "This talk already has a {CARGO_FILE}, so it has been left as it is."
+        ));
+    }
+    // A link counts too, whether or not what it points at is there.
+    if let Some((name, what)) = REFUSED
+        .iter()
+        .find(|(name, _)| folder.join(name).symlink_metadata().is_ok())
+    {
+        return Err(format!(
+            "This talk has {what}, so it hasn't been set up for a code editor. Remove {name} first if you trust it isn't needed."
         ));
     }
     let toolkit = std::path::absolute(toolkit_source(bundle))
