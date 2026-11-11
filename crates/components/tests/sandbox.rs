@@ -24,10 +24,13 @@ struct Wat<'a> {
     schema: Option<&'a str>,
     /// The body of `render(ptr, len) -> i64`.
     render: &'a str,
+    /// Pages of memory, if not the usual 8.
+    pages: Option<u32>,
 }
 
 fn wat(parts: Wat) -> Vec<u8> {
-    let Wat { abi_version, imports, extra, schema, render } = parts;
+    let Wat { abi_version, imports, extra, schema, render, pages } = parts;
+    let pages = pages.unwrap_or(8);
     let version = abi_version.unwrap_or(1);
     let usual_schema = format!("(i64.const {})", packed(SCHEMA_AT, SCHEMA.len()));
     let schema = schema.unwrap_or(&usual_schema);
@@ -35,7 +38,7 @@ fn wat(parts: Wat) -> Vec<u8> {
     let text = format!(
         r#"(module
   {imports}
-  (memory (export "memory") 8)
+  (memory (export "memory") {pages})
   (global $heap (mut i32) (i32.const {HEAP_AT}))
   {schema_data}
   {extra}
@@ -455,4 +458,72 @@ fn a_component_built_for_version_one_still_runs() {
             animated: false,
         }
     );
+}
+
+/// Where a large answer sits, past the heap the input is written to.
+const FAR_AT: u32 = 1024 * 1024;
+
+/// A module whose `render` gives `answer`, which can be up to 3 MiB.
+fn answering_at_length(answer: &str) -> Vec<u8> {
+    let extra = data(FAR_AT, answer.as_bytes());
+    let render = format!("(i64.const {})", packed(FAR_AT, answer.len()));
+    wat(Wat { extra: &extra, render: &render, pages: Some(64), ..Wat::default() })
+}
+
+#[test]
+fn an_answer_placing_children_twice_is_refused() {
+    let once = r#"{"element":{"Stack":{"horizontal":false,"gap":0,"children":["Children","Empty"]}}}"#;
+    assert!(render(&answering(once)).is_ok());
+    let twice = r#"{"element":{"Stack":{"horizontal":false,"gap":0,"children":["Children",{"Shape":{"kind":"Rect","width":1,"height":1,"fill":null,"outline":null,"outline_width":0,"radius":0,"padding":0,"child":"Children"}}]}}}"#;
+    assert_bad_output(render(&answering(twice)));
+}
+
+#[test]
+fn an_answer_with_too_much_text_is_refused() {
+    let limit = 256 * 1024;
+    assert!(render(&answering_at_length(&text_answer(&"a".repeat(limit)))).is_ok());
+    assert_bad_output(render(&answering_at_length(&text_answer(&"a".repeat(limit + 1)))));
+    // Spread over many elements, it still counts.
+    let half = format!(r#"{{"Problem":{{"message":"{}"}}}}"#, "b".repeat(limit / 2));
+    let icon = r#"{"Icon":{"name":"star","size":10,"color":null}}"#;
+    let spread = format!(r#"{{"element":{{"Stack":{{"horizontal":false,"gap":0,"children":[{half},{half},{icon}]}}}}}}"#);
+    assert_bad_output(render(&answering_at_length(&spread)));
+}
+
+/// A module whose schema is `schema`.
+fn with_schema(schema: &str) -> Vec<u8> {
+    let at = ANSWER_AT + 4096;
+    let extra = data(at, schema.as_bytes());
+    let body = format!("(i64.const {})", packed(at, schema.len()));
+    wat(Wat { extra: &extra, schema: Some(&body), render: "(i64.const 0)", ..Wat::default() })
+}
+
+fn schema_json(name: &str, props: &[(&str, &str)]) -> String {
+    let props: Vec<String> = props.iter().map(|(name, kind)| format!(r#"{{"name":"{name}","kind":{kind},"optional":true}}"#)).collect();
+    format!(r#"{{"name":"{name}","props":[{}],"children":false}}"#, props.join(","))
+}
+
+#[test]
+fn a_schema_holds_its_strings_to_64_bytes() {
+    let long = "N".repeat(65);
+    assert!(WasmComponent::load(&with_schema(&schema_json(&"N".repeat(64), &[]))).is_ok());
+    assert_malformed(WasmComponent::load(&with_schema(&schema_json(&long, &[]))));
+    assert_malformed(WasmComponent::load(&with_schema(&schema_json("Test", &[(&long, r#""Text""#)]))));
+    let choice = format!(r#"{{"Choice":["a","{long}"]}}"#);
+    assert_malformed(WasmComponent::load(&with_schema(&schema_json("Test", &[("look", &choice)]))));
+    let file = format!(r#"{{"File":["{long}"]}}"#);
+    assert_malformed(WasmComponent::load(&with_schema(&schema_json("Test", &[("data", &file)]))));
+}
+
+#[test]
+fn a_schema_has_at_most_64_props() {
+    let names: Vec<String> = (0..65).map(|n| format!("p{n}")).collect();
+    let props: Vec<(&str, &str)> = names.iter().map(|name| (name.as_str(), r#""Text""#)).collect();
+    assert!(WasmComponent::load(&with_schema(&schema_json("Test", &props[..64]))).is_ok());
+    assert_malformed(WasmComponent::load(&with_schema(&schema_json("Test", &props))));
+}
+
+#[test]
+fn a_module_over_four_mebibytes_is_too_large() {
+    assert_eq!(MAX_MODULE_BYTES, 4 * 1024 * 1024);
 }

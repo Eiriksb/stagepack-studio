@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use toolkit::{asset_path_allowed, ComponentSchema, Element, RenderInput, RenderOutput, ABI_VERSION};
+use toolkit::{asset_path_allowed, ComponentSchema, Element, PropKind, RenderInput, RenderOutput, ABI_VERSION};
 use wasmtime::{
     Caller, Config, Engine, ExternType, Instance, Linker, Memory, Module, ResourceLimiter, Store, Trap, TypedFunc,
 };
@@ -13,10 +13,17 @@ use wasmtime::{
 pub const MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 pub const RENDER_TIME_LIMIT: Duration = Duration::from_millis(250);
 pub const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
-pub const MAX_MODULE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_MODULE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_ELEMENTS: usize = 20_000;
 /// Below the 64 the design names, because the JSON reader stops at about 42 nested stacks.
 pub const MAX_ELEMENT_DEPTH: usize = 40;
+/// The most text one answer can hold, in its text, messages, icon names, picture paths
+/// and path data together. Laying out text costs far more than reading it.
+pub const MAX_TEXT_BYTES: usize = 256 * 1024;
+/// The most bytes in each of a schema's names and choices.
+pub const MAX_SCHEMA_STRING_BYTES: usize = 64;
+/// The most props a schema can list.
+pub const MAX_PROPS: usize = 64;
 
 /// How often the clock that stops a component ticks.
 const TICK: Duration = Duration::from_millis(10);
@@ -91,6 +98,7 @@ impl WasmComponent {
         let schema = running.export::<(), u64>("schema")?;
         let packed = running.call(&schema, ())?;
         let schema = serde_json::from_slice(&running.answer(packed)?).map_err(|error| ComponentError::BadOutput(error.to_string()))?;
+        check_schema(&schema)?;
         Ok(WasmComponent { module, schema })
     }
 
@@ -113,8 +121,7 @@ impl WasmComponent {
         let answer = running.answer(packed)?;
         let mut output: RenderOutput = serde_json::from_slice(&answer).map_err(|error| ComponentError::BadOutput(error.to_string()))?;
 
-        let mut count = 0;
-        measure(&output.element, 1, &mut count)?;
+        Measure::default().element(&output.element, 1)?;
         keep_pictures_in_assets(&mut output.element);
         Ok(output)
     }
@@ -319,20 +326,68 @@ fn read_asset(mut caller: Caller<'_, State>, ptr: u32, len: u32) -> wasmtime::Re
     Ok((u64::from(at) << 32) | bytes.len() as u64)
 }
 
-/// Counts the elements and how deeply they nest, and refuses a tree over either limit.
-fn measure(element: &Element, depth: usize, count: &mut usize) -> Result<(), ComponentError> {
-    *count += 1;
-    if *count > MAX_ELEMENTS {
-        return Err(ComponentError::BadOutput(format!("it has more than {MAX_ELEMENTS} elements")));
+/// Holds a schema's strings and props to what a form can show.
+fn check_schema(schema: &ComponentSchema) -> Result<(), ComponentError> {
+    let malformed = |message: String| Err(ComponentError::Malformed(message));
+    if schema.props.len() > MAX_PROPS {
+        return malformed(format!("its schema has more than {MAX_PROPS} props"));
     }
-    if depth > MAX_ELEMENT_DEPTH {
-        return Err(ComponentError::BadOutput(format!("it nests more than {MAX_ELEMENT_DEPTH} levels deep")));
+    let choices = schema.props.iter().flat_map(|prop| match &prop.kind {
+        PropKind::File(choices) | PropKind::Choice(choices) => choices.as_slice(),
+        _ => &[],
+    });
+    let names = std::iter::once(&schema.name).chain(schema.props.iter().map(|prop| &prop.name)).chain(choices);
+    for name in names {
+        if name.len() > MAX_SCHEMA_STRING_BYTES {
+            return malformed(format!("its schema has a name or choice over {MAX_SCHEMA_STRING_BYTES} bytes"));
+        }
     }
-    match element {
-        Element::Stack { children, .. } => children.iter().try_for_each(|child| measure(child, depth + 1, count)),
-        Element::Shape { child: Some(child), .. } => measure(child, depth + 1, count),
-        Element::Canvas { items, .. } => items.iter().try_for_each(|item| measure(&item.element, depth + 1, count)),
-        _ => Ok(()),
+    Ok(())
+}
+
+/// What an answer has added up to so far, held to the limits on it.
+#[derive(Default)]
+struct Measure {
+    elements: usize,
+    text_bytes: usize,
+    children: bool,
+}
+
+impl Measure {
+    /// Counts the elements, how deeply they nest, their text and where the tag's content
+    /// goes, and refuses a tree over any limit.
+    fn element(&mut self, element: &Element, depth: usize) -> Result<(), ComponentError> {
+        self.elements += 1;
+        if self.elements > MAX_ELEMENTS {
+            return Err(ComponentError::BadOutput(format!("it has more than {MAX_ELEMENTS} elements")));
+        }
+        if depth > MAX_ELEMENT_DEPTH {
+            return Err(ComponentError::BadOutput(format!("it nests more than {MAX_ELEMENT_DEPTH} levels deep")));
+        }
+        match element {
+            Element::Text { text, .. } => self.text(text),
+            Element::Problem { message } => self.text(message),
+            Element::Icon { name, .. } => self.text(name),
+            Element::Picture { src, .. } => self.text(src),
+            Element::Path { data, .. } => self.text(data),
+            Element::Children if self.children => Err(ComponentError::BadOutput("it places the tag's content more than once".into())),
+            Element::Children => {
+                self.children = true;
+                Ok(())
+            }
+            Element::Stack { children, .. } => children.iter().try_for_each(|child| self.element(child, depth + 1)),
+            Element::Shape { child: Some(child), .. } => self.element(child, depth + 1),
+            Element::Canvas { items, .. } => items.iter().try_for_each(|item| self.element(&item.element, depth + 1)),
+            _ => Ok(()),
+        }
+    }
+
+    fn text(&mut self, text: &str) -> Result<(), ComponentError> {
+        self.text_bytes += text.len();
+        if self.text_bytes > MAX_TEXT_BYTES {
+            return Err(ComponentError::BadOutput(format!("it has more than {} KiB of text", MAX_TEXT_BYTES / 1024)));
+        }
+        Ok(())
     }
 }
 

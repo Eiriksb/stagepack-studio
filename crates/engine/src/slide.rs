@@ -5,7 +5,8 @@ use tiny_skia::PathBuilder;
 use toolkit::{Color, Registry, Theme};
 
 use crate::elements::lay_out_positioned_tag;
-use crate::flow::{flow_region, flow_region_each};
+use crate::flow::{MAX_NOTICE_CHARS, flow_region, flow_region_each};
+use slides_components::shortened;
 use crate::timeline::{MAX_CLICK, RegionClick, read_region_timing, read_tag_timing, read_transition};
 use crate::native::placeholder_element;
 use crate::placeholder::placeholder_items;
@@ -155,6 +156,7 @@ pub fn layout_slide(talk: &Talk, index: usize, env: &mut LayoutEnv) -> LaidOutSl
             layers.push(layer);
         }
     }
+    let notices = notices.into_iter().map(|notice| Notice(shortened(&notice.0, MAX_NOTICE_CHARS))).collect();
     LaidOutSlide { layers, notices, transition, asks: std::mem::take(&mut env.asks) }
 }
 

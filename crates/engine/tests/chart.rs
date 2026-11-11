@@ -528,3 +528,19 @@ fn charts_for_a_look() {
         pixmap.save_png(out.join(format!("{name}.png"))).unwrap();
     }
 }
+
+#[test]
+fn a_csv_over_one_mebibyte_is_refused_before_it_is_read() {
+    let big = format!("L,S\n{}", "x".repeat(1024 * 1024));
+    let element = chart_at(&[("kind", "bar"), ("data", "assets/big.csv")], 1200.0, 600.0, 0, &[("assets/big.csv", &big)]).0;
+    assert_eq!(message(&element), "The chart's data is over 1 MiB, more than a chart can show");
+}
+
+#[test]
+fn what_a_chart_quotes_is_shortened() {
+    let long = "y".repeat(5000);
+    let refused = parse_csv(&format!("L,S\nA,{long}\n")).unwrap_err();
+    assert!(refused.chars().count() < 100, "{refused}");
+    let element = chart_at(&[("kind", "bar"), ("data", &format!("assets/{long}.csv"))], 1200.0, 600.0, 0, &[]).0;
+    assert!(message(&element).chars().count() < 100, "{}", message(&element));
+}

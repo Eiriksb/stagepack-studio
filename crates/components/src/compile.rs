@@ -46,7 +46,7 @@ pub fn compile(bundle: &Bundle, file: &str, source: &str) -> Result<Vec<u8>, Vec
 
 pub fn compile_with_limit(bundle: &Bundle, file: &str, source: &str, limit: Duration) -> Result<Vec<u8>, Vec<Diagnostic>> {
     check_source(file, source)?;
-    let failed = |message: String| vec![Diagnostic { file: file.to_string(), line: 0, message }];
+    let failed = |message: String| vec![Diagnostic::new(file, 0, message)];
 
     let scratch = tempfile::Builder::new()
         .prefix("component-build")
@@ -157,7 +157,7 @@ fn diagnostics(file: &str, stderr: &str) -> Vec<Diagnostic> {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             // A line cut short at `MAX_ERROR_OUTPUT` says nothing worth showing.
             if !line.starts_with('{') {
-                found.push(Diagnostic { file: file.to_string(), line: 0, message: line.to_string() });
+                found.push(Diagnostic::new(file, 0, line));
             }
             continue;
         };
@@ -171,15 +171,12 @@ fn diagnostics(file: &str, stderr: &str) -> Vec<Diagnostic> {
             Some(span) => {
                 let name = span["file_name"].as_str().unwrap_or_default();
                 let names_the_source = Path::new(name).file_name().is_some_and(|last| last == SOURCE_NAME);
-                found.push(Diagnostic {
-                    file: if names_the_source { file.to_string() } else { name.to_string() },
-                    line: span["line_start"].as_u64().unwrap_or(0) as u32,
-                    message,
-                });
+                let line = span["line_start"].as_u64().unwrap_or(0) as u32;
+                found.push(Diagnostic::new(if names_the_source { file } else { name }, line, message));
             }
             // This one only counts the others, but something like a linker failure has no span either.
             None if message.starts_with("aborting due to") => {}
-            None => found.push(Diagnostic { file: file.to_string(), line: 0, message }),
+            None => found.push(Diagnostic::new(file, 0, message)),
         }
     }
     found

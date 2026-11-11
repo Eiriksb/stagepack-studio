@@ -15,6 +15,7 @@ use toolkit::{Color, Theme};
 use crate::elements::{PathLook, ShapeLook, path_items, shape_items};
 use crate::native::{MAX_TABLE_CELLS, Semantic, native_elements};
 use crate::placeholder::placeholder_items;
+use slides_components::shortened;
 use crate::{
     Align, Bullet, DisplayItem, Fonts, LayoutEnv, NativeElement, NativeParagraph, NativeRun, Notice, Rect, RegionDef, ShapedText, TextRun,
     highlight, shape_text,
@@ -31,9 +32,14 @@ const CODE_SIZE: f32 = 32.0;
 pub(crate) const CODE_PADDING: f32 = 24.0;
 const CODE_RADIUS: f32 = 12.0;
 pub(crate) const CODE_PANEL: Color = Color::rgb(0xf1, 0xf5, 0xf9);
-/// How far lists and tags can sit inside each other. A talk could nest them as deep as it
-/// likes, and laying out each level uses up more of the stack.
-const MAX_NESTING: u32 = 16;
+/// How far lists, tags and a component's elements can sit inside each other, all counted
+/// together. A talk could nest them as deep as it likes, and laying out each level uses up
+/// more of the stack.
+const MAX_DEPTH: u32 = 64;
+const NESTED_TOO_DEEPLY: &str = "Some content is nested too deeply to show";
+const TOO_MUCH: &str = "This slide has too much on it to show";
+/// The most characters a notice keeps, as many are made from a talk's or a component's text.
+pub(crate) const MAX_NOTICE_CHARS: usize = 200;
 /// The tag that styles the text inside it. It isn't a component and has nothing of its own to draw.
 pub(crate) const TEXT_TAG: &str = "Text";
 
@@ -126,7 +132,12 @@ pub(crate) struct Flow<'a, 'env> {
     pub(crate) theme: &'a Theme,
     pub(crate) env: &'a mut LayoutEnv<'env>,
     notices: &'a mut Vec<Notice>,
-    nesting: u32,
+    /// How deep the block or element being laid out is, counting both.
+    depth: u32,
+    /// Whether the tag being laid out has already placed its content.
+    children_placed: bool,
+    /// Whether the slide had too much on it, so nothing more is laid out in this layer.
+    stopped: bool,
     /// What the `<Text>` tags around the current block ask of the text in it.
     text_tag_style: TextStyle,
 }
@@ -225,7 +236,19 @@ impl<'a, 'env> Flow<'a, 'env> {
         let mut tree = TaffyTree::new();
         // Slide units aren't pixels. Rounding would also leave text a sliver narrower than it was measured at.
         tree.disable_rounding();
-        Flow { tree, semantics: HashMap::new(), region, width, theme, env, notices, nesting: 0, text_tag_style: TextStyle::default() }
+        Flow {
+            tree,
+            semantics: HashMap::new(),
+            region,
+            width,
+            theme,
+            env,
+            notices,
+            depth: 0,
+            children_placed: false,
+            stopped: false,
+            text_tag_style: TextStyle::default(),
+        }
     }
 
     /// Lays out the tree under `root`, `width` wide, and returns its drawing and what it is.
@@ -260,6 +283,7 @@ impl<'a, 'env> Flow<'a, 'env> {
     }
 
     pub(crate) fn node(&mut self, style: Style, children: &[NodeId]) -> NodeId {
+        self.env.components.count_node();
         self.tree.new_with_children(style, children).expect("every child is in the tree")
     }
 
@@ -270,12 +294,56 @@ impl<'a, 'env> Flow<'a, 'env> {
     }
 
     pub(crate) fn leaf(&mut self, style: Style, content: Content) -> NodeId {
+        self.env.components.count_node();
         self.tree.new_leaf_with_context(style, content).expect("a new leaf can always be added")
+    }
+
+    /// Whether the slide has made more nodes than it can have.
+    pub(crate) fn over_budget(&self) -> bool {
+        self.env.components.too_many_nodes()
+    }
+
+    /// The box that takes the place of a block once the slide has too much on it, after
+    /// which nothing more is laid out in this layer.
+    pub(crate) fn too_much(&mut self) -> NodeId {
+        self.stopped = true;
+        self.notice(TOO_MUCH.to_string());
+        self.block_placeholder(TOO_MUCH.to_string())
+    }
+
+    /// The box for something nested deeper than the limit.
+    pub(crate) fn nested_too_deeply(&mut self, size: Size<taffy::prelude::Dimension>) -> NodeId {
+        self.notice(NESTED_TOO_DEEPLY.to_string());
+        self.placeholder("Nested too deeply".to_string(), size)
+    }
+
+    /// Runs `lay_out` one level deeper, or gives `None` past the limit.
+    pub(crate) fn deeper<T>(&mut self, lay_out: impl FnOnce(&mut Self) -> T) -> Option<T> {
+        if self.depth >= MAX_DEPTH {
+            return None;
+        }
+        self.depth += 1;
+        let laid = lay_out(self);
+        self.depth -= 1;
+        Some(laid)
+    }
+
+    /// Runs `lay_out` for a tag, whose content can be placed once.
+    pub(crate) fn in_tag<T>(&mut self, lay_out: impl FnOnce(&mut Self) -> T) -> T {
+        let outer = std::mem::replace(&mut self.children_placed, false);
+        let laid = lay_out(self);
+        self.children_placed = outer;
+        laid
+    }
+
+    /// Whether the tag being laid out can still place its content, which it can do once.
+    pub(crate) fn place_children(&mut self) -> bool {
+        !std::mem::replace(&mut self.children_placed, true)
     }
 
     /// Says `text` to the user, once however often it comes up.
     pub(crate) fn notice(&mut self, text: String) {
-        let notice = Notice(text);
+        let notice = Notice(shortened(&text, MAX_NOTICE_CHARS));
         if !self.notices.contains(&notice) {
             self.notices.push(notice);
         }
@@ -364,13 +432,28 @@ impl<'a, 'env> Flow<'a, 'env> {
     }
 
     /// The node for one block, if it's a block this flow draws.
+    /// Once the slide has too much on it, the top-level block being laid out becomes a box
+    /// saying so, and nothing more is laid out in its layer.
     pub(crate) fn block(&mut self, block: &Block, align: Align) -> Option<NodeId> {
-        if self.nesting == MAX_NESTING {
-            self.notice("Some content is nested too deeply to show".to_string());
-            return Some(self.block_placeholder("Nested too deeply".to_string()));
+        if self.stopped {
+            return None;
         }
-        self.nesting += 1;
-        let node = match block {
+        let top = self.depth == 0;
+        if self.over_budget() {
+            return top.then(|| self.too_much());
+        }
+        let laid = self.deeper(|flow| flow.block_node(block, align));
+        let Some(node) = laid else {
+            return Some(self.nested_too_deeply(crate::elements::size_when_empty(0.0, 0.0, false)));
+        };
+        if top && self.over_budget() {
+            return Some(self.too_much());
+        }
+        node
+    }
+
+    fn block_node(&mut self, block: &Block, align: Align) -> Option<NodeId> {
+        match block {
             Block::Heading { level, spans, .. } => Some(self.text(spans, self.heading_look(*level), align)),
             Block::Paragraph { spans, .. } => Some(self.text(spans, self.region_look(), align)),
             Block::List { ordered, items, .. } => Some(self.list(*ordered, items)),
@@ -379,9 +462,7 @@ impl<'a, 'env> Flow<'a, 'env> {
             Block::Picture { src, alt, .. } => Some(self.picture(src, alt, 0.0, 0.0, align, false)),
             Block::Tag(tag) => self.tag(tag, align),
             Block::Region { .. } => None,
-        };
-        self.nesting -= 1;
-        node
+        }
     }
 
     /// Each item is a row of its marker, in the indent, and a column of its blocks.
@@ -394,6 +475,9 @@ impl<'a, 'env> Flow<'a, 'env> {
         let indent = LIST_INDENT.max(widest + MARKER_GAP);
         let mut rows = Vec::with_capacity(items.len());
         for (index, (marker, item)) in markers.into_iter().zip(items).enumerate() {
+            if self.over_budget() {
+                break;
+            }
             let in_the_indent = Style {
                 size: Size { width: length(indent), height: auto() },
                 flex_shrink: 0.0,
@@ -431,6 +515,9 @@ impl<'a, 'env> Flow<'a, 'env> {
         for (r, row) in rows.iter().enumerate() {
             let look = TextLook { bold: r == 0 || self.region.bold, ..self.region_look() };
             let mut native_row = Vec::with_capacity(row.len());
+            if self.over_budget() {
+                break;
+            }
             for (c, spans) in row.iter().enumerate() {
                 let style = Style {
                     grid_row: line(r as i16 + 1),

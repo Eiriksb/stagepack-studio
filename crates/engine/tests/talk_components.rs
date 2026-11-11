@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use slides_components::{BuildEntry, BuildIndex, INDEX_FILE, MEMORY_LIMIT_BYTES, source_hash};
 use slides_engine::*;
-use toolkit::{Ctx, Element, Registry, component, text};
+use toolkit::{Children, Ctx, Element, Registry, component, text};
 
 // Modules, written in WAT, that answer with fixed JSON.
 
@@ -51,14 +51,19 @@ fn packed(at: u32, len: usize) -> i64 {
 /// A module that calls itself `name`, with `extra` at its top level and `render` as the
 /// body of `render(ptr, len) -> i64`.
 fn module(name: &str, imports: &str, extra: &str, render: &str) -> Vec<u8> {
+    module_of_pages(name, imports, extra, render, 8, HEAP_AT)
+}
+
+/// As `module`, with `pages` of memory and `alloc` starting at `heap`.
+fn module_of_pages(name: &str, imports: &str, extra: &str, render: &str, pages: u32, heap: u32) -> Vec<u8> {
     let schema = format!(r#"{{"name":"{name}","props":[],"children":true}}"#);
     let schema_data = data(SCHEMA_AT, schema.as_bytes());
     let schema_answer = packed(SCHEMA_AT, schema.len());
     let text = format!(
         r#"(module
   {imports}
-  (memory (export "memory") 8)
-  (global $heap (mut i32) (i32.const {HEAP_AT}))
+  (memory (export "memory") {pages})
+  (global $heap (mut i32) (i32.const {heap}))
   {schema_data}
   {extra}
   {CONTAINS}
@@ -429,6 +434,18 @@ fn a_component_in_the_middle_of_a_line_is_noticed() {
 mod probes {
     use super::*;
 
+    /// Places what's between its tags twice.
+    #[component]
+    pub fn Twice(_children: Children) -> Element {
+        toolkit::col![Element::from(Children), Element::from(Children)]
+    }
+
+    /// A stack of 20,000 empty shapes.
+    #[component]
+    pub fn Crowd() -> Element {
+        toolkit::stack(false, vec![toolkit::shape(toolkit::ShapeKind::Rect, 1.0, 1.0); 20_000])
+    }
+
     #[component]
     pub fn Measured(ctx: &Ctx) -> Element {
         text(format!("{}x{}", ctx.width(), ctx.height()))
@@ -458,6 +475,8 @@ fn probe_registry() -> Registry {
     registry.add(probes::Measured_component());
     registry.add(probes::Reader_component());
     registry.add(probes::Hoarder_component());
+    registry.add(probes::Twice_component());
+    registry.add(probes::Crowd_component());
     registry
 }
 
@@ -623,4 +642,135 @@ fn a_packed_talks_builds_are_not_read_again_by_an_update() {
     assert_eq!(deck.update("<Hello />\n\n# More\n".into()), vec![0]);
     assert!(shows(&mut deck, 0, "From the pack"));
     assert_eq!(*reads.borrow(), before, "nothing of the pack is read again");
+}
+
+// What a talk can make the app lay out.
+
+/// Where a large answer sits, past where the input is written.
+const FAR_AT: u32 = 6_000_000;
+
+/// A module called `name` whose every render answers `answer`, which can be megabytes long.
+fn answering_large(name: &str, answer: &str) -> Vec<u8> {
+    let extra = data(FAR_AT, answer.as_bytes());
+    module_of_pages(name, "", &extra, &format!("(i64.const {})", packed(FAR_AT, answer.len())), 200, 4 * 65536)
+}
+
+/// A talk whose only component is `Fan`, a build with no source that answers `answer`.
+fn talk_with_fan(slides: &str, answer: &str) -> Files {
+    let files = Files::default();
+    files.put("slides.md", slides);
+    files.put("build/fan.wasm", answering_large("Fan", answer));
+    files.put(INDEX_FILE, index(&[("Fan", "fan", "x")]));
+    files
+}
+
+/// `<Fan>` nested `levels` deep around `inside`.
+fn fans(levels: usize, inside: &str) -> String {
+    format!("{}{inside}\n\n{}", "<Fan>\n\n".repeat(levels), "</Fan>\n\n".repeat(levels))
+}
+
+#[test]
+fn a_component_placing_its_content_many_times_shows_a_box() {
+    // From the review: a 2 KB talk with this took 101 s and 12 GB, and the nested one 8 s and 1 GB.
+    for (children, levels, words) in [(19_990, 1, 400), (300, 2, 1)] {
+        let answer = format!(r#"{{"element":{{"Stack":{{"horizontal":false,"gap":0.0,"children":[{}]}}}}}}"#, vec!["\"Children\""; children].join(","));
+        let files = talk_with_fan(&fans(levels, &"word ".repeat(words)), &answer);
+        let mut deck = open(&files);
+        let started = Instant::now();
+        let _ = deck.specs(0);
+        assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
+        let notices = deck.notices(0);
+        assert!(notices.iter().any(|notice| notice == "Fan: gave an answer that can't be read"), "{notices:?}");
+    }
+}
+
+#[test]
+fn a_built_in_places_its_content_once() {
+    let files = Files::default();
+    files.put("slides.md", "<Twice>\n\nword\n\n</Twice>\n");
+    let mut deck = open_with(&files, probe_registry());
+    assert_eq!(texts(&mut deck, 0), ["word"]);
+}
+
+#[test]
+fn a_slide_with_too_much_on_it_shows_a_box() {
+    let files = Files::default();
+    files.put("slides.md", "before\n\n<Crowd />\n\n<Crowd />\n\n<Crowd />\n\nafter\n");
+    let mut deck = open_with(&files, probe_registry());
+    let started = Instant::now();
+    let shown = texts(&mut deck, 0);
+    assert!(started.elapsed() < Duration::from_secs(10), "took {:?}", started.elapsed());
+    assert!(shown.contains(&"before".to_string()), "{shown:?}");
+    assert!(!shown.contains(&"after".to_string()), "nothing more is laid out: {shown:?}");
+    assert!(deck.notices(0).iter().any(|notice| notice == "This slide has too much on it to show"), "{:?}", deck.notices(0));
+}
+
+#[test]
+fn components_nested_deeply_lay_out_on_a_small_stack() {
+    // 38 stacks around Children, in a tag nested 15 deep: about 570 levels before the limit.
+    let laid_out = std::thread::Builder::new()
+        .stack_size(1024 * 1024)
+        .spawn(|| {
+            let mut element = String::from("\"Children\"");
+            for _ in 0..38 {
+                element = format!(r#"{{"Stack":{{"horizontal":false,"gap":0.0,"children":[{element}]}}}}"#);
+            }
+            let files = talk_with_fan(&fans(15, "word"), &format!(r#"{{"element":{element}}}"#));
+            let mut deck = open(&files);
+            let _ = deck.layers(0, 0.5);
+            deck.notices(0)
+        })
+        .unwrap()
+        .join()
+        .expect("it lays out without overflowing the stack");
+    assert!(laid_out.iter().any(|notice| notice == "Some content is nested too deeply to show"), "{laid_out:?}");
+}
+
+/// `wasm` with a custom section of `extra` bytes, which loading skips over.
+fn padded(mut wasm: Vec<u8>, extra: usize) -> Vec<u8> {
+    let name = b"padding";
+    let mut body = vec![name.len() as u8];
+    body.extend_from_slice(name);
+    body.resize(body.len() + extra, 0);
+    wasm.push(0);
+    let mut size = body.len();
+    loop {
+        let byte = (size & 0x7f) as u8;
+        size >>= 7;
+        if size == 0 {
+            wasm.push(byte);
+            break;
+        }
+        wasm.push(byte | 0x80);
+    }
+    wasm.extend(body);
+    wasm
+}
+
+#[test]
+fn a_talk_loads_at_most_16_mib_of_modules() {
+    let files = Files::default();
+    let tags = ["A", "B", "C", "D", "E"];
+    files.put("slides.md", tags.map(|tag| format!("<{tag} />\n\n")).concat());
+    for tag in tags {
+        files.put(&format!("build/{}.wasm", tag.to_lowercase()), padded(answering(tag, &text_answer(tag)), 3_500_000));
+    }
+    let entries: Vec<(String, String)> = tags.iter().map(|tag| (tag.to_string(), tag.to_lowercase())).collect();
+    let entries: Vec<(&str, &str, &str)> = entries.iter().map(|(tag, file)| (tag.as_str(), file.as_str(), "x")).collect();
+    files.put(INDEX_FILE, index(&entries));
+    let mut deck = open(&files);
+    assert_eq!(texts(&mut deck, 0)[..4], ["A", "B", "C", "D"]);
+    assert!(deck.notices(0).iter().any(|notice| notice == "E: too large to run"), "{:?}", deck.notices(0));
+}
+
+#[test]
+fn a_long_problem_is_shortened_in_its_notice() {
+    let answer = format!(r#"{{"element":{{"Problem":{{"message":"{}"}}}}}}"#, "é".repeat(1000));
+    let files = talk_with_hello("<Hello />\n", answering_large("Hello", &answer));
+    files.put("components/hello.rs", source("Hello"));
+    let mut deck = open(&files);
+    let notices = deck.notices(0);
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0].chars().count(), 200);
+    assert!(notices[0].ends_with('…'));
 }

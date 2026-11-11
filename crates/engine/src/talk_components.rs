@@ -28,6 +28,11 @@ pub const MAX_COMPONENTS: usize = 256;
 pub const MAX_SOURCE_BYTES: u64 = 1024 * 1024;
 /// The most bytes a talk's index of builds can have: far more than `MAX_COMPONENTS` entries need.
 pub const MAX_INDEX_BYTES: u64 = 1024 * 1024;
+/// The most bytes of modules a talk can have loaded at once. Loading takes time on the
+/// thread that asks, about 12 s for this much.
+pub const MAX_TALK_MODULE_BYTES: u64 = 16 * 1024 * 1024;
+/// The most nodes the layout of one slide can make, across all its layers.
+pub const MAX_LAYOUT_NODES: usize = 50_000;
 /// What one render can read of the talk's assets, in one file and in all of them together.
 const ASSET_BUDGET: u64 = MEMORY_LIMIT_BYTES as u64;
 /// The tags the format itself uses, which a component can't have either.
@@ -89,6 +94,8 @@ struct Seen<T> {
 struct Loaded {
     identity: String,
     component: Result<WasmComponent, ComponentError>,
+    /// The bytes it counts against `MAX_TALK_MODULE_BYTES`: none if it didn't load.
+    bytes: u64,
 }
 
 pub struct TalkComponents {
@@ -104,6 +111,8 @@ pub struct TalkComponents {
     identities_this_scan: HashMap<String, Option<String>>,
     /// The time renders have taken since the slide being laid out was started.
     spent: Duration,
+    /// The nodes made since the slide being laid out was started.
+    nodes: usize,
 }
 
 struct NoFiles;
@@ -115,7 +124,7 @@ impl TalkFiles for NoFiles {
 }
 
 fn problem(file: &str, message: impl Into<String>) -> Diagnostic {
-    Diagnostic { file: file.to_string(), line: 0, message: message.into() }
+    Diagnostic::new(file, 0, message.into())
 }
 
 /// The bytes of `path`, held to the rules for a render's reads: only from the talk's
@@ -176,6 +185,7 @@ impl TalkComponents {
             index_seen: HashMap::new(),
             identities_this_scan: HashMap::new(),
             spent: Duration::ZERO,
+            nodes: 0,
         };
         components.rescan(registry);
         components
@@ -233,6 +243,17 @@ impl TalkComponents {
     /// Restarts the budget, for the slide about to be laid out.
     pub(crate) fn new_layout(&mut self) {
         self.spent = Duration::ZERO;
+        self.nodes = 0;
+    }
+
+    /// Counts one more node made in the slide's layout.
+    pub(crate) fn count_node(&mut self) {
+        self.nodes += 1;
+    }
+
+    /// Whether the slide's layout has made more nodes than it can have.
+    pub(crate) fn too_many_nodes(&self) -> bool {
+        self.nodes > MAX_LAYOUT_NODES
     }
 
     pub(crate) fn is_out_of_date(&self, tag: &str) -> bool {
@@ -264,8 +285,11 @@ impl TalkComponents {
     /// The loaded module of `build`, loading it if it isn't already, and only if it says it is `tag`.
     fn component(&mut self, tag: &str, build: &Build) -> Result<&WasmComponent, ComponentError> {
         if !self.loaded.contains_key(&build.path) {
-            let component = self.load(&build.path);
-            self.loaded.insert(build.path.clone(), Loaded { identity: build.identity.clone(), component });
+            let (component, bytes) = match self.load(&build.path) {
+                Ok((component, bytes)) => (Ok(component), bytes),
+                Err(error) => (Err(error), 0),
+            };
+            self.loaded.insert(build.path.clone(), Loaded { identity: build.identity.clone(), component, bytes });
         }
         let component = self.loaded[&build.path].component.as_ref().map_err(Clone::clone)?;
         let name = &component.schema().name;
@@ -275,12 +299,18 @@ impl TalkComponents {
         Ok(component)
     }
 
-    fn load(&self, path: &str) -> Result<WasmComponent, ComponentError> {
-        if self.files.len(path).is_some_and(|len| len > MAX_MODULE_BYTES as u64) {
+    /// The module at `path`, and its size, if it fits in what the talk has left to load.
+    fn load(&self, path: &str) -> Result<(WasmComponent, u64), ComponentError> {
+        let left = MAX_TALK_MODULE_BYTES.saturating_sub(self.loaded.values().map(|loaded| loaded.bytes).sum());
+        let limit = left.min(MAX_MODULE_BYTES as u64);
+        if self.files.len(path).is_some_and(|len| len > limit) {
             return Err(ComponentError::TooLarge);
         }
         let bytes = self.files.read(path).ok_or_else(|| ComponentError::Malformed("its build can't be read".into()))?;
-        WasmComponent::load(&bytes)
+        if bytes.len() as u64 > limit {
+            return Err(ComponentError::TooLarge);
+        }
+        Ok((WasmComponent::load(&bytes)?, bytes.len() as u64))
     }
 
     /// The talk's index of builds, or an empty one if it has none or it can't be read.

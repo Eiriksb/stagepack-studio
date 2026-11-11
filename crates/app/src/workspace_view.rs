@@ -752,6 +752,9 @@ fn footer_line(id: &'static str, line: SharedString, color: Hsla) -> impl IntoEl
 }
 
 /// How a problem with a component reads: its file, its line if it has one, and what's wrong.
+/// The most problems the panel lists, before it says how many more there are.
+const MAX_PROBLEM_LINES: usize = 20;
+
 fn problem_line(problem: &Diagnostic) -> SharedString {
     if problem.line == 0 {
         format!("{}: {}", problem.file, problem.message).into()
@@ -821,12 +824,11 @@ impl WorkspaceView {
     /// What's wrong with the talk's components, one line each.
     fn component_problems(&self, cx: &App) -> Option<impl IntoElement> {
         let document = self.document.as_ref()?.read(cx);
-        let lines: Vec<SharedString> = document
-            .component_problems()
-            .iter()
-            .chain(&self.build_problems)
-            .map(problem_line)
-            .collect();
+        let problems: Vec<&Diagnostic> = document.component_problems().iter().chain(&self.build_problems).collect();
+        let mut lines: Vec<SharedString> = problems.iter().take(MAX_PROBLEM_LINES).map(|problem| problem_line(problem)).collect();
+        if problems.len() > MAX_PROBLEM_LINES {
+            lines.push(format!("and {} more", problems.len() - MAX_PROBLEM_LINES).into());
+        }
         if lines.is_empty() {
             return None;
         }

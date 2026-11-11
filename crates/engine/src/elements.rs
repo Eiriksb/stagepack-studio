@@ -11,7 +11,8 @@ use taffy::prelude::{
 use tiny_skia::{Path, PathBuilder};
 use toolkit::{Color, Ctx, CtxData, Element, Placed, Props, RenderInput, ShapeKind, TextAlign, Theme};
 
-use crate::flow::{Content, Flow, TEXT_TAG, column, rounded_rect, rounded_rect_with};
+use crate::flow::{Content, Flow, MAX_NOTICE_CHARS, TEXT_TAG, column, rounded_rect, rounded_rect_with};
+use slides_components::shortened;
 use crate::pictures::icon_pixmap;
 use crate::slide::{MAX_SIZE, SLIDE_HEIGHT, SLIDE_WIDTH, is_positioned};
 use crate::native::Semantic;
@@ -93,7 +94,7 @@ fn size_of(width: f32, height: f32, boxed: bool) -> Size<Dimension> {
 }
 
 /// The size of something with no content. Outside a box, nothing else says how big it is.
-fn size_when_empty(width: f32, height: f32, boxed: bool) -> Size<Dimension> {
+pub(crate) fn size_when_empty(width: f32, height: f32, boxed: bool) -> Size<Dimension> {
     let or_default = |value: f32, default: f32| if value > 0.0 || boxed { value } else { default };
     size_of(or_default(width, DEFAULT_WIDTH), or_default(height, DEFAULT_HEIGHT), boxed)
 }
@@ -140,9 +141,10 @@ pub(crate) fn lay_out_positioned_tag(
     let natural = element.as_ref().and_then(|element| flow.natural_size(element));
     let (w, h) = box_size(wanted, natural);
     let content = match element {
-        Some(element) => flow.with_text_style_of(tag, |flow| flow.element(&element, &tag.children, Align::Left, true)),
+        Some(element) => flow.tag_element(tag, &element, Align::Left, true),
         None => Some(flow.placeholder(tag.name.clone(), size_of(0.0, 0.0, true))),
     };
+    let content = if flow.over_budget() { Some(flow.too_much()) } else { content };
     let style = Style {
         size: Size { width: length(w), height: length(h) },
         flex_direction: FlexDirection::Column,
@@ -223,9 +225,14 @@ impl Flow<'_, '_> {
             self.notice(format!("{} is inside another tag, so the place it asks for is ignored", tag.name));
         }
         match self.render_tag(tag, (self.width, 0.0)) {
-            Some(element) => self.with_text_style_of(tag, |flow| flow.element(&element, &tag.children, align, false)),
+            Some(element) => self.tag_element(tag, &element, align, false),
             None => Some(self.block_placeholder(tag.name.clone())),
         }
+    }
+
+    /// The node for what `tag`'s component returned, which places the tag's content once.
+    fn tag_element(&mut self, tag: &Tag, element: &Element, align: Align, boxed: bool) -> Option<NodeId> {
+        self.in_tag(|flow| flow.with_text_style_of(tag, |flow| flow.element(element, &tag.children, align, boxed)))
     }
 
     pub(crate) fn placeholder(&mut self, label: String, size: Size<Dimension>) -> NodeId {
@@ -237,9 +244,20 @@ impl Flow<'_, '_> {
         self.placeholder(label, size_when_empty(0.0, 0.0, false))
     }
 
-    /// The node for `element`, or `None` if it has nothing in it. `blocks` is what its
-    /// `Element::Children` stands for. `boxed` says it sits in a box of a known size.
+    /// The node for `element`, or `None` if it has nothing in it or the slide already has
+    /// too much on it. `blocks` is what its `Element::Children` stands for, which is laid
+    /// out the first time only. `boxed` says it sits in a box of a known size.
     fn element(&mut self, element: &Element, blocks: &[Block], align: Align, boxed: bool) -> Option<NodeId> {
+        if self.over_budget() {
+            return None;
+        }
+        match self.deeper(|flow| flow.element_node(element, blocks, align, boxed)) {
+            Some(node) => node,
+            None => Some(self.nested_too_deeply(size_when_empty(0.0, 0.0, boxed))),
+        }
+    }
+
+    fn element_node(&mut self, element: &Element, blocks: &[Block], align: Align, boxed: bool) -> Option<NodeId> {
         match element {
             Element::Text { text, size, bold, color } => Some(self.plain_text(text, *size, *bold, *color, align)),
             Element::Stack { horizontal, gap, children } => self.stack(*horizontal, *gap, children, blocks, align),
@@ -280,10 +298,12 @@ impl Flow<'_, '_> {
             }
             Element::Canvas { width, height, items } => Some(self.canvas(*width, *height, items, blocks, align)),
             Element::Problem { message } => {
+                let message = shortened(message, MAX_NOTICE_CHARS);
                 self.notice(message.clone());
-                Some(self.placeholder(message.clone(), size_when_empty(0.0, 0.0, boxed)))
+                Some(self.placeholder(message, size_when_empty(0.0, 0.0, boxed)))
             }
-            Element::Children => self.child_blocks(blocks, align),
+            Element::Children if self.place_children() => self.child_blocks(blocks, align),
+            Element::Children => None,
             Element::Empty => None,
         }
     }

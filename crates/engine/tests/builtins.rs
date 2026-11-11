@@ -822,9 +822,11 @@ fn tags_nested_absurdly_deep_stop_with_a_notice() {
 
 #[test]
 fn lists_nested_absurdly_deep_stop_with_a_notice() {
-    let source: String = (0..40).map(|depth| format!("{}- item\n", "  ".repeat(depth))).collect();
+    // As deep as the format reads, which with the paragraph in the last item is past the
+    // 64 levels the layout goes to.
+    let source: String = (0..64).map(|depth| format!("{}- item\n", "  ".repeat(depth))).collect();
     let (slide, mut fonts) = lay_out(&source, &[]);
-    assert!(notice_about(&slide, "nested"));
+    assert!(slide.notices.iter().any(|notice| notice.0 == "Some content is nested too deeply to show"), "{:?}", slide.notices);
     render_layer(&slide.layers[1], 1.0, &mut fonts);
 }
 

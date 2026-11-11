@@ -245,7 +245,7 @@ fn starts_with_a_shebang(source: &str) -> bool {
 
 /// Whether this source may be given to the compiler, and the name of its component.
 pub fn check_source(file: &str, source: &str) -> Result<SourceInfo, Vec<Diagnostic>> {
-    let refusal = |line: u32, message: String| Diagnostic { file: file.to_string(), line, message };
+    let refusal = |line: u32, message: String| Diagnostic::new(file, line, message);
     if starts_with_a_shebang(source) {
         return Err(vec![refusal(1, "A component can't start with a `#!` line, as the compiler would skip it and this check wouldn't".to_string())]);
     }

@@ -28,6 +28,10 @@ const LABEL_GAP: f32 = 16.0;
 /// Longer labels are cut short, with an ellipsis.
 const MAX_LABEL_CHARS: usize = 40;
 const MAX_LEGEND_CHARS: usize = 24;
+/// How much of a value or a path a message quotes.
+const MAX_QUOTED_CHARS: usize = 40;
+/// The most a chart's CSV can have. Far more than its points and series need.
+const MAX_CSV_BYTES: usize = 1024 * 1024;
 
 const TITLE_ROOM: f32 = 64.0;
 const LEGEND_ROOM: f32 = 48.0;
@@ -85,7 +89,9 @@ fn number(text: &str) -> Result<f64, String> {
         return Err("A value is missing".to_string());
     }
     let lower = text.to_ascii_lowercase();
-    match text.parse::<f64>() {
+    let parsed = text.parse::<f64>();
+    let text = shortened(text, MAX_QUOTED_CHARS);
+    match parsed {
         Ok(value) if value.is_nan() || lower.contains("inf") => Err(format!("\"{text}\" isn't a number")),
         Ok(value) if !value.is_finite() || value.abs() > MAX_VALUE => Err(format!("\"{text}\" is too large for a chart")),
         Ok(value) => Ok(value),
@@ -664,10 +670,14 @@ fn read_data(labels: &str, values: &str, data: Option<&DataFile>, ctx: &Ctx) -> 
         return parse_inline(labels, values);
     };
     let path = path.trim();
+    let quoted = shortened(path, MAX_QUOTED_CHARS);
     if !asset_path_allowed(path) {
-        return Err(format!("A chart's data has to be a file in the talk's assets folder, and {path} isn't"));
+        return Err(format!("A chart's data has to be a file in the talk's assets folder, and {quoted} isn't"));
     }
-    let text = ctx.asset_text(path).ok_or_else(|| format!("Can't read {path}"))?;
+    let text = ctx.asset_text(path).ok_or_else(|| format!("Can't read {quoted}"))?;
+    if text.len() > MAX_CSV_BYTES {
+        return Err("The chart's data is over 1 MiB, more than a chart can show".to_string());
+    }
     parse_csv(&text)
 }
 

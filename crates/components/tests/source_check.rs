@@ -235,3 +235,11 @@ fn a_refused_source_never_reaches_the_compiler() {
     assert!(refusals[0].message.contains("`env`"), "{refusals:?}");
     assert_eq!(refusals[0].line, 4);
 }
+
+#[test]
+fn a_diagnostic_keeps_at_most_500_characters() {
+    let made = slides_components::Diagnostic::new("components/a.rs", 3, "é".repeat(2000));
+    assert_eq!(made.message.chars().count(), 500);
+    assert!(made.message.ends_with('…'));
+    assert_eq!(slides_components::Diagnostic::new("f", 0, "short").message, "short");
+}

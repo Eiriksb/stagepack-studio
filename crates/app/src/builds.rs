@@ -78,11 +78,7 @@ pub fn build_components(folder: &Path, compile: &Compile) -> BuildOutcome {
 }
 
 fn problem(file: &str, message: impl Into<String>) -> Vec<Diagnostic> {
-    vec![Diagnostic {
-        file: file.to_string(),
-        line: 0,
-        message: message.into(),
-    }]
+    vec![Diagnostic::new(file, 0, message.into())]
 }
 
 fn source_too_large(file: &str) -> Vec<Diagnostic> {

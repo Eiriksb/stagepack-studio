@@ -1620,6 +1620,24 @@ fn a_problem_the_scan_finds_shows_too(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn the_problems_panel_shows_at_most_twenty_lines(cx: &mut TestAppContext) {
+    let folder = component_talk_folder(&component_source("Score"));
+    for n in 0..25 {
+        std::fs::write(folder.path().join(format!("components/bad name {n:02}.rs")), "").unwrap();
+    }
+    let talk = open_component_talk_in(cx, folder, false);
+    assert!(talk.says(
+        cx,
+        "components/bad name 19.rs: A component's file name can have only letters, digits, _ and -, and at most 64 of them"
+    ));
+    assert!(!talk.says(
+        cx,
+        "components/bad name 20.rs: A component's file name can have only letters, digits, _ and -, and at most 64 of them"
+    ));
+    assert!(talk.says(cx, "and 5 more"));
+}
+
+#[gpui_kit::test]
 fn no_compiler_says_so(cx: &mut TestAppContext) {
     // No bundle is set up for the tests, so this window finds no compiler.
     let folder = component_talk_folder(&component_source("Score"));
