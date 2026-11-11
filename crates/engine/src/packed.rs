@@ -422,13 +422,10 @@ fn picture_paths(talk: &Talk) -> BTreeSet<String> {
 /// The pictures the talk in `folder` shows from files that exist but aren't in a packed folder,
 /// sorted. Found in the talk's text, so nothing is decoded. A picture that is in a packed folder
 /// and still didn't go in has been reported as skipped.
-fn pictures_outside(folder: &Path) -> Vec<String> {
-    let Ok(source) = std::fs::read_to_string(folder.join(SLIDES_NAME)) else {
-        return Vec::new();
-    };
+fn pictures_outside(folder: &Path, source: &str) -> Vec<String> {
     let files = FolderFiles::new(folder.to_path_buf());
     let packed = |path: &str| path == SLIDES_NAME || PACKED_FOLDERS.contains(&path.split('/').next().unwrap_or(""));
-    let outside: BTreeSet<String> = picture_paths(&parse_talk(&source))
+    let outside: BTreeSet<String> = picture_paths(&parse_talk(source))
         .iter()
         .filter_map(|path| normalise(path))
         .filter(|path| !packed(path) && files.stamp(path).is_some())
@@ -443,35 +440,34 @@ fn io_other(e: zip::result::ZipError) -> std::io::Error {
     }
 }
 
-/// Packs the talk in `folder` into the file `out`, replacing it only if packing succeeds.
-pub fn pack_folder(folder: &Path, out: &Path, app_version: &str) -> Result<PackReport, PackError> {
-    let mut skipped = Vec::new();
-    let files = collect(folder, &mut skipped)?;
-    let limits = PackLimits::default();
+/// What a pack says about itself, written by hand so the fields keep this order.
+fn manifest_for(app_version: &str) -> Vec<u8> {
+    format!(
+        r#"{{"format":{FORMAT_VERSION},"app":{},"entry":"{SLIDES_NAME}"}}"#,
+        serde_json::Value::from(app_version)
+    )
+    .into_bytes()
+}
+
+/// Holds what goes in from a folder to the limits of a pack: how many files, and how big each
+/// is and all are. `slides`, if given, is what `slides.md` will hold in place of the file.
+fn check_sizes(
+    files: &[(String, std::path::PathBuf)],
+    slides: Option<&str>,
+    limits: PackLimits,
+) -> Result<(), PackError> {
     if files.len() + 1 > limits.entries {
         return Err(PackError::TooLarge(format!(
             "it would hold more than {} files",
             limits.entries
         )));
     }
-    // Written by hand so the fields keep this order.
-    let manifest = format!(
-        r#"{{"format":{FORMAT_VERSION},"app":{},"entry":"{SLIDES_NAME}"}}"#,
-        serde_json::Value::from(app_version)
-    )
-    .into_bytes();
-
-    let mut entries: Vec<(String, Option<&Path>)> = files
-        .iter()
-        .map(|(name, path)| (name.clone(), Some(path.as_path())))
-        .collect();
-    entries.push((MANIFEST_NAME.to_string(), None));
-    entries.sort();
-
     let mut total = 0u64;
-    for (name, path) in &entries {
-        let Some(path) = path else { continue };
-        let size = std::fs::metadata(path)?.len();
+    for (name, path) in files {
+        let size = match slides {
+            Some(slides) if name == SLIDES_NAME => slides.len() as u64,
+            _ => std::fs::metadata(path)?.len(),
+        };
         total = total.saturating_add(size);
         if size > limits.entry_bytes {
             return Err(PackError::TooLarge(format!(
@@ -486,6 +482,48 @@ pub fn pack_folder(folder: &Path, out: &Path, app_version: &str) -> Result<PackR
             )));
         }
     }
+    Ok(())
+}
+
+/// Packs the talk in `folder` into the file `out`, replacing it only if packing succeeds.
+pub fn pack_folder(folder: &Path, out: &Path, app_version: &str) -> Result<PackReport, PackError> {
+    pack(folder, out, None, app_version)
+}
+
+/// Packs the talk in `folder` into the file `out` as [`pack_folder`] does, with `slides` as its
+/// `slides.md` in place of the file in the folder, which isn't touched.
+pub fn pack_folder_with_slides(
+    folder: &Path,
+    out: &Path,
+    slides: &str,
+    app_version: &str,
+) -> Result<PackReport, PackError> {
+    pack(folder, out, Some(slides), app_version)
+}
+
+fn pack(
+    folder: &Path,
+    out: &Path,
+    slides: Option<&str>,
+    app_version: &str,
+) -> Result<PackReport, PackError> {
+    let mut skipped = Vec::new();
+    let files = collect(folder, &mut skipped)?;
+    let limits = PackLimits::default();
+    check_sizes(&files, slides, limits)?;
+    let manifest = manifest_for(app_version);
+    // Read once, so that what's packed and what's reported come from the same text.
+    let source = match slides {
+        Some(slides) => slides.to_string(),
+        None => std::fs::read_to_string(folder.join(SLIDES_NAME)).unwrap_or_default(),
+    };
+
+    let mut entries: Vec<(String, Option<&Path>)> = files
+        .iter()
+        .map(|(name, path)| (name.clone(), Some(path.as_path())))
+        .collect();
+    entries.push((MANIFEST_NAME.to_string(), None));
+    entries.sort();
 
     write_atomically(out, |file| {
         let mut zip = ZipWriter::new(file);
@@ -504,9 +542,12 @@ pub fn pack_folder(folder: &Path, out: &Path, app_version: &str) -> Result<PackR
                 .last_modified_time(DateTime::default())
                 .unix_permissions(0o644);
             zip.start_file(name.as_str(), options).map_err(io_other)?;
-            match path {
-                None => zip.write_all(&manifest)?,
-                Some(path) => {
+            match (path, slides) {
+                (None, _) => zip.write_all(&manifest)?,
+                (Some(_), Some(slides)) if name == SLIDES_NAME => {
+                    zip.write_all(slides.as_bytes())?
+                }
+                (Some(path), _) => {
                     // Bounded, in case the file grows while it is read.
                     let mut reader = File::open(path)?.take(limits.entry_bytes + 1);
                     let copied = std::io::copy(&mut reader, &mut zip)?;
@@ -519,12 +560,22 @@ pub fn pack_folder(folder: &Path, out: &Path, app_version: &str) -> Result<PackR
         zip.finish().map_err(io_other)?;
         Ok(())
     })?;
-    Ok(PackReport { skipped, outside_pictures: pictures_outside(folder) })
+    Ok(PackReport { skipped, outside_pictures: pictures_outside(folder, &source) })
 }
 
 /// Unpacks a packed talk into `folder`, which must be missing or empty. `talk.json` isn't
 /// written, since packing makes a new one. A failure leaves `folder` as it was.
 pub fn unpack_to_folder(packed: &Path, folder: &Path) -> Result<(), PackError> {
+    unpack(packed, folder, None)
+}
+
+/// Unpacks a packed talk into `folder` as [`unpack_to_folder`] does, with `slides` as its
+/// `slides.md` in place of the one in the pack.
+pub fn unpack_with_slides(packed: &Path, folder: &Path, slides: &str) -> Result<(), PackError> {
+    unpack(packed, folder, Some(slides))
+}
+
+fn unpack(packed: &Path, folder: &Path, slides: Option<&str>) -> Result<(), PackError> {
     let files = open_packed(packed)?;
     // Only what a talk is made of is written: not `.git/config` and the like.
     let under_a_folder =
@@ -538,7 +589,23 @@ pub fn unpack_to_folder(packed: &Path, folder: &Path) -> Result<(), PackError> {
     if let Some(bad) = bad_file.or(bad_directory) {
         return Err(PackError::UnsafeName(bad.clone()));
     }
-    let existed = match std::fs::read_dir(folder) {
+    if slides.is_some_and(|slides| slides.len() as u64 > files.entry_bytes) {
+        return Err(PackError::TooLarge(format!(
+            "{SLIDES_NAME} is bigger than {} bytes",
+            files.entry_bytes
+        )));
+    }
+    let existed = missing_or_empty(folder)?;
+    let result = unpack_into(&files, folder, slides);
+    if result.is_err() {
+        clear_away(folder, existed);
+    }
+    result
+}
+
+/// Whether `folder` is there, when it's empty: it must be missing or empty to be written into.
+fn missing_or_empty(folder: &Path) -> Result<bool, PackError> {
+    match std::fs::read_dir(folder) {
         Ok(mut entries) => {
             if entries.next().is_some() {
                 return Err(PackError::Io(std::io::Error::new(
@@ -546,54 +613,73 @@ pub fn unpack_to_folder(packed: &Path, folder: &Path) -> Result<(), PackError> {
                     "the folder isn't empty",
                 )));
             }
-            true
+            Ok(true)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => return Err(e.into()),
-    };
-    let result = unpack_into(&files, folder);
-    if result.is_err() {
-        if existed {
-            if let Ok(entries) = std::fs::read_dir(folder) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    let _ = if path.is_dir() {
-                        std::fs::remove_dir_all(&path)
-                    } else {
-                        std::fs::remove_file(&path)
-                    };
-                }
-            }
-        } else {
-            let _ = std::fs::remove_dir_all(folder);
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
     }
-    result
 }
 
-fn unpack_into(files: &PackedFiles, folder: &Path) -> Result<(), PackError> {
-    // The place a name leads to, which must be inside `folder`.
-    let target_of = |name: &str| {
-        let target = folder.join(name);
-        let plain = Path::new(name)
-            .components()
-            .all(|c| matches!(c, std::path::Component::Normal(_)));
-        (plain && target.starts_with(folder))
-            .then_some(target)
-            .ok_or_else(|| PackError::UnsafeName(name.to_string()))
-    };
+/// Takes away what a failed write put in `folder`, which was missing or empty before it:
+/// all of it, or the folder itself if it wasn't there.
+fn clear_away(folder: &Path, existed: bool) {
+    if !existed {
+        let _ = std::fs::remove_dir_all(folder);
+        return;
+    }
+    if let Ok(entries) = std::fs::read_dir(folder) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let _ = if path.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+        }
+    }
+}
+
+/// The place `name`, a path within a talk, leads to in `folder`, which must be inside it.
+fn target_in(folder: &Path, name: &str) -> Result<std::path::PathBuf, PackError> {
+    let target = folder.join(name);
+    let plain = Path::new(name)
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)));
+    (plain && target.starts_with(folder))
+        .then_some(target)
+        .ok_or_else(|| PackError::UnsafeName(name.to_string()))
+}
+
+/// Writes `bytes` as the new file `target`, making the folders it's in.
+fn write_new(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)?;
+    file.write_all(bytes)
+}
+
+/// `slides.md` is written last, so that a folder cut short has no talk in it rather than a
+/// talk missing some of its files.
+fn unpack_into(files: &PackedFiles, folder: &Path, slides: Option<&str>) -> Result<(), PackError> {
     std::fs::create_dir_all(folder)?;
     for directory in &files.directories {
-        std::fs::create_dir_all(target_of(directory)?)?;
+        std::fs::create_dir_all(target_in(folder, directory)?)?;
     }
     let mut written = 0u64;
-    for name in files.names() {
-        if name == MANIFEST_NAME {
-            continue;
-        }
-        let bytes = files
-            .read_checked(&name)?
-            .ok_or_else(|| PackError::Corrupt(format!("{name} is missing")))?;
+    let mut names = files.names();
+    names.retain(|name| name != MANIFEST_NAME && name != SLIDES_NAME);
+    names.push(SLIDES_NAME.to_string());
+    for name in names {
+        let bytes = match slides {
+            Some(slides) if name == SLIDES_NAME => slides.as_bytes().to_vec(),
+            _ => files
+                .read_checked(&name)?
+                .ok_or_else(|| PackError::Corrupt(format!("{name} is missing")))?,
+        };
         written = written.saturating_add(bytes.len() as u64);
         if written > files.total_bytes {
             return Err(PackError::TooLarge(format!(
@@ -601,7 +687,92 @@ fn unpack_into(files: &PackedFiles, folder: &Path) -> Result<(), PackError> {
                 files.total_bytes
             )));
         }
-        let target = target_of(&name)?;
+        write_new(&target_in(folder, &name)?, &bytes)?;
+    }
+    Ok(())
+}
+
+/// Copies the packed talk `packed` into the file `out`, with `slides` as its `slides.md` and a
+/// `talk.json` naming `app_version`. Every other entry is copied as it is, byte for byte, without
+/// being unpacked. `out` may be `packed` itself: the copy is written beside it and takes its
+/// place only once it's whole.
+pub fn repack_with_slides(
+    packed: &Path,
+    out: &Path,
+    slides: &str,
+    app_version: &str,
+) -> Result<(), PackError> {
+    let files = open_packed(packed)?;
+    if slides.len() as u64 > files.entry_bytes {
+        return Err(PackError::TooLarge(format!(
+            "{SLIDES_NAME} is bigger than {} bytes",
+            files.entry_bytes
+        )));
+    }
+    let manifest = manifest_for(app_version);
+    write_atomically(out, move |file| {
+        let mut zip = files.zip.into_inner().unwrap_or_else(|e| e.into_inner());
+        let mut writer = ZipWriter::new(file);
+        for i in 0..zip.len() {
+            let entry = zip.by_index_raw(i).map_err(io_other)?;
+            let name = entry.name().map_err(io_other)?.to_string();
+            let replacement = match name.as_str() {
+                SLIDES_NAME => Some(slides.as_bytes()),
+                MANIFEST_NAME => Some(manifest.as_slice()),
+                _ => None,
+            };
+            match replacement {
+                Some(bytes) => {
+                    drop(entry);
+                    let options = SimpleFileOptions::default()
+                        .compression_method(CompressionMethod::Deflated)
+                        .last_modified_time(DateTime::default())
+                        .unix_permissions(0o644);
+                    writer.start_file(name.as_str(), options).map_err(io_other)?;
+                    writer.write_all(bytes)?;
+                }
+                None => writer.raw_copy_file(entry).map_err(io_other)?,
+            }
+        }
+        writer.finish().map_err(io_other)?;
+        // The pack is let go of here, before the copy takes its place: Windows won't replace
+        // a file that's open.
+        drop(zip);
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// Copies the talk in `from` into the folder `to`, which must be missing or empty, with
+/// `slides` as its `slides.md`. What's copied is what [`pack_folder`] would pack, with the same
+/// refusals and limits, and the names it left out are returned. `from` isn't touched, and a
+/// failure leaves `to` as it was.
+pub fn copy_talk_folder(from: &Path, to: &Path, slides: &str) -> Result<Vec<String>, PackError> {
+    let mut skipped = Vec::new();
+    let files = collect(from, &mut skipped)?;
+    let limits = PackLimits::default();
+    check_sizes(&files, Some(slides), limits)?;
+    let existed = missing_or_empty(to)?;
+    let result = copy_into(&files, to, slides, limits);
+    if result.is_err() {
+        clear_away(to, existed);
+    }
+    result.map(|()| skipped)
+}
+
+/// `slides.md` is written last, as in [`unpack_into`].
+fn copy_into(
+    files: &[(String, std::path::PathBuf)],
+    to: &Path,
+    slides: &str,
+    limits: PackLimits,
+) -> Result<(), PackError> {
+    std::fs::create_dir_all(to)?;
+    for (name, path) in files {
+        if name == SLIDES_NAME {
+            continue;
+        }
+        let target = target_in(to, name)?;
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -609,8 +780,16 @@ fn unpack_into(files: &PackedFiles, folder: &Path) -> Result<(), PackError> {
             .write(true)
             .create_new(true)
             .open(&target)?;
-        file.write_all(&bytes)?;
+        // Bounded, in case the file grows while it is read.
+        let mut reader = File::open(path)?.take(limits.entry_bytes + 1);
+        if std::io::copy(&mut reader, &mut file)? > limits.entry_bytes {
+            return Err(PackError::TooLarge(format!(
+                "{name} is bigger than {} bytes",
+                limits.entry_bytes
+            )));
+        }
     }
+    write_new(&target_in(to, SLIDES_NAME)?, slides.as_bytes())?;
     Ok(())
 }
 

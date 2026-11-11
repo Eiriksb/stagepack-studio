@@ -6,6 +6,7 @@ use std::sync::Arc;
 use slides_engine::{Fonts, Layer, pack_folder};
 use stagepack_studio::document::{Document, EditRefused, OpenProblem, Reload};
 use stagepack_studio::export::{ExportKind, run_export};
+use stagepack_studio::saving::SaveTarget;
 use zip::ZipArchive;
 use zip::write::SimpleFileOptions;
 
@@ -365,7 +366,8 @@ fn saving_a_packed_copy_then_opening_it_shows_the_same_talk() {
     let (_d, doc) = talk(TWO_SLIDES);
     let elsewhere = tempfile::tempdir().unwrap();
     let out = elsewhere.path().join("copy.sptx");
-    assert!(doc.save_packed(&out).unwrap().is_empty());
+    let saved = doc.save_as_job(SaveTarget::Packed(out.clone())).run().unwrap();
+    assert!(saved.notices().is_empty());
     let copy = Document::open_packed(&out, Fonts::bundled_only()).unwrap();
     assert_eq!(copy.source(), TWO_SLIDES);
 }
@@ -377,9 +379,11 @@ fn saving_a_packed_copy_says_what_was_left_out() {
     std::fs::create_dir(dir.path().join("assets")).unwrap();
     std::os::unix::fs::symlink("/nowhere", dir.path().join("assets/link.png")).unwrap();
     let elsewhere = tempfile::tempdir().unwrap();
-    let notices = doc
-        .save_packed(&elsewhere.path().join("copy.sptx"))
+    let saved = doc
+        .save_as_job(SaveTarget::Packed(elsewhere.path().join("copy.sptx")))
+        .run()
         .unwrap();
+    let notices = saved.notices();
     assert_eq!(notices.len(), 1, "{notices:?}");
     assert!(notices[0].contains("assets/link.png"), "{notices:?}");
 }
@@ -390,8 +394,8 @@ fn saving_a_packed_copy_names_a_picture_it_could_not_take() {
     std::fs::create_dir(dir.path().join("pics")).unwrap();
     std::fs::write(dir.path().join("pics/photo.jpg"), "a picture").unwrap();
     let elsewhere = tempfile::tempdir().unwrap();
-    let notices = doc.save_packed(&elsewhere.path().join("copy.sptx")).unwrap();
-    assert_eq!(notices, ["The picture pics/photo.jpg is outside assets/ and wasn't packed"]);
+    let saved = doc.save_as_job(SaveTarget::Packed(elsewhere.path().join("copy.sptx"))).run().unwrap();
+    assert_eq!(saved.notices(), ["The picture pics/photo.jpg is outside assets/ and wasn't packed"]);
 }
 
 #[test]
@@ -421,7 +425,7 @@ fn a_packed_talk_can_be_saved_as_a_folder() {
     let (dir, file) = packed_talk("talk.sptx", "# One\n");
     let doc = Document::open_packed(&file, Fonts::bundled_only()).unwrap();
     let folder = dir.path().join("unpacked");
-    doc.save_folder(&folder).unwrap();
+    doc.save_as_job(SaveTarget::Folder(folder.clone())).run().unwrap();
     assert_eq!(
         std::fs::read_to_string(folder.join("slides.md")).unwrap(),
         "# One\n"
@@ -435,7 +439,7 @@ fn saving_over_a_folder_that_holds_things_says_why_and_leaves_them() {
     let folder = dir.path().join("in-use");
     std::fs::create_dir(&folder).unwrap();
     std::fs::write(folder.join("keep.txt"), "mine").unwrap();
-    assert!(doc.save_folder(&folder).is_err());
+    assert!(doc.save_as_job(SaveTarget::Folder(folder.clone())).run().is_err());
     assert_eq!(
         std::fs::read_to_string(folder.join("keep.txt")).unwrap(),
         "mine"
@@ -443,21 +447,17 @@ fn saving_over_a_folder_that_holds_things_says_why_and_leaves_them() {
 }
 
 #[test]
-fn a_talk_is_not_saved_as_the_form_it_already_has() {
+fn a_talk_can_be_saved_as_a_copy_in_the_form_it_already_has() {
     let elsewhere = tempfile::tempdir().unwrap();
     let (_d, in_a_folder) = talk("# One\n");
-    assert!(
-        in_a_folder
-            .save_folder(&elsewhere.path().join("a"))
-            .is_err()
-    );
+    let copy = elsewhere.path().join("a");
+    in_a_folder.save_as_job(SaveTarget::Folder(copy.clone())).run().unwrap();
+    assert_eq!(std::fs::read_to_string(copy.join("slides.md")).unwrap(), "# One\n");
     let (_dir, file) = packed_talk("talk.sptx", "# One\n");
     let packed = Document::open_packed(&file, Fonts::bundled_only()).unwrap();
-    assert!(
-        packed
-            .save_packed(&elsewhere.path().join("b.sptx"))
-            .is_err()
-    );
+    let out = elsewhere.path().join("b.sptx");
+    packed.save_as_job(SaveTarget::Packed(out.clone())).run().unwrap();
+    assert_eq!(Document::open_packed(&out, Fonts::bundled_only()).unwrap().source(), "# One\n");
 }
 
 /// The text layer of a talk that asks for the talk's own font, packed from `folder` and drawn.

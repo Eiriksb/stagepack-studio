@@ -6,7 +6,7 @@ use std::time::Duration;
 use gpui_kit::test::{TestQueryExt, TestWindowExt};
 use gpui_kit::{
     AnyWindowHandle, App, AppContext, Bounds, Context, Entity, Pixels, Point, RenderImage,
-    TestAppContext, Window, WindowBounds, WindowOptions, point, px, size,
+    TestAppContext, VisualTestContext, Window, WindowBounds, WindowOptions, point, px, size,
 };
 use slides_components::{Bundle, Diagnostic, component_tag};
 use slides_engine::{ComponentState, Fonts};
@@ -16,10 +16,11 @@ use stagepack_studio::permissions::BuildPermissions;
 use stagepack_studio::present::{LayerLook, SlideLook};
 use stagepack_studio::slide_canvas::{SlideCanvas, letterbox};
 use stagepack_studio::workspace_view::{
-    self, BUILD_ALWAYS_ID, BUILD_ONCE_ID, CANVAS_ID, COMPONENT_PROBLEMS_ID, EXPORT_MENU_ID,
-    ExportPdf, ExportPowerPoint, FILE_MENU_ID, MARKDOWN_ID, NOTICES_ID, OPEN_IN_STAGEPACK_ID,
-    OpenFolder, OpenPacked, PROBLEM_ID, STATUS_ID, SaveFolder, SavePacked, SetUpForCodeEditor,
-    TITLE_ID, WorkspaceView,
+    self, BUILD_ALWAYS_ID, BUILD_ONCE_ID, CANVAS_ID, CLOSE_CANCEL_ID, CLOSE_DONT_SAVE_ID,
+    CLOSE_SAVE_ID, COMPONENT_PROBLEMS_ID, EXPORT_MENU_ID, ExportPdf, ExportPowerPoint,
+    FILE_MENU_ID, KEEP_MINE_ID, LOAD_THEIRS_ID, MARKDOWN_ID, NOTICES_ID, OPEN_IN_STAGEPACK_ID,
+    OUTSIDE_CHANGE, OUTSIDE_CHANGE_ID, OpenFolder, OpenPacked, PROBLEM_ID, SAVE_AS_FOLDER_ID,
+    SAVE_AS_PACKED_ID, STATUS_ID, SaveAs, SetUpForCodeEditor, TITLE_ID, WorkspaceView,
 };
 
 fn document(source: &str) -> Document {
@@ -1007,17 +1008,24 @@ fn file_menu_has(cx: &mut TestAppContext, handle: AnyWindowHandle, item: &str) -
 }
 
 #[gpui_kit::test]
-fn a_talk_in_a_folder_offers_to_be_packed(cx: &mut TestAppContext) {
+fn the_file_menu_offers_save_and_save_as(cx: &mut TestAppContext) {
     let handle = open_talk(cx, "# One\n");
-    assert!(file_menu_has(cx, handle, "Save as packed talk…"));
+    assert!(file_menu_has(cx, handle, "Save"));
+    assert!(file_menu_has(cx, handle, "Save As…"));
+    assert!(!file_menu_has(cx, handle, "Save as packed talk…"));
+    let (_dir, handle, _view) = open_packed_talk(cx, "# One\n");
+    assert!(file_menu_has(cx, handle, "Save As…"));
     assert!(!file_menu_has(cx, handle, "Save as folder…"));
 }
 
-#[gpui_kit::test]
-fn a_packed_talk_offers_to_become_a_folder(cx: &mut TestAppContext) {
-    let (_dir, handle, _view) = open_packed_talk(cx, "# One\n");
-    assert!(file_menu_has(cx, handle, "Save as folder…"));
-    assert!(!file_menu_has(cx, handle, "Save as packed talk…"));
+/// Asks to Save As, and answers which form with the button `kind`.
+fn save_as(cx: &mut TestAppContext, handle: AnyWindowHandle, kind: &'static str) {
+    cx.dispatch_action(handle, SaveAs);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(kind, cx);
+    })
+    .unwrap();
 }
 
 #[gpui_kit::test]
@@ -1045,10 +1053,10 @@ fn a_packed_talk_shows_and_is_not_watched(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn a_packed_talk_can_be_saved_as_a_folder_from_the_window(cx: &mut TestAppContext) {
-    let (dir, handle, _view) = open_packed_talk(cx, "# One\n");
+    let (dir, handle, view) = open_packed_talk(cx, "# One\n");
     let folder = dir.path().join("unpacked");
 
-    cx.dispatch_action(handle, SaveFolder);
+    save_as(cx, handle, SAVE_AS_FOLDER_ID);
     choose(cx, Some(folder.clone()));
 
     assert_eq!(
@@ -1056,6 +1064,8 @@ fn a_packed_talk_can_be_saved_as_a_folder_from_the_window(cx: &mut TestAppContex
         "# One\n"
     );
     assert_eq!(status(cx, handle).as_deref(), Some("Saved unpacked."));
+    // It's kept there from now on.
+    cx.read(|cx| assert!(!view.read(cx).document().unwrap().read(cx).is_packed()));
 }
 
 #[gpui_kit::test]
@@ -1064,7 +1074,7 @@ fn a_talk_in_a_folder_can_be_packed_from_the_window(cx: &mut TestAppContext) {
     let elsewhere = tempfile::tempdir().unwrap();
     let out = elsewhere.path().join("copy.sptx");
 
-    cx.dispatch_action(talk.handle, SavePacked);
+    save_as(cx, talk.handle, SAVE_AS_PACKED_ID);
     choose(cx, Some(out.clone()));
 
     let copy = Document::open_packed(&out, Fonts::bundled_only()).unwrap();
@@ -1652,4 +1662,239 @@ fn no_compiler_says_so(cx: &mut TestAppContext) {
         assert!(window.try_find(BUILD_ALWAYS_ID).is_none());
     })
     .unwrap();
+}
+
+// ---- Saving ----
+
+/// Adds a slide to the talk in the window, as the slide commands do.
+fn add_slide(cx: &mut TestAppContext, view: &Entity<WorkspaceView>) {
+    cx.update(|cx| {
+        let document = view.read(cx).document().unwrap().clone();
+        document.update(cx, |document, cx| {
+            document.add_slide("content").unwrap();
+            cx.notify();
+        });
+    });
+}
+
+fn source_of(cx: &TestAppContext, view: &Entity<WorkspaceView>) -> String {
+    cx.read(|cx| view.read(cx).document().unwrap().read(cx).source().to_string())
+}
+
+#[gpui_kit::test]
+fn the_title_shows_unsaved_changes(cx: &mut TestAppContext) {
+    let talk = open_saved_talk(cx, "---\ntitle: T\n---\n\n# One\n");
+    assert_eq!(title(cx, talk.handle), "T · 1 / 1");
+    add_slide(cx, &talk.view);
+    assert_eq!(title(cx, talk.handle), "• T · 2 / 2");
+}
+
+#[gpui_kit::test]
+fn ctrl_s_saves(cx: &mut TestAppContext) {
+    let talk = open_saved_talk(cx, "---\ntitle: T\n---\n\n# One\n");
+    add_slide(cx, &talk.view);
+
+    cx.simulate_keystrokes(talk.handle, "ctrl-s");
+    cx.run_until_parked();
+
+    assert_eq!(std::fs::read_to_string(&talk.file).unwrap(), source_of(cx, &talk.view));
+    assert_eq!(title(cx, talk.handle), "T · 2 / 2");
+    let folder = talk.file.parent().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+    assert_eq!(status(cx, talk.handle), Some(format!("Saved {folder}.")));
+}
+
+#[gpui_kit::test]
+fn a_failed_save_says_why_and_stays_unsaved(cx: &mut TestAppContext) {
+    let talk = open_saved_talk(cx, "---\ntitle: T\n---\n\n# One\n");
+    add_slide(cx, &talk.view);
+    // A folder where the file was: it can't be replaced.
+    std::fs::remove_file(&talk.file).unwrap();
+    std::fs::create_dir(&talk.file).unwrap();
+
+    cx.simulate_keystrokes(talk.handle, "ctrl-s");
+    cx.run_until_parked();
+
+    let said = status(cx, talk.handle).expect("it says what happened");
+    assert!(said.starts_with("Couldn't save"), "{said}");
+    assert_eq!(title(cx, talk.handle), "• T · 2 / 2");
+}
+
+/// The talk in the window with an edit of its own, and its file changed from outside.
+fn changed_underneath(cx: &mut TestAppContext) -> (SavedTalk, String, String) {
+    let talk = open_saved_talk(cx, "---\ntitle: T\n---\n\n# One\n");
+    add_slide(cx, &talk.view);
+    let mine = source_of(cx, &talk.view);
+    let theirs = "---\ntitle: T\n---\n\n# Theirs\n".to_string();
+    save(cx, &talk, &theirs);
+    wait(cx, &talk, 200);
+    (talk, mine, theirs)
+}
+
+fn shows_the_bar(cx: &mut TestAppContext, handle: AnyWindowHandle) -> bool {
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.try_find(OUTSIDE_CHANGE_ID).is_some()
+    })
+    .unwrap()
+}
+
+#[gpui_kit::test]
+fn the_outside_change_bar_offers_both(cx: &mut TestAppContext) {
+    let (talk, mine, theirs) = changed_underneath(cx);
+    cx.update_window(talk.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find(OUTSIDE_CHANGE_ID).label(), Some(OUTSIDE_CHANGE));
+        assert!(window.find(KEEP_MINE_ID).visible());
+        assert!(window.find(LOAD_THEIRS_ID).visible());
+    })
+    .unwrap();
+    assert_eq!(source_of(cx, &talk.view), mine, "nothing is taken until asked");
+
+    cx.update_window(talk.handle, |_, window, cx| window.click(LOAD_THEIRS_ID, cx))
+        .unwrap();
+    settle(cx, talk.handle);
+    assert_eq!(source_of(cx, &talk.view), theirs);
+    assert!(!shows_the_bar(cx, talk.handle));
+    assert!(shows_line(cx, &talk, "# Theirs"));
+    assert_eq!(title(cx, talk.handle), "T · 1 / 1");
+}
+
+#[gpui_kit::test]
+fn keeping_my_changes_puts_the_bar_away(cx: &mut TestAppContext) {
+    let (talk, mine, _theirs) = changed_underneath(cx);
+    cx.update_window(talk.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(KEEP_MINE_ID, cx);
+    })
+    .unwrap();
+    settle(cx, talk.handle);
+    assert!(!shows_the_bar(cx, talk.handle));
+    assert_eq!(source_of(cx, &talk.view), mine);
+    assert_eq!(title(cx, talk.handle), "• T · 2 / 2");
+
+    cx.simulate_keystrokes(talk.handle, "ctrl-s");
+    cx.run_until_parked();
+    assert_eq!(std::fs::read_to_string(&talk.file).unwrap(), mine);
+}
+
+#[gpui_kit::test]
+fn the_apps_own_save_brings_no_bar(cx: &mut TestAppContext) {
+    let talk = open_saved_talk(cx, "---\ntitle: T\n---\n\n# One\n");
+    add_slide(cx, &talk.view);
+    cx.simulate_keystrokes(talk.handle, "ctrl-s");
+    cx.run_until_parked();
+    // The watcher sees the app's own write, after another edit.
+    add_slide(cx, &talk.view);
+    cx.update(|cx| talk.view.update(cx, |view, cx| view.reload_soon(talk.file.clone(), cx)));
+    wait(cx, &talk, 200);
+    assert!(!shows_the_bar(cx, talk.handle));
+    assert_eq!(title(cx, talk.handle), "• T · 3 / 3");
+}
+
+/// Tries to close the window, as its close button does, and says whether it closed at once.
+fn try_to_close(cx: &mut TestAppContext, handle: AnyWindowHandle) -> bool {
+    let closed = VisualTestContext::from_window(handle, cx).simulate_close();
+    cx.run_until_parked();
+    closed
+}
+
+fn is_open(cx: &TestAppContext, handle: AnyWindowHandle) -> bool {
+    cx.read(|cx| cx.windows().iter().any(|window| window.window_id() == handle.window_id()))
+}
+
+fn click_in(cx: &mut TestAppContext, handle: AnyWindowHandle, id: &'static str) {
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(id, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui_kit::test]
+fn closing_with_unsaved_changes_asks(cx: &mut TestAppContext) {
+    let talk = open_saved_talk(cx, "---\ntitle: T\n---\n\n# One\n");
+    assert!(try_to_close(cx, talk.handle), "nothing to lose");
+
+    add_slide(cx, &talk.view);
+    assert!(!try_to_close(cx, talk.handle));
+    cx.update_window(talk.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find(CLOSE_SAVE_ID).visible());
+        assert!(window.find(CLOSE_DONT_SAVE_ID).visible());
+        assert!(window.find(CLOSE_CANCEL_ID).visible());
+    })
+    .unwrap();
+
+    // Cancel keeps the window, and its changes.
+    click_in(cx, talk.handle, CLOSE_CANCEL_ID);
+    assert!(is_open(cx, talk.handle));
+    assert_eq!(title(cx, talk.handle), "• T · 2 / 2");
+
+    // Save writes them, then closes.
+    assert!(!try_to_close(cx, talk.handle));
+    let mine = source_of(cx, &talk.view);
+    click_in(cx, talk.handle, CLOSE_SAVE_ID);
+    assert_eq!(std::fs::read_to_string(&talk.file).unwrap(), mine);
+    assert!(!is_open(cx, talk.handle));
+}
+
+#[gpui_kit::test]
+fn dont_save_closes_without_writing(cx: &mut TestAppContext) {
+    let talk = open_saved_talk(cx, "---\ntitle: T\n---\n\n# One\n");
+    add_slide(cx, &talk.view);
+    assert!(!try_to_close(cx, talk.handle));
+
+    click_in(cx, talk.handle, CLOSE_DONT_SAVE_ID);
+
+    assert!(!is_open(cx, talk.handle));
+    assert_eq!(
+        std::fs::read_to_string(&talk.file).unwrap(),
+        "---\ntitle: T\n---\n\n# One\n"
+    );
+}
+
+#[gpui_kit::test]
+fn a_save_that_fails_on_closing_keeps_the_window(cx: &mut TestAppContext) {
+    let talk = open_saved_talk(cx, "---\ntitle: T\n---\n\n# One\n");
+    add_slide(cx, &talk.view);
+    std::fs::remove_file(&talk.file).unwrap();
+    std::fs::create_dir(&talk.file).unwrap();
+    assert!(!try_to_close(cx, talk.handle));
+
+    click_in(cx, talk.handle, CLOSE_SAVE_ID);
+
+    assert!(is_open(cx, talk.handle));
+    let said = status(cx, talk.handle).expect("it says what happened");
+    assert!(said.starts_with("Couldn't save"), "{said}");
+}
+
+#[gpui_kit::test]
+fn save_as_a_packed_talk_keeps_it_there(cx: &mut TestAppContext) {
+    let talk = open_saved_talk(cx, "---\ntitle: T\n---\n\n# One\n");
+    add_slide(cx, &talk.view);
+    let elsewhere = tempfile::tempdir().unwrap();
+    let out = elsewhere.path().join("copy.sptx");
+
+    cx.simulate_keystrokes(talk.handle, "ctrl-shift-s");
+    cx.update_window(talk.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(SAVE_AS_PACKED_ID, cx);
+    })
+    .unwrap();
+    choose(cx, Some(out.clone()));
+
+    assert_eq!(title(cx, talk.handle), "T · 2 / 2");
+    assert_eq!(status(cx, talk.handle).as_deref(), Some("Saved copy.sptx."));
+    // The next save goes to the pack, and the folder is left as it was.
+    add_slide(cx, &talk.view);
+    cx.simulate_keystrokes(talk.handle, "ctrl-s");
+    cx.run_until_parked();
+    let packed = slides_engine::open_packed(&out).unwrap();
+    assert_eq!(packed.slides().unwrap(), source_of(cx, &talk.view));
+    assert_eq!(
+        std::fs::read_to_string(&talk.file).unwrap(),
+        "---\ntitle: T\n---\n\n# One\n"
+    );
+    cx.read(|cx| assert!(cx.windows().len() == 1 && talk.view.read(cx).document().unwrap().read(cx).is_packed()));
 }

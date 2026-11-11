@@ -6,15 +6,14 @@ use std::sync::Arc;
 use slides_components::Diagnostic;
 use slides_engine::{
     ComponentInfo, Deck, FolderFiles, Fonts, Layer, LayerTiming, Moment, PackError, SlideTimeline,
-    TalkFiles, Transition, layout_by_name, open_packed, pack_folder, read_talk_text,
-    unpack_to_folder,
+    TalkFiles, Transition, layout_by_name, open_packed, read_talk_text,
 };
 use slides_format::{Change, Talk, split_slides};
 
-use crate::builds;
 use crate::export::ExportInput;
 use crate::history::History;
 use crate::present::TalkShape;
+use crate::saving::{SaveJob, SaveTarget, Saved};
 
 pub(crate) const SLIDES_FILE: &str = "slides.md";
 const FONTS_FOLDER: &str = "assets/fonts";
@@ -32,6 +31,9 @@ pub enum Reload {
     Unchanged,
     /// The read gave nothing to use, so the talk stays as it was.
     KeptLastGood,
+    /// The file changed while the talk has edits it doesn't, so nothing was taken: whoever is
+    /// editing it is asked which to keep. [`Document::outside_change`] is what the file holds.
+    Conflict,
 }
 
 /// Why an edit wasn't made. Nothing of it was applied, and there's nothing to undo.
@@ -87,8 +89,8 @@ impl From<PackError> for OpenProblem {
     }
 }
 
-/// Where a talk is kept: what saving it in the other form works from. It can be handed to a
-/// background task, as a [`Document`] can't.
+/// Where a talk is kept: what saving it works from. It can be handed to a background task, as a
+/// [`Document`] can't.
 #[derive(Clone)]
 pub enum TalkPlace {
     Folder(PathBuf),
@@ -96,38 +98,6 @@ pub enum TalkPlace {
 }
 
 impl TalkPlace {
-    /// Packs a talk kept in a folder into the file `out`, and says what had to be left out
-    /// and which components it carries an older build of.
-    pub fn save_packed(&self, out: &Path) -> Result<Vec<String>, String> {
-        let TalkPlace::Folder(folder) = self else {
-            return Err("This talk is already packed.".to_string());
-        };
-        let report =
-            pack_folder(folder, out, env!("CARGO_PKG_VERSION")).map_err(|e| e.to_string())?;
-        let left_out = report
-            .skipped
-            .into_iter()
-            .map(|name| format!("{name} was left out"));
-        let outside = report
-            .outside_pictures
-            .into_iter()
-            .map(|name| format!("The picture {name} is outside assets/ and wasn't packed"));
-        let behind = builds::behind(folder).into_iter().map(|tag| {
-            format!(
-                "{tag} couldn't be built just now, so the packed talk carries its last good build"
-            )
-        });
-        Ok(left_out.chain(outside).chain(behind).collect())
-    }
-
-    /// Unpacks a packed talk into `folder`, which must be missing or empty.
-    pub fn save_folder(&self, folder: &Path) -> Result<(), String> {
-        let TalkPlace::Packed(file) = self else {
-            return Err("This talk is already a folder.".to_string());
-        };
-        unpack_to_folder(file, folder).map_err(|e| e.to_string())
-    }
-
     /// The folder this talk sits in, where anything saved from it starts out.
     pub fn directory(&self) -> &Path {
         let (TalkPlace::Folder(path) | TalkPlace::Packed(path)) = self;
@@ -135,7 +105,7 @@ impl TalkPlace {
     }
 
     /// What to call a talk with no title setting.
-    fn name(&self) -> String {
+    pub(crate) fn name(&self) -> String {
         match self {
             TalkPlace::Folder(folder) => folder_name(folder),
             TalkPlace::Packed(file) => file.file_stem().map_or_else(
@@ -160,6 +130,11 @@ pub struct Document {
     /// The slide whose notes the last step was typed into, while nothing else has happened
     /// since: more typing there joins that step.
     typing_notes: Option<usize>,
+    /// What the talk's file held when the app last wrote or read it, so that the app's own
+    /// save isn't taken for someone else's change.
+    on_disk: String,
+    /// What the file holds after it changed under unsaved edits, until that's answered.
+    outside: Option<String>,
 }
 
 impl Document {
@@ -218,6 +193,8 @@ impl Document {
             fonts.load_talk_font(font.clone());
         }
         Document {
+            on_disk: source.clone(),
+            outside: None,
             deck: Deck::open(Box::new(files.clone()), fonts, source),
             place_name: place.name(),
             place,
@@ -532,14 +509,65 @@ impl Document {
         &self.place
     }
 
-    /// Packs a talk kept in a folder into the file `out`, and says what had to be left out.
-    pub fn save_packed(&self, out: &Path) -> Result<Vec<String>, String> {
-        self.place.save_packed(out)
+    /// A save of the talk as it is now, where it's kept: for a folder, only its `slides.md`.
+    pub fn save_job(&self) -> SaveJob {
+        SaveJob::new(self.source().to_string(), self.place.clone(), None)
     }
 
-    /// Unpacks a packed talk into `folder`, which must be missing or empty.
-    pub fn save_folder(&self, folder: &Path) -> Result<(), String> {
-        self.place.save_folder(folder)
+    /// A save of the talk as it is now, somewhere new.
+    pub fn save_as_job(&self, target: SaveTarget) -> SaveJob {
+        SaveJob::new(self.source().to_string(), self.place.clone(), Some(target))
+    }
+
+    /// Takes in a save that worked. The talk is saved if its text is still what was written,
+    /// and after a Save As it's kept in the new place from now on.
+    pub fn saved(&mut self, saved: Saved) {
+        if let Some((place, files)) = saved.moved_to {
+            self.place_name = place.name();
+            self.place = place;
+            self.files = files.clone();
+            self.deck.set_files(Box::new(files));
+        }
+        if self.source() == saved.written {
+            self.history.mark_saved();
+        } else {
+            // Edited while it saved: no step leads to what the file holds now.
+            self.history.forget_saved();
+        }
+        self.on_disk = saved.written;
+        self.outside = None;
+    }
+
+    /// What the talk's file held when the app last wrote or read it.
+    pub fn stamp_on_disk(&self) -> &str {
+        &self.on_disk
+    }
+
+    /// What the file holds, when it changed under unsaved edits and nobody has said yet whether
+    /// to keep those or load it.
+    pub fn outside_change(&self) -> Option<&str> {
+        self.outside.as_deref()
+    }
+
+    /// Loads `text`, what the file holds after a change from outside, in place of the edits
+    /// made here, which can't be undone after it.
+    pub fn take_theirs(&mut self, text: String) {
+        self.outside = None;
+        if text.is_empty() {
+            return;
+        }
+        self.history = History::new();
+        self.typing_notes = None;
+        self.take(text);
+    }
+
+    /// Keeps the edits made here over the file's change, which isn't asked about again. The
+    /// file holds neither, so the talk has unsaved changes until it's saved.
+    pub fn keep_mine(&mut self) {
+        if let Some(theirs) = self.outside.take() {
+            self.on_disk = theirs;
+            self.history.forget_saved();
+        }
     }
 
     /// What an export needs to know about the talk as it is now.
@@ -553,10 +581,40 @@ impl Document {
 
     /// Takes a new read of the talk's file: its text, or `None` if it couldn't be read. An
     /// empty read is an editor caught halfway through a save, not an empty talk.
+    ///
+    /// A file that holds what the app last wrote or read brings nothing new. A change made
+    /// while the talk has unsaved edits isn't taken, but asked about.
     pub fn reload(&mut self, contents: Option<String>) -> Reload {
         let Some(source) = contents.filter(|source| !source.is_empty()) else {
             return Reload::KeptLastGood;
         };
+        let holds_mine = source == self.source();
+        if holds_mine {
+            // The file holds what's here, however it came to: nothing is unsaved.
+            self.history.mark_saved();
+        }
+        if holds_mine || source == self.on_disk {
+            self.on_disk = source;
+            // The app's own save, or changed back: a picture the talk shows may still have
+            // been replaced.
+            self.outside = None;
+            let changed = self.deck.update(self.source().to_string());
+            return if changed.is_empty() {
+                Reload::Unchanged
+            } else {
+                Reload::Changed(changed)
+            };
+        }
+        if self.has_unsaved_changes() {
+            self.outside = Some(source);
+            return Reload::Conflict;
+        }
+        self.take(source)
+    }
+
+    /// Takes `source`, what the file holds, as the talk's text.
+    fn take(&mut self, source: String) -> Reload {
+        self.on_disk = source.clone();
         let same_text = source == self.source();
         // Even the same text goes through: a picture it shows may have been replaced.
         let mut changed = self.deck.update(source);

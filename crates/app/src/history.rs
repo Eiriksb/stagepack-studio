@@ -169,6 +169,11 @@ impl History {
         self.saved = Some(self.position());
     }
 
+    /// The saved text is one no step leads to: the file was written or changed from elsewhere.
+    pub fn forget_saved(&mut self) {
+        self.saved = None;
+    }
+
     /// Whether the text is as it was last saved.
     pub fn is_saved(&self) -> bool {
         self.saved == Some(self.position())

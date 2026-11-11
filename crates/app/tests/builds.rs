@@ -7,7 +7,8 @@ use slides_components::{BuildIndex, Bundle, Diagnostic, INDEX_FILE, component_ta
 use slides_engine::{ComponentState, FolderFiles, Fonts, TalkComponents};
 use stagepack_studio::builds::{BuildOutcome, Compile, behind, build_components};
 use stagepack_studio::cargo_file::write_cargo_file;
-use stagepack_studio::document::{Document, TalkPlace};
+use stagepack_studio::document::Document;
+use stagepack_studio::saving::SaveTarget;
 use stagepack_studio::permissions::BuildPermissions;
 use tempfile::TempDir;
 
@@ -424,11 +425,13 @@ fn a_packed_copy_says_which_builds_are_behind() {
     assert_eq!(behind(dir.path()), ["Score"]);
     let elsewhere = tempfile::tempdir().unwrap();
     let out = elsewhere.path().join("talk.sptx");
-    let notices = TalkPlace::Folder(dir.path().to_path_buf())
-        .save_packed(&out)
+    let saved = Document::open(dir.path(), Fonts::bundled_only())
+        .unwrap()
+        .save_as_job(SaveTarget::Packed(out))
+        .run()
         .unwrap();
     assert_eq!(
-        notices,
+        saved.notices(),
         ["Score couldn't be built just now, so the packed talk carries its last good build"]
     );
 }

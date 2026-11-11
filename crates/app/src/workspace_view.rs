@@ -1,5 +1,5 @@
-//! The window's content: the title bar, the slide, its notices and the talk's Markdown, and
-//! the bar that offers to build the talk's components.
+//! The window's content: the title bar, the slide, its notices and the talk's Markdown, the
+//! bar that offers to build the talk's components, and saving the talk.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -9,7 +9,7 @@ use futures::channel::mpsc;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::DropdownMenu as _;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, TitleBar, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Sizable as _, TitleBar, WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -23,6 +23,7 @@ use crate::export::{self, ExportKind, run_export, stagepack_executable};
 use crate::markdown_panel::MarkdownPanel;
 use crate::permissions::BuildPermissions;
 use crate::present_view::{self, Presentation, start_show};
+use crate::saving::{SaveJob, SaveTarget, Saved};
 use crate::slide_canvas::{ScaleChanged, SlideCanvas};
 use crate::watcher::{self, Change};
 
@@ -40,6 +41,15 @@ pub const BUILD_BAR_ID: &str = "build-bar";
 pub const BUILD_ONCE_ID: &str = "build-once";
 pub const BUILD_ALWAYS_ID: &str = "build-always";
 pub const COMPONENT_PROBLEMS_ID: &str = "component-problems";
+pub const OUTSIDE_CHANGE_ID: &str = "outside-change";
+pub const KEEP_MINE_ID: &str = "keep-mine";
+pub const LOAD_THEIRS_ID: &str = "load-theirs";
+pub const SAVE_AS_FOLDER_ID: &str = "save-as-folder";
+pub const SAVE_AS_PACKED_ID: &str = "save-as-packed";
+pub const SAVE_AS_CANCEL_ID: &str = "save-as-cancel";
+pub const CLOSE_SAVE_ID: &str = "close-save";
+pub const CLOSE_DONT_SAVE_ID: &str = "close-dont-save";
+pub const CLOSE_CANCEL_ID: &str = "close-cancel";
 
 /// The key context of the window's content, where its shortcuts apply.
 pub const KEY_CONTEXT: &str = "Workspace";
@@ -62,6 +72,12 @@ const NEEDS_BUILDING: &str =
 const BUILDING: &str = "Building components…";
 const NO_COMPILER: &str = "This copy of the app has no compiler, so components can't be built.";
 
+pub const OUTSIDE_CHANGE: &str = "This talk was changed outside the app.";
+const UNSAVED_ON_CLOSE: &str = "This talk has changes that haven't been saved.";
+
+/// What the title shows before the talk's name while it has unsaved changes.
+pub const UNSAVED_MARK: &str = "• ";
+
 actions!(
     stagepack_studio,
     [
@@ -70,8 +86,8 @@ actions!(
         ToggleMarkdown,
         OpenFolder,
         OpenPacked,
-        SavePacked,
-        SaveFolder,
+        Save,
+        SaveAs,
         SetUpForCodeEditor,
         ExportPowerPoint,
         ExportPdf,
@@ -88,6 +104,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("left", PreviousSlide, Some(KEY_CONTEXT)),
         KeyBinding::new("pageup", PreviousSlide, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-m", ToggleMarkdown, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-s", Save, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-shift-s", SaveAs, Some(KEY_CONTEXT)),
         KeyBinding::new("f5", Present, Some(KEY_CONTEXT)),
         KeyBinding::new("shift-f5", Rehearse, Some(KEY_CONTEXT)),
     ]);
@@ -119,6 +137,13 @@ const SAVING: Wording = Wording {
     doing: "Saving",
     done: "Saved",
 };
+
+/// The two forms Save As offers.
+#[derive(Clone, Copy)]
+enum SaveKind {
+    Folder,
+    Packed,
+}
 
 /// A file this app can't show but an installed Stagepack can.
 struct StagepackOffer {
@@ -167,7 +192,21 @@ pub struct WorkspaceView {
     build_problems: Vec<Diagnostic>,
     /// The look at the components waiting for them to go quiet.
     pending_components: Option<Task<()>>,
+    /// Whether a save is running.
+    saving: bool,
+    /// Whether another save was asked for while one ran.
+    save_again: bool,
+    /// A read of the file that came in while a save ran, which waits for it: the save may be
+    /// what changed the file.
+    reload_after_save: Option<Option<String>>,
+    /// Whether the window closes once the running save is done.
+    close_after_save: bool,
+    /// Whether the window may close with unsaved changes, as asked.
+    close_anyway: bool,
+    /// The window this is the content of.
+    window_handle: AnyWindowHandle,
     _scale_changed: Subscription,
+    _document_changed: Option<Subscription>,
 }
 
 impl WorkspaceView {
@@ -239,6 +278,15 @@ impl WorkspaceView {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
         let document = document.map(|document| cx.new(|_| document));
+        // The title says whether there are unsaved changes, whatever made them.
+        let document_changed = document
+            .as_ref()
+            .map(|document| cx.observe(document, |_, _, cx| cx.notify()));
+        let view = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            view.update(cx, |view, cx| view.should_close(window, cx))
+                .unwrap_or(true)
+        });
         let notices = document
             .as_ref()
             .map(|document| document.update(cx, |document, _| document.notices()))
@@ -274,7 +322,14 @@ impl WorkspaceView {
             build_again: false,
             build_problems: Vec::new(),
             pending_components: None,
+            saving: false,
+            save_again: false,
+            reload_after_save: None,
+            close_after_save: false,
+            close_anyway: false,
+            window_handle: window.window_handle(),
             _scale_changed: scale_changed,
+            _document_changed: document_changed,
         };
         view.always_build = view.is_always_built();
         view
@@ -401,10 +456,18 @@ impl WorkspaceView {
         // Replacing the task cancels the one waiting, so the wait starts again from now.
         self.pending_reload = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(RELOAD_DELAY).await;
+            let read = file.clone();
             let contents = cx
-                .background_spawn(async move { slides_engine::read_talk_text(&file).ok() })
+                .background_spawn(async move { slides_engine::read_talk_text(&read).ok() })
                 .await;
-            this.update(cx, |this, cx| this.reload(contents, cx)).ok();
+            this.update(cx, |this, cx| {
+                // A file the talk was saved away from says nothing about it now.
+                let talks_file = this.talk_folder.as_ref().map(|folder| folder.join(SLIDES_FILE));
+                if talks_file.as_ref() == Some(&file) {
+                    this.reload(contents, cx);
+                }
+            })
+            .ok();
         }));
     }
 
@@ -412,6 +475,10 @@ impl WorkspaceView {
         let Some(document) = self.document.clone() else {
             return;
         };
+        if self.saving {
+            self.reload_after_save = Some(contents);
+            return;
+        }
         let reload = document.update(cx, |document, cx| {
             let reload = document.reload(contents);
             if matches!(reload, Reload::Changed(_)) {
@@ -421,6 +488,8 @@ impl WorkspaceView {
             reload
         });
         let Reload::Changed(slides) = reload else {
+            // The bar about a change from outside may have come or gone.
+            cx.notify();
             return;
         };
         let (showing_changed, source) = {
@@ -660,28 +729,272 @@ impl WorkspaceView {
         );
     }
 
-    fn save_packed(&mut self, cx: &mut Context<Self>) {
-        self.write_out(
-            Some(PACKED_EXTENSION),
-            SAVING,
-            |document| {
-                let place = document.place().clone();
-                move |out: &Path| place.save_packed(out)
-            },
-            cx,
-        );
+    /// Saves the talk where it's kept, on a background task.
+    fn save(&mut self, cx: &mut Context<Self>) {
+        let Some(document) = &self.document else {
+            return;
+        };
+        if self.saving {
+            self.save_again = true;
+            return;
+        }
+        let document = document.read(cx);
+        let job = document.save_job();
+        let name = place_label(document.place());
+        self.run_save(job, name, cx);
     }
 
-    fn save_folder(&mut self, cx: &mut Context<Self>) {
-        self.write_out(
-            None,
-            SAVING,
-            |document| {
-                let place = document.place().clone();
-                move |out: &Path| place.save_folder(out).map(|()| Vec::new())
-            },
-            cx,
-        );
+    /// Asks which form to save the talk in, then where.
+    fn ask_to_save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.document.is_none() || window.has_active_dialog(cx) {
+            return;
+        }
+        let view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let choose = |kind: SaveKind| {
+                let view = view.clone();
+                move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                    window.close_dialog(cx);
+                    view.update(cx, |view, cx| view.save_as(kind, cx)).ok();
+                }
+            };
+            dialog
+                .title("Save as")
+                .child("Keep the talk as a folder of files, or pack it into one file to send.")
+                .footer(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(
+                            Button::new(SAVE_AS_CANCEL_ID)
+                                .ghost()
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new(SAVE_AS_FOLDER_ID)
+                                .label("Talk folder")
+                                .on_click(choose(SaveKind::Folder)),
+                        )
+                        .child(
+                            Button::new(SAVE_AS_PACKED_ID)
+                                .primary()
+                                .label("Packed talk (.sptx)")
+                                .on_click(choose(SaveKind::Packed)),
+                        ),
+                )
+        });
+    }
+
+    /// Asks where to save the talk as `kind`, then saves it there on a background task. From
+    /// then on the talk is kept there.
+    fn save_as(&mut self, kind: SaveKind, cx: &mut Context<Self>) {
+        let Some(document) = &self.document else {
+            return;
+        };
+        let document = document.read(cx);
+        let stem = export::file_stem_for(&document.name());
+        let suggested = match kind {
+            SaveKind::Folder => stem,
+            SaveKind::Packed => format!("{stem}.{PACKED_EXTENSION}"),
+        };
+        let chosen = cx.prompt_for_new_path(document.place().directory(), Some(&suggested));
+        cx.spawn(async move |this, cx| {
+            let out = match chosen.await {
+                Ok(Ok(Some(out))) => out,
+                Ok(Err(error)) => {
+                    let problem = format!("Could not show the Save dialog: {error}");
+                    this.update(cx, |this, cx| this.say(problem, cx)).ok();
+                    return;
+                }
+                _ => return,
+            };
+            this.update(cx, |this, cx| {
+                let Some(document) = &this.document else {
+                    return;
+                };
+                if this.saving {
+                    this.say("The talk is still being saved. Try Save As again in a moment.", cx);
+                    return;
+                }
+                let name = file_label(&out);
+                let target = match kind {
+                    SaveKind::Folder => SaveTarget::Folder(out),
+                    SaveKind::Packed => SaveTarget::Packed(out),
+                };
+                let job = document.read(cx).save_as_job(target);
+                this.run_save(job, name, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Runs `job`, which saves to the place called `name`, on a background task.
+    fn run_save(&mut self, job: SaveJob, name: String, cx: &mut Context<Self>) {
+        self.saving = true;
+        self.say(format!("{} {name}…", SAVING.doing), cx);
+        cx.spawn(async move |this, cx| {
+            let outcome = cx.background_spawn(async move { job.run() }).await;
+            this.update(cx, |this, cx| this.finish_save(outcome, name, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    fn finish_save(&mut self, outcome: Result<Saved, String>, name: String, cx: &mut Context<Self>) {
+        self.saving = false;
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        match outcome {
+            Ok(saved) => {
+                let said = if saved.notices().is_empty() {
+                    format!("{} {name}.", SAVING.done)
+                } else {
+                    format!("{} {name}. {}", SAVING.done, saved.notices().join(" · "))
+                };
+                let moved = saved.moved();
+                document.update(cx, |document, cx| {
+                    document.saved(saved);
+                    cx.notify();
+                });
+                if moved {
+                    self.moved(cx);
+                }
+                self.say(said, cx);
+                if std::mem::take(&mut self.close_after_save) {
+                    self.close_anyway = true;
+                    self.close_window(cx);
+                    return;
+                }
+            }
+            Err(problem) => {
+                self.close_after_save = false;
+                self.say(problem, cx);
+            }
+        }
+        if let Some(contents) = self.reload_after_save.take() {
+            self.reload(contents, cx);
+        }
+        if std::mem::take(&mut self.save_again) && document.read(cx).has_unsaved_changes() {
+            self.save(cx);
+        }
+    }
+
+    /// Follows the talk to where Save As put it: its folder is the one watched and built.
+    fn moved(&mut self, cx: &mut Context<Self>) {
+        let Some(document) = &self.document else {
+            return;
+        };
+        self.talk_folder = match document.read(cx).place() {
+            TalkPlace::Folder(folder) => Some(folder.clone()),
+            TalkPlace::Packed(_) => None,
+        };
+        self.always_build = self.is_always_built();
+        self.build_problems.clear();
+        self.pending_reload = None;
+        self.pending_components = None;
+        let followed = self.watcher.take().is_some() || self.watch_problem.take().is_some();
+        if followed && let Some(folder) = self.talk_folder.clone() {
+            self.follow_saves(folder, cx);
+        }
+        self.show_slide(cx);
+    }
+
+    /// Keeps the edits made here over the file's change.
+    fn keep_mine(&mut self, cx: &mut Context<Self>) {
+        if let Some(document) = &self.document {
+            document.update(cx, |document, _| document.keep_mine());
+            cx.notify();
+        }
+    }
+
+    /// Loads the file as it was changed, in place of the edits made here.
+    fn load_theirs(&mut self, cx: &mut Context<Self>) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        let Some(theirs) = document.read(cx).outside_change().map(str::to_string) else {
+            return;
+        };
+        document.update(cx, |document, cx| {
+            document.take_theirs(theirs);
+            // A show of the talk has to know.
+            cx.notify();
+        });
+        let source = document.read(cx).source().to_string();
+        self.markdown_panel
+            .update(cx, |panel, cx| panel.set_source(&source, cx));
+        self.show_slide(cx);
+    }
+
+    /// Whether the window can close now. With unsaved changes it asks first, and closes
+    /// itself once that's answered.
+    fn should_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let unsaved = self
+            .document
+            .as_ref()
+            .is_some_and(|document| document.read(cx).has_unsaved_changes());
+        if self.close_anyway || !unsaved {
+            return true;
+        }
+        if !window.has_active_dialog(cx) {
+            self.ask_before_closing(window, cx);
+        }
+        false
+    }
+
+    fn ask_before_closing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let answer = |answer: fn(&mut WorkspaceView, &mut Context<WorkspaceView>)| {
+                let view = view.clone();
+                move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                    window.close_dialog(cx);
+                    view.update(cx, answer).ok();
+                }
+            };
+            dialog
+                .title("Save before closing?")
+                .child(UNSAVED_ON_CLOSE)
+                .footer(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(
+                            Button::new(CLOSE_CANCEL_ID)
+                                .ghost()
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new(CLOSE_DONT_SAVE_ID)
+                                .label("Don't save")
+                                .on_click(answer(|view, cx| {
+                                    view.close_anyway = true;
+                                    view.close_window(cx);
+                                })),
+                        )
+                        .child(
+                            Button::new(CLOSE_SAVE_ID)
+                                .primary()
+                                .label("Save")
+                                .on_click(answer(|view, cx| {
+                                    view.close_after_save = true;
+                                    view.save(cx);
+                                })),
+                        ),
+                )
+        });
+    }
+
+    /// Closes this window, once nothing else is using it.
+    fn close_window(&mut self, cx: &mut Context<Self>) {
+        let window = self.window_handle;
+        cx.defer(move |cx| {
+            window.update(cx, |_, window, _| window.remove_window()).ok();
+        });
     }
 
     /// Writes a Cargo project for the talk's components, in the app's data folder, which only
@@ -719,23 +1032,30 @@ fn file_menu(packed: Option<bool>, for_code_editor: bool) -> impl IntoElement {
         .small()
         .label("File")
         .dropdown_menu(move |menu, _, _| {
-            let menu = menu
-                .menu("Open folder…", Box::new(OpenFolder))
-                .menu("Open packed talk…", Box::new(OpenPacked));
-            match packed {
-                Some(false) => menu
-                    .separator()
-                    .menu("Save as packed talk…", Box::new(SavePacked))
-                    .when(for_code_editor, |menu| {
-                        menu.separator()
-                            .menu("Set up for a code editor", Box::new(SetUpForCodeEditor))
-                    }),
-                Some(true) => menu
-                    .separator()
-                    .menu("Save as folder…", Box::new(SaveFolder)),
-                None => menu,
-            }
+            let no_talk = packed.is_none();
+            menu.menu("Open folder…", Box::new(OpenFolder))
+                .menu("Open packed talk…", Box::new(OpenPacked))
+                .separator()
+                .menu_with_disabled("Save", Box::new(Save), no_talk)
+                .menu_with_disabled("Save As…", Box::new(SaveAs), no_talk)
+                .when(for_code_editor && packed == Some(false), |menu| {
+                    menu.separator()
+                        .menu("Set up for a code editor", Box::new(SetUpForCodeEditor))
+                })
         })
+}
+
+/// What to call the place a talk is saved to: the name of its folder or file.
+fn place_label(place: &TalkPlace) -> String {
+    let (TalkPlace::Folder(path) | TalkPlace::Packed(path)) = place;
+    file_label(path)
+}
+
+fn file_label(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }
 
 fn export_menu(has_talk: bool) -> impl IntoElement {
@@ -834,6 +1154,41 @@ impl WorkspaceView {
         })
     }
 
+    /// The bar that asks what to do about a change to the file made outside the app, while
+    /// the talk has changes of its own.
+    fn outside_change_bar(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
+        self.document.as_ref()?.read(cx).outside_change()?;
+        Some(
+            h_flex()
+                .id(OUTSIDE_CHANGE_ID)
+                .test_support()
+                .aria_label(OUTSIDE_CHANGE)
+                .w_full()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .items_center()
+                .bg(cx.theme().secondary)
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .child(div().text_sm().child(OUTSIDE_CHANGE))
+                .child(
+                    Button::new(KEEP_MINE_ID)
+                        .small()
+                        .primary()
+                        .label("Keep my changes")
+                        .on_click(cx.listener(|this, _, _, cx| this.keep_mine(cx))),
+                )
+                .child(
+                    Button::new(LOAD_THEIRS_ID)
+                        .small()
+                        .ghost()
+                        .label("Load the changed file")
+                        .on_click(cx.listener(|this, _, _, cx| this.load_theirs(cx))),
+                ),
+        )
+    }
+
     /// What's wrong with the talk's components, one line each.
     fn component_problems(&self, cx: &App) -> Option<impl IntoElement> {
         let document = self.document.as_ref()?.read(cx);
@@ -872,11 +1227,18 @@ impl WorkspaceView {
 impl Render for WorkspaceView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let build_bar = self.build_bar(cx);
+        let outside_change_bar = self.outside_change_bar(cx);
         let component_problems = self.component_problems(cx);
         let document = self.document.as_ref().map(|document| document.read(cx));
+        let unsaved = document.is_some_and(Document::has_unsaved_changes);
         let title: SharedString = document
             .map_or_else(|| "Untitled".to_string(), Document::title)
             .into();
+        let title: SharedString = if unsaved {
+            format!("{UNSAVED_MARK}{title}").into()
+        } else {
+            title
+        };
         let packed = document.map(Document::is_packed);
         let muted_text = cx.theme().muted_foreground;
         let notices: Vec<&str> = self
@@ -899,8 +1261,8 @@ impl Render for WorkspaceView {
             }))
             .on_action(cx.listener(|this, _: &OpenFolder, _, cx| this.ask_to_open(true, cx)))
             .on_action(cx.listener(|this, _: &OpenPacked, _, cx| this.ask_to_open(false, cx)))
-            .on_action(cx.listener(|this, _: &SavePacked, _, cx| this.save_packed(cx)))
-            .on_action(cx.listener(|this, _: &SaveFolder, _, cx| this.save_folder(cx)))
+            .on_action(cx.listener(|this, _: &Save, _, cx| this.save(cx)))
+            .on_action(cx.listener(|this, _: &SaveAs, window, cx| this.ask_to_save_as(window, cx)))
             .on_action(
                 cx.listener(|this, _: &SetUpForCodeEditor, _, cx| this.set_up_for_code_editor(cx)),
             )
@@ -991,6 +1353,7 @@ impl Render for WorkspaceView {
                         )
                     }),
             )
+            .children(outside_change_bar)
             .children(component_problems)
             .children(build_bar)
             .when(!notices.is_empty(), |this| {

@@ -102,6 +102,12 @@ impl PictureCache {
         self.memory_budget = bytes;
     }
 
+    /// Lets go of every picture, keeping the budget: they're read again when next asked for.
+    pub(crate) fn clear(&mut self) {
+        self.pictures.clear();
+        self.bytes = 0;
+    }
+
     /// The pixel bytes of the pictures in memory.
     pub(crate) fn bytes(&self) -> usize {
         self.bytes

@@ -789,3 +789,136 @@ fn the_temp_file_never_follows_a_planted_link() {
     assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
     assert_eq!(std::fs::read(&out).unwrap(), b"new");
 }
+
+// ---- Saving a talk ----
+
+/// Every file in the pack at `path` with what it holds, uncompressed, by name.
+fn entries_of(path: &Path) -> Vec<(String, Vec<u8>)> {
+    let packed = open_packed(path).unwrap();
+    packed
+        .names()
+        .into_iter()
+        .map(|name| {
+            let bytes = packed.read(&name).unwrap();
+            (name, bytes)
+        })
+        .collect()
+}
+
+#[test]
+fn a_repacked_talk_has_the_new_slides_and_everything_else_as_it_was() {
+    let dir = talk_folder();
+    let packed = dir.path().join("talk.sptx");
+    pack_folder(dir.path(), &packed, "0.1.0").unwrap();
+    let out = dir.path().join("again.sptx");
+
+    repack_with_slides(&packed, &out, "# New\r\n\r\n---\r\n\r\n# Slides\r\n", "0.2.0").unwrap();
+
+    let reopened = open_packed(&out).unwrap();
+    assert_eq!(reopened.slides().unwrap(), "# New\r\n\r\n---\r\n\r\n# Slides\r\n");
+    let before = entries_of(&packed);
+    let after = entries_of(&out);
+    let others = |entries: &[(String, Vec<u8>)]| -> Vec<(String, Vec<u8>)> {
+        entries
+            .iter()
+            .filter(|(name, _)| name != "slides.md" && name != "talk.json")
+            .cloned()
+            .collect()
+    };
+    assert_eq!(others(&after), others(&before));
+    assert_eq!(after.len(), before.len());
+    let manifest = reopened.read("talk.json").unwrap();
+    assert_eq!(manifest, br#"{"format":1,"app":"0.2.0","entry":"slides.md"}"#);
+}
+
+#[test]
+fn repacking_over_itself_is_atomic() {
+    let dir = talk_folder();
+    let packed = dir.path().join("talk.sptx");
+    pack_folder(dir.path(), &packed, "0.1.0").unwrap();
+    let before = entries_of(&packed);
+
+    // A failure part way leaves the pack as it was, and nothing beside it.
+    let too_big = "x".repeat(MAX_FILE_BYTES as usize + 1);
+    assert!(repack_with_slides(&packed, &packed, &too_big, "0.1.0").is_err());
+    assert_eq!(entries_of(&packed), before);
+
+    repack_with_slides(&packed, &packed, "# Changed\n", "0.1.0").unwrap();
+    assert_eq!(open_packed(&packed).unwrap().slides().unwrap(), "# Changed\n");
+    let mut left: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".tmp"))
+        .collect();
+    left.sort();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
+fn a_folder_is_copied_with_the_new_slides() {
+    let dir = talk_folder();
+    let work = tempfile::tempdir().unwrap();
+    let to = work.path().join("copy");
+
+    let left_out = copy_talk_folder(dir.path(), &to, "# Copied\r\n").unwrap();
+
+    assert!(left_out.is_empty(), "{left_out:?}");
+    assert_eq!(
+        snapshot(&to),
+        [
+            ("assets/a.png".to_string(), b"\x89PNG not really".to_vec()),
+            ("build/c.wasm".to_string(), b"\0asm\x01\0\0\0".to_vec()),
+            ("components/c.rs".to_string(), b"fn main() {}".to_vec()),
+            ("slides.md".to_string(), b"# Copied\r\n".to_vec()),
+        ]
+    );
+    // The talk it came from is as it was.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("slides.md")).unwrap(),
+        "# One\n\n---\n\n# Two\n"
+    );
+    // Into an empty folder too, but never one with things in it.
+    let empty = work.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    copy_talk_folder(dir.path(), &empty, "# Copied\r\n").unwrap();
+    assert_eq!(snapshot(&empty), snapshot(&to));
+    assert!(copy_talk_folder(dir.path(), &to, "# Again\n").is_err());
+    assert_eq!(std::fs::read(to.join("slides.md")).unwrap(), b"# Copied\r\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_copied_folder_leaves_out_what_a_pack_would() {
+    let dir = talk_folder();
+    std::os::unix::fs::symlink("/etc/passwd", dir.path().join("assets/link.png")).unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let to = work.path().join("copy");
+    let left_out = copy_talk_folder(dir.path(), &to, "# Copied\n").unwrap();
+    assert_eq!(left_out, ["assets/link.png"]);
+    assert!(std::fs::symlink_metadata(to.join("assets/link.png")).is_err());
+}
+
+#[test]
+fn a_packed_talk_is_unpacked_with_the_new_slides() {
+    let dir = talk_folder();
+    let packed = dir.path().join("talk.sptx");
+    pack_folder(dir.path(), &packed, "0.1.0").unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let folder = work.path().join("talk");
+    unpack_with_slides(&packed, &folder, "# Unpacked\n").unwrap();
+    assert_eq!(std::fs::read_to_string(folder.join("slides.md")).unwrap(), "# Unpacked\n");
+    assert_eq!(std::fs::read(folder.join("assets/a.png")).unwrap(), b"\x89PNG not really");
+}
+
+#[test]
+fn a_folder_is_packed_with_the_new_slides() {
+    let dir = talk_folder();
+    let work = tempfile::tempdir().unwrap();
+    let out = work.path().join("talk.sptx");
+    pack_folder_with_slides(dir.path(), &out, "# Packed\n", "0.1.0").unwrap();
+    assert_eq!(open_packed(&out).unwrap().slides().unwrap(), "# Packed\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("slides.md")).unwrap(),
+        "# One\n\n---\n\n# Two\n"
+    );
+}

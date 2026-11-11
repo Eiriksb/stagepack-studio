@@ -9,6 +9,7 @@ pub mod markdown_panel;
 pub mod permissions;
 pub mod present;
 pub mod present_view;
+pub mod saving;
 pub mod slide_canvas;
 pub mod watcher;
 pub mod workspace_view;

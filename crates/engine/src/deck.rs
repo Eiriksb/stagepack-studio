@@ -250,6 +250,23 @@ impl Deck {
         (0..self.slides.len()).collect()
     }
 
+    /// Reads the talk's files from `files` from now on, as when the talk has been saved
+    /// somewhere new. Every slide is laid out again when next asked for, as nothing drawn
+    /// from the old files is kept.
+    pub fn set_files(&mut self, files: Box<dyn TalkFiles>) {
+        self.files = Rc::from(files);
+        self.components = TalkComponents::scan_for(self.files.clone(), &self.registry);
+        self.pictures.clear();
+        self.files_generation += 1;
+        for slide in &mut self.slides {
+            slide.laid = None;
+            slide.at_moment = None;
+            slide.thumbnail = None;
+            slide.drawn.clear();
+        }
+        self.slides_holding_pictures.clear();
+    }
+
     /// The names of every component the talk can use: the built-ins and its own, sorted, for
     /// a palette to offer.
     pub fn available_components(&self) -> Vec<String> {
