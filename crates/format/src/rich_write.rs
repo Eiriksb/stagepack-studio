@@ -18,43 +18,20 @@ const MAX_LEVEL: u8 = 8;
 /// Markdown for one paragraph's content, as it's written on a line of its own: every
 /// character Markdown would read as structure is escaped, and `**` or `*` that can't close
 /// gives way to `<Text bold="true">` or `<Text italic="true">`. A line break is a hard
-/// break. Spans that can't be written exactly, such as a line break at the very end, come
-/// out as near as they can.
+/// break. Spans that can't be written exactly, such as a line break in code, come out as
+/// near as they can.
 pub fn write_inline(spans: &[Span]) -> String {
     let spans = tidy(spans);
     let ctx = Inline { heading: false, indent: "", eol: "\n" };
-    inline_for(&spans, Probe::Body, &ctx, PLAIN).unwrap_or_else(|| render(&spans, &ctx, Form::Tags, Escapes::Safe))
+    inline_for(&spans, Probe::Body, &ctx, PLAIN).unwrap_or_else(|| render(&spans, &ctx, Form::Tags, Escapes::Safe, NOTHING))
 }
 
-/// `paras` as Markdown can hold them: spans tidied, the line breaks at the start and end
-/// of each paragraph dropped, and then body paragraphs left with no text dropped. Empty
-/// headings, bullets and numbers stay, as a marker alone reads back as one. This is what
-/// [`write_flow`] and [`write_into_region`] write, and what reads back.
+/// `paras` in the form they read back in: line endings made `\n`, no empty spans, and
+/// neighbours with the same style merged. Nothing else is changed: an empty paragraph, of
+/// any kind, and a line break at a paragraph's start or end are written so that they read
+/// back as they are. This is what [`write_flow`] and [`write_into_region`] write.
 pub fn storable(paras: &[Para]) -> Vec<Para> {
-    paras
-        .iter()
-        .map(|para| {
-            let mut spans = tidy(&para.spans);
-            while let Some(first) = spans.first_mut() {
-                let trimmed = first.text.trim_start_matches('\n').len();
-                first.text.drain(..first.text.len() - trimmed);
-                if !first.text.is_empty() {
-                    break;
-                }
-                spans.remove(0);
-            }
-            while let Some(last) = spans.last_mut() {
-                let kept = last.text.trim_end_matches('\n').len();
-                last.text.truncate(kept);
-                if !last.text.is_empty() {
-                    break;
-                }
-                spans.pop();
-            }
-            Para { kind: para.kind, spans }
-        })
-        .filter(|para| !(para.kind == ParaKind::Body && para.spans.is_empty()))
-        .collect()
+    paras.iter().map(|para| Para { kind: para.kind, spans: tidy(&para.spans) }).collect()
 }
 
 /// The edits that turn `flow`, a flow of slide `slide` as [`text_flows`] reads it now, into
@@ -123,13 +100,15 @@ enum Escapes {
 struct Ways {
     forms: &'static [Form],
     escapes: &'static [Escapes],
+    /// What's written where text must be and there's none.
+    nothing: &'static str,
 }
 
 /// The plainest way that reads back alone first.
-const PLAIN: Ways = Ways { forms: &[Form::Marks, Form::Tags], escapes: &[Escapes::Least, Escapes::Safe] };
+const PLAIN: Ways = Ways { forms: &[Form::Marks, Form::Tags], escapes: &[Escapes::Least, Escapes::Safe], nothing: NOTHING };
 /// The way that depends least on what's around it, for when the plainest doesn't read back
 /// where it's put.
-const GUARDED: Ways = Ways { forms: &[Form::Tags], escapes: &[Escapes::Safe] };
+const GUARDED: Ways = Ways { forms: &[Form::Tags], escapes: &[Escapes::Safe], nothing: NOTHING_AFTER_ANYTHING };
 
 /// What a paragraph's content is tried out in, to see that it reads back.
 #[derive(Clone, Copy)]
@@ -146,7 +125,7 @@ fn inline_for(spans: &[Span], probe: Probe, ctx: &Inline, ways: Ways) -> Option<
     ways.forms
         .iter()
         .flat_map(|form| ways.escapes.iter().map(move |escapes| (*form, *escapes)))
-        .map(|(form, escapes)| render(spans, ctx, form, escapes))
+        .map(|(form, escapes)| render(spans, ctx, form, escapes, ways.nothing))
         .find(|text| reads_back(text, spans, probe, ctx.eol))
 }
 
@@ -164,17 +143,28 @@ fn reads_back(text: &str, spans: &[Span], probe: Probe, eol: &str) -> bool {
         && matches!(flows.as_slice(), [flow] if matches!(flow.paras.as_slice(), [para] if para.spans == spans))
 }
 
-/// Spans with the empty ones dropped and neighbours of the same style merged, as they read.
+/// Spans as they read: line endings made `\n`, the empty ones dropped, and neighbours of
+/// the same style merged.
 fn tidy(spans: &[Span]) -> Vec<Span> {
     let mut out: Vec<Span> = Vec::with_capacity(spans.len());
-    for span in spans.iter().filter(|span| !span.text.is_empty()) {
+    for span in spans {
+        let text = span.text.replace("\r\n", "\n").replace('\r', "\n");
+        if text.is_empty() {
+            continue;
+        }
         match out.last_mut() {
-            Some(last) if last.style == span.style => last.text.push_str(&span.text),
-            _ => out.push(span.clone()),
+            Some(last) if last.style == span.style => last.text.push_str(&text),
+            _ => out.push(Span { text, style: span.style.clone() }),
         }
     }
     out
 }
+
+/// Something that's read as text, and holds none: an empty tag in marks, as a line holding
+/// only a tag is read as a block of its own.
+const NOTHING: &str = "**<Text></Text>**";
+/// The same, for where `**` can't open, as straight after a byte order mark.
+const NOTHING_AFTER_ANYTHING: &str = "<Text></Text>**<Text></Text>**";
 
 /// Where `spans[from]`'s run of spans that `same` holds for ends.
 fn run_end(spans: &[Span], from: usize, same: impl Fn(&Span, &Span) -> bool) -> usize {
@@ -182,9 +172,9 @@ fn run_end(spans: &[Span], from: usize, same: impl Fn(&Span, &Span) -> bool) -> 
 }
 
 /// The content for `spans` in `form`.
-fn render(spans: &[Span], ctx: &Inline, form: Form, escapes: Escapes) -> String {
+fn render(spans: &[Span], ctx: &Inline, form: Form, escapes: Escapes, nothing: &str) -> String {
     let text: String = spans.iter().map(|span| span.text.as_str()).collect();
-    let mut writer = Writer { out: String::new(), ctx, escapes, edge: edge_whitespace(&text), at: 0, line_start: true, leading_digits: false };
+    let mut writer = Writer { out: String::new(), ctx, escapes, nothing, edge: edge_whitespace(&text), at: 0, line_start: true, leading_digits: false };
     let mut index = 0;
     while index < spans.len() {
         match form {
@@ -204,7 +194,7 @@ fn render(spans: &[Span], ctx: &Inline, form: Form, escapes: Escapes) -> String 
                     let Style { bold, italic, underline, ref color, size, .. } = span.style;
                     let attrs = text_attrs(bold, italic, underline, color.as_deref(), size);
                     writer.raw_open(&attrs);
-                    writer.content(span, wrapped || !attrs.is_empty());
+                    writer.content(span, wrapped || !attrs.is_empty(), false);
                     writer.raw_close(&attrs);
                 });
                 index = end;
@@ -256,6 +246,8 @@ struct Writer<'a> {
     out: String,
     ctx: &'a Inline<'a>,
     escapes: Escapes,
+    /// What's written where text must be and there's none.
+    nothing: &'a str,
     edge: Vec<bool>,
     /// Where in the paragraph's text the next character is.
     at: usize,
@@ -315,23 +307,26 @@ impl Writer<'_> {
         if !marker.is_empty() {
             self.raw(marker);
         }
-        self.content(span, wrapped || !marker.is_empty());
+        self.content(span, wrapped || !marker.is_empty(), !marker.is_empty());
         if !marker.is_empty() {
             self.raw(marker);
         }
     }
 
     /// A span's text, as code or as escaped text. `wrapped` says whether something closes
-    /// after it, which a line can't start with.
-    fn content(&mut self, span: &Span, wrapped: bool) {
+    /// after it, and `in_marks` whether that's `*` or `**`.
+    fn content(&mut self, span: &Span, wrapped: bool, in_marks: bool) {
         if span.style.code {
             self.code(&span.text);
         } else {
             self.text(&span.text);
         }
-        if wrapped && span.text.ends_with('\n') {
-            // A line can't start by closing what's open, so something empty goes first.
-            self.raw("<Text></Text>");
+        let at_the_end = self.at == self.edge.len();
+        if span.text.ends_with('\n') && (wrapped || at_the_end) {
+            // A line can't start by closing what's open, and one with nothing on it would
+            // end the paragraph, so something empty goes on it. Alone, or before a closing
+            // tag, an empty tag would be read as a block of its own, so it's put in marks.
+            self.raw(if in_marks { "<Text></Text>" } else { self.nothing });
         }
     }
 
@@ -552,7 +547,7 @@ fn level_of(kind: ParaKind) -> Option<u8> {
 }
 
 /// Whether a list of these paragraphs can be written at all: every item has the item it
-/// sits in just before it, an empty item holds no other, and there's no empty body text.
+/// sits in just before it, and an empty item holds no other.
 fn writable(paras: &[Para]) -> bool {
     paras.iter().enumerate().all(|(index, para)| {
         let before = index.checked_sub(1).map(|i| &paras[i]);
@@ -562,12 +557,11 @@ fn writable(paras: &[Para]) -> bool {
             (Some(level), Some((above, above_empty))) => level <= above + u8::from(!above_empty),
             (None, _) => true,
         };
-        let ends_in_a_break = para.spans.last().is_some_and(|span| span.text.ends_with('\n'));
         let heading_fits = match para.kind {
             ParaKind::Heading(level) => (1..=6).contains(&level),
             _ => true,
         };
-        fits && heading_fits && !ends_in_a_break && !(para.kind == ParaKind::Body && para.spans.is_empty())
+        fits && heading_fits
     })
 }
 
@@ -608,13 +602,14 @@ struct Look {
 /// How each of `new`'s list items is written. Items that `from_old` gives a shape for keep
 /// it. Others take the indentation and marker of the item before them at their level, or
 /// the text column of the item they're in, and run on the numbering, but keep the marker
-/// `old_marker` gives them, if any. `start` gives the number a numbered item starts a list with.
+/// of the shape `old_shape` gives them, if any, and its spacing too where they're at its
+/// column. `start` gives the number a numbered item starts a list with.
 fn shapes(
     new: &[Para],
     base: &str,
     look: &Look,
     from_old: impl Fn(usize) -> Option<Option<Shape>>,
-    old_marker: impl Fn(usize) -> Option<Marker>,
+    old_shape: impl Fn(usize) -> Option<Shape>,
     start: impl Fn(usize) -> Option<u64>,
 ) -> Option<Vec<Option<Shape>>> {
     let mut shapes: Vec<Option<Shape>> = Vec::with_capacity(new.len());
@@ -636,11 +631,14 @@ fn shapes(
             (indent, marker)
         };
         let mut found = None;
+        // Whether the item runs on a list from the item before it at its level.
+        let mut runs_on = false;
         for back in (0..index).rev() {
             let (Some(above), Some(shape)) = (level_of(new[back].kind), shapes[back].as_ref()) else { break };
             if above > level {
                 continue;
             }
+            runs_on = above == level && new[back].kind == para.kind;
             found = Some(if above == level {
                 match (&shape.marker, numbered, new[back].kind == para.kind) {
                     (Marker::Number(n, delim), true, true) => (shape.indent.clone(), Marker::Number(n + 1, *delim)),
@@ -659,10 +657,23 @@ fn shapes(
             None if level == 0 => fresh(base.to_string()),
             None => return None,
         };
-        match (old_marker(index), numbered) {
-            (Some(Marker::Number(n, delim)), true) => marker = Marker::Number(if tight && n != 1 { 1 } else { n }, delim),
-            (Some(Marker::Bullet(c)), false) => marker = Marker::Bullet(c),
+        let old = old_shape(index);
+        let mut kept = false;
+        match old.as_ref().map(|old| &old.marker) {
+            // A list that starts straight under an item's line is only read as one from 1.
+            Some(Marker::Number(n, delim)) if numbered => {
+                kept = runs_on || !tight || *n == 1;
+                marker = Marker::Number(if kept { *n } else { 1 }, *delim);
+            }
+            Some(Marker::Bullet(c)) if !numbered => {
+                kept = true;
+                marker = Marker::Bullet(*c);
+            }
             _ => {}
+        }
+        if let Some(old) = old.filter(|old| kept && old.indent == indent) {
+            shapes.push(Some(old));
+            continue;
         }
         let content = format!("{indent}{}", " ".repeat(marker.text().len() + 1));
         shapes.push(Some(Shape { indent, marker, content }));
@@ -688,7 +699,7 @@ fn block_text(para: &Para, shape: Option<&Shape>, src: &Source, keep: Option<&st
         None => inline_for(&para.spans, probe, &Inline { heading, indent, eol: src.eol }, src.ways),
     };
     match para.kind {
-        ParaKind::Body if para.spans.is_empty() => None,
+        ParaKind::Body if para.spans.is_empty() => Some(src.ways.nothing.to_string()),
         ParaKind::Body => inline(Probe::Body, false, &src.base),
         ParaKind::Heading(level) => {
             let hashes = "#".repeat(usize::from(level));
@@ -711,7 +722,9 @@ fn block_text(para: &Para, shape: Option<&Shape>, src: &Source, keep: Option<&st
             if para.spans.is_empty() {
                 return Some(marker);
             }
-            Some(format!("{marker} {}", inline(Probe::Item, false, &shape.content)?))
+            // The spaces between the marker and the text, as the shape has them.
+            let spaces = shape.content.len().saturating_sub(shape.indent.len() + marker.len()).clamp(1, 4);
+            Some(format!("{marker}{}{}", " ".repeat(spaces), inline(Probe::Item, false, &shape.content)?))
         }
     }
 }
@@ -892,7 +905,7 @@ fn whole_change(src: &Source, flow: &TextFlow, new: &[Para], origin: &[Origin]) 
     }
     let look = look_of(src, flow);
     let keeps_marker = |j: usize| match origin[j] {
-        Origin::Kept(i) | Origin::Paired(i) if flow.paras[i].kind == new[j].kind => old_shape(src, flow, i).map(|shape| shape.marker),
+        Origin::Kept(i) | Origin::Paired(i) if flow.paras[i].kind == new[j].kind => old_shape(src, flow, i),
         _ => None,
     };
     let shapes = shapes(new, &src.base, &look, |_| None, keeps_marker, |j| old_number(src, flow, origin[j]))?;
@@ -1041,11 +1054,14 @@ fn region_change(talk: &Talk, index: usize, region: &str, paras: &[Para]) -> Opt
         return None;
     }
     let new = storable(paras);
+    let (regions, main) = layout_of(slide);
+    if !regions.contains(&region) || has_content(slide, region) {
+        return None;
+    }
     if new.is_empty() {
         return Some(Change { edits: Vec::new() });
     }
-    let (regions, main) = layout_of(slide);
-    if !regions.contains(&region) || has_content(slide, region) || !writable(&new) {
+    if !writable(&new) {
         return None;
     }
     if region == "title" && !matches!(new.as_slice(), [Para { kind: ParaKind::Heading(_), .. }]) {

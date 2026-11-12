@@ -301,33 +301,67 @@ fn a_refusal_is_not_an_empty_change() {
     let same = write_flow(&talk, 0, flow, &flow.paras.clone());
     assert_eq!(same, Some(Change { edits: Vec::new() }));
     assert_eq!(write_flow(&talk, 0, flow, &[para(ParaKind::Bullet { level: 3 }, "x")]), None);
-    assert_eq!(write_into_region(&talk, 0, "body", &[Para { kind: BODY, spans: vec![] }]), Some(Change { edits: Vec::new() }));
+    // The body has text already.
     assert_eq!(write_into_region(&talk, 0, "body", &[para(BODY, "x")]), None);
+    assert_eq!(write_into_region(&talk, 0, "body", &[]), None);
+    let bare = parse_talk("# T
+");
+    assert_eq!(write_into_region(&bare, 0, "body", &[]), Some(Change { edits: Vec::new() }));
+}
+
+#[test]
+fn nothing_goes_into_a_region_the_layout_lacks() {
+    let talk = parse_talk("# T
+");
+    assert_eq!(write_into_region(&talk, 0, "nowhere", &[]), None);
+    assert_eq!(write_into_region(&talk, 0, "nowhere", &[para(BODY, "x")]), None);
 }
 
 #[test]
 fn enter_at_the_end_of_a_paragraph_is_not_refused() {
     let source = "# T\n\na\n";
-    let talk = parse_talk(source);
-    let flow = &text_flows(&talk, 0)[1];
-    let change = write_flow(&talk, 0, flow, &[para(BODY, "a"), Para { kind: BODY, spans: vec![] }]);
-    assert_eq!(change, Some(Change { edits: Vec::new() }));
-    assert_eq!(storable(&[para(BODY, "a"), Para { kind: BODY, spans: vec![] }]), [para(BODY, "a")]);
-    // An empty bullet and an empty heading are kept: a marker alone reads back as one.
+    let paras = [para(BODY, "a"), Para { kind: BODY, spans: vec![] }];
+    assert_eq!(storable(&paras), paras);
+    let (after, flows) = written(source, 0, 1, &paras);
+    assert_eq!(after, "# T\n\na\n\n**<Text></Text>**\n");
+    assert_eq!(flows[1].paras, paras);
+    // Typing into the empty paragraph.
+    let (after, flows) = written(&after, 0, 1, &[para(BODY, "a"), para(BODY, "b")]);
+    assert_eq!(after, "# T\n\na\n\nb\n");
+    assert_eq!(flows[1].paras, [para(BODY, "a"), para(BODY, "b")]);
+    // An empty bullet and an empty heading are a marker alone.
     let (after, flows) = written(source, 0, 1, &[para(BODY, "a"), Para { kind: BULLET, spans: vec![] }, Para { kind: ParaKind::Heading(2), spans: vec![] }]);
     assert_eq!(after, "# T\n\na\n\n-\n\n##\n");
     assert_eq!(flows[1].paras.len(), 3);
 }
 
 #[test]
-fn a_break_at_the_end_is_dropped() {
+fn a_flow_of_empty_paragraphs_reads_back() {
+    let empty = Para { kind: BODY, spans: vec![] };
+    let paras = [empty.clone(), empty.clone(), empty];
+    let (after, flows) = written("# T\n\nWords.\n\n---\n\n# Next\n", 0, 1, &paras);
+    assert_eq!(flows[1].paras, paras, "{after:?}");
+    assert!(after.ends_with("\n\n---\n\n# Next\n"));
+}
+
+#[test]
+fn a_break_at_the_end_reads_back() {
     let source = "# T\n\nOld.\n";
-    let asked = [Para { kind: BODY, spans: vec![plain("\nwords"), styled("bold\n", bold())] }, para(BULLET, "\n\n")];
-    let stored = [Para { kind: BODY, spans: vec![plain("words"), styled("bold", bold())] }, Para { kind: BULLET, spans: vec![] }];
-    assert_eq!(storable(&asked), stored);
-    let (after, flows) = written(source, 0, 1, &asked);
-    assert_eq!(after, "# T\n\nwords**bold**\n\n-\n");
-    assert_eq!(flows[1].paras, stored);
+    let cases = [
+        vec![para(BODY, "a\n")],
+        vec![para(BODY, "\n")],
+        vec![para(BODY, "\n\na\n\n")],
+        vec![Para { kind: BODY, spans: vec![plain("\nwords"), styled("bold\n", bold())] }],
+        vec![Para { kind: BODY, spans: vec![styled("red\n", Style { color: Some("red".into()), ..Style::default() })] }],
+        vec![Para { kind: BODY, spans: vec![styled("linked\n", Style { link: Some("x.md".into()), ..Style::default() })] }],
+        vec![para(BODY, "x"), para(BULLET, "item\n"), para(NUMBERED, "\n")],
+        vec![para(ParaKind::Heading(2), "two\n")],
+    ];
+    for paras in cases {
+        let (after, flows) = written(source, 0, 1, &paras);
+        assert_eq!(flows[1].paras, paras, "{after:?}");
+    }
+    assert_eq!(written(source, 0, 1, &[para(BODY, "a\n")]).0, "# T\n\na\\\n**<Text></Text>**\n");
 }
 
 #[test]
@@ -341,7 +375,8 @@ fn all_the_text_can_be_deleted() {
     ] {
         let talk = parse_talk(source);
         let flows = text_flows(&talk, slide);
-        for paras in [vec![], vec![Para { kind: BODY, spans: vec![plain("\n")] }]] {
+        {
+            let paras: Vec<Para> = Vec::new();
             let change = write_flow(&talk, slide, &flows[flow], &paras).unwrap_or_else(|| panic!("refused {source:?}"));
             let after = change.apply(source);
             assert_eq!(after, expected);
@@ -362,6 +397,40 @@ fn untouched_items_keep_their_markers_when_the_list_is_written_again() {
     let after = write_flow(&talk, 0, flow, &paras).unwrap().apply(source);
     assert_eq!(after, "# T\n\n1) one\n   - inner\n     1. deep\n\ntwo\n");
     assert_eq!(text_flows(&parse_talk(&after), 0)[1].paras, paras);
+}
+
+/// `source`'s body flow with item `which` made a body paragraph.
+fn made_body(source: &str, which: usize) -> String {
+    let talk = parse_talk(source);
+    let flows = text_flows(&talk, 0);
+    let at = flow_in(&flows, "body");
+    let mut paras = flows[at].paras.clone();
+    paras[which].kind = BODY;
+    let after = write_flow(&talk, 0, &flows[at], &paras).expect("written").apply(source);
+    assert_eq!(text_flows(&parse_talk(&after), 0)[at].paras, paras, "{after:?}");
+    after
+}
+
+#[test]
+fn untouched_numbers_stay_as_they_were() {
+    assert_eq!(made_body("# T\n\n1. a\n2. b\n3. c\n4. d\n", 3), "# T\n\n1. a\n2. b\n3. c\n\nd\n");
+}
+
+#[test]
+fn untouched_numbers_after_a_nested_list_stay_as_they_were() {
+    let source = "# T\n\n1) one\n   - inner\n     1. deep\n2) two\n3) three\n";
+    assert_eq!(made_body(source, 4), "# T\n\n1) one\n   - inner\n     1. deep\n2) two\n\nthree\n");
+}
+
+#[test]
+fn untouched_numbers_from_ten_stay_as_they_were() {
+    assert_eq!(made_body("# T\n\n10) ten\n11) eleven\n12) twelve\n", 2), "# T\n\n10) ten\n11) eleven\n\ntwelve\n");
+}
+
+#[test]
+fn an_untouched_items_spacing_stays() {
+    assert_eq!(made_body("# T\n\n-   wide\n-   wider\n- last\n", 2), "# T\n\n-   wide\n-   wider\n\nlast\n");
+    assert_eq!(made_body("# T\n\n1.  one\n    - in\n2.  two\n", 2), "# T\n\n1.  one\n    - in\n\ntwo\n");
 }
 
 #[test]
@@ -423,8 +492,7 @@ fn spans() -> impl Strategy<Value = Vec<Span>> {
 
 /// Kinds and spans made into paragraphs the editor could hold: no line break in code, a
 /// heading of several lines only at level 1 or 2, and each item no deeper than the one
-/// before it allows, once what can't be stored is dropped. Empty body paragraphs and line
-/// breaks at the ends are left in, for `storable` to drop.
+/// before it allows. Empty paragraphs and line breaks at the start and end are in.
 fn paras() -> impl Strategy<Value = Vec<Para>> {
     let kind = prop_oneof![
         3 => Just(BODY),
@@ -449,9 +517,7 @@ fn paras() -> impl Strategy<Value = Vec<Para>> {
                 span.text = span.text.replace('\n', "");
             }
             let para = Para { kind, spans };
-            if let [stored] = storable(std::slice::from_ref(&para)).as_slice() {
-                kept = Some(stored.clone());
-            }
+            kept = storable(std::slice::from_ref(&para)).pop();
             out.push(para);
         }
         out
