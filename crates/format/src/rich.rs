@@ -64,7 +64,7 @@ const ODD_LIST: &str = "This list can't be edited on the slide yet.";
 const UNREADABLE: &str = "This slide couldn't be read, so its text can't be edited.";
 
 /// The deepest a list can nest and still be edited.
-const MAX_LEVEL: u8 = 8;
+pub(crate) const MAX_LEVEL: u8 = 8;
 
 /// The tags that draw their text as a box of its own when they're given a place.
 const TEXT_BOXES: [&str; 3] = ["Text", "Box", "Shape"];
