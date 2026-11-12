@@ -7015,6 +7015,7 @@ dependencies = [
  "tempfile",
  "tiny-skia",
  "toolkit",
+ "unicode-segmentation",
  "wat",
  "zip",
 ]

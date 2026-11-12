@@ -249,7 +249,7 @@ fn a_shape_is_built_without_naming_its_fields() {
 
 #[test]
 fn the_names_kept_for_the_slide_cover_its_placement() {
-    for name in ["x", "y", "w", "h", "rotate", "click", "enter", "z", "opacity", "id", "class", "style", "exit", "key", "ref", "slot"] {
+    for name in ["x", "y", "w", "h", "rotate", "click", "enter", "align", "z", "opacity", "id", "class", "style", "exit", "key", "ref", "slot"] {
         assert!(toolkit::RESERVED_NAMES.contains(&name), "{name}");
     }
 }

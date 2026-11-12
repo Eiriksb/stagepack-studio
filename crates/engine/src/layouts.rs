@@ -3,6 +3,7 @@
 use crate::{Align, Rect};
 
 /// A named place on the slide, and how text in it looks.
+#[derive(Clone, Copy)]
 pub struct RegionDef {
     pub name: &'static str,
     pub rect: Rect,

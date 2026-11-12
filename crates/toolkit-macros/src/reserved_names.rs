@@ -3,5 +3,5 @@
 // `#[component]` and `toolkit::RESERVED_NAMES` both include this file, so the list is
 // written once.
 [
-    "x", "y", "w", "h", "rotate", "click", "enter", "z", "opacity", "id", "class", "style", "exit", "key", "ref", "slot",
+    "x", "y", "w", "h", "rotate", "click", "enter", "align", "z", "opacity", "id", "class", "style", "exit", "key", "ref", "slot",
 ]
