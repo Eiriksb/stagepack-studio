@@ -28,6 +28,10 @@ impl WorkspaceView {
         let Some(document) = self.document.clone() else {
             return;
         };
+        // What's typed on the slide is in the talk; only what typing left empty is tidied.
+        if document.read(cx).text().is_some() {
+            self.edit(Document::end_text, cx);
+        }
         let before = document.read(cx).current();
         document.update(cx, |document, _| step(document));
         if document.read(cx).current() == before {
@@ -81,7 +85,7 @@ impl WorkspaceView {
 
     /// Brings what shows the talk up to date after an edit. A "Saved" on the status line no
     /// longer holds, so it goes.
-    fn edited(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn edited(&mut self, cx: &mut Context<Self>) {
         self.clear_fading_status(cx);
         let Some(document) = &self.document else {
             return;
@@ -203,6 +207,14 @@ impl WorkspaceView {
                         .size_full()
                         .p_4()
                         .bg(cx.theme().muted)
+                        // A click on the desk ends typing on the slide.
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.slide_editor
+                                    .update(cx, |editor, cx| editor.stop_typing(window, cx))
+                            }),
+                        )
                         .child(canvas)
                         .child(
                             v_flex()

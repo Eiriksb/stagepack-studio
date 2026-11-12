@@ -342,6 +342,13 @@ impl TextLayout {
         &self.paras
     }
 
+    /// Where the empty region `region` is, in slide units before its turn, and the degrees it
+    /// turns by around its centre: for a caret in it before it holds any text.
+    pub fn placeholder(&self, region: &str) -> Option<(Rect, f32)> {
+        let (_, rect, frame) = self.placeholders.iter().find(|(name, ..)| name == region)?;
+        Some((*rect, frame.rotate))
+    }
+
     fn find(&self, flow: usize, para: usize) -> Option<usize> {
         self.paras.iter().position(|placed| placed.flow == flow && placed.para == para)
     }

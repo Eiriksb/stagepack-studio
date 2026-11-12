@@ -5,6 +5,8 @@ use std::collections::VecDeque;
 
 use slides_format::{Change, SourceEdit};
 
+use crate::text_editing::TextMark;
+
 /// The most steps kept.
 const MAX_STEPS: usize = 1_000;
 /// The most bytes of edit text kept, over all the steps.
@@ -15,6 +17,8 @@ const MAX_BYTES: usize = 64 * 1024 * 1024;
 pub struct Step {
     pub change: Change,
     pub current: usize,
+    /// Where the step's text was typed, if it was typed on a slide.
+    pub mark: Option<TextMark>,
 }
 
 struct Entry {
@@ -25,6 +29,8 @@ struct Entry {
     before: usize,
     /// The slide to show once it's done again.
     after: usize,
+    /// Where its text was typed, if it was typed on a slide.
+    mark: Option<TextMark>,
 }
 
 impl Entry {
@@ -113,6 +119,7 @@ impl History {
             change: undo,
             before,
             after,
+            mark: None,
         };
         self.bytes += entry.bytes();
         self.undo.push_back(entry);
@@ -152,6 +159,19 @@ impl History {
         true
     }
 
+    /// Notes where the newest step's text was typed, so that undoing or redoing it goes back
+    /// to typing there.
+    pub fn mark_last(&mut self, mark: TextMark) {
+        if let Some(last) = self.undo.back_mut() {
+            last.mark = Some(mark);
+        }
+    }
+
+    /// Where the newest step's text was typed, if it was typed on a slide.
+    pub fn last_mark_mut(&mut self) -> Option<&mut TextMark> {
+        self.undo.back_mut().and_then(|entry| entry.mark.as_mut())
+    }
+
     /// Whether `run` is open, so that edits can still join it.
     pub fn is_open(&self, run: RunId) -> bool {
         self.run == Some(run)
@@ -182,9 +202,10 @@ impl History {
         entry.change = change.inverse(source);
         self.bytes += entry.bytes();
         let current = entry.before;
+        let mark = entry.mark.clone();
         self.redo.push(entry);
         self.trim();
-        Some(Step { change, current })
+        Some(Step { change, current, mark })
     }
 
     /// Makes the last step undone again. `source` is the talk's text now.
@@ -196,9 +217,10 @@ impl History {
         entry.change = change.inverse(source);
         self.bytes += entry.bytes();
         let current = entry.after;
+        let mark = entry.mark.clone();
         self.undo.push_back(entry);
         self.trim();
-        Some(Step { change, current })
+        Some(Step { change, current, mark })
     }
 
     pub fn can_undo(&self) -> bool {

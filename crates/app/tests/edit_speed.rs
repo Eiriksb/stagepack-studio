@@ -4,6 +4,7 @@
 use std::time::{Duration, Instant};
 
 use slides_engine::Fonts;
+use slides_format::{FlowPlace, Pos, text_flows};
 use stagepack_studio::document::Document;
 
 const SLIDES: usize = 500;
@@ -31,6 +32,54 @@ fn long_talk() -> String {
     talk
 }
 
+fn report(what: &str, mut times: Vec<Duration>) {
+    times.sort();
+    let median = times[times.len() / 2];
+    println!(
+        "median {what} on a {SLIDES}-slide talk: {median:?} (slowest {:?})",
+        times.last().unwrap()
+    );
+    assert!(median < MOST, "a keystroke took {median:?}");
+}
+
+/// A letter typed on a slide: written to the talk, read back, and the slide's text laid out
+/// again for its caret, as the window does before it draws.
+#[test]
+#[ignore = "timing; run in release"]
+fn a_keystroke_typed_on_a_slide_of_a_long_talk_is_quick() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("slides.md"), long_talk()).unwrap();
+    let mut doc = Document::open(dir.path(), Fonts::bundled_only()).unwrap();
+    let slide = SLIDES / 2;
+    doc.select(slide);
+    let flows = text_flows(doc.talk(), slide);
+    let body = flows
+        .iter()
+        .position(|flow| flow.place == FlowPlace::Region("body".into()))
+        .expect("the slide has words");
+    let words: usize = flows[body].paras[0].spans.iter().map(|span| span.text.len()).sum();
+    assert!(doc.begin_text(slide, body, Pos { para: 0, offset: words }));
+    // The slide is showing, so it's laid out already.
+    doc.text_layout(slide);
+
+    let mut times = Vec::with_capacity(KEYSTROKES);
+    for key in 0..KEYSTROKES {
+        let letter = if key % 6 == 5 { " " } else { "a" };
+        let start = Instant::now();
+        doc.apply_text(|edit| edit.insert(letter)).unwrap();
+        let head = doc.text().unwrap().edit.selection.head;
+        let layout = doc.text_layout(slide);
+        assert!(layout.caret(body, head).is_some());
+        times.push(start.elapsed());
+    }
+    let typed: String = (0..KEYSTROKES).map(|key| if key % 6 == 5 { ' ' } else { 'a' }).collect();
+    let flows = text_flows(doc.talk(), slide);
+    let text: String = flows[body].paras[0].spans.iter().map(|span| span.text.as_str()).collect();
+    assert!(text.ends_with(typed.trim_end()), "{text}");
+    assert_eq!(doc.undo_label(), Some("Typing"));
+    report("keystroke typed on a slide", times);
+}
+
 #[test]
 #[ignore = "timing; run in release"]
 fn a_keystroke_on_a_long_talk_is_quick() {
@@ -49,12 +98,5 @@ fn a_keystroke_on_a_long_talk_is_quick() {
         times.push(start.elapsed());
     }
     assert_eq!(doc.notes_of(slide).as_deref(), Some(notes.trim_end()));
-
-    times.sort();
-    let median = times[times.len() / 2];
-    println!(
-        "median keystroke on a {SLIDES}-slide talk: {median:?} (slowest {:?})",
-        times.last().unwrap()
-    );
-    assert!(median < MOST, "a keystroke took {median:?}");
+    report("keystroke in the notes", times);
 }

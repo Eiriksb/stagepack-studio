@@ -34,6 +34,7 @@ use crate::ribbon::{Panels, Ribbon};
 use crate::save_flow::{CloseAnswer, Effect, SaveFlow, SaveOutcome};
 use crate::saving::{SaveError, SaveJob, SaveTarget, Saved};
 use crate::slide_canvas::{ScaleChanged, SlideCanvas};
+use crate::slide_editor::{self, EditorEvent, SlideEditor};
 use crate::slide_strip::{
     self, STRIP_CONTEXT, STRIP_MAX_WIDTH, STRIP_MIN_WIDTH, STRIP_WIDTH, SlideStrip,
 };
@@ -200,6 +201,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-f5", Rehearse, Some(KEY_CONTEXT)),
     ]);
     slide_strip::bind_keys(cx);
+    slide_editor::bind_keys(cx);
     present_view::bind_keys(cx);
 }
 
@@ -243,6 +245,8 @@ pub struct WorkspaceView {
     problem: Option<SharedString>,
     stagepack_offer: Option<StagepackOffer>,
     slide_canvas: Entity<SlideCanvas>,
+    /// The slide as it's typed on, over the canvas.
+    slide_editor: Entity<SlideEditor>,
     notices: Vec<String>,
     /// What came of the last thing asked of the File or Export menu.
     status: Option<SharedString>,
@@ -302,6 +306,7 @@ pub struct WorkspaceView {
     _scale_changed: Subscription,
     _document_changed: Option<Subscription>,
     _notes_edited: Subscription,
+    _editor_events: Subscription,
     _working_copies_changed: Subscription,
     _keep_failed: Subscription,
 }
@@ -380,6 +385,15 @@ impl WorkspaceView {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
         let document = document.map(|document| cx.new(|_| document));
+        let slide_editor = cx.new(|cx| {
+            let canvas = slide_canvas.clone();
+            SlideEditor::new(document.clone(), canvas, focus_handle.clone(), window, cx)
+        });
+        let editor_events =
+            cx.subscribe(&slide_editor, |this, _, event: &EditorEvent, cx| match event {
+                EditorEvent::Edited => this.edited(cx),
+                EditorEvent::Said(said) => this.say(said.clone(), cx),
+            });
         let panels = Panels {
             notes: true,
             slide_list: true,
@@ -435,6 +449,7 @@ impl WorkspaceView {
             problem,
             stagepack_offer: None,
             slide_canvas,
+            slide_editor,
             notices,
             status: None,
             status_fading: None,
@@ -469,6 +484,7 @@ impl WorkspaceView {
             _scale_changed: scale_changed,
             _document_changed: document_changed,
             _notes_edited: notes_edited,
+            _editor_events: editor_events,
             _working_copies_changed: working_copies_changed,
             _keep_failed: keep_failed,
         };
@@ -522,6 +538,10 @@ impl WorkspaceView {
         &self.slide_canvas
     }
 
+    pub fn slide_editor(&self) -> &Entity<SlideEditor> {
+        &self.slide_editor
+    }
+
     pub fn ribbon(&self) -> &Entity<Ribbon> {
         &self.ribbon
     }
@@ -569,7 +589,7 @@ impl WorkspaceView {
         let (notices, layers) = document.update(cx, |document, _| {
             (
                 document.notices(),
-                scale.map(|scale| document.layers(scale)),
+                scale.map(|scale| document.editor_layers(scale)),
             )
         });
         self.notices = notices;
@@ -1144,7 +1164,7 @@ impl Render for WorkspaceView {
             .relative()
             .size_full()
             .bg(cx.theme().muted)
-            .child(self.slide_canvas.clone())
+            .child(self.slide_editor.clone())
             .when_some(self.problem.clone(), |this, problem| {
                 this.child(
                     v_flex()

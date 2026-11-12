@@ -625,8 +625,14 @@ fn arrow_keys_in_the_notes_field_do_not_change_slide(cx: &mut TestAppContext) {
         keys(cx, handle, key);
         assert_eq!(current(cx, &view), 1, "{key}");
     }
-    // The canvas has them again once it's clicked.
-    click(cx, handle, CANVAS_ID);
+    // The slide has them again once the desk around it is clicked: a click on the slide itself
+    // types there.
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click_at(CANVAS_ID, point(px(1.), px(1.)), cx);
+    })
+    .unwrap();
+    settle(cx, handle);
     keys(cx, handle, "right");
     assert_eq!(current(cx, &view), 2);
 }
