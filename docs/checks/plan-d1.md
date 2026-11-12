@@ -1,19 +1,19 @@
 # Plan D1: what ran, and what to check by hand
 
-The run was on the `plan-d1` branch, starting from commit 178099c, on a 16-core Linux laptop, with Rust 1.98.0, in a release build, on 2026-11-11. It found five things to fix, each fixed in its own commit with a test, and the run was repeated in part on the release build with the fixes, at bf56d1e. The tests were run at c285066. The branch hasn't been pushed or merged yet. Nothing here has run on Windows.
+The run was on the `plan-d1` branch, starting from commit 178099c, on a 16-core Linux laptop, with Rust 1.98.0, in a release build, on 2026-11-11. It found five things to fix, each fixed in its own commit with a test, and the run was repeated in part on the release build with the fixes, at bf56d1e. The whole-branch review that followed asked for one wave of fixes, made at e1a5fb0 to 25926ff, and the tests were run again at 25926ff (see *The final review* below). The branch hasn't been pushed or merged yet. Nothing here has run on Windows.
 
 ## Tests on Linux
 
-At c285066, `scripts/cargo-safe.sh test --workspace` passed: 1,108 tests, 0 failed, 8 ignored, no warnings. `scripts/cargo-safe.sh clippy --workspace --all-targets` gave no warnings.
+At 25926ff, `scripts/cargo-safe.sh test --workspace` passed: 1,136 tests, 0 failed, 8 ignored, no warnings. `scripts/cargo-safe.sh clippy --workspace --all-targets` gave no warnings.
 
 | Crate | Tests |
 | --- | --- |
 | slides-components | 64, and 5 ignored (sandbox 36, source_check 19, compile 4 and 4 ignored, examples 2 and 1 ignored, unit 3) |
 | slides-engine | 398, and 1 ignored (builtins 85, packed 49, native 45, talk_components 42, chart 39 and 1 ignored, deck 39, flow 29, moments 15, timeline 13, files 12, canvas 11, render 11, text 8) |
-| slides-format | 92 (parse 35, slide_ops 32, edit 18, split 7) |
+| slides-format | 94 (parse 35, slide_ops 34, edit 18, split 7) |
 | slides-pdf | 20 (pdf 16, unit 4) |
 | slides-pptx | 108 (elements 36, write 32, parts 20, timing 10, fonts 9, unit 1) |
-| stagepack-studio (app) | 380, and 2 ignored (ui_slides 80, document_state 53, ui_present 50, ui_editor 41, present 33, recovery 31, builds 26 and 2 ignored, saving 19, export 16, watcher 15, history 12, unit 3, ui_layout 1) |
+| stagepack-studio (app) | 406, and 2 ignored (ui_slides 85, document_state 54, ui_present 50, ui_editor 48, recovery 34, present 33, builds 26 and 2 ignored, saving 24, export 16, history 16, watcher 15, unit 3, edit_panics 1, ui_layout 1) |
 | toolkit | 46 (component 24, interface_v1 20, doc 2) |
 | toolkit-macros | 0 |
 
@@ -67,6 +67,19 @@ A generated talk of 500 slides, each with a title, a list or a box, and notes, a
 - **Scrolling the list:** 800 wheel clicks in 4.5 s went from the top to slide 500. Halfway down, the rows showed their numbers and grey frames, with their pictures drawn a moment later. At the bottom, the last six pictures were already drawn in the first screenshot. The app used 1.1 cores while scrolling. Afterwards it held 295 to 299 MB, and scrolling the whole list down and up twice more left it at 300 MB. It felt smooth, with the pictures catching up.
 - **One Undo:** from the click on Undo after a Delete to the slide on screen changing took 0.15 to 0.21 s, measured by screenshots 35 ms apart, and a Delete the same. Clicking another slide in the list, which only draws a slide, took 0.11 to 0.18 s by the same measure, so most of it is drawing. In a scratch test of the talk alone, with no window, Delete took 16 to 34 ms and Undo 15 to 32 ms.
 - **Idle:** with the list or the slide focused, over 20 s, the app used 0.007 to 0.008 of a core, and Xephyr none. With the notes focused it used 0.11 of a core, because the blinking caret drew the whole window twice a second, which in software drawing is expensive. The caret now holds still ten seconds after the last key, click or focus, as GTK's does, and starts again on the next. With the fix, the notes focused and left for 11 s, it used 0.008 of a core over the next 20 s. (83035b6) On the components talk, on a still slide and on the clock's slide, it used about 0.015 of a core.
+
+## The final review
+
+The review of the whole branch found no path that writes a damaged talk, and asked for these fixes, each with a test that failed first:
+
+- **Clearing notes that start a last slide, in a file with no final newline, panicked.** On `# A`, a new line and `---`, a note typed on the empty last slide and then deleted took the app down. The removal no longer reaches back past the slide's content. The property tests now also make talks ending in an empty slide or a slide of notes only. (e1a5fb0)
+- **A bare `---` ending the file, made the first slide, joined the talk's settings onto it** (`---title: T`). It gets a line of its own now. (e1a5fb0)
+- **Notes typed, deleted and typed again joined an unrelated step**, so one Undo took back a Delete with them. The history now keeps an open run of typing that anything else ends. (9312bd6)
+- **An edit that panics inside the talk's format code is refused** with "That change couldn't be made, so nothing was changed.", and the talk is as it was. The refusal for a broken slide no longer says *another* slide. *Load the changed file* is now a step Undo takes back. (9312bd6)
+- **Saving a packed talk now asks when the pack was changed outside**, as a folder's save does. Save As to a folder says which pictures outside `assets/` it left out. A `slides.md` that's there but can't be read is left alone, with a sentence saying why. Edits that never pause are kept in the working copy within three seconds of the first one not kept. Closing right after a save waits for the working copy to be cleared. After Save As from a pack to a folder, the folder's saves are followed. (46f0318)
+- **For someone who doesn't code:** a Save tool first on Home, in a *File* group, greyed when there's nothing to save; the recovery and outside-change bars over the top of the desk, under the tools, so the slide keeps its size; *Open talk folder…* and *Open talk file…*, as the system's Open dialog picks one kind only; *Delete* beside Delete in a slide's menu; *Saved* gone from the status line after five seconds or at the next edit; a small *Notes* caption; room between the Export menu and the title. (0dc92dd, and 25926ff for the Save icon, found missing on the desktop)
+
+On the release build at 25926ff on the same nested display, a talk of exactly `# A`, a new line and `---` had a note typed on its empty last slide and deleted with no crash; the Save tool saved and greyed, and *Saved* left the status line after five seconds; after a `kill -9` the recovery bar showed under the tools over the top of the desk, and *Bring them back* worked; a change from outside brought the outside-change bar to the same place, and *Keep my changes* then Save wrote the edits. The screenshots are in `target/check/d1-final-run/`, and the whole window in `target/check/d1-final.png`. On this display clicks land at three quarters of their x position (the window draws 960 wide on a 1280 screen), so the clicks were sent at four thirds of the x seen in the screenshots; the earlier run's helpers didn't need this, and nothing suggests it happens on a real desktop.
 
 ## Not exercised
 
