@@ -26,7 +26,7 @@ const NUMBERED: ParaKind = ParaKind::Numbered { level: 0 };
 fn written(source: &str, slide: usize, flow: usize, paras: &[Para]) -> (String, Vec<TextFlow>) {
     let talk = parse_talk(source);
     let flows = text_flows(&talk, slide);
-    let change = write_flow(&talk, slide, &flows[flow], paras);
+    let change = write_flow(&talk, slide, &flows[flow], paras).expect("the paragraphs can be written");
     let after = change.apply(&talk.source);
     let flows = text_flows(&parse_talk(&after), slide);
     (after, flows)
@@ -35,18 +35,6 @@ fn written(source: &str, slide: usize, flow: usize, paras: &[Para]) -> (String, 
 /// The flow of slide 0 in `region`.
 fn flow_in(flows: &[TextFlow], region: &str) -> usize {
     flows.iter().position(|flow| flow.place == FlowPlace::Region(region.to_string())).expect("a flow in the region")
-}
-
-/// `spans` with the empty ones dropped and neighbours of one style merged, as they read.
-fn tidy(spans: &[Span]) -> Vec<Span> {
-    let mut out: Vec<Span> = Vec::new();
-    for span in spans.iter().filter(|span| !span.text.is_empty()) {
-        match out.last_mut() {
-            Some(last) if last.style == span.style => last.text.push_str(&span.text),
-            _ => out.push(span.clone()),
-        }
-    }
-    out
 }
 
 /// `spans` with `letter` added after the first character.
@@ -81,20 +69,16 @@ fn typing_a_letter_keeps_the_rest_of_a_hand_written_paragraph() {
             let flow = &flows[at];
             let mut paras = flow.paras.clone();
             paras[0].spans = with_a_letter(&paras[0].spans, 'x');
-            let change = write_flow(&talk, 0, flow, &paras);
+            let change = write_flow(&talk, 0, flow, &paras).unwrap_or_else(|| panic!("refused {written_by_hand:?}"));
             assert!(!change.is_empty(), "nothing written for {written_by_hand:?}");
             let after_source = change.apply(&source);
             let read = text_flows(&parse_talk(&after_source), 0);
-            assert_eq!(read[at].paras, tidy_paras(&paras), "{written_by_hand:?} became {after_source:?}");
+            assert_eq!(read[at].paras, storable(&paras), "{written_by_hand:?} became {after_source:?}");
             let inline = &flow.source[0].inline;
             assert_eq!(&after_source[..inline.start], &source[..inline.start]);
             assert!(after_source.ends_with(&source[inline.end..]), "{after_source:?}");
         }
     }
-}
-
-fn tidy_paras(paras: &[Para]) -> Vec<Para> {
-    paras.iter().map(|para| Para { kind: para.kind, spans: tidy(&para.spans) }).collect()
 }
 
 #[test]
@@ -179,17 +163,15 @@ fn what_cannot_be_written_is_refused() {
     let talk = parse_talk(source);
     let flow = &text_flows(&talk, 0)[1];
     let refused = [
-        vec![Para { kind: BODY, spans: vec![] }],
-        vec![para(BODY, "ends in a break\n")],
         vec![para(ParaKind::Bullet { level: 1 }, "no item above")],
         vec![Para { kind: BODY, spans: vec![styled("a\nb", Style { code: true, ..Style::default() })] }],
         vec![para(ParaKind::Heading(3), "two\nlines")],
     ];
     for paras in refused {
-        assert!(write_flow(&talk, 0, flow, &paras).is_empty(), "{paras:?}");
+        assert!(write_flow(&talk, 0, flow, &paras).is_none(), "{paras:?}");
     }
     let stale = TextFlow { paras: vec![para(BODY, "Other")], ..flow.clone() };
-    assert!(write_flow(&talk, 0, &stale, &[para(BODY, "x")]).is_empty());
+    assert!(write_flow(&talk, 0, &stale, &[para(BODY, "x")]).is_none());
 }
 
 #[test]
@@ -197,19 +179,19 @@ fn text_goes_into_an_empty_title_as_a_heading() {
     let source = "---\nlayout: content\n---\n\nBody text.\n";
     let talk = parse_talk(source);
     let title = [para(ParaKind::Heading(1), "Hello")];
-    let after = write_into_region(&talk, 0, "title", &title).apply(source);
+    let after = write_into_region(&talk, 0, "title", &title).unwrap().apply(source);
     assert_eq!(after, "---\nlayout: content\n---\n# Hello\n\nBody text.\n");
     let flows = text_flows(&parse_talk(&after), 0);
     assert_eq!(flows[flow_in(&flows, "title")].paras, title);
 
     let empty = "# A\n\n---\n";
     let talk = parse_talk(empty);
-    let after = write_into_region(&talk, 1, "title", &title).apply(empty);
+    let after = write_into_region(&talk, 1, "title", &title).unwrap().apply(empty);
     assert_eq!(after, "# A\n\n---\n# Hello\n");
 
     // Not a heading, or a title that's there already.
-    assert!(write_into_region(&talk, 1, "title", &[para(BODY, "x")]).is_empty());
-    assert!(write_into_region(&talk, 0, "title", &title).is_empty());
+    assert!(write_into_region(&talk, 1, "title", &[para(BODY, "x")]).is_none());
+    assert!(write_into_region(&talk, 0, "title", &title).is_none());
 }
 
 #[test]
@@ -217,21 +199,21 @@ fn text_goes_into_the_right_column_after_its_marker() {
     let source = "---\nlayout: two-columns\n---\n# T\n\nLeft.\n";
     let talk = parse_talk(source);
     let words = [para(BODY, "Right.")];
-    let after = write_into_region(&talk, 0, "right", &words).apply(source);
+    let after = write_into_region(&talk, 0, "right", &words).unwrap().apply(source);
     assert_eq!(after, "---\nlayout: two-columns\n---\n# T\n\nLeft.\n\n<Region name=\"right\" />\n\nRight.\n");
     let flows = text_flows(&parse_talk(&after), 0);
     assert_eq!(flows[flow_in(&flows, "right")].paras, words);
 
     let marked = "---\nlayout: two-columns\n---\n# T\n\n<Region name=\"right\" />\n";
     let talk = parse_talk(marked);
-    let after = write_into_region(&talk, 0, "right", &words).apply(marked);
+    let after = write_into_region(&talk, 0, "right", &words).unwrap().apply(marked);
     assert_eq!(after, "---\nlayout: two-columns\n---\n# T\n\n<Region name=\"right\" />\n\nRight.\n");
 
     let main = "# T\n";
     let talk = parse_talk(main);
-    let after = write_into_region(&talk, 0, "body", &[para(BULLET, "a"), para(BULLET, "b")]).apply(main);
+    let after = write_into_region(&talk, 0, "body", &[para(BULLET, "a"), para(BULLET, "b")]).unwrap().apply(main);
     assert_eq!(after, "# T\n\n- a\n- b\n");
-    assert!(write_into_region(&talk, 0, "nowhere", &words).is_empty());
+    assert!(write_into_region(&talk, 0, "nowhere", &words).is_none());
 }
 
 #[test]
@@ -256,6 +238,150 @@ fn styles_are_written_as_markdown_where_they_can_be() {
     let code = Style { code: true, ..Style::default() };
     assert_eq!(write_inline(&[styled("site", linked), plain(" and "), styled("a`b", code)]), "[site](https://example.com) and ``a`b``");
     assert_eq!(write_inline(&[plain("# not a heading\n- not a list")]), "\\# not a heading\\\n\\- not a list");
+}
+
+#[test]
+fn a_bom_does_not_stop_the_first_flow_being_edited() {
+    for source in ["\u{feff}# T\n\nWords.\n", "\u{feff}Plain.\n", "\u{feff}- a\n- b\n", "\u{feff}# T\r\n\r\nWords.\r\n"] {
+        let talk = parse_talk(source);
+        let flow = &text_flows(&talk, 0)[0];
+        let mut paras = flow.paras.clone();
+        paras[0].spans = with_a_letter(&paras[0].spans, 'x');
+        if flow.place != FlowPlace::Region("title".into()) {
+            paras.push(para(BULLET, "added"));
+        }
+        let change = write_flow(&talk, 0, flow, &paras).unwrap_or_else(|| panic!("refused {source:?}"));
+        let after = change.apply(source);
+        assert!(after.starts_with('\u{feff}'), "{after:?}");
+        assert_eq!(text_flows(&parse_talk(&after), 0)[0].paras, paras, "{after:?}");
+    }
+}
+
+#[test]
+fn ordinary_sentences_are_written_as_typed() {
+    let sentences = [
+        "Q&A",
+        "R&D and P&L",
+        "snake_case and file_name.txt",
+        "2 * 3 = 6",
+        "C:\\Users\\me",
+        "a | b",
+        "Revenue grew 12% in Q3 - up from 9.5% a year ago.",
+        "Wait... what?!",
+        "50/50 (roughly)",
+        "it's #1",
+    ];
+    for typed in sentences {
+        assert_eq!(write_inline(&[plain(typed)]), typed);
+        let source = "# T\n\nOld.\n";
+        let (after, flows) = written(source, 0, 1, &[para(BODY, typed)]);
+        assert_eq!(after, format!("# T\n\n{typed}\n"));
+        assert_eq!(flows[1].paras, [para(BODY, typed)]);
+    }
+    // What would be read as something is still escaped.
+    for (typed, escaped) in [("&amp;", "\\&amp;"), ("_a_", "\\_a\\_"), ("2*3*4", "2\\*3\\*4"), ("a\\*", "a\\\\\\*"), ("&#32;", "\\&#32;")] {
+        assert_eq!(write_inline(&[plain(typed)]), escaped);
+    }
+}
+
+#[test]
+fn an_exclamation_mark_before_a_link_stays_text() {
+    let link = Style { link: Some("https://example.com".into()), ..Style::default() };
+    let spans = [plain("Look!"), styled("here", link)];
+    let written = write_inline(&spans);
+    assert_eq!(written, "Look\\![here](https://example.com)");
+    assert_eq!(text_flows(&parse_talk(&written), 0)[0].paras[0].spans, spans);
+}
+
+#[test]
+fn a_refusal_is_not_an_empty_change() {
+    let source = "# T\n\nWords.\n";
+    let talk = parse_talk(source);
+    let flow = &text_flows(&talk, 0)[1];
+    let same = write_flow(&talk, 0, flow, &flow.paras.clone());
+    assert_eq!(same, Some(Change { edits: Vec::new() }));
+    assert_eq!(write_flow(&talk, 0, flow, &[para(ParaKind::Bullet { level: 3 }, "x")]), None);
+    assert_eq!(write_into_region(&talk, 0, "body", &[Para { kind: BODY, spans: vec![] }]), Some(Change { edits: Vec::new() }));
+    assert_eq!(write_into_region(&talk, 0, "body", &[para(BODY, "x")]), None);
+}
+
+#[test]
+fn enter_at_the_end_of_a_paragraph_is_not_refused() {
+    let source = "# T\n\na\n";
+    let talk = parse_talk(source);
+    let flow = &text_flows(&talk, 0)[1];
+    let change = write_flow(&talk, 0, flow, &[para(BODY, "a"), Para { kind: BODY, spans: vec![] }]);
+    assert_eq!(change, Some(Change { edits: Vec::new() }));
+    assert_eq!(storable(&[para(BODY, "a"), Para { kind: BODY, spans: vec![] }]), [para(BODY, "a")]);
+    // An empty bullet and an empty heading are kept: a marker alone reads back as one.
+    let (after, flows) = written(source, 0, 1, &[para(BODY, "a"), Para { kind: BULLET, spans: vec![] }, Para { kind: ParaKind::Heading(2), spans: vec![] }]);
+    assert_eq!(after, "# T\n\na\n\n-\n\n##\n");
+    assert_eq!(flows[1].paras.len(), 3);
+}
+
+#[test]
+fn a_break_at_the_end_is_dropped() {
+    let source = "# T\n\nOld.\n";
+    let asked = [Para { kind: BODY, spans: vec![plain("\nwords"), styled("bold\n", bold())] }, para(BULLET, "\n\n")];
+    let stored = [Para { kind: BODY, spans: vec![plain("words"), styled("bold", bold())] }, Para { kind: BULLET, spans: vec![] }];
+    assert_eq!(storable(&asked), stored);
+    let (after, flows) = written(source, 0, 1, &asked);
+    assert_eq!(after, "# T\n\nwords**bold**\n\n-\n");
+    assert_eq!(flows[1].paras, stored);
+}
+
+#[test]
+fn all_the_text_can_be_deleted() {
+    for (source, slide, flow, expected) in [
+        ("# A\n\nWords.\n\n---\n\n# B\n\nMore.\n", 1, 1, "# A\n\nWords.\n\n---\n\n# B\n\n"),
+        ("# A\n\nWords.\n\n---\n\n# B\n\nMore.\n", 0, 1, "# A\n\n---\n\n# B\n\nMore.\n"),
+        ("Only words.\n\n---\n\n# B\n", 0, 0, "\n\n---\n\n# B\n"),
+        ("---\nlayout: content\n---\n\nOnly words.\n", 0, 0, "---\nlayout: content\n---\n\n"),
+        ("---\nlayout: content\n---\nOnly words.\n", 0, 0, "---\nlayout: content\n---\n"),
+    ] {
+        let talk = parse_talk(source);
+        let flows = text_flows(&talk, slide);
+        for paras in [vec![], vec![Para { kind: BODY, spans: vec![plain("\n")] }]] {
+            let change = write_flow(&talk, slide, &flows[flow], &paras).unwrap_or_else(|| panic!("refused {source:?}"));
+            let after = change.apply(source);
+            assert_eq!(after, expected);
+            let read = parse_talk(&after);
+            assert_eq!(read.slides.len(), talk.slides.len());
+            assert_eq!(text_flows(&read, slide).len(), flows.len() - 1);
+        }
+    }
+}
+
+#[test]
+fn untouched_items_keep_their_markers_when_the_list_is_written_again() {
+    let source = "# T\n\n1) one\n   - inner\n     1. deep\n2) two\n";
+    let talk = parse_talk(source);
+    let flow = &text_flows(&talk, 0)[1];
+    let mut paras = flow.paras.clone();
+    paras[3].kind = BODY;
+    let after = write_flow(&talk, 0, flow, &paras).unwrap().apply(source);
+    assert_eq!(after, "# T\n\n1) one\n   - inner\n     1. deep\n\ntwo\n");
+    assert_eq!(text_flows(&parse_talk(&after), 0)[1].paras, paras);
+}
+
+#[test]
+fn code_of_three_backticks_is_written() {
+    let code = Style { code: true, ..Style::default() };
+    let paras = [Para { kind: BODY, spans: vec![styled("```", code.clone())] }];
+    let source = "# T\n\nOld.\n\n---\n\n# Next\n";
+    let (after, flows) = written(source, 0, 1, &paras);
+    assert_eq!(flows[1].paras, paras, "{after:?}");
+    assert!(after.ends_with("\n\n---\n\n# Next\n"));
+    assert_eq!(parse_talk(&after).slides.len(), 2);
+}
+
+#[test]
+fn a_paragraph_between_two_items_has_a_blank_line_on_each_side() {
+    let source = "# T\n\n- a\n- b\n";
+    let paras = [para(BULLET, "a"), para(BODY, "between"), para(BULLET, "b")];
+    let (after, flows) = written(source, 0, 1, &paras);
+    assert_eq!(after, "# T\n\n- a\n\nbetween\n\n- b\n");
+    assert_eq!(flows[1].paras, paras);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -295,9 +421,10 @@ fn spans() -> impl Strategy<Value = Vec<Span>> {
     prop::collection::vec((text(), style()).prop_map(|(text, style)| Span { text, style }), 0..5)
 }
 
-/// Kinds and spans made into paragraphs the editor could hold: no empty body text, no line
-/// break at the end of a paragraph or in code, a heading of several lines only at level 1
-/// or 2, and each item no deeper than the one before allows.
+/// Kinds and spans made into paragraphs the editor could hold: no line break in code, a
+/// heading of several lines only at level 1 or 2, and each item no deeper than the one
+/// before it allows, once what can't be stored is dropped. Empty body paragraphs and line
+/// breaks at the ends are left in, for `storable` to drop.
 fn paras() -> impl Strategy<Value = Vec<Para>> {
     let kind = prop_oneof![
         3 => Just(BODY),
@@ -307,8 +434,9 @@ fn paras() -> impl Strategy<Value = Vec<Para>> {
     ];
     prop::collection::vec((kind, spans()), 1..6).prop_map(|raw| {
         let mut out: Vec<Para> = Vec::new();
+        let mut kept: Option<Para> = None;
         for (mut kind, mut spans) in raw {
-            let most = match out.last() {
+            let most = match &kept {
                 Some(Para { kind: ParaKind::Bullet { level } | ParaKind::Numbered { level }, spans }) => level + u8::from(!spans.is_empty()),
                 _ => 0,
             };
@@ -320,20 +448,11 @@ fn paras() -> impl Strategy<Value = Vec<Para>> {
             for span in spans.iter_mut().filter(|span| span.style.code) {
                 span.text = span.text.replace('\n', "");
             }
-            let mut spans = tidy(&spans);
-            while let Some(last) = spans.last_mut() {
-                let kept = last.text.trim_end_matches('\n').len();
-                last.text.truncate(kept);
-                if !last.text.is_empty() {
-                    break;
-                }
-                spans.pop();
+            let para = Para { kind, spans };
+            if let [stored] = storable(std::slice::from_ref(&para)).as_slice() {
+                kept = Some(stored.clone());
             }
-            let mut spans = tidy(&spans);
-            if kind == BODY && spans.is_empty() {
-                spans.push(plain("x"));
-            }
-            out.push(Para { kind, spans });
+            out.push(para);
         }
         out
     })
@@ -347,8 +466,9 @@ fn talk() -> impl Strategy<Value = (String, usize, usize)> {
         ("# T\n\n<Box x=\"10\" y=\"10\">\n\nIn a box\n\n</Box>\n\n| a |\n| - |\n| 1 |\n\nAfter the table\n", 0, 1),
         ("# T\n\n| a |\n| - |\n| 1 |\n\nAfter the table   \nwrapped\n\n<Notes>\nSay it\n</Notes>\n", 0, 1),
         ("# A\n\nFirst slide.\n\n---\n\n#   Odd   heading\n\n10. ten\n11. eleven\n\n```\n---\n```\n", 1, 1),
+        ("Plain words first.\n\n- a\n- b\n", 0, 0),
     ];
-    (prop::sample::select(slides), any::<bool>(), any::<bool>()).prop_map(|((source, slide, flow), crlf, more)| {
+    (prop::sample::select(slides), any::<[bool; 3]>()).prop_map(|((source, slide, flow), [crlf, more, bom])| {
         let mut source = source.to_string();
         if more {
             source.push_str("\n---\n\n# Another\n\nWith *words*.\n");
@@ -356,22 +476,38 @@ fn talk() -> impl Strategy<Value = (String, usize, usize)> {
         if crlf {
             source = source.replace('\n', "\r\n");
         }
+        if bom {
+            source.insert(0, '\u{feff}');
+        }
         (source, slide, flow)
     })
 }
 
 proptest! {
     #[test]
-    fn what_is_written_reads_back_the_same((source, slide, flow) in talk(), paras in paras()) {
+    fn what_is_written_reads_back_the_same((source, slide, flow) in talk(), mut paras in paras()) {
         let talk = parse_talk(&source);
         let flows = text_flows(&talk, slide);
+        if flow == 0 {
+            // With no title above, a heading would be the slide's title.
+            for para in paras.iter_mut().filter(|para| matches!(para.kind, ParaKind::Heading(_))) {
+                para.kind = BODY;
+            }
+        }
+        let stored = storable(&paras);
         let change = write_flow(&talk, slide, &flows[flow], &paras);
-        let after = change.apply(&source);
+        prop_assert!(change.is_some(), "refused {:?}", stored);
+        let after = change.unwrap().apply(&source);
         let read = parse_talk(&after);
         prop_assert_eq!(read.slides.len(), talk.slides.len());
-        let read_flows = text_flows(&read, slide);
-        prop_assert_eq!(read_flows.len(), flows.len(), "{:?}", after);
-        prop_assert_eq!(&read_flows[flow].paras, &paras, "{:?}", after);
+        let mut read_flows = text_flows(&read, slide);
+        if stored.is_empty() {
+            prop_assert_eq!(read_flows.len() + 1, flows.len(), "{:?}", after);
+            read_flows.insert(flow, TextFlow { paras: Vec::new(), ..flows[flow].clone() });
+        } else {
+            prop_assert_eq!(read_flows.len(), flows.len(), "{:?}", after);
+            prop_assert_eq!(&read_flows[flow].paras, &stored, "{:?}", after);
+        }
         for (other, (old, new)) in flows.iter().zip(&read_flows).enumerate() {
             if other != flow {
                 prop_assert_eq!(&old.paras, &new.paras);
@@ -414,8 +550,8 @@ proptest! {
         paras[which].spans = vec![styled(new_text.trim(), style)];
         prop_assume!(!new_text.trim().is_empty() && paras[which] != flow.paras[which]);
         let change = write_flow(&talk, 0, flow, &paras);
-        prop_assert!(!change.is_empty());
-        let after = change.apply(&source);
+        prop_assert!(change.as_ref().is_some_and(|change| !change.is_empty()));
+        let after = change.unwrap().apply(&source);
         let block = &flow.source[which].block;
         prop_assert_eq!(&after[..block.start], &source[..block.start]);
         prop_assert!(after.ends_with(&source[block.end..]), "{:?}", after);

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 629ad89e895aec8122199ce56e8570200a224798d12e932e630df845d48fdd3e # shrinks to (source, slide, flow) = ("# Title\n\nPara one.\n\n- a\n- b\n  - c\n\n1. x\n2. y\n", 0, 1), mut paras = [Para { kind: Body, spans: [Span { text: "!", style: Style { bold: false, italic: false, underline: false, code: false, color: None, size: None, link: None } }, Span { text: "a", style: Style { bold: false, italic: false, underline: false, code: false, color: None, size: None, link: Some("https://example.com/a_b") } }] }]

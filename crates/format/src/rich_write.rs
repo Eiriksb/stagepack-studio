@@ -1,8 +1,7 @@
 //! Writing a slide's text model back as Markdown. Only the paragraphs that changed are
 //! written: one whose words changed has its content replaced and keeps its marker, one
 //! that's the same keeps every byte. Each change is read back before it's given out, and
-//! one that wouldn't read back as the paragraphs it was asked for is refused: the change
-//! that comes back is then empty.
+//! one that wouldn't read back as the paragraphs it was asked for is refused.
 
 use std::ops::Range;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -24,7 +23,38 @@ const MAX_LEVEL: u8 = 8;
 pub fn write_inline(spans: &[Span]) -> String {
     let spans = tidy(spans);
     let ctx = Inline { heading: false, indent: "", eol: "\n" };
-    inline_for(&spans, Probe::Body, &ctx).unwrap_or_else(|| render(&spans, &ctx, Form::Tags))
+    inline_for(&spans, Probe::Body, &ctx, PLAIN).unwrap_or_else(|| render(&spans, &ctx, Form::Tags, Escapes::Safe))
+}
+
+/// `paras` as Markdown can hold them: spans tidied, the line breaks at the start and end
+/// of each paragraph dropped, and then body paragraphs left with no text dropped. Empty
+/// headings, bullets and numbers stay, as a marker alone reads back as one. This is what
+/// [`write_flow`] and [`write_into_region`] write, and what reads back.
+pub fn storable(paras: &[Para]) -> Vec<Para> {
+    paras
+        .iter()
+        .map(|para| {
+            let mut spans = tidy(&para.spans);
+            while let Some(first) = spans.first_mut() {
+                let trimmed = first.text.trim_start_matches('\n').len();
+                first.text.drain(..first.text.len() - trimmed);
+                if !first.text.is_empty() {
+                    break;
+                }
+                spans.remove(0);
+            }
+            while let Some(last) = spans.last_mut() {
+                let kept = last.text.trim_end_matches('\n').len();
+                last.text.truncate(kept);
+                if !last.text.is_empty() {
+                    break;
+                }
+                spans.pop();
+            }
+            Para { kind: para.kind, spans }
+        })
+        .filter(|para| !(para.kind == ParaKind::Body && para.spans.is_empty()))
+        .collect()
 }
 
 /// The edits that turn `flow`, a flow of slide `slide` as [`text_flows`] reads it now, into
@@ -32,12 +62,12 @@ pub fn write_inline(spans: &[Span]) -> String {
 /// whose kind didn't has only its content replaced. Added and removed paragraphs take the
 /// list markers, numbering, indentation and blank lines of the paragraphs around them.
 ///
-/// If `paras` can't be written so that they read back exactly, or `flow` isn't one of the
-/// slide's flows, the change is empty, and nothing is changed. Nothing can be written for an
-/// empty body paragraph, a line break at the very end of a paragraph, a line break in code,
-/// a heading of more than one line below level 2, or a list item deeper than the one before
-/// it allows.
-pub fn write_flow(talk: &Talk, slide: usize, flow: &TextFlow, paras: &[Para]) -> Change {
+/// What's written is [`storable`]`(paras)`, and the change reads back as exactly that. An
+/// empty change means there was nothing to change. `None` means the paragraphs can't be
+/// written there, and nothing is changed: when `flow` isn't one of the slide's flows, when
+/// the talk would lose the slide, or for a line break in code, a heading of more than one
+/// line below level 2, or a list item deeper than the one before it allows.
+pub fn write_flow(talk: &Talk, slide: usize, flow: &TextFlow, paras: &[Para]) -> Option<Change> {
     guarded(|| flow_change(talk, slide, flow, paras))
 }
 
@@ -45,15 +75,16 @@ pub fn write_flow(talk: &Talk, slide: usize, flow: &TextFlow, paras: &[Para]) ->
 /// that has nothing in it yet. The title's text, a single heading, goes at the top of the
 /// slide. Another region's goes after its `<Region name="…" />` line, which is added at the
 /// end of the slide if there isn't one, except for the layout's main region on a slide with
-/// no such lines, whose text goes at the end. The change is empty if the region isn't the
-/// layout's, already has something in it, or `paras` can't be written exactly there.
-pub fn write_into_region(talk: &Talk, slide: usize, region: &str, paras: &[Para]) -> Change {
+/// no such lines, whose text goes at the end. What's written is [`storable`]`(paras)`; if
+/// that's nothing, the change is empty. It's `None` if the region isn't the layout's,
+/// already has something in it, or the paragraphs can't be written exactly there.
+pub fn write_into_region(talk: &Talk, slide: usize, region: &str, paras: &[Para]) -> Option<Change> {
     guarded(|| region_change(talk, slide, region, paras))
 }
 
-/// What `make` gives, or an empty change if it gives nothing or panics.
-fn guarded(make: impl FnOnce() -> Option<Change>) -> Change {
-    catch_unwind(AssertUnwindSafe(make)).ok().flatten().unwrap_or(Change { edits: Vec::new() })
+/// What `make` gives, or `None` if it panics.
+fn guarded(make: impl FnOnce() -> Option<Change>) -> Option<Change> {
+    catch_unwind(AssertUnwindSafe(make)).ok().flatten()
 }
 
 // ---------------------------------------------------------------------------------------
@@ -77,6 +108,29 @@ enum Form {
     Tags,
 }
 
+/// How much ordinary punctuation is escaped.
+#[derive(Clone, Copy, PartialEq)]
+enum Escapes {
+    /// Only where it could be read as something: `Q&A`, `snake_case` and `2 * 3` stay as
+    /// typed.
+    Least,
+    /// Every character that's ever read as something.
+    Safe,
+}
+
+/// The ways content may be written, tried in order.
+#[derive(Clone, Copy)]
+struct Ways {
+    forms: &'static [Form],
+    escapes: &'static [Escapes],
+}
+
+/// The plainest way that reads back alone first.
+const PLAIN: Ways = Ways { forms: &[Form::Marks, Form::Tags], escapes: &[Escapes::Least, Escapes::Safe] };
+/// The way that depends least on what's around it, for when the plainest doesn't read back
+/// where it's put.
+const GUARDED: Ways = Ways { forms: &[Form::Tags], escapes: &[Escapes::Safe] };
+
 /// What a paragraph's content is tried out in, to see that it reads back.
 #[derive(Clone, Copy)]
 enum Probe {
@@ -86,9 +140,14 @@ enum Probe {
     Item,
 }
 
-/// The content for `spans`, in the first form that reads back as them, if any does.
-fn inline_for(spans: &[Span], probe: Probe, ctx: &Inline) -> Option<String> {
-    [Form::Marks, Form::Tags].into_iter().map(|form| render(spans, ctx, form)).find(|text| reads_back(text, spans, probe, ctx.eol))
+/// The content for `spans`, in the first way of writing it that reads back as them, if any
+/// does: each form in turn, and with each, each set of escapes.
+fn inline_for(spans: &[Span], probe: Probe, ctx: &Inline, ways: Ways) -> Option<String> {
+    ways.forms
+        .iter()
+        .flat_map(|form| ways.escapes.iter().map(move |escapes| (*form, *escapes)))
+        .map(|(form, escapes)| render(spans, ctx, form, escapes))
+        .find(|text| reads_back(text, spans, probe, ctx.eol))
 }
 
 /// Whether `text`, the content of a paragraph of the sort `probe` says, reads as `spans`.
@@ -117,19 +176,15 @@ fn tidy(spans: &[Span]) -> Vec<Span> {
     out
 }
 
-fn tidy_paras(paras: &[Para]) -> Vec<Para> {
-    paras.iter().map(|para| Para { kind: para.kind, spans: tidy(&para.spans) }).collect()
-}
-
 /// Where `spans[from]`'s run of spans that `same` holds for ends.
 fn run_end(spans: &[Span], from: usize, same: impl Fn(&Span, &Span) -> bool) -> usize {
     from + 1 + spans[from + 1..].iter().take_while(|span| same(&spans[from], span)).count()
 }
 
 /// The content for `spans` in `form`.
-fn render(spans: &[Span], ctx: &Inline, form: Form) -> String {
+fn render(spans: &[Span], ctx: &Inline, form: Form, escapes: Escapes) -> String {
     let text: String = spans.iter().map(|span| span.text.as_str()).collect();
-    let mut writer = Writer { out: String::new(), ctx, edge: edge_whitespace(&text), at: 0, line_start: true, leading_digits: false };
+    let mut writer = Writer { out: String::new(), ctx, escapes, edge: edge_whitespace(&text), at: 0, line_start: true, leading_digits: false };
     let mut index = 0;
     while index < spans.len() {
         match form {
@@ -200,6 +255,7 @@ fn edge_whitespace(text: &str) -> Vec<bool> {
 struct Writer<'a> {
     out: String,
     ctx: &'a Inline<'a>,
+    escapes: Escapes,
     edge: Vec<bool>,
     /// Where in the paragraph's text the next character is.
     at: usize,
@@ -288,7 +344,8 @@ impl Writer<'_> {
     }
 
     fn text(&mut self, text: &str) {
-        for c in text.chars() {
+        let chars: Vec<(usize, char)> = text.char_indices().collect();
+        for (index, &(offset, c)) in chars.iter().enumerate() {
             let at = self.at;
             self.at += c.len_utf8();
             if c == '\n' {
@@ -299,7 +356,26 @@ impl Writer<'_> {
                 self.raw(if c == '\t' { "&#9;" } else { "&#32;" });
                 continue;
             }
+            let before = index.checked_sub(1).map(|i| chars[i].1);
+            let after = chars.get(index + 1).map(|&(_, c)| c);
+            let rest = &text[offset + c.len_utf8()..];
+            // A space beside it that's written as a reference doesn't count as a space.
+            let spaced = |c: Option<char>, at: Option<usize>| {
+                matches!(c, Some(' ' | '\t')) && at.is_some_and(|at| !self.edge.get(at).copied().unwrap_or(true))
+            };
+            let least = self.escapes == Escapes::Least;
             let escape = match c {
+                '&' if least => starts_a_reference(rest),
+                '_' if least => !(before.is_some_and(char::is_alphanumeric) && after.is_some_and(char::is_alphanumeric)),
+                '*' if least => {
+                    let around = (spaced(before, at.checked_sub(1)), spaced(after, Some(at + 1)));
+                    self.line_start || around != (true, true)
+                }
+                '\\' if least => after.is_none_or(|after| after.is_ascii_punctuation()),
+                '|' if least => false,
+                // Before a link, `!` would make it a picture.
+                '!' if least => after.is_none() && at + 1 < self.edge.len(),
+                '!' => true,
                 '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '&' | '|' => true,
                 '#' => self.line_start || self.ctx.heading,
                 '>' | '-' | '+' | '=' | '~' => self.line_start,
@@ -337,9 +413,23 @@ impl Writer<'_> {
                 || piece.ends_with('`')
                 || (piece.starts_with(' ') && piece.ends_with(' ') && piece.contains(|c| c != ' '));
             let pad = if pad { " " } else { "" };
+            if self.line_start && fence.len() >= 3 {
+                // A line starting with three backticks would be taken for a fence where the
+                // talk is split into slides, so something empty goes first.
+                self.raw("<Text></Text>");
+            }
             self.raw(&format!("{fence}{pad}{piece}{pad}{fence}"));
         }
     }
+}
+
+/// Whether `&` followed by `rest` would be read as a character reference.
+fn starts_a_reference(rest: &str) -> bool {
+    if rest.starts_with('#') {
+        return true;
+    }
+    let name = rest.chars().take_while(char::is_ascii_alphanumeric).count();
+    name > 0 && rest[name..].starts_with(';')
 }
 
 /// A link's destination as it's written between `(` and `)`.
@@ -368,11 +458,22 @@ struct Source<'a> {
     eol: &'static str,
     /// What starts the line of a paragraph at the flow's top level.
     base: String,
+    /// How content may be written.
+    ways: Ways,
+}
+
+/// Where the line holding `at` starts. The first line starts after a byte order mark.
+fn line_start(text: &str, at: usize) -> usize {
+    match text[..at].rfind(['\n', '\r']) {
+        Some(i) => i + 1,
+        None if text.starts_with('\u{feff}') && at >= 3 => 3,
+        None => 0,
+    }
 }
 
 impl Source<'_> {
     fn line_start(&self, at: usize) -> usize {
-        self.text[..at].rfind(['\n', '\r']).map_or(0, |i| i + 1)
+        line_start(self.text, at)
     }
 
     /// What's before `at` on its line, if that's only spaces and tabs.
@@ -506,13 +607,14 @@ struct Look {
 
 /// How each of `new`'s list items is written. Items that `from_old` gives a shape for keep
 /// it. Others take the indentation and marker of the item before them at their level, or
-/// the text column of the item they're in, and run on the numbering. `start` gives the
-/// number a numbered item starts a list with.
+/// the text column of the item they're in, and run on the numbering, but keep the marker
+/// `old_marker` gives them, if any. `start` gives the number a numbered item starts a list with.
 fn shapes(
     new: &[Para],
     base: &str,
     look: &Look,
     from_old: impl Fn(usize) -> Option<Option<Shape>>,
+    old_marker: impl Fn(usize) -> Option<Marker>,
     start: impl Fn(usize) -> Option<u64>,
 ) -> Option<Vec<Option<Shape>>> {
     let mut shapes: Vec<Option<Shape>> = Vec::with_capacity(new.len());
@@ -552,11 +654,16 @@ fn shapes(
             });
             break;
         }
-        let (indent, marker) = match found {
+        let (indent, mut marker) = match found {
             Some(found) => found,
             None if level == 0 => fresh(base.to_string()),
             None => return None,
         };
+        match (old_marker(index), numbered) {
+            (Some(Marker::Number(n, delim)), true) => marker = Marker::Number(if tight && n != 1 { 1 } else { n }, delim),
+            (Some(Marker::Bullet(c)), false) => marker = Marker::Bullet(c),
+            _ => {}
+        }
         let content = format!("{indent}{}", " ".repeat(marker.text().len() + 1));
         shapes.push(Some(Shape { indent, marker, content }));
     }
@@ -578,7 +685,7 @@ fn separator(before: &Para, after: &Para, eol: &str) -> String {
 fn block_text(para: &Para, shape: Option<&Shape>, src: &Source, keep: Option<&str>) -> Option<String> {
     let inline = |probe: Probe, heading: bool, indent: &str| match keep {
         Some(kept) => Some(kept.to_string()),
-        None => inline_for(&para.spans, probe, &Inline { heading, indent, eol: src.eol }),
+        None => inline_for(&para.spans, probe, &Inline { heading, indent, eol: src.eol }, src.ways),
     };
     match para.kind {
         ParaKind::Body if para.spans.is_empty() => None,
@@ -658,15 +765,24 @@ fn gaps_are_blank(src: &Source, flow: &TextFlow, between: Range<usize>) -> bool 
     })
 }
 
-/// The change that edits only what changed.
-fn least_change(src: &Source, flow: &TextFlow, new: &[Para], origin: &[Origin], gone: &Range<usize>, slide_end: usize) -> Option<Vec<SourceEdit>> {
+/// The change that edits only what changed. When every paragraph goes, the blank lines
+/// after them go too, unless `keep_blank`.
+fn least_change(
+    src: &Source,
+    flow: &TextFlow,
+    new: &[Para],
+    origin: &[Origin],
+    gone: &Range<usize>,
+    slide_end: usize,
+    keep_blank: bool,
+) -> Option<Vec<SourceEdit>> {
     let old = &flow.paras;
     let look = look_of(src, flow);
     let keeps_shape = |j: usize| match origin[j] {
         Origin::Kept(i) | Origin::Paired(i) if old[i].kind == new[j].kind => Some(old_shape(src, flow, i)),
         _ => None,
     };
-    let shapes = shapes(new, &src.base, &look, keeps_shape, |j| old_number(src, flow, origin[j]))?;
+    let shapes = shapes(new, &src.base, &look, keeps_shape, |_| None, |j| old_number(src, flow, origin[j]))?;
     let mut edits = Vec::new();
     let mut j = 0;
     while j < new.len() {
@@ -683,6 +799,15 @@ fn least_change(src: &Source, flow: &TextFlow, new: &[Para], origin: &[Origin], 
                         for k in j..end {
                             text.push_str(&separator(&new[k - 1], &new[k], src.eol));
                             text.push_str(&written(k)?);
+                        }
+                        // What follows was tight against the paragraph before, and may need
+                        // a blank line between it and what's added.
+                        if let (Some(next), Some(next_source)) = (new.get(end), flow.source.get(i + 1)) {
+                            let gap = src.text.get(flow.source[i].block.end..next_source.block.start)?;
+                            let blank_wanted = separator(&new[end - 1], next, src.eol).len() > src.eol.len();
+                            if blank_wanted && gap.matches('\n').count() < 2 {
+                                text.push_str(src.eol);
+                            }
                         }
                         flow.source[i].block.end
                     }
@@ -717,7 +842,9 @@ fn least_change(src: &Source, flow: &TextFlow, new: &[Para], origin: &[Origin], 
             (None, None) => {
                 let first = flow.source.first()?.block.start;
                 src.prefix(first)?;
-                src.line_start(first)..src.past_blank_lines(flow.source.last()?.block.end, slide_end)
+                let last = flow.source.last()?.block.end;
+                let end = if keep_blank { last } else { src.past_blank_lines(last, slide_end) };
+                src.line_start(first)..end
             }
         };
         edits.push(SourceEdit { range, text: String::new() });
@@ -744,7 +871,7 @@ fn paired_edit(src: &Source, flow: &TextFlow, i: usize, para: &Para, shape: Opti
         };
         let indent = src.column(source.inline.start)?;
         let heading = matches!(probe, Probe::Atx);
-        let text = inline_for(&para.spans, probe, &Inline { heading, indent: &indent, eol: src.eol })?;
+        let text = inline_for(&para.spans, probe, &Inline { heading, indent: &indent, eol: src.eol }, src.ways)?;
         return Some(SourceEdit { range: source.inline.clone(), text });
     }
     // The whole paragraph is written again, from the start of its line.
@@ -754,23 +881,28 @@ fn paired_edit(src: &Source, flow: &TextFlow, i: usize, para: &Para, shape: Opti
     Some(SourceEdit { range: start..source.block.end, text: format!("{indent}{}", block_text(para, shape, src, None)?) })
 }
 
-/// The change that writes the whole flow again, keeping the content of paragraphs whose
-/// words didn't change if `keep_words`.
-fn whole_change(src: &Source, flow: &TextFlow, new: &[Para], origin: &[Origin], keep_words: bool) -> Option<Vec<SourceEdit>> {
+/// The change that writes the whole flow's markers, indentation and spacing again.
+/// Paragraphs whose words didn't change keep their content's bytes, and items whose kind
+/// didn't change keep their markers.
+fn whole_change(src: &Source, flow: &TextFlow, new: &[Para], origin: &[Origin]) -> Option<Vec<SourceEdit>> {
     let first = flow.source.first()?.block.start;
     src.prefix(first)?;
     if new.is_empty() || !gaps_are_blank(src, flow, 0..flow.source.len()) {
         return None;
     }
     let look = look_of(src, flow);
-    let shapes = shapes(new, &src.base, &look, |_| None, |j| old_number(src, flow, origin[j]))?;
+    let keeps_marker = |j: usize| match origin[j] {
+        Origin::Kept(i) | Origin::Paired(i) if flow.paras[i].kind == new[j].kind => old_shape(src, flow, i).map(|shape| shape.marker),
+        _ => None,
+    };
+    let shapes = shapes(new, &src.base, &look, |_| None, keeps_marker, |j| old_number(src, flow, origin[j]))?;
     let mut text = String::new();
     for (j, para) in new.iter().enumerate() {
         if j > 0 {
             text.push_str(&separator(&new[j - 1], para, src.eol));
         }
         let keep = match origin[j] {
-            Origin::Kept(i) | Origin::Paired(i) if keep_words && !para.spans.is_empty() && flow.paras[i].spans == para.spans => {
+            Origin::Kept(i) | Origin::Paired(i) if !para.spans.is_empty() && flow.paras[i].spans == para.spans => {
                 src.text.get(flow.source[i].inline.clone())
             }
             _ => None,
@@ -785,7 +917,7 @@ fn flow_change(talk: &Talk, index: usize, flow: &TextFlow, paras: &[Para]) -> Op
     let slide = talk.slides.get(index)?;
     let flows = text_flows(talk, index);
     let at = flows.iter().position(|candidate| candidate == flow)?;
-    let new = tidy_paras(paras);
+    let new = storable(paras);
     if new == flow.paras {
         return Some(Change { edits: Vec::new() });
     }
@@ -793,7 +925,7 @@ fn flow_change(talk: &Talk, index: usize, flow: &TextFlow, paras: &[Para]) -> Op
         return None;
     }
     let first = flow.source.first()?.block.start;
-    let src = Source { text: &talk.source, eol: eol_in(&talk.source), base: src_base(&talk.source, first)? };
+    let base = src_base(&talk.source, first)?;
     let (origin, gone) = align(&flow.paras, &new);
     let mut expected: Vec<(FlowPlace, Vec<Para>)> = flows.iter().map(|flow| (flow.place.clone(), flow.paras.clone())).collect();
     if new.is_empty() {
@@ -801,17 +933,26 @@ fn flow_change(talk: &Talk, index: usize, flow: &TextFlow, paras: &[Para]) -> Op
     } else {
         expected[at].1 = new.clone();
     }
-    let tries: [&dyn Fn() -> Option<Vec<SourceEdit>>; 3] = [
-        &|| least_change(&src, flow, &new, &origin, &gone, slide.range.end),
-        &|| whole_change(&src, flow, &new, &origin, true),
-        &|| whole_change(&src, flow, &new, &origin, false),
-    ];
-    tries.iter().filter_map(|attempt| attempt()).map(|edits| Change { edits }).find(|change| reads_as(talk, slide, change, &expected))
+    // Content is written as plainly as reads back alone, and if that reads as something
+    // else on the slide, in tags and with every escape.
+    for ways in [PLAIN, GUARDED] {
+        let src = Source { text: &talk.source, eol: eol_in(&talk.source), base: base.clone(), ways };
+        let tries: [&dyn Fn() -> Option<Vec<SourceEdit>>; 3] = [
+            &|| least_change(&src, flow, &new, &origin, &gone, slide.range.end, false),
+            &|| least_change(&src, flow, &new, &origin, &gone, slide.range.end, true).filter(|_| new.is_empty()),
+            &|| whole_change(&src, flow, &new, &origin),
+        ];
+        let found = tries.iter().filter_map(|attempt| attempt()).map(|edits| Change { edits }).find(|change| reads_as(talk, slide, change, &expected));
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
 }
 
 /// What starts the line of `at`, if it's blank.
 fn src_base(source: &str, at: usize) -> Option<String> {
-    let start = source[..at].rfind(['\n', '\r']).map_or(0, |i| i + 1);
+    let start = line_start(source, at);
     let prefix = source.get(start..at)?;
     prefix.chars().all(|c| c == ' ' || c == '\t').then(|| prefix.to_string())
 }
@@ -837,13 +978,13 @@ fn reads_as(talk: &Talk, slide: &Slide, change: &Change, expected: &[(FlowPlace,
             .collect(),
     };
     let new_text = local.apply(old_text);
-    // The slide still ends where the next one starts: no break is added, and no fence is
-    // left open to swallow the next slide's break.
-    let eol = eol_in(&talk.source);
-    let ending = if new_text.ends_with('\n') || new_text.is_empty() { "" } else { eol };
-    let probe = format!("{new_text}{ending}---{eol}after");
+    // The slide still ends where the next one starts, and is still a slide: no break is
+    // added or lost, and no fence is left open to swallow the next slide's break.
+    let next_line = talk.source[range.end..].find('\n').map_or(talk.source.len(), |i| range.end + i + 1);
+    let probe = format!("{new_text}{}", &talk.source[range.end..next_line]);
     let raw = split_slides(&probe);
-    if raw.len() != 2 || raw[0].range.end != new_text.len() + ending.len() {
+    let slides = if next_line > range.end { 2 } else { 1 };
+    if raw.len() != slides || raw[0].range.end != new_text.len() {
         return false;
     }
     let read = parse_talk(&new_text);
@@ -899,7 +1040,7 @@ fn region_change(talk: &Talk, index: usize, region: &str, paras: &[Para]) -> Opt
     if slide.error.is_some() {
         return None;
     }
-    let new = tidy_paras(paras);
+    let new = storable(paras);
     if new.is_empty() {
         return Some(Change { edits: Vec::new() });
     }
@@ -911,9 +1052,9 @@ fn region_change(talk: &Talk, index: usize, region: &str, paras: &[Para]) -> Opt
         return None;
     }
     let eol = eol_in(&talk.source);
-    let src = Source { text: &talk.source, eol, base: String::new() };
+    let src = Source { text: &talk.source, eol, base: String::new(), ways: PLAIN };
     let look = Look { bullets: ['-'; MAX_LEVEL as usize + 1], delim: '.' };
-    let shapes = shapes(&new, "", &look, |_| None, |_| None)?;
+    let shapes = shapes(&new, "", &look, |_| None, |_| None, |_| None)?;
     let mut text = String::new();
     for (j, para) in new.iter().enumerate() {
         if j > 0 {
