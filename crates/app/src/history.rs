@@ -157,6 +157,11 @@ impl History {
         self.run == Some(run)
     }
 
+    /// The run that's open, if any.
+    pub fn open_run(&self) -> Option<RunId> {
+        self.run
+    }
+
     /// The change [`Self::undo`] would give, without taking the step back.
     pub fn next_undo(&self) -> Option<&Change> {
         self.undo.back().map(|entry| &entry.change)

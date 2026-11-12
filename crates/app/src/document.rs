@@ -51,6 +51,8 @@ pub enum EditRefused {
     WouldBreakASlide,
     /// The talk would have ended up with more or fewer slides than the edit was meant to give.
     WouldChangeTheSlides,
+    /// An edit to one slide would have changed another.
+    WouldChangeAnotherSlide,
     /// Working the change out went wrong.
     CouldNotBeMade,
 }
@@ -64,12 +66,34 @@ impl std::fmt::Display for EditRefused {
             EditRefused::WouldChangeTheSlides => {
                 "That change would have joined or split slides, so it wasn't made."
             }
+            EditRefused::WouldChangeAnotherSlide => {
+                "That change would have changed another slide, so it wasn't made."
+            }
             EditRefused::CouldNotBeMade => "That change couldn't be made, so nothing was changed.",
         })
     }
 }
 
 impl std::error::Error for EditRefused {}
+
+/// Whether an edit to one slide joins the run of edits open in the history, so that one undo
+/// takes the run back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditRun {
+    /// The edit is a step of its own, which opens a run that later edits can join.
+    New,
+    /// The edit joins this run, while it's open. Once it isn't, the edit is a new step.
+    Continue(RunId),
+}
+
+/// How many slides an edit is meant to leave, and which of them it may change.
+#[derive(Clone, Copy)]
+enum Holds {
+    /// The number of slides changes by this, and any slide may change.
+    Count(isize),
+    /// Only this slide may change, and the number of slides stays the same.
+    Slide(usize),
+}
 
 /// What Undo shows for each kind of edit.
 const ADD_SLIDE: &str = "Add slide";
@@ -418,7 +442,29 @@ impl Document {
         slides: isize,
     ) -> Result<Vec<usize>, EditRefused> {
         let current = self.current;
-        self.make(label, change, slides, current, current)
+        self.make(label, change, Holds::Count(slides), current, current, None)
+    }
+
+    /// Makes `change` to slide `index`'s text, named `label` for Undo, joining the run `run`
+    /// says, makes `index` the current slide, and returns the slides to show again.
+    ///
+    /// The change is refused, and nothing applied or recorded, unless every other slide's
+    /// bytes are the same after it as before and the talk has as many slides, or if it would
+    /// leave a slide that could be read as one that can't. An empty change does nothing.
+    pub fn edit_slide(
+        &mut self,
+        label: &'static str,
+        index: usize,
+        change: Change,
+        run: EditRun,
+    ) -> Result<Vec<usize>, EditRefused> {
+        self.make(label, change, Holds::Slide(index), index, index, Some(run))
+    }
+
+    /// The run of edits that's open in the history, which an edit can join with
+    /// [`EditRun::Continue`].
+    pub fn open_run(&self) -> Option<RunId> {
+        self.history.open_run()
     }
 
     /// The change `build` works out from the talk as it is, for one of the commands. A command
@@ -431,17 +477,20 @@ impl Document {
         built
     }
 
-    /// Makes `change` as [`Self::edit`] does. `before` is the slide it's about in the text
-    /// as it is, and `after` the one it's about once made, which becomes the current slide.
+    /// Makes `change` as [`Self::edit`] does, held to what `holds` says. `before` is the slide
+    /// it's about in the text as it is, and `after` the one it's about once made, which becomes
+    /// the current slide. With `run`, the step opens a run, or joins the one given; without, it
+    /// opens none.
     fn make(
         &mut self,
         label: &'static str,
         change: Change,
-        slides: isize,
+        holds: Holds,
         before: usize,
         after: usize,
+        run: Option<EditRun>,
     ) -> Result<Vec<usize>, EditRefused> {
-        let made = self.try_make(label, change, slides, before, after);
+        let made = self.try_make(label, change, holds, before, after, run);
         if made.is_err() {
             self.typing_notes = None;
         }
@@ -453,9 +502,10 @@ impl Document {
         &mut self,
         label: &'static str,
         change: Change,
-        slides: isize,
+        holds: Holds,
         before: usize,
         after: usize,
+        run: Option<EditRun>,
     ) -> Result<Vec<usize>, EditRefused> {
         if change.is_empty() {
             return Ok(Vec::new());
@@ -467,8 +517,17 @@ impl Document {
         // panic, leaves the deck untouched.
         let (undo, text) = guarded(|| (change.inverse(old), change.apply(old)))?;
         let candidate = read_after(self.talk(), text)?;
+        let slides = match holds {
+            Holds::Count(slides) => slides,
+            Holds::Slide(_) => 0,
+        };
         if old_count.checked_add_signed(slides) != Some(candidate.slides.len()) {
             return Err(EditRefused::WouldChangeTheSlides);
+        }
+        if let Holds::Slide(index) = holds
+            && !others_alike(self.talk(), &candidate, index)
+        {
+            return Err(EditRefused::WouldChangeAnotherSlide);
         }
         if guarded(|| broken_bodies(&candidate))?
             .iter()
@@ -478,18 +537,15 @@ impl Document {
         }
         let old = old.to_string();
         let mut changed = self.deck.update_text(candidate);
-        let typing = label == EDIT_NOTES;
-        let run = self
-            .typing_notes
-            .filter(|&(slide, _)| typing && slide == after)
-            .map(|(_, run)| run);
-        let run = match run {
-            Some(run) if self.history.extend(run, &old, self.deck.source()) => {
-                Some(run).filter(|&run| self.history.is_open(run))
-            }
-            _ => self.history.record(label, undo, before, after, typing),
+        let joined = match run {
+            Some(EditRun::Continue(run)) => self.history.extend(run, &old, self.deck.source()),
+            _ => false,
         };
-        self.typing_notes = run.map(|run| (after, run));
+        if !joined {
+            self.history.record(label, undo, before, after, run.is_some());
+        }
+        // Typing in the notes goes on only through set_notes, which says so itself.
+        self.typing_notes = None;
         self.show(after, &mut changed);
         Ok(changed)
     }
@@ -618,14 +674,14 @@ impl Document {
         };
         let at = self.current;
         let change = self.build(|talk| slides_format::insert_slide(talk, Some(at), &text))?;
-        self.make(ADD_SLIDE, change, 1, at, at + 1)
+        self.make(ADD_SLIDE, change, Holds::Count(1), at, at + 1, None)
     }
 
     /// Puts a copy of the current slide straight after it, and makes the copy current.
     pub fn duplicate_current(&mut self) -> Result<Vec<usize>, EditRefused> {
         let at = self.current;
         let change = self.build(|talk| slides_format::duplicate_slide(talk, at))?;
-        self.make(DUPLICATE_SLIDE, change, 1, at, at + 1)
+        self.make(DUPLICATE_SLIDE, change, Holds::Count(1), at, at + 1, None)
     }
 
     /// Removes the current slide, unless it's the only one. The one after it becomes
@@ -636,13 +692,13 @@ impl Document {
             return Ok(Vec::new());
         };
         let after = at.min(self.slide_count() - 2);
-        self.make(DELETE_SLIDE, change, -1, at, after)
+        self.make(DELETE_SLIDE, change, Holds::Count(-1), at, after, None)
     }
 
     /// Moves slide `from` so that `to` is its place afterwards, and makes it current.
     pub fn move_slide(&mut self, from: usize, to: usize) -> Result<Vec<usize>, EditRefused> {
         let change = self.build(|talk| slides_format::move_slide(talk, from, to))?;
-        self.make(MOVE_SLIDE, change, 0, from, to)
+        self.make(MOVE_SLIDE, change, Holds::Count(0), from, to, None)
     }
 
     /// Leaves the current slide out of shows, or puts it back in.
@@ -650,14 +706,24 @@ impl Document {
         let at = self.current;
         let change = self.build(|talk| slides_format::set_hidden(talk, at, hidden))?;
         let label = if hidden { HIDE_SLIDE } else { SHOW_SLIDE };
-        self.make(label, change, 0, at, at)
+        self.edit_slide(label, at, change, EditRun::New)
     }
 
     /// Sets the notes of slide `index`, and makes it current. Notes typed into one slide
     /// with nothing else done in between are one step to undo.
     pub fn set_notes(&mut self, index: usize, notes: &str) -> Result<Vec<usize>, EditRefused> {
         let change = self.build(|talk| slides_format::set_notes(talk, index, notes))?;
-        self.make(EDIT_NOTES, change, 0, index, index)
+        if change.is_empty() {
+            // Nothing typed: the notes typing, wherever it is, goes on as it was.
+            return Ok(Vec::new());
+        }
+        let run = self
+            .typing_notes
+            .filter(|&(slide, _)| slide == index)
+            .map_or(EditRun::New, |(_, run)| EditRun::Continue(run));
+        let changed = self.edit_slide(EDIT_NOTES, index, change, run)?;
+        self.typing_notes = self.open_run().map(|run| (index, run));
+        Ok(changed)
     }
 
     /// The talk's own components, and whether each is built.
@@ -872,6 +938,18 @@ fn broken_bodies(talk: &Talk) -> Vec<String> {
         .filter(|(_, slide)| slide.error.is_some())
         .map(|(raw, _)| talk.source[raw.body.clone()].trim().to_string())
         .collect()
+}
+
+/// Whether every slide of `after` but `index` has the bytes it had in `before`, given both
+/// have as many slides.
+fn others_alike(before: &Talk, after: &Talk, index: usize) -> bool {
+    fn text(talk: &Talk, at: usize) -> Option<&str> {
+        talk.source.get(talk.slides[at].range.clone())
+    }
+    before.slides.len() == after.slides.len()
+        && (0..before.slides.len())
+            .filter(|&at| at != index)
+            .all(|at| text(before, at) == text(after, at))
 }
 
 /// The folder's own name, even for a path like `talk/..`.

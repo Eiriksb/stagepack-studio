@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use slides_engine::{Fonts, Layer, pack_folder};
 use slides_format::{Change, SourceEdit};
-use stagepack_studio::document::{Document, EditRefused, OpenProblem, Reload, panic_in_next_change};
+use stagepack_studio::document::{Document, EditRefused, EditRun, OpenProblem, Reload, panic_in_next_change};
 use stagepack_studio::export::{ExportKind, run_export};
 use stagepack_studio::saving::SaveTarget;
 use zip::ZipArchive;
@@ -827,4 +827,89 @@ fn a_panic_while_undoing_leaves_the_talk_as_it_was() {
     // It undoes as before once nothing panics.
     assert!(doc.undo().unwrap().is_some());
     assert_eq!(doc.source(), "# One\n\n---\n\n# Two\n");
+}
+
+#[test]
+fn an_edit_that_changes_another_slide_is_refused() {
+    let source = "# One\n\n---\n\n# Two\n\n---\n\n# Three\n";
+    let (_d, mut doc) = talk(source);
+    let versions: Vec<_> = (0..3).map(|index| doc.slide_version(index)).collect();
+    // Slide 2's heading, from an edit said to be slide 1's.
+    let two = source.find("Two").unwrap();
+    let change = Change::single(SourceEdit { range: two..two + 3, text: "Deux".into() });
+
+    let refused = doc.edit_slide("Edit", 0, change, EditRun::New).unwrap_err();
+
+    assert_eq!(refused, EditRefused::WouldChangeAnotherSlide);
+    assert_eq!(refused.to_string(), "That change would have changed another slide, so it wasn't made.");
+    assert_eq!(doc.source(), source);
+    assert!(!doc.can_undo());
+    assert_eq!((0..3).map(|index| doc.slide_version(index)).collect::<Vec<_>>(), versions);
+}
+
+#[test]
+fn an_edit_held_to_its_slide_is_made() {
+    let source = "# One\n\n---\n\n# Two\n\n---\n\n# Three\n";
+    let (_d, mut doc) = talk(source);
+    let two = source.find("Two").unwrap();
+    let change = Change::single(SourceEdit { range: two..two + 3, text: "Deux".into() });
+
+    let changed = doc.edit_slide("Edit", 1, change, EditRun::New).unwrap();
+
+    assert_eq!(changed, vec![1]);
+    assert_eq!(doc.current(), 1);
+    assert_eq!(doc.source(), "# One\n\n---\n\n# Deux\n\n---\n\n# Three\n");
+    assert_eq!(doc.undo_label(), Some("Edit"));
+}
+
+#[test]
+fn a_typed_code_fence_cannot_swallow_the_next_slide() {
+    // Slide 3 holds a code block with slide breaks in it.
+    let source = "# One\n\n---\n\n# Two\n\n---\n\n```\na\n---\nb\n---\nc\n```\n";
+    let (_d, mut doc) = talk(source);
+    assert_eq!(doc.slide_count(), 3);
+    // A fence opened on slide 1 hides the breaks of slides 2 and 3, and the two inside slide
+    // 3's block become breaks: the talk still has three slides.
+    let at = "# One\n".len();
+    let change = Change::single(SourceEdit { range: at..at, text: "```\n".into() });
+    let changed = change.apply(source);
+    assert_eq!(slides_format::parse_talk(&changed).slides.len(), 3, "the same count");
+
+    let refused = doc.edit_slide("Edit", 0, change, EditRun::New).unwrap_err();
+
+    assert_eq!(refused, EditRefused::WouldChangeAnotherSlide);
+    assert_eq!(doc.source(), source);
+    assert!(!doc.can_undo());
+}
+
+#[test]
+fn edits_that_continue_a_run_are_one_step() {
+    let (_d, mut doc) = talk(FOUR_SLIDES);
+    let at = FOUR_SLIDES.find("# Two").unwrap() + "# Two".len();
+    let typed = |at: usize, text: &str| Change::single(SourceEdit { range: at..at, text: text.into() });
+    assert_eq!(doc.open_run(), None);
+    doc.edit_slide("Typing", 1, typed(at, "!"), EditRun::New).unwrap();
+    let run = doc.open_run().expect("a new run is open");
+    doc.edit_slide("Typing", 1, typed(at + 1, "?"), EditRun::Continue(run)).unwrap();
+    assert_eq!(doc.open_run(), Some(run));
+    // A new run is a step of its own.
+    doc.edit_slide("Typing", 1, typed(at + 2, "."), EditRun::New).unwrap();
+    assert_ne!(doc.open_run(), Some(run));
+
+    doc.undo().unwrap();
+    assert!(doc.source().contains("# Two!?  \r\n"));
+    assert_eq!(doc.open_run(), None, "an undo ends the run");
+    doc.undo().unwrap();
+    assert_eq!(doc.source(), FOUR_SLIDES);
+}
+
+#[test]
+fn notes_left_as_they_are_on_another_slide_do_not_join_its_typing() {
+    let (_d, mut doc) = talk(FOUR_SLIDES);
+    doc.set_notes(2, "Two").unwrap();
+    doc.set_notes(1, "").unwrap();
+    doc.set_notes(1, "One").unwrap();
+    doc.undo().unwrap();
+    assert_eq!(doc.notes_of(1), None);
+    assert_eq!(doc.notes_of(2).as_deref(), Some("Two"));
 }

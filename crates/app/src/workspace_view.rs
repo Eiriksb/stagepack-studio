@@ -3,9 +3,7 @@
 //! talk's components, and saving the talk.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures::StreamExt as _;
 use futures::channel::mpsc;
@@ -31,19 +29,19 @@ use crate::notes_panel::{
 };
 use crate::permissions::BuildPermissions;
 use crate::present_view::{self, Presentation, start_show};
-use crate::recovery::{Found, Recovery, hash_text};
+use crate::recovery::Recovery;
 use crate::ribbon::{Panels, Ribbon};
+use crate::save_flow::{CloseAnswer, Effect, SaveFlow, SaveOutcome};
 use crate::saving::{SaveError, SaveJob, SaveTarget, Saved};
 use crate::slide_canvas::{ScaleChanged, SlideCanvas};
 use crate::slide_strip::{
     self, STRIP_CONTEXT, STRIP_MAX_WIDTH, STRIP_MIN_WIDTH, STRIP_WIDTH, SlideStrip,
 };
 use crate::watcher::{self, Change};
+use crate::working_copies::{KEEP_FAILED, KeepFailed, WorkingCopies};
 
 mod editing;
 mod saving;
-
-use saving::Kept;
 
 pub const CANVAS_ID: &str = "canvas";
 pub const TITLE_ID: &str = "title";
@@ -83,15 +81,8 @@ pub(crate) const APP_ID: &str = "stagepack-studio";
 /// How long the file has to stay quiet before it's read, as one save can be several writes.
 const RELOAD_DELAY: Duration = Duration::from_millis(100);
 
-/// How long after the last edit the working copy of unsaved changes is brought up to date.
-const WORKING_COPY_DELAY: Duration = Duration::from_secs(1);
-/// The longest edits that never stop for [`WORKING_COPY_DELAY`] go without being kept, from
-/// the first of them.
-const WORKING_COPY_MOST_WAIT: Duration = Duration::from_secs(3);
 /// How long "Saved" stays on the status line.
 const STATUS_FADE: Duration = Duration::from_secs(5);
-/// How long after a working copy couldn't be written it's tried again.
-const KEEP_RETRY_DELAY: Duration = Duration::from_secs(10);
 
 const MARKDOWN_WIDTH: Pixels = px(380.);
 const MARKDOWN_MIN_WIDTH: Pixels = px(200.);
@@ -112,8 +103,6 @@ const UNSAVED_ON_CLOSE: &str = "This talk has changes that haven't been saved.";
 
 pub const RECOVERY_OFFER: &str = "Changes from last time weren't saved.";
 pub const RECOVERY_CHANGED_SINCE: &str = "The talk has also changed since then.";
-const KEEP_FAILED: &str =
-    "Unsaved changes couldn't be kept safe in case the app stops. The app will try again shortly.";
 
 /// What the title shows before the talk's name while it has unsaved changes.
 pub const UNSAVED_MARK: &str = "• ";
@@ -304,39 +293,17 @@ pub struct WorkspaceView {
     build_problems: Vec<Diagnostic>,
     /// The look at the components waiting for them to go quiet.
     pending_components: Option<Task<()>>,
-    /// Whether a save is running.
-    saving: bool,
-    /// Whether another save was asked for while one ran.
-    save_again: bool,
-    /// Whether a read of the file came in while a save ran. It's read again once the save
-    /// is done: what came in may be older than what the save wrote.
-    reload_after_save: bool,
-    /// Whether the window closes once the running save is done.
-    close_after_save: bool,
-    /// Whether the window may close with unsaved changes, as asked.
-    close_anyway: bool,
-    /// Where working copies of unsaved changes are kept, if anywhere.
-    recovery: Option<Recovery>,
-    /// The working copy this window last wrote, while it's there.
-    kept: Option<Kept>,
-    /// The update of the working copy waiting for the edits to stop for a moment.
-    pending_working_copy: Option<Task<()>>,
-    /// When the first edit the working copy doesn't hold yet was made, while an update waits.
-    unkept_since: Option<Instant>,
-    /// Unsaved changes from last time, while nobody has said whether to bring them back.
-    offered: Option<Found>,
-    /// The copy from last time that was brought back, until this window's own copy or a save
-    /// holds what it did.
-    adopted: saving::Adopted,
-    /// The last change to the working copies, which the next one waits for.
-    working_copy_chain: Option<Task<()>>,
-    /// How many clears of this window's copy have been asked for.
-    clears: Arc<AtomicU64>,
+    /// Whether a save is running, and what's to happen once it's done.
+    save_flow: SaveFlow,
+    /// The working copies of the talk's unsaved changes.
+    working_copies: Entity<WorkingCopies>,
     /// The window this is the content of.
     window_handle: AnyWindowHandle,
     _scale_changed: Subscription,
     _document_changed: Option<Subscription>,
     _notes_edited: Subscription,
+    _working_copies_changed: Subscription,
+    _keep_failed: Subscription,
 }
 
 impl WorkspaceView {
@@ -432,11 +399,18 @@ impl WorkspaceView {
                 notes_panel.update(cx, |panel, cx| panel.follow_slide(window, cx));
             },
         );
+        let working_copies = cx.new(|_| WorkingCopies::new(document.clone()));
+        // The bar offering back last time's changes comes and goes.
+        let working_copies_changed = cx.observe(&working_copies, |_, _, cx| cx.notify());
+        let keep_failed = cx.subscribe(&working_copies, |this, _, _: &KeepFailed, cx| {
+            this.say(KEEP_FAILED, cx)
+        });
         // The title says whether there are unsaved changes, whatever made them, and the
         // working copy follows them.
         let document_changed = document.as_ref().map(|document| {
             cx.observe(document, |this, _, cx| {
-                this.keep_working_copy_soon(cx);
+                this.working_copies
+                    .update(cx, |copies, cx| copies.talk_changed(cx));
                 cx.notify();
             })
         });
@@ -489,23 +463,14 @@ impl WorkspaceView {
             build_again: false,
             build_problems: Vec::new(),
             pending_components: None,
-            saving: false,
-            save_again: false,
-            reload_after_save: false,
-            close_after_save: false,
-            close_anyway: false,
-            recovery: None,
-            kept: None,
-            pending_working_copy: None,
-            unkept_since: None,
-            offered: None,
-            adopted: saving::Adopted::default(),
-            working_copy_chain: None,
-            clears: Arc::new(AtomicU64::new(0)),
+            save_flow: SaveFlow::default(),
+            working_copies,
             window_handle: window.window_handle(),
             _scale_changed: scale_changed,
             _document_changed: document_changed,
             _notes_edited: notes_edited,
+            _working_copies_changed: working_copies_changed,
+            _keep_failed: keep_failed,
         };
         view.always_build = view.is_always_built();
         view
@@ -684,8 +649,8 @@ impl WorkspaceView {
         let Some(document) = self.document.clone() else {
             return;
         };
-        if self.saving {
-            self.reload_after_save = true;
+        // A read that comes in while a save runs is held back, and the file read again after.
+        if !self.save_flow.read_arrived().contains(&Effect::TakeRead) {
             return;
         }
         let reload = document.update(cx, |document, cx| {
@@ -882,7 +847,7 @@ impl WorkspaceView {
             multiple: false,
             prompt: Some("Open".into()),
         });
-        let recovery = self.recovery.clone();
+        let recovery = self.working_copies.read(cx).recovery().cloned();
         cx.spawn(async move |this, cx| {
             let opened = match chosen.await {
                 Ok(Ok(Some(mut paths))) if !paths.is_empty() => cx
