@@ -51,6 +51,7 @@ fn moved(slide: &Slide, from: usize, to: usize) -> Slide {
         notes: slide.notes.as_ref().map(|notes| Notes { text: notes.text.clone(), range: shift.range(&notes.range) }),
         error: slide.error.clone(),
         inline_tags: slide.inline_tags.clone(),
+        quotes: slide.quotes.iter().map(|quote| shift.range(quote)).collect(),
     }
 }
 
@@ -75,12 +76,21 @@ impl Shift {
 
     fn block(&self, block: &Block) -> Block {
         match block {
-            Block::Heading { level, spans, range } => Block::Heading { level: *level, spans: spans.clone(), range: self.range(range) },
-            Block::Paragraph { spans, range } => Block::Paragraph { spans: spans.clone(), range: self.range(range) },
-            Block::List { ordered, items, range } => Block::List {
+            Block::Heading { level, spans, range, inline, only_text } => Block::Heading {
+                level: *level,
+                spans: spans.clone(),
+                range: self.range(range),
+                inline: self.range(inline),
+                only_text: *only_text,
+            },
+            Block::Paragraph { spans, range, inline, only_text } => {
+                Block::Paragraph { spans: spans.clone(), range: self.range(range), inline: self.range(inline), only_text: *only_text }
+            }
+            Block::List { ordered, items, range, item_ranges } => Block::List {
                 ordered: *ordered,
                 items: items.iter().map(|item| self.blocks(item)).collect(),
                 range: self.range(range),
+                item_ranges: item_ranges.iter().map(|item| self.range(item)).collect(),
             },
             Block::Table { rows, range } => Block::Table { rows: rows.clone(), range: self.range(range) },
             Block::Code { language, code, range } => Block::Code { language: language.clone(), code: code.clone(), range: self.range(range) },

@@ -80,7 +80,7 @@ pub(crate) fn read_slides(source: &str, raw_slides: &[&RawSlide]) -> Vec<Slide> 
 }
 
 fn empty_slide(raw: &RawSlide) -> Slide {
-    Slide { range: raw.range.clone(), settings: raw.settings.clone(), blocks: Vec::new(), notes: None, error: None, inline_tags: Vec::new() }
+    Slide { range: raw.range.clone(), settings: raw.settings.clone(), blocks: Vec::new(), notes: None, error: None, inline_tags: Vec::new(), quotes: Vec::new() }
 }
 
 fn refused_slide(raw: &RawSlide, message: &str) -> Slide {
@@ -98,14 +98,20 @@ fn read_slide(source: &str, raw: &RawSlide) -> Slide {
     }
     // A slide that trips a bug in the `markdown` crate shouldn't take the rest of the talk with it.
     match catch_unwind(AssertUnwindSafe(|| read_body(source, raw.body.clone()))) {
-        Ok(Ok((blocks, notes, inline_tags))) => Slide { blocks, notes, inline_tags, ..empty_slide(raw) },
+        Ok(Ok(Body { blocks, notes, inline_tags, quotes })) => Slide { blocks, notes, inline_tags, quotes, ..empty_slide(raw) },
         Ok(Err(message)) => refused_slide(raw, &message),
         Err(_) => refused_slide(raw, UNREADABLE),
     }
 }
 
-/// A slide's blocks, its notes, and the tags in the middle of a line.
-type Body = (Vec<Block>, Option<Notes>, Vec<String>);
+/// What's read from a slide's body.
+struct Body {
+    blocks: Vec<Block>,
+    notes: Option<Notes>,
+    /// The tags in the middle of a line.
+    inline_tags: Vec<String>,
+    quotes: Vec<Range<usize>>,
+}
 
 fn read_body(source: &str, body: Range<usize>) -> Result<Body, String> {
     let root = markdown::to_mdast(&source[body.clone()], &options()).map_err(|message| message.to_string())?;
@@ -113,12 +119,12 @@ fn read_body(source: &str, body: Range<usize>) -> Result<Body, String> {
         return Err(TOO_DEEP.to_string());
     }
     // Nothing past the slide is looked at, so that a slide reads the same wherever it sits.
-    let ctx = Ctx { source: &source[..body.end], base: body.start, inline_tags: RefCell::new(Vec::new()) };
+    let ctx = Ctx { source: &source[..body.end], base: body.start, inline_tags: RefCell::new(Vec::new()), quotes: RefCell::new(Vec::new()) };
     let (mut blocks, mut notes) = (Vec::new(), None);
     for node in root.children().into_iter().flatten() {
         ctx.block(node, &mut blocks, &mut notes);
     }
-    Ok((blocks, notes, ctx.inline_tags.into_inner()))
+    Ok(Body { blocks, notes, inline_tags: ctx.inline_tags.into_inner(), quotes: ctx.quotes.into_inner() })
 }
 
 /// Whether a line starts with more quote and list markers than a slide can nest. Markers
@@ -190,6 +196,8 @@ struct Ctx<'a> {
     base: usize,
     /// The tags found in the middle of a line, other than `<Text>`.
     inline_tags: RefCell<Vec<String>>,
+    /// The block quotes found, at any depth.
+    quotes: RefCell<Vec<Range<usize>>>,
 }
 
 impl Ctx<'_> {
@@ -205,6 +213,8 @@ impl Ctx<'_> {
             Node::Heading(h) => out.push(Block::Heading {
                 level: h.depth,
                 spans: self.spans(&h.children),
+                inline: self.inline_range(&h.children, range.end),
+                only_text: only_text(&h.children),
                 range,
             }),
             Node::Paragraph(p) => match p.children.as_slice() {
@@ -213,7 +223,12 @@ impl Ctx<'_> {
                     alt: image.alt.clone(),
                     range,
                 }),
-                children => out.push(Block::Paragraph { spans: self.spans(children), range }),
+                children => out.push(Block::Paragraph {
+                    spans: self.spans(children),
+                    inline: self.inline_range(children, range.end),
+                    only_text: only_text(children),
+                    range,
+                }),
             },
             Node::List(list) => out.push(Block::List {
                 ordered: list.ordered,
@@ -228,6 +243,7 @@ impl Ctx<'_> {
                         blocks
                     })
                     .collect(),
+                item_ranges: list.children.iter().map(|item| self.range(item)).collect(),
                 range,
             }),
             Node::Table(table) => out.push(Block::Table {
@@ -251,6 +267,7 @@ impl Ctx<'_> {
             }),
             // Quotes have no block of their own; their content is kept.
             Node::Blockquote(quote) => {
+                self.quotes.borrow_mut().push(range);
                 for child in &quote.children {
                     self.block(child, out, notes);
                 }
@@ -283,6 +300,15 @@ impl Ctx<'_> {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// The bytes from the first of `nodes` to the end of the last, or an empty range at
+    /// `otherwise` when there are none.
+    fn inline_range(&self, nodes: &[Node], otherwise: usize) -> Range<usize> {
+        match (nodes.first(), nodes.last()) {
+            (Some(first), Some(last)) => self.range(first).start..self.range(last).end,
+            _ => otherwise..otherwise,
         }
     }
 
@@ -338,6 +364,26 @@ impl Ctx<'_> {
             }
         }
     }
+}
+
+/// Whether `nodes`, a paragraph's or heading's content, are text alone: plain, bold,
+/// italic, code or a link, or inside `<Text>` tags whose attributes are all written out.
+/// Anything else is drawn as something the spans don't say, or means something they leave out.
+fn only_text(nodes: &[Node]) -> bool {
+    nodes.iter().all(|node| match node {
+        Node::Text(_) | Node::Break(_) | Node::InlineCode(_) => true,
+        Node::Strong(s) => only_text(&s.children),
+        Node::Emphasis(e) => only_text(&e.children),
+        Node::Link(l) => only_text(&l.children),
+        Node::MdxJsxTextElement(element) => {
+            element.name.as_deref() == Some("Text")
+                && element.attributes.iter().all(|attribute| {
+                    matches!(attribute, AttributeContent::Property(p) if matches!(p.value, None | Some(AttributeValue::Literal(_))))
+                })
+                && only_text(&element.children)
+        }
+        _ => false,
+    })
 }
 
 fn push_span(out: &mut Vec<Span>, text: &str, style: &Style) {

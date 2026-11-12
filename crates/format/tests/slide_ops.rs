@@ -524,11 +524,14 @@ fn without_ranges(blocks: &[Block]) -> Vec<Block> {
     blocks
         .iter()
         .map(|block| match block.clone() {
-            Block::Heading { level, spans, .. } => Block::Heading { level, spans, range: 0..0 },
-            Block::Paragraph { spans, .. } => Block::Paragraph { spans, range: 0..0 },
-            Block::List { ordered, items, .. } => {
-                Block::List { ordered, items: items.iter().map(|item| without_ranges(item)).collect(), range: 0..0 }
-            }
+            Block::Heading { level, spans, only_text, .. } => Block::Heading { level, spans, range: 0..0, inline: 0..0, only_text },
+            Block::Paragraph { spans, only_text, .. } => Block::Paragraph { spans, range: 0..0, inline: 0..0, only_text },
+            Block::List { ordered, items, item_ranges, .. } => Block::List {
+                ordered,
+                items: items.iter().map(|item| without_ranges(item)).collect(),
+                range: 0..0,
+                item_ranges: vec![0..0; item_ranges.len()],
+            },
             Block::Table { rows, .. } => Block::Table { rows, range: 0..0 },
             Block::Code { language, code, .. } => Block::Code { language, code, range: 0..0 },
             Block::Picture { src, alt, .. } => Block::Picture { src, alt, range: 0..0 },
