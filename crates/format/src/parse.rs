@@ -367,18 +367,26 @@ impl Ctx<'_> {
 }
 
 /// Whether `nodes`, a paragraph's or heading's content, are text alone: plain, bold,
-/// italic, code or a link, or inside `<Text>` tags whose attributes are all written out.
+/// italic, code or a link with no title, or inside `<Text>` tags whose attributes are all
+/// ones a [`Style`] holds, with values it reads.
 /// Anything else is drawn as something the spans don't say, or means something they leave out.
 fn only_text(nodes: &[Node]) -> bool {
     nodes.iter().all(|node| match node {
         Node::Text(_) | Node::Break(_) | Node::InlineCode(_) => true,
         Node::Strong(s) => only_text(&s.children),
         Node::Emphasis(e) => only_text(&e.children),
-        Node::Link(l) => only_text(&l.children),
+        // A link's title isn't kept.
+        Node::Link(l) => l.title.is_none() && only_text(&l.children),
         Node::MdxJsxTextElement(element) => {
             element.name.as_deref() == Some("Text")
                 && element.attributes.iter().all(|attribute| {
-                    matches!(attribute, AttributeContent::Property(p) if matches!(p.value, None | Some(AttributeValue::Literal(_))))
+                    let AttributeContent::Property(p) = attribute else { return false };
+                    let value = match &p.value {
+                        None => "true",
+                        Some(AttributeValue::Literal(value)) => value.as_str(),
+                        Some(_) => return false,
+                    };
+                    Style::knows_text_attr(&p.name, value)
                 })
                 && only_text(&element.children)
         }

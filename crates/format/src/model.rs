@@ -26,6 +26,17 @@ impl Style {
             _ => {}
         }
     }
+
+    /// Whether the attribute `name` of a `<Text>` tag is one [`Style::apply_text_attr`]
+    /// knows, with a value it reads as written, so that the style holds all it says.
+    pub fn knows_text_attr(name: &str, value: &str) -> bool {
+        match name {
+            "color" => !value.is_empty(),
+            "size" => value.parse::<u32>().is_ok(),
+            "bold" | "italic" | "underline" => matches!(value, "true" | "false"),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

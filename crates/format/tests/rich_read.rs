@@ -65,6 +65,30 @@ fn an_empty_item_is_an_empty_paragraph() {
 }
 
 #[test]
+fn an_item_whose_content_the_parser_drops_is_in_no_flow() {
+    for source in ["- ***\n- a\n", "- [r]: http://x\n- a\n"] {
+        assert!(flows(source).is_empty(), "{source:?}");
+        assert_eq!(uneditable_reason(&parse_talk(source), 0, 3), Some("This list can't be edited on the slide yet."), "{source:?}");
+    }
+    for source in ["-\n- a\n", "-   \n- a\n", "1.\n2. a\n"] {
+        assert_eq!(flows(source)[0].paras[0].spans, vec![], "{source:?}");
+    }
+}
+
+#[test]
+fn text_tags_and_links_the_model_cannot_hold_are_in_no_flow() {
+    for inline in ["<Text font=\"Mono\">f</Text>", "<Text click=\"2\">f</Text>", "<Text size=\"x\">f</Text>", "<Text bold=\"yes\">f</Text>", "[l](http://x \"tip\")"] {
+        let source = format!("A {inline} b\n");
+        let talk = parse_talk(&source);
+        assert!(text_flows(&talk, 0).is_empty(), "{source:?}");
+        assert!(uneditable_reason(&talk, 0, 0).is_some(), "{source:?}");
+    }
+    for inline in ["<Text color=\"red\" size=\"64\">f</Text>", "<Text bold=\"false\" underline>f</Text>", "[l](http://x)"] {
+        assert_eq!(flows(&format!("A {inline} b\n")).len(), 1, "{inline:?}");
+    }
+}
+
+#[test]
 fn a_table_splits_the_text_around_it() {
     let flows = flows("# T\n\nBefore.\n\n| a | b |\n| - | - |\n| 1 | 2 |\n\nAfter.\n");
     assert_eq!(flows.len(), 3);
@@ -260,6 +284,8 @@ fn mixed_source() -> impl Strategy<Value = String> {
             "<Region name=\"body\" />", "<Box x=\"1\">\n\nboxed\n\n</Box>", "<Box x=\"1\" y=\"2\" />", "<Text color=\"red\">\n\nred\n\n</Text>",
             "<Chart />", "<Notes>\nnotes\n</Notes>", "**bold** and *it*", "a  \nb", "---", "---\nlayout: two-columns\n---", "\r\n",
             "  indented", "    code by indent", "* star", "<Text size=\"40\">x</Text> y",
+            "- ***", "- [r]: http://x", "-   ", "- a\n\n- b\n\n  - c", "<Text font=\"Mono\">f</Text> g", "[l](http://x \"tip\")",
+            "<Box x=\"1\">\n\n- a\n\n  b\n\n</Box>",
         ]),
         0..12,
     )
@@ -280,11 +306,27 @@ fn assert_flows_are_sound(talk: &Talk) -> Result<(), TestCaseError> {
                 prop_assert!(at.block.start <= at.inline.start && at.inline.end <= at.block.end);
                 prop_assert!(slide.range.start <= at.block.start && at.block.end <= slide.range.end);
                 prop_assert!(talk.source.is_char_boundary(at.inline.start) && talk.source.is_char_boundary(at.inline.end));
+                prop_assert!(talk.source.is_char_boundary(at.block.start) && talk.source.is_char_boundary(at.block.end));
                 prop_assert!(para.spans.iter().all(|span| !span.text.is_empty()));
                 prop_assert!(para.spans.windows(2).all(|pair| pair[0].style != pair[1].style));
                 blocks.push(at.block.clone());
             }
-            prop_assert!(uneditable_reason(talk, index, flow.source[0].inline.start).is_none());
+            // Every byte of what the flow was read from is in it: a box from its opening tag
+            // to its closing one, a list's markers and the lines between its items.
+            let read: Vec<std::ops::Range<usize>> = match &flow.place {
+                FlowPlace::Tag(range) => vec![range.clone()],
+                FlowPlace::Region(_) => slide
+                    .blocks
+                    .iter()
+                    .map(|block| block.range().clone())
+                    .filter(|range| flow.source.iter().any(|at| range.start <= at.block.start && at.block.end <= range.end))
+                    .collect(),
+            };
+            for range in read {
+                for at in range {
+                    prop_assert_eq!(uneditable_reason(talk, index, at), None, "at {} of {:?}", at, &talk.source);
+                }
+            }
         }
         let in_file_order = blocks.clone();
         blocks.sort_by_key(|block| block.start);

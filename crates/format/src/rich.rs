@@ -119,7 +119,7 @@ pub fn text_flows(talk: &Talk, slide: usize) -> Vec<TextFlow> {
             }
             Block::Tag(tag) if is_positioned(tag) => {
                 end_run(&mut run, &mut flows);
-                flows.extend(box_flow(slide, tag));
+                flows.extend(box_flow(&talk.source, slide, tag));
             }
             _ => {
                 let region = match block {
@@ -127,7 +127,7 @@ pub fn text_flows(talk: &Talk, slide: usize) -> Vec<TextFlow> {
                     _ => current,
                 };
                 let mut read = Vec::new();
-                if !read_block(slide, block, &mut read) {
+                if !read_block(&talk.source, slide, block, &mut read) {
                     end_run(&mut run, &mut flows);
                     continue;
                 }
@@ -148,13 +148,13 @@ pub fn text_flows(talk: &Talk, slide: usize) -> Vec<TextFlow> {
 }
 
 /// The flow of a positioned tag's text, if it's a box holding only editable text.
-fn box_flow(slide: &Slide, tag: &Tag) -> Option<TextFlow> {
+fn box_flow(source: &str, slide: &Slide, tag: &Tag) -> Option<TextFlow> {
     if !TEXT_BOXES.contains(&tag.name.as_str()) || is_quoted(slide, &tag.range) || tag.children.is_empty() {
         return None;
     }
     let mut read = Vec::new();
     for child in &tag.children {
-        if !read_block(slide, child, &mut read) {
+        if !read_block(source, slide, child, &mut read) {
             return None;
         }
     }
@@ -166,9 +166,9 @@ fn is_quoted(slide: &Slide, range: &Range<usize>) -> bool {
     slide.quotes.iter().any(|quote| quote.start < range.end && range.start < quote.end)
 }
 
-/// Adds the paragraphs of `block` to `out`, or returns false, having added nothing, if
-/// it isn't text the model holds exactly.
-fn read_block(slide: &Slide, block: &Block, out: &mut Vec<(Para, ParaSource)>) -> bool {
+/// Adds the paragraphs of `block`, a block of `source`, to `out`, or returns false, having
+/// added nothing, if it isn't text the model holds exactly.
+fn read_block(source: &str, slide: &Slide, block: &Block, out: &mut Vec<(Para, ParaSource)>) -> bool {
     if is_quoted(slide, block.range()) {
         return false;
     }
@@ -183,7 +183,7 @@ fn read_block(slide: &Slide, block: &Block, out: &mut Vec<(Para, ParaSource)>) -
         }
         Block::List { ordered, items, item_ranges, .. } => {
             let mut read = Vec::new();
-            let fits = read_list(*ordered, items, item_ranges, 0, &mut read);
+            let fits = read_list(source, *ordered, items, item_ranges, 0, &mut read);
             if fits {
                 out.extend(read);
             }
@@ -194,15 +194,17 @@ fn read_block(slide: &Slide, block: &Block, out: &mut Vec<(Para, ParaSource)>) -
 }
 
 /// Adds a list's items, at `level`, to `out`. An item is editable if it's empty, or holds a
-/// paragraph of text followed by lists, which are a level deeper.
-fn read_list(ordered: bool, items: &[Vec<Block>], item_ranges: &[Range<usize>], level: u8, out: &mut Vec<(Para, ParaSource)>) -> bool {
+/// paragraph of text followed by lists, which are a level deeper. An item the parser kept
+/// nothing of is empty only if it's a marker alone: anything else in it, a rule or a link
+/// definition, is dropped by the parser, and would be lost.
+fn read_list(source: &str, ordered: bool, items: &[Vec<Block>], item_ranges: &[Range<usize>], level: u8, out: &mut Vec<(Para, ParaSource)>) -> bool {
     if level > MAX_LEVEL || items.len() != item_ranges.len() {
         return false;
     }
     let kind = if ordered { ParaKind::Numbered { level } } else { ParaKind::Bullet { level } };
     for (item, item_range) in items.iter().zip(item_ranges) {
         let nested = match item.as_slice() {
-            [] => {
+            [] if is_a_marker_alone(source.get(item_range.clone()).unwrap_or_default()) => {
                 let end = item_range.end;
                 out.push((Para { kind, spans: Vec::new() }, ParaSource { block: item_range.clone(), inline: end..end }));
                 continue;
@@ -215,12 +217,19 @@ fn read_list(ordered: bool, items: &[Vec<Block>], item_ranges: &[Range<usize>], 
         };
         for block in nested {
             let Block::List { ordered, items, item_ranges, .. } = block else { return false };
-            if !read_list(*ordered, items, item_ranges, level + 1, out) {
+            if !read_list(source, *ordered, items, item_ranges, level + 1, out) {
                 return false;
             }
         }
     }
     true
+}
+
+/// Whether `item` is a list marker and nothing more than whitespace.
+fn is_a_marker_alone(item: &str) -> bool {
+    let item = item.trim();
+    let digits = item.bytes().take_while(u8::is_ascii_digit).count();
+    matches!((digits, &item[digits..]), (0, "-" | "*" | "+") | (1..=9, "." | ")"))
 }
 
 /// A paragraph of `kind` holding `spans`, tidied: line endings made `\n`, no empty spans,
@@ -251,18 +260,20 @@ pub fn uneditable_reason(talk: &Talk, slide: usize, at: usize) -> Option<&'stati
     if slide.error.is_some() {
         return Some(UNREADABLE);
     }
-    let in_a_flow = text_flows(talk, index)
-        .iter()
-        .flat_map(|flow| &flow.source)
-        .any(|source| source.block.start <= at && at <= source.block.end);
-    if in_a_flow {
+    let block = slide.blocks.iter().find(|block| block.range().contains(&at));
+    // Every byte of a block that was read into a flow is in it: its markers, the blank
+    // lines between a list's items, a box's opening and closing tags.
+    let read = block.is_some_and(|block| match block {
+        Block::Tag(tag) if is_positioned(tag) => box_flow(&talk.source, slide, tag).is_some(),
+        block => read_block(&talk.source, slide, block, &mut Vec::new()),
+    });
+    if read {
         return None;
     }
     if slide.quotes.iter().any(|quote| quote.contains(&at)) {
         return Some(QUOTE);
     }
-    let block = slide.blocks.iter().find(|block| block.range().contains(&at))?;
-    reason_in(block, at)
+    reason_in(block?, at)
 }
 
 /// Why the text at `at`, inside `block`, isn't editable, or `None` if what's there is
