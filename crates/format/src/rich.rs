@@ -81,7 +81,7 @@ const LAYOUTS: [(&str, &[&str], &str); 5] = [
 const DEFAULT_LAYOUT: &str = "content";
 
 /// The regions of the slide's layout, and its main one, as the engine finds them.
-fn layout_of(slide: &Slide) -> (&'static [&'static str], &'static str) {
+pub(crate) fn layout_of(slide: &Slide) -> (&'static [&'static str], &'static str) {
     let name = slide.settings.as_ref().and_then(|settings| settings.get("layout")).filter(|name| !name.is_empty());
     let find = |name: &str| LAYOUTS.iter().find(|layout| layout.0 == name);
     let layout = name.and_then(find).or_else(|| find(DEFAULT_LAYOUT)).expect("the default layout is listed");
@@ -89,7 +89,7 @@ fn layout_of(slide: &Slide) -> (&'static [&'static str], &'static str) {
 }
 
 /// Whether a tag asks for a place on the slide, as the engine decides it.
-fn is_positioned(tag: &Tag) -> bool {
+pub(crate) fn is_positioned(tag: &Tag) -> bool {
     ["x", "y", "w", "h"]
         .iter()
         .any(|name| tag.attr(name).and_then(|value| value.trim().parse::<f32>().ok()).is_some_and(f32::is_finite))
