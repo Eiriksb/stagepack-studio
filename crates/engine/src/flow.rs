@@ -19,8 +19,9 @@ use crate::text_geometry::{DrawnBlock, DrawnText, LayerText};
 use slides_components::shortened;
 use crate::{
     Align, Bullet, DisplayItem, Fonts, LayoutEnv, NativeElement, NativeParagraph, NativeRun, Notice, Rect, RegionDef, ShapedText, TextRun,
-    highlight, shape_text,
+    highlight,
 };
+use crate::text::shape_text_with;
 
 pub(crate) const GAP: f32 = 24.0;
 /// The least a list is indented, however narrow its markers.
@@ -94,12 +95,15 @@ pub(crate) struct Leaf {
     align: Align,
     /// A list marker stays on one line, however narrow the indent is.
     wraps: bool,
+    /// Whether a line break at the end of the text is drawn as an empty last line, as it is
+    /// at the end of a heading or a paragraph.
+    end_line: bool,
     frame: Frame,
 }
 
 impl Leaf {
     fn shape(&self, width: Option<f32>, fonts: &mut Fonts) -> ShapedText {
-        shape_text(fonts, &self.runs, width.filter(|_| self.wraps), self.align)
+        shape_text_with(fonts, &self.runs, width.filter(|_| self.wraps), self.align, self.end_line)
     }
 
     /// Takes the space Taffy offers, not its known size: only the space has had the
@@ -447,9 +451,16 @@ impl<'a, 'env> Flow<'a, 'env> {
             .unzip()
     }
 
+    /// A heading's or a paragraph's text. One with nothing in it is still a line of its
+    /// look's height, and a break at its end is an empty last line.
     fn text(&mut self, spans: &[Span], look: TextLook, align: Align) -> NodeId {
-        let (runs, native) = self.runs(spans, look);
-        let node = self.leaf(Style::default(), Content::Text(Leaf { runs, align, wraps: true, frame: Frame::None }));
+        let (mut runs, mut native) = self.runs(spans, look);
+        if runs.iter().all(|run| run.text.is_empty()) {
+            let run = self.run(&Span { text: String::new(), style: Default::default() }, look);
+            native = vec![NativeRun::new(&run, None)];
+            runs = vec![run];
+        }
+        let node = self.leaf(Style::default(), Content::Text(Leaf { runs, align, wraps: true, end_line: true, frame: Frame::None }));
         self.note(node, Semantic::Paragraph(NativeParagraph::new(native, align)));
         node
     }
@@ -461,7 +472,7 @@ impl<'a, 'env> Flow<'a, 'env> {
         run.color = color.unwrap_or(run.color);
         run.size = size.unwrap_or(run.size);
         let paragraph = NativeParagraph::new(vec![NativeRun::new(&run, None)], align);
-        let node = self.leaf(Style::default(), Content::Text(Leaf { runs: vec![run], align, wraps: true, frame: Frame::None }));
+        let node = self.leaf(Style::default(), Content::Text(Leaf { runs: vec![run], align, wraps: true, end_line: false, frame: Frame::None }));
         self.note(node, Semantic::Paragraph(paragraph));
         node
     }
@@ -551,7 +562,7 @@ impl<'a, 'env> Flow<'a, 'env> {
     fn marker(&self, label: String) -> Leaf {
         let span = Span { text: label, style: Default::default() };
         let run = self.run(&span, self.region_look());
-        Leaf { runs: vec![run], align: Align::Left, wraps: false, frame: Frame::None }
+        Leaf { runs: vec![run], align: Align::Left, wraps: false, end_line: false, frame: Frame::None }
     }
 
     /// Columns share the width evenly. Cells are placed by number, so a row with too
@@ -574,7 +585,7 @@ impl<'a, 'env> Flow<'a, 'env> {
                     ..Style::default()
                 };
                 let (runs, native) = self.runs(spans, look);
-                let cell = self.leaf(style, Content::Text(Leaf { runs, align, wraps: true, frame: Frame::Outline }));
+                let cell = self.leaf(style, Content::Text(Leaf { runs, align, wraps: true, end_line: false, frame: Frame::Outline }));
                 native_row.push((cell, NativeParagraph::new(native, align)));
                 cells.push(cell);
             }
@@ -620,7 +631,7 @@ impl<'a, 'env> Flow<'a, 'env> {
             lines.push(NativeParagraph::new(without_line_ending(native), Align::Left));
         }
         let style = Style { padding: length(CODE_PADDING), ..Style::default() };
-        let node = self.leaf(style, Content::Text(Leaf { runs, align: Align::Left, wraps: true, frame: Frame::Panel }));
+        let node = self.leaf(style, Content::Text(Leaf { runs, align: Align::Left, wraps: true, end_line: false, frame: Frame::Panel }));
         self.note(node, Semantic::Code(lines));
         node
     }

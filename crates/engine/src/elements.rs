@@ -14,7 +14,7 @@ use toolkit::{Color, Ctx, CtxData, Element, Placed, Props, RenderInput, ShapeKin
 use crate::flow::{Content, Drawing, Flow, MAX_NOTICE_CHARS, TEXT_TAG, column, rounded_rect, rounded_rect_with};
 use slides_components::shortened;
 use crate::pictures::icon_pixmap;
-use crate::slide::{MAX_SIZE, SLIDE_HEIGHT, SLIDE_WIDTH, is_positioned};
+use crate::slide::{ALIGN_UNPLACED, MAX_SIZE, SLIDE_HEIGHT, SLIDE_WIDTH, is_positioned};
 use crate::native::Semantic;
 use crate::talk_components::{Rendered, read_asset};
 use crate::{Align, DisplayItem, LayoutEnv, NativeContent, Notice, PLACEMENT_ATTRS, PathStep, RegionDef, layout_by_name};
@@ -218,6 +218,9 @@ impl Flow<'_, '_> {
     pub(crate) fn tag(&mut self, tag: &Tag, align: Align) -> Option<NodeId> {
         if is_positioned(tag) {
             self.notice(format!("{} is inside another tag, so the place it asks for is ignored", tag.name));
+        }
+        if tag.attr("align").is_some() {
+            self.notice(ALIGN_UNPLACED.to_string());
         }
         match self.render_tag(tag, (self.width, 0.0)) {
             Some(element) => self.tag_element(tag, &element, align, false),

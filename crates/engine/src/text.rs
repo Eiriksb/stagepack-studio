@@ -4,8 +4,8 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use cosmic_text::{
-    fontdb, Align as TextAlign, Attrs, Buffer, Color as TextColor, Command, Family, FontSystem,
-    Metrics, Shaping, Style, SwashCache, SwashContent, Weight,
+    fontdb, Align as TextAlign, Attrs, AttrsList, Buffer, BufferLine, Color as TextColor, Command, Family, FontSystem,
+    LineEnding, Metrics, Shaping, Style, SwashCache, SwashContent, Weight,
 };
 use tiny_skia::{
     Color, ColorU8, FillRule, FilterQuality, Paint, Path, PathBuilder, Pixmap, PixmapMut,
@@ -169,6 +169,17 @@ fn run_attrs(run: &TextRun, index: usize) -> Attrs<'_> {
 
 /// Shapes `runs` in slide units. With a width the text wraps at it.
 pub fn shape_text(fonts: &mut Fonts, runs: &[TextRun], width: Option<f32>, align: Align) -> ShapedText {
+    shape_text_with(fonts, runs, width, align, false)
+}
+
+/// Whether `c` ends a line, as the shaper splits text into lines.
+fn ends_a_line(c: char) -> bool {
+    matches!(c, '\n' | '\r' | '\u{1c}'..='\u{1e}' | '\u{85}' | '\u{2029}')
+}
+
+/// As [`shape_text`]. With `end_line`, text that ends with a line break has an empty line
+/// after it, as a paragraph ending in a break is drawn, where the shaper would leave none.
+pub(crate) fn shape_text_with(fonts: &mut Fonts, runs: &[TextRun], width: Option<f32>, align: Align, end_line: bool) -> ShapedText {
     let biggest = runs.iter().map(|r| limited_size(r.size)).fold(MIN_TEXT_SIZE, f32::max);
     let mut buffer = Buffer::new(&mut fonts.system, Metrics::new(biggest, biggest * LINE_HEIGHT));
     buffer.set_size(width, None);
@@ -183,6 +194,12 @@ pub fn shape_text(fonts: &mut Fonts, runs: &[TextRun], width: Option<f32>, align
         Shaping::Advanced,
         Some(alignment),
     );
+    let last = runs.iter().rev().find(|run| !run.text.is_empty());
+    if end_line && let Some(last) = last.filter(|run| run.text.ends_with(ends_a_line)) {
+        let mut line = BufferLine::new("", LineEnding::None, AttrsList::new(&run_attrs(last, runs.len())), Shaping::Advanced);
+        line.set_align(Some(alignment));
+        buffer.lines.push(line);
+    }
     buffer.shape_until_scroll(&mut fonts.system, false);
 
     let mut shaped_width = 0.0_f32;

@@ -55,6 +55,15 @@ pub enum Hit {
     Nothing,
 }
 
+/// The rectangles that show a selection, in slide units before their layer is turned, and
+/// how that layer turns: by `rotate` degrees around `centre`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SelectionRects {
+    pub rects: Vec<Rect>,
+    pub rotate: f32,
+    pub centre: (f32, f32),
+}
+
 /// Where a caret goes from where it is, by lines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LineMove {
@@ -92,8 +101,8 @@ pub(crate) struct DrawnBlock {
 pub(crate) struct LayerText {
     pub texts: Vec<DrawnText>,
     pub blocks: Vec<DrawnBlock>,
-    /// The layout region the layer is, if it is one.
-    pub region: Option<&'static str>,
+    /// The layout region the layer is, if it is one, and where that region is on the slide.
+    pub region: Option<(&'static str, Rect)>,
     /// Whether the layer stands for one thing, a positioned tag or a slide that couldn't be
     /// read, so that a click on it away from its text is about the start of its source.
     pub whole: bool,
@@ -180,6 +189,9 @@ struct Frame {
     centre: (f32, f32),
     /// Whether it's a box of its own, a click anywhere in which is about it.
     whole: bool,
+    /// The layout region it's in, and where that region is, for a click in the region away
+    /// from its text.
+    region: Option<(&'static str, Rect)>,
 }
 
 /// Where slide `index`'s editable text is, laid out as its layers draw it in its whole state.
@@ -208,8 +220,8 @@ fn contains(rect: &Rect, (x, y): (f32, f32)) -> bool {
     x >= rect.x && x <= rect.x + rect.w && y >= rect.y && y <= rect.y + rect.h
 }
 
-fn frame_of(rect: Rect, rotate: f32, whole: bool) -> Frame {
-    Frame { rect, rotate, centre: (rect.x + rect.w / 2.0, rect.y + rect.h / 2.0), whole }
+fn frame_of(rect: Rect, rotate: f32, whole: bool, region: Option<(&'static str, Rect)>) -> Frame {
+    Frame { rect, rotate, centre: (rect.x + rect.w / 2.0, rect.y + rect.h / 2.0), whole, region }
 }
 
 fn align_x(align: Align, width: f32) -> f32 {
@@ -278,8 +290,8 @@ impl TextLayout {
     /// left `empty` empty.
     pub(crate) fn build(talk: &Talk, index: usize, specs: &[LayerSpec], drawn: &[LayerText], empty: &[EmptyRegion]) -> TextLayout {
         let mut layout = TextLayout {
-            frames: specs.iter().zip(drawn).map(|(spec, text)| frame_of(spec.rect, spec.rotate, text.whole)).collect(),
-            placeholders: empty.iter().map(|region| (region.name.to_string(), region.rect, frame_of(region.rect, region.rotate, true))).collect(),
+            frames: specs.iter().zip(drawn).map(|(spec, text)| frame_of(spec.rect, spec.rotate, text.whole, text.region)).collect(),
+            placeholders: empty.iter().map(|region| (region.name.to_string(), region.rect, frame_of(region.rect, region.rotate, true, None))).collect(),
             ..TextLayout::default()
         };
         // Each drawn text by the end of its block and its content, which tell paragraphs apart.
@@ -294,7 +306,7 @@ impl TextLayout {
                 let Some(&(layer, text)) = found.get(&(source.block.end, source.inline.start, source.inline.end)) else { continue };
                 // The flow is where the format crate says it is, or it isn't placed at all.
                 let in_place = match &flow.place {
-                    FlowPlace::Region(name) => drawn[layer].region == Some(name.as_str()),
+                    FlowPlace::Region(name) => drawn[layer].region.is_some_and(|(region, _)| region == name.as_str()),
                     FlowPlace::Tag(range) => drawn[layer].whole && specs[layer].source.as_ref() == Some(range),
                 };
                 if !in_place {
@@ -334,9 +346,9 @@ impl TextLayout {
         self.paras.iter().position(|placed| placed.flow == flow && placed.para == para)
     }
 
-    /// The caret at `pos` of flow `flow`. A position past what the talk holds, as the editor
-    /// can have while typing, a line break at a paragraph's end or a paragraph not yet
-    /// written, is on a new line below the flow's last; `None` for a flow that isn't placed.
+    /// The caret at `pos` of flow `flow`. A position just past what the talk holds, one
+    /// offset past a paragraph's end or the paragraph after the flow's last, is on a new line
+    /// below it; `None` for anything further, or a flow that isn't placed.
     pub fn caret(&self, flow: usize, pos: Pos) -> Option<CaretRect> {
         let at = match self.find(flow, pos.para) {
             Some(at) => at,
@@ -347,6 +359,9 @@ impl TextLayout {
         let index = lines.line_of(pos.offset);
         let line = &lines.lines[index];
         let last = line.stops[line.stops.len() - 1].0;
+        if pos.offset > lines.len + 1 {
+            return None;
+        }
         if pos.offset > last && index == lines.lines.len() - 1 && lines.len > 0 {
             return Some(CaretRect { x: lines.empty_x, top: line.top + line.height, height: line.height, rotate: frame.rotate, centre: frame.centre });
         }
@@ -357,13 +372,13 @@ impl TextLayout {
     fn caret_past(&self, flow: usize, pos: Pos) -> Option<CaretRect> {
         let last = self.paras.iter().rposition(|placed| placed.flow == flow)?;
         let (placed, lines) = (&self.paras[last], &self.lines[last]);
-        if pos.para <= placed.para {
+        if pos.para != placed.para + 1 || pos.offset != 0 {
             return None;
         }
         let frame = self.frames[placed.layer];
         let height = lines.size * LINE_HEIGHT;
         let below = placed.rect.y.max(lines.lines.last().map_or(0.0, |line| line.top + line.height));
-        let top = below + (pos.para - placed.para - 1) as f32 * height + crate::flow::GAP;
+        let top = below + crate::flow::GAP;
         Some(CaretRect { x: lines.empty_x, top, height, rotate: frame.rotate, centre: frame.centre })
     }
 
@@ -386,12 +401,21 @@ impl TextLayout {
                 return Some(Hit::Uneditable(reason));
             }
             // In a box of text away from its text, the caret goes to the nearest paragraph.
-            if frame.whole && contains(&frame.rect, point) {
-                let distance = |rect: &Rect| (rect.y - point.1).max(point.1 - (rect.y + rect.h)).max(0.0);
-                let in_layer = self.paras.iter().enumerate().filter(|(_, placed)| placed.layer == layer);
-                if let Some((at, placed)) = in_layer.min_by(|a, b| distance(&a.1.rect).total_cmp(&distance(&b.1.rect))) {
-                    return Some(Hit::Text { flow: placed.flow, pos: Pos { para: placed.para, offset: self.offset_at(at, point) } });
-                }
+            if frame.whole
+                && contains(&frame.rect, point)
+                && let Some(hit) = self.nearest(|placed| placed.layer == layer, (x, y))
+            {
+                return Some(hit);
+            }
+        }
+        // So it does in a region of text away from its text: between paragraphs, on a marker,
+        // below the last.
+        for frame in self.frames.iter().rev() {
+            let Some((name, area)) = frame.region else { continue };
+            if contains(&area, turned(x, y, frame.centre, -frame.rotate))
+                && let Some(hit) = self.nearest(|placed| self.frames[placed.layer].region.is_some_and(|(other, _)| other == name), (x, y))
+            {
+                return Some(hit);
             }
         }
         for (name, rect, frame) in &self.placeholders {
@@ -402,6 +426,36 @@ impl TextLayout {
         Some(Hit::Nothing)
     }
 
+    /// The place in the paragraphs `among` takes nearest the point (`x`, `y`) of the slide:
+    /// the nearest line by height, then the nearest offset on it.
+    fn nearest(&self, among: impl Fn(&PlacedPara) -> bool, (x, y): (f32, f32)) -> Option<Hit> {
+        let mut best: Option<(f32, f32, usize, (f32, f32))> = None;
+        for (at, (placed, lines)) in self.paras.iter().zip(&self.lines).enumerate() {
+            if !among(placed) {
+                continue;
+            }
+            let frame = self.frames[placed.layer];
+            let point = turned(x, y, frame.centre, -frame.rotate);
+            for line in &lines.lines {
+                let down = (line.top - point.1).max(point.1 - (line.top + line.height)).max(0.0);
+                let across = (placed.rect.x - point.0).max(point.0 - (placed.rect.x + placed.rect.w)).max(0.0);
+                if best.is_none_or(|(d, a, ..)| (down, across) < (d, a)) {
+                    best = Some((down, across, at, point));
+                }
+            }
+        }
+        let (_, _, at, point) = best?;
+        let placed = &self.paras[at];
+        let lines = &self.lines[at];
+        // The nearest line, with the point held within the paragraph's height.
+        let index = lines.lines.iter().enumerate().min_by(|a, b| {
+            let distance = |line: &Line| (line.top - point.1).max(point.1 - (line.top + line.height)).max(0.0);
+            distance(a.1).total_cmp(&distance(b.1))
+        });
+        let index = index.map_or(0, |(index, _)| index);
+        Some(Hit::Text { flow: placed.flow, pos: Pos { para: placed.para, offset: lines.nearest(index, point.0) } })
+    }
+
     /// The offset in placed paragraph `at` nearest `point`, which is in its layer's frame.
     fn offset_at(&self, at: usize, (x, y): (f32, f32)) -> usize {
         let lines = &self.lines[at];
@@ -410,10 +464,12 @@ impl TextLayout {
     }
 
     /// The rectangles that show flow `flow` selected from `start` to `end`, either way round,
-    /// one for each line it covers, in slide units before their layer's turn. A selection
-    /// that runs on past a line's end covers a little of its break too.
-    pub fn selection_rects(&self, flow: usize, start: Pos, end: Pos) -> Vec<Rect> {
+    /// one for each line it covers, with the turn of the flow's layer. A selection that runs
+    /// on past a line's end covers a little of its break too.
+    pub fn selection_rects(&self, flow: usize, start: Pos, end: Pos) -> SelectionRects {
         let (start, end) = if (start.para, start.offset) <= (end.para, end.offset) { (start, end) } else { (end, start) };
+        let Some(first) = self.paras.iter().find(|placed| placed.flow == flow) else { return SelectionRects::default() };
+        let frame = self.frames[first.layer];
         let mut rects = Vec::new();
         for (placed, lines) in self.paras.iter().zip(&self.lines) {
             if placed.flow != flow || placed.para < start.para || placed.para > end.para {
@@ -439,7 +495,7 @@ impl TextLayout {
                 }
             }
         }
-        rects
+        SelectionRects { rects, rotate: frame.rotate, centre: frame.centre }
     }
 
     /// Where the caret goes from `pos` of flow `flow`: up or down a line, keeping to

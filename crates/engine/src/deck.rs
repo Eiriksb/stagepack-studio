@@ -583,6 +583,9 @@ impl Deck {
     /// alone, what it shows in each region of the layout with nothing in it: an offer to add
     /// a title or text there. A show, a thumbnail and an export never have those.
     pub fn editor_layers(&mut self, index: usize, scale: f32) -> Vec<Arc<Layer>> {
+        if index >= self.slides.len() {
+            return Vec::new();
+        }
         let mut layers = self.layers(index, scale);
         let drawn = self.slides[index].drawn.entry(scale.to_bits()).or_default();
         let empty = match &drawn.empty_regions {
@@ -607,6 +610,9 @@ impl Deck {
     /// What `editor_layers` adds to the slide's own layers, before it's drawn.
     #[doc(hidden)]
     pub fn placeholder_specs(&mut self, index: usize) -> Vec<LayerSpec> {
+        if index >= self.slides.len() {
+            return Vec::new();
+        }
         let moment = self.ensure_whole(index);
         let theme = talk_theme(&self.talk);
         let regions = self.slides[index].laid_at(moment).empty_regions.clone();
@@ -631,6 +637,9 @@ impl Deck {
     /// Every source range slide `index`'s text geometry is read from, in order, for tests.
     #[doc(hidden)]
     pub fn drawn_text_sources(&mut self, index: usize) -> Vec<std::ops::Range<usize>> {
+        if index >= self.slides.len() {
+            return Vec::new();
+        }
         let moment = self.ensure_whole(index);
         self.slides[index].laid_at(moment).texts.iter().flat_map(LayerText::sources).collect()
     }

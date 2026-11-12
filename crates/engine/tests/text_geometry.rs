@@ -150,7 +150,7 @@ fn a_click_on_the_background_is_nothing() {
 #[test]
 fn a_selection_over_two_lines_is_two_rects() {
     let layout = layout("# T\n\nOne\nTwo\n");
-    let rects = layout.selection_rects(1, at(0, 1), at(0, 6));
+    let rects = layout.selection_rects(1, at(0, 1), at(0, 6)).rects;
     assert_eq!(rects.len(), 2, "{rects:?}");
     assert!(rects[1].y > rects[0].y);
     let (one, three) = (caret(&layout, 1, at(0, 1)), caret(&layout, 1, at(0, 3)));
@@ -159,8 +159,8 @@ fn a_selection_over_two_lines_is_two_rects() {
     let (two_start, six) = (caret(&layout, 1, at(0, 4)), caret(&layout, 1, at(0, 6)));
     assert!(near(rects[1].x, two_start.x, 0.01));
     assert!(near(rects[1].x + rects[1].w, six.x, 0.01));
-    assert_eq!(layout.selection_rects(1, at(0, 6), at(0, 1)), rects, "either way round");
-    assert!(layout.selection_rects(1, at(0, 2), at(0, 2)).is_empty());
+    assert_eq!(layout.selection_rects(1, at(0, 6), at(0, 1)).rects, rects, "either way round");
+    assert!(layout.selection_rects(1, at(0, 2), at(0, 2)).rects.is_empty());
 }
 
 #[test]
@@ -203,6 +203,9 @@ fn mixed_slides() -> Vec<String> {
         "---\nregion.body: align=right\n---\n\n# Right\n\nTo the right\n\n<Text x=\"100\" y=\"700\" w=\"800\" h=\"200\" align=\"center\">\n\nCentred box\n\n</Text>\n".to_string(),
     ];
     slides.push("# Each\n\n- one\n- two\n\nAnd more\n".replace("# Each", "---\nregion.body: click=each\n---\n\n# Each"));
+    // Empty paragraphs and breaks at a paragraph's edges, as the format crate writes them.
+    slides.push("# Edges\n\n**<Text></Text>**\n\nMiddle\n\n**<Text></Text>**\n\nEnds in a break\\\n**<Text></Text>**\n\n\\\nStarts with one\n\n**<Text></Text>**\n".to_string());
+    slides.push("<Text x=\"1000\" y=\"500\" w=\"700\" h=\"300\">\n\n**<Text></Text>**\n\nA *break\\\n<Text></Text>*\n\n</Text>\n\n- \n- item\\\n**<Text></Text>**\n".to_string());
     slides
 }
 
@@ -359,4 +362,100 @@ fn a_click_on_a_component_says_why() {
     assert_eq!(hit_at(&layout, (300.0, 250.0)), Hit::Uneditable("Text inside a component can't be edited on the slide yet."));
     assert_eq!(hit_at(&layout, (1100.0, 620.0)), Hit::Uneditable("Tables can't be edited on the slide yet."));
     assert_eq!(hit_at(&layout, (1350.0, 780.0)), Hit::Uneditable("Text in a box that holds more than text can't be edited on the slide yet."));
+}
+
+#[test]
+fn an_empty_paragraph_is_a_line_with_a_caret() {
+    let source = "# T\n\nFirst\n\n**<Text></Text>**\n\nThird\n";
+    let mut d = deck(source);
+    let layout = d.text_layout(0);
+    let body: Vec<_> = layout.paras().iter().filter(|placed| placed.flow == 1).collect();
+    assert_eq!(body.iter().map(|placed| placed.para).collect::<Vec<_>>(), vec![0, 1, 2], "every paragraph is placed, in order");
+    let (first, empty, third) = (caret(&layout, 1, at(0, 0)), caret(&layout, 1, at(1, 0)), caret(&layout, 1, at(2, 0)));
+    assert!(near(empty.height, 50.0, 0.5), "{empty:?}");
+    assert!(near(empty.x, 100.0, 0.5));
+    assert!(near(empty.top, first.top + first.height + 24.0, 0.5), "{empty:?}");
+    assert!(near(third.top, empty.top + empty.height + 24.0, 0.5), "{third:?}");
+    assert!(near(body[1].rect.h, 50.0, 0.5), "the empty line is drawn as tall as the region's text");
+    assert_eq!(hit_at(&layout, middle(&empty)), Hit::Text { flow: 1, pos: at(1, 0) });
+    assert_eq!(hit_at(&layout, (900.0, empty.top + 10.0)), Hit::Text { flow: 1, pos: at(1, 0) });
+    let texts = texts_in(d.specs(0));
+    assert!(texts.iter().all(|text| !text.contains("Text")), "nothing of its spelling is drawn: {texts:?}");
+    let without = self::layout("# T\n\nFirst\n\nThird\n");
+    assert!(near(caret(&without, 1, at(1, 0)).top + 74.0, third.top, 0.5));
+}
+
+#[test]
+fn a_break_at_the_end_has_a_caret_on_its_own_line() {
+    let layout = layout("# T\n\nab\\\n**<Text></Text>**\n\nNext\n");
+    let (end, after) = (caret(&layout, 1, at(0, 2)), caret(&layout, 1, at(0, 3)));
+    assert!(near(after.top, end.top + end.height, 0.5), "{after:?}");
+    assert!(near(after.x, 100.0, 0.5));
+    assert_eq!(hit_at(&layout, middle(&after)), Hit::Text { flow: 1, pos: at(0, 3) });
+    let placed = layout.paras().iter().find(|placed| placed.flow == 1 && placed.para == 0).unwrap();
+    assert!(near(placed.rect.h, 100.0, 0.5), "two lines are drawn: {placed:?}");
+    let next = caret(&layout, 1, at(1, 0));
+    assert!(near(next.top, after.top + after.height + 24.0, 0.5), "the next paragraph is below the empty line");
+}
+
+#[test]
+fn a_click_between_paragraphs_goes_to_the_nearest() {
+    let layout = layout("# T\n\nFirst\n\nSecond\n");
+    let (first, second) = (caret(&layout, 1, at(0, 0)), caret(&layout, 1, at(1, 0)));
+    let gap = first.top + first.height + 4.0;
+    assert!(gap < second.top);
+    assert_eq!(hit_at(&layout, (100.0, gap)), Hit::Text { flow: 1, pos: at(0, 0) });
+    assert_eq!(hit_at(&layout, (100.0, second.top - 4.0)), Hit::Text { flow: 1, pos: at(1, 0) });
+}
+
+#[test]
+fn a_click_on_a_marker_goes_to_its_items_start() {
+    let layout = layout("# T\n\n- One\n- Two\n\n1. Three\n");
+    let two = caret(&layout, 1, at(1, 0));
+    assert_eq!(hit_at(&layout, (110.0, two.top + 20.0)), Hit::Text { flow: 1, pos: at(1, 0) });
+    let three = caret(&layout, 1, at(2, 0));
+    assert_eq!(hit_at(&layout, (105.0, three.top + 20.0)), Hit::Text { flow: 1, pos: at(2, 0) });
+}
+
+#[test]
+fn a_click_below_the_last_paragraph_goes_to_it() {
+    let layout = layout("# T\n\nFirst\n\nLast\n");
+    assert_eq!(hit_at(&layout, (1500.0, 900.0)), Hit::Text { flow: 1, pos: at(1, 4) });
+    assert_eq!(hit_at(&layout, (50.0, 900.0)), Hit::Nothing, "outside the region");
+    let table = self::layout("# T\n\nText\n\n| a | b |\n|---|---|\n| 1 | 2 |\n");
+    assert_eq!(hit_at(&table, (300.0, 320.0)), Hit::Uneditable("Tables can't be edited on the slide yet."), "the table still says why");
+}
+
+#[test]
+fn a_turned_boxs_selection_turns_with_it() {
+    let layout = layout("<Text x=\"600\" y=\"300\" w=\"600\" h=\"200\" rotate=\"30\">\n\nHello world\n\n</Text>\n");
+    let selection = layout.selection_rects(0, at(0, 0), at(0, 5));
+    assert_eq!((selection.rotate, selection.centre), (30.0, (900.0, 400.0)));
+    assert_eq!(selection.rects.len(), 1);
+    assert!(layout.selection_rects(7, at(0, 0), at(0, 5)).rects.is_empty());
+}
+
+#[test]
+fn a_caret_far_past_the_text_is_none() {
+    let layout = layout("# T\n\nOne\n");
+    assert!(layout.caret(1, at(0, 5)).is_none());
+    assert!(layout.caret(1, at(2, 0)).is_none());
+    assert!(layout.caret(1, at(1, 3)).is_none());
+    assert!(layout.caret(9, at(0, 0)).is_none());
+    let mut d = deck("# T\n");
+    assert!(d.editor_layers(4, 0.5).is_empty());
+    assert!(d.placeholder_specs(4).is_empty());
+    assert!(d.drawn_text_sources(4).is_empty());
+}
+
+#[test]
+fn align_where_it_does_nothing_says_so() {
+    let said = "Only a box placed on the slide can be aligned, so align is ignored here".to_string();
+    for source in ["<Box align=\"right\">\n\nHi\n\n</Box>\n", "Hi <Text align=\"right\">there</Text>\n", "- Hi <Text bold align=\"center\">there</Text>\n"] {
+        assert!(deck(source).notices_whole(0).contains(&said), "{source}");
+    }
+    assert!(!deck("<Text x=\"10\" y=\"10\" w=\"500\" align=\"right\">\n\nHi\n\n</Text>\n").notices_whole(0).contains(&said));
+    let layout = layout("---\nregion.body: align=center align=right\n---\n\n# T\n\nHi\n");
+    let (start, end) = (caret(&layout, 1, at(0, 0)), caret(&layout, 1, at(0, 2)));
+    assert!(near((start.x + end.x) / 2.0, 960.0, 1.0), "the first align wins");
 }

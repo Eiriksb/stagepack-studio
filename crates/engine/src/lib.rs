@@ -40,5 +40,5 @@ pub use talk_components::{
     COMPONENTS_FOLDER, ComponentInfo, ComponentState, MAX_ASSETS_REMEMBERED, MAX_COMPONENTS, MAX_INDEX_BYTES, MAX_SOURCE_BYTES, SLIDE_RENDER_BUDGET, TalkComponents,
 };
 pub use text::*;
-pub use text_geometry::{CaretRect, Hit, LineMove, PlacedPara, TextLayout};
+pub use text_geometry::{CaretRect, Hit, LineMove, PlacedPara, SelectionRects, TextLayout};
 pub use timeline::*;

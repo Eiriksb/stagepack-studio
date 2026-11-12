@@ -30,6 +30,9 @@ pub(crate) const MAX_POSITION: f32 = 7680.0;
 pub(crate) const MAX_SIZE: f32 = 3840.0;
 pub(crate) const MAX_ROTATION: f32 = 360.0;
 
+/// What's said of an `align` that's given where it does nothing.
+pub(crate) const ALIGN_UNPLACED: &str = "Only a box placed on the slide can be aligned, so align is ignored here";
+
 pub struct LayoutEnv<'a> {
     pub fonts: &'a mut Fonts,
     pub registry: &'a Registry,
@@ -117,6 +120,9 @@ pub fn layout_slide(talk: &Talk, index: usize, env: &mut LayoutEnv) -> LaidOutSl
         return LaidOutSlide { layers, notices, transition: Transition::None, asks, texts, empty_regions: Vec::new() };
     }
     let mut empty_regions = Vec::new();
+    if aligns_inline(&talk.source, &slide.blocks) {
+        notices.push(Notice(ALIGN_UNPLACED.to_string()));
+    }
     let transition = read_transition(slide.settings.as_ref().and_then(|settings| settings.get("transition")), &mut notices);
     let layout = slide_layout(slide, &mut notices);
     let contents = assign_blocks(slide, layout, &mut notices);
@@ -162,7 +168,7 @@ pub fn layout_slide(talk: &Talk, index: usize, env: &mut LayoutEnv) -> LaidOutSl
                             is_title: is_title && step == 0,
                             varies,
                         });
-                        texts.push(LayerText { region: Some(region.name), ..piece.text });
+                        texts.push(LayerText { region: Some((region.name, rect)), ..piece.text });
                     }
                     continue;
                 }
@@ -172,7 +178,7 @@ pub fn layout_slide(talk: &Talk, index: usize, env: &mut LayoutEnv) -> LaidOutSl
         let (drawing, varies) = noting_asks(env, |env| flow_region(blocks, region, rect.w, &theme, env, &mut notices));
         let (items, native) = (drawing.items, drawing.native);
         layers.push(LayerSpec { source: Some(source), rect, rotate, items, click, enter: timing.enter, native, is_title, varies });
-        texts.push(LayerText { region: Some(region.name), ..drawing.text });
+        texts.push(LayerText { region: Some((region.name, rect)), ..drawing.text });
     }
     for block in &slide.blocks {
         if let Block::Tag(tag) = block
@@ -254,6 +260,25 @@ fn positioned_layer(tag: &Tag, theme: &Theme, env: &mut LayoutEnv, notices: &mut
     (layer, drawing.text)
 }
 
+/// Whether the text of any of `blocks`, at any depth, has an inline `<Text>` tag that asks for
+/// an alignment, which only a placed box can have.
+fn aligns_inline(source: &str, blocks: &[Block]) -> bool {
+    let asks = |inline: &std::ops::Range<usize>| {
+        let text = source.get(inline.clone()).unwrap_or_default();
+        text.match_indices("<Text").any(|(at, _)| {
+            let tag = &text[at..];
+            let tag = &tag[..tag.find('>').unwrap_or(tag.len())];
+            tag.split(|c: char| c.is_whitespace()).any(|part| part.starts_with("align="))
+        })
+    };
+    blocks.iter().any(|block| match block {
+        Block::Heading { inline, .. } | Block::Paragraph { inline, .. } => asks(inline),
+        Block::List { items, .. } => items.iter().any(|item| aligns_inline(source, item)),
+        Block::Tag(tag) => aligns_inline(source, &tag.children),
+        _ => false,
+    })
+}
+
 /// The alignment `value` names, or `None`, with a notice about `what`, if it names none.
 fn read_align(value: &str, what: &str, notices: &mut Vec<Notice>) -> Option<Align> {
     match value.trim() {
@@ -274,7 +299,8 @@ fn read_align(value: &str, what: &str, notices: &mut Vec<Notice>) -> Option<Alig
 /// `align` says, or as the layout has it.
 fn region_align(slide: &Slide, region: &RegionDef, notices: &mut Vec<Notice>) -> Align {
     let line = region_line(slide, region);
-    let asked = line.split_whitespace().rev().find_map(|pair| pair.strip_prefix("align="));
+    // The first, as a tag's first attribute of a name is the one it has.
+    let asked = line.split_whitespace().find_map(|pair| pair.strip_prefix("align="));
     let what = format!("The {} region", region.name);
     asked.and_then(|value| read_align(value, &what, notices)).unwrap_or(region.align)
 }
