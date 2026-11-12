@@ -1061,6 +1061,7 @@ fn a_packed_talk_shows_and_is_not_watched(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn a_packed_talk_can_be_saved_as_a_folder_from_the_window(cx: &mut TestAppContext) {
     let (dir, handle, view) = open_packed_talk(cx, "# One\n");
+    cx.update(|cx| view.update(cx, |view, _| view.set_no_watching_for_test()));
     let folder = dir.path().join("unpacked");
 
     save_as(cx, handle, SAVE_AS_FOLDER_ID);
@@ -1071,8 +1072,9 @@ fn a_packed_talk_can_be_saved_as_a_folder_from_the_window(cx: &mut TestAppContex
         "# One\n"
     );
     assert_eq!(status(cx, handle).as_deref(), Some("Saved unpacked."));
-    // It's kept there from now on.
+    // It's kept there from now on, and its saves are followed as a folder's are.
     cx.read(|cx| assert!(!view.read(cx).document().unwrap().read(cx).is_packed()));
+    cx.read(|cx| assert_eq!(view.read(cx).followed_folder(), Some(folder.as_path())));
 }
 
 #[gpui_kit::test]

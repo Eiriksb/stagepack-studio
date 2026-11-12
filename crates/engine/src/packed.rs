@@ -748,9 +748,9 @@ pub fn repack_with_slides(
 
 /// Copies the talk in `from` into the folder `to`, which must be missing or empty, with
 /// `slides` as its `slides.md`. What's copied is what [`pack_folder`] would pack, with the same
-/// refusals and limits, and the names it left out are returned. `from` isn't touched, and a
-/// failure leaves `to` as it was.
-pub fn copy_talk_folder(from: &Path, to: &Path, slides: &str) -> Result<Vec<String>, PackError> {
+/// refusals and limits, and what it left out is reported as a pack's is. `from` isn't touched,
+/// and a failure leaves `to` as it was.
+pub fn copy_talk_folder(from: &Path, to: &Path, slides: &str) -> Result<PackReport, PackError> {
     if lies_within(to, from) {
         // A copy in the talk's own folders would travel in every pack made from it.
         return Err(PackError::InsideTheTalk);
@@ -764,7 +764,7 @@ pub fn copy_talk_folder(from: &Path, to: &Path, slides: &str) -> Result<Vec<Stri
     if result.is_err() {
         clear_away(to, existed);
     }
-    result.map(|()| skipped)
+    result.map(|()| PackReport { skipped, outside_pictures: pictures_outside(from, slides) })
 }
 
 /// Whether `path`, which needn't exist yet, is `folder` or lies anywhere under it. Both are

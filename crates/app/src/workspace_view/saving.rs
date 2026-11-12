@@ -146,6 +146,7 @@ impl WorkspaceView {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(found);
         self.pending_working_copy = None;
+        self.unkept_since = None;
         if let Some(job) = self.working_copy_job(cx) {
             self.enqueue_working_copy_job(job, cx);
         }
@@ -165,9 +166,13 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    /// Brings the working copy up to date once the edits have stopped for a moment.
+    /// Brings the working copy up to date once the edits have stopped for a moment, or
+    /// [`WORKING_COPY_MOST_WAIT`] after the first edit it doesn't hold, if that's sooner.
     pub(super) fn keep_working_copy_soon(&mut self, cx: &mut Context<Self>) {
-        self.keep_working_copy_after(WORKING_COPY_DELAY, cx);
+        let now = cx.background_executor().now();
+        let since = *self.unkept_since.get_or_insert(now);
+        let left = WORKING_COPY_MOST_WAIT.saturating_sub(now.saturating_duration_since(since));
+        self.keep_working_copy_after(WORKING_COPY_DELAY.min(left), cx);
     }
 
     fn keep_working_copy_after(&mut self, delay: Duration, cx: &mut Context<Self>) {
@@ -178,6 +183,7 @@ impl WorkspaceView {
         self.pending_working_copy = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(delay).await;
             this.update(cx, |this, cx| {
+                this.unkept_since = None;
                 if let Some(job) = this.working_copy_job(cx) {
                     this.enqueue_working_copy_job(job, cx);
                 }
@@ -261,6 +267,7 @@ impl WorkspaceView {
     fn clear_working_copies(&mut self, place: TalkPlace, cx: &mut Context<Self>) {
         self.kept = None;
         self.pending_working_copy = None;
+        self.unkept_since = None;
         let Some(recovery) = self.recovery.clone() else {
             return;
         };
@@ -279,6 +286,7 @@ impl WorkspaceView {
     fn close_after_working_copies(&mut self, cx: &mut Context<Self>) {
         self.close_anyway = true;
         self.pending_working_copy = None;
+        self.unkept_since = None;
         // Taken, so the close waits for it. A job asked for after this has nothing before it
         // to wait for, but none that matters can be: with `close_anyway` set no keep is
         // started, and a clear or discard that comes anyway removes copies of changes the
@@ -481,9 +489,9 @@ impl WorkspaceView {
         self.build_problems.clear();
         self.pending_reload = None;
         self.pending_components = None;
-        let watched = self.watcher.take().is_some();
+        let watched = self.followed.take().is_some() | self.watcher.take().is_some();
         let tried_to_watch = self.watch_problem.take().is_some();
-        let followed = watched || tried_to_watch;
+        let followed = self.opened_from_path || watched || tried_to_watch;
         if followed && let Some(folder) = self.talk_folder.clone() {
             self.follow_saves(folder, cx);
         }
@@ -536,6 +544,10 @@ impl WorkspaceView {
             {
                 let place = document.read(cx).place().clone();
                 self.clear_working_copies(place, cx);
+            }
+            // A change to the working copies still to be made, such as the clear after a
+            // save, would be lost with the window.
+            if self.working_copy_chain.is_some() {
                 self.close_after_working_copies(cx);
                 return false;
             }

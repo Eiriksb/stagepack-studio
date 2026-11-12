@@ -531,6 +531,74 @@ fn the_working_copy_follows_edits_after_a_moment(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn edits_that_never_stop_are_kept_within_three_seconds(cx: &mut TestAppContext) {
+    let setup = Setup::new(ONE);
+    let (_handle, view) = open_view(cx, &setup);
+    let recovery = setup.recovery();
+    add_slide(cx, &view);
+    for _ in 0..5 {
+        wait(cx, 500);
+        add_slide(cx, &view);
+    }
+    wait(cx, 499);
+    assert!(
+        recovery.find(&setup.place()).is_none(),
+        "each edit within the wait"
+    );
+    wait(cx, 1);
+    assert_eq!(
+        recovery.find(&setup.place()).unwrap().text,
+        source_of(cx, &view),
+        "three seconds after the first edit not kept"
+    );
+
+    // The next edit starts the count again.
+    add_slide(cx, &view);
+    wait(cx, 999);
+    assert_ne!(
+        recovery.find(&setup.place()).unwrap().text,
+        source_of(cx, &view)
+    );
+    wait(cx, 1);
+    assert_eq!(
+        recovery.find(&setup.place()).unwrap().text,
+        source_of(cx, &view)
+    );
+}
+
+#[gpui_kit::test]
+fn closing_just_after_a_save_leaves_no_copy(cx: &mut TestAppContext) {
+    let setup = Setup::new(ONE);
+    let (handle, view) = open_view(cx, &setup);
+    add_slide(cx, &view);
+    wait(cx, 1_000);
+    assert!(setup.recovery().find(&setup.place()).is_some());
+    let document = document(cx, &view);
+    drop(view);
+
+    cx.update_window(handle, |_, window, cx| {
+        window.dispatch_action(Box::new(workspace_view::Save), cx)
+    })
+    .unwrap();
+    // Only as far as the save being taken in: the copy's clear is still to come.
+    while cx.read(|cx| document.read(cx).has_unsaved_changes()) {
+        assert!(cx.executor().tick(), "the save runs");
+    }
+    if VisualTestContext::from_window(handle, cx).simulate_close() {
+        // As the system does with a window that says it may close.
+        crash(cx, handle);
+    }
+    cx.run_until_parked();
+
+    assert!(!is_open(cx, handle));
+    assert!(
+        kept_folders(&setup.root).is_empty(),
+        "{:?}",
+        kept_folders(&setup.root)
+    );
+}
+
+#[gpui_kit::test]
 fn edits_made_in_the_window_are_kept_like_any_other(cx: &mut TestAppContext) {
     let setup = Setup::new(ONE);
     let (handle, view) = open_view(cx, &setup);

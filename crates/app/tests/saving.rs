@@ -415,3 +415,117 @@ fn saving_over_an_emptied_file_goes_ahead() {
     assert_eq!(read(&dir.path().join("slides.md")), doc.source());
     assert!(!doc.has_unsaved_changes());
 }
+
+#[test]
+fn saving_a_packed_talk_changed_outside_does_not_write_and_asks() {
+    let (dir, file) = packed_talk(TWO_SLIDES);
+    let mut doc = Document::open_packed(&file, Fonts::bundled_only()).unwrap();
+    doc.add_slide("content").unwrap();
+    let mine = doc.source().to_string();
+    // A second window, or a sync client, puts another pack in its place.
+    let theirs = format!("{TWO_SLIDES}\n---\n\n# Theirs\n");
+    let other = dir.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    std::fs::write(other.join("slides.md"), &theirs).unwrap();
+    pack_folder(&other, &file, "test").unwrap();
+
+    let refused = doc.save_job().run().err();
+
+    assert!(
+        matches!(&refused, Some(SaveError::ChangedOutside(found)) if *found == theirs),
+        "{:?}",
+        refused.map(|e| e.to_string())
+    );
+    assert_eq!(open_packed(&file).unwrap().slides().unwrap(), theirs, "nothing was written");
+    assert!(matches!(doc.reload(Some(theirs)), Reload::Conflict));
+    doc.keep_mine();
+    save(&mut doc);
+    assert_eq!(open_packed(&file).unwrap().slides().unwrap(), mine);
+}
+
+#[test]
+fn saving_a_packed_talk_that_holds_what_is_here_goes_ahead() {
+    let (_dir, file) = packed_talk(TWO_SLIDES);
+    let mut doc = Document::open_packed(&file, Fonts::bundled_only()).unwrap();
+    doc.add_slide("content").unwrap();
+    save(&mut doc);
+    doc.add_slide("content").unwrap();
+    save(&mut doc);
+    assert_eq!(open_packed(&file).unwrap().slides().unwrap(), doc.source());
+}
+
+#[test]
+fn save_as_a_folder_says_which_pictures_it_left_out() {
+    let (dir, doc) = talk("![](pics/photo.jpg)\n\n![](assets/in.png)\n");
+    std::fs::create_dir(dir.path().join("pics")).unwrap();
+    std::fs::write(dir.path().join("pics/photo.jpg"), "a picture").unwrap();
+    std::fs::create_dir(dir.path().join("assets")).unwrap();
+    std::fs::write(dir.path().join("assets/in.png"), "another").unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let saved = doc
+        .save_as_job(SaveTarget::Folder(elsewhere.path().join("copy")))
+        .run()
+        .unwrap();
+    assert_eq!(saved.notices(), ["The picture pics/photo.jpg is outside assets/ and wasn't copied"]);
+}
+
+/// Saves a talk whose `slides.md` has been made `broken`, and says what came of it, with the
+/// folder's name in it read as "the talk".
+fn save_over(broken: impl FnOnce(&Path)) -> (Option<String>, tempfile::TempDir) {
+    let (dir, mut doc) = talk(TWO_SLIDES);
+    doc.add_slide("content").unwrap();
+    let file = dir.path().join("slides.md");
+    broken(&file);
+    let name = dir.path().file_name().unwrap().to_string_lossy().into_owned();
+    let problem = doc
+        .save_job()
+        .run()
+        .err()
+        .map(|problem| problem.to_string().replace(&format!("Couldn't save {name}:"), "Couldn't save the talk:"));
+    (problem, dir)
+}
+
+#[test]
+fn a_slides_file_that_is_there_but_cannot_be_read_is_not_written_over() {
+    let not_text = b"# One\n\xff\xfe\n".to_vec();
+    let (problem, dir) = save_over(|file| std::fs::write(file, &not_text).unwrap());
+    assert_eq!(
+        problem.as_deref(),
+        Some("Couldn't save the talk: its slides.md can't be read, as it isn't UTF-8 text, so it was left as it is.")
+    );
+    assert_eq!(std::fs::read(dir.path().join("slides.md")).unwrap(), not_text);
+
+    let (problem, dir) = save_over(|file| {
+        std::fs::File::create(file).unwrap().set_len(slides_engine::MAX_FILE_BYTES + 1).unwrap();
+    });
+    assert_eq!(
+        problem.as_deref(),
+        Some("Couldn't save the talk: its slides.md can't be read, as it's over the limit of 256 MiB, so it was left as it is.")
+    );
+    assert_eq!(std::fs::metadata(dir.path().join("slides.md")).unwrap().len(), slides_engine::MAX_FILE_BYTES + 1);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (problem, dir) = save_over(|file| {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o200)).unwrap();
+        });
+        let file = dir.path().join("slides.md");
+        // Someone the system lets read anything sees no refusal to test.
+        if std::fs::read(&file).is_err() {
+            assert_eq!(
+                problem.as_deref(),
+                Some("Couldn't save the talk: its slides.md can't be read, as the app isn't allowed to read it, so it was left as it is.")
+            );
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(read(&file), TWO_SLIDES);
+        }
+    }
+}
+
+#[test]
+fn a_missing_slides_file_is_written_without_asking() {
+    let (problem, dir) = save_over(|file| std::fs::remove_file(file).unwrap());
+    assert_eq!(problem, None);
+    assert!(read(&dir.path().join("slides.md")).contains("# \n"), "the edit was saved");
+}

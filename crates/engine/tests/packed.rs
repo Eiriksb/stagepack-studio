@@ -860,7 +860,7 @@ fn a_folder_is_copied_with_the_new_slides() {
     let work = tempfile::tempdir().unwrap();
     let to = work.path().join("copy");
 
-    let left_out = copy_talk_folder(dir.path(), &to, "# Copied\r\n").unwrap();
+    let left_out = copy_talk_folder(dir.path(), &to, "# Copied\r\n").unwrap().skipped;
 
     assert!(left_out.is_empty(), "{left_out:?}");
     assert_eq!(
@@ -893,7 +893,7 @@ fn a_copied_folder_leaves_out_what_a_pack_would() {
     std::os::unix::fs::symlink("/etc/passwd", dir.path().join("assets/link.png")).unwrap();
     let work = tempfile::tempdir().unwrap();
     let to = work.path().join("copy");
-    let left_out = copy_talk_folder(dir.path(), &to, "# Copied\n").unwrap();
+    let left_out = copy_talk_folder(dir.path(), &to, "# Copied\n").unwrap().skipped;
     assert_eq!(left_out, ["assets/link.png"]);
     assert!(std::fs::symlink_metadata(to.join("assets/link.png")).is_err());
 }

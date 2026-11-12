@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt as _;
 use futures::channel::mpsc;
@@ -85,6 +85,9 @@ const RELOAD_DELAY: Duration = Duration::from_millis(100);
 
 /// How long after the last edit the working copy of unsaved changes is brought up to date.
 const WORKING_COPY_DELAY: Duration = Duration::from_secs(1);
+/// The longest edits that never stop for [`WORKING_COPY_DELAY`] go without being kept, from
+/// the first of them.
+const WORKING_COPY_MOST_WAIT: Duration = Duration::from_secs(3);
 /// How long after a working copy couldn't be written it's tried again.
 const KEEP_RETRY_DELAY: Duration = Duration::from_secs(10);
 
@@ -261,6 +264,14 @@ pub struct WorkspaceView {
     focus_handle: FocusHandle,
     /// Keeps the talk's folder watched for as long as the window is open.
     watcher: Option<watcher::TalkWatcher>,
+    /// Whether the window was opened from a path, as the app opens one, and so follows its
+    /// talk's folder wherever Save As puts it.
+    opened_from_path: bool,
+    /// The folder whose saves are followed, if any.
+    followed: Option<PathBuf>,
+    /// Whether following a folder starts a watch on it. A test's scheduler can't have a
+    /// watcher's thread waking its tasks.
+    really_watch: bool,
     /// Why saved changes won't show up, if the folder couldn't be watched.
     watch_problem: Option<String>,
     /// The reload waiting for the file to go quiet.
@@ -305,6 +316,8 @@ pub struct WorkspaceView {
     kept: Option<Kept>,
     /// The update of the working copy waiting for the edits to stop for a moment.
     pending_working_copy: Option<Task<()>>,
+    /// When the first edit the working copy doesn't hold yet was made, while an update waits.
+    unkept_since: Option<Instant>,
     /// Unsaved changes from last time, while nobody has said whether to bring them back.
     offered: Option<Found>,
     /// The copy from last time that was brought back, until this window's own copy or a save
@@ -330,6 +343,7 @@ impl WorkspaceView {
             return match Document::open(&path, fonts) {
                 Ok(document) => {
                     let mut view = Self::open_with(document, window, cx);
+                    view.opened_from_path = true;
                     view.follow_saves(path, cx);
                     view
                 }
@@ -337,7 +351,11 @@ impl WorkspaceView {
             };
         }
         match Document::open_packed(&path, fonts) {
-            Ok(document) => Self::open_with(document, window, cx),
+            Ok(document) => {
+                let mut view = Self::open_with(document, window, cx);
+                view.opened_from_path = true;
+                view
+            }
             Err(OpenProblem::SlidevTalk) => {
                 let stagepack =
                     stagepack_executable(|name| std::env::var(name).ok(), Path::is_file);
@@ -449,6 +467,9 @@ impl WorkspaceView {
             show_notes: panels.notes,
             focus_handle,
             watcher: None,
+            opened_from_path: false,
+            followed: None,
+            really_watch: true,
             watch_problem: None,
             pending_reload: None,
             show: None,
@@ -470,6 +491,7 @@ impl WorkspaceView {
             recovery: None,
             kept: None,
             pending_working_copy: None,
+            unkept_since: None,
             offered: None,
             adopted: saving::Adopted::default(),
             working_copy_chain: None,
@@ -508,6 +530,12 @@ impl WorkspaceView {
         self.always_build = self.is_always_built();
     }
 
+    /// Follows a folder's saves without watching it for real, so a test can see which folder
+    /// is followed.
+    pub fn set_no_watching_for_test(&mut self) {
+        self.really_watch = false;
+    }
+
     /// Keeps working copies in `recovery`, in place of the app's data folder.
     pub fn set_recovery_for_test(&mut self, recovery: Recovery, cx: &mut Context<Self>) {
         self.use_recovery(recovery, cx);
@@ -537,7 +565,12 @@ impl WorkspaceView {
 
     /// Whether the talk's folder is being watched for saves.
     pub fn follows_saves(&self) -> bool {
-        self.watcher.is_some()
+        self.followed.is_some()
+    }
+
+    /// The folder whose saves are followed, if any.
+    pub fn followed_folder(&self) -> Option<&Path> {
+        self.followed.as_deref()
     }
 
     /// Window options for a window whose content is a `WorkspaceView`.
@@ -578,12 +611,19 @@ impl WorkspaceView {
 
     /// Watches `folder`, and reloads the talk from its file whenever that changes.
     pub fn follow_saves(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
+        if !self.really_watch {
+            self.followed = Some(folder);
+            return;
+        }
         let (changed, mut changes) = mpsc::unbounded();
         let watcher = watcher::watch(&folder, move |change| {
             changed.unbounded_send(change).ok();
         });
         match watcher {
-            Ok(watcher) => self.watcher = Some(watcher),
+            Ok(watcher) => {
+                self.watcher = Some(watcher);
+                self.followed = Some(folder.clone());
+            }
             Err(error) => {
                 self.watch_problem = Some(format!(
                     "Saved changes won't show here: could not watch {}: {error}",

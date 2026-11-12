@@ -119,27 +119,35 @@ impl SaveJob {
         }
         let (moved_to, notices) = match (&from, to) {
             (TalkPlace::Folder(folder), None) => {
-                // A file that can't be read is written anyway: it may have been deleted. An
-                // empty one is an editor halfway through a save, as a reload takes it, and
-                // nothing would ever ask about it, so it's written too.
-                if let Ok(found) = read_talk_text(&folder.join(SLIDES_FILE))
-                    && !found.is_empty()
-                    && found != on_disk
-                    && found != text
-                {
-                    return Err(SaveError::ChangedOutside(found));
+                // A file that's gone is written without asking. One that's there but can't be
+                // read is left alone: it may be someone else's that the app can't make out.
+                let found = match read_talk_text(&folder.join(SLIDES_FILE)) {
+                    Ok(found) => Some(found),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(failed(folder, unreadable(&error)).into()),
+                };
+                if let Some(found) = found {
+                    changed_outside(found, &on_disk, &text)?;
                 }
                 write_slides(folder, &text)?;
                 (None, Vec::new())
             }
             (TalkPlace::Packed(file), None) => {
+                // A pack that can't be read is refused by the repack below.
+                if let Ok(found) = open_packed(file).and_then(|packed| packed.slides()) {
+                    changed_outside(found, &on_disk, &text)?;
+                }
                 repack_with_slides(file, file, &text, APP_VERSION).map_err(|e| failed(file, e))?;
                 (None, Vec::new())
             }
             (TalkPlace::Folder(folder), Some(SaveTarget::Folder(to))) => {
-                let left_out = copy_talk_folder(folder, &to, &text).map_err(|e| failed(&to, e))?;
-                let notices = left_out.into_iter().map(|name| format!("{name} was left out")).collect();
-                (Some(in_folder(to)), notices)
+                let report = copy_talk_folder(folder, &to, &text).map_err(|e| failed(&to, e))?;
+                let left_out = report.skipped.into_iter().map(|name| format!("{name} was left out"));
+                let outside = report
+                    .outside_pictures
+                    .into_iter()
+                    .map(|name| format!("The picture {name} is outside assets/ and wasn't copied"));
+                (Some(in_folder(to)), left_out.chain(outside).collect())
             }
             (TalkPlace::Folder(folder), Some(SaveTarget::Packed(out))) => {
                 let report = pack_folder_with_slides(folder, &out, &text, APP_VERSION)
@@ -170,6 +178,27 @@ impl SaveJob {
             notices,
         })
     }
+}
+
+/// Refuses the save if `found`, what the talk's file holds, is neither what the app last
+/// wrote or read nor what it's about to write. An empty file is an editor halfway through a
+/// save, as a reload takes it, and nothing would ever ask about it, so it's written over.
+fn changed_outside(found: String, on_disk: &str, text: &str) -> Result<(), SaveError> {
+    if !found.is_empty() && found != on_disk && found != text {
+        return Err(SaveError::ChangedOutside(found));
+    }
+    Ok(())
+}
+
+/// Why a `slides.md` that's there wasn't written over, in words for the person saving.
+fn unreadable(error: &std::io::Error) -> String {
+    let why = match error.kind() {
+        std::io::ErrorKind::PermissionDenied => "the app isn't allowed to read it".to_string(),
+        // The reader's own words, such as that it isn't UTF-8 text or is too big.
+        std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput => error.to_string(),
+        _ => "something went wrong reading it".to_string(),
+    };
+    format!("its {SLIDES_FILE} can't be read, as {why}, so it was left as it is.")
 }
 
 /// Writes only the talk's `slides.md` in `folder`, by way of a file beside it.
