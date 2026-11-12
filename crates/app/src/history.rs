@@ -157,6 +157,16 @@ impl History {
         self.run == Some(run)
     }
 
+    /// The change [`Self::undo`] would give, without taking the step back.
+    pub fn next_undo(&self) -> Option<&Change> {
+        self.undo.back().map(|entry| &entry.change)
+    }
+
+    /// The change [`Self::redo`] would give, without making the step again.
+    pub fn next_redo(&self) -> Option<&Change> {
+        self.redo.last().map(|entry| &entry.change)
+    }
+
     /// Takes the last step back. `source` is the talk's text now, which the step's change
     /// is made to.
     pub fn undo(&mut self, source: &str) -> Option<Step> {

@@ -73,10 +73,10 @@ impl WorkspaceView {
     /// Takes back the last edit, or makes the last one undone again.
     pub(super) fn step_history(
         &mut self,
-        step: fn(&mut Document) -> Option<Vec<usize>>,
+        step: fn(&mut Document) -> Result<Option<Vec<usize>>, EditRefused>,
         cx: &mut Context<Self>,
     ) {
-        self.edit(|document| Ok(step(document).unwrap_or_default()), cx);
+        self.edit(|document| step(document).map(Option::unwrap_or_default), cx);
     }
 
     /// Brings what shows the talk up to date after an edit. A "Saved" on the status line no

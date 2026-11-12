@@ -10,7 +10,7 @@ use slides_engine::{
     ComponentInfo, Deck, FolderFiles, Fonts, Layer, LayerTiming, Moment, PackError, Pixmap,
     SlideTimeline, TalkFiles, Transition, layout_by_name, open_packed, read_talk_text,
 };
-use slides_format::{Change, SourceEdit, Talk, parse_talk, split_slides};
+use slides_format::{Change, SourceEdit, Talk, parse_talk, reparse, split_slides};
 
 use crate::export::ExportInput;
 use crate::history::{History, RunId};
@@ -36,7 +36,13 @@ pub enum Reload {
     /// The file changed while the talk has edits it doesn't, so nothing was taken: whoever is
     /// editing it is asked which to keep. [`Document::outside_change`] is what the file holds.
     Conflict,
+    /// Reading what the file holds went wrong, so the talk stays as it was.
+    Unreadable,
 }
+
+/// What the window says when a new read of the talk's file can't be taken in.
+pub const UNREADABLE_FILE: &str =
+    "The talk's file changed, but it couldn't be read, so the talk is shown as it was.";
 
 /// Why an edit wasn't made. Nothing of it was applied, and there's nothing to undo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,12 +83,13 @@ const RECOVER_CHANGES: &str = "Recover changes";
 const LOAD_CHANGED_FILE: &str = "Load the changed file";
 
 thread_local! {
-    /// Whether the next change worked out on this thread panics, for tests.
+    /// Whether the next change worked out, or text read, on this thread panics, for tests.
     static PANIC_IN_NEXT_CHANGE: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Makes the next change a [`Document`] command works out on this thread panic, as a fault in
-/// the format crate would, so tests can see that it's refused. Only for tests.
+/// Makes the next change a [`Document`] command works out on this thread panic, or the next
+/// text it reads, as a fault in the format crate would, so tests can see that it's refused.
+/// Only for tests.
 #[doc(hidden)]
 pub fn panic_in_next_change() {
     PANIC_IN_NEXT_CHANGE.with(|flag| flag.set(true));
@@ -94,14 +101,25 @@ fn guarded<T>(work: impl FnOnce() -> T) -> Result<T, EditRefused> {
     catch_unwind(AssertUnwindSafe(work)).map_err(|_| EditRefused::CouldNotBeMade)
 }
 
-/// What `build` makes of `talk`: the change a command works out, guarded as [`guarded`] is.
-fn built<T>(talk: &Talk, build: impl FnOnce(&Talk) -> T) -> Result<T, EditRefused> {
+/// What `work`, some of the format crate's work, gives, guarded as [`guarded`] is.
+fn worked_out<T>(work: impl FnOnce() -> T) -> Result<T, EditRefused> {
     guarded(|| {
         if PANIC_IN_NEXT_CHANGE.with(|flag| flag.replace(false)) {
             panic!("a change that panics, for a test");
         }
-        build(talk)
+        work()
     })
+}
+
+/// What `build` makes of `talk`: the change a command works out, guarded as [`guarded`] is.
+fn built<T>(talk: &Talk, build: impl FnOnce(&Talk) -> T) -> Result<T, EditRefused> {
+    worked_out(|| build(talk))
+}
+
+/// The talk `source` reads as, the text of `talk` once changed, guarded as [`guarded`] is.
+/// Only the slides whose text changed are read again.
+fn read_after(talk: &Talk, source: String) -> Result<Talk, EditRefused> {
+    worked_out(|| reparse(talk, source))
 }
 
 /// The layout a slide has when its settings name none.
@@ -183,13 +201,19 @@ impl Document {
         })?;
         let files = FolderFiles::new(folder.to_path_buf());
         let talk_fonts = read_talk_fonts(font_names_in_folder(folder), &files);
-        Ok(Document::new(
+        Document::new(
             TalkPlace::Folder(folder.to_path_buf()),
             Arc::new(files),
             talk_fonts,
             source,
             fonts,
-        ))
+        )
+        .map_err(|_| {
+            format!(
+                "Could not read {SLIDES_FILE} in {}: something in it can't be read.",
+                folder.display()
+            )
+        })
     }
 
     /// Opens the packed talk in the file at `path`, along with any fonts it carries.
@@ -208,13 +232,19 @@ impl Document {
             .filter(|name| is_talk_font(name))
             .collect();
         let talk_fonts = read_talk_fonts(names, &packed);
-        Ok(Document::new(
+        Document::new(
             TalkPlace::Packed(path.to_path_buf()),
             Arc::new(packed),
             talk_fonts,
             source,
             fonts,
-        ))
+        )
+        .map_err(|_| {
+            OpenProblem::Other(format!(
+                "Could not read the talk in {}: something in it can't be read.",
+                path.display()
+            ))
+        })
     }
 
     fn new(
@@ -223,14 +253,15 @@ impl Document {
         talk_fonts: Vec<Arc<Vec<u8>>>,
         source: String,
         mut fonts: Fonts,
-    ) -> Document {
+    ) -> Result<Document, EditRefused> {
+        let talk = worked_out(|| parse_talk(&source))?;
         for font in &talk_fonts {
             fonts.load_talk_font(font.clone());
         }
-        Document {
-            on_disk: source.clone(),
+        Ok(Document {
+            on_disk: source,
             outside: None,
-            deck: Deck::open(Box::new(files.clone()), fonts, source),
+            deck: Deck::open_parsed(Box::new(files.clone()), fonts, talk),
             place_name: place.name(),
             place,
             files,
@@ -238,7 +269,7 @@ impl Document {
             current: 0,
             history: History::new(),
             typing_notes: None,
-        }
+        })
     }
 
     pub fn current(&self) -> usize {
@@ -434,7 +465,8 @@ impl Document {
         let broken_before = guarded(|| broken_bodies(self.talk()))?;
         // The candidate is worked out and read before the deck takes it, so a refusal, or a
         // panic, leaves the deck untouched.
-        let (undo, candidate) = guarded(|| (change.inverse(old), parse_talk(&change.apply(old))))?;
+        let (undo, text) = guarded(|| (change.inverse(old), change.apply(old)))?;
+        let candidate = read_after(self.talk(), text)?;
         if old_count.checked_add_signed(slides) != Some(candidate.slides.len()) {
             return Err(EditRefused::WouldChangeTheSlides);
         }
@@ -445,7 +477,7 @@ impl Document {
             return Err(EditRefused::WouldBreakASlide);
         }
         let old = old.to_string();
-        let mut changed = self.deck.update_parsed(candidate);
+        let mut changed = self.deck.update_text(candidate);
         let typing = label == EDIT_NOTES;
         let run = self
             .typing_notes
@@ -475,24 +507,44 @@ impl Document {
     }
 
     /// Takes the last edit back, and returns the slides to show again: `None` if there was
-    /// nothing to undo.
-    pub fn undo(&mut self) -> Option<Vec<usize>> {
-        let step = self.history.undo(self.deck.source())?;
-        Some(self.take_step(step))
+    /// nothing to undo. If reading the text it gives goes wrong, it's refused, and the talk
+    /// and its history stay as they were.
+    pub fn undo(&mut self) -> Result<Option<Vec<usize>>, EditRefused> {
+        let Some(change) = self.history.next_undo() else {
+            return Ok(None);
+        };
+        let talk = self.read_changed(change)?;
+        let step = self
+            .history
+            .undo(self.deck.source())
+            .expect("there's a step to undo");
+        Ok(Some(self.take_step(step.current, talk)))
     }
 
     /// Makes the last undone edit again, and returns the slides to show again: `None` if
-    /// there was nothing to redo.
-    pub fn redo(&mut self) -> Option<Vec<usize>> {
-        let step = self.history.redo(self.deck.source())?;
-        Some(self.take_step(step))
+    /// there was nothing to redo. It's refused as [`Self::undo`] is.
+    pub fn redo(&mut self) -> Result<Option<Vec<usize>>, EditRefused> {
+        let Some(change) = self.history.next_redo() else {
+            return Ok(None);
+        };
+        let talk = self.read_changed(change)?;
+        let step = self
+            .history
+            .redo(self.deck.source())
+            .expect("there's a step to redo");
+        Ok(Some(self.take_step(step.current, talk)))
     }
 
-    fn take_step(&mut self, step: crate::history::Step) -> Vec<usize> {
-        let source = step.change.apply(self.deck.source());
-        let mut changed = self.deck.update(source);
+    /// The talk as `change` leaves it.
+    fn read_changed(&self, change: &Change) -> Result<Talk, EditRefused> {
+        let text = guarded(|| change.apply(self.source()))?;
+        read_after(self.talk(), text)
+    }
+
+    fn take_step(&mut self, current: usize, talk: Talk) -> Vec<usize> {
+        let mut changed = self.deck.update_text(talk);
         self.typing_notes = None;
-        self.show(step.current, &mut changed);
+        self.show(current, &mut changed);
         changed
     }
 
@@ -522,29 +574,36 @@ impl Document {
     /// Takes `text`, the working copy of edits that weren't saved, as the talk's text, and
     /// returns the slides to show again. It's taken as it is, whatever it does to the slides,
     /// and one undo gives back the text as it was. Nothing is written until the talk is saved.
-    pub fn recover(&mut self, text: String) -> Vec<usize> {
+    /// If reading it goes wrong, it's refused, and the talk stays as it was.
+    pub fn recover(&mut self, text: String) -> Result<Vec<usize>, EditRefused> {
         self.replace_all(RECOVER_CHANGES, text)
     }
 
     /// Takes `text` as the talk's whole text, as one step named `label`, and returns the
     /// slides to show again. A whole-text step's ranges fit any text, so the steps before it
     /// can still be undone.
-    fn replace_all(&mut self, label: &'static str, text: String) -> Vec<usize> {
+    fn replace_all(
+        &mut self,
+        label: &'static str,
+        text: String,
+    ) -> Result<Vec<usize>, EditRefused> {
         let old = self.source().to_string();
         if text == old {
-            return Vec::new();
+            return Ok(Vec::new());
         }
+        let talk = read_after(self.talk(), text.clone())?;
         let change = Change::single(SourceEdit {
             range: 0..old.len(),
             text,
         });
         let undo = change.inverse(&old);
-        let mut changed = self.deck.update(change.apply(&old));
+        // Taken from outside the app, so its pictures are looked at again too.
+        let mut changed = self.deck.update_parsed(talk);
         let at = self.current;
         self.history.record(label, undo, at, at, false);
         self.typing_notes = None;
         self.show(at, &mut changed);
-        changed
+        Ok(changed)
     }
 
     /// Adds a slide with the layout called `layout` after the current one, with an empty
@@ -681,16 +740,19 @@ impl Document {
     }
 
     /// Loads `text`, what the file holds after a change from outside, in place of the edits
-    /// made here. It's one step, which brings the edits back when it's undone.
-    pub fn take_theirs(&mut self, text: String) {
-        self.outside = None;
+    /// made here. It's one step, which brings the edits back when it's undone. If reading it
+    /// goes wrong, it's refused, and the talk and the question about the change stay as they were.
+    pub fn take_theirs(&mut self, text: String) -> Result<(), EditRefused> {
         if text.is_empty() {
-            return;
+            self.outside = None;
+            return Ok(());
         }
-        self.on_disk = text.clone();
-        self.replace_all(LOAD_CHANGED_FILE, text);
+        self.replace_all(LOAD_CHANGED_FILE, text.clone())?;
+        self.outside = None;
+        self.on_disk = text;
         // What the file holds is what's here now.
         self.history.mark_saved();
+        Ok(())
     }
 
     /// Keeps the edits made here over the file's change, which isn't asked about again. The
@@ -715,41 +777,54 @@ impl Document {
     /// empty read is an editor caught halfway through a save, not an empty talk.
     ///
     /// A file that holds what the app last wrote or read brings nothing new. A change made
-    /// while the talk has unsaved edits isn't taken, but asked about.
+    /// while the talk has unsaved edits isn't taken, but asked about. If reading what it holds
+    /// goes wrong, the talk stays as it was.
     pub fn reload(&mut self, contents: Option<String>) -> Reload {
         let Some(source) = contents.filter(|source| !source.is_empty()) else {
             return Reload::KeptLastGood;
         };
         let holds_mine = source == self.source();
-        if holds_mine {
-            // The file holds what's here, however it came to: nothing is unsaved.
-            self.history.mark_saved();
-        }
         if holds_mine || source == self.on_disk {
-            self.on_disk = source;
-            // The app's own save, or changed back: a picture the talk shows may still have
-            // been replaced.
-            self.outside = None;
-            let changed = self.deck.update(self.source().to_string());
-            return if changed.is_empty() {
-                Reload::Unchanged
-            } else {
-                Reload::Changed(changed)
+            let Ok(talk) = read_after(self.talk(), self.source().to_string()) else {
+                return Reload::Unreadable;
             };
+            return self.take_same(source, holds_mine, talk);
         }
         if self.has_unsaved_changes() {
             self.outside = Some(source);
             return Reload::Conflict;
         }
-        self.take(source)
+        let Ok(talk) = read_after(self.talk(), source.clone()) else {
+            return Reload::Unreadable;
+        };
+        self.take(source, talk)
     }
 
-    /// Takes `source`, what the file holds, as the talk's text.
-    fn take(&mut self, source: String) -> Reload {
+    /// Takes a read of the file that holds what's here, `holds_mine`, or what the app last
+    /// wrote or read. `talk` is what's here, read again.
+    fn take_same(&mut self, source: String, holds_mine: bool, talk: Talk) -> Reload {
+        if holds_mine {
+            // The file holds what's here, however it came to: nothing is unsaved.
+            self.history.mark_saved();
+        }
+        self.on_disk = source;
+        // The app's own save, or changed back: a picture the talk shows may still have been
+        // replaced.
+        self.outside = None;
+        let changed = self.deck.update_parsed(talk);
+        if changed.is_empty() {
+            Reload::Unchanged
+        } else {
+            Reload::Changed(changed)
+        }
+    }
+
+    /// Takes `source`, what the file holds, as the talk's text. `talk` is what it reads as.
+    fn take(&mut self, source: String, talk: Talk) -> Reload {
         self.on_disk = source.clone();
         let same_text = source == self.source();
         // Even the same text goes through: a picture it shows may have been replaced.
-        let mut changed = self.deck.update(source);
+        let mut changed = self.deck.update_parsed(talk);
         if !same_text {
             // Its steps are ranges of the text it had, which no longer fit.
             self.history = History::new();

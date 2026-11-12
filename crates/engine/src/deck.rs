@@ -161,16 +161,32 @@ fn shown_slides_of(talk: &Talk) -> Vec<usize> {
     if shown.is_empty() { (0..talk.slides.len()).collect() } else { shown }
 }
 
+/// How the slides of a talk just taken are matched to the ones it had, to keep what's known of each.
+enum Matching {
+    /// Each to the one that was at its place.
+    ByPlace,
+    /// From the start, and then from the end: slides after one added or taken out are still found.
+    FromBothEnds,
+}
+
 impl Deck {
     pub fn open(files: Box<dyn TalkFiles>, fonts: Fonts, source: String) -> Deck {
         Deck::with_registry(files, fonts, source, builtin_registry())
     }
 
+    /// As [`Self::open`], with the talk's text already read.
+    pub fn open_parsed(files: Box<dyn TalkFiles>, fonts: Fonts, talk: Talk) -> Deck {
+        Deck::of_talk(files, fonts, talk, builtin_registry())
+    }
+
     /// A deck whose talk can use the components in `registry`, as well as its own.
     pub fn with_registry(files: Box<dyn TalkFiles>, fonts: Fonts, source: String, registry: Registry) -> Deck {
+        Deck::of_talk(files, fonts, parse_talk(&source), registry)
+    }
+
+    fn of_talk(files: Box<dyn TalkFiles>, fonts: Fonts, talk: Talk, registry: Registry) -> Deck {
         let files: Rc<dyn TalkFiles> = Rc::from(files);
         let components = TalkComponents::scan_for(files.clone(), &registry);
-        let talk = parse_talk(&source);
         let slides: Vec<SlideState> = slide_texts(&talk)
             .into_iter()
             .zip(1..)
@@ -223,31 +239,58 @@ impl Deck {
         if files_changed {
             self.files_generation += 1;
         }
+        self.take_talk(talk, files_changed, Matching::ByPlace)
+    }
+
+    /// Takes the talk as an edit made in the app left it, and returns the slides whose text
+    /// differs from what was at the same place, or all of them if the talk's settings did. The
+    /// talk's files are as they were, so none are looked at.
+    ///
+    /// Each slide is matched to the old ones by its text, from the start and then from the
+    /// end, so that a slide added or taken out in the middle leaves every other slide its
+    /// version, layout and drawn layers.
+    pub fn update_text(&mut self, talk: Talk) -> Vec<usize> {
+        self.take_talk(talk, false, Matching::FromBothEnds)
+    }
+
+    fn take_talk(&mut self, talk: Talk, files_changed: bool, matching: Matching) -> Vec<usize> {
         let same_look = !files_changed
             && settings_pairs(self.talk.slides.first().and_then(|s| s.settings.as_ref()))
                 == settings_pairs(talk.slides.first().and_then(|s| s.settings.as_ref()));
-        let mut old = std::mem::take(&mut self.slides);
-        let mut changed = Vec::new();
-        let mut slides = Vec::new();
-        for (index, text) in slide_texts(&talk).into_iter().enumerate() {
-            let previous = old.get_mut(index);
+        let texts = slide_texts(&talk);
+        let changed: Vec<usize> = (0..texts.len())
+            .filter(|&index| !same_look || self.slides.get(index).is_none_or(|old| old.text != texts[index]))
+            .collect();
+        let old_starts: Vec<usize> = self.talk.slides.iter().map(|slide| slide.range.start).collect();
+        let (old_count, new_count) = (self.slides.len(), texts.len());
+        // Matched from the end too, a slide comes from the old slide as far from the end as it is.
+        let from_end = match matching {
+            Matching::FromBothEnds if same_look => {
+                let most = old_count.min(new_count);
+                let from_start = (0..most).take_while(|&index| self.slides[index].text == texts[index]).count();
+                (0..most - from_start).take_while(|&back| self.slides[old_count - 1 - back].text == texts[new_count - 1 - back]).count()
+            }
+            _ => 0,
+        };
+        let mut old: Vec<Option<SlideState>> = std::mem::take(&mut self.slides).into_iter().map(Some).collect();
+        let mut slides = Vec::with_capacity(new_count);
+        for (index, text) in texts.into_iter().enumerate() {
+            let came_from = if index >= new_count - from_end {
+                Some(index + old_count - new_count)
+            } else {
+                Some(index).filter(|&index| index < old_count - from_end)
+            };
+            let previous = came_from.and_then(|from| Some((from, old[from].take()?)));
+            let start = talk.slides[index].range.start;
             match previous {
-                Some(previous) if same_look && previous.text == text => {
-                    slides.push(SlideState {
-                        text,
-                        laid: previous.laid.take(),
-                        at_moment: previous.at_moment.take(),
-                        drawn: std::mem::take(&mut previous.drawn),
-                        thumbnail: previous.thumbnail.take(),
-                        last_used: previous.last_used,
-                        thumbnail_used: previous.thumbnail_used,
-                        version: previous.version,
-                    });
+                Some((from, mut previous)) if same_look && previous.text == text => {
+                    previous.moved(old_starts[from], start);
+                    slides.push(previous);
                 }
                 previous => {
-                    changed.push(index);
+                    let previous = previous.map(|(_, previous)| previous);
                     let (last_used, thumbnail_used) = previous.as_ref().map_or((0, 0), |p| (p.last_used, p.thumbnail_used));
-                    let mut drawn = previous.map(|p| std::mem::take(&mut p.drawn)).unwrap_or_default();
+                    let mut drawn = previous.map(|p| p.drawn).unwrap_or_default();
                     for scale in drawn.values_mut() {
                         scale.ordered = None;
                     }
@@ -743,6 +786,21 @@ impl Deck {
 }
 
 impl SlideState {
+    /// Moves what the slide was laid out from to where its text now sits: from `from` to `to`.
+    fn moved(&mut self, from: usize, to: usize) {
+        if from == to {
+            return;
+        }
+        let at_moment = self.at_moment.as_mut().map(|(_, laid)| laid);
+        for laid in self.laid.iter_mut().chain(at_moment) {
+            for spec in &mut laid.specs {
+                if let Some(source) = &mut spec.source {
+                    *source = source.start - from + to..source.end - from + to;
+                }
+            }
+        }
+    }
+
     /// Whether either of its layouts shows a picture from a file of the talk.
     fn holds_pictures(&self) -> bool {
         let at_moment = self.at_moment.as_ref().map(|(_, laid)| laid);

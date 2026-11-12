@@ -136,11 +136,21 @@ impl WorkspaceView {
             return;
         };
         let text = std::mem::take(&mut found.text);
-        document.update(cx, |document, cx| {
-            document.recover(text);
-            // A show of the talk has to know.
-            cx.notify();
+        let recovered = document.update(cx, |document, cx| {
+            let recovered = document.recover(text.clone());
+            if recovered.is_ok() {
+                // A show of the talk has to know.
+                cx.notify();
+            }
+            recovered
         });
+        if let Err(refused) = recovered {
+            // Nothing was taken, so they're still there to bring back.
+            found.text = text;
+            self.offered = Some(found);
+            self.say(refused.to_string(), cx);
+            return;
+        }
         *self
             .adopted
             .lock()
@@ -516,11 +526,18 @@ impl WorkspaceView {
         let Some(theirs) = document.read(cx).outside_change().map(str::to_string) else {
             return;
         };
-        document.update(cx, |document, cx| {
-            document.take_theirs(theirs);
-            // A show of the talk has to know.
-            cx.notify();
+        let taken = document.update(cx, |document, cx| {
+            let taken = document.take_theirs(theirs);
+            if taken.is_ok() {
+                // A show of the talk has to know.
+                cx.notify();
+            }
+            taken
         });
+        if let Err(refused) = taken {
+            self.say(refused.to_string(), cx);
+            return;
+        }
         let source = document.read(cx).source().to_string();
         self.markdown_panel
             .update(cx, |panel, cx| panel.set_source(&source, cx));

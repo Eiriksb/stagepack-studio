@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use slides_engine::{Fonts, Layer, pack_folder};
-use stagepack_studio::document::{Document, EditRefused, OpenProblem, Reload};
+use slides_format::{Change, SourceEdit};
+use stagepack_studio::document::{Document, EditRefused, OpenProblem, Reload, panic_in_next_change};
 use stagepack_studio::export::{ExportKind, run_export};
 use stagepack_studio::saving::SaveTarget;
 use zip::ZipArchive;
@@ -607,18 +608,18 @@ fn undo_goes_back_through_every_kind_of_change() {
     assert!(doc.has_unsaved_changes());
     for (text, label) in texts.iter().rev().skip(1).zip(labels.iter().rev()) {
         assert_eq!(doc.undo_label(), Some(*label));
-        assert!(doc.undo().is_some());
+        assert!(doc.undo().unwrap().is_some());
         assert_eq!(doc.source(), text, "after undoing {label}");
         assert_eq!(doc.redo_label(), Some(*label));
     }
     assert!(!doc.can_undo());
     assert!(!doc.has_unsaved_changes(), "back to the text as it was opened");
     for (text, label) in texts.iter().skip(1).zip(&labels) {
-        assert!(doc.redo().is_some());
+        assert!(doc.redo().unwrap().is_some());
         assert_eq!(doc.source(), text, "after redoing {label}");
     }
     assert!(!doc.can_redo());
-    assert!(doc.undo().is_some());
+    assert!(doc.undo().unwrap().is_some());
     assert_eq!(doc.source(), texts[texts.len() - 2]);
 }
 
@@ -787,4 +788,43 @@ fn a_slide_that_was_already_broken_can_still_be_moved() {
     assert!(doc.talk().slides[0].error.is_some());
     doc.duplicate_current().unwrap();
     assert_eq!(doc.slide_count(), 3);
+}
+
+#[test]
+fn a_refused_edit_leaves_the_deck_alone() {
+    let (_d, mut doc) = talk("# One\n\n---\n\n# Two\n\n---\n\n# Three\n");
+    let versions: Vec<_> = (0..3).map(|index| doc.slide_version(index)).collect();
+    let joined = doc.source().replacen("---\n", "", 1);
+    let refused = doc
+        .edit("Join", Change::single(SourceEdit { range: 0..doc.source().len(), text: joined }), 0)
+        .unwrap_err();
+    assert_eq!(refused, EditRefused::WouldChangeTheSlides);
+    assert_eq!(doc.slide_count(), 3);
+    assert_eq!((0..3).map(|index| doc.slide_version(index)).collect::<Vec<_>>(), versions);
+}
+
+#[test]
+fn a_panic_while_undoing_leaves_the_talk_as_it_was() {
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if info.payload().downcast_ref::<&str>() != Some(&"a change that panics, for a test") {
+            report(info);
+        }
+    }));
+    let (_d, mut doc) = talk("# One\n\n---\n\n# Two\n");
+    doc.set_notes(1, "Say this").unwrap();
+    let typed = doc.source().to_string();
+    let versions: Vec<_> = (0..2).map(|index| doc.slide_version(index)).collect();
+
+    panic_in_next_change();
+    let refused = doc.undo().unwrap_err();
+
+    assert_eq!(refused.to_string(), "That change couldn't be made, so nothing was changed.");
+    assert_eq!(doc.source(), typed);
+    assert_eq!((0..2).map(|index| doc.slide_version(index)).collect::<Vec<_>>(), versions);
+    assert_eq!(doc.undo_label(), Some("Edit notes"));
+    assert!(!doc.can_redo());
+    // It undoes as before once nothing panics.
+    assert!(doc.undo().unwrap().is_some());
+    assert_eq!(doc.source(), "# One\n\n---\n\n# Two\n");
 }

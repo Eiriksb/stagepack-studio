@@ -5,13 +5,15 @@ mod edit;
 mod model;
 mod notes;
 mod parse;
+mod reparse;
 mod settings;
 mod slide_ops;
 mod split;
 
 pub use edit::{Change, SourceEdit, set_attr, set_setting};
 pub use model::{Attr, Block, Notes, Slide, SlideError, Span, Style, Tag, Talk};
-pub use parse::parse_talk;
+pub use parse::{parse_talk, slides_parsed_on_this_thread};
+pub use reparse::reparse;
 pub use settings::{SettingEntry, Settings};
 pub use slide_ops::{
     TALK_SETTINGS, delete_slide, duplicate_slide, insert_slide, is_hidden, move_slide, remove_setting, set_hidden, set_notes,

@@ -535,3 +535,41 @@ fn a_slide_keeps_its_version_until_it_changes() {
     assert_eq!(d.slide_version(0), Some(before[0]));
     assert_ne!(d.slide_version(1), Some(before[2]));
 }
+
+#[test]
+fn a_slide_added_in_the_middle_keeps_the_others_drawn() {
+    let mut d = deck(TALK);
+    let before = d.layers(2, SCALE);
+    let version = d.slide_version(2);
+    let changed = d.update_text(slides_format::parse_talk(&TALK.replace("---\n\n# Two", "---\n\n# New\n\n---\n\n# Two")));
+    assert_eq!(changed, vec![1, 2, 3], "the slides whose place now holds other text");
+    assert_eq!(d.slide_version(3), version);
+    assert!(Arc::ptr_eq(&before[1], &d.layers(3, SCALE)[1]));
+}
+
+/// Files that count how often they're asked anything.
+#[derive(Clone, Default)]
+struct CountingFiles(Arc<std::sync::atomic::AtomicUsize>);
+
+impl CountingFiles {
+    fn asked(&self) -> usize { self.0.load(std::sync::atomic::Ordering::SeqCst) }
+    fn ask(&self) { self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+}
+
+impl TalkFiles for CountingFiles {
+    fn read(&self, _: &str) -> Option<Vec<u8>> { self.ask(); Some(one_colour_png(tiny_skia::Color::BLACK)) }
+    fn stamp(&self, _: &str) -> Option<(u64, std::time::SystemTime)> { self.ask(); None }
+    fn len(&self, _: &str) -> Option<u64> { self.ask(); None }
+    fn names_in(&self, _: &str) -> Vec<String> { self.ask(); Vec::new() }
+}
+
+#[test]
+fn an_edit_made_in_the_app_reads_no_files() {
+    let files = CountingFiles::default();
+    let mut d = Deck::open(Box::new(files.clone()), Fonts::bundled_only(), PICTURE_TALK.to_string());
+    d.layers(0, SCALE);
+    let asked = files.asked();
+    assert!(asked > 0, "opening and drawing the talk read its picture");
+    d.update_text(slides_format::parse_talk(&PICTURE_TALK.replace("Two", "Changed")));
+    assert_eq!(files.asked(), asked);
+}

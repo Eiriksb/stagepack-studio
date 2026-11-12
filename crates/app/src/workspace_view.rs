@@ -23,7 +23,7 @@ use slides_engine::{ComponentState, Fonts};
 
 use crate::builds::{self, BuildOutcome, Compile};
 use crate::cargo_file::{self, write_cargo_file};
-use crate::document::{Document, EditRefused, OpenProblem, Reload, SLIDES_FILE, TalkPlace};
+use crate::document::{Document, EditRefused, OpenProblem, Reload, SLIDES_FILE, TalkPlace, UNREADABLE_FILE};
 use crate::export::{self, ExportKind, run_export, stagepack_executable};
 use crate::markdown_panel::MarkdownPanel;
 use crate::notes_panel::{
@@ -696,6 +696,10 @@ impl WorkspaceView {
             }
             reload
         });
+        if matches!(reload, Reload::Unreadable) {
+            self.say(UNREADABLE_FILE, cx);
+            return;
+        }
         let Reload::Changed(slides) = reload else {
             // The bar about a change from outside may have come or gone.
             cx.notify();

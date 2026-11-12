@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::thread;
@@ -44,18 +44,39 @@ fn options() -> ParseOptions {
     }
 }
 
+thread_local! {
+    /// How many slides have been read on this thread, for tests.
+    static SLIDES_PARSED: Cell<usize> = const { Cell::new(0) };
+}
+
+/// How many slides this thread has had read, by [`parse_talk`] or [`crate::reparse`], so
+/// that tests can see which are read again. Only for tests.
+#[doc(hidden)]
+pub fn slides_parsed_on_this_thread() -> usize {
+    SLIDES_PARSED.with(Cell::get)
+}
+
 /// Reads a whole file into slides. A slide that fails to parse carries an
 /// error and no blocks; the others are unaffected.
 pub fn parse_talk(source: &str) -> Talk {
     let raw_slides = split_slides(source);
+    let slides = read_slides(source, &raw_slides.iter().collect::<Vec<_>>());
+    Talk { source: source.to_string(), slides }
+}
+
+/// Reads each of `raw_slides`, slides of `source`, on the parser's thread.
+pub(crate) fn read_slides(source: &str, raw_slides: &[&RawSlide]) -> Vec<Slide> {
+    if raw_slides.is_empty() {
+        return Vec::new();
+    }
+    SLIDES_PARSED.with(|parsed| parsed.set(parsed.get() + raw_slides.len()));
     let slides = thread::scope(|scope| {
         let reader = thread::Builder::new()
             .stack_size(PARSER_STACK)
             .spawn_scoped(scope, || raw_slides.iter().map(|raw| read_slide(source, raw)).collect::<Vec<_>>());
         reader.ok().and_then(|reader| reader.join().ok())
     });
-    let slides = slides.unwrap_or_else(|| raw_slides.iter().map(|raw| refused_slide(raw, UNREADABLE)).collect());
-    Talk { source: source.to_string(), slides }
+    slides.unwrap_or_else(|| raw_slides.iter().map(|raw| refused_slide(raw, UNREADABLE)).collect())
 }
 
 fn empty_slide(raw: &RawSlide) -> Slide {
@@ -91,7 +112,8 @@ fn read_body(source: &str, body: Range<usize>) -> Result<Body, String> {
     if nests_too_deep(&root) {
         return Err(TOO_DEEP.to_string());
     }
-    let ctx = Ctx { source, base: body.start, inline_tags: RefCell::new(Vec::new()) };
+    // Nothing past the slide is looked at, so that a slide reads the same wherever it sits.
+    let ctx = Ctx { source: &source[..body.end], base: body.start, inline_tags: RefCell::new(Vec::new()) };
     let (mut blocks, mut notes) = (Vec::new(), None);
     for node in root.children().into_iter().flatten() {
         ctx.block(node, &mut blocks, &mut notes);

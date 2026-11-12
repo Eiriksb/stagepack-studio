@@ -9,14 +9,19 @@ type Command = fn(&mut Document) -> Result<Vec<usize>, EditRefused>;
 
 const TALK: &str = "---\ntitle: T\n---\n# One\n---\n# Two\n";
 
-#[test]
-fn an_edit_that_panics_is_refused_and_changes_nothing() {
+/// Keeps the panics these tests make from being reported, and lets any other through.
+fn quiet_the_panics_made() {
     let report = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if info.payload().downcast_ref::<&str>() != Some(&"a change that panics, for a test") {
             report(info);
         }
     }));
+}
+
+#[test]
+fn an_edit_that_panics_is_refused_and_changes_nothing() {
+    quiet_the_panics_made();
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("slides.md"), TALK).unwrap();
     let mut doc = Document::open(dir.path(), Fonts::bundled_only()).unwrap();
@@ -52,4 +57,23 @@ fn an_edit_that_panics_is_refused_and_changes_nothing() {
     assert_eq!(doc.source(), before);
     doc.undo().unwrap();
     assert_eq!(doc.source(), TALK);
+}
+
+#[test]
+fn a_talk_that_panics_as_it_is_read_says_so_instead_of_opening() {
+    quiet_the_panics_made();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("slides.md"), TALK).unwrap();
+    panic_in_next_change();
+    let problem = Document::open(dir.path(), Fonts::bundled_only())
+        .err()
+        .unwrap();
+    assert!(
+        problem.starts_with("Could not read slides.md in "),
+        "{problem}"
+    );
+    assert!(
+        problem.ends_with(": something in it can't be read."),
+        "{problem}"
+    );
 }
