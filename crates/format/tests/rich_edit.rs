@@ -434,6 +434,41 @@ fn select_word_at_selects_the_word() {
 }
 
 #[test]
+fn select_word_at_leaves_out_punctuation_and_spaces_after_the_word() {
+    let edit = at(vec![body("hello, world.")], caret(0, 0));
+    assert_eq!(edit.select_word_at(pos(0, 13)).selection, range(pos(0, 7), pos(0, 12)));
+    assert_eq!(edit.select_word_at(pos(0, 12)).selection, range(pos(0, 7), pos(0, 12)));
+    assert_eq!(edit.select_word_at(pos(0, 5)).selection, range(pos(0, 0), pos(0, 5)));
+    assert_eq!(edit.select_word_at(pos(0, 6)).selection, range(pos(0, 0), pos(0, 5)));
+    let edit = at(vec![body("end.  ")], caret(0, 0));
+    assert_eq!(edit.select_word_at(pos(0, 6)).selection, range(pos(0, 0), pos(0, 3)));
+    // With no word before them, the spaces or punctuation themselves.
+    let edit = at(vec![body("  ...")], caret(0, 0));
+    assert_eq!(edit.select_word_at(pos(0, 1)).selection, range(pos(0, 0), pos(0, 2)));
+}
+
+#[test]
+fn word_edges_are_moved_onto_the_edges_of_characters() {
+    // Word edges here (a regional indicator with an accent on it, then a flag) aren't
+    // the edges of what's drawn, which are 0, 6 and 14.
+    let text = "\u{1F1F3}\u{301}\u{1F1F3}\u{1F1F3}";
+    assert_eq!(boundaries(text), [0, 6, 14]);
+    let edit = at(vec![body(text)], caret(0, 0));
+    for at in 0..=text.len() {
+        assert_well_formed(&edit.select_word_at(pos(0, at)));
+    }
+    let picked = edit.select_word_at(pos(0, 0)).selection;
+    assert_eq!(picked.anchor, pos(0, 0));
+    assert!([6, 14].contains(&picked.head.offset), "{picked:?}");
+    for motion in [Motion::WordLeft, Motion::WordRight] {
+        for at in [0, 6, 14] {
+            let moved = edit.move_to(pos(0, at), false).move_by(motion, false);
+            assert_well_formed(&moved);
+        }
+    }
+}
+
+#[test]
 fn moves_by_character_cross_paragraphs() {
     let edit = at(vec![body("ab"), body("cd")], caret(1, 0));
     assert_eq!(edit.move_by(Motion::Left, false).selection, caret(0, 2));
@@ -453,13 +488,16 @@ fn left_and_right_collapse_a_selection() {
 
 #[test]
 fn moves_by_word() {
-    let edit = at(vec![body("one two, three"), body("four")], caret(0, 0));
+    // Right goes to the start of the next word, or the end of the paragraph.
+    let edit = at(vec![body("hello, world."), body("four")], caret(0, 0));
     let right = edit.move_by(Motion::WordRight, false);
-    assert_eq!(right.selection, caret(0, 3));
-    let right = right.move_by(Motion::WordRight, false);
     assert_eq!(right.selection, caret(0, 7));
-    let right = right.move_by(Motion::WordRight, false).move_by(Motion::WordRight, false);
+    let right = right.move_by(Motion::WordRight, false);
+    assert_eq!(right.selection, caret(0, 13));
+    let right = right.move_by(Motion::WordRight, false);
     assert_eq!(right.selection, caret(1, 0));
+    let right = at(vec![body("one two")], caret(0, 1)).move_by(Motion::WordRight, true);
+    assert_eq!(right.selection, range(pos(0, 1), pos(0, 4)));
     let left = at(vec![body("one two, three")], caret(0, 9)).move_by(Motion::WordLeft, false);
     assert_eq!(left.selection, caret(0, 4));
     let left = at(vec![body("one two, three")], caret(0, 6)).move_by(Motion::WordLeft, true);
@@ -553,10 +591,115 @@ fn what_is_copied_pastes_back() {
     assert_eq!(edit.backspace().paste(&copied).paras, paras);
 }
 
+#[test]
+fn a_paste_of_one_paragraph_into_an_empty_one_brings_its_kind() {
+    let edit = at(vec![body("")], caret(0, 0)).paste(&[para(HEADING, "Title")]);
+    assert_eq!(edit.paras, [para(HEADING, "Title")]);
+    let edit = at(vec![body("")], caret(0, 0)).paste(&[para(HEADING, "Title"), body("")]);
+    assert_eq!(edit.paras, [para(HEADING, "Title"), body("")]);
+    // A paragraph left empty by the selection counts as empty.
+    let edit = at(vec![body("abc")], range(pos(0, 0), pos(0, 3))).paste(&[para(BULLET, "x")]);
+    assert_eq!(edit.paras, [para(BULLET, "x")]);
+}
+
+// Control characters.
+
+#[test]
+fn typed_line_endings_and_separators_break_lines_and_paragraphs() {
+    let edit = at(vec![body("")], caret(0, 0)).insert("a\u{2028}b");
+    assert_eq!(texts(&edit), ["a\nb"]);
+    assert_eq!(edit.selection, caret(0, 3));
+    let edit = at(vec![body("")], caret(0, 0)).insert("a\u{2029}b\r\nc\rd");
+    assert_eq!(texts(&edit), ["a", "b", "c", "d"]);
+}
+
+#[test]
+fn typed_control_characters_are_dropped() {
+    let edit = at(vec![body("")], caret(0, 0)).insert("\u{feff}a\u{7}b\u{0}\u{1b}c\td\u{7f}\u{85}");
+    assert_eq!(texts(&edit), ["abc\td"]);
+    let edit = at(vec![body("ab")], caret(0, 1)).insert("\u{feff}\u{7}");
+    assert_eq!(edit.paras, [body("ab")]);
+    assert_eq!(edit.selection, caret(0, 1));
+}
+
+#[test]
+fn pasted_control_characters_are_made_breaks_or_dropped() {
+    let pasted = [Para { kind: BODY, spans: vec![plain("a\r"), styled("\nb\u{2028}c\u{7}\u{feff}\r\rd\te", bold())] }];
+    let edit = at(vec![body("")], caret(0, 0)).paste(&pasted);
+    assert_eq!(edit.paras, [Para { kind: BODY, spans: vec![plain("a\n"), styled("b\nc\n\nd\te", bold())] }]);
+    let pasted = [Para { kind: BULLET, spans: vec![plain("a\u{2029}"), styled("b", bold())] }];
+    let edit = at(vec![body("")], caret(0, 0)).paste(&pasted);
+    assert_eq!(edit.paras, [para(BULLET, "a"), Para { kind: BULLET, spans: vec![styled("b", bold())] }]);
+    assert_eq!(edit.selection, caret(1, 1));
+    let edit = at(vec![body("xy")], caret(0, 1)).paste(&[body("\u{0}\u{feff}")]);
+    assert_eq!(edit.paras, [body("xy")]);
+}
+
+// The style chosen for typing.
+
+#[test]
+fn a_pending_style_lasts_through_enter_breaks_and_kinds() {
+    let pending = at(vec![body("abcd")], caret(0, 2)).toggle(StyleBit::Bold);
+    let edit = pending.enter();
+    assert_eq!(texts(&edit), ["ab", "cd"]);
+    assert_eq!(edit.typing_style, Some(bold()));
+    assert_eq!(edit.insert("x").paras[1].spans, [styled("x", bold()), plain("cd")]);
+    let edit = pending.soft_break();
+    assert_eq!(edit.typing_style, Some(bold()));
+    assert_eq!(edit.paras[0].spans, [plain("ab"), styled("\n", bold()), plain("cd")]);
+    for edit in [pending.set_kind(BULLET), pending.set_kind(BULLET).indent(), pending.set_kind(BULLET).indent().outdent()] {
+        assert_eq!(edit.typing_style, Some(bold()));
+    }
+    let empty_bullet = at(vec![para(BULLET, "")], caret(0, 0)).toggle(StyleBit::Bold).enter();
+    assert_eq!(empty_bullet.typing_style, Some(bold()));
+}
+
+#[test]
+fn a_pending_style_is_forgotten_by_moving_selecting_and_deleting() {
+    let pending = at(vec![body("abcd")], caret(0, 2)).toggle(StyleBit::Bold);
+    for edit in [
+        pending.move_by(Motion::Left, false),
+        pending.move_to(pos(0, 2), false),
+        pending.select_all(),
+        pending.select_word_at(pos(0, 1)),
+        pending.backspace(),
+        pending.delete(),
+        pending.move_to(pos(0, 0), false).toggle(StyleBit::Bold).backspace(),
+        pending.insert("x"),
+    ] {
+        assert_eq!(edit.typing_style, None, "{edit:?}");
+    }
+}
+
+#[test]
+fn backspace_and_delete_leave_an_empty_flow_as_it_is() {
+    let empty = at(Vec::new(), caret(0, 0));
+    assert_eq!(empty.backspace(), empty);
+    assert_eq!(empty.delete(), empty);
+    let pending = empty.toggle(StyleBit::Italic);
+    assert_eq!(pending.backspace(), pending);
+}
+
 // Properties.
 
-/// Whole characters to type: none of them joins the character beside it.
-const LETTERS: [&str; 10] = ["a", "b", " ", ",", "\u{e9}", COMBINING, FAMILY, FLAG, SURROGATE_PAIR, "\n"];
+/// Characters to type: whole ones, and pieces that join the characters beside them (a lone
+/// regional indicator, a combining accent, a zero-width joiner, a skin-tone modifier).
+const LETTERS: [&str; 14] = [
+    "a",
+    "b",
+    " ",
+    ",",
+    "\u{e9}",
+    COMBINING,
+    FAMILY,
+    FLAG,
+    SURROGATE_PAIR,
+    "\n",
+    "\u{1F1F3}",
+    "\u{301}",
+    "\u{200D}",
+    "\u{1F3FB}",
+];
 
 fn letters(max: usize) -> impl Strategy<Value = String> {
     prop::collection::vec(prop::sample::select(LETTERS.to_vec()), 0..max).prop_map(|letters| letters.concat())
@@ -720,8 +863,20 @@ impl Plain {
         self.paras[para].1.len()
     }
 
-    /// Replaces the selection with `pasted`, as the editor does.
-    fn replace(&mut self, pasted: &[(ParaKind, String)]) {
+    /// `at` moved onto the edge of a character: forward, or back.
+    fn snap(&self, at: Pos, forward: bool) -> Pos {
+        let bounds = boundaries(&self.paras[at.para].1);
+        let offset = if forward {
+            bounds.iter().copied().find(|&b| b >= at.offset).unwrap()
+        } else {
+            bounds.iter().copied().rev().find(|&b| b <= at.offset).unwrap()
+        };
+        pos(at.para, offset)
+    }
+
+    /// Replaces the selection with `pasted`, as the editor does, the caret after it moved
+    /// forward off a character it ended inside if `forward`, else back.
+    fn replace(&mut self, pasted: &[(ParaKind, String)], forward: bool) {
         self.ensure();
         let (start, end) = self.ends();
         let kind = self.paras[start.para].0;
@@ -734,6 +889,7 @@ impl Plain {
                 start
             }
             [one] => {
+                let kind = if head.is_empty() && tail.is_empty() { one.0 } else { kind };
                 new.push((kind, head + &one.1 + &tail));
                 pos(start.para, start.offset + one.1.len())
             }
@@ -745,6 +901,7 @@ impl Plain {
             }
         };
         self.paras.splice(start.para..=end.para, new);
+        let at = self.snap(at, forward);
         self.caret(at);
     }
 
@@ -774,13 +931,17 @@ impl Plain {
                 let kind = if self.paras.is_empty() { BODY } else { self.paras[self.ends().0.para].0 };
                 let lines: Vec<(ParaKind, String)> = text.split('\n').map(|line| (kind, line.to_string())).collect();
                 if !(text.is_empty() && self.anchor == self.head) {
-                    self.replace(&lines);
+                    self.replace(&lines, true);
                 }
             }
-            Op::SoftBreak => self.replace(&[(BODY, "\n".to_string())]),
-            Op::Backspace | Op::Delete if self.anchor != self.head => self.replace(&[]),
-            Op::Backspace => {
+            Op::SoftBreak => {
                 self.ensure();
+                let kind = self.paras[self.ends().0.para].0;
+                self.replace(&[(kind, "\n".to_string())], true);
+            }
+            Op::Backspace | Op::Delete if self.paras.is_empty() => {}
+            Op::Backspace | Op::Delete if self.anchor != self.head => self.replace(&[], false),
+            Op::Backspace => {
                 let at = self.head;
                 let kind = &mut self.paras[at.para].0;
                 match (at.offset, *kind) {
@@ -793,18 +954,17 @@ impl Plain {
                     (0, ParaKind::Bullet { .. } | ParaKind::Numbered { .. }) => *kind = BODY,
                     _ => {
                         self.anchor = self.prev(at);
-                        self.replace(&[]);
+                        self.replace(&[], false);
                     }
                 }
             }
             Op::Delete => {
-                self.ensure();
                 self.head = self.next(self.head);
-                self.replace(&[]);
+                self.replace(&[], false);
             }
             Op::Enter => {
                 let was_caret = self.anchor == self.head;
-                self.replace(&[]);
+                self.replace(&[], false);
                 let at = self.head;
                 let (kind, text) = self.paras[at.para].clone();
                 let is_list = matches!(kind, ParaKind::Bullet { .. } | ParaKind::Numbered { .. });
@@ -812,7 +972,7 @@ impl Plain {
                     self.paras[at.para].0 = BODY;
                 } else {
                     let tail = if matches!(kind, ParaKind::Heading(_)) && at.offset == text.len() { BODY } else { kind };
-                    self.replace(&[(kind, String::new()), (tail, String::new())]);
+                    self.replace(&[(kind, String::new()), (tail, String::new())], false);
                 }
             }
             Op::Toggle(_) | Op::SetSize(_) => {}
@@ -879,7 +1039,7 @@ impl Plain {
                     .iter()
                     .map(|para| (para.kind, para.spans.iter().map(|span| span.text.as_str()).collect()))
                     .collect();
-                self.replace(&pasted);
+                self.replace(&pasted, true);
             }
             Op::SelectWord(..) | Op::WordMove(..) | Op::Wild(..) => return false,
         }

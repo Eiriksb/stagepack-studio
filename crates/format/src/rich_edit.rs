@@ -115,7 +115,9 @@ pub struct TextEdit {
     pub paras: Vec<Para>,
     pub selection: Selection,
     /// The style the next typed character takes, when the caret selects nothing and a
-    /// style was chosen for it. Anything but styling forgets it.
+    /// style was chosen for it, or Enter at the end of styled text carried that style on.
+    /// It lasts through changes of kind and level, Enter and a line break, and is used up
+    /// by typing or pasting. Moving the caret, selecting, Backspace and Delete forget it.
     pub typing_style: Option<Style>,
 }
 
@@ -127,9 +129,10 @@ impl TextEdit {
         edit
     }
 
-    /// Puts `text` in place of the selection. Each newline in it starts a paragraph of the
-    /// kind the selection starts in. What's typed takes the style before the caret, or,
-    /// over a selection, the style of its first character.
+    /// Puts `text` in place of the selection. Each newline or paragraph separator in it
+    /// starts a paragraph of the kind the selection starts in; a line separator is a line
+    /// break inside the paragraph. Other control characters are dropped. What's typed takes
+    /// the style before the caret, or, over a selection, the style of its first character.
     pub fn insert(&self, text: &str) -> Self {
         let mut edit = self.clamped();
         if text.is_empty() && edit.selection.is_caret() {
@@ -138,8 +141,8 @@ impl TextEdit {
         edit.ensure_para();
         let style = edit.style_for_typing();
         let kind = edit.paras[edit.selection.start().para].kind;
-        let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        let fragment = text.split('\n').map(|line| Para { kind, spans: span(line, &style) }).collect();
+        let text = text.replace("\r\n", "\n").replace(['\r', PARA_SEPARATOR], "\n");
+        let fragment = text.split('\n').map(|line| Para { kind, spans: span(&clean_line(line), &style) }).collect();
         edit.replace(fragment, true);
         edit
     }
@@ -148,17 +151,24 @@ impl TextEdit {
     pub fn soft_break(&self) -> Self {
         let mut edit = self.clamped();
         edit.ensure_para();
+        let pending = edit.pending();
         let style = edit.style_for_typing();
-        edit.replace(vec![Para { kind: ParaKind::Body, spans: span("\n", &style) }], true);
+        let kind = edit.paras[edit.selection.start().para].kind;
+        edit.replace(vec![Para { kind, spans: span("\n", &style) }], true);
+        edit.typing_style = pending;
         edit
     }
 
     /// Deletes the selection, or the character before the caret. At the start of a list
     /// item it outdents it, or, at the top level, makes it a body paragraph; at the start
-    /// of anything else it joins the paragraph to the one before.
+    /// of anything else it joins the paragraph to the one before. An empty flow stays as
+    /// it is.
     pub fn backspace(&self) -> Self {
         let mut edit = self.clamped();
-        edit.ensure_para();
+        if edit.paras.is_empty() {
+            return edit;
+        }
+        edit.typing_style = None;
         if !edit.selection.is_caret() {
             edit.replace(Vec::new(), false);
             return edit;
@@ -169,7 +179,6 @@ impl TextEdit {
             match *kind {
                 ParaKind::Bullet { level } | ParaKind::Numbered { level } => {
                     *kind = if level == 0 { ParaKind::Body } else { with_level(*kind, level - 1) };
-                    edit.typing_style = None;
                     return edit;
                 }
                 _ if at.para == 0 => return edit,
@@ -182,10 +191,12 @@ impl TextEdit {
     }
 
     /// Deletes the selection, or the character after the caret. At the end of a paragraph
-    /// it joins the next one to it.
+    /// it joins the next one to it. An empty flow stays as it is.
     pub fn delete(&self) -> Self {
         let mut edit = self.clamped();
-        edit.ensure_para();
+        if edit.paras.is_empty() {
+            return edit;
+        }
         if edit.selection.is_caret() {
             edit.selection.head = edit.after(edit.selection.head);
         }
@@ -195,13 +206,16 @@ impl TextEdit {
 
     /// Ends the paragraph at the caret, after deleting the selection. In an empty list item
     /// it makes the item a body paragraph instead. Ending a heading at its end starts a body
-    /// paragraph; anything else goes on as the kind it was.
+    /// paragraph; anything else goes on as the kind it was. A style chosen for typing lasts,
+    /// and, at the end of styled text, the new paragraph goes on in that text's style.
     pub fn enter(&self) -> Self {
         let mut edit = self.clamped();
         edit.ensure_para();
         let was_caret = edit.selection.is_caret();
+        let pending = edit.pending();
         let style = edit.style_for_typing();
         edit.replace(Vec::new(), false);
+        edit.typing_style = pending.clone();
         let at = edit.selection.head;
         let para = &mut edit.paras[at.para];
         let is_list = matches!(para.kind, ParaKind::Bullet { .. } | ParaKind::Numbered { .. });
@@ -213,10 +227,7 @@ impl TextEdit {
         let tail = if at_end && matches!(para.kind, ParaKind::Heading(_)) { ParaKind::Body } else { para.kind };
         let kind = para.kind;
         edit.replace(vec![Para { kind, spans: Vec::new() }, Para { kind: tail, spans: Vec::new() }], false);
-        // A new empty paragraph goes on in the style the text before it had.
-        if at_end && style != Style::default() {
-            edit.typing_style = Some(style);
-        }
+        edit.typing_style = pending.or_else(|| (at_end && style != Style::default()).then_some(style));
         edit
     }
 
@@ -271,7 +282,9 @@ impl TextEdit {
         edit
     }
 
-    /// Selects the word at `at`, or the space or punctuation there.
+    /// Selects the word at `at`. At the end of a paragraph, or on spaces or punctuation, it
+    /// selects the word before them in the paragraph, or, with none, the spaces or
+    /// punctuation themselves.
     pub fn select_word_at(&self, at: Pos) -> Self {
         let mut edit = self.clamped();
         edit.typing_style = None;
@@ -279,13 +292,14 @@ impl TextEdit {
         edit.selection = Selection::caret(at);
         let Some(para) = edit.paras.get(at.para) else { return edit };
         let text = para_text(para);
-        let word = text
-            .split_word_bound_indices()
-            .map(|(start, word)| start..start + word.len())
-            .find(|word| word.contains(&at.offset) || word.end == text.len());
-        if let Some(word) = word {
-            edit.selection = Selection { anchor: Pos { para: at.para, offset: word.start }, head: Pos { para: at.para, offset: word.end } };
-        }
+        let words: Vec<(usize, &str)> = text.split_word_bound_indices().collect();
+        let Some(under) = words.iter().position(|(start, word)| at.offset < start + word.len()).or(words.len().checked_sub(1)) else {
+            return edit;
+        };
+        let chosen = words[..=under].iter().rev().find(|(_, word)| is_word(word)).unwrap_or(&words[under]);
+        let edges = edges(&text);
+        let (start, end) = (floor_edge(&edges, chosen.0), ceil_edge(&edges, chosen.0 + chosen.1.len()));
+        edit.selection = Selection { anchor: Pos { para: at.para, offset: start }, head: Pos { para: at.para, offset: end } };
         edit
     }
 
@@ -324,16 +338,14 @@ impl TextEdit {
     }
 
     /// Puts `paras` in place of the selection. One paragraph goes into the one the selection
-    /// starts in. More start in it, taking its kind unless nothing's before them in it, and
-    /// the last is followed by what came after the selection.
+    /// starts in, and gives it its kind if that's left empty. More start in it, taking its
+    /// kind unless nothing's before them in it, and the last is followed by what came after
+    /// the selection. Line endings become line breaks, a paragraph separator ends a
+    /// paragraph, and other control characters are dropped.
     pub fn paste(&self, paras: &[Para]) -> Self {
         let mut edit = self.clamped();
         edit.ensure_para();
-        let line_breaks = |span: &Span| Span { text: span.text.replace("\r\n", "\n").replace('\r', "\n"), style: span.style.clone() };
-        let fragment = paras
-            .iter()
-            .map(|para| Para { kind: clamp_kind(para.kind), spans: tidy(para.spans.iter().map(line_breaks).collect()) })
-            .collect();
+        let fragment = paras.iter().flat_map(clean_para).collect();
         edit.replace(fragment, true);
         edit
     }
@@ -409,11 +421,7 @@ impl TextEdit {
         let para = at.para.min(last);
         let text = para_text(&self.paras[para]);
         let edges = edges(&text);
-        let offset = if forward {
-            edges.iter().copied().find(|&edge| edge >= at.offset).unwrap_or(text.len())
-        } else {
-            edges.iter().copied().rev().find(|&edge| edge <= at.offset).unwrap_or(0)
-        };
+        let offset = if forward { ceil_edge(&edges, at.offset) } else { floor_edge(&edges, at.offset) };
         Pos { para, offset }
     }
 
@@ -456,21 +464,23 @@ impl TextEdit {
         }
         let text = para_text(&self.paras[at.para]);
         let offset = text.split_word_bound_indices().rev().find(|(start, word)| *start < at.offset && is_word(word)).map(|(start, _)| start);
-        Pos { para: at.para, offset: offset.unwrap_or(0) }
+        Pos { para: at.para, offset: floor_edge(&edges(&text), offset.unwrap_or(0)) }
     }
 
-    /// The end of the word after `at`, or the start of the next paragraph.
+    /// The start of the word after `at`, or, with none, the end of the paragraph, or, from
+    /// there, the start of the next one.
     fn word_after(&self, at: Pos) -> Pos {
         let text = para_text(&self.paras[at.para]);
         if at.offset >= text.len() {
             return self.after(at);
         }
-        let offset = text
-            .split_word_bound_indices()
-            .map(|(start, word)| (start + word.len(), word))
-            .find(|(end, word)| *end > at.offset && is_word(word))
-            .map(|(end, _)| end);
-        Pos { para: at.para, offset: offset.unwrap_or(text.len()) }
+        let offset = text.split_word_bound_indices().find(|(start, word)| *start > at.offset && is_word(word)).map(|(start, _)| start);
+        Pos { para: at.para, offset: ceil_edge(&edges(&text), offset.unwrap_or(text.len())) }
+    }
+
+    /// The style chosen for what a caret types next, if one was.
+    fn pending(&self) -> Option<Style> {
+        if self.selection.is_caret() { self.typing_style.clone() } else { None }
     }
 
     /// The style a caret types: the one chosen for it, or that of the character before it,
@@ -562,6 +572,7 @@ impl TextEdit {
             (None, _) => (vec![Para { kind, spans: join(head, tail) }], start),
             (Some(only), None) => {
                 let caret = Pos { para: start.para, offset: start.offset + spans_len(&only.spans) };
+                let kind = if head.is_empty() && tail.is_empty() { only.kind } else { kind };
                 (vec![Para { kind, spans: join(join(head, only.spans), tail) }], caret)
             }
             (Some(first), Some(last)) => {
@@ -615,6 +626,61 @@ fn text_len(para: &Para) -> usize {
 /// The offsets in `text` a caret may be at: the edges of its characters as they're drawn.
 fn edges(text: &str) -> Vec<usize> {
     text.grapheme_indices(true).map(|(at, _)| at).chain([text.len()]).collect()
+}
+
+/// The last of `edges` at or before `at`.
+fn floor_edge(edges: &[usize], at: usize) -> usize {
+    edges.iter().copied().rev().find(|&edge| edge <= at).unwrap_or(0)
+}
+
+/// The first of `edges` at or after `at`.
+fn ceil_edge(edges: &[usize], at: usize) -> usize {
+    edges.iter().copied().find(|&edge| edge >= at).unwrap_or(edges.last().copied().unwrap_or(0))
+}
+
+const LINE_SEPARATOR: char = '\u{2028}';
+const PARA_SEPARATOR: char = '\u{2029}';
+const BYTE_ORDER_MARK: char = '\u{feff}';
+
+/// Whether `c` is a control character the model never holds.
+fn is_dropped(c: char) -> bool {
+    c == BYTE_ORDER_MARK || (c.is_control() && c != '\t' && c != '\n')
+}
+
+/// A line of typed text as the model holds it: a line separator a line break, other
+/// control characters dropped.
+fn clean_line(line: &str) -> String {
+    line.chars().filter(|&c| !is_dropped(c)).map(|c| if c == LINE_SEPARATOR { '\n' } else { c }).collect()
+}
+
+/// A pasted paragraph as the model holds it, its kind in range: line endings, across
+/// spans as well, and line separators made line breaks, other control characters dropped,
+/// and split where it holds a paragraph separator.
+fn clean_para(para: &Para) -> Vec<Para> {
+    let kind = clamp_kind(para.kind);
+    let mut out = Vec::new();
+    let mut spans = Vec::new();
+    let mut after_cr = false;
+    for span in &para.spans {
+        let mut text = String::new();
+        for c in span.text.chars() {
+            let skip = c == '\n' && after_cr;
+            after_cr = c == '\r';
+            match c {
+                _ if skip => {}
+                '\r' | '\n' | LINE_SEPARATOR => text.push('\n'),
+                PARA_SEPARATOR => {
+                    spans.push(Span { text: std::mem::take(&mut text), style: span.style.clone() });
+                    out.push(Para { kind, spans: tidy(std::mem::take(&mut spans)) });
+                }
+                c if is_dropped(c) => {}
+                c => text.push(c),
+            }
+        }
+        spans.push(Span { text, style: span.style.clone() });
+    }
+    out.push(Para { kind, spans: tidy(spans) });
+    out
 }
 
 /// A span of `text` in `style`, or none for no text.
