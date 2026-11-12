@@ -93,9 +93,9 @@ On the release build at 25926ff on the same nested display, a talk of exactly `#
 
 ## Windows check, by hand
 
-The work is on the `plan-d1` branch, which hasn't been pushed or merged yet. Once it is pushed, this check starts from a clone of that branch; once it's merged, from `main`. It needs a Windows PC with Rust 1.98.0 and the MSVC build tools, Git for Windows, two screens if there are two, and a USB stick formatted FAT32 or exFAT.
+The work has been merged into `main` and pushed, so this check starts from a clone of `main`. It needs a Windows PC with Rust 1.98.0 and the MSVC build tools, Git for Windows, two screens if there are two, and a USB stick formatted FAT32 or exFAT.
 
-1. `git clone https://github.com/Eiriksb/stagepack-studio.git`, then `cd stagepack-studio` and `git checkout plan-d1`.
+1. `git clone https://github.com/Eiriksb/stagepack-studio.git`, then `cd stagepack-studio`.
 2. `cargo test --workspace`. If only golden tests fail, the images differ slightly from Linux, so send back which ones.
 3. `cargo build --release -p stagepack-studio`. Make `C:\StudioCheck`, copy `target\release\stagepack-studio.exe` into it, and copy `fixtures\showcase` to `C:\StudioCheck\showcase` and again to `C:\StudioCheck\original`.
 4. Run `C:\StudioCheck\stagepack-studio.exe C:\StudioCheck\showcase`. Say whether anything looks cut off, cramped or out of line in the tabs, the slide list, the slide or the notes, and send a screenshot.
