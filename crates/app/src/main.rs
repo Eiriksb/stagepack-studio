@@ -6,7 +6,7 @@ use stagepack_studio::recovery::{KEEP_FOR, Recovery};
 use stagepack_studio::workspace_view;
 
 // The editor's tools show these, beyond the icons that come with the components.
-icon_assets!(ToolIcons, [SquarePlus, CopyPlus, Trash, Presentation, Timer, CodeXml]);
+icon_assets!(ToolIcons, [Save, SquarePlus, CopyPlus, Trash, Presentation, Timer, CodeXml]);
 
 /// The components' icons and the tools'.
 struct AppAssets;
