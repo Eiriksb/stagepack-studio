@@ -1,12 +1,16 @@
 //! The current slide's notes, under the slide, to read and type into.
 
-use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::{ActiveTheme as _, v_flex};
 use gpui_kit::*;
 
 use crate::document::Document;
 
 pub const NOTES_ID: &str = "slide-notes";
+pub const NOTES_CAPTION_ID: &str = "slide-notes-caption";
+
+/// The caption above the field.
+const NOTES_CAPTION: &str = "Notes";
 
 /// What the field says while the slide has no notes.
 pub const NOTES_PLACEHOLDER: &str = "Notes for this slide";
@@ -98,16 +102,28 @@ impl NotesPanel {
 
 impl Render for NotesPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        v_flex()
             .id(NOTES_ID)
             .test_support()
             .size_full()
             .p_2()
+            .gap_1()
             .bg(cx.theme().background)
+            .child(
+                div()
+                    .id(NOTES_CAPTION_ID)
+                    .test_support()
+                    .aria_label(NOTES_CAPTION)
+                    .flex_none()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(NOTES_CAPTION),
+            )
             .child(
                 Textarea::new(&self.field)
                     .aria_label("Notes")
-                    .h_full()
+                    .flex_1()
+                    .min_h_0()
                     .w_full(),
             )
     }

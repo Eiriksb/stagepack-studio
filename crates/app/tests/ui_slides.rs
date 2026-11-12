@@ -14,6 +14,7 @@ use stagepack_studio::builds::Compile;
 use stagepack_studio::document::Document;
 use stagepack_studio::permissions::BuildPermissions;
 use stagepack_studio::present::{LayerLook, SlideLook};
+use stagepack_studio::ribbon::{NEW_SLIDE_ID, RIBBON_ID, SAVE_ID};
 use stagepack_studio::slide_canvas::{SlideCanvas, letterbox};
 use stagepack_studio::workspace_view::{
     self, BUILD_ALWAYS_ID, BUILD_ONCE_ID, CANVAS_ID, CLOSE_CANCEL_ID, CLOSE_DONT_SAVE_ID,
@@ -1007,7 +1008,7 @@ fn file_menu_has(cx: &mut TestAppContext, handle: AnyWindowHandle, item: &str) -
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
         window.click(FILE_MENU_ID, cx);
-        let found = window.try_find_by_label(item).is_some();
+        let found = window.within("popup-menu").try_find_by_label(item).is_some();
         window.click(FILE_MENU_ID, cx);
         found
     })
@@ -1979,4 +1980,117 @@ fn saving_over_an_outside_change_asks_first(cx: &mut TestAppContext) {
     cx.simulate_keystrokes(talk.handle, "ctrl-s");
     assert_eq!(std::fs::read_to_string(&talk.file).unwrap(), mine);
     assert!(!shows_the_bar(cx, talk.handle));
+}
+
+#[gpui_kit::test]
+fn the_save_tool_comes_first_on_home_and_works_when_there_is_something_to_save(
+    cx: &mut TestAppContext,
+) {
+    let talk = open_saved_talk(cx, "# One\n");
+    cx.update_window(talk.handle, |_, window, cx| {
+        window.render_frame(cx);
+        let save = window.find(SAVE_ID);
+        assert!(save.visible(), "{save:?}");
+        assert_eq!(save.disabled(), Some(true), "nothing to save");
+        let file = window.find("group-File");
+        assert_eq!(file.label(), Some("File"));
+        let new_slide = window.find(NEW_SLIDE_ID);
+        assert!(save.bounds().right() <= new_slide.bounds().left(), "Save comes first");
+        assert!(file.bounds().right() <= window.find("group-Slides").bounds().left());
+    })
+    .unwrap();
+
+    click_and_settle(cx, talk.handle, NEW_SLIDE_ID);
+    cx.update_window(talk.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_ne!(window.find(SAVE_ID).disabled(), Some(true), "an edit to save");
+    })
+    .unwrap();
+
+    click_and_settle(cx, talk.handle, SAVE_ID);
+    assert_eq!(std::fs::read_to_string(&talk.file).unwrap(), source_of(cx, &talk.view));
+    cx.update_window(talk.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find(SAVE_ID).disabled(), Some(true), "saved");
+    })
+    .unwrap();
+}
+
+fn click_and_settle(cx: &mut TestAppContext, handle: AnyWindowHandle, id: &'static str) {
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(id, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    settle(cx, handle);
+}
+
+fn bounds_of(cx: &mut TestAppContext, handle: AnyWindowHandle, id: &'static str) -> Bounds<Pixels> {
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.find(id).bounds()
+    })
+    .unwrap()
+}
+
+#[gpui_kit::test]
+fn the_outside_change_bar_sits_under_the_ribbon_and_leaves_the_slide_its_size(
+    cx: &mut TestAppContext,
+) {
+    let talk = open_saved_talk(cx, "---\ntitle: T\n---\n\n# One\n");
+    let canvas = bounds_of(cx, talk.handle, CANVAS_ID);
+    add_slide(cx, &talk.view);
+    save(cx, &talk, "---\ntitle: T\n---\n\n# Theirs\n");
+    wait(cx, &talk, 200);
+    assert!(shows_the_bar(cx, talk.handle));
+
+    let bar = bounds_of(cx, talk.handle, OUTSIDE_CHANGE_ID);
+    let ribbon = bounds_of(cx, talk.handle, RIBBON_ID);
+    assert!(bar.top() >= ribbon.bottom(), "under the ribbon: {bar:?} {ribbon:?}");
+    assert!(bar.bottom() <= canvas.bottom(), "over the top of the desk: {bar:?} {canvas:?}");
+    assert_eq!(bounds_of(cx, talk.handle, CANVAS_ID), canvas, "the slide keeps its size");
+
+    click_and_settle(cx, talk.handle, KEEP_MINE_ID);
+    assert!(!shows_the_bar(cx, talk.handle));
+    assert_eq!(bounds_of(cx, talk.handle, CANVAS_ID), canvas);
+}
+
+#[gpui_kit::test]
+fn saved_goes_from_the_status_line_after_five_seconds_or_at_the_next_edit(
+    cx: &mut TestAppContext,
+) {
+    let talk = open_saved_talk(cx, "# One\n");
+    click_and_settle(cx, talk.handle, NEW_SLIDE_ID);
+    cx.simulate_keystrokes(talk.handle, "ctrl-s");
+    settle(cx, talk.handle);
+    let said = status(cx, talk.handle).expect("it says so");
+    assert!(said.starts_with("Saved "), "{said}");
+    wait(cx, &talk, 4_999);
+    assert_eq!(status(cx, talk.handle), Some(said.clone()));
+    wait(cx, &talk, 1);
+    assert_eq!(status(cx, talk.handle), None);
+
+    click_and_settle(cx, talk.handle, NEW_SLIDE_ID);
+    cx.simulate_keystrokes(talk.handle, "ctrl-s");
+    settle(cx, talk.handle);
+    assert!(status(cx, talk.handle).is_some());
+    click_and_settle(cx, talk.handle, NEW_SLIDE_ID);
+    assert_eq!(status(cx, talk.handle), None, "the next edit takes it away");
+}
+
+#[gpui_kit::test]
+fn the_file_menu_names_both_ways_to_open_a_talk(cx: &mut TestAppContext) {
+    let handle = open_talk(cx, "# One\n");
+    assert!(file_menu_has(cx, handle, "Open talk folder…"));
+    assert!(file_menu_has(cx, handle, "Open talk file…"));
+    assert!(!file_menu_has(cx, handle, "Open folder…"));
+}
+
+#[gpui_kit::test]
+fn the_title_has_room_after_the_export_menu(cx: &mut TestAppContext) {
+    let handle = open_talk(cx, "# One\n");
+    let export = bounds_of(cx, handle, EXPORT_MENU_ID);
+    let title = bounds_of(cx, handle, TITLE_ID);
+    assert!(title.left() - export.right() >= px(12.), "{export:?} {title:?}");
 }

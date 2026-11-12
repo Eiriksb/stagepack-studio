@@ -442,7 +442,7 @@ impl WorkspaceView {
                 if moved {
                     self.moved(cx);
                 }
-                self.say(said, cx);
+                self.say_for_a_while(said, cx);
                 if self.close_after_save {
                     if !document.read(cx).has_unsaved_changes() {
                         self.close_after_save = false;
@@ -629,7 +629,7 @@ impl WorkspaceView {
                 .py_1()
                 .items_center()
                 .bg(cx.theme().secondary)
-                .border_t_1()
+                .border_b_1()
                 .border_color(cx.theme().border)
                 .child(div().text_sm().child(OUTSIDE_CHANGE))
                 .child(
@@ -668,7 +668,7 @@ impl WorkspaceView {
                 .py_1()
                 .items_center()
                 .bg(cx.theme().secondary)
-                .border_t_1()
+                .border_b_1()
                 .border_color(cx.theme().border)
                 .child(div().text_sm().child(said))
                 .child(

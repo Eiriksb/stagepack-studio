@@ -13,7 +13,7 @@ use gpui_kit::{
 use slides_engine::{Fonts, pack_folder};
 use slides_format::is_hidden;
 use stagepack_studio::document::Document;
-use stagepack_studio::notes_panel::{NOTES_ID, NOTES_PLACEHOLDER};
+use stagepack_studio::notes_panel::{NOTES_CAPTION_ID, NOTES_ID, NOTES_PLACEHOLDER};
 use stagepack_studio::ribbon::{
     DELETE_ID, DUPLICATE_ID, HIDE_ID, MARKDOWN_TOGGLE_ID, NEW_SLIDE_ID, NEW_SLIDE_LAYOUTS_ID,
     NOTES_TOGGLE_ID, ON_THE_WAY, ON_THE_WAY_ID, PRESENT_ID, REDO_ID, REHEARSE_ID, RIBBON_ID,
@@ -1492,4 +1492,36 @@ fn a_drop_during_scrolling_lands_where_the_line_was(cx: &mut TestAppContext) {
         "just above the row the line was over"
     );
     assert_eq!(current(cx, &view), gap - 1);
+}
+
+#[gpui_kit::test]
+fn the_rows_menu_names_delete_by_the_delete_key(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, THREE);
+    open_rows_menu(cx, handle, 1);
+    let strip = cx.read(|cx| view.read(cx).slide_strip().read(cx).focus_handle().clone());
+    cx.update_window(handle, |_, window, _| {
+        let binding = window
+            .highest_precedence_binding_for_action_in(&workspace_view::DeleteSlide, &strip)
+            .expect("Delete has a key");
+        let keys: Vec<String> = binding.keystrokes().iter().map(|key| key.key().to_string()).collect();
+        assert_eq!(keys, ["delete"]);
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn the_notes_have_a_caption_above_them(cx: &mut TestAppContext) {
+    let (handle, _view) = open(cx, THREE);
+    with_window(cx, handle, |window, _| {
+        let caption = window.find(NOTES_CAPTION_ID);
+        assert_eq!(caption.label(), Some("Notes"));
+        assert!(caption.visible(), "{caption:?}");
+        let field = window
+            .within(NOTES_ID)
+            .elements()
+            .into_iter()
+            .find(|element| element.placeholder().is_some())
+            .expect("the field");
+        assert!(caption.bounds().bottom() <= field.bounds().top(), "{caption:?} {field:?}");
+    });
 }

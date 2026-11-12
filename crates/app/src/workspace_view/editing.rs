@@ -79,8 +79,10 @@ impl WorkspaceView {
         self.edit(|document| Ok(step(document).unwrap_or_default()), cx);
     }
 
-    /// Brings what shows the talk up to date after an edit.
+    /// Brings what shows the talk up to date after an edit. A "Saved" on the status line no
+    /// longer holds, so it goes.
     fn edited(&mut self, cx: &mut Context<Self>) {
+        self.clear_fading_status(cx);
         let Some(document) = &self.document else {
             return;
         };
@@ -186,15 +188,32 @@ impl WorkspaceView {
     pub(super) fn editor_area(
         &self,
         canvas: impl IntoElement,
+        bars: Vec<AnyElement>,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let has_talk = self.document.is_some();
         let slide_and_notes = v_resizable("slide-and-notes")
-            .child(resizable_panel().child(
-                // Room around the slide, so that it sits on the desk rather than against
-                // the tools.
-                div().size_full().p_4().bg(cx.theme().muted).child(canvas),
-            ))
+            .child(
+                resizable_panel().child(
+                    // Room around the slide, so that it sits on the desk rather than against
+                    // the tools. The bars that need an answer lie over the top of the desk, so
+                    // that the slide keeps its size as they come and go.
+                    div()
+                        .relative()
+                        .size_full()
+                        .p_4()
+                        .bg(cx.theme().muted)
+                        .child(canvas)
+                        .child(
+                            v_flex()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .right_0()
+                                .children(bars),
+                        ),
+                ),
+            )
             .child(
                 resizable_panel()
                     .size(NOTES_HEIGHT)

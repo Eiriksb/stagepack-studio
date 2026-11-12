@@ -12,7 +12,7 @@ use gpui_kit::*;
 
 use crate::document::Document;
 use crate::workspace_view::{
-    AddSlide, DeleteSlide, DuplicateSlide, KEY_CONTEXT, NewSlide, Present, Redo, Rehearse,
+    AddSlide, DeleteSlide, DuplicateSlide, KEY_CONTEXT, NewSlide, Present, Redo, Rehearse, Save,
     ToggleHidden, ToggleMarkdown, ToggleNotes, ToggleSlideList, Undo,
 };
 
@@ -23,6 +23,7 @@ pub const TAB_INSERT_ID: &str = "tab-insert";
 pub const TAB_ANIMATE_ID: &str = "tab-animate";
 pub const TAB_SLIDE_SHOW_ID: &str = "tab-slide-show";
 pub const TAB_VIEW_ID: &str = "tab-view";
+pub const SAVE_ID: &str = "save";
 pub const NEW_SLIDE_ID: &str = "new-slide";
 /// The New slide button and the arrow beside it, which lists the layouts.
 pub const NEW_SLIDE_LAYOUTS_ID: &str = "new-slide-layouts";
@@ -169,6 +170,7 @@ impl Ribbon {
         let has_talk = document.is_some();
         let several = document.is_some_and(|document| document.slide_count() > 1);
         let hidden = document.is_some_and(|document| document.is_hidden(document.current()));
+        let unsaved = document.is_some_and(Document::has_unsaved_changes);
         let undo = document.and_then(Document::undo_label);
         let redo = document.and_then(Document::redo_label);
         let new_slide = DropdownButton::new(NEW_SLIDE_LAYOUTS_ID)
@@ -198,6 +200,17 @@ impl Ribbon {
             "Leave this slide out of the show"
         };
         vec![
+            group(
+                "File",
+                vec![
+                    tool(SAVE_ID, Icons::Save, "Save")
+                        .tooltip_with_action("Save the talk", &Save, Some(KEY_CONTEXT))
+                        .disabled(!unsaved)
+                        .on_click(dispatch(Save))
+                        .into_any_element(),
+                ],
+                cx,
+            ),
             group(
                 "Slides",
                 vec![

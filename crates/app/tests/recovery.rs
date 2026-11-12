@@ -10,10 +10,10 @@ use slides_engine::Fonts;
 use stagepack_studio::document::{Document, TalkPlace};
 use stagepack_studio::notes_panel::NOTES_ID;
 use stagepack_studio::recovery::{KEEP_FOR, Recovery, hash_text};
-use stagepack_studio::ribbon::{HIDE_ID, NEW_SLIDE_ID};
+use stagepack_studio::ribbon::{HIDE_ID, NEW_SLIDE_ID, RIBBON_ID};
 use stagepack_studio::workspace_view::{
-    self, CLOSE_DONT_SAVE_ID, DISCARD_RECOVERY_ID, RECOVER_ID, RECOVERY_CHANGED_SINCE, RECOVERY_ID,
-    RECOVERY_OFFER, SAVE_AS_FOLDER_ID, STATUS_ID, TITLE_ID, WorkspaceView,
+    self, CANVAS_ID, CLOSE_DONT_SAVE_ID, DISCARD_RECOVERY_ID, RECOVER_ID, RECOVERY_CHANGED_SINCE,
+    RECOVERY_ID, RECOVERY_OFFER, SAVE_AS_FOLDER_ID, STATUS_ID, TITLE_ID, WorkspaceView,
 };
 
 const ONE: &str = "---\ntitle: T\n---\n\n# One\n";
@@ -1044,5 +1044,37 @@ fn a_save_just_after_bringing_them_back_leaves_nothing(cx: &mut TestAppContext) 
         kept_folders(&setup.root).is_empty(),
         "{:?}",
         kept_texts(&setup.root)
+    );
+}
+
+fn bounds_of(
+    cx: &mut TestAppContext,
+    handle: AnyWindowHandle,
+    id: &'static str,
+) -> Bounds<gpui_kit::Pixels> {
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.find(id).bounds()
+    })
+    .unwrap()
+}
+
+#[gpui_kit::test]
+fn the_recovery_bar_sits_under_the_ribbon_and_leaves_the_slide_its_size(cx: &mut TestAppContext) {
+    let (setup, _) = left_unsaved(cx);
+    let (handle, _view) = open_view(cx, &setup);
+    assert!(bar(cx, handle).is_some());
+    let shown = bounds_of(cx, handle, RECOVERY_ID);
+    let ribbon = bounds_of(cx, handle, RIBBON_ID);
+    let canvas = bounds_of(cx, handle, CANVAS_ID);
+    assert!(shown.top() >= ribbon.bottom(), "{shown:?} {ribbon:?}");
+    assert!(shown.bottom() <= canvas.bottom(), "{shown:?} {canvas:?}");
+
+    click(cx, handle, DISCARD_RECOVERY_ID);
+    assert_eq!(bar(cx, handle), None);
+    assert_eq!(
+        bounds_of(cx, handle, CANVAS_ID),
+        canvas,
+        "the slide keeps its size"
     );
 }

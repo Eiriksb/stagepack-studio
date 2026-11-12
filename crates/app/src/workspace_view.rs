@@ -88,6 +88,8 @@ const WORKING_COPY_DELAY: Duration = Duration::from_secs(1);
 /// The longest edits that never stop for [`WORKING_COPY_DELAY`] go without being kept, from
 /// the first of them.
 const WORKING_COPY_MOST_WAIT: Duration = Duration::from_secs(3);
+/// How long "Saved" stays on the status line.
+const STATUS_FADE: Duration = Duration::from_secs(5);
 /// How long after a working copy couldn't be written it's tried again.
 const KEEP_RETRY_DELAY: Duration = Duration::from_secs(10);
 
@@ -198,8 +200,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-z", input::Redo, Some(INPUT_CONTEXT)),
         KeyBinding::new("up", PreviousSlide, Some(STRIP_CONTEXT)),
         KeyBinding::new("down", NextSlide, Some(STRIP_CONTEXT)),
-        KeyBinding::new("delete", DeleteSlide, Some(STRIP_CONTEXT)),
+        // The last bound is the one menus show.
         KeyBinding::new("backspace", DeleteSlide, Some(STRIP_CONTEXT)),
+        KeyBinding::new("delete", DeleteSlide, Some(STRIP_CONTEXT)),
         KeyBinding::new("ctrl-up", MoveSlideUp, Some(STRIP_CONTEXT)),
         KeyBinding::new("ctrl-down", MoveSlideDown, Some(STRIP_CONTEXT)),
         KeyBinding::new("ctrl-s", Save, Some(KEY_CONTEXT)),
@@ -254,6 +257,8 @@ pub struct WorkspaceView {
     notices: Vec<String>,
     /// What came of the last thing asked of the File or Export menu.
     status: Option<SharedString>,
+    /// The wait before a status that only stays a while goes, while it's showing.
+    status_fading: Option<Task<()>>,
     markdown_panel: Entity<MarkdownPanel>,
     show_markdown: bool,
     ribbon: Entity<Ribbon>,
@@ -458,6 +463,7 @@ impl WorkspaceView {
             slide_canvas,
             notices,
             status: None,
+            status_fading: None,
             markdown_panel,
             show_markdown: panels.markdown,
             ribbon,
@@ -842,7 +848,26 @@ impl WorkspaceView {
     /// Puts `status` on the status line.
     fn say(&mut self, status: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.status = Some(status.into());
+        self.status_fading = None;
         cx.notify();
+    }
+
+    /// Puts `status` on the status line until [`STATUS_FADE`] has passed, or the next edit.
+    fn say_for_a_while(&mut self, status: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.say(status, cx);
+        self.status_fading = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(STATUS_FADE).await;
+            this.update(cx, |this, cx| this.clear_fading_status(cx))
+                .ok();
+        }));
+    }
+
+    /// Takes away a status that was only to stay a while.
+    fn clear_fading_status(&mut self, cx: &mut Context<Self>) {
+        if self.status_fading.take().is_some() {
+            self.status = None;
+            cx.notify();
+        }
     }
 
     /// Asks which talk to open, and opens it in a window of its own.
@@ -969,8 +994,9 @@ fn file_menu(packed: Option<bool>, for_code_editor: bool) -> impl IntoElement {
         .label("File")
         .dropdown_menu(move |menu, _, _| {
             let no_talk = packed.is_none();
-            menu.menu("Open folder…", Box::new(OpenFolder))
-                .menu("Open packed talk…", Box::new(OpenPacked))
+            // The system's Open dialog picks files or folders, never both at once.
+            menu.menu("Open talk folder…", Box::new(OpenFolder))
+                .menu("Open talk file…", Box::new(OpenPacked))
                 .separator()
                 .menu_with_disabled("Save", Box::new(Save), no_talk)
                 .menu_with_disabled("Save As…", Box::new(SaveAs), no_talk)
@@ -1115,8 +1141,13 @@ impl WorkspaceView {
 impl Render for WorkspaceView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let build_bar = self.build_bar(cx);
-        let recovery_bar = self.recovery_bar(cx);
-        let outside_change_bar = self.outside_change_bar(cx);
+        // The bars that need an answer.
+        let bars: Vec<AnyElement> = self
+            .recovery_bar(cx)
+            .map(IntoElement::into_any_element)
+            .into_iter()
+            .chain(self.outside_change_bar(cx).map(IntoElement::into_any_element))
+            .collect();
         let component_problems = self.component_problems(cx);
         let document = self.document.as_ref().map(|document| document.read(cx));
         let unsaved = document.is_some_and(Document::has_unsaved_changes);
@@ -1240,15 +1271,14 @@ impl Render for WorkspaceView {
                                 .id(TITLE_ID)
                                 .test_support()
                                 .aria_label(title.clone())
+                                .ml_4()
                                 .text_sm()
                                 .child(title),
                         ),
                 ),
             )
             .child(self.ribbon.clone())
-            .child(self.editor_area(canvas, cx))
-            .children(recovery_bar)
-            .children(outside_change_bar)
+            .child(self.editor_area(canvas, bars, cx))
             .children(component_problems)
             .children(build_bar)
             .when(!notices.is_empty(), |this| {

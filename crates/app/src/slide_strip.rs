@@ -236,7 +236,6 @@ impl SlideStrip {
         }
     }
 
-    /// Takes in what the rows on screen show, and has what's missing drawn.
     /// Takes in which rows are on screen, lets go of the pictures of rows far from them, and
     /// has the ones on screen that don't show their slide as it is now drawn.
     fn rows_shown(&mut self, rows: Range<usize>, cx: &mut Context<Self>) {
