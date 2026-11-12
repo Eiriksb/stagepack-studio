@@ -603,7 +603,7 @@ struct Look {
 /// it. Others take the indentation and marker of the item before them at their level, or
 /// the text column of the item they're in, and run on the numbering, but keep the marker
 /// of the shape `old_shape` gives them, if any, and its spacing too where they're at its
-/// column. `start` gives the number a numbered item starts a list with.
+/// column. `blank_before` says which have a blank line before them. `start` gives the number a numbered item starts a list with.
 fn shapes(
     new: &[Para],
     base: &str,
@@ -611,6 +611,7 @@ fn shapes(
     from_old: impl Fn(usize) -> Option<Option<Shape>>,
     old_shape: impl Fn(usize) -> Option<Shape>,
     start: impl Fn(usize) -> Option<u64>,
+    blank_before: impl Fn(usize) -> bool,
 ) -> Option<Vec<Option<Shape>>> {
     let mut shapes: Vec<Option<Shape>> = Vec::with_capacity(new.len());
     for (index, para) in new.iter().enumerate() {
@@ -624,7 +625,7 @@ fn shapes(
         }
         let numbered = matches!(para.kind, ParaKind::Numbered { .. });
         // Straight under another item's line, only a list starting at 1 is read as one.
-        let tight = index > 0 && level_of(new[index - 1].kind).is_some();
+        let tight = index > 0 && level_of(new[index - 1].kind).is_some() && !blank_before(index);
         let fresh = |indent: String| {
             let first = if tight { 1 } else { start(index).unwrap_or(1) };
             let marker = if numbered { Marker::Number(first, look.delim) } else { Marker::Bullet(look.bullets[usize::from(level)]) };
@@ -733,9 +734,15 @@ fn block_text(para: &Para, shape: Option<&Shape>, src: &Source, keep: Option<&st
 fn old_shape(src: &Source, flow: &TextFlow, index: usize) -> Option<Shape> {
     let source = &flow.source[index];
     let indent = src.prefix(source.block.start)?.to_string();
-    let (marker, length) = marker_at(src.text.get(source.block.start..)?)?;
-    let same_line = !source.inline.is_empty() && src.line_start(source.inline.start) == src.line_start(source.block.start);
-    let content = if same_line { src.column(source.inline.start)? } else { format!("{indent}{}", " ".repeat(length + 1)) };
+    let rest = src.text.get(source.block.start..)?;
+    let (marker, length) = marker_at(rest)?;
+    // The spaces after the marker, up to the text on its line. With none, or more than an
+    // item's text can be indented by, the text is one space after it.
+    let after = &rest[length..];
+    let spaces = after.bytes().take_while(|byte| *byte == b' ').count();
+    let text_follows = after[spaces..].chars().next().is_some_and(|c| c != '\n' && c != '\r');
+    let spaces = if text_follows && (1..=4).contains(&spaces) { spaces } else { 1 };
+    let content = format!("{indent}{}", " ".repeat(length + spaces));
     Some(Shape { indent, marker, content })
 }
 
@@ -795,7 +802,8 @@ fn least_change(
         Origin::Kept(i) | Origin::Paired(i) if old[i].kind == new[j].kind => Some(old_shape(src, flow, i)),
         _ => None,
     };
-    let shapes = shapes(new, &src.base, &look, keeps_shape, |_| None, |j| old_number(src, flow, origin[j]))?;
+    let blank = |j: usize| j > 0 && separator(&new[j - 1], &new[j], src.eol).len() > src.eol.len();
+    let shapes = shapes(new, &src.base, &look, keeps_shape, |_| None, |j| old_number(src, flow, origin[j]), blank)?;
     let mut edits = Vec::new();
     let mut j = 0;
     while j < new.len() {
@@ -898,6 +906,7 @@ fn paired_edit(src: &Source, flow: &TextFlow, i: usize, para: &Para, shape: Opti
 /// Paragraphs whose words didn't change keep their content's bytes, and items whose kind
 /// didn't change keep their markers.
 fn whole_change(src: &Source, flow: &TextFlow, new: &[Para], origin: &[Origin]) -> Option<Vec<SourceEdit>> {
+    let blank_line = format!("{}{}", src.eol, src.eol);
     let first = flow.source.first()?.block.start;
     src.prefix(first)?;
     if new.is_empty() || !gaps_are_blank(src, flow, 0..flow.source.len()) {
@@ -908,11 +917,27 @@ fn whole_change(src: &Source, flow: &TextFlow, new: &[Para], origin: &[Origin]) 
         Origin::Kept(i) | Origin::Paired(i) if flow.paras[i].kind == new[j].kind => old_shape(src, flow, i),
         _ => None,
     };
-    let shapes = shapes(new, &src.base, &look, |_| None, keeps_marker, |j| old_number(src, flow, origin[j]))?;
+    // A blank line that stood between two paragraphs that are still next to each other
+    // stays, as what comes after it may need it to be read as it was.
+    let blank: Vec<bool> = (0..new.len())
+        .map(|j| {
+            if j == 0 {
+                return false;
+            }
+            let kept_gap = match (origin[j - 1], origin[j]) {
+                (Origin::Kept(a) | Origin::Paired(a), Origin::Kept(b) | Origin::Paired(b)) if a + 1 == b => {
+                    src.text.get(flow.source[a].block.end..flow.source[b].block.start).is_some_and(|gap| gap.matches('\n').count() >= 2)
+                }
+                _ => false,
+            };
+            kept_gap || separator(&new[j - 1], &new[j], src.eol).len() > src.eol.len()
+        })
+        .collect();
+    let shapes = shapes(new, &src.base, &look, |_| None, keeps_marker, |j| old_number(src, flow, origin[j]), |j| blank[j])?;
     let mut text = String::new();
     for (j, para) in new.iter().enumerate() {
         if j > 0 {
-            text.push_str(&separator(&new[j - 1], para, src.eol));
+            text.push_str(if blank[j] { &blank_line } else { src.eol });
         }
         let keep = match origin[j] {
             Origin::Kept(i) | Origin::Paired(i) if !para.spans.is_empty() && flow.paras[i].spans == para.spans => {
@@ -1070,7 +1095,8 @@ fn region_change(talk: &Talk, index: usize, region: &str, paras: &[Para]) -> Opt
     let eol = eol_in(&talk.source);
     let src = Source { text: &talk.source, eol, base: String::new(), ways: PLAIN };
     let look = Look { bullets: ['-'; MAX_LEVEL as usize + 1], delim: '.' };
-    let shapes = shapes(&new, "", &look, |_| None, |_| None, |_| None)?;
+    let blank = |j: usize| j > 0 && separator(&new[j - 1], &new[j], eol).len() > eol.len();
+    let shapes = shapes(&new, "", &look, |_| None, |_| None, |_| None, blank)?;
     let mut text = String::new();
     for (j, para) in new.iter().enumerate() {
         if j > 0 {

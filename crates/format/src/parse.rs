@@ -213,7 +213,7 @@ impl Ctx<'_> {
             Node::Heading(h) => out.push(Block::Heading {
                 level: h.depth,
                 spans: self.spans(&h.children),
-                inline: self.inline_range(&h.children, range.end),
+                inline: self.inline_range(&h.children, &range),
                 only_text: only_text(&h.children),
                 range,
             }),
@@ -225,7 +225,7 @@ impl Ctx<'_> {
                 }),
                 children => out.push(Block::Paragraph {
                     spans: self.spans(children),
-                    inline: self.inline_range(children, range.end),
+                    inline: self.inline_range(children, &range),
                     only_text: only_text(children),
                     range,
                 }),
@@ -303,12 +303,20 @@ impl Ctx<'_> {
         }
     }
 
-    /// The bytes from the first of `nodes` to the end of the last, or an empty range at
-    /// `otherwise` when there are none.
-    fn inline_range(&self, nodes: &[Node], otherwise: usize) -> Range<usize> {
+    /// The bytes from the first of `nodes`, a block's content, to the end of the last, or an
+    /// empty range at the block's end when there are none. Text that starts with an escaped
+    /// character starts at its backslash, which the text's own position leaves out.
+    fn inline_range(&self, nodes: &[Node], block: &Range<usize>) -> Range<usize> {
         match (nodes.first(), nodes.last()) {
-            (Some(first), Some(last)) => self.range(first).start..self.range(last).end,
-            _ => otherwise..otherwise,
+            (Some(first), Some(last)) => {
+                let mut start = self.range(first).start;
+                let escaped = matches!(first, Node::Text(_)) && start > block.start && self.source.as_bytes().get(start - 1) == Some(&b'\\');
+                if escaped {
+                    start -= 1;
+                }
+                start..self.range(last).end
+            }
+            _ => block.end..block.end,
         }
     }
 

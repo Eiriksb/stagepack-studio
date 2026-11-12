@@ -434,6 +434,37 @@ fn an_untouched_items_spacing_stays() {
 }
 
 #[test]
+fn typing_after_a_leading_escape_changes_nothing_else() {
+    let source = "# T\n\n- \\*a\n  - c\n- b\n";
+    let mut now = source.to_string();
+    for _ in 0..20 {
+        let talk = parse_talk(&now);
+        let flows = text_flows(&talk, 0);
+        let mut paras = flows[1].paras.clone();
+        paras[0].spans[0].text.push('q');
+        let item = flows[1].source[0].clone();
+        let after = write_flow(&talk, 0, &flows[1], &paras).expect("written").apply(&now);
+        assert_eq!(&after[..item.block.start], &now[..item.block.start]);
+        assert!(after.ends_with(&now[item.block.end..]), "{after:?}");
+        assert_eq!(text_flows(&parse_talk(&after), 0)[1].paras, paras);
+        now = after;
+    }
+    assert_eq!(now, format!("# T\n\n- \\*a{}\n  - c\n- b\n", "q".repeat(20)));
+}
+
+#[test]
+fn a_leading_escape_is_kept_when_the_list_is_written_again() {
+    assert_eq!(made_body("# T\n\n- \\*a\n  - c\n- b\n", 2), "# T\n\n- \\*a\n  - c\n\nb\n");
+    assert_eq!(made_body("# T\n\n-  \\#a\n-  b\n", 1), "# T\n\n-  \\#a\n\nb\n");
+}
+
+#[test]
+fn a_blank_line_before_an_untouched_item_stays() {
+    let source = "# T\n\nIntro.\n\n- a\n- b\n\n5. five\n6. six\n\nOutro.\n";
+    assert_eq!(made_body(source, 4), "# T\n\nIntro.\n\n- a\n- b\n\n5. five\n\nsix\n\nOutro.\n");
+}
+
+#[test]
 fn code_of_three_backticks_is_written() {
     let code = Style { code: true, ..Style::default() };
     let paras = [Para { kind: BODY, spans: vec![styled("```", code.clone())] }];
@@ -533,6 +564,7 @@ fn talk() -> impl Strategy<Value = (String, usize, usize)> {
         ("# T\n\n| a |\n| - |\n| 1 |\n\nAfter the table   \nwrapped\n\n<Notes>\nSay it\n</Notes>\n", 0, 1),
         ("# A\n\nFirst slide.\n\n---\n\n#   Odd   heading\n\n10. ten\n11. eleven\n\n```\n---\n```\n", 1, 1),
         ("Plain words first.\n\n- a\n- b\n", 0, 0),
+        ("# T\n\n- \\*a\n  - \\#c\n-   \\[b]\n\n\\_d and \\\\e\n\n&amp; f\n", 0, 1),
     ];
     (prop::sample::select(slides), any::<[bool; 3]>()).prop_map(|((source, slide, flow), [crlf, more, bom])| {
         let mut source = source.to_string();

@@ -156,6 +156,15 @@ fn inline_ranges_cover_exactly_the_content() {
 }
 
 #[test]
+fn content_that_starts_with_an_escape_starts_at_its_backslash() {
+    let source = "\\*a\n\n- \\#b\n  - \\[c]\n\n## \\_d\n\n\\-e\n\n\\\\f\n\n&amp;g\n\n\\*h\n===\n";
+    let talk = parse_talk(source);
+    let flows = text_flows(&talk, 0);
+    let inline: Vec<&str> = flows.iter().flat_map(|flow| &flow.source).map(|at| &source[at.inline.clone()]).collect();
+    assert_eq!(inline, ["\\*a", "\\#b", "\\[c]", "\\_d", "\\-e", "\\\\f", "&amp;g", "\\*h"]);
+}
+
+#[test]
 fn positions_are_in_the_whole_talk() {
     let source = "# One\n\n---\n\n# Two\n\nWords\n";
     let talk = parse_talk(source);
@@ -286,6 +295,8 @@ fn mixed_source() -> impl Strategy<Value = String> {
             "  indented", "    code by indent", "* star", "<Text size=\"40\">x</Text> y",
             "- ***", "- [r]: http://x", "-   ", "- a\n\n- b\n\n  - c", "<Text font=\"Mono\">f</Text> g", "[l](http://x \"tip\")",
             "<Box x=\"1\">\n\n- a\n\n  b\n\n</Box>",
+            "\\*a", "- \\*a\n  - c\n- b", "# \\#tag", "\\[x]", "\\_y_", "\\- z", "\\\\w", "&amp; co", "1\\. not a list",
+            "- \\[x] \\[y]", "## \\* starred", "\\\\\n===",
         ]),
         0..12,
     )
@@ -309,6 +320,22 @@ fn assert_flows_are_sound(talk: &Talk) -> Result<(), TestCaseError> {
                 prop_assert!(talk.source.is_char_boundary(at.block.start) && talk.source.is_char_boundary(at.block.end));
                 prop_assert!(para.spans.iter().all(|span| !span.text.is_empty()));
                 prop_assert!(para.spans.windows(2).all(|pair| pair[0].style != pair[1].style));
+                // The content's bytes, read on their own as a paragraph of the same kind,
+                // give the same spans, where they read as one paragraph at all: a lone
+                // `- *` is a list in a list, though it's text after another line.
+                let content = &talk.source[at.inline.clone()];
+                let alone = match para.kind {
+                    ParaKind::Heading(_) => format!("{content}\n==="),
+                    ParaKind::Bullet { .. } | ParaKind::Numbered { .. } => format!("- {content}"),
+                    ParaKind::Body => content.to_string(),
+                };
+                if content.is_empty() {
+                    prop_assert!(para.spans.is_empty());
+                } else if let [flow] = text_flows(&parse_talk(&alone), 0).as_slice()
+                    && let [read_alone] = flow.paras.as_slice()
+                {
+                    prop_assert_eq!(&read_alone.spans, &para.spans, "content {:?} of {:?}", content, &talk.source);
+                }
                 blocks.push(at.block.clone());
             }
             // Every byte of what the flow was read from is in it: a box from its opening tag
