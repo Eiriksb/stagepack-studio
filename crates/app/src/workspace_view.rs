@@ -586,12 +586,13 @@ impl WorkspaceView {
             return;
         };
         let scale = self.slide_canvas.read(cx).scale();
-        let (notices, layers) = document.update(cx, |document, _| {
-            (
-                document.notices(),
-                scale.map(|scale| document.editor_layers(scale)),
-            )
+        let (notices, layers, message) = document.update(cx, |document, _| {
+            let layers = scale.map(|scale| document.editor_layers(scale));
+            (document.notices(), layers, document.take_message())
         });
+        if let Some(message) = message {
+            self.say(message, cx);
+        }
         self.notices = notices;
         if let Some(layers) = layers {
             self.slide_canvas
@@ -809,6 +810,7 @@ impl WorkspaceView {
 
     /// Starts a show of the talk, unless one is running already.
     fn present(&mut self, rehearsing: bool, cx: &mut Context<Self>) {
+        self.settle_typing(cx);
         let Some(document) = self.document.clone() else {
             return;
         };
@@ -894,6 +896,7 @@ impl WorkspaceView {
     ) where
         Job: FnOnce(&Path) -> Result<Vec<String>, String> + Send + 'static,
     {
+        self.settle_typing(cx);
         let Some(document) = &self.document else {
             return;
         };

@@ -15,11 +15,12 @@ use gpui_kit::{
 };
 use slides_engine::{Fonts, Hit, TextLayout};
 use slides_format::{FlowPlace, ParaKind, Pos, Selection, TextFlow, text_flows};
-use stagepack_studio::document::{Document, TalkPlace};
+use stagepack_studio::document::{Document, LAYOUT_FAILED, TalkPlace, panic_in_next_layout};
+use stagepack_studio::ribbon::{DELETE_ID, DUPLICATE_ID, HIDE_ID, NEW_SLIDE_ID};
 use stagepack_studio::recovery::Recovery;
 use stagepack_studio::slide_editor::{CARET_ID, SLIDE_EDITOR_ID};
 use stagepack_studio::text_editing::{COULD_NOT_TYPE, EditingText};
-use stagepack_studio::workspace_view::{self, CLOSE_SAVE_ID, STATUS_ID, WorkspaceView};
+use stagepack_studio::workspace_view::{self, CLOSE_SAVE_ID, ExportPdf, STATUS_ID, WorkspaceView};
 
 /// Two slides, the first with a title and a line of words.
 const TWO: &str = "---\ntitle: T\n---\n\n# Hello\n\nSome words here\n\n---\n\n# Second\n";
@@ -995,4 +996,276 @@ fn a_reload_while_typing_ends_editing_without_losing_what_was_typed(cx: &mut Tes
     typing.settle(cx);
     assert_eq!(typing.source(cx), mine);
     assert!(mine.contains("Someabcd words"));
+}
+
+impl Typing {
+    fn can_undo(&self, cx: &TestAppContext) -> bool {
+        self.document(cx)
+            .read_with(cx, |document, _| document.can_undo())
+    }
+
+    fn undo(&self, cx: &mut TestAppContext) {
+        let document = self.document(cx);
+        cx.update(|cx| document.update(cx, |document, _| document.undo().unwrap()));
+        self.settle(cx);
+    }
+
+    fn click_id(&self, cx: &mut TestAppContext, id: &'static str) {
+        self.with_window(cx, |window, cx| {
+            window.render_frame(cx);
+            window.click(id, cx);
+        });
+        self.settle(cx);
+    }
+}
+
+/// A region whose text a table splits in two.
+const SPLIT: &str = "# T\n\nfirst\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nsecond\n";
+/// And in three.
+const SPLIT_THREE: &str =
+    "# T\n\nfirst\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nsecond\n\n| c | d |\n|---|---|\n| 3 | 4 |\n\nthird\n";
+
+fn redo_of_a_tidy_up(cx: &mut TestAppContext, source: &str) {
+    let typing = open(cx, source);
+    assert_eq!(typing.text_of(cx, 0, 2), ["second"]);
+    typing.click_text(cx, 2, pos(0, 3));
+    typing.press(cx, "ctrl-a");
+    typing.press(cx, "backspace");
+    typing.press(cx, "escape");
+    assert!(!typing.source(cx).contains("second"));
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), source);
+    assert_eq!(typing.editing(cx).map(|editing| editing.flow), {
+        let flows = typing.flows(cx, 0);
+        stagepack_studio::text_editing::FlowKey::of(&flows, 2)
+    });
+    typing.press(cx, "ctrl-shift-z");
+    let tidied = typing.source(cx);
+    assert!(!tidied.contains("second"), "{tidied}");
+    assert!(typing.editing(cx).is_none(), "the text typed in has gone, so typing ends");
+    assert!(typing.caret(cx).is_none());
+    typing.type_text(cx, "x");
+    assert_eq!(typing.source(cx), tidied, "nothing else is typed into");
+}
+
+#[gpui_kit::test]
+fn a_redo_of_a_tidy_up_types_nowhere_else(cx: &mut TestAppContext) {
+    redo_of_a_tidy_up(cx, SPLIT);
+}
+
+#[gpui_kit::test]
+fn a_redo_of_a_tidy_up_types_nowhere_else_with_more_text_after(cx: &mut TestAppContext) {
+    redo_of_a_tidy_up(cx, SPLIT_THREE);
+}
+
+/// Two slides, the first with nothing in its body.
+const EMPTY_BODY: &str = "# T\n\n---\n\n# Two\n";
+
+/// `EMPTY_BODY`, with two empty lines typed into the first slide's body, and typing going on.
+fn typed_empty_lines(cx: &mut TestAppContext) -> Typing {
+    let typing = open(cx, EMPTY_BODY);
+    let at = typing.placeholder_point(cx, "body");
+    typing.click(cx, at);
+    typing.press(cx, "enter");
+    typing.press(cx, "enter");
+    assert!(typing.source(cx).contains("<Text></Text>"), "{}", typing.source(cx));
+    assert!(typing.editing(cx).is_some());
+    typing
+}
+
+/// A ribbon button pressed while typing leaves what typing left empty tidy: no empty lines in
+/// the talk, and one undo takes the button's edit back to the talk as it was opened.
+fn ribbon_while_typing(cx: &mut TestAppContext, id: &'static str) -> Typing {
+    let typing = typed_empty_lines(cx);
+    typing.click_id(cx, id);
+    assert!(typing.editing(cx).is_none(), "typing ended");
+    assert!(!typing.source(cx).contains("<Text"), "{}", typing.source(cx));
+    typing.undo(cx);
+    assert_eq!(typing.source(cx), EMPTY_BODY);
+    assert!(!typing.can_undo(cx), "the typing left no step");
+    typing
+}
+
+#[gpui_kit::test]
+fn new_slide_while_typing_tidies_up_first(cx: &mut TestAppContext) {
+    ribbon_while_typing(cx, NEW_SLIDE_ID);
+}
+
+#[gpui_kit::test]
+fn duplicate_while_typing_tidies_up_first(cx: &mut TestAppContext) {
+    ribbon_while_typing(cx, DUPLICATE_ID);
+}
+
+#[gpui_kit::test]
+fn hide_while_typing_tidies_up_first(cx: &mut TestAppContext) {
+    ribbon_while_typing(cx, HIDE_ID);
+}
+
+#[gpui_kit::test]
+fn delete_while_typing_tidies_up_first(cx: &mut TestAppContext) {
+    ribbon_while_typing(cx, DELETE_ID);
+}
+
+#[gpui_kit::test]
+fn a_save_while_typing_tidies_up_and_typing_goes_on(cx: &mut TestAppContext) {
+    let typing = typed_empty_lines(cx);
+    cx.simulate_keystrokes(typing.handle, "ctrl-s");
+    cx.run_until_parked();
+    assert_eq!(std::fs::read_to_string(&typing.file).unwrap(), EMPTY_BODY);
+    assert_eq!(typing.source(cx), EMPTY_BODY);
+    let saved = typing
+        .document(cx)
+        .read_with(cx, |document, _| !document.has_unsaved_changes());
+    assert!(saved);
+    let editing = typing.editing(cx).expect("typing goes on in the empty body");
+    assert_eq!(editing.flow.region(), Some("body"));
+    assert!(typing.caret(cx).is_some());
+    typing.type_text(cx, "Words");
+    assert_eq!(typing.text_of(cx, 0, 1), ["Words"]);
+}
+
+#[gpui_kit::test]
+fn a_show_while_typing_tidies_up_first(cx: &mut TestAppContext) {
+    let typing = typed_empty_lines(cx);
+    cx.simulate_keystrokes(typing.handle, "f5");
+    cx.run_until_parked();
+    assert_eq!(cx.read(|cx| cx.windows().len()), 2, "the show started");
+    assert_eq!(typing.source(cx), EMPTY_BODY);
+}
+
+#[gpui_kit::test]
+fn an_export_while_typing_tidies_up_first(cx: &mut TestAppContext) {
+    let typing = typed_empty_lines(cx);
+    cx.dispatch_action(typing.handle, ExportPdf);
+    cx.run_until_parked();
+    assert!(cx.did_prompt_for_new_path(), "a Save dialog is showing");
+    assert_eq!(typing.source(cx), EMPTY_BODY);
+    cx.simulate_new_path_selection(|_| None);
+    cx.run_until_parked();
+}
+
+#[gpui_kit::test]
+fn an_emptied_title_gives_back_its_placeholder(cx: &mut TestAppContext) {
+    let typing = open(cx, TWO);
+    typing.click_text(cx, 0, pos(0, 2));
+    typing.press(cx, "ctrl-a");
+    typing.press(cx, "backspace");
+    typing.press(cx, "escape");
+    let source = typing.source(cx);
+    assert!(!source.lines().any(|line| line.trim() == "#"), "{source:?}");
+    assert!(source.contains(WORDS));
+    assert!(typing.layout(cx).placeholder("title").is_some(), "Click to add title is back");
+}
+
+#[gpui_kit::test]
+fn an_emptied_list_gives_back_its_placeholder(cx: &mut TestAppContext) {
+    let typing = open(cx, "# T\n\n- one\n- two\n");
+    typing.click_text(cx, 1, pos(0, 2));
+    typing.press(cx, "ctrl-a");
+    typing.press(cx, "backspace");
+    typing.press(cx, "escape");
+    let source = typing.source(cx);
+    assert!(!source.lines().any(|line| line.trim() == "-"), "{source:?}");
+    assert!(typing.flows(cx, 0).len() == 1, "{source:?}");
+    assert!(typing.layout(cx).placeholder("body").is_some(), "Click to add text is back");
+}
+
+#[gpui_kit::test]
+fn text_that_keeps_some_words_keeps_its_empty_lines(cx: &mut TestAppContext) {
+    let typing = open(cx, "# T\n\nWords\n");
+    typing.click_text(cx, 1, pos(0, 5));
+    typing.press(cx, "enter");
+    typing.press(cx, "escape");
+    assert_eq!(typing.text_of(cx, 0, 1), ["Words", ""]);
+}
+
+#[gpui_kit::test]
+fn a_tidy_up_that_undoes_the_typing_leaves_no_step(cx: &mut TestAppContext) {
+    let typing = open(cx, "# T\n");
+    let at = typing.placeholder_point(cx, "body");
+    typing.click(cx, at);
+    typing.press(cx, "enter");
+    wait(cx, 3_000);
+    typing.press(cx, "escape");
+    assert_eq!(typing.source(cx), "# T\n");
+    assert!(!typing.can_undo(cx), "the history is as it was");
+}
+
+#[gpui_kit::test]
+fn a_tidy_up_joins_the_step_before_it(cx: &mut TestAppContext) {
+    let typing = open(cx, TWO);
+    typing.click_text(cx, 1, pos(0, 2));
+    typing.press(cx, "ctrl-a");
+    typing.press(cx, "backspace");
+    wait(cx, 3_000);
+    typing.press(cx, "escape");
+    assert!(!typing.source(cx).contains("<Text"));
+    typing.undo(cx);
+    assert_eq!(typing.source(cx), TWO, "one undo brings the words back");
+    assert!(!typing.can_undo(cx));
+}
+
+#[gpui_kit::test]
+fn a_fault_laying_out_the_slide_is_said_and_not_fatal(cx: &mut TestAppContext) {
+    let typing = open(cx, TWO);
+    let at = typing.point_of(cx, 1, pos(0, 4));
+    panic_in_next_layout();
+    typing.click(cx, at);
+    assert_eq!(typing.status(cx).as_deref(), Some(LAYOUT_FAILED));
+    assert!(typing.editing(cx).is_none());
+    // Laid out again, it works. The status line took some room, so the slide moved.
+    let at = typing.point_of(cx, 1, pos(0, 4));
+    typing.click(cx, at);
+    assert_eq!(typing.selection(cx), caret_at(pos(0, 4)));
+    typing.press(cx, "escape");
+
+    panic_in_next_layout();
+    typing.press(cx, "right");
+    assert_eq!(typing.current(cx), 1);
+    assert_eq!(typing.status(cx).as_deref(), Some(LAYOUT_FAILED));
+    let images = cx.read(|cx| typing.view.read(cx).slide_canvas().read(cx).images());
+    assert!(images.is_empty(), "nothing is drawn of a slide that couldn't be laid out");
+    typing.press(cx, "left");
+    let images = cx.read(|cx| typing.view.read(cx).slide_canvas().read(cx).images());
+    assert!(!images.is_empty());
+}
+
+#[gpui_kit::test]
+fn a_drag_off_the_slide_keeps_selecting(cx: &mut TestAppContext) {
+    let typing = open(cx, TWO);
+    let from = typing.point_of(cx, 1, pos(0, 5));
+    let slide = typing.slide_bounds(cx);
+    let to = point(slide.origin.x + slide.size.width + px(40.), from.y);
+    typing.drag(cx, from, to);
+    assert_eq!(
+        typing.selection(cx),
+        Selection {
+            anchor: pos(0, 5),
+            head: pos(0, WORDS.len())
+        }
+    );
+    // Below the slide, under the end of "words": the nearest place is there.
+    let across = typing.point_of(cx, 1, pos(0, 10)).x;
+    let below = point(across, slide.origin.y + slide.size.height + px(40.));
+    typing.drag(cx, from, below);
+    let dragged = Selection {
+        anchor: pos(0, 5),
+        head: pos(0, 10),
+    };
+    assert_eq!(typing.selection(cx), dragged);
+    // Let go of off the editor, the drag is over: a later press elsewhere selects nothing.
+    let elsewhere = typing.point_of(cx, 1, pos(0, 2));
+    typing.with_window(cx, |window, cx| {
+        window.dispatch_event(
+            MouseMoveEvent {
+                position: elsewhere,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::default(),
+            }
+            .to_platform_input(),
+            cx,
+        );
+    });
+    typing.settle(cx);
+    assert_eq!(typing.selection(cx), dragged);
 }

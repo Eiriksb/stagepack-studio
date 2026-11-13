@@ -222,20 +222,23 @@ impl SlideEditor {
     }
 
     /// Does `work` to the talk, and tells the window what came of it: the slides it changed,
-    /// or `None` if it was refused, which is said.
+    /// or `None` if it was refused, which is said, as is anything else that went wrong.
     fn run(
         &mut self,
         work: impl FnOnce(&mut Document) -> Result<Vec<usize>, EditRefused>,
         cx: &mut Context<Self>,
     ) -> Option<Vec<usize>> {
         let document = self.document.clone()?;
-        let made = document.update(cx, |document, cx| {
+        let (made, message) = document.update(cx, |document, cx| {
             let made = work(document);
             if made.as_ref().is_ok_and(|changed| !changed.is_empty()) {
                 cx.notify();
             }
-            made
+            (made, document.take_message())
         });
+        if let Some(message) = message {
+            cx.emit(EditorEvent::Said(message.into()));
+        }
         match made {
             Ok(changed) => {
                 if !changed.is_empty() {
@@ -362,11 +365,23 @@ impl SlideEditor {
         cx: &mut Context<Self>,
     ) -> Option<(usize, Option<usize>, Arc<TextLayout>)> {
         let document = self.document.clone()?;
-        document.update(cx, |document, _| {
-            let slide = document.text()?.slide;
-            let flow = document.text_flow();
-            Some((slide, flow, document.text_layout(slide)))
-        })
+        let slide = document.read(cx).text()?.slide;
+        let flow = document.read(cx).text_flow();
+        Some((slide, flow, self.layout(slide, cx)?))
+    }
+
+    /// Where slide `slide`'s text is. If it couldn't be laid out, that's said.
+    fn layout(&self, slide: usize, cx: &mut Context<Self>) -> Option<Arc<TextLayout>> {
+        let document = self.document.clone()?;
+        let (layout, message) = document.update(cx, |document, _| {
+            (document.text_layout(slide), document.take_message())
+        });
+        if let Some(message) = message {
+            cx.emit(EditorEvent::Said(message.into()));
+            // Typing on it ended, so the keyboard goes back.
+            document.update(cx, |_, cx| cx.notify());
+        }
+        Some(layout)
     }
 
     fn go(&mut self, go: Go, extend: bool, cx: &mut Context<Self>) {
@@ -441,23 +456,33 @@ impl SlideEditor {
     /// Where `position`, in the window, is on the slide, in slide units, if it's on it.
     fn slide_point(&self, position: Point<Pixels>, cx: &App) -> Option<(f32, f32)> {
         let slide = self.canvas.read(cx).slide_bounds()?;
-        if !slide.contains(&position) {
+        slide
+            .contains(&position)
+            .then(|| self.nearest_slide_point(position, cx))
+            .flatten()
+    }
+
+    /// The point of the slide nearest `position`, in the window, in slide units: `position`
+    /// itself if it's on the slide, or else the nearest point of its edge.
+    fn nearest_slide_point(&self, position: Point<Pixels>, cx: &App) -> Option<(f32, f32)> {
+        let slide = self.canvas.read(cx).slide_bounds()?;
+        let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
+        if unit <= 0.0 {
             return None;
         }
-        let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
+        let along = |at: Pixels, start: Pixels, length: Pixels| {
+            f32::from(at - start).clamp(0.0, f32::from(length)) / unit
+        };
         Some((
-            f32::from(position.x - slide.origin.x) / unit,
-            f32::from(position.y - slide.origin.y) / unit,
+            along(position.x, slide.origin.x, slide.size.width),
+            along(position.y, slide.origin.y, slide.size.height),
         ))
     }
 
     /// What's at (`x`, `y`) of the current slide.
     fn hit(&self, (x, y): (f32, f32), cx: &mut Context<Self>) -> Option<(usize, Hit)> {
-        let document = self.document.clone()?;
-        let (slide, layout) = document.update(cx, |document, _| {
-            let slide = document.current();
-            (slide, document.text_layout(slide))
-        });
+        let slide = self.document.as_ref()?.read(cx).current();
+        let layout = self.layout(slide, cx)?;
         Some((slide, layout.hit(x, y)?))
     }
 
@@ -559,18 +584,21 @@ impl SlideEditor {
         if !self.dragging || event.pressed_button != Some(MouseButton::Left) {
             return;
         }
-        let Some(point) = self.slide_point(event.position, cx) else {
+        // Off the slide, or away from the text, the selection goes on to the nearest place.
+        let Some(point) = self.nearest_slide_point(event.position, cx) else {
             return;
         };
-        if let Some((slide, Hit::Text { flow, pos })) = self.hit(point, cx)
-            && self.editing_flow(slide, flow, cx)
-        {
+        let Some((_, Some(flow), layout)) = self.editing_place(cx) else {
+            return;
+        };
+        let in_flow = |point: (f32, f32)| match layout.hit(point.0, point.1) {
+            Some(Hit::Text { flow: hit, pos }) if hit == flow => Some(pos),
+            _ => None,
+        };
+        let pos = in_flow(point).or_else(|| in_flow(nearest_in_flow(&layout, flow, point)?));
+        if let Some(pos) = pos {
             self.apply(|edit| edit.move_to(pos, true), cx);
         }
-    }
-
-    fn mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
-        self.dragging = false;
     }
 
     /// The caret and the selection of the text being typed, in slide units.
@@ -612,6 +640,32 @@ impl SlideEditor {
         };
         Some(Marks { caret, selection })
     }
+}
+
+/// The point of flow `flow`'s paragraphs, taken together, nearest `point` of the slide, in
+/// slide units: where a drag that leaves the text keeps selecting.
+fn nearest_in_flow(layout: &TextLayout, flow: usize, point: (f32, f32)) -> Option<(f32, f32)> {
+    let (left, top, right, bottom) = layout
+        .paras()
+        .iter()
+        .filter(|placed| placed.flow == flow)
+        .map(|placed| placed.rect)
+        .fold(None, |area: Option<(f32, f32, f32, f32)>, rect| {
+            let (l, t, r, b) = (rect.x, rect.y, rect.x + rect.w, rect.y + rect.h);
+            Some(area.map_or((l, t, r, b), |(al, at, ar, ab)| {
+                (al.min(l), at.min(t), ar.max(r), ab.max(b))
+            }))
+        })?;
+    // The paragraphs lie in their layer, which may be turned.
+    let caret = layout.caret(flow, Pos { para: 0, offset: 0 })?;
+    let (x, y) = turned(point, caret.centre, -caret.rotate);
+    // Just inside, as a point on the very edge can be taken for the next line.
+    let inside = |at: f32, low: f32, high: f32| at.clamp(low, (high - 0.5).max(low));
+    Some(turned(
+        (inside(x, left, right), inside(y, top, bottom)),
+        caret.centre,
+        caret.rotate,
+    ))
 }
 
 /// `(x, y)` turned by `degrees` around `centre`, as the engine turns a layer.
@@ -666,6 +720,7 @@ fn paint_polygon(
 
 impl Render for SlideEditor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let editor = cx.entity().downgrade();
         let marks = self.marks(cx);
         let caret_color = cx.theme().caret;
         let selection_color = cx.theme().selection.opacity(0.6);
@@ -697,6 +752,21 @@ impl Render for SlideEditor {
         let overlay = canvas(
             |_, _, _| {},
             move |area, _, window, _| {
+                // A drag goes on selecting wherever the mouse goes, off the slide and off the
+                // editor too, until it's let go of anywhere.
+                let moved = editor.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Bubble {
+                        moved
+                            .update(cx, |editor, cx| editor.mouse_move(event, window, cx))
+                            .ok();
+                    }
+                });
+                window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Bubble {
+                        editor.update(cx, |editor, _| editor.dragging = false).ok();
+                    }
+                });
                 let Some(marks) = marks else { return };
                 let slide = letterbox(area, window.scale_factor());
                 let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
@@ -735,8 +805,6 @@ impl Render for SlideEditor {
             .absolute()
             .size_full()
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
-            .on_mouse_move(cx.listener(Self::mouse_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_key_down(cx.listener(Self::key_down))
             .on_action(
                 cx.listener(|this, _: &MoveLeft, _, cx| this.go(Go::By(Motion::Left), false, cx)),

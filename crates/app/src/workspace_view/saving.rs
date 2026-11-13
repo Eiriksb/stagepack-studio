@@ -116,6 +116,7 @@ impl WorkspaceView {
 
     /// Runs the save the saving has started, of the talk as it is now where it's kept.
     fn start_save(&mut self, cx: &mut Context<Self>) {
+        self.settle_typing(cx);
         let Some(document) = &self.document else {
             return;
         };
@@ -170,6 +171,7 @@ impl WorkspaceView {
     /// Asks where to save the talk as `kind`, then saves it there on a background task. From
     /// then on the talk is kept there.
     fn save_as(&mut self, kind: SaveKind, cx: &mut Context<Self>) {
+        self.settle_typing(cx);
         let Some(document) = &self.document else {
             return;
         };

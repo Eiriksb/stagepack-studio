@@ -21,8 +21,8 @@ use crate::history::{History, RunId};
 use crate::present::TalkShape;
 use crate::saving::{SaveJob, SaveTarget, Saved};
 use crate::text_editing::{
-    COULD_NOT_TYPE, EditingText, FORMAT_TEXT, FlowKey, Kind, TYPING, TextMark, holds_something,
-    only_empty_lines,
+    COULD_NOT_TYPE, EditingText, FORMAT_TEXT, FlowKey, Kind, TYPING, TextMark, holds_no_words,
+    holds_something, region_has_text,
 };
 
 pub(crate) const SLIDES_FILE: &str = "slides.md";
@@ -65,6 +65,8 @@ pub enum EditRefused {
     CouldNotBeMade,
     /// What was typed on a slide couldn't be written as it was typed.
     CouldNotBeTyped,
+    /// Text that typing left with no words couldn't be taken away.
+    CouldNotTidy,
 }
 
 impl std::fmt::Display for EditRefused {
@@ -81,6 +83,9 @@ impl std::fmt::Display for EditRefused {
             }
             EditRefused::CouldNotBeMade => "That change couldn't be made, so nothing was changed.",
             EditRefused::CouldNotBeTyped => COULD_NOT_TYPE,
+            EditRefused::CouldNotTidy => {
+                "The emptied text couldn't be taken away, so it's left on the slide."
+            }
         })
     }
 }
@@ -95,6 +100,17 @@ pub enum EditRun {
     New,
     /// The edit joins this run, while it's open. Once it isn't, the edit is a new step.
     Continue(RunId),
+}
+
+/// Which step of the history an edit's change goes into.
+#[derive(Clone, Copy)]
+enum Join {
+    /// A step of its own, which opens no run.
+    Alone,
+    /// A step of its own that opens a run, or the run's step, as [`EditRun`] says.
+    Run(EditRun),
+    /// The newest step, if [`History::fold`] can take it in; otherwise a step of its own.
+    Last,
 }
 
 /// How many slides an edit is meant to leave, and which of them it may change.
@@ -117,9 +133,15 @@ const EDIT_NOTES: &str = "Edit notes";
 const RECOVER_CHANGES: &str = "Recover changes";
 const LOAD_CHANGED_FILE: &str = "Load the changed file";
 
+/// What the window says when the current slide couldn't be laid out for the editor.
+pub const LAYOUT_FAILED: &str =
+    "This slide couldn't be laid out, so it can't be shown or typed on just now.";
+
 thread_local! {
     /// Whether the next change worked out, or text read, on this thread panics, for tests.
     static PANIC_IN_NEXT_CHANGE: Cell<bool> = const { Cell::new(false) };
+    /// Whether the next layout of a slide for the editor on this thread panics, for tests.
+    static PANIC_IN_NEXT_LAYOUT: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Makes the next change a [`Document`] command works out on this thread panic, or the next
@@ -128,6 +150,25 @@ thread_local! {
 #[doc(hidden)]
 pub fn panic_in_next_change() {
     PANIC_IN_NEXT_CHANGE.with(|flag| flag.set(true));
+}
+
+/// Makes the next layout of a slide for the editor, its layers or where its text is, panic on
+/// this thread, as a fault in the engine would, so tests can see that it's survived. Only for
+/// tests.
+#[doc(hidden)]
+pub fn panic_in_next_layout() {
+    PANIC_IN_NEXT_LAYOUT.with(|flag| flag.set(true));
+}
+
+/// What `work`, the engine's layout of a slide for the editor, gives, or `None` if it panics.
+fn laid_out<T>(work: impl FnOnce() -> T) -> Option<T> {
+    guarded(|| {
+        if PANIC_IN_NEXT_LAYOUT.with(|flag| flag.replace(false)) {
+            panic!("a layout that panics, for a test");
+        }
+        work()
+    })
+    .ok()
 }
 
 /// What `work` gives, or [`EditRefused::CouldNotBeMade`] if it panics. It's the format crate's
@@ -225,6 +266,11 @@ pub struct Document {
     outside: Option<String>,
     /// The text being typed on a slide, if any.
     editing: Option<EditingText>,
+    /// The number the next time of typing on a slide gets.
+    next_session: u64,
+    /// What the window should say about something that went wrong where nothing was refused
+    /// to whoever asked, such as a tidy-up before a slide change, until it's taken.
+    message: Option<String>,
 }
 
 impl Document {
@@ -307,6 +353,8 @@ impl Document {
             history: History::new(),
             typing_notes: None,
             editing: None,
+            next_session: 0,
+            message: None,
         })
     }
 
@@ -345,7 +393,9 @@ impl Document {
         let index = index.min(self.slide_count() - 1);
         if index != self.current {
             // What's typed is in the talk already; only what typing left empty is tidied.
-            self.end_text().ok();
+            if let Err(refused) = self.end_text() {
+                self.say(refused);
+            }
             self.current = index;
             self.typing_notes = None;
         }
@@ -382,13 +432,44 @@ impl Document {
 
     /// The current slide's layers as the editor shows them, first to last, drawn at `scale`:
     /// with an offer to add text in each region that has none.
+    ///
+    /// If laying the slide out goes wrong, it has none, and [`Self::take_message`] says so.
     pub fn editor_layers(&mut self, scale: f32) -> Vec<Arc<Layer>> {
-        self.deck.editor_layers(self.current, scale)
+        let (deck, current) = (&mut self.deck, self.current);
+        laid_out(|| deck.editor_layers(current, scale)).unwrap_or_else(|| {
+            self.layout_failed();
+            Vec::new()
+        })
     }
 
     /// Where slide `index`'s editable text is drawn, for a caret, a selection and a click.
+    ///
+    /// If laying the slide out goes wrong, it has no text, any typing ends, and
+    /// [`Self::take_message`] says so.
     pub fn text_layout(&mut self, index: usize) -> Arc<TextLayout> {
-        self.deck.text_layout(index)
+        let deck = &mut self.deck;
+        laid_out(|| deck.text_layout(index)).unwrap_or_else(|| {
+            self.layout_failed();
+            Arc::new(TextLayout::default())
+        })
+    }
+
+    /// A slide couldn't be laid out for the editor: typing on it can't go on, and it's said.
+    fn layout_failed(&mut self) {
+        self.editing = None;
+        self.message = Some(LAYOUT_FAILED.to_string());
+    }
+
+    /// Notes `refused`, which nobody was told of, for the window to say.
+    fn say(&mut self, refused: EditRefused) {
+        self.message = Some(refused.to_string());
+    }
+
+    /// What the window should say about something that went wrong where no edit was refused
+    /// to whoever asked: a tidy-up of typing before something else, or a slide that couldn't
+    /// be laid out. Each is given once.
+    pub fn take_message(&mut self) -> Option<String> {
+        self.message.take()
     }
 
     /// The layers of slide `index` at `moment`, first to last, drawn at `scale`.
@@ -494,10 +575,13 @@ impl Document {
         self.history.open_run()
     }
 
-    /// The change `build` works out from the talk as it is, for one of the commands. A command
-    /// that's refused ends any typing in the notes.
+    /// The change `build` works out from the talk as it is, for one of the commands. Text being
+    /// typed on a slide is finished first, so the change is worked out from the talk as tidied.
+    /// A command that's refused ends any typing in the notes.
     fn build<T>(&mut self, build: impl FnOnce(&Talk) -> T) -> Result<T, EditRefused> {
-        let built = built(self.talk(), build);
+        let built = self
+            .finish_before_edit()
+            .and_then(|_| built(self.talk(), build));
         if built.is_err() {
             self.typing_notes = None;
         }
@@ -508,6 +592,11 @@ impl Document {
     /// it's about in the text as it is, and `after` the one it's about once made, which becomes
     /// the current slide. With `run`, the step opens a run, or joins the one given; without, it
     /// opens none.
+    ///
+    /// Every edit made to the talk's text comes this way, or through [`Self::build`] first, but
+    /// typing on a slide itself and what the history or the file gives back: undo, redo,
+    /// recovering and reloading. Text being typed is finished before it; if that tidied the
+    /// talk, `change`, worked out from the talk as it was, no longer fits it, and is refused.
     fn make(
         &mut self,
         label: &'static str,
@@ -518,7 +607,12 @@ impl Document {
         run: Option<EditRun>,
     ) -> Result<Vec<usize>, EditRefused> {
         let empty = change.is_empty();
-        let made = self.try_make(label, change, holds, before, after, run, None);
+        let join = run.map_or(Join::Alone, Join::Run);
+        let made = match self.finish_before_edit() {
+            Ok(false) => self.try_make(label, change, holds, before, after, join, None),
+            Ok(true) => Err(EditRefused::CouldNotBeMade),
+            Err(refused) => Err(refused),
+        };
         if made.is_err() {
             self.typing_notes = None;
         }
@@ -529,8 +623,18 @@ impl Document {
         made
     }
 
-    /// [`Self::make`], but for ending the typing when it's refused. With `check`, the talk the
-    /// change gives is refused unless `check` holds for it, before anything is taken.
+    /// Finishes the text being typed on a slide, before another edit, and says whether tidying
+    /// what typing left empty changed the talk.
+    fn finish_before_edit(&mut self) -> Result<bool, EditRefused> {
+        if self.editing.is_none() {
+            return Ok(false);
+        }
+        let (_, removed) = self.finish_text()?;
+        Ok(removed.is_some())
+    }
+
+    /// [`Self::make`], but for ending the typing, into the step `join` says. With `check`, the
+    /// talk the change gives is refused unless `check` holds for it, before anything is taken.
     #[allow(clippy::too_many_arguments)]
     fn try_make(
         &mut self,
@@ -539,7 +643,7 @@ impl Document {
         holds: Holds,
         before: usize,
         after: usize,
-        run: Option<EditRun>,
+        join: Join,
         check: Option<&dyn Fn(&Talk) -> bool>,
     ) -> Result<Vec<usize>, EditRefused> {
         if change.is_empty() {
@@ -577,12 +681,16 @@ impl Document {
         }
         let old = old.to_string();
         let mut changed = self.deck.update_text(candidate);
-        let joined = match run {
-            Some(EditRun::Continue(run)) => self.history.extend(run, &old, self.deck.source()),
-            _ => false,
+        let joined = match join {
+            Join::Run(EditRun::Continue(run)) => {
+                self.history.extend(run, &old, self.deck.source())
+            }
+            Join::Last => self.history.fold(&old, self.deck.source()),
+            Join::Run(EditRun::New) | Join::Alone => false,
         };
         if !joined {
-            self.history.record(label, undo, before, after, run.is_some());
+            let opens_run = matches!(join, Join::Run(_));
+            self.history.record(label, undo, before, after, opens_run);
         }
         // Typing in the notes goes on only through set_notes, which says so itself.
         self.typing_notes = None;
@@ -615,7 +723,7 @@ impl Document {
             .undo(self.deck.source())
             .expect("there's a step to undo");
         let changed = self.take_step(step.current, talk);
-        self.resume_text(step.mark.map(|mark| (mark.slide, mark.flow, mark.before)));
+        self.resume_text(step.mark, true);
         Ok(Some(changed))
     }
 
@@ -631,7 +739,7 @@ impl Document {
             .redo(self.deck.source())
             .expect("there's a step to redo");
         let changed = self.take_step(step.current, talk);
-        self.resume_text(step.mark.map(|mark| (mark.slide, mark.flow, mark.after)));
+        self.resume_text(step.mark, false);
         Ok(Some(changed))
     }
 
@@ -785,6 +893,12 @@ impl Document {
         editing.flow.find(&flows)
     }
 
+    /// The number for a new time of typing.
+    fn new_session(&mut self) -> u64 {
+        self.next_session += 1;
+        self.next_session
+    }
+
     /// Starts typing in flow `flow` of slide `slide`, an index into its `text_flows`, with the
     /// caret at `pos`, and makes `slide` the current slide. Text being typed elsewhere ends
     /// first, and `flow` is taken as it was before that. In the flow already being typed in,
@@ -807,7 +921,13 @@ impl Document {
             self.apply_text(|edit| edit.move_to(pos, false)).ok();
             return true;
         }
-        let ended = self.finish_text().ok().and_then(|(_, removed)| removed);
+        let ended = match self.finish_text() {
+            Ok((_, removed)) => removed,
+            Err(refused) => {
+                self.say(refused);
+                None
+            }
+        };
         let flow = match ended {
             Some((on, removed)) if on == slide && removed == flow => return false,
             Some((on, removed)) if on == slide && removed < flow => flow - 1,
@@ -826,18 +946,22 @@ impl Document {
             flow: key,
             edit,
             run: None,
+            session: self.new_session(),
         });
         true
     }
 
     /// Starts typing in region `region` of slide `slide`, which has nothing in it, and makes
     /// `slide` the current slide. Nothing is written until something is typed. A region with
-    /// text in it is typed into at the end of its first run of text.
+    /// text in it is typed into at the end of its first run of text. Says whether the slide's
+    /// layout has such a region to type in.
     pub fn begin_text_in_region(&mut self, slide: usize, region: &str) -> bool {
         if slide >= self.slide_count() {
             return false;
         }
-        self.end_text().ok();
+        if let Err(refused) = self.end_text() {
+            self.say(refused);
+        }
         self.select(slide);
         let Ok(flows) = guarded(|| text_flows(self.talk(), slide)) else {
             return false;
@@ -847,7 +971,14 @@ impl Document {
             let end = TextEdit::new(flows[index].paras.clone()).select_all().selection.end();
             return self.begin_text(slide, index, end);
         }
-        self.editing = Some(EditingText::in_empty_region(slide, region));
+        // A region of the layout with no text in it offers to add some.
+        if self.text_layout(slide).placeholder(region).is_none() {
+            return false;
+        }
+        self.editing = Some(EditingText {
+            session: self.new_session(),
+            ..EditingText::in_empty_region(slide, region)
+        });
         true
     }
 
@@ -855,14 +986,27 @@ impl Document {
     /// slides to show again. A run of typing in one flow is one step to undo, until the caret
     /// is moved, the text is styled, or [`Self::end_typing_run`] or anything else happens.
     ///
-    /// What's written must read back as the paragraphs `op` gave. If it wouldn't, or it can't
-    /// be written there, it's refused, and the talk and the text being typed stay as they were.
+    /// What's typed always reads as the talk holds it: the flow its key finds holds exactly
+    /// its paragraphs, or, before anything is written in an empty region, the region has no
+    /// text and it holds one empty paragraph. If that doesn't hold before `op`, typing ends and
+    /// it's refused, with nothing written. What's written must read back as the paragraphs `op`
+    /// gave, with the slide's other text as it was. If it wouldn't, or it can't be written
+    /// there, it's refused, and the talk and the text being typed stay as they were.
     pub fn apply_text(
         &mut self,
         op: impl FnOnce(&TextEdit) -> TextEdit,
     ) -> Result<Vec<usize>, EditRefused> {
         let Some(editing) = self.editing.clone() else {
             return Ok(Vec::new());
+        };
+        let slide = editing.slide;
+        let flows = (slide < self.slide_count())
+            .then(|| guarded(|| text_flows(self.talk(), slide)).ok())
+            .flatten();
+        let Some(flows) = flows.filter(|flows| reads_as_typed(flows, &editing)) else {
+            // The talk and what's typed have parted: nothing can be written safely.
+            self.editing = None;
+            return Err(EditRefused::CouldNotBeTyped);
         };
         let after = guarded(|| op(&editing.edit)).map_err(|_| EditRefused::CouldNotBeTyped)?;
         let kind = Kind::of(&editing.edit, &after);
@@ -874,20 +1018,16 @@ impl Document {
             }
             Kind::Typed | Kind::Formatted => {}
         }
-        let slide = editing.slide;
-        let change = {
-            let talk = self.talk();
-            let flows = guarded(|| text_flows(talk, slide)).map_err(|_| EditRefused::CouldNotBeTyped)?;
-            match (editing.flow.find(&flows), editing.flow.region()) {
-                (Some(index), _) => write_flow(talk, slide, &flows[index], &after.paras),
-                // An empty region's first paragraph is written once it holds something.
-                (None, Some(_)) if !holds_something(&after.paras) => {
-                    self.keep_typed(after, editing.run);
-                    return Ok(Vec::new());
-                }
-                (None, Some(region)) => write_into_region(talk, slide, region, &after.paras),
-                (None, None) => None,
+        let found = editing.flow.find(&flows);
+        let change = match (found, editing.flow.region()) {
+            (Some(index), _) => write_flow(self.talk(), slide, &flows[index], &after.paras),
+            // An empty region's first paragraph is written once it holds something.
+            (None, Some(_)) if !holds_something(&after.paras) => {
+                self.keep_typed(after, editing.run);
+                return Ok(Vec::new());
             }
+            (None, Some(region)) => write_into_region(self.talk(), slide, region, &after.paras),
+            (None, None) => None,
         };
         let Some(change) = change else {
             return Err(EditRefused::CouldNotBeTyped);
@@ -902,20 +1042,26 @@ impl Document {
             _ => EditRun::New,
         };
         let expected = storable(&after.paras);
+        // Writing into an empty region adds its text; anything else keeps the slide's count.
+        let count = flows.len() + usize::from(found.is_none());
         let key = editing.flow.clone();
         let reads_back = |candidate: &Talk| {
             let flows = text_flows(candidate, slide);
-            key.find(&flows).is_some_and(|index| flows[index].paras == expected)
+            flows.len() == count
+                && key
+                    .find(&flows)
+                    .is_some_and(|index| flows[index].paras == expected)
         };
         let label = if typed { TYPING } else { FORMAT_TEXT };
-        let changed = self.make_text(label, slide, change, run, &reads_back)?;
+        let changed = self.make_text(label, slide, change, Join::Run(run), &reads_back)?;
         self.note_step(
             run,
             TextMark {
                 slide,
                 flow: editing.flow,
                 before: editing.edit.selection,
-                after: after.selection,
+                after: Some(after.selection),
+                session: editing.session,
             },
         );
         let run = if typed { self.history.open_run() } else { None };
@@ -931,10 +1077,32 @@ impl Document {
     }
 
     /// Stops typing on the slide, and returns the slides to show again. Everything typed is in
-    /// the talk already; a region left with nothing but empty lines is emptied, so that it
-    /// offers to add text again.
+    /// the talk already; text left with no words at all is taken away, so that its region
+    /// offers to add text again. Typing ends even if that's refused.
     pub fn end_text(&mut self) -> Result<Vec<usize>, EditRefused> {
         self.finish_text().map(|(changed, _)| changed)
+    }
+
+    /// Leaves the talk tidy while typing goes on, as before a save, a show or an export, and
+    /// returns the slides to show again. Text that typing left with no words at all is taken
+    /// away, as [`Self::end_text`] does; typing then goes on in its region, empty again, or
+    /// ends if the region still has other text. Any other typing goes on as it was.
+    pub fn settle_text(&mut self) -> Result<Vec<usize>, EditRefused> {
+        let Some(editing) = self.editing.clone() else {
+            return Ok(Vec::new());
+        };
+        let (changed, removed) = self.tidy(&editing)?;
+        if removed.is_some() {
+            let region = editing.flow.region().unwrap_or_default();
+            let flows = guarded(|| text_flows(self.talk(), editing.slide)).ok();
+            self.editing = flows
+                .filter(|flows| !region_has_text(flows, region))
+                .map(|_| EditingText {
+                    session: editing.session,
+                    ..EditingText::in_empty_region(editing.slide, region)
+                });
+        }
+        Ok(changed)
     }
 
     /// [`Self::end_text`], which also gives the slide and the flow it took away, if it did.
@@ -942,6 +1110,15 @@ impl Document {
         let Some(editing) = self.editing.take() else {
             return Ok((Vec::new(), None));
         };
+        self.tidy(&editing)
+    }
+
+    /// Takes away the region text `editing` is typing in, if it has no words at all, and gives
+    /// the slides to show again, and the slide and flow taken away. That's no step of its own:
+    /// it joins the step before it typed in the same time of typing, where the history can
+    /// take it, and if that leaves the step doing nothing, the step goes. A box of text is
+    /// never taken away, as an empty box would be no text at all.
+    fn tidy(&mut self, editing: &EditingText) -> Result<EndedText, EditRefused> {
         let slide = editing.slide;
         if editing.flow.region().is_none() || slide >= self.slide_count() {
             return Ok((Vec::new(), None));
@@ -952,31 +1129,75 @@ impl Document {
             let Some(index) = editing.flow.find(&flows) else {
                 return Ok((Vec::new(), None));
             };
-            if !only_empty_lines(&flows[index].paras) {
+            if !holds_no_words(&flows[index].paras) {
                 return Ok((Vec::new(), None));
             }
             (write_flow(talk, slide, &flows[index], &[]), index, flows.len())
         };
-        let Some(change) = change.filter(|change| !change.is_empty()) else {
+        let join = match editing.run {
+            Some(run) if self.history.is_open(run) => Join::Run(EditRun::Continue(run)),
+            _ if self
+                .history
+                .last_mark()
+                .is_some_and(|mark| mark.session == editing.session) =>
+            {
+                Join::Last
+            }
+            _ => Join::Alone,
+        };
+        // Where this typing's own step put the text there, taking it away gives back the
+        // slide's bytes from before it, so that the two together are no change at all.
+        let change = match join {
+            Join::Alone => change,
+            _ => self.before_typed_in(editing, index).or(change),
+        };
+        let change = change.ok_or(EditRefused::CouldNotTidy)?;
+        if change.is_empty() {
             return Ok((Vec::new(), None));
-        };
-        let run = match editing.run {
-            Some(run) if self.history.is_open(run) => EditRun::Continue(run),
-            _ => EditRun::New,
-        };
+        }
+        let depth = self.history.depth();
         let emptied = |candidate: &Talk| text_flows(candidate, slide).len() + 1 == count;
-        let changed = self.make_text(TYPING, slide, change, run, &emptied)?;
-        let selection = editing.edit.selection;
-        self.note_step(
-            run,
-            TextMark {
+        let changed = self
+            .make_text(TYPING, slide, change, join, &emptied)
+            .map_err(|_| EditRefused::CouldNotTidy)?;
+        // Made again, the step leaves nothing to type in.
+        let now = self.history.depth();
+        if now > depth {
+            self.history.mark_last(TextMark {
                 slide,
-                flow: editing.flow,
-                before: selection,
-                after: selection,
-            },
-        );
+                flow: editing.flow.clone(),
+                before: editing.edit.selection,
+                after: None,
+                session: editing.session,
+            });
+        } else if now == depth
+            && let Some(last) = self.history.last_mark_mut()
+        {
+            last.after = None;
+        }
         Ok((changed, Some((slide, index))))
+    }
+
+    /// The change back to the talk from before the newest step, if that step is what put
+    /// flow `index` of `editing`'s slide there: before it, the slide had all its other text as
+    /// it is now, and not that flow.
+    fn before_typed_in(&self, editing: &EditingText, index: usize) -> Option<Change> {
+        let undo = self.history.next_undo()?;
+        let slide = editing.slide;
+        let alike = guarded(|| {
+            let before = reparse(self.talk(), undo.apply(self.source()));
+            let mut now = text_flows(self.talk(), slide);
+            now.remove(index);
+            let then = text_flows(&before, slide);
+            before.slides.len() == self.slide_count()
+                && others_alike(self.talk(), &before, slide)
+                && then.len() == now.len()
+                && then
+                    .iter()
+                    .zip(&now)
+                    .all(|(then, now)| same_place(&then.place, &now.place) && then.paras == now.paras)
+        });
+        alike.unwrap_or(false).then(|| undo.clone())
     }
 
     /// Takes `edit` as the text being typed, in the run `run`.
@@ -987,17 +1208,17 @@ impl Document {
         }
     }
 
-    /// Makes `change` to slide `slide`, typed on it, unless the talk it gives fails `check`.
-    /// The text being typed goes on.
+    /// Makes `change` to slide `slide`, typed on it, into the step `join` says, unless the talk
+    /// it gives fails `check`. The text being typed goes on.
     fn make_text(
         &mut self,
         label: &'static str,
         slide: usize,
         change: Change,
-        run: EditRun,
+        join: Join,
         check: &dyn Fn(&Talk) -> bool,
     ) -> Result<Vec<usize>, EditRefused> {
-        self.try_make(label, change, Holds::Slide(slide), slide, slide, Some(run), Some(check))
+        self.try_make(label, change, Holds::Slide(slide), slide, slide, join, Some(check))
             .map_err(|_| EditRefused::CouldNotBeTyped)
     }
 
@@ -1016,32 +1237,43 @@ impl Document {
         }
     }
 
-    /// Goes back to typing at `at`, a slide, one of its flows and a selection in it, after an
-    /// undo or a redo of a step typed there.
-    fn resume_text(&mut self, at: Option<(usize, FlowKey, slides_format::Selection)>) {
-        let Some((slide, key, selection)) = at else {
+    /// Goes back to typing where `mark` says, after an undo, with `before`, or a redo of the
+    /// step typed there. A step that took the text away leaves nothing to type in once it's
+    /// made again, and text found where only an empty region was is someone else's: in both,
+    /// typing stays ended.
+    fn resume_text(&mut self, mark: Option<TextMark>, before: bool) {
+        let Some(mark) = mark else {
             return;
         };
+        let selection = if before { Some(mark.before) } else { mark.after };
+        let Some(selection) = selection else {
+            return;
+        };
+        let slide = mark.slide;
         if slide >= self.slide_count() {
             return;
         }
         let Ok(flows) = guarded(|| text_flows(self.talk(), slide)) else {
             return;
         };
-        self.editing = match (key.find(&flows), key.region()) {
+        self.editing = match (mark.flow.find(&flows), mark.flow.region()) {
             (Some(index), _) => {
                 let edit = TextEdit::new(flows[index].paras.clone())
                     .move_to(selection.anchor, false)
                     .move_to(selection.head, true);
                 Some(EditingText {
                     slide,
-                    flow: key,
+                    flow: mark.flow,
                     edit,
                     run: None,
+                    session: mark.session,
                 })
             }
-            (None, Some(region)) => Some(EditingText::in_empty_region(slide, region)),
-            (None, None) => None,
+            (None, Some(region)) if !region_has_text(&flows, region) => Some(EditingText {
+                session: mark.session,
+                ..EditingText::in_empty_region(slide, region)
+            }),
+            _ => None,
         };
     }
 
@@ -1235,6 +1467,30 @@ impl Document {
 /// What ending the text being typed did: the slides to show again, and the slide and flow it
 /// took away, if it emptied one.
 type EndedText = (Vec<usize>, Option<(usize, usize)>);
+
+/// Whether `editing` reads as the talk holds it in `flows`, its slide's text: the flow its key
+/// finds holds exactly its paragraphs, or, in an empty region before anything is written, the
+/// region has no text and it holds one empty paragraph.
+fn reads_as_typed(flows: &[slides_format::TextFlow], editing: &EditingText) -> bool {
+    match (editing.flow.find(flows), editing.flow.region()) {
+        (Some(index), _) => flows[index].paras == storable(&editing.edit.paras),
+        (None, Some(region)) => {
+            !region_has_text(flows, region) && !holds_something(&editing.edit.paras)
+        }
+        (None, None) => false,
+    }
+}
+
+/// Whether `a` and `b` are the same kind of place: the same region, or both boxes, whose
+/// ranges move with the text before them.
+fn same_place(a: &slides_format::FlowPlace, b: &slides_format::FlowPlace) -> bool {
+    use slides_format::FlowPlace::{Region, Tag};
+    match (a, b) {
+        (Region(a), Region(b)) => a == b,
+        (Tag(_), Tag(_)) => true,
+        _ => false,
+    }
+}
 
 /// A show's slides are the talk's shown ones, so `slide` here is a position among those.
 impl TalkShape for Document {

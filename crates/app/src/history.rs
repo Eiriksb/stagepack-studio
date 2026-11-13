@@ -141,8 +141,29 @@ impl History {
         if self.run != Some(run) {
             return false;
         }
-        let Some(last) = self.undo.back_mut() else {
+        let joined = self.join_last(before, after);
+        if !joined {
             self.run = None;
+        }
+        joined
+    }
+
+    /// Takes an edit that turned the text `before` into `after` into the newest step, whether
+    /// or not its run is open, and says whether it did. It doesn't while there's something to
+    /// redo, or when the newest step leads to the saved text, which would no longer be one a
+    /// step leads to. An edit that brings the text back to where the step started takes the
+    /// step away. Any run that was open ends.
+    pub fn fold(&mut self, before: &str, after: &str) -> bool {
+        if !self.redo.is_empty() || self.saved == Some(self.position()) {
+            return false;
+        }
+        self.run = None;
+        self.join_last(before, after)
+    }
+
+    /// Takes an edit from `before` to `after` into the newest step, if there is one.
+    fn join_last(&mut self, before: &str, after: &str) -> bool {
+        let Some(last) = self.undo.back_mut() else {
             return false;
         };
         let start = last.change.apply(before);
@@ -165,6 +186,17 @@ impl History {
         if let Some(last) = self.undo.back_mut() {
             last.mark = Some(mark);
         }
+    }
+
+    /// Where the newest step's text was typed, if it was typed on a slide.
+    pub fn last_mark(&self) -> Option<&TextMark> {
+        self.undo.back().and_then(|entry| entry.mark.as_ref())
+    }
+
+    /// How many steps from the start the text is now: one more after a step is recorded, one
+    /// fewer once a step is taken away.
+    pub fn depth(&self) -> usize {
+        self.position()
     }
 
     /// Where the newest step's text was typed, if it was typed on a slide.

@@ -33,7 +33,13 @@ impl WorkspaceView {
             self.edit(Document::end_text, cx);
         }
         let before = document.read(cx).current();
-        document.update(cx, |document, _| step(document));
+        let message = document.update(cx, |document, _| {
+            step(document);
+            document.take_message()
+        });
+        if let Some(message) = message {
+            self.say(message, cx);
+        }
         if document.read(cx).current() == before {
             return;
         }
@@ -55,7 +61,7 @@ impl WorkspaceView {
         let Some(document) = self.document.clone() else {
             return;
         };
-        let (made, changed) = document.update(cx, |document, cx| {
+        let (made, changed, message) = document.update(cx, |document, cx| {
             let before = talk_state(document);
             let made = change(document);
             // Whether the talk changed, as its text or its history did: what the edit says
@@ -64,13 +70,28 @@ impl WorkspaceView {
             if changed {
                 cx.notify();
             }
-            (made, changed)
+            (made, changed, document.take_message())
         });
         if changed {
             self.edited(cx);
         }
         if let Err(refused) = made {
             self.say(refused.to_string(), cx);
+        }
+        if let Some(message) = message {
+            self.say(message, cx);
+        }
+    }
+
+    /// Leaves the talk tidy of what typing on the slide left empty, before it's saved, shown
+    /// or exported. Typing goes on where it can.
+    pub(super) fn settle_typing(&mut self, cx: &mut Context<Self>) {
+        let typing = self
+            .document
+            .as_ref()
+            .is_some_and(|document| document.read(cx).text().is_some());
+        if typing {
+            self.edit(Document::settle_text, cx);
         }
     }
 

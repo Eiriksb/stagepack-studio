@@ -79,13 +79,16 @@ impl FlowKey {
 }
 
 /// Where a step of the history was typed: the selection before it and after it, so that
-/// undoing it, or making it again, goes back to typing there.
+/// undoing it, or making it again, goes back to typing there. A step that took away the text
+/// it was typed in has nothing after it, and making it again ends the typing.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextMark {
     pub slide: usize,
     pub flow: FlowKey,
     pub before: Selection,
-    pub after: Selection,
+    pub after: Option<Selection>,
+    /// The time of typing the step was made in, from a click on the text until it ended.
+    pub(crate) session: u64,
 }
 
 /// The text being edited on a slide: which slide, which of its flows, and the flow's
@@ -99,6 +102,9 @@ pub struct EditingText {
     pub edit: TextEdit,
     /// The run of the history typing here joins, while it's open.
     pub(crate) run: Option<RunId>,
+    /// Which time of typing this is: it starts with a click on the text, and goes on through
+    /// an undo or a redo of a step made in it.
+    pub(crate) session: u64,
 }
 
 impl EditingText {
@@ -121,6 +127,7 @@ impl EditingText {
                 spans: Vec::new(),
             }]),
             run: None,
+            session: 0,
         }
     }
 
@@ -173,9 +180,15 @@ pub(crate) fn holds_something(paras: &[Para]) -> bool {
     paras.len() > 1 || paras.iter().any(|para| !para.spans.is_empty())
 }
 
-/// Whether `paras` are nothing but empty body paragraphs, left by typing and taking it away.
-pub(crate) fn only_empty_lines(paras: &[Para]) -> bool {
-    paras
+/// Whether `paras` have no words at all, whatever kind of paragraph each is: what typing
+/// leaves once everything typed or there before is taken away.
+pub(crate) fn holds_no_words(paras: &[Para]) -> bool {
+    paras.iter().all(|para| para.spans.is_empty())
+}
+
+/// Whether any of `flows` is text in the layout's region `region`.
+pub(crate) fn region_has_text(flows: &[TextFlow], region: &str) -> bool {
+    flows
         .iter()
-        .all(|para| para.kind == ParaKind::Body && para.spans.is_empty())
+        .any(|flow| matches!(&flow.place, FlowPlace::Region(name) if name == region))
 }

@@ -913,3 +913,84 @@ fn notes_left_as_they_are_on_another_slide_do_not_join_its_typing() {
     assert_eq!(doc.notes_of(1), None);
     assert_eq!(doc.notes_of(2).as_deref(), Some("Two"));
 }
+
+/// Three slides, the first with nothing in its body.
+const EMPTY_BODY: &str = "# T\n\n---\n\n# Two\n\n---\n\n# Three\n";
+
+/// `EMPTY_BODY` with two empty lines typed into the first slide's body.
+fn with_empty_lines() -> (tempfile::TempDir, Document) {
+    let (dir, mut doc) = talk(EMPTY_BODY);
+    assert!(doc.begin_text_in_region(0, "body"));
+    doc.apply_text(|edit| edit.enter()).unwrap();
+    doc.apply_text(|edit| edit.enter()).unwrap();
+    assert!(doc.source().contains("<Text></Text>"), "{}", doc.source());
+    (dir, doc)
+}
+
+/// One of the commands, as a test makes it.
+type Command = fn(&mut Document) -> Result<Vec<usize>, EditRefused>;
+
+#[test]
+fn typing_left_empty_is_tidied_before_another_edit() {
+    let edits: [(&str, Command); 5] = [
+        ("new slide", |doc| doc.add_slide("content")),
+        ("duplicate", Document::duplicate_current),
+        ("hide", |doc| doc.set_current_hidden(true)),
+        ("delete", Document::delete_current),
+        ("move", |doc| doc.move_slide(0, 1)),
+    ];
+    for (what, edit) in edits {
+        let (_d, mut doc) = with_empty_lines();
+        edit(&mut doc).unwrap();
+        assert!(doc.text().is_none(), "{what}: typing ended");
+        assert!(!doc.source().contains("<Text"), "{what}: {}", doc.source());
+        doc.undo().unwrap();
+        assert_eq!(doc.source(), EMPTY_BODY, "{what}: one undo takes the edit back");
+        assert!(!doc.can_undo(), "{what}: and the typing left no step");
+    }
+}
+
+#[test]
+fn a_change_worked_out_before_typing_was_tidied_is_refused() {
+    let (_d, mut doc) = with_empty_lines();
+    let typed = doc.source().to_string();
+    let end = typed.len();
+    let change = Change::single(SourceEdit { range: end..end, text: "\nMore\n".into() });
+    let refused = doc.edit_slide("Edit", 2, change, EditRun::New).unwrap_err();
+    assert_eq!(refused, EditRefused::CouldNotBeMade);
+    assert!(doc.text().is_none());
+    assert_eq!(doc.source(), EMPTY_BODY, "the empty lines were tidied all the same");
+}
+
+#[test]
+fn text_is_not_begun_in_a_region_the_layout_has_not_got() {
+    let (_d, mut doc) = talk("# T\n\nwords\n");
+    assert!(!doc.begin_text_in_region(0, "right"));
+    assert!(!doc.begin_text_in_region(0, "nowhere"));
+    assert!(doc.text().is_none());
+    assert!(doc.begin_text_in_region(0, "body"), "the body has text, typed at its end");
+}
+
+#[test]
+fn a_tidy_up_that_is_refused_is_said() {
+    let source = "# T\n\nwords\n\n---\n\n# Two\n";
+    let empty_the_body = |doc: &mut Document| {
+        assert!(doc.begin_text(0, 1, slides_format::Pos { para: 0, offset: 0 }));
+        doc.apply_text(|edit| edit.select_all()).unwrap();
+        doc.apply_text(|edit| edit.backspace()).unwrap();
+        panic_in_next_change();
+    };
+    let (_d, mut doc) = talk(source);
+    assert_eq!(doc.take_message(), None);
+    empty_the_body(&mut doc);
+    doc.select(1);
+    assert_eq!(doc.current(), 1);
+    assert!(doc.text().is_none());
+    assert!(doc.take_message().is_some(), "the refusal is said");
+    assert_eq!(doc.take_message(), None, "once");
+
+    let (_d, mut doc) = talk(source);
+    empty_the_body(&mut doc);
+    doc.begin_text_in_region(0, "title");
+    assert!(doc.take_message().is_some(), "the refusal is said");
+}
