@@ -63,6 +63,30 @@ pub fn duplicate_slide(talk: &Talk, index: usize) -> Change {
     rearrange(talk, &order)
 }
 
+/// Slide `index`'s own text, as [`insert_slide`] takes it to put a copy of the slide anywhere,
+/// in this talk or another: its settings and notes, but none of the talk's settings, which a
+/// first slide carries, and no break line of its own. Line endings are `\n`, as
+/// [`insert_slide`] makes them the talk's. Empty for a slide that isn't there.
+pub fn slide_text_for_copy(talk: &Talk, index: usize) -> String {
+    let source = talk.source.as_str();
+    let raw = split_slides(source);
+    let Some(slide) = raw.get(index) else { return String::new() };
+    let parts = parts(source, slide, index == 0);
+    let mut out = String::new();
+    if let Head::Block { lines, close, .. } = &parts.head {
+        // As a copy placed anywhere but first keeps them: see `as_later`.
+        let own: Vec<_> = lines.iter().filter(|(_, key)| index > 0 || !is_talk_setting(key)).collect();
+        if own.iter().any(|(_, key)| key.is_some()) {
+            for (range, _) in own {
+                out.push_str(&source[range.clone()]);
+            }
+            out.push_str(&source[close.clone()]);
+        }
+    }
+    out.push_str(&source[parts.content.clone()]);
+    out.replace("\r\n", "\n")
+}
+
 /// Moves slide `from` so that `to` is its index afterwards.
 pub fn move_slide(talk: &Talk, from: usize, to: usize) -> Change {
     let count = talk.slides.len();

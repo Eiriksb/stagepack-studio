@@ -749,3 +749,70 @@ proptest! {
         }
     }
 }
+
+/// Talks to copy slides from: the first slide carries the talk's settings and some of its
+/// own, one is hidden, one has notes, and one ends the file with no line ending.
+const COPY_FROM: [&str; 3] = [
+    "---\ntitle: Talk\ncolor.accent: #f00\nlayout: section\n---\n\n# One\n\nwords **bold**\n\n<Notes>\nsay one\n</Notes>\n\n---\nhidden: true\n---\n\n# Two\n\n- a\n- b\n\n---\n\n# Three\n",
+    "# Plain first\n\nwith words\n\n---\n\n![a picture](pic.png)\n\n<Notes>\nlook\n</Notes>\n",
+    "---\ntitle: Only talk settings\n---\n\n# Alone\n",
+];
+
+const COPY_INTO: [&str; 2] = ["# A\n\n---\n\n# B\n", "---\ntitle: Other\n---\n\n# A\n"];
+
+/// The settings of a slide, as key and value.
+fn settings_of(slide: &Slide) -> Vec<(String, String)> {
+    slide.settings.as_ref().map_or_else(Vec::new, |settings| {
+        settings.entries.iter().map(|entry| (entry.key.clone(), entry.value.clone())).collect()
+    })
+}
+
+#[test]
+fn a_slides_text_for_copy_pastes_back_as_the_same_slide() {
+    let endings: [fn(&str) -> String; 2] = [|text| text.to_string(), |text| text.replace('\n', "\r\n")];
+    for from_eol in endings {
+        for into_eol in endings {
+            for from in COPY_FROM {
+                let from = parse_talk(&from_eol(from));
+                for index in 0..from.slides.len() {
+                    let copied = slide_text_for_copy(&from, index);
+                    assert!(!copied.contains('\r'), "the copy has newlines only: {copied:?}");
+                    for into in COPY_INTO {
+                        let into_src = into_eol(into);
+                        let into = parse_talk(&into_src);
+                        for after in 0..into.slides.len() {
+                            let pasted = parse_talk(&applied(&into_src, &insert_slide(&into, Some(after), &copied)));
+                            assert_eq!(pasted.slides.len(), into.slides.len() + 1);
+                            let new = &pasted.slides[after + 1];
+                            let ctx = format!("slide {index} of {:?} after {after} of {into_src:?}", from.source);
+                            assert_eq!(slide_text_for_copy(&pasted, after + 1), copied, "{ctx}");
+                            assert_eq!(new.notes.as_ref().map(|n| &n.text), from.slides[index].notes.as_ref().map(|n| &n.text), "{ctx}");
+                            assert_eq!(is_hidden(new), is_hidden(&from.slides[index]), "{ctx}");
+                            assert_eq!(new.blocks.len(), from.slides[index].blocks.len(), "{ctx}");
+                            let own: Vec<_> = settings_of(&from.slides[index]).into_iter().filter(|(key, _)| index > 0 || !TALK_SETTINGS.contains(&key.as_str())).collect();
+                            assert_eq!(settings_of(new), own, "{ctx}");
+                            // The pasted slide takes the line endings of the talk it's pasted into.
+                            let text = &pasted.source[new.range.clone()];
+                            if into_src.contains('\r') {
+                                assert!(!text.replace("\r\n", "").contains('\n'), "{ctx}: {text:?}");
+                            } else {
+                                assert!(!text.contains('\r'), "{ctx}: {text:?}");
+                            }
+                            // The talk's own settings stay as they were.
+                            assert_eq!(settings_of(&pasted.slides[0]), settings_of(&into.slides[0]), "{ctx}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_copied_first_slide_leaves_the_talks_settings_out() {
+    let talk = parse_talk(COPY_FROM[0]);
+    assert_eq!(slide_text_for_copy(&talk, 0), "layout: section\n---\n\n# One\n\nwords **bold**\n\n<Notes>\nsay one\n</Notes>\n\n");
+    assert_eq!(slide_text_for_copy(&talk, 1), "hidden: true\n---\n\n# Two\n\n- a\n- b\n\n");
+    assert_eq!(slide_text_for_copy(&parse_talk(COPY_FROM[2]), 0), "\n# Alone\n");
+    assert_eq!(slide_text_for_copy(&talk, 9), "");
+}

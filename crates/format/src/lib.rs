@@ -23,5 +23,6 @@ pub use rich_write::{storable, write_flow, write_inline, write_into_region};
 pub use settings::{SettingEntry, Settings};
 pub use slide_ops::{
     TALK_SETTINGS, delete_slide, duplicate_slide, insert_slide, is_hidden, move_slide, remove_setting, set_align, set_hidden, set_notes,
+    slide_text_for_copy,
 };
 pub use split::{RawSlide, split_slides};
