@@ -259,6 +259,31 @@ impl TextEdit {
         self.clamped().rekind(|_| kind)
     }
 
+    /// Makes every paragraph the selection touches a bulleted list item, or a numbered one
+    /// with `numbered`, keeping the level of one that's a list item already. If all of them
+    /// are that kind of item already, they become body paragraphs instead.
+    pub fn toggle_list(&self, numbered: bool) -> Self {
+        let edit = self.clamped();
+        let is_one = |kind: ParaKind| match kind {
+            ParaKind::Bullet { .. } => !numbered,
+            ParaKind::Numbered { .. } => numbered,
+            _ => false,
+        };
+        let (start, end) = (edit.selection.start(), edit.selection.end());
+        let all = edit.paras.get(start.para..=end.para).is_some_and(|paras| paras.iter().all(|para| is_one(para.kind)));
+        edit.rekind(|kind| {
+            let level = match kind {
+                ParaKind::Bullet { level } | ParaKind::Numbered { level } => level,
+                _ => 0,
+            };
+            match (all, numbered) {
+                (true, _) => ParaKind::Body,
+                (false, true) => ParaKind::Numbered { level },
+                (false, false) => ParaKind::Bullet { level },
+            }
+        })
+    }
+
     /// Takes every list item the selection touches a level deeper.
     pub fn indent(&self) -> Self {
         self.clamped().rekind(|kind| match kind {

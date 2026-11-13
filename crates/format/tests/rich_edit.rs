@@ -416,6 +416,32 @@ fn indent_and_outdent_change_list_levels_from_0_to_8() {
     assert_eq!(kinds(&edit), [ParaKind::Bullet { level: 8 }]);
 }
 
+#[test]
+fn toggle_list_makes_the_paragraphs_a_list_keeping_levels_and_back() {
+    let two = ParaKind::Numbered { level: 2 };
+    let edit = at(vec![body("a"), para(two, "b"), para(HEADING, "c"), body("d")], range(pos(0, 0), pos(2, 1)));
+    let bullets = edit.toggle_list(false);
+    assert_eq!(kinds(&bullets), [BULLET, ParaKind::Bullet { level: 2 }, BULLET, BODY]);
+    assert_eq!(texts(&bullets), ["a", "b", "c", "d"]);
+    assert_eq!(bullets.selection, edit.selection, "the selection stays");
+    // All of them bullets already: they go back to body paragraphs.
+    assert_eq!(kinds(&bullets.toggle_list(false)), [BODY, BODY, BODY, BODY]);
+    // Bullets numbered keep their levels; one paragraph not yet numbered numbers them all.
+    let numbered = bullets.toggle_list(true);
+    assert_eq!(kinds(&numbered), [NUMBERED, two, NUMBERED, BODY]);
+    let mixed = at(vec![para(NUMBERED, "a"), body("b")], range(pos(0, 0), pos(1, 0))).toggle_list(true);
+    assert_eq!(kinds(&mixed), [NUMBERED, NUMBERED]);
+}
+
+#[test]
+fn toggle_list_with_a_caret_changes_its_paragraph_and_keeps_a_chosen_style() {
+    let edit = at(vec![body("a"), body("b")], caret(1, 1)).toggle(StyleBit::Bold);
+    let listed = edit.toggle_list(false);
+    assert_eq!(kinds(&listed), [BODY, BULLET]);
+    assert_eq!(listed.typing_style, edit.typing_style, "what's typed next is still bold");
+    assert_eq!(kinds(&at(Vec::new(), caret(0, 0)).toggle_list(true)), Vec::<ParaKind>::new());
+}
+
 // Selecting and moving.
 
 #[test]

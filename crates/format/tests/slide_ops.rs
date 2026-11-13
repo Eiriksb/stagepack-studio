@@ -220,6 +220,102 @@ fn removing_a_setting_takes_its_whole_line() {
     });
 }
 
+/// `src` with region `region` of slide `slide` aligned `align`.
+fn region_aligned(src: &str, slide: usize, region: &str, align: &str) -> String {
+    let change = set_align(&parse_talk(src), slide, &FlowPlace::Region(region.to_string()), align).unwrap();
+    applied(src, &change)
+}
+
+fn region_line(src: &str, slide: usize, region: &str) -> Option<String> {
+    let talk = parse_talk(src);
+    let settings = talk.slides[slide].settings.as_ref()?;
+    settings.get(&format!("region.{region}")).map(str::to_string)
+}
+
+#[test]
+fn a_region_is_aligned_on_a_settings_line_added_to_a_slide_with_none() {
+    on_both(|e| {
+        let src = e("# A\n---\n# B\n\nText\n");
+        let aligned = region_aligned(&src, 1, "body", "center");
+        assert_eq!(aligned, e("# A\n---\nregion.body: align=center\n---\n# B\n\nText\n"));
+        assert_eq!(region_line(&aligned, 1, "body").as_deref(), Some("align=center"));
+        assert_eq!(parse_talk(&aligned).slides.len(), 2);
+
+        let src = e("# A\n\nText\n");
+        assert_eq!(region_aligned(&src, 0, "body", "right"), e("---\nregion.body: align=right\n---\n# A\n\nText\n"));
+    });
+}
+
+#[test]
+fn a_region_is_aligned_after_a_byte_order_mark() {
+    on_both(|e| {
+        let src = format!("\u{feff}{}", e("# A\n\nText\n"));
+        let aligned = region_aligned(&src, 0, "title", "center");
+        assert_eq!(aligned, format!("\u{feff}{}", e("---\nregion.title: align=center\n---\n# A\n\nText\n")));
+        assert_eq!(region_line(&aligned, 0, "title").as_deref(), Some("align=center"));
+    });
+}
+
+#[test]
+fn a_first_slides_alignment_goes_beside_the_talks_settings() {
+    on_both(|e| {
+        let src = e("---\ntitle: T\ncolor.text: #112233\n---\n# A\n");
+        let aligned = region_aligned(&src, 0, "title", "right");
+        assert_eq!(aligned, e("---\ntitle: T\ncolor.text: #112233\nregion.title: align=right\n---\n# A\n"));
+        let talk = parse_talk(&aligned);
+        let settings = talk.slides[0].settings.as_ref().unwrap();
+        assert_eq!((settings.get("title"), settings.get("color.text")), (Some("T"), Some("#112233")));
+    });
+}
+
+#[test]
+fn an_alignment_already_given_is_changed_and_the_lines_other_values_stay() {
+    on_both(|e| {
+        let src = e("# A\n---\nregion.body: x=100  align=left w=800\nhidden: true\n---\n# B\n");
+        assert_eq!(region_aligned(&src, 1, "body", "center"), e("# A\n---\nregion.body: x=100  align=center w=800\nhidden: true\n---\n# B\n"));
+        // Only the first, which is the one that counts.
+        let src = e("---\nregion.body: align=left align=right\n---\n# B\n");
+        assert_eq!(region_aligned(&src, 0, "body", "center"), e("---\nregion.body: align=center align=right\n---\n# B\n"));
+        // A line without one has it added at its end, after what else it says.
+        let src = e("---\nregion.body: x=100 click=1\n---\n# B\n");
+        assert_eq!(region_aligned(&src, 0, "body", "right"), e("---\nregion.body: x=100 click=1 align=right\n---\n# B\n"));
+        let src = e("---\nregion.body:\n---\n# B\n");
+        assert_eq!(region_aligned(&src, 0, "body", "right"), e("---\nregion.body: align=right\n---\n# B\n"));
+        // One given with no value takes one.
+        let src = e("---\nregion.body: align= x=3\n---\n# B\n");
+        assert_eq!(region_aligned(&src, 0, "body", "left"), e("---\nregion.body: align=left x=3\n---\n# B\n"));
+    });
+}
+
+#[test]
+fn aligning_as_it_is_already_changes_nothing() {
+    let src = "---\nregion.body: align=center\n---\n# B\n";
+    let change = set_align(&parse_talk(src), 0, &FlowPlace::Region("body".into()), "center").unwrap();
+    assert!(change.is_empty());
+    let src = "<Text x=\"1\" align=\"right\">\n\nHi\n\n</Text>\n";
+    let talk = parse_talk(src);
+    let place = text_flows(&talk, 0)[0].place.clone();
+    assert!(set_align(&talk, 0, &place, "right").unwrap().is_empty());
+}
+
+#[test]
+fn a_box_is_aligned_by_its_own_attribute() {
+    on_both(|e| {
+        let src = e("# A\n\n<Text x=\"10\" y=\"20\">\n\nHi\n\n</Text>\n");
+        let talk = parse_talk(&src);
+        let place = text_flows(&talk, 0).into_iter().find(|flow| matches!(flow.place, FlowPlace::Tag(_))).unwrap().place;
+        let aligned = applied(&src, &set_align(&talk, 0, &place, "center").unwrap());
+        assert_eq!(aligned, e("# A\n\n<Text x=\"10\" y=\"20\" align=\"center\">\n\nHi\n\n</Text>\n"));
+        let talk = parse_talk(&aligned);
+        let place = text_flows(&talk, 0).into_iter().find(|flow| matches!(flow.place, FlowPlace::Tag(_))).unwrap().place;
+        let again = applied(&aligned, &set_align(&talk, 0, &place, "right").unwrap());
+        assert_eq!(again, e("# A\n\n<Text x=\"10\" y=\"20\" align=\"right\">\n\nHi\n\n</Text>\n"));
+        // A box the slide doesn't have.
+        assert_eq!(set_align(&talk, 0, &FlowPlace::Tag(0..1), "left"), None);
+        assert_eq!(set_align(&talk, 5, &FlowPlace::Region("body".into()), "left"), None);
+    });
+}
+
 #[test]
 fn notes_are_added_changed_and_removed() {
     on_both(|e| {

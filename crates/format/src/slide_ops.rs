@@ -15,8 +15,9 @@
 use std::ops::Range;
 
 use crate::attrs::scan_open_tag;
-use crate::edit::{Change, SourceEdit, eol_in, set_setting};
+use crate::edit::{Change, SourceEdit, eol_in, set_attr, set_setting};
 use crate::model::{Block, Notes, Slide, Talk};
+use crate::rich::FlowPlace;
 use crate::parse::parse_talk;
 use crate::notes::escape_notes;
 use crate::settings::parse_entry;
@@ -127,6 +128,52 @@ pub fn remove_setting(source: &str, slide: &Slide, key: &str) -> Option<SourceEd
         String::new()
     };
     Some(SourceEdit { range: start..settings.range.end, text })
+}
+
+/// Aligns the text in `place` on slide `index` `align`, one of `left`, `center` and `right`.
+/// A region's alignment is the `align=` of its `region.<name>` settings line: the first one
+/// there is changed, or one is added at the line's end, or the line, or the settings block,
+/// is added, and whatever else the line says stays. A box's is its own `align` attribute.
+/// Aligning as it is already changes nothing. `None` if the slide, or the box, isn't there.
+pub fn set_align(talk: &Talk, index: usize, place: &FlowPlace, align: &str) -> Option<Change> {
+    let slide = talk.slides.get(index)?;
+    let source = talk.source.as_str();
+    let edit = match place {
+        FlowPlace::Region(region) => set_region_value(source, slide, region, "align", align),
+        FlowPlace::Tag(range) => {
+            let tag = slide.blocks.iter().find_map(|block| match block {
+                Block::Tag(tag) if tag.range == *range => Some(tag),
+                _ => None,
+            })?;
+            (tag.attr("align") != Some(align)).then(|| set_attr(source, tag, "align", align))
+        }
+    };
+    Some(edit.map_or_else(no_change, Change::single))
+}
+
+/// Sets `name=value` on the `region.<region>` settings line of `slide`, as [`set_align`]
+/// does, or `None` if it says that already.
+fn set_region_value(source: &str, slide: &Slide, region: &str, name: &str, value: &str) -> Option<SourceEdit> {
+    let key = format!("region.{region}");
+    let Some(entry) = setting_entry(slide, &key) else {
+        return Some(set_setting(source, slide, &key, &format!("{name}={value}")));
+    };
+    let line = &source[entry.value_range.clone()];
+    let prefix = format!("{name}=");
+    let mut at = 0;
+    for word in line.split_whitespace() {
+        let start = at + line[at..].find(word).unwrap_or(0);
+        at = start + word.len();
+        if let Some(old) = word.strip_prefix(&prefix) {
+            if old == value {
+                return None;
+            }
+            let from = entry.value_range.start + start + prefix.len();
+            return Some(SourceEdit { range: from..from + old.len(), text: value.to_string() });
+        }
+    }
+    let end = entry.value_range.end;
+    Some(SourceEdit { range: end..end, text: format!(" {name}={value}") })
 }
 
 /// Sets what slide `index`'s `<Notes>` hold: the words inside an existing element are

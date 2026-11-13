@@ -22,6 +22,6 @@ pub use rich_edit::{Motion, Pos, Selection, Shared, StyleBit, StyleState, TextEd
 pub use rich_write::{storable, write_flow, write_inline, write_into_region};
 pub use settings::{SettingEntry, Settings};
 pub use slide_ops::{
-    TALK_SETTINGS, delete_slide, duplicate_slide, insert_slide, is_hidden, move_slide, remove_setting, set_hidden, set_notes,
+    TALK_SETTINGS, delete_slide, duplicate_slide, insert_slide, is_hidden, move_slide, remove_setting, set_align, set_hidden, set_notes,
 };
 pub use split::{RawSlide, split_slides};
