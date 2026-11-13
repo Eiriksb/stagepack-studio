@@ -310,6 +310,47 @@ fn a_box_can_be_right_aligned() {
 }
 
 #[test]
+fn each_paragraph_knows_the_size_and_alignment_it_is_drawn_with() {
+    let layout = layout("---\nregion.body: align=center\n---\n\n# T\n\nHi <Text size=\"80\">big</Text>\n\n- item\n");
+    assert_eq!(layout.text_size(0, 0), Some(64.0), "a title");
+    assert_eq!(layout.text_size(1, 0), Some(40.0), "the body, whatever its spans ask for");
+    assert_eq!(layout.text_size(1, 1), Some(40.0), "a list item");
+    assert_eq!(layout.text_size(1, 2), None, "no such paragraph");
+    assert_eq!(layout.text_size(7, 0), None, "no such flow");
+    assert_eq!(layout.align(0), Some(Align::Left));
+    assert_eq!(layout.align(1), Some(Align::Center));
+    assert_eq!(layout.align(2), None);
+    let boxed = self::layout("<Text x=\"100\" y=\"100\" w=\"800\" h=\"200\" align=\"right\">\n\nHi\n\n</Text>\n");
+    assert_eq!(boxed.align(0), Some(Align::Right));
+    let title = self::layout("---\nlayout: title\n---\n\n# Big\n");
+    assert_eq!((title.text_size(0, 0), title.align(0)), (Some(96.0), Some(Align::Center)));
+}
+
+#[test]
+fn a_caret_in_an_empty_region_is_as_tall_as_its_text_where_its_text_starts() {
+    let layout = layout("# Only a title\n");
+    let (rect, _) = layout.placeholder("body").expect("the body is empty");
+    assert_eq!(layout.placeholder_text("body"), Some((40.0, Align::Left)));
+    let caret = layout.placeholder_caret("body").expect("a caret in the body");
+    // As a caret in an empty paragraph typed there would be.
+    let typed = self::layout("# Only a title\n\n- \n");
+    let empty_line = self::caret(&typed, 1, at(0, 0));
+    assert!(near(caret.height, empty_line.height, 0.5), "{caret:?} against {empty_line:?}");
+    assert!(near(caret.x, rect.x, 0.01) && near(caret.top, rect.y, 0.01), "{caret:?}");
+    assert_eq!(caret.rotate, 0.0);
+
+    let centred = self::layout("---\nregion.body: align=center\n---\n\n# T\n");
+    let (rect, _) = centred.placeholder("body").unwrap();
+    assert_eq!(centred.placeholder_text("body"), Some((40.0, Align::Center)));
+    assert!(near(centred.placeholder_caret("body").unwrap().x, rect.x + rect.w / 2.0, 0.01));
+    let title = self::layout("---\nlayout: title\n---\n\nSubtitle\n");
+    assert_eq!(title.placeholder_text("title"), Some((96.0, Align::Center)));
+    let caret = title.placeholder_caret("title").unwrap();
+    assert!(near(caret.height, 120.0, 0.5), "{caret:?}");
+    assert_eq!(layout.placeholder_caret("title"), None, "the title has text");
+}
+
+#[test]
 fn list_markers_are_not_part_of_the_text() {
     let layout = layout("# T\n\n- One\n- Two\n\n1. Three\n");
     for para in 0..3 {

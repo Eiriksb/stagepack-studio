@@ -158,6 +158,7 @@ struct ParaLines {
     /// Where a line with nothing on it starts.
     empty_x: f32,
     size: f32,
+    align: Align,
 }
 
 impl ParaLines {
@@ -202,8 +203,18 @@ pub struct TextLayout {
     frames: Vec<Frame>,
     /// What can't be edited, by layer, and why: innermost first among those that overlap.
     uneditable: Vec<(usize, Rect, &'static str)>,
-    /// The empty regions, their place and turn.
-    placeholders: Vec<(String, Rect, Frame)>,
+    /// The empty regions, their place and turn, and the size and alignment of their text.
+    placeholders: Vec<Placeholder>,
+}
+
+/// An empty region of the slide's layout.
+#[derive(Clone, Debug, PartialEq)]
+struct Placeholder {
+    name: String,
+    rect: Rect,
+    frame: Frame,
+    size: f32,
+    align: Align,
 }
 
 /// `(x, y)` turned by `degrees` around `centre`, as a layer is drawn.
@@ -282,7 +293,7 @@ fn para_lines(drawn: &DrawnText, rect: Rect) -> ParaLines {
         len = 0;
         lines = vec![Line { top: rect.y, height: drawn.size * LINE_HEIGHT, stops: vec![(0, empty_x)] }];
     }
-    ParaLines { lines, len, empty_x, size: drawn.size }
+    ParaLines { lines, len, empty_x, size: drawn.size, align: drawn.align }
 }
 
 impl TextLayout {
@@ -291,7 +302,16 @@ impl TextLayout {
     pub(crate) fn build(talk: &Talk, index: usize, specs: &[LayerSpec], drawn: &[LayerText], empty: &[EmptyRegion]) -> TextLayout {
         let mut layout = TextLayout {
             frames: specs.iter().zip(drawn).map(|(spec, text)| frame_of(spec.rect, spec.rotate, text.whole, text.region)).collect(),
-            placeholders: empty.iter().map(|region| (region.name.to_string(), region.rect, frame_of(region.rect, region.rotate, true, None))).collect(),
+            placeholders: empty
+                .iter()
+                .map(|region| Placeholder {
+                    name: region.name.to_string(),
+                    rect: region.rect,
+                    frame: frame_of(region.rect, region.rotate, true, None),
+                    size: region.size,
+                    align: region.align,
+                })
+                .collect(),
             ..TextLayout::default()
         };
         // Each drawn text by the end of its block and its content, which tell paragraphs apart.
@@ -345,8 +365,45 @@ impl TextLayout {
     /// Where the empty region `region` is, in slide units before its turn, and the degrees it
     /// turns by around its centre: for a caret in it before it holds any text.
     pub fn placeholder(&self, region: &str) -> Option<(Rect, f32)> {
-        let (_, rect, frame) = self.placeholders.iter().find(|(name, ..)| name == region)?;
-        Some((*rect, frame.rotate))
+        let placeholder = self.find_placeholder(region)?;
+        Some((placeholder.rect, placeholder.frame.rotate))
+    }
+
+    fn find_placeholder(&self, region: &str) -> Option<&Placeholder> {
+        self.placeholders.iter().find(|placeholder| placeholder.name == region)
+    }
+
+    /// The size and alignment text typed into the empty region `region` takes, before its
+    /// spans have their say.
+    pub fn placeholder_text(&self, region: &str) -> Option<(f32, Align)> {
+        let placeholder = self.find_placeholder(region)?;
+        Some((placeholder.size, placeholder.align))
+    }
+
+    /// The caret in the empty region `region`, before it holds any text: where its first line
+    /// starts, as tall as that line, held within the region.
+    pub fn placeholder_caret(&self, region: &str) -> Option<CaretRect> {
+        let Placeholder { rect, frame, size, align, .. } = self.find_placeholder(region)?;
+        Some(CaretRect {
+            x: rect.x + align_x(*align, rect.w),
+            top: rect.y,
+            height: (size * LINE_HEIGHT).min(rect.h),
+            rotate: frame.rotate,
+            centre: frame.centre,
+        })
+    }
+
+    /// The size paragraph `para` of flow `flow` is drawn at before its spans have their say:
+    /// what text in it with no size of its own is drawn at. `None` if it isn't placed.
+    pub fn text_size(&self, flow: usize, para: usize) -> Option<f32> {
+        self.find(flow, para).map(|at| self.lines[at].size)
+    }
+
+    /// How flow `flow`'s text is aligned, as its first placed paragraph is. `None` if none of
+    /// it is placed.
+    pub fn align(&self, flow: usize) -> Option<Align> {
+        let at = self.paras.iter().position(|placed| placed.flow == flow)?;
+        Some(self.lines[at].align)
     }
 
     fn find(&self, flow: usize, para: usize) -> Option<usize> {
@@ -425,7 +482,7 @@ impl TextLayout {
                 return Some(hit);
             }
         }
-        for (name, rect, frame) in &self.placeholders {
+        for Placeholder { name, rect, frame, .. } in &self.placeholders {
             if contains(rect, turned(x, y, frame.centre, -frame.rotate)) {
                 return Some(Hit::Placeholder(name.clone()));
             }
