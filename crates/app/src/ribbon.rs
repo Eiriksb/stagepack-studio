@@ -11,6 +11,7 @@ use gpui_kit::component::{
 use gpui_kit::*;
 
 use crate::document::Document;
+use crate::text_tools::TextTools;
 use crate::workspace_view::{
     AddSlide, DeleteSlide, DuplicateSlide, KEY_CONTEXT, NewSlide, Present, Redo, Rehearse, Save,
     ToggleHidden, ToggleMarkdown, ToggleNotes, ToggleSlideList, Undo,
@@ -109,22 +110,34 @@ pub struct Panels {
 
 pub struct Ribbon {
     document: Option<Entity<Document>>,
+    /// The tools for text being typed, on the Home tab.
+    text_tools: Entity<TextTools>,
     tab: RibbonTab,
     panels: Panels,
     _document_changed: Option<Subscription>,
 }
 
 impl Ribbon {
-    pub fn new(document: Option<Entity<Document>>, panels: Panels, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        document: Option<Entity<Document>>,
+        text_tools: Entity<TextTools>,
+        panels: Panels,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let document_changed = document
             .as_ref()
             .map(|document| cx.observe(document, |_, _, cx| cx.notify()));
         Ribbon {
             document,
+            text_tools,
             tab: RibbonTab::default(),
             panels,
             _document_changed: document_changed,
         }
+    }
+
+    pub fn text_tools(&self) -> &Entity<TextTools> {
+        &self.text_tools
     }
 
     pub fn tab(&self) -> RibbonTab {
@@ -237,6 +250,7 @@ impl Ribbon {
                 ],
                 cx,
             ),
+            self.text_tools.clone().into_any_element(),
             group(
                 "History",
                 vec![
@@ -360,7 +374,7 @@ fn dispatch(action: impl Action) -> impl Fn(&ClickEvent, &mut Window, &mut App) 
 }
 
 /// A group of tools with its caption under them.
-fn group(caption: &'static str, tools: Vec<AnyElement>, cx: &App) -> AnyElement {
+pub(crate) fn group(caption: &'static str, tools: Vec<AnyElement>, cx: &App) -> AnyElement {
     v_flex()
         .h_full()
         .px_2()
@@ -382,7 +396,7 @@ fn group(caption: &'static str, tools: Vec<AnyElement>, cx: &App) -> AnyElement 
 }
 
 /// The line between two groups.
-fn divider(cx: &App) -> AnyElement {
+pub(crate) fn divider(cx: &App) -> AnyElement {
     div()
         .flex_none()
         .w(px(1.))

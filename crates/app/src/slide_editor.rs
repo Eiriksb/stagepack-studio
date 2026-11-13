@@ -16,12 +16,15 @@ use std::time::Duration;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use slides_engine::{CaretRect, Hit, LineMove, SelectionRects, TextLayout};
-use slides_format::{Motion, Pos, TextEdit};
+use slides_engine::{Align, CaretRect, Hit, LineMove, SelectionRects, TextLayout};
+use slides_format::{Motion, Pos, StyleBit, TextEdit};
 
 use crate::document::{Document, EditRefused};
 use crate::slide_canvas::{SLIDE_WIDTH, SlideCanvas, letterbox};
 use crate::text_editing::{Composing, EditingText, utf16_slice};
+use crate::text_tools::{
+    SetTextSize, ToggleBold, ToggleBullets, ToggleItalic, ToggleNumbering, ToggleUnderline,
+};
 use crate::workspace_view::CARET_BLINKS_FOR;
 
 pub const SLIDE_EDITOR_ID: &str = "slide-editor";
@@ -40,9 +43,6 @@ const TYPING_PAUSE: Duration = Duration::from_secs(2);
 const CARET_WIDTH: f32 = 2.0;
 /// How big the text being composed is drawn, to the height of the caret.
 const COMPOSITION_TEXT: f32 = 0.7;
-/// How tall the caret is in an empty region before it has a line of its own, in slide units.
-const EMPTY_TITLE_LINE: f32 = 80.0;
-const EMPTY_LINE: f32 = 50.0;
 
 actions!(
     slide_editor,
@@ -117,6 +117,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-m", NoAction, context),
         KeyBinding::new("ctrl-d", NoAction, context),
     ]);
+    crate::text_tools::bind_keys(cx);
 }
 
 /// What the editor tells the window.
@@ -146,6 +147,8 @@ pub struct SlideEditor {
     focus_handle: FocusHandle,
     /// Where the keyboard goes once typing ends: the window's own.
     away: FocusHandle,
+    /// What holds the text tools: the keyboard can go there and typing goes on.
+    tools: FocusHandle,
     /// Whether the caret shows, as it blinks.
     caret_on: bool,
     /// How many more times it blinks before it holds still.
@@ -166,22 +169,34 @@ impl EventEmitter<EditorEvent> for SlideEditor {}
 
 impl SlideEditor {
     /// An editor over `canvas`, typing into `document`. The keyboard goes back to `away`
-    /// once typing ends.
+    /// once typing ends. The keyboard can go to what `tools` holds, the text tools, while
+    /// typing goes on.
     pub fn new(
         document: Option<Entity<Document>>,
         canvas: Entity<SlideCanvas>,
         away: FocusHandle,
+        tools: FocusHandle,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
-        let mut subscriptions =
-            vec![
-                cx.on_focus_out(&focus_handle, window, |this, _, window, cx| {
-                    // The keyboard went elsewhere: what was typed is in the talk, and typing ends.
+        let mut subscriptions = vec![
+            cx.on_focus_out(&focus_handle, window, |this, _, window, cx| {
+                // The keyboard went elsewhere: what was typed is in the talk, and typing ends,
+                // unless it went to the text tools.
+                if !this.tools.contains_focused(window, cx) {
                     this.end_editing(false, window, cx)
-                }),
-            ];
+                }
+            }),
+            cx.on_focus_out(&tools, window, |this, _, window, cx| {
+                // From the text tools the keyboard went on elsewhere than the text.
+                if !this.focus_handle.contains_focused(window, cx)
+                    && !this.tools.contains_focused(window, cx)
+                {
+                    this.end_editing(false, window, cx)
+                }
+            }),
+        ];
         if let Some(document) = &document {
             subscriptions.push(cx.observe_in(document, window, |this, _, window, cx| {
                 this.document_changed(window, cx)
@@ -192,6 +207,7 @@ impl SlideEditor {
             canvas,
             focus_handle,
             away,
+            tools,
             caret_on: true,
             blinks_left: 0,
             blinking: false,
@@ -218,7 +234,8 @@ impl SlideEditor {
     fn document_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let focused = self.focus_handle.is_focused(window);
         if self.is_editing(cx) {
-            if !focused {
+            // A text tool keeps the keyboard until it's done with it.
+            if !focused && !self.tools.contains_focused(window, cx) {
                 self.focus_handle.focus(window, cx);
                 self.wake(cx);
             }
@@ -267,6 +284,33 @@ impl SlideEditor {
     fn apply(&mut self, op: impl FnOnce(&TextEdit) -> TextEdit, cx: &mut Context<Self>) {
         self.run(|document| document.apply_text(op), cx);
         self.typed(cx);
+    }
+
+    /// Makes `op`, one of the text tools', to the text being typed: a step of its own to undo,
+    /// after which typing starts a new one.
+    pub fn format(&mut self, op: impl FnOnce(&TextEdit) -> TextEdit, cx: &mut Context<Self>) {
+        self.wanted_x = None;
+        self.apply(op, cx);
+    }
+
+    /// Aligns the text being typed: all of its region, or its box.
+    pub fn align_text(&mut self, align: Align, cx: &mut Context<Self>) {
+        let align = match align {
+            Align::Left => "left",
+            Align::Center => "center",
+            Align::Right => "right",
+        };
+        self.run(|document| document.align_text(align), cx);
+        self.typed(cx);
+    }
+
+    /// Gives the keyboard back to the text being typed, if any is, as a text tool does once
+    /// it's used.
+    pub fn focus_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_editing(cx) && !self.focus_handle.is_focused(window) {
+            self.focus_handle.focus(window, cx);
+            self.wake(cx);
+        }
     }
 
     /// Puts `text` in place of the selection, as typed. Every character typed comes this way,
@@ -495,6 +539,15 @@ impl SlideEditor {
         }
     }
 
+    /// Makes the paragraphs a list, numbered with `numbered`, or not, as the Bullets and
+    /// Numbering tools do. A title can't be a list.
+    pub fn toggle_list(&mut self, numbered: bool, cx: &mut Context<Self>) {
+        if self.editing(cx).is_some_and(EditingText::is_title) {
+            return;
+        }
+        self.format(|edit| edit.toggle_list(numbered), cx);
+    }
+
     fn edit_with(&mut self, op: fn(&TextEdit) -> TextEdit, cx: &mut Context<Self>) {
         self.wanted_x = None;
         self.apply(op, cx);
@@ -654,22 +707,9 @@ impl SlideEditor {
         if let Some(flow) = flow {
             return layout.caret(flow, pos);
         }
-        // An empty region, before anything is typed: the caret is at its start.
-        let editing = self.editing(cx)?;
-        let region = editing.flow.region()?;
-        let (rect, rotate) = layout.placeholder(region)?;
-        let line = if editing.is_title() {
-            EMPTY_TITLE_LINE
-        } else {
-            EMPTY_LINE
-        };
-        Some(CaretRect {
-            x: rect.x,
-            top: rect.y,
-            height: rect.h.min(line),
-            rotate,
-            centre: (rect.x + rect.w / 2., rect.y + rect.h / 2.),
-        })
+        // An empty region, before anything is typed: the caret is where its text would start.
+        let region = self.editing(cx)?.flow.region()?;
+        layout.placeholder_caret(region)
     }
 
     /// Where the caret at `pos` of the text being typed is in the window.
@@ -978,6 +1018,21 @@ impl Render for SlideEditor {
             .on_action(
                 cx.listener(|this, _: &StopEditing, window, cx| this.end_editing(true, window, cx)),
             )
+            .on_action(cx.listener(|this, _: &ToggleBold, _, cx| {
+                this.format(|edit| edit.toggle(StyleBit::Bold), cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleItalic, _, cx| {
+                this.format(|edit| edit.toggle(StyleBit::Italic), cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleUnderline, _, cx| {
+                this.format(|edit| edit.toggle(StyleBit::Underline), cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleBullets, _, cx| this.toggle_list(false, cx)))
+            .on_action(cx.listener(|this, _: &ToggleNumbering, _, cx| this.toggle_list(true, cx)))
+            .on_action(cx.listener(|this, action: &SetTextSize, _, cx| {
+                let size = action.size;
+                this.format(|edit| edit.set_size(Some(size)), cx)
+            }))
             .child(self.canvas.clone())
             .child(overlay)
             .when_some(caret_box, |this, caret| {

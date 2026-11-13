@@ -35,6 +35,7 @@ use crate::save_flow::{CloseAnswer, Effect, SaveFlow, SaveOutcome};
 use crate::saving::{SaveError, SaveJob, SaveTarget, Saved};
 use crate::slide_canvas::{ScaleChanged, SlideCanvas};
 use crate::slide_editor::{self, EditorEvent, SlideEditor};
+use crate::text_tools::TextTools;
 use crate::slide_strip::{
     self, STRIP_CONTEXT, STRIP_MAX_WIDTH, STRIP_MIN_WIDTH, STRIP_WIDTH, SlideStrip,
 };
@@ -385,9 +386,15 @@ impl WorkspaceView {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
         let document = document.map(|document| cx.new(|_| document));
+        // What holds the text tools, which can have the keyboard while typing goes on.
+        let tools_focus = cx.focus_handle();
         let slide_editor = cx.new(|cx| {
             let canvas = slide_canvas.clone();
-            SlideEditor::new(document.clone(), canvas, focus_handle.clone(), window, cx)
+            let (away, tools) = (focus_handle.clone(), tools_focus.clone());
+            SlideEditor::new(document.clone(), canvas, away, tools, window, cx)
+        });
+        let text_tools = cx.new(|cx| {
+            TextTools::new(document.clone(), slide_editor.clone(), tools_focus, window, cx)
         });
         let editor_events =
             cx.subscribe(&slide_editor, |this, _, event: &EditorEvent, cx| match event {
@@ -399,7 +406,7 @@ impl WorkspaceView {
             slide_list: true,
             markdown: false,
         };
-        let ribbon = cx.new(|cx| Ribbon::new(document.clone(), panels, cx));
+        let ribbon = cx.new(|cx| Ribbon::new(document.clone(), text_tools, panels, cx));
         let slide_strip = cx.new(|cx| SlideStrip::new(document.clone(), cx));
         let notes_panel = cx.new(|cx| NotesPanel::new(document.clone(), window, cx));
         let notes_edited = cx.subscribe_in(

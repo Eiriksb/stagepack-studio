@@ -1711,3 +1711,670 @@ fn replacing_a_range_the_system_names_replaces_exactly_that(cx: &mut TestAppCont
     typing.commit(cx, "words");
     assert_eq!(typing.source(cx), TWO.replacen("Some words", "é words", 1));
 }
+
+/// The text tools on the Home tab.
+mod tools {
+    use super::*;
+    use gpui_kit::component::color_picker::ColorPickerState;
+    use gpui_kit::{ElementId, Hsla, rgb};
+    use slides_format::{Span, Style};
+    use stagepack_studio::text_editing::ALIGN_TEXT;
+    use stagepack_studio::text_tools::{
+        ALIGN_CENTER_ID, ALIGN_LEFT_ID, ALIGN_RIGHT_ID, AUTOMATIC_COLOR_ID, BOLD_ID, BULLETS_ID,
+        COLOR_ID, INDENT_LESS_ID, INDENT_MORE_ID, ITALIC_ID, NUMBERING_ID, SIZE_ID, SIZE_LIST_ID,
+        SetTextSize, TextTools, UNDERLINE_ID, button_id,
+    };
+
+    /// How a tool shows the selection.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Shows {
+        Off,
+        On,
+        Half,
+    }
+
+    /// The talk `source` in a window that's the active one, as a window being used is: the
+    /// keyboard moving from one place to another is heard.
+    fn open(cx: &mut TestAppContext, source: &str) -> Typing {
+        let typing = super::open(cx, source);
+        typing.with_window(cx, |window, _| window.activate_window());
+        typing.settle(cx);
+        typing
+    }
+
+    impl Typing {
+        fn click_on(&self, cx: &mut TestAppContext, id: impl Into<ElementId>) {
+            let id = id.into();
+            self.with_window(cx, |window, cx| {
+                window.render_frame(cx);
+                window.click(id, cx);
+            });
+            self.settle(cx);
+        }
+
+        fn shows(&self, cx: &mut TestAppContext, tool: &'static str) -> Shows {
+            self.with_window(cx, |window, cx| {
+                window.render_frame(cx);
+                let tool = window.find(tool);
+                match (tool.checked(), tool.indeterminate()) {
+                    (_, Some(true)) => Shows::Half,
+                    (Some(true), _) => Shows::On,
+                    _ => Shows::Off,
+                }
+            })
+        }
+
+        fn disabled(&self, cx: &mut TestAppContext, id: impl Into<ElementId>) -> bool {
+            let id = id.into();
+            self.with_window(cx, |window, cx| {
+                window.render_frame(cx);
+                window.find(id).disabled() == Some(true)
+            })
+        }
+
+        /// What the size field shows.
+        fn size_shown(&self, cx: &mut TestAppContext) -> String {
+            self.with_window(cx, |window, cx| {
+                window.render_frame(cx);
+                window.find(SIZE_ID).value().unwrap_or_default().to_string()
+            })
+        }
+
+        fn tools(&self, cx: &TestAppContext) -> Entity<TextTools> {
+            cx.read(|cx| self.view.read(cx).ribbon().read(cx).text_tools().clone())
+        }
+
+        fn picker(&self, cx: &TestAppContext) -> Entity<ColorPickerState> {
+            self.tools(cx).read_with(cx, |tools, _| tools.color_picker().clone())
+        }
+
+        /// The colour the picker shows, and whether it's open.
+        fn picker_shows(&self, cx: &TestAppContext) -> (Option<Hsla>, bool) {
+            self.picker(cx)
+                .read_with(cx, |picker, _| (picker.value(), picker.is_open()))
+        }
+
+        /// Whether the keyboard is with the text being typed.
+        fn text_has_keyboard(&self, cx: &mut TestAppContext) -> bool {
+            let editor = self.editor(cx);
+            self.with_window(cx, |window, cx| editor.read(cx).focus_handle().is_focused(window))
+        }
+
+        /// Selects the word at `offset` of the body's first paragraph on the first slide.
+        fn select_word(&self, cx: &mut TestAppContext, offset: usize) {
+            let at = self.point_of(cx, 1, pos(0, offset));
+            self.clicks(cx, at, 2, Modifiers::default());
+        }
+
+        /// The spans of flow `flow`'s paragraph `para` on the first slide.
+        fn spans(&self, cx: &TestAppContext, flow: usize, para: usize) -> Vec<Span> {
+            self.flows(cx, 0)[flow].paras[para].spans.clone()
+        }
+
+        fn undo_label(&self, cx: &TestAppContext) -> Option<&'static str> {
+            self.document(cx).read_with(cx, |document, _| document.undo_label())
+        }
+
+        /// Picks `color` in the colour picker, as a click on one of its swatches does.
+        fn pick(&self, cx: &mut TestAppContext, color: Hsla) {
+            let picker = self.picker(cx);
+            self.with_window(cx, |window, cx| {
+                picker.update(cx, |picker, cx| picker.select_color(color, window, cx))
+            });
+            self.settle(cx);
+        }
+    }
+
+    fn span(text: &str, style: Style) -> Span {
+        Span {
+            text: text.to_string(),
+            style,
+        }
+    }
+
+    fn bold() -> Style {
+        Style {
+            bold: true,
+            ..Style::default()
+        }
+    }
+
+    /// Selects "words", then gives it a style twice: by `tool` and by `key`, each once on and
+    /// once off again, checking the source and the button each time.
+    fn styles_by_button_and_by_key(
+        cx: &mut TestAppContext,
+        tool: &'static str,
+        key: &str,
+        on: &str,
+        style: Style,
+    ) {
+        let typing = open(cx, TWO);
+        typing.select_word(cx, 6);
+        assert_eq!(typing.shows(cx, tool), Shows::Off);
+        let styled = TWO.replacen("words", on, 1);
+        for by_key in [false, true] {
+            if by_key {
+                typing.press(cx, key);
+            } else {
+                typing.click_on(cx, tool);
+            }
+            assert_eq!(typing.source(cx), styled, "by key: {by_key}");
+            assert_eq!(
+                typing.spans(cx, 1, 0),
+                [
+                    span("Some ", Style::default()),
+                    span("words", style.clone()),
+                    span(" here", Style::default())
+                ]
+            );
+            assert_eq!(typing.shows(cx, tool), Shows::On);
+            assert_eq!(typing.selection(cx).start(), pos(0, 5), "the words stay selected");
+            assert_eq!(typing.selection(cx).end(), pos(0, 10));
+            if by_key {
+                typing.click_on(cx, tool);
+            } else {
+                typing.press(cx, key);
+            }
+            assert_eq!(typing.source(cx), TWO);
+            assert_eq!(typing.shows(cx, tool), Shows::Off);
+        }
+    }
+
+    #[gpui_kit::test]
+    fn bold_makes_the_selected_words_bold_and_the_button_shows_it(cx: &mut TestAppContext) {
+        styles_by_button_and_by_key(cx, BOLD_ID, "ctrl-b", "**words**", bold());
+    }
+
+    #[gpui_kit::test]
+    fn italic_makes_the_selected_words_italic_and_the_button_shows_it(cx: &mut TestAppContext) {
+        let italic = Style {
+            italic: true,
+            ..Style::default()
+        };
+        styles_by_button_and_by_key(cx, ITALIC_ID, "ctrl-i", "*words*", italic);
+    }
+
+    #[gpui_kit::test]
+    fn underline_underlines_the_selected_words_and_the_button_shows_it(cx: &mut TestAppContext) {
+        let underline = Style {
+            underline: true,
+            ..Style::default()
+        };
+        styles_by_button_and_by_key(
+            cx,
+            UNDERLINE_ID,
+            "ctrl-u",
+            "<Text underline=\"true\">words</Text>",
+            underline,
+        );
+    }
+
+    #[gpui_kit::test]
+    fn a_style_change_is_a_step_of_its_own_and_typing_after_it_another(cx: &mut TestAppContext) {
+        let typing = open(cx, TWO);
+        typing.click_text(cx, 1, pos(0, 4));
+        typing.type_text(cx, "ab");
+        typing.select_word(cx, 8);
+        typing.press(cx, "ctrl-b");
+        assert_eq!(typing.undo_label(cx), Some("Format text"));
+        typing.click_text(cx, 1, pos(0, 0));
+        typing.type_text(cx, "X");
+        typing.press(cx, "ctrl-z");
+        assert_eq!(typing.source(cx), TWO.replacen("Some words", "Someab **words**", 1));
+        typing.press(cx, "ctrl-z");
+        assert_eq!(typing.source(cx), TWO.replacen("Some words", "Someab words", 1));
+        typing.press(cx, "ctrl-z");
+        assert_eq!(typing.source(cx), TWO);
+    }
+
+    #[gpui_kit::test]
+    fn a_mixed_selection_shows_half_pressed(cx: &mut TestAppContext) {
+        let typing = open(cx, TWO);
+        typing.select_word(cx, 6);
+        typing.press(cx, "ctrl-b");
+        // From the start of "Some" to the end of "words": some of it bold, some not.
+        let start = typing.point_of(cx, 1, pos(0, 0));
+        let end = typing.point_of(cx, 1, pos(0, 10));
+        typing.click(cx, start);
+        typing.clicks(cx, end, 1, Modifiers::shift());
+        assert_eq!(typing.selection(cx).end(), pos(0, 10));
+        assert_eq!(typing.shows(cx, BOLD_ID), Shows::Half);
+        assert_eq!(typing.shows(cx, ITALIC_ID), Shows::Off);
+        // Bold over a mixed selection makes all of it bold.
+        typing.press(cx, "ctrl-b");
+        assert_eq!(typing.shows(cx, BOLD_ID), Shows::On);
+        assert_eq!(typing.source(cx), TWO.replacen("Some words", "**Some words**", 1));
+    }
+
+    #[gpui_kit::test]
+    fn bold_with_no_selection_applies_to_what_is_typed_next(cx: &mut TestAppContext) {
+        let typing = open(cx, TWO);
+        typing.click_text(cx, 1, pos(0, 15));
+        typing.click_on(cx, BOLD_ID);
+        assert_eq!(typing.source(cx), TWO, "nothing to make bold yet");
+        assert_eq!(typing.shows(cx, BOLD_ID), Shows::On, "what's typed next is bold");
+        typing.type_text(cx, " too");
+        assert_eq!(
+            typing.spans(cx, 1, 0),
+            [span(WORDS, Style::default()), span(" too", bold())]
+        );
+        // Moving the caret forgets it.
+        typing.click_text(cx, 1, pos(0, 4));
+        typing.press(cx, "ctrl-b");
+        typing.press(cx, "right");
+        assert_eq!(typing.shows(cx, BOLD_ID), Shows::Off);
+    }
+
+    #[gpui_kit::test]
+    fn choosing_a_size_changes_only_the_selected_words(cx: &mut TestAppContext) {
+        let typing = open(cx, TWO);
+        typing.select_word(cx, 6);
+        assert_eq!(typing.size_shown(cx), "40", "the body's own size");
+        // The list opens, and typing goes on while it's open.
+        typing.click_on(cx, SIZE_LIST_ID);
+        assert!(typing.editing(cx).is_some());
+        typing.press(cx, "escape");
+        assert!(typing.editing(cx).is_some(), "Escape closes the list, not the typing");
+        assert!(typing.text_has_keyboard(cx));
+        // A size from the list is given as the list gives it.
+        typing.with_window(cx, |window, cx| {
+            window.dispatch_action(Box::new(SetTextSize { size: 64 }), cx)
+        });
+        typing.settle(cx);
+        assert_eq!(
+            typing.source(cx),
+            TWO.replacen("words", "<Text size=\"64\">words</Text>", 1)
+        );
+        assert_eq!(typing.size_shown(cx), "64");
+        assert_eq!(typing.selection(cx).start(), pos(0, 5));
+        typing.click_text(cx, 1, pos(0, 2));
+        assert_eq!(typing.size_shown(cx), "40", "the words around it keep theirs");
+    }
+
+    #[gpui_kit::test]
+    fn the_size_shown_is_what_is_drawn(cx: &mut TestAppContext) {
+        let typing = open(cx, TWO);
+        typing.click_text(cx, 0, pos(0, 2));
+        assert_eq!(typing.size_shown(cx), "64", "the title's size");
+        typing.click_text(cx, 1, pos(0, 2));
+        assert_eq!(typing.size_shown(cx), "40");
+        // Over words of two sizes, it's empty.
+        typing.select_word(cx, 6);
+        typing.with_window(cx, |window, cx| {
+            window.dispatch_action(Box::new(SetTextSize { size: 64 }), cx)
+        });
+        typing.settle(cx);
+        let start = typing.point_of(cx, 1, pos(0, 0));
+        typing.click(cx, start);
+        let end = typing.point_of(cx, 1, pos(0, 10));
+        typing.clicks(cx, end, 1, Modifiers::shift());
+        assert_eq!(typing.size_shown(cx), "");
+        // Words given the size their region draws them at already are all one size.
+        typing.select_word(cx, 0);
+        typing.with_window(cx, |window, cx| {
+            window.dispatch_action(Box::new(SetTextSize { size: 40 }), cx)
+        });
+        typing.settle(cx);
+        let start = typing.point_of(cx, 1, pos(0, 0));
+        typing.click(cx, start);
+        let space = typing.point_of(cx, 1, pos(0, 5));
+        typing.clicks(cx, space, 1, Modifiers::shift());
+        assert_eq!(typing.size_shown(cx), "40");
+    }
+
+    /// Types `size` into the size field, and presses Enter.
+    fn type_size(typing: &Typing, cx: &mut TestAppContext, size: &str) {
+        typing.click_on(cx, SIZE_ID);
+        assert!(!typing.text_has_keyboard(cx), "the field has the keyboard");
+        assert!(typing.editing(cx).is_some(), "typing goes on");
+        typing.press(cx, "ctrl-a");
+        typing.type_text(cx, size);
+        typing.press(cx, "enter");
+    }
+
+    #[gpui_kit::test]
+    fn typing_a_size_and_pressing_enter_applies_it(cx: &mut TestAppContext) {
+        let typing = open(cx, TWO);
+        typing.select_word(cx, 6);
+        let selected = typing.selection(cx);
+        type_size(&typing, cx, "57");
+        assert_eq!(
+            typing.source(cx),
+            TWO.replacen("words", "<Text size=\"57\">words</Text>", 1)
+        );
+        assert!(typing.text_has_keyboard(cx), "the keyboard is back with the text");
+        assert_eq!(typing.selection(cx), selected, "and so is the selection");
+        assert_eq!(typing.size_shown(cx), "57");
+        // Typing goes on, over the selection.
+        typing.type_text(cx, "terms");
+        assert!(typing.source(cx).contains("<Text size=\"57\">terms</Text>"));
+    }
+
+    #[gpui_kit::test]
+    fn escape_in_the_size_field_goes_back_to_the_text_as_it_was(cx: &mut TestAppContext) {
+        let typing = open(cx, TWO);
+        typing.select_word(cx, 6);
+        let selected = typing.selection(cx);
+        typing.click_on(cx, SIZE_ID);
+        typing.press(cx, "ctrl-a");
+        typing.type_text(cx, "90");
+        typing.press(cx, "escape");
+        assert_eq!(typing.source(cx), TWO);
+        assert!(typing.text_has_keyboard(cx));
+        assert_eq!(typing.selection(cx), selected);
+        assert_eq!(typing.size_shown(cx), "40", "the field shows the size again");
+        // Something that isn't a number changes nothing either.
+        type_size(&typing, cx, "big");
+        assert_eq!(typing.source(cx), TWO);
+        assert!(typing.text_has_keyboard(cx));
+    }
+
+    #[gpui_kit::test]
+    fn leaving_the_size_field_for_elsewhere_ends_the_typing(cx: &mut TestAppContext) {
+        let typing = open(cx, TWO);
+        typing.select_word(cx, 6);
+        typing.click_on(cx, SIZE_ID);
+        assert!(typing.editing(cx).is_some());
+        let strip = cx.read(|cx| typing.view.read(cx).slide_strip().clone());
+        typing.with_window(cx, |window, cx| {
+            let focus = strip.read(cx).focus_handle().clone();
+            window.focus(&focus, cx);
+        });
+        typing.settle(cx);
+        assert!(typing.editing(cx).is_none());
+    }
+
+    #[gpui_kit::test]
+    fn a_size_out_of_range_is_held_to_the_limits(cx: &mut TestAppContext) {
+        let typing = open(cx, TWO);
+        typing.select_word(cx, 6);
+        type_size(&typing, cx, "9000");
+        assert_eq!(
+            typing.source(cx),
+            TWO.replacen("words", "<Text size=\"512\">words</Text>", 1)
+        );
+        type_size(&typing, cx, "0");
+        assert_eq!(
+            typing.source(cx),
+            TWO.replacen("words", "<Text size=\"1\">words</Text>", 1)
+        );
+        type_size(&typing, cx, "-20");
+        assert!(typing.source(cx).contains("<Text size=\"1\">words</Text>"));
+        type_size(&typing, cx, "31.6");
+        assert!(typing.source(cx).contains("<Text size=\"32\">words</Text>"));
+    }
+
+    fn red() -> Hsla {
+        rgb(0xff0000).into()
+    }
+
+    #[gpui_kit::test]
+    fn choosing_a_colour_changes_the_selected_words(cx: &mut TestAppContext) {
+        let typing = open(cx, TWO);
+        typing.select_word(cx, 6);
+        let selected = typing.selection(cx);
+        typing.click_on(cx, COLOR_ID);
+        assert!(typing.picker_shows(cx).1, "the picker opens");
+        assert!(typing.editing(cx).is_some(), "typing goes on while it's open");
+        typing.pick(cx, red());
+        assert_eq!(
+            typing.source(cx),
+            TWO.replacen("words", "<Text color=\"#ff0000\">words</Text>", 1)
+        );
+        assert!(typing.text_has_keyboard(cx), "the keyboard is back with the text");
+        assert_eq!(typing.selection(cx), selected);
+        assert_eq!(typing.picker_shows(cx).0, Some(red()));
+        // Elsewhere, the picker shows no colour of the text's own.
+        typing.click_text(cx, 1, pos(0, 2));
+        assert_eq!(typing.picker_shows(cx).0, None);
+    }
+
+    #[gpui_kit::test]
+    fn the_picker_offers_the_talks_own_colours_first(cx: &mut TestAppContext) {
+        let source = "---\ncolor.text: #112233\ncolor.accent: #445566\n---\n\n# T\n\nWords\n";
+        let typing = open(cx, source);
+        let tools = typing.tools(cx);
+        let offered = cx.read(|cx| tools.read(cx).featured_colors(cx));
+        let theirs: Vec<Hsla> = [0x112233, 0x445566, 0xffffff].map(|color| rgb(color).into()).into();
+        assert_eq!(offered, theirs, "its text, accent and background");
+        typing.select_word(cx, 2);
+        typing.click_on(cx, COLOR_ID);
+        assert!(typing.picker_shows(cx).1);
+        typing.pick(cx, offered[1]);
+        assert!(typing.source(cx).contains("<Text color=\"#445566\">Words</Text>"), "{}", typing.source(cx));
+    }
+
+    #[gpui_kit::test]
+    fn automatic_clears_the_colour(cx: &mut TestAppContext) {
+        let coloured = TWO.replacen("words", "<Text color=\"#ff0000\">words</Text>", 1);
+        let typing = open(cx, &coloured);
+        typing.select_word(cx, 6);
+        assert_eq!(typing.picker_shows(cx).0, Some(red()));
+        typing.click_on(cx, AUTOMATIC_COLOR_ID);
+        assert_eq!(typing.source(cx), TWO);
+        assert!(typing.text_has_keyboard(cx));
+        assert_eq!(typing.picker_shows(cx).0, None);
+    }
+
+    #[gpui_kit::test]
+    fn the_markdown_for_a_red_bold_word_is_what_the_design_shows(cx: &mut TestAppContext) {
+        let typing = open(cx, TWO);
+        typing.select_word(cx, 6);
+        typing.click_on(cx, BOLD_ID);
+        typing.click_on(cx, COLOR_ID);
+        typing.pick(cx, red());
+        let source = typing.source(cx);
+        let either = [
+            TWO.replacen("words", "<Text color=\"#ff0000\">**words**</Text>", 1),
+            TWO.replacen("words", "**<Text color=\"#ff0000\">words</Text>**", 1),
+        ];
+        assert!(either.contains(&source), "{source}");
+        let red_bold = Style {
+            bold: true,
+            color: Some("#ff0000".to_string()),
+            ..Style::default()
+        };
+        assert_eq!(typing.spans(cx, 1, 0)[1], span("words", red_bold));
+    }
+
+    fn kinds(typing: &Typing, cx: &TestAppContext, flow: usize) -> Vec<ParaKind> {
+        typing.flows(cx, 0)[flow].paras.iter().map(|para| para.kind).collect()
+    }
+
+    const LINES: &str = "# T\n\nOne\n\nTwo\n";
+
+    /// Selects from the start of the body's first paragraph to the end of its second.
+    fn select_both(typing: &Typing, cx: &mut TestAppContext) {
+        let start = typing.point_of(cx, 1, pos(0, 0));
+        typing.click(cx, start);
+        let end = typing.point_of(cx, 1, pos(1, 3));
+        typing.clicks(cx, end, 1, Modifiers::shift());
+    }
+
+    #[gpui_kit::test]
+    fn bullets_turn_the_paragraphs_into_a_list_and_back(cx: &mut TestAppContext) {
+        let typing = open(cx, LINES);
+        select_both(&typing, cx);
+        typing.click_on(cx, BULLETS_ID);
+        assert_eq!(typing.source(cx), "# T\n\n- One\n\n- Two\n");
+        let bullet = ParaKind::Bullet { level: 0 };
+        assert_eq!(kinds(&typing, cx, 1), [bullet, bullet]);
+        assert_eq!(typing.shows(cx, BULLETS_ID), Shows::On);
+        assert_eq!(typing.shows(cx, NUMBERING_ID), Shows::Off);
+        typing.click_on(cx, BULLETS_ID);
+        assert_eq!(kinds(&typing, cx, 1), [ParaKind::Body, ParaKind::Body]);
+        assert_eq!(typing.source(cx), LINES);
+        assert_eq!(typing.shows(cx, BULLETS_ID), Shows::Off);
+        assert!(typing.editing(cx).is_some());
+    }
+
+    #[gpui_kit::test]
+    fn numbering_numbers_them(cx: &mut TestAppContext) {
+        let typing = open(cx, "# T\n\n- One\n\nTwo\n");
+        select_both(&typing, cx);
+        assert_eq!(typing.shows(cx, BULLETS_ID), Shows::Half);
+        typing.click_on(cx, NUMBERING_ID);
+        let numbered = ParaKind::Numbered { level: 0 };
+        assert_eq!(kinds(&typing, cx, 1), [numbered, numbered]);
+        assert!(typing.source(cx).starts_with("# T\n\n1. One\n"), "{}", typing.source(cx));
+        assert_eq!(typing.shows(cx, NUMBERING_ID), Shows::On);
+        assert_eq!(typing.shows(cx, BULLETS_ID), Shows::Off);
+    }
+
+    #[gpui_kit::test]
+    fn indent_more_and_less(cx: &mut TestAppContext) {
+        let typing = open(cx, "# T\n\n- One\n- Two\n");
+        typing.click_text(cx, 1, pos(1, 1));
+        typing.click_on(cx, INDENT_MORE_ID);
+        let bullet = |level| ParaKind::Bullet { level };
+        assert_eq!(kinds(&typing, cx, 1), [bullet(0), bullet(1)]);
+        assert_eq!(typing.source(cx), "# T\n\n- One\n  - Two\n");
+        typing.click_on(cx, INDENT_LESS_ID);
+        assert_eq!(kinds(&typing, cx, 1), [bullet(0), bullet(0)]);
+        assert_eq!(typing.source(cx), "# T\n\n- One\n- Two\n");
+        assert_eq!(typing.selection(cx), caret_at(pos(1, 1)));
+    }
+
+    #[gpui_kit::test]
+    fn a_title_cannot_be_made_a_list(cx: &mut TestAppContext) {
+        let typing = open(cx, TWO);
+        typing.click_text(cx, 0, pos(0, 2));
+        for tool in [BULLETS_ID, NUMBERING_ID] {
+            assert!(typing.disabled(cx, button_id(tool)), "{tool}");
+        }
+        assert!(!typing.disabled(cx, button_id(BOLD_ID)));
+        assert!(!typing.disabled(cx, ALIGN_CENTER_ID));
+        // Nor by a key that's sent all the same.
+        typing.with_window(cx, |window, cx| {
+            window.dispatch_action(Box::new(stagepack_studio::text_tools::ToggleBullets), cx)
+        });
+        typing.settle(cx);
+        assert_eq!(typing.source(cx), TWO);
+        typing.click_text(cx, 1, pos(0, 2));
+        assert!(!typing.disabled(cx, button_id(BULLETS_ID)));
+    }
+
+    #[gpui_kit::test]
+    fn centre_centres_the_whole_region_and_one_undo_puts_it_back(cx: &mut TestAppContext) {
+        let typing = open(cx, "---\ntitle: T\n---\n\n# Hello\n\nOne\n\nTwo\n");
+        typing.click_text(cx, 1, pos(1, 2));
+        assert_eq!(typing.shows(cx, ALIGN_LEFT_ID), Shows::On);
+        let before = typing.layout(cx).caret(1, pos(0, 0)).unwrap().x;
+        typing.click_on(cx, ALIGN_CENTER_ID);
+        let centred = "---\ntitle: T\nregion.body: align=center\n---\n\n# Hello\n\nOne\n\nTwo\n";
+        assert_eq!(typing.source(cx), centred);
+        assert_eq!(typing.shows(cx, ALIGN_CENTER_ID), Shows::On);
+        assert_eq!(typing.shows(cx, ALIGN_LEFT_ID), Shows::Off);
+        assert_eq!(typing.undo_label(cx), Some(ALIGN_TEXT));
+        // Both paragraphs of the region moved, the title didn't.
+        let layout = typing.layout(cx);
+        assert!(layout.caret(1, pos(0, 0)).unwrap().x > before + 100.);
+        assert!(layout.caret(1, pos(1, 0)).unwrap().x > before + 100.);
+        assert!((layout.caret(0, pos(0, 0)).unwrap().x - 100.).abs() < 1.);
+        // Typing goes on where it was.
+        assert_eq!(typing.selection(cx), caret_at(pos(1, 2)));
+        assert!(typing.text_has_keyboard(cx));
+        typing.type_text(cx, "!");
+        assert!(typing.source(cx).contains("\nTw!o\n"));
+        typing.press(cx, "ctrl-z");
+        assert_eq!(typing.source(cx), centred);
+        typing.press(cx, "ctrl-z");
+        assert_eq!(typing.source(cx), "---\ntitle: T\n---\n\n# Hello\n\nOne\n\nTwo\n");
+        assert_eq!(typing.selection(cx), caret_at(pos(1, 2)), "and typing goes on there");
+        // Right, then left again, on the same line.
+        typing.click_on(cx, ALIGN_RIGHT_ID);
+        typing.click_on(cx, ALIGN_LEFT_ID);
+        assert_eq!(
+            typing.source(cx),
+            "---\ntitle: T\nregion.body: align=left\n---\n\n# Hello\n\nOne\n\nTwo\n"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn a_box_is_aligned_by_its_own_attribute(cx: &mut TestAppContext) {
+        let source = "# T\n\n<Text x=\"100\" y=\"400\" w=\"800\" h=\"200\">\n\nHi\n\n</Text>\n";
+        let typing = open(cx, source);
+        typing.click_text(cx, 1, pos(0, 1));
+        // What the system was composing is dropped first, as before any other change.
+        typing.compose(cx, "´");
+        typing.click_on(cx, ALIGN_RIGHT_ID);
+        assert_eq!(typing.composing(cx), None);
+        assert_eq!(
+            typing.source(cx),
+            source.replace("h=\"200\">", "h=\"200\" align=\"right\">")
+        );
+        assert_eq!(typing.shows(cx, ALIGN_RIGHT_ID), Shows::On);
+        assert!(typing.editing(cx).is_some());
+    }
+
+    #[gpui_kit::test]
+    fn an_empty_region_is_aligned_before_anything_is_typed(cx: &mut TestAppContext) {
+        let typing = open(cx, TWO);
+        typing.with_window(cx, |window, cx| window.press("right", cx));
+        typing.settle(cx);
+        assert_eq!(typing.current(cx), 1);
+        let at = typing.placeholder_point(cx, "body");
+        typing.click(cx, at);
+        let left = typing.caret(cx).expect("a caret in the empty region");
+        // As tall as a line of the region's text, which is 40 high.
+        let unit = f32::from(typing.slide_bounds(cx).size.width) / 1920.;
+        let height = f32::from(left.size.height) / unit;
+        assert!((height - 50.).abs() < 1., "the caret is {height} high");
+        typing.click_on(cx, ALIGN_CENTER_ID);
+        assert!(typing.source(cx).ends_with("---\nregion.body: align=center\n---\n\n# Second\n"));
+        let centred = typing.caret(cx).expect("the caret is still there");
+        assert!(centred.origin.x > left.origin.x + px(100.), "{left:?} {centred:?}");
+        typing.type_text(cx, "Middle");
+        assert!(typing.source(cx).contains("Middle"));
+    }
+
+    #[gpui_kit::test]
+    fn the_tools_are_disabled_with_no_text_being_edited(cx: &mut TestAppContext) {
+        let typing = open(cx, TWO);
+        for tool in [BOLD_ID, ITALIC_ID, UNDERLINE_ID, BULLETS_ID, NUMBERING_ID] {
+            assert!(typing.disabled(cx, button_id(tool)), "{tool}");
+        }
+        for tool in [
+            SIZE_LIST_ID,
+            AUTOMATIC_COLOR_ID,
+            INDENT_LESS_ID,
+            INDENT_MORE_ID,
+            ALIGN_LEFT_ID,
+            ALIGN_CENTER_ID,
+            ALIGN_RIGHT_ID,
+        ] {
+            assert!(typing.disabled(cx, tool), "{tool}");
+        }
+        assert_eq!(typing.size_shown(cx), "");
+        // Their keys do nothing.
+        for key in ["ctrl-b", "ctrl-i", "ctrl-u"] {
+            typing.press(cx, key);
+        }
+        assert_eq!(typing.source(cx), TWO);
+        assert!(!typing.can_undo(cx));
+        // And they come on with typing.
+        typing.click_text(cx, 1, pos(0, 2));
+        assert!(!typing.disabled(cx, button_id(BOLD_ID)));
+        assert!(!typing.disabled(cx, ALIGN_LEFT_ID));
+        typing.press(cx, "escape");
+        assert!(typing.disabled(cx, button_id(BOLD_ID)));
+    }
+
+    #[gpui_kit::test]
+    fn using_a_tool_keeps_the_caret_in_the_text(cx: &mut TestAppContext) {
+        let typing = open(cx, TWO);
+        typing.click_text(cx, 1, pos(0, 4));
+        for tool in [BOLD_ID, ITALIC_ID] {
+            typing.click_on(cx, tool);
+            assert!(typing.text_has_keyboard(cx), "{tool}");
+            assert_eq!(typing.selection(cx), caret_at(pos(0, 4)));
+        }
+        typing.click_on(cx, button_id(BOLD_ID));
+        typing.type_text(cx, "x");
+        assert_eq!(
+            typing.source(cx),
+            TWO.replacen("Some words", "Some*x* words", 1)
+        );
+        assert!(typing.caret(cx).is_some());
+    }
+}

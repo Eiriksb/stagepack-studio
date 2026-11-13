@@ -13,6 +13,8 @@ use crate::history::RunId;
 pub const TYPING: &str = "Typing";
 /// What Undo calls a change to how text looks or what kind of paragraph it is.
 pub const FORMAT_TEXT: &str = "Format text";
+/// What Undo calls aligning a region's or a box's text.
+pub const ALIGN_TEXT: &str = "Align text";
 
 /// What the window says when typing can't be written to the talk.
 pub const COULD_NOT_TYPE: &str = "That couldn't be typed here, so nothing was changed.";

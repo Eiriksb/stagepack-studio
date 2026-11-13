@@ -12,8 +12,8 @@ use slides_engine::{
     read_talk_text,
 };
 use slides_format::{
-    Change, Pos, SourceEdit, Talk, TextEdit, parse_talk, reparse, split_slides, storable,
-    text_flows, write_flow, write_into_region,
+    Change, FlowPlace, Pos, SourceEdit, Talk, TextEdit, parse_talk, reparse, set_align,
+    split_slides, storable, text_flows, write_flow, write_into_region,
 };
 
 use crate::export::ExportInput;
@@ -21,7 +21,7 @@ use crate::history::{History, RunId};
 use crate::present::TalkShape;
 use crate::saving::{SaveJob, SaveTarget, Saved};
 use crate::text_editing::{
-    COULD_NOT_TYPE, Composing, EditingText, FORMAT_TEXT, FlowKey, Kind, TYPING, TextMark,
+    ALIGN_TEXT, COULD_NOT_TYPE, Composing, EditingText, FORMAT_TEXT, FlowKey, Kind, TYPING, TextMark,
     holds_no_words, holds_something, region_has_text,
 };
 
@@ -1069,6 +1069,50 @@ impl Document {
         );
         let run = if typed { self.history.open_run() } else { None };
         self.keep_typed(after, run);
+        Ok(changed)
+    }
+
+    /// Aligns the text being typed `align`, one of `left`, `center` and `right`, and returns the
+    /// slides to show again. It's the whole region the text is in that's aligned, or the whole
+    /// box, as one step to undo, and typing goes on where it was: the paragraphs typed in are as
+    /// they were, only where they're drawn changes. Aligning as it is already changes nothing.
+    pub fn align_text(&mut self, align: &str) -> Result<Vec<usize>, EditRefused> {
+        self.compose(None);
+        let Some(editing) = self.editing.clone() else {
+            return Ok(Vec::new());
+        };
+        let slide = editing.slide;
+        if slide >= self.slide_count() {
+            return Ok(Vec::new());
+        }
+        let change = guarded(|| {
+            let talk = self.talk();
+            let place = match &editing.flow {
+                FlowKey::Region { name, .. } => Some(FlowPlace::Region(name.clone())),
+                FlowKey::Box { .. } => {
+                    let flows = text_flows(talk, slide);
+                    editing.flow.find(&flows).map(|index| flows[index].place.clone())
+                }
+            };
+            place.and_then(|place| set_align(talk, slide, &place, align))
+        })?
+        .ok_or(EditRefused::CouldNotBeMade)?;
+        let depth = self.history.depth();
+        // Not through `make`: the typing isn't finished first, as it goes on.
+        let changed =
+            self.try_make(ALIGN_TEXT, change, Holds::Slide(slide), slide, slide, Join::Alone, None)?;
+        if self.history.depth() > depth {
+            let selection = editing.edit.selection;
+            self.history.mark_last(TextMark {
+                slide,
+                flow: editing.flow,
+                before: selection,
+                after: Some(selection),
+                session: editing.session,
+            });
+        }
+        // What's typed next is a step of its own.
+        self.end_typing_run();
         Ok(changed)
     }
 
