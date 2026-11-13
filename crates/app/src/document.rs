@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use slides_components::Diagnostic;
 use slides_engine::{
-    ComponentInfo, Deck, FolderFiles, Fonts, Layer, LayerTiming, Moment, PackError, Pixmap,
-    SlideTimeline, TalkFiles, TextLayout, Transition, layout_by_name, open_packed,
+    Align, ComponentInfo, Deck, FolderFiles, Fonts, Layer, LayerTiming, Moment, PackError, Pixmap,
+    SlideTimeline, TalkFiles, TextLayout, Transition, layout_by_name, open_packed, text_align,
     read_talk_text,
 };
 use slides_format::{
@@ -1147,11 +1147,11 @@ impl Document {
         Ok(changed)
     }
 
-    /// Aligns the text being typed `align`, one of `left`, `center` and `right`, and returns the
-    /// slides to show again. It's the whole region the text is in that's aligned, or the whole
-    /// box, as one step to undo, and typing goes on where it was: the paragraphs typed in are as
-    /// they were, only where they're drawn changes. Aligning as it is already changes nothing.
-    pub fn align_text(&mut self, align: &str) -> Result<Vec<usize>, EditRefused> {
+    /// Aligns the text being typed `align`, and returns the slides to show again. It's the whole
+    /// region the text is in that's aligned, or the whole box, as one step to undo, and typing
+    /// goes on where it was: the paragraphs typed in are as they were, only where they're drawn
+    /// changes. Aligning as it's set to be aligned already changes nothing and makes no step.
+    pub fn align_text(&mut self, align: Align) -> Result<Vec<usize>, EditRefused> {
         self.compose(None);
         let Some(editing) = self.editing.clone() else {
             return Ok(Vec::new());
@@ -1160,18 +1160,23 @@ impl Document {
         if slide >= self.slide_count() {
             return Ok(Vec::new());
         }
+        let written = match align {
+            Align::Left => "left",
+            Align::Center => "center",
+            Align::Right => "right",
+        };
         let change = guarded(|| {
             let talk = self.talk();
-            let place = match &editing.flow {
-                FlowKey::Region { name, .. } => Some(FlowPlace::Region(name.clone())),
-                FlowKey::Box { .. } => {
-                    let flows = text_flows(talk, slide);
-                    editing.flow.find(&flows).map(|index| flows[index].place.clone())
-                }
-            };
-            place.and_then(|place| set_align(talk, slide, &place, align))
+            let place = typed_place(talk, &editing)?;
+            if text_align(talk, slide, &place) == Some(align) {
+                return Some(Change { edits: Vec::new() });
+            }
+            set_align(talk, slide, &place, written)
         })?
         .ok_or(EditRefused::CouldNotBeMade)?;
+        if change.is_empty() {
+            return Ok(Vec::new());
+        }
         let depth = self.history.depth();
         // Not through `make`: the typing isn't finished first, as it goes on.
         let changed =
@@ -1189,6 +1194,16 @@ impl Document {
         // What's typed next is a step of its own.
         self.end_typing_run();
         Ok(changed)
+    }
+
+    /// How the text being typed is set to be aligned: its region's or its box's alignment, if
+    /// any text is being typed.
+    pub fn text_align(&self) -> Option<Align> {
+        let editing = self.editing.as_ref()?;
+        let talk = self.talk();
+        guarded(|| text_align(talk, editing.slide, &typed_place(talk, editing)?))
+            .ok()
+            .flatten()
     }
 
     /// Shows `composing` in place of the selection of the text being typed, as the system's
@@ -1617,6 +1632,17 @@ fn reads_as_typed(flows: &[slides_format::TextFlow], editing: &EditingText) -> b
 
 /// Whether `a` and `b` are the same kind of place: the same region, or both boxes, whose
 /// ranges move with the text before them.
+/// Where `editing`'s text is on its slide: its region, or the box it's in.
+fn typed_place(talk: &Talk, editing: &EditingText) -> Option<FlowPlace> {
+    match &editing.flow {
+        FlowKey::Region { name, .. } => Some(FlowPlace::Region(name.clone())),
+        FlowKey::Box { .. } => {
+            let flows = text_flows(talk, editing.slide);
+            editing.flow.find(&flows).map(|index| flows[index].place.clone())
+        }
+    }
+}
+
 fn same_place(a: &slides_format::FlowPlace, b: &slides_format::FlowPlace) -> bool {
     use slides_format::FlowPlace::{Region, Tag};
     match (a, b) {

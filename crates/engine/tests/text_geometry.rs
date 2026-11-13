@@ -500,3 +500,23 @@ fn align_where_it_does_nothing_says_so() {
     let (start, end) = (caret(&layout, 1, at(0, 0)), caret(&layout, 1, at(0, 2)));
     assert!(near((start.x + end.x) / 2.0, 960.0, 1.0), "the first align wins");
 }
+
+#[test]
+fn the_alignment_asked_for_is_told_whatever_a_list_is_drawn_at() {
+    let region = |name: &str| FlowPlace::Region(name.to_string());
+    let talk = |source: &str| slides_format::parse_talk(source);
+    let plain = talk("# T\n\n- One\n");
+    assert_eq!(text_align(&plain, 0, &region("body")), Some(Align::Left));
+    assert_eq!(text_align(&plain, 0, &region("left")), None, "no such region in this layout");
+    assert_eq!(text_align(&plain, 3, &region("body")), None, "no such slide");
+    let centred = talk("---\nregion.body: x=10 align=center\n---\n\n# T\n\n- One\n");
+    assert_eq!(text_align(&centred, 0, &region("body")), Some(Align::Center));
+    assert_eq!(text_align(&centred, 0, &region("title")), Some(Align::Left));
+    let title = talk("---\nlayout: title\n---\n\n# Big\n");
+    assert_eq!(text_align(&title, 0, &region("title")), Some(Align::Center), "as the layout has it");
+    let boxes = talk("<Text x=\"1\" align=\"right\">\n\nHi\n\n</Text>\n\n<Text x=\"2\">\n\nHo\n\n</Text>\n");
+    let places: Vec<FlowPlace> = text_flows(&boxes, 0).into_iter().map(|flow| flow.place).collect();
+    assert_eq!(text_align(&boxes, 0, &places[0]), Some(Align::Right));
+    assert_eq!(text_align(&boxes, 0, &places[1]), Some(Align::Left));
+    assert_eq!(text_align(&boxes, 0, &FlowPlace::Tag(0..1)), None);
+}

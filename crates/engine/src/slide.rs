@@ -1,6 +1,6 @@
 //! Puts a parsed slide's content into the regions of its layout.
 
-use slides_format::{Block, Slide, Tag, Talk};
+use slides_format::{Block, FlowPlace, Slide, Tag, Talk};
 use tiny_skia::PathBuilder;
 use toolkit::{Color, Registry, Theme};
 
@@ -303,6 +303,26 @@ fn region_align(slide: &Slide, region: &RegionDef, notices: &mut Vec<Notice>) ->
     let asked = line.split_whitespace().find_map(|pair| pair.strip_prefix("align="));
     let what = format!("The {} region", region.name);
     asked.and_then(|value| read_align(value, &what, notices)).unwrap_or(region.align)
+}
+
+/// How the text in `place` on slide `index` is set to be aligned: a region's as its
+/// `region.<name>` line says or its layout has it, a positioned box's as its `align` says, or
+/// at the left. It's what's asked for, whatever a list in it is drawn at. `None` if the slide
+/// has no such region or box.
+pub fn text_align(talk: &Talk, index: usize, place: &FlowPlace) -> Option<Align> {
+    let slide = talk.slides.get(index)?;
+    let mut notices = Vec::new();
+    match place {
+        FlowPlace::Region(name) => {
+            let layout = slide_layout(slide, &mut notices);
+            let region = layout.regions.iter().find(|region| region.name == name.as_str())?;
+            Some(region_align(slide, region, &mut notices))
+        }
+        FlowPlace::Tag(range) => slide.blocks.iter().find_map(|block| match block {
+            Block::Tag(tag) if tag.range == *range && is_positioned(tag) => Some(TagPlace::of(tag).align.unwrap_or(Align::Left)),
+            _ => None,
+        }),
+    }
 }
 
 /// What the editor shows in an empty region: a dashed outline, and an offer in a muted tint

@@ -12,7 +12,7 @@ use gpui_kit::component::color_picker::{ColorPicker, ColorPickerEvent, ColorPick
 use gpui_kit::component::input::{self, Input, InputEvent, InputState};
 use gpui_kit::component::menu::DropdownMenu as _;
 use gpui_kit::component::{
-    Disableable as _, Icon, IconName, Selectable as _, Sizable as _, h_flex,
+    Disableable as _, Icon, IconName, Selectable as _, Sizable as _, h_flex, tooltip::Tooltip,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -21,7 +21,7 @@ use slides_format::{ParaKind, Shared, StyleBit, TextEdit};
 
 use crate::document::Document;
 use crate::ribbon::{divider, group};
-use crate::slide_editor::{EDITOR_CONTEXT, Indent, Outdent, SlideEditor};
+use crate::slide_editor::{EDITOR_CONTEXT, Indent, Outdent, SlideEditor, only_lists};
 use crate::text_editing::EditingText;
 
 pub const TEXT_TOOLS_ID: &str = "text-tools";
@@ -42,6 +42,9 @@ pub const INDENT_MORE_ID: &str = "indent-more";
 pub const ALIGN_LEFT_ID: &str = "align-left";
 pub const ALIGN_CENTER_ID: &str = "align-center";
 pub const ALIGN_RIGHT_ID: &str = "align-right";
+
+/// What the alignment tools say when the text is all list items.
+pub const LISTS_STAY_LEFT: &str = "Lists stay at the left for now.";
 
 /// The sizes the list offers. Any other from [`MIN_SIZE`] to [`MAX_SIZE`] can be typed in.
 pub const SIZES: [u32; 8] = [18, 24, 32, 40, 48, 64, 80, 96];
@@ -108,6 +111,10 @@ struct Showing {
     bullets: Pressed,
     numbering: Pressed,
     align: Option<Align>,
+    /// Whether the text is all list items, which stay at the left.
+    only_lists: bool,
+    /// Whether any selected paragraph is a list item, which can be indented.
+    any_listed: bool,
 }
 
 /// What the tools show for the text being typed in `document`, if any is.
@@ -167,10 +174,8 @@ fn showing(document: &Entity<Document>, cx: &mut App) -> Option<Showing> {
         };
         Pressed::of(Shared::of_all(kinds.iter().map(is)))
     };
-    let align = match flow {
-        Some(flow) => layout.align(flow),
-        None => placeholder().map(|(_, align)| align),
-    };
+    // As it's set to be, whatever a list in it is drawn at.
+    let align = document.read(cx).text_align();
     Some(Showing {
         title: editing.is_title(),
         bold: Pressed::of(state.bold),
@@ -181,6 +186,10 @@ fn showing(document: &Entity<Document>, cx: &mut App) -> Option<Showing> {
         bullets: listed(false),
         numbering: listed(true),
         align,
+        only_lists: only_lists(&edit.paras),
+        any_listed: kinds
+            .iter()
+            .any(|kind| matches!(kind, ParaKind::Bullet { .. } | ParaKind::Numbered { .. })),
     })
 }
 
@@ -233,9 +242,6 @@ pub struct TextTools {
     focus_handle: FocusHandle,
     size_field: Entity<InputState>,
     color_picker: Entity<ColorPickerState>,
-    /// A colour chosen while the picker is open, by its sliders, to give the text once it
-    /// closes.
-    color_chosen: Option<Hsla>,
     /// The text being typed as the tools last heard of it.
     seen: Option<EditingText>,
     _subscriptions: Vec<Subscription>,
@@ -265,19 +271,21 @@ impl TextTools {
                     let ColorPickerEvent::Change(Some(color)) = event else {
                         return;
                     };
-                    if picker.read(cx).is_open() {
-                        this.color_chosen = Some(*color);
-                    } else {
-                        this.color_chosen = None;
-                        this.give_color(Some(written_color(*color)), cx);
-                    }
+                    let color = written_color(*color);
+                    let open = picker.read(cx).is_open();
+                    this.editor.update(cx, |editor, cx| {
+                        // A drag of the sliders is one change, given once the picker closes,
+                        // however it does: the editor gives it before typing ends, too.
+                        editor.hold_color(color);
+                        if !open {
+                            editor.give_held_color(cx);
+                        }
+                    });
                 },
             ),
             cx.observe(&color_picker, |this, picker, cx| {
-                if !picker.read(cx).is_open()
-                    && let Some(color) = this.color_chosen.take()
-                {
-                    this.give_color(Some(written_color(color)), cx);
+                if !picker.read(cx).is_open() {
+                    this.editor.update(cx, |editor, cx| editor.give_held_color(cx));
                 }
             }),
             // The selection moves with the editor, and the text it's in with the talk. The
@@ -299,7 +307,6 @@ impl TextTools {
             focus_handle,
             size_field,
             color_picker,
-            color_chosen: None,
             seen: None,
             _subscriptions: subscriptions,
         }
@@ -329,15 +336,9 @@ impl TextTools {
         let typed = self.size_field.read(cx).value();
         self.back_to_text(window, cx);
         if let Some(size) = size_typed(&typed) {
-            self.editor.update(cx, |editor, cx| {
-                editor.format(|edit| edit.set_size(Some(size)), cx)
-            });
+            self.editor
+                .update(cx, |editor, cx| editor.set_text_size(size, cx));
         }
-    }
-
-    fn give_color(&mut self, color: Option<String>, cx: &mut Context<Self>) {
-        self.editor
-            .update(cx, |editor, cx| editor.format(|edit| edit.set_color(color), cx));
     }
 
     /// A tool that's on or off, `(id, icon, label)`, showing `pressed`, whose key is `action`'s.
@@ -411,6 +412,8 @@ impl TextTools {
                 })
             });
         let size_field = div()
+            .id("text-size-tool")
+            .tooltip(|window, cx| Tooltip::new("Text size").build(window, cx))
             .w(px(72.))
             // Escape in the field leaves the size as it was, and goes back to the text.
             .capture_action(cx.listener(|this, _: &input::Escape, window, cx| {
@@ -440,6 +443,7 @@ impl TextTools {
             .id(COLOR_ID)
             .test_support()
             .aria_label("Colour")
+            .tooltip(|window, cx| Tooltip::new("Text colour").build(window, cx))
             .child(if editing {
                 ColorPicker::new(&self.color_picker)
                     .featured_colors(self.featured_colors(cx))
@@ -495,25 +499,28 @@ impl TextTools {
     }
 
     fn paragraph_group(&self, showing: Option<&Showing>, cx: &App) -> AnyElement {
-        let editing = showing.is_some();
         // A title is one paragraph, never a list.
         let lists = showing.is_some_and(|showing| !showing.title);
         let pressed = |get: fn(&Showing) -> Pressed| showing.map_or(Pressed::Off, get);
         let align = showing.and_then(|showing| showing.align);
+        // Lists stay at the left, so text that's all list items can't be aligned.
+        let alignable = showing.is_some_and(|showing| !showing.only_lists);
+        let listed = showing.is_some_and(|showing| showing.any_listed);
         let aligner = |this: &Self, id: &'static str, icon: Icons, label: &'static str, to: Align| {
             let on = align == Some(to);
+            let tip = if showing.is_some() && !alignable { LISTS_STAY_LEFT } else { label };
             icon_tool(id, icon, label)
-                .tooltip(label)
+                .tooltip(tip)
                 .selected(on)
                 .toggled(on)
-                .disabled(!editing)
+                .disabled(!alignable)
                 .on_click(this.with_editor(move |editor, cx| editor.align_text(to, cx)))
                 .into_any_element()
         };
         let indent = |this: &Self, id: &'static str, icon: Icons, label: &'static str, action: &dyn Action, more: bool| {
             icon_tool(id, icon, label)
                 .tooltip_with_action(label, action, Some(EDITOR_CONTEXT))
-                .disabled(!lists)
+                .disabled(!lists || !listed)
                 .on_click(this.with_editor(move |editor, cx| {
                     editor.format(if more { TextEdit::indent } else { TextEdit::outdent }, cx)
                 }))

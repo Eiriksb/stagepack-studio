@@ -17,7 +17,7 @@ use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use slides_engine::{Align, CaretRect, Hit, LineMove, SelectionRects, TextLayout};
-use slides_format::{Motion, Para, Pos, Selection, Span, StyleBit, TextEdit};
+use slides_format::{Motion, Para, ParaKind, Pos, Selection, Span, StyleBit, TextEdit};
 
 use crate::clipboard::{self, ClipboardOp, TextPaste};
 use crate::clipboard_tools::{read_clipboard, write_clipboard};
@@ -169,6 +169,8 @@ pub struct SlideEditor {
     wanted_x: Option<f32>,
     /// Whether a press on the text is being dragged, selecting.
     dragging: bool,
+    /// A colour the colour picker's sliders chose, to give the text once the picker closes.
+    held_color: Option<String>,
     /// Where the caret and any composition were last drawn, so that the system's input method
     /// is told when they move, and only then.
     ime_place: Option<ImePlace>,
@@ -253,6 +255,7 @@ impl SlideEditor {
             pause: None,
             wanted_x: None,
             dragging: false,
+            held_color: None,
             ime_place: None,
             _subscriptions: subscriptions,
         }
@@ -333,14 +336,44 @@ impl SlideEditor {
     }
 
     /// Aligns the text being typed: all of its region, or its box.
+    /// Text that's all list items isn't aligned: lists stay at the left.
     pub fn align_text(&mut self, align: Align, cx: &mut Context<Self>) {
-        let align = match align {
-            Align::Left => "left",
-            Align::Center => "center",
-            Align::Right => "right",
-        };
+        if self.editing(cx).is_some_and(|editing| only_lists(&editing.edit.paras)) {
+            return;
+        }
         self.run(|document| document.align_text(align), cx);
         self.typed(cx);
+    }
+
+    /// Gives the selection, or what's typed next, size `size`. Where that's the size its
+    /// paragraphs are drawn at anyway, the text is given no size of its own instead.
+    pub fn set_text_size(&mut self, size: u32, cx: &mut Context<Self>) {
+        let base = self.base_size(cx);
+        let size = (base != Some(size)).then_some(size);
+        self.format(|edit| edit.set_size(size), cx);
+    }
+
+    /// The size the selected paragraphs are drawn at before their spans have their say, if
+    /// it's one size for all of them.
+    fn base_size(&self, cx: &mut Context<Self>) -> Option<u32> {
+        let (_, flow, layout) = self.editing_place(cx)?;
+        let editing = self.editing(cx)?;
+        let selection = editing.edit.selection;
+        let sizes: Vec<Option<f32>> = (selection.start().para..=selection.end().para)
+            .map(|para| match flow {
+                Some(flow) => layout.text_size(flow, para),
+                None => editing
+                    .flow
+                    .region()
+                    .and_then(|region| layout.placeholder_text(region))
+                    .map(|(size, _)| size),
+            })
+            .collect();
+        let first = (*sizes.first()?)?;
+        sizes
+            .iter()
+            .all(|size| *size == Some(first))
+            .then(|| first.round().max(0.0) as u32)
     }
 
     /// Copies, cuts or pastes in the text being typed.
@@ -421,6 +454,19 @@ impl SlideEditor {
     fn drop_composing(&mut self, cx: &mut Context<Self>) {
         if self.editing(cx).is_some_and(|editing| editing.composing.is_some()) {
             self.set_composing(None, cx);
+        }
+    }
+
+    /// Keeps `color` to give the text being typed once the colour picker closes, as its sliders
+    /// choose one after another.
+    pub fn hold_color(&mut self, color: String) {
+        self.held_color = Some(color);
+    }
+
+    /// Gives the text being typed the colour held for it, if one is.
+    pub fn give_held_color(&mut self, cx: &mut Context<Self>) {
+        if let Some(color) = self.held_color.take() {
+            self.format(|edit| edit.set_color(Some(color)), cx);
         }
     }
 
@@ -576,6 +622,8 @@ impl SlideEditor {
     /// Ends typing on the slide. With `give_back`, the keyboard goes back to the window, if
     /// the editor has it.
     fn end_editing(&mut self, give_back: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // A colour chosen and not yet given is given before the typing ends.
+        self.give_held_color(cx);
         self.stop(cx);
         if self.is_editing(cx) {
             self.run(Document::end_text, cx);
@@ -1198,8 +1246,7 @@ impl Render for SlideEditor {
             .on_action(cx.listener(|this, _: &ToggleBullets, _, cx| this.toggle_list(false, cx)))
             .on_action(cx.listener(|this, _: &ToggleNumbering, _, cx| this.toggle_list(true, cx)))
             .on_action(cx.listener(|this, action: &SetTextSize, _, cx| {
-                let size = action.size;
-                this.format(|edit| edit.set_size(Some(size)), cx)
+                this.set_text_size(action.size, cx)
             }))
             .child(self.canvas.clone())
             .child(overlay)
@@ -1383,4 +1430,12 @@ impl EntityInputHandler for SlideEditor {
     fn accepts_text_input(&self, _: &mut Window, cx: &mut Context<Self>) -> bool {
         self.is_editing(cx)
     }
+}
+
+/// Whether `paras` are all list items: text that stays at the left, however it's aligned.
+pub(crate) fn only_lists(paras: &[Para]) -> bool {
+    !paras.is_empty()
+        && paras
+            .iter()
+            .all(|para| matches!(para.kind, ParaKind::Bullet { .. } | ParaKind::Numbered { .. }))
 }

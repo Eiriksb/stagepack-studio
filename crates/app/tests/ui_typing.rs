@@ -1722,7 +1722,14 @@ mod tools {
     use stagepack_studio::text_tools::{
         ALIGN_CENTER_ID, ALIGN_LEFT_ID, ALIGN_RIGHT_ID, AUTOMATIC_COLOR_ID, BOLD_ID, BULLETS_ID,
         COLOR_ID, INDENT_LESS_ID, INDENT_MORE_ID, ITALIC_ID, NUMBERING_ID, SIZE_ID, SIZE_LIST_ID,
-        SetTextSize, TextTools, UNDERLINE_ID, button_id,
+        LISTS_STAY_LEFT, SetTextSize, TextTools, UNDERLINE_ID, button_id,
+    };
+    use gpui_kit::test::TestQueryExt as _;
+    use gpui_kit::{ScrollDelta, ScrollEvent, TouchPhase};
+    use stagepack_studio::clipboard_tools::{COPY_ID, CUT_ID, PASTE_ID};
+    use stagepack_studio::ribbon::{
+        MORE_LEFT_ID, MORE_RIGHT_ID, REDO_ID, RIBBON_ID, RIBBON_TOOLS_ID,
+        SAVE_ID, UNDO_ID,
     };
 
     /// How a tool shows the selection.
@@ -2377,6 +2384,258 @@ mod tools {
         );
         assert!(typing.caret(cx).is_some());
     }
+
+    impl Typing {
+        fn bounds_of(&self, cx: &mut TestAppContext, id: impl Into<ElementId>) -> Option<Bounds<Pixels>> {
+            let id = id.into();
+            self.with_window(cx, |window, cx| {
+                window.render_frame(cx);
+                window.try_find(id).map(|found| found.bounds())
+            })
+        }
+
+        /// Turns the mouse wheel over the row of tools by `notches`, down for more than 0.
+        fn wheel(&self, cx: &mut TestAppContext, notches: f32, shift: bool) {
+            let row = self.bounds_of(cx, RIBBON_TOOLS_ID).expect("the row of tools");
+            let modifiers = Modifiers { shift, ..Modifiers::default() };
+            self.with_window(cx, |window, cx| {
+                window.dispatch_event(
+                    MouseMoveEvent { position: row.center(), pressed_button: None, modifiers }.to_platform_input(),
+                    cx,
+                );
+                window.dispatch_event(
+                    ScrollEvent {
+                        position: row.center(),
+                        delta: ScrollDelta::Pixels(point(px(0.), px(-40. * notches))),
+                        modifiers,
+                        touch_phase: TouchPhase::Moved,
+                        source: Default::default(),
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            });
+            self.settle(cx);
+        }
+
+        /// The part of the ribbon a tool can be clicked in: not under an arrow at an end.
+        fn clear_part(&self, cx: &mut TestAppContext) -> (Pixels, Pixels) {
+            let ribbon = self.bounds_of(cx, RIBBON_ID).unwrap();
+            let left = self.bounds_of(cx, MORE_LEFT_ID).map_or(ribbon.left(), |arrow| arrow.right());
+            let right = self.bounds_of(cx, MORE_RIGHT_ID).map_or(ribbon.right(), |arrow| arrow.left());
+            (left, right)
+        }
+
+        /// Scrolls the row until `tool` is in the clear, and says whether it got there.
+        fn bring_into_view(&self, cx: &mut TestAppContext, tool: impl Into<ElementId>) -> bool {
+            let tool = tool.into();
+            for turn in 0..60 {
+                let bounds = self
+                    .bounds_of(cx, tool.clone())
+                    .unwrap_or_else(|| panic!("{tool:?} is there"));
+                let (left, right) = self.clear_part(cx);
+                if bounds.left() >= left && bounds.right() <= right {
+                    return true;
+                }
+                // Both ways of turning the wheel scroll the row.
+                let notches = if bounds.right() > right { 1. } else { -1. };
+                self.wheel(cx, notches, turn % 2 == 1);
+            }
+            false
+        }
+
+        fn resize(&self, cx: &mut TestAppContext, width: f32, height: f32) {
+            cx.simulate_window_resize(self.handle, size(px(width), px(height)));
+            self.settle(cx);
+        }
+    }
+
+    const HOME_TOOLS: [&str; 24] = [
+        PASTE_ID, CUT_ID, COPY_ID, SAVE_ID, DUPLICATE_ID, DELETE_ID, HIDE_ID,
+        BOLD_ID, ITALIC_ID, UNDERLINE_ID, SIZE_ID, SIZE_LIST_ID, COLOR_ID, AUTOMATIC_COLOR_ID,
+        BULLETS_ID, NUMBERING_ID, INDENT_LESS_ID, INDENT_MORE_ID, ALIGN_LEFT_ID, ALIGN_CENTER_ID,
+        ALIGN_RIGHT_ID, UNDO_ID, REDO_ID, NEW_SLIDE_ID,
+    ];
+
+    #[gpui_kit::test]
+    fn in_a_narrow_window_the_tools_scroll_and_every_one_can_be_reached(cx: &mut TestAppContext) {
+        let typing = open(cx, TWO);
+        typing.resize(cx, 800., 500.);
+        typing.select_word(cx, 6);
+        assert!(typing.bounds_of(cx, MORE_RIGHT_ID).is_some(), "an arrow says there's more");
+        assert!(typing.bounds_of(cx, MORE_LEFT_ID).is_none(), "but not to the left yet");
+        for tool in HOME_TOOLS {
+            assert!(typing.bring_into_view(cx, tool), "{tool} can't be reached");
+        }
+        // At the far end, the arrow is on the other side.
+        typing.bring_into_view(cx, REDO_ID);
+        assert!(typing.bounds_of(cx, MORE_LEFT_ID).is_some());
+        // Tools reached by scrolling work, and typing goes on.
+        assert!(typing.bring_into_view(cx, ALIGN_RIGHT_ID));
+        typing.click_on(cx, ALIGN_RIGHT_ID);
+        assert!(typing.source(cx).contains("region.body: align=right"));
+        assert!(typing.bring_into_view(cx, BOLD_ID));
+        typing.click_on(cx, BOLD_ID);
+        assert!(typing.source(cx).contains("Some **words** here"));
+        assert!(typing.text_has_keyboard(cx));
+        // The arrow scrolls too.
+        assert!(typing.bring_into_view(cx, PASTE_ID));
+        let before = typing.bounds_of(cx, PASTE_ID).unwrap();
+        typing.click_on(cx, MORE_RIGHT_ID);
+        assert!(typing.bounds_of(cx, PASTE_ID).unwrap().left() < before.left());
+    }
+
+    #[gpui_kit::test]
+    fn in_a_wide_window_nothing_scrolls(cx: &mut TestAppContext) {
+        let typing = open(cx, TWO);
+        typing.resize(cx, 1400., 800.);
+        typing.select_word(cx, 6);
+        assert!(typing.bounds_of(cx, MORE_RIGHT_ID).is_none());
+        assert!(typing.bounds_of(cx, MORE_LEFT_ID).is_none());
+        let before = typing.bounds_of(cx, BOLD_ID).unwrap();
+        typing.wheel(cx, 3., false);
+        typing.wheel(cx, 3., true);
+        assert_eq!(typing.bounds_of(cx, BOLD_ID).unwrap(), before);
+        let ribbon = typing.bounds_of(cx, RIBBON_ID).unwrap();
+        for tool in HOME_TOOLS {
+            let bounds = typing.bounds_of(cx, tool).unwrap();
+            assert!(bounds.right() <= ribbon.right(), "{tool} is cut off");
+        }
+        // Narrowed, it does; widened again, it doesn't.
+        typing.resize(cx, 800., 500.);
+        assert!(typing.bounds_of(cx, MORE_RIGHT_ID).is_some());
+        typing.resize(cx, 1400., 800.);
+        assert!(typing.bounds_of(cx, MORE_RIGHT_ID).is_none());
+    }
+
+    #[gpui_kit::test]
+    fn aligning_as_it_is_already_writes_nothing(cx: &mut TestAppContext) {
+        // A region with no setting of its own, on a slide with no settings block.
+        let typing = open(cx, LINES);
+        typing.click_text(cx, 1, pos(0, 1));
+        assert_eq!(typing.shows(cx, ALIGN_LEFT_ID), Shows::On);
+        typing.click_on(cx, ALIGN_LEFT_ID);
+        assert_eq!(typing.source(cx), LINES);
+        assert!(!typing.can_undo(cx), "and makes no step");
+        // One set already.
+        let centred = "---\nregion.body: align=center\n---\n\n# T\n\nOne\n";
+        let typing = open(cx, centred);
+        typing.click_text(cx, 1, pos(0, 1));
+        typing.click_on(cx, ALIGN_CENTER_ID);
+        assert_eq!(typing.source(cx), centred);
+        assert!(!typing.can_undo(cx));
+        // A box, left as boxes are.
+        let boxed = "# T\n\n<Text x=\"100\" y=\"400\" w=\"800\" h=\"200\">\n\nHi\n\n</Text>\n";
+        let typing = open(cx, boxed);
+        typing.click_text(cx, 1, pos(0, 1));
+        assert_eq!(typing.shows(cx, ALIGN_LEFT_ID), Shows::On);
+        typing.click_on(cx, ALIGN_LEFT_ID);
+        assert_eq!(typing.source(cx), boxed);
+        assert!(!typing.can_undo(cx));
+    }
+
+    #[gpui_kit::test]
+    fn lists_alone_are_not_aligned(cx: &mut TestAppContext) {
+        let list = "# T\n\n- One\n- Two\n";
+        let typing = open(cx, list);
+        typing.click_text(cx, 1, pos(0, 1));
+        for tool in [ALIGN_LEFT_ID, ALIGN_CENTER_ID, ALIGN_RIGHT_ID] {
+            assert!(typing.disabled(cx, tool), "{tool}");
+        }
+        let tip = typing.with_window(cx, |window, cx| {
+            window.render_frame(cx);
+            window.find(ALIGN_CENTER_ID).description().map(str::to_string)
+        });
+        assert_eq!(tip.as_deref(), Some(LISTS_STAY_LEFT));
+        typing.click_on(cx, ALIGN_CENTER_ID);
+        assert_eq!(typing.source(cx), list);
+        // With a body paragraph too, they work, and say how the region is set.
+        let mixed = "# T\n\nIntro\n\n- One\n";
+        let typing = open(cx, mixed);
+        typing.click_text(cx, 1, pos(1, 1));
+        assert!(!typing.disabled(cx, ALIGN_CENTER_ID));
+        let before = typing.layout(cx).caret(1, pos(0, 0)).unwrap().x;
+        typing.click_on(cx, ALIGN_CENTER_ID);
+        assert!(typing.source(cx).contains("region.body: align=center"));
+        assert_eq!(typing.shows(cx, ALIGN_CENTER_ID), Shows::On, "with the caret in the list");
+        assert!(typing.layout(cx).caret(1, pos(0, 0)).unwrap().x > before + 100., "Intro moved");
+    }
+
+    #[gpui_kit::test]
+    fn indent_is_only_for_list_items(cx: &mut TestAppContext) {
+        let typing = open(cx, "# T\n\nIntro\n\n- One\n");
+        typing.click_text(cx, 1, pos(0, 1));
+        assert!(typing.disabled(cx, INDENT_LESS_ID));
+        assert!(typing.disabled(cx, INDENT_MORE_ID));
+        typing.click_text(cx, 1, pos(1, 1));
+        assert!(!typing.disabled(cx, INDENT_LESS_ID));
+        assert!(!typing.disabled(cx, INDENT_MORE_ID));
+    }
+
+    #[gpui_kit::test]
+    fn the_size_text_is_drawn_at_anyway_gives_it_no_size_of_its_own(cx: &mut TestAppContext) {
+        let typing = open(cx, TWO);
+        typing.select_word(cx, 6);
+        type_size(&typing, cx, "40");
+        assert_eq!(typing.source(cx), TWO, "nothing to write");
+        assert!(!typing.can_undo(cx), "and no step");
+        typing.with_window(cx, |window, cx| window.dispatch_action(Box::new(SetTextSize { size: 40 }), cx));
+        typing.settle(cx);
+        assert_eq!(typing.source(cx), TWO);
+        assert!(!typing.can_undo(cx));
+        let sized = TWO.replacen("words", "<Text size=\"64\">words</Text>", 1);
+        let typing = open(cx, &sized);
+        typing.select_word(cx, 6);
+        type_size(&typing, cx, "40");
+        assert_eq!(typing.source(cx), TWO, "the size of its own is taken away");
+    }
+
+    #[gpui_kit::test]
+    fn a_size_is_chosen_from_the_list(cx: &mut TestAppContext) {
+        let typing = open(cx, TWO);
+        typing.select_word(cx, 6);
+        typing.click_on(cx, SIZE_LIST_ID);
+        let item = typing.with_window(cx, |window, cx| {
+            window.render_frame(cx);
+            window.find_by_label("80").bounds().center()
+        });
+        typing.click(cx, item);
+        assert_eq!(typing.source(cx), TWO.replacen("words", "<Text size=\"80\">words</Text>", 1));
+        assert!(typing.text_has_keyboard(cx));
+        assert_eq!(typing.size_shown(cx), "80");
+    }
+
+    /// Opens the picker over "words" and moves its sliders to red, as a drag does.
+    fn drag_to_red(typing: &Typing, cx: &mut TestAppContext) {
+        typing.select_word(cx, 6);
+        typing.click_on(cx, COLOR_ID);
+        assert!(typing.picker_shows(cx).1);
+        let picker = typing.picker(cx);
+        typing.with_window(cx, |window, cx| {
+            picker.update(cx, |picker, cx| picker.update_color(red(), window, cx))
+        });
+        typing.settle(cx);
+        assert_eq!(typing.source(cx), TWO, "nothing yet, while it's open");
+    }
+
+    #[gpui_kit::test]
+    fn a_colour_from_the_sliders_is_given_however_the_picker_closes(cx: &mut TestAppContext) {
+        let red_words = TWO.replacen("words", "<Text color=\"#ff0000\">words</Text>", 1);
+        let typing = open(cx, TWO);
+        drag_to_red(&typing, cx);
+        typing.press(cx, "escape");
+        assert!(!typing.picker_shows(cx).1);
+        assert_eq!(typing.source(cx), red_words, "closed with Escape");
+        assert!(typing.text_has_keyboard(cx));
+
+        let typing = open(cx, TWO);
+        drag_to_red(&typing, cx);
+        // The tab bar, beside its last tab.
+        let tab = typing.bounds_of(cx, stagepack_studio::ribbon::TAB_VIEW_ID).unwrap();
+        typing.click(cx, point(tab.right() + px(120.), tab.center().y));
+        assert!(!typing.picker_shows(cx).1);
+        assert_eq!(typing.source(cx), red_words, "closed by a click elsewhere");
+    }
 }
 
 /// `start..end`, the wrong way round, as the system may give it.
@@ -2518,4 +2777,5 @@ fn a_shortcut_during_a_composition_leaves_no_stale_composition(cx: &mut TestAppC
     typing.compose(cx, "´");
     typing.key(cx, "e", ctrl_alt(), "€");
     assert_eq!(typing.source(cx), TWO.replacen("Some words", "Some€ words", 1));
+
 }
