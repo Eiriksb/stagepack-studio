@@ -86,12 +86,18 @@ impl WorkspaceView {
     /// Leaves the talk tidy of what typing on the slide left empty, before it's saved, shown
     /// or exported. Typing goes on where it can.
     pub(super) fn settle_typing(&mut self, cx: &mut Context<Self>) {
-        let typing = self
-            .document
-            .as_ref()
-            .is_some_and(|document| document.read(cx).text().is_some());
-        if typing {
+        let typing = self.document.as_ref().and_then(|document| {
+            document
+                .read(cx)
+                .text()
+                .map(|text| text.composing.is_some())
+        });
+        if let Some(composing) = typing {
             self.edit(Document::settle_text, cx);
+            // What the system was composing went with it, and isn't shown any more.
+            if composing {
+                self.slide_editor.update(cx, |_, cx| cx.notify());
+            }
         }
     }
 

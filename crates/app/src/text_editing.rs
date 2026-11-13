@@ -2,7 +2,10 @@
 //! once the talk has changed. The text itself is always the talk's: each edit is written to
 //! the talk as it's made, so there's nothing to keep anywhere else.
 
-use slides_format::{FlowPlace, Para, ParaKind, Selection, TextEdit, TextFlow};
+use std::ops::Range;
+
+use slides_format::{FlowPlace, Para, ParaKind, Pos, Selection, TextEdit, TextFlow};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::history::RunId;
 
@@ -105,6 +108,228 @@ pub struct EditingText {
     /// Which time of typing this is: it starts with a click on the text, and goes on through
     /// an undo or a redo of a step made in it.
     pub(crate) session: u64,
+    /// What the system's input method is composing in place of the selection, as a dead key
+    /// waits for its letter. It isn't in the talk: committing it types it, and anything else
+    /// done to the text, or anything that ends typing, drops it.
+    pub composing: Option<Composing>,
+}
+
+/// Text the system's input method is composing, shown at the caret until it's committed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Composing {
+    pub text: String,
+    /// The system's selection inside it, in UTF-16 from its start.
+    pub selected: Range<usize>,
+}
+
+impl Composing {
+    /// `text` being composed, the system's selection in it `selected`, or after it. `None` for
+    /// no text, as an empty composition is none.
+    pub fn new(text: &str, selected: Option<Range<usize>>) -> Option<Composing> {
+        let len = utf16_len(text);
+        let selected = selected.map_or(len..len, |range| {
+            range.start.min(len)..range.end.clamp(range.start.min(len), len)
+        });
+        (!text.is_empty()).then(|| Composing {
+            text: text.to_string(),
+            selected,
+        })
+    }
+
+    fn len(&self) -> usize {
+        utf16_len(&self.text)
+    }
+}
+
+/// The text being typed as the system's input method sees it: the flow's paragraphs one line
+/// apart, a line break in one a line too, and any composition in place of the selection.
+/// Offsets in it are UTF-16, as the system counts; turned into places in the paragraphs, they
+/// land on the edges of characters as they're drawn.
+impl EditingText {
+    /// The text the system sees.
+    pub fn system_text(&self) -> String {
+        let flow = flow_text(&self.edit.paras);
+        match &self.composing {
+            None => flow,
+            Some(composing) => {
+                let selection = self.edit.selection;
+                let start = byte_in_flow(&self.edit.paras, selection.start());
+                let end = byte_in_flow(&self.edit.paras, selection.end());
+                format!("{}{}{}", &flow[..start], composing.text, &flow[end..])
+            }
+        }
+    }
+
+    /// Where `pos` is in the text the system sees. A place the composition stands over is its
+    /// start.
+    pub fn system_offset(&self, pos: Pos) -> usize {
+        let paras = &self.edit.paras;
+        let at = utf16_in_flow(paras, pos);
+        let Some(composing) = &self.composing else {
+            return at;
+        };
+        let selection = self.edit.selection;
+        let (start, end) = (selection.start(), selection.end());
+        if pos <= start {
+            at
+        } else if pos >= end {
+            at - utf16_in_flow(paras, end) + utf16_in_flow(paras, start) + composing.len()
+        } else {
+            utf16_in_flow(paras, start)
+        }
+    }
+
+    /// The place in the paragraphs of offset `at` of the text the system sees: on the edge of a
+    /// character before it, or after it with `forward`. A place inside the composition is the
+    /// start of the selection it stands in for.
+    pub fn system_pos(&self, at: usize, forward: bool) -> Pos {
+        let paras = &self.edit.paras;
+        let Some(composing) = &self.composing else {
+            return pos_in_flow(paras, at, forward);
+        };
+        let selection = self.edit.selection;
+        let start = utf16_in_flow(paras, selection.start());
+        if at <= start {
+            pos_in_flow(paras, at, forward)
+        } else if at >= start + composing.len() {
+            let end = utf16_in_flow(paras, selection.end());
+            pos_in_flow(paras, at - start - composing.len() + end, forward)
+        } else {
+            selection.start()
+        }
+    }
+
+    /// The selection as the system sees it, and whether its caret is at its start. While
+    /// composing, it's the system's own selection inside the composition.
+    pub fn system_selection(&self) -> (Range<usize>, bool) {
+        let selection = self.edit.selection;
+        match (&self.composing, self.marked_range()) {
+            (Some(composing), Some(marked)) => (
+                marked.start + composing.selected.start..marked.start + composing.selected.end,
+                false,
+            ),
+            _ => {
+                let anchor = self.system_offset(selection.anchor);
+                let head = self.system_offset(selection.head);
+                (anchor.min(head)..anchor.max(head), head < anchor)
+            }
+        }
+    }
+
+    /// Where the composition is in the text the system sees, if there is one.
+    pub fn marked_range(&self) -> Option<Range<usize>> {
+        let composing = self.composing.as_ref()?;
+        let start = utf16_in_flow(&self.edit.paras, self.edit.selection.start());
+        Some(start..start + composing.len())
+    }
+}
+
+/// The part of `text` in UTF-16 range `range`, widened onto whole characters, and the range it
+/// is.
+pub fn utf16_slice(text: &str, range: Range<usize>) -> (String, Range<usize>) {
+    let (start, start16) = byte_at_utf16(text, range.start, false);
+    let (end, end16) = byte_at_utf16(text, range.end.max(range.start), true);
+    (text[start..end].to_string(), start16..end16)
+}
+
+fn utf16_len(text: &str) -> usize {
+    text.encode_utf16().count()
+}
+
+fn para_text(para: &Para) -> String {
+    para.spans.iter().map(|span| span.text.as_str()).collect()
+}
+
+fn flow_text(paras: &[Para]) -> String {
+    paras.iter().map(para_text).collect::<Vec<_>>().join("\n")
+}
+
+/// The byte of [`flow_text`] `pos` is at.
+fn byte_in_flow(paras: &[Para], pos: Pos) -> usize {
+    let before: usize = paras
+        .iter()
+        .take(pos.para)
+        .map(|para| para_text(para).len() + 1)
+        .sum();
+    let text = paras.get(pos.para).map(para_text).unwrap_or_default();
+    before + floor_char(&text, pos.offset)
+}
+
+/// The UTF-16 offset of [`flow_text`] `pos` is at.
+fn utf16_in_flow(paras: &[Para], pos: Pos) -> usize {
+    let before: usize = paras
+        .iter()
+        .take(pos.para)
+        .map(|para| utf16_len(&para_text(para)) + 1)
+        .sum();
+    let text = paras.get(pos.para).map(para_text).unwrap_or_default();
+    before + utf16_len(&text[..floor_char(&text, pos.offset)])
+}
+
+/// The place in `paras` of UTF-16 offset `at` of [`flow_text`], on the edge of a character as
+/// it's drawn: the one before, or after with `forward`. Past the end is the end.
+fn pos_in_flow(paras: &[Para], at: usize, forward: bool) -> Pos {
+    let mut start = 0;
+    for (index, para) in paras.iter().enumerate() {
+        let text = para_text(para);
+        let len = utf16_len(&text);
+        if at <= start + len || index + 1 == paras.len() {
+            let (byte, _) = byte_at_utf16(&text, at.saturating_sub(start), forward);
+            return Pos {
+                para: index,
+                offset: grapheme_edge(&text, byte, forward),
+            };
+        }
+        start += len + 1;
+    }
+    Pos::default()
+}
+
+/// The byte of `text` at UTF-16 offset `at`, and the offset it's at: inside a character, its
+/// start, or its end with `forward`. Past the end is the end.
+fn byte_at_utf16(text: &str, at: usize, forward: bool) -> (usize, usize) {
+    let mut units = 0;
+    for (byte, c) in text.char_indices() {
+        let next = units + c.len_utf16();
+        if at <= units {
+            return (byte, units);
+        }
+        if at < next {
+            return if forward {
+                (byte + c.len_utf8(), next)
+            } else {
+                (byte, units)
+            };
+        }
+        units = next;
+    }
+    (text.len(), units)
+}
+
+/// `at`, a byte of `text`, moved back onto a character's start.
+fn floor_char(text: &str, at: usize) -> usize {
+    let mut at = at.min(text.len());
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+/// `at`, a byte of `text` on a character's start, moved onto the edge of a character as it's
+/// drawn: back, or forward with `forward`.
+fn grapheme_edge(text: &str, at: usize, forward: bool) -> usize {
+    let edges = text
+        .grapheme_indices(true)
+        .map(|(edge, _)| edge)
+        .chain([text.len()]);
+    if forward {
+        edges
+            .into_iter()
+            .find(|&edge| edge >= at)
+            .unwrap_or(text.len())
+    } else {
+        edges.take_while(|&edge| edge <= at).last().unwrap_or(0)
+    }
 }
 
 impl EditingText {
@@ -128,6 +353,7 @@ impl EditingText {
             }]),
             run: None,
             session: 0,
+            composing: None,
         }
     }
 

@@ -21,8 +21,8 @@ use crate::history::{History, RunId};
 use crate::present::TalkShape;
 use crate::saving::{SaveJob, SaveTarget, Saved};
 use crate::text_editing::{
-    COULD_NOT_TYPE, EditingText, FORMAT_TEXT, FlowKey, Kind, TYPING, TextMark, holds_no_words,
-    holds_something, region_has_text,
+    COULD_NOT_TYPE, Composing, EditingText, FORMAT_TEXT, FlowKey, Kind, TYPING, TextMark,
+    holds_no_words, holds_something, region_has_text,
 };
 
 pub(crate) const SLIDES_FILE: &str = "slides.md";
@@ -947,6 +947,7 @@ impl Document {
             edit,
             run: None,
             session: self.new_session(),
+            composing: None,
         });
         true
     }
@@ -996,6 +997,8 @@ impl Document {
         &mut self,
         op: impl FnOnce(&TextEdit) -> TextEdit,
     ) -> Result<Vec<usize>, EditRefused> {
+        // Anything done to the text drops what the system was composing: a commit types it.
+        self.compose(None);
         let Some(editing) = self.editing.clone() else {
             return Ok(Vec::new());
         };
@@ -1069,6 +1072,15 @@ impl Document {
         Ok(changed)
     }
 
+    /// Shows `composing` in place of the selection of the text being typed, as the system's
+    /// input method composes it, or, with `None`, drops what it was composing. Nothing is
+    /// written to the talk: committing it is typing it, through [`Self::apply_text`].
+    pub fn compose(&mut self, composing: Option<Composing>) {
+        if let Some(editing) = &mut self.editing {
+            editing.composing = composing;
+        }
+    }
+
     /// Ends the run of typing, so that what's typed next is a step of its own, as after a pause.
     pub fn end_typing_run(&mut self) {
         if let Some(editing) = &mut self.editing {
@@ -1088,6 +1100,8 @@ impl Document {
     /// away, as [`Self::end_text`] does; typing then goes on in its region, empty again, or
     /// ends if the region still has other text. Any other typing goes on as it was.
     pub fn settle_text(&mut self) -> Result<Vec<usize>, EditRefused> {
+        // What the system was composing isn't text yet, and isn't kept.
+        self.compose(None);
         let Some(editing) = self.editing.clone() else {
             return Ok(Vec::new());
         };
@@ -1267,6 +1281,7 @@ impl Document {
                     edit,
                     run: None,
                     session: mark.session,
+                    composing: None,
                 })
             }
             (None, Some(region)) if !region_has_text(&flows, region) => Some(EditingText {

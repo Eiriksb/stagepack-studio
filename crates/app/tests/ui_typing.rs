@@ -9,16 +9,17 @@ use std::time::Duration;
 
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext, Bounds, Entity, InputEvent as _, Modifiers, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, TestAppContext, VisualTestContext,
-    Window, WindowBounds, WindowOptions, point, px, size,
+    AnyWindowHandle, App, AppContext, Bounds, Context, Entity, EntityInputHandler as _,
+    InputEvent as _, KeyDownEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, TestAppContext, VisualTestContext, Window,
+    WindowBounds, WindowOptions, point, px, size,
 };
 use slides_engine::{Fonts, Hit, TextLayout};
 use slides_format::{FlowPlace, ParaKind, Pos, Selection, TextFlow, text_flows};
 use stagepack_studio::document::{Document, LAYOUT_FAILED, TalkPlace, panic_in_next_layout};
 use stagepack_studio::ribbon::{DELETE_ID, DUPLICATE_ID, HIDE_ID, NEW_SLIDE_ID};
 use stagepack_studio::recovery::Recovery;
-use stagepack_studio::slide_editor::{CARET_ID, SLIDE_EDITOR_ID};
+use stagepack_studio::slide_editor::{CARET_ID, COMPOSITION_ID, SLIDE_EDITOR_ID, SlideEditor};
 use stagepack_studio::text_editing::{COULD_NOT_TYPE, EditingText};
 use stagepack_studio::workspace_view::{self, CLOSE_SAVE_ID, ExportPdf, STATUS_ID, WorkspaceView};
 
@@ -1268,4 +1269,445 @@ fn a_drag_off_the_slide_keeps_selecting(cx: &mut TestAppContext) {
     });
     typing.settle(cx);
     assert_eq!(typing.selection(cx), dragged);
+}
+
+// The system's input method: dead keys, compose sequences, the emoji picker and the keys
+// that type, each typing once.
+
+impl Typing {
+    fn editor(&self, cx: &TestAppContext) -> Entity<SlideEditor> {
+        cx.read(|cx| self.view.read(cx).slide_editor().clone())
+    }
+
+    /// Does `ask` of the editor as the system's input method would, and draws.
+    fn system<T>(
+        &self,
+        cx: &mut TestAppContext,
+        ask: impl FnOnce(&mut SlideEditor, &mut Window, &mut Context<SlideEditor>) -> T,
+    ) -> T {
+        let editor = self.editor(cx);
+        let answer = self.with_window(cx, |window, cx| {
+            editor.update(cx, |editor, cx| ask(editor, window, cx))
+        });
+        self.settle(cx);
+        answer
+    }
+
+    /// The system composes `text` at the caret, as a dead key does.
+    fn compose(&self, cx: &mut TestAppContext, text: &str) {
+        self.system(cx, |editor, window, cx| {
+            editor.replace_and_mark_text_in_range(None, text, None, window, cx)
+        });
+    }
+
+    /// The system types `text`, as it does a letter, a finished composition or an emoji.
+    fn commit(&self, cx: &mut TestAppContext, text: &str) {
+        self.system(cx, |editor, window, cx| {
+            editor.replace_text_in_range(None, text, window, cx)
+        });
+    }
+
+    fn composing(&self, cx: &TestAppContext) -> Option<String> {
+        self.editing(cx)?.composing.map(|composing| composing.text)
+    }
+
+    fn system_selection(&self, cx: &mut TestAppContext) -> std::ops::Range<usize> {
+        self.system(cx, |editor, window, cx| {
+            editor.selected_text_range(false, window, cx)
+        })
+        .expect("text is being typed")
+        .range
+    }
+
+    fn marked(&self, cx: &mut TestAppContext) -> Option<std::ops::Range<usize>> {
+        self.system(cx, |editor, window, cx| {
+            editor.marked_text_range(window, cx)
+        })
+    }
+
+    /// The composition as it's shown, if it is.
+    fn composition(&self, cx: &mut TestAppContext) -> Option<(Bounds<Pixels>, String)> {
+        self.with_window(cx, |window, cx| {
+            window.render_frame(cx);
+            window.try_find(COMPOSITION_ID).map(|shown| {
+                assert!(shown.visible());
+                (
+                    shown.bounds(),
+                    shown.label().unwrap_or_default().to_string(),
+                )
+            })
+        })
+    }
+
+    /// A key pressed that gives `text`, as the platform reports it, and the text it types, if
+    /// it isn't taken as a key.
+    fn key(&self, cx: &mut TestAppContext, key: &str, modifiers: Modifiers, text: &str) {
+        let keystroke = Keystroke {
+            modifiers,
+            key: key.into(),
+            key_char: Some(text.into()),
+        };
+        self.with_window(cx, |window, cx| {
+            window.render_frame(cx);
+            window.dispatch_keystroke(keystroke, cx);
+        });
+        self.settle(cx);
+    }
+}
+
+fn ctrl_alt() -> Modifiers {
+    Modifiers {
+        control: true,
+        alt: true,
+        ..Modifiers::default()
+    }
+}
+
+#[gpui_kit::test]
+fn a_dead_key_then_a_letter_gives_one_character(cx: &mut TestAppContext) {
+    let typing = open(cx, TWO);
+    typing.click_text(cx, 1, pos(0, 4));
+    typing.compose(cx, "´");
+    typing.commit(cx, "é");
+    assert_eq!(
+        typing.source(cx),
+        TWO.replacen("Some words", "Someé words", 1)
+    );
+    assert_eq!(typing.selection(cx), caret_at(pos(0, 4 + "é".len())));
+    assert_eq!(typing.composing(cx), None);
+    assert_eq!(typing.system_selection(cx), 5..5);
+    assert!(
+        typing.composition(cx).is_none(),
+        "nothing is left composing"
+    );
+}
+
+#[gpui_kit::test]
+fn a_dead_key_from_the_keyboard_types_once(cx: &mut TestAppContext) {
+    let typing = open(cx, TWO);
+    typing.click_text(cx, 1, pos(0, 4));
+    // Where the system composes it, as on Linux: the letter's key gives the finished one.
+    typing.compose(cx, "¨");
+    typing.key(cx, "u", Modifiers::default(), "ü");
+    // Where it doesn't, as on Windows: the dead key's own press types nothing, and the
+    // character comes after the letter.
+    typing.with_window(cx, |window, cx| {
+        window.dispatch_event(
+            KeyDownEvent {
+                keystroke: Keystroke {
+                    modifiers: Modifiers::default(),
+                    key: "´".into(),
+                    key_char: Some("´".into()),
+                },
+                is_held: false,
+                prefer_character_input: true,
+            }
+            .to_platform_input(),
+            cx,
+        );
+    });
+    typing.settle(cx);
+    typing.commit(cx, "é");
+    // A dead key then a space gives the accent itself.
+    typing.compose(cx, "^");
+    typing.key(cx, "space", Modifiers::default(), "^");
+    assert_eq!(
+        typing.source(cx),
+        TWO.replacen("Some words", "Someüé^ words", 1)
+    );
+    assert_eq!(typing.composing(cx), None);
+}
+
+#[gpui_kit::test]
+fn the_keys_that_type_type_once(cx: &mut TestAppContext) {
+    let typing = open(cx, TWO);
+    typing.click_text(cx, 1, pos(0, 4));
+    typing.type_text(cx, "ab");
+    typing.press(cx, "shift-c");
+    typing.press(cx, "space");
+    // AltGr, which the system reports as Ctrl and Alt together.
+    typing.key(cx, "2", ctrl_alt(), "@");
+    typing.key(cx, "7", ctrl_alt(), "{");
+    typing.key(cx, "e", ctrl_alt(), "€");
+    typing.type_text(cx, "øæå");
+    assert_eq!(
+        typing.source(cx),
+        TWO.replacen("Some words", "SomeabC @{€øæå words", 1)
+    );
+    // A key that's the editor's own does what it does, and types nothing as well.
+    typing.key(cx, "enter", Modifiers::default(), "\n");
+    assert_eq!(typing.text_of(cx, 0, 1), ["SomeabC @{€øæå", " words here"]);
+}
+
+#[gpui_kit::test]
+fn composing_text_shows_underlined_and_is_not_in_the_talk(cx: &mut TestAppContext) {
+    let typing = open(cx, TWO);
+    typing.click_text(cx, 1, pos(0, 4));
+    let caret = typing.caret(cx).unwrap();
+    typing.compose(cx, "´");
+    assert_eq!(typing.source(cx), TWO, "the talk doesn't have it");
+    assert!(!typing.can_undo(cx));
+    assert_eq!(typing.composing(cx).as_deref(), Some("´"));
+    let (shown, text) = typing.composition(cx).expect("it's shown");
+    assert_eq!(text, "´");
+    assert!(
+        (shown.origin.x - (caret.origin.x + caret.size.width)).abs() <= px(1.)
+            && (shown.origin.y - caret.origin.y).abs() <= px(1.),
+        "at the caret: {shown:?} by {caret:?}"
+    );
+    // The system sees it where the caret was, and its caret after it.
+    assert_eq!(typing.marked(cx), Some(4..5));
+    assert_eq!(typing.system_selection(cx), 5..5);
+    let text = typing.system(cx, |editor, window, cx| {
+        let mut adjusted = None;
+        editor.text_for_range(0..100, &mut adjusted, window, cx)
+    });
+    assert_eq!(text.as_deref(), Some("Some´ words here"));
+    // The system goes on composing.
+    typing.compose(cx, "´´");
+    assert_eq!(typing.composition(cx).unwrap().1, "´´");
+    assert_eq!(typing.source(cx), TWO);
+}
+
+#[gpui_kit::test]
+fn a_cancelled_composition_leaves_no_text(cx: &mut TestAppContext) {
+    let typing = open(cx, TWO);
+    typing.click_text(cx, 1, pos(0, 4));
+    typing.compose(cx, "´");
+    typing.commit(cx, "");
+    assert_eq!(typing.composing(cx), None);
+    assert!(typing.composition(cx).is_none());
+    // Cancelled by its range, as some systems do.
+    typing.compose(cx, "~");
+    let marked = typing.marked(cx).unwrap();
+    typing.system(cx, |editor, window, cx| {
+        editor.replace_text_in_range(Some(marked), "", window, cx)
+    });
+    assert_eq!(typing.composing(cx), None);
+    // Or by composing nothing.
+    typing.compose(cx, "`");
+    typing.compose(cx, "");
+    assert_eq!(typing.composing(cx), None);
+    // Over a selection, which stays as it was.
+    let word = typing.point_of(cx, 1, pos(0, 6));
+    typing.clicks(cx, word, 2, Modifiers::default());
+    let words = typing.selection(cx);
+    typing.compose(cx, "´");
+    typing.commit(cx, "");
+    assert_eq!(typing.selection(cx), words);
+
+    assert_eq!(typing.source(cx), TWO);
+    assert!(!typing.can_undo(cx), "and no step to undo");
+}
+
+#[gpui_kit::test]
+fn a_committed_composition_is_one_undo_step(cx: &mut TestAppContext) {
+    let typing = open(cx, TWO);
+    typing.click_text(cx, 1, pos(0, 4));
+    typing.compose(cx, "´");
+    typing.compose(cx, "´");
+    typing.commit(cx, "é");
+    let label = typing
+        .document(cx)
+        .read_with(cx, |document, _| document.undo_label());
+    assert_eq!(label, Some("Typing"));
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), TWO);
+    assert!(!typing.can_undo(cx), "it was one step");
+
+    // Among typed letters, it's one of them: the run is one step.
+    typing.click_text(cx, 1, pos(0, 4));
+    typing.type_text(cx, "a");
+    typing.compose(cx, "¨");
+    typing.commit(cx, "ö");
+    typing.type_text(cx, "b");
+    // Committed as it is, when the system ends it so.
+    typing.compose(cx, "~");
+    typing.system(cx, |editor, window, cx| editor.unmark_text(window, cx));
+    assert_eq!(
+        typing.source(cx),
+        TWO.replacen("Some words", "Someaöb~ words", 1)
+    );
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), TWO);
+    assert!(!typing.can_undo(cx));
+}
+
+#[gpui_kit::test]
+fn an_emoji_from_the_picker_lands_at_the_caret(cx: &mut TestAppContext) {
+    let typing = open(cx, TWO);
+    typing.click_text(cx, 1, pos(0, 4));
+    typing.commit(cx, "😀");
+    assert_eq!(
+        typing.source(cx),
+        TWO.replacen("Some words", "Some😀 words", 1)
+    );
+    assert_eq!(typing.selection(cx), caret_at(pos(0, 4 + "😀".len())));
+    assert_eq!(typing.system_selection(cx), 6..6, "two UTF-16 units");
+    // One with a skin tone is one character, which the caret goes past whole.
+    typing.commit(cx, "👍🏽");
+    typing.press(cx, "left");
+    assert_eq!(typing.selection(cx), caret_at(pos(0, 4 + "😀".len())));
+}
+
+#[gpui_kit::test]
+fn utf16_offsets_round_trip_across_emoji_and_accents(cx: &mut TestAppContext) {
+    let source = "# T\n\n- Hé😀\n- e\u{301}👍🏽 x\n";
+    let typing = open(cx, source);
+    typing.click_text(cx, 1, pos(0, 0));
+    let set = |cx: &mut TestAppContext, range: std::ops::Range<usize>| {
+        typing.system(cx, |editor, window, cx| {
+            editor.set_selected_text_range(range, window, cx)
+        });
+    };
+    // Each edge of a character, as the system counts and as the text holds it.
+    for (at, place) in [
+        (0, pos(0, 0)),
+        (1, pos(0, 1)),
+        (2, pos(0, 3)),
+        (4, pos(0, 7)),
+        (5, pos(1, 0)),
+        (7, pos(1, 3)),
+        (11, pos(1, 11)),
+        (12, pos(1, 12)),
+        (13, pos(1, 13)),
+    ] {
+        set(cx, at..at);
+        assert_eq!(typing.selection(cx), caret_at(place), "{at}");
+        assert_eq!(typing.system_selection(cx), at..at, "{place:?}");
+    }
+    // Inside a character, or between the parts of one, a caret goes before it.
+    for (at, place) in [
+        (3, pos(0, 3)),
+        (6, pos(1, 0)),
+        (9, pos(1, 3)),
+        (10, pos(1, 3)),
+    ] {
+        set(cx, at..at);
+        assert_eq!(typing.selection(cx), caret_at(place), "{at}");
+    }
+    // And a range takes in all of the characters it cuts.
+    set(cx, 3..9);
+    assert_eq!(
+        typing.selection(cx),
+        Selection {
+            anchor: pos(0, 3),
+            head: pos(1, 11)
+        }
+    );
+    assert_eq!(typing.system_selection(cx), 2..11);
+    let (text, adjusted) = typing.system(cx, |editor, window, cx| {
+        let mut adjusted = None;
+        let text = editor.text_for_range(3..6, &mut adjusted, window, cx);
+        (text, adjusted)
+    });
+    assert_eq!(text.as_deref(), Some("😀\ne"));
+    assert_eq!(adjusted, Some(2..6));
+    // Typed there, it replaces exactly that.
+    typing.commit(cx, "!");
+    assert_eq!(typing.source(cx), "# T\n\n- Hé! x\n");
+}
+
+#[gpui_kit::test]
+fn the_candidate_window_sits_at_the_caret(cx: &mut TestAppContext) {
+    let typing = open(cx, TWO);
+    typing.click_text(cx, 1, pos(0, 4));
+    let caret = typing.caret(cx).unwrap();
+    let near = |a: Bounds<Pixels>, b: Bounds<Pixels>| {
+        (a.origin.x - b.origin.x).abs() <= px(1.)
+            && (a.origin.y - b.origin.y).abs() <= px(1.)
+            && (a.size.height - b.size.height).abs() <= px(1.)
+    };
+    let bounds_for = |cx: &mut TestAppContext, range: std::ops::Range<usize>| {
+        typing
+            .system(cx, |editor, window, cx| {
+                editor.bounds_for_range(range, Bounds::default(), window, cx)
+            })
+            .expect("the place has bounds")
+    };
+    let bounds = bounds_for(cx, 4..4);
+    assert!(near(bounds, caret), "{bounds:?} at {caret:?}");
+    // While composing, it stays where the composition starts.
+    typing.compose(cx, "´");
+    let marked = typing.marked(cx).unwrap();
+    let bounds = bounds_for(cx, marked);
+    assert!(near(bounds, caret), "{bounds:?} at {caret:?}");
+    // And the system's place for a point on the slide is the text's there.
+    let at = typing.point_of(cx, 1, pos(0, 10));
+    let index = typing.system(cx, |editor, window, cx| {
+        editor.character_index_for_point(at, window, cx)
+    });
+    assert_eq!(index, Some(11), "after the composition");
+}
+
+#[gpui_kit::test]
+fn saving_during_a_composition_ends_it_first(cx: &mut TestAppContext) {
+    let typing = open(cx, TWO);
+    typing.click_text(cx, 1, pos(0, 4));
+    typing.type_text(cx, "ab");
+    typing.compose(cx, "´");
+    cx.simulate_keystrokes(typing.handle, "ctrl-s");
+    cx.run_until_parked();
+    typing.settle(cx);
+    // What was composed isn't text yet: it's dropped, and what was typed is saved.
+    let saved = std::fs::read_to_string(&typing.file).unwrap();
+    assert_eq!(saved, TWO.replacen("Some words", "Someab words", 1));
+    assert_eq!(typing.source(cx), saved);
+    assert_eq!(typing.composing(cx), None);
+    assert!(typing.composition(cx).is_none());
+    // Typing goes on, and the letter the system then gives is typed once.
+    typing.commit(cx, "é");
+    assert!(typing.source(cx).contains("Someabé words"));
+}
+
+#[gpui_kit::test]
+fn ending_or_undoing_typing_during_a_composition_drops_it(cx: &mut TestAppContext) {
+    let typing = open(cx, TWO);
+    typing.click_text(cx, 1, pos(0, 4));
+    typing.compose(cx, "´");
+    typing.press(cx, "escape");
+    assert!(typing.editing(cx).is_none());
+    assert!(typing.composition(cx).is_none());
+    assert_eq!(typing.source(cx), TWO);
+
+    typing.click_text(cx, 1, pos(0, 4));
+    typing.type_text(cx, "a");
+    typing.compose(cx, "´");
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), TWO);
+    assert_eq!(typing.composing(cx), None);
+    assert!(typing.composition(cx).is_none());
+
+    // Another slide.
+    typing.compose(cx, "´");
+    typing.click_id(cx, NEW_SLIDE_ID);
+    assert_eq!(typing.composing(cx), None);
+    assert!(typing.composition(cx).is_none());
+}
+
+#[gpui_kit::test]
+fn replacing_a_range_the_system_names_replaces_exactly_that(cx: &mut TestAppContext) {
+    let typing = open(cx, TWO);
+    typing.click_text(cx, 1, pos(0, 0));
+    let replace = |cx: &mut TestAppContext, range: std::ops::Range<usize>, text: &str| {
+        typing.system(cx, |editor, window, cx| {
+            editor.replace_text_in_range(Some(range), text, window, cx)
+        });
+    };
+    replace(cx, 5..10, "WORDS");
+    assert_eq!(
+        typing.source(cx),
+        TWO.replacen("Some words", "Some WORDS", 1)
+    );
+    assert_eq!(typing.selection(cx), caret_at(pos(0, 10)));
+    replace(cx, 0..4, "😀");
+    replace(cx, 0..2, "é");
+    assert_eq!(typing.source(cx), TWO.replacen("Some words", "é WORDS", 1));
+    // Composed over a range of its own, the system's text goes in place of it once committed.
+    typing.system(cx, |editor, window, cx| {
+        editor.replace_and_mark_text_in_range(Some(2..7), "w", None, window, cx)
+    });
+    assert_eq!(typing.source(cx), TWO.replacen("Some words", "é WORDS", 1));
+    typing.commit(cx, "words");
+    assert_eq!(typing.source(cx), TWO.replacen("Some words", "é words", 1));
 }

@@ -4,7 +4,12 @@
 //!
 //! While text is being typed the editor has the keyboard, in a key context of its own, so the
 //! keys that change slides or edit the list of slides don't reach the window.
+//!
+//! What's typed comes from the system's input method, through [`EntityInputHandler`]: a letter,
+//! a dead key's accented letter, a composed character or an emoji from the picker all arrive
+//! there, and nothing else types. The keys themselves only move the caret and edit.
 
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,10 +21,13 @@ use slides_format::{Motion, Pos, TextEdit};
 
 use crate::document::{Document, EditRefused};
 use crate::slide_canvas::{SLIDE_WIDTH, SlideCanvas, letterbox};
+use crate::text_editing::{Composing, EditingText, utf16_slice};
 use crate::workspace_view::CARET_BLINKS_FOR;
 
 pub const SLIDE_EDITOR_ID: &str = "slide-editor";
 pub const CARET_ID: &str = "caret";
+/// What the system's input method is composing, shown at the caret.
+pub const COMPOSITION_ID: &str = "composition";
 
 /// The key context the editor's keys apply in, while text is being typed.
 pub const EDITOR_CONTEXT: &str = "SlideEditor";
@@ -30,6 +38,8 @@ const BLINK: Duration = Duration::from_millis(500);
 const TYPING_PAUSE: Duration = Duration::from_secs(2);
 /// How wide the caret is drawn, in the window's pixels.
 const CARET_WIDTH: f32 = 2.0;
+/// How big the text being composed is drawn, to the height of the caret.
+const COMPOSITION_TEXT: f32 = 0.7;
 /// How tall the caret is in an empty region before it has a line of its own, in slide units.
 const EMPTY_TITLE_LINE: f32 = 80.0;
 const EMPTY_LINE: f32 = 50.0;
@@ -259,10 +269,64 @@ impl SlideEditor {
         self.typed(cx);
     }
 
-    /// Puts `text` in place of the selection, as typed. Every character typed comes this way.
+    /// Puts `text` in place of the selection, as typed. Every character typed comes this way,
+    /// from the system's input method.
     pub fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.type_over(None, text, cx);
+    }
+
+    /// Puts `text` in place of what's from `over.0` to `over.1`, or the selection, as typed.
+    fn type_over(&mut self, over: Option<(Pos, Pos)>, text: &str, cx: &mut Context<Self>) {
         self.wanted_x = None;
-        self.apply(|edit| edit.insert(text), cx);
+        self.apply(
+            |edit| match over {
+                Some((from, to)) => edit.move_to(from, false).move_to(to, true).insert(text),
+                None => edit.insert(text),
+            },
+            cx,
+        );
+    }
+
+    /// The text being typed.
+    fn editing<'a>(&self, cx: &'a App) -> Option<&'a EditingText> {
+        self.document.as_ref()?.read(cx).text()
+    }
+
+    /// Shows `composing` at the caret, or drops what was being composed. The talk isn't
+    /// touched.
+    fn set_composing(&mut self, composing: Option<Composing>, cx: &mut Context<Self>) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        document.update(cx, |document, _| document.compose(composing));
+        self.wake(cx);
+        cx.notify();
+    }
+
+    /// Types what was being composed, as it is.
+    fn commit_composing(&mut self, cx: &mut Context<Self>) {
+        let text = self
+            .editing(cx)
+            .and_then(|editing| editing.composing.as_ref())
+            .map(|composing| composing.text.clone());
+        if let Some(text) = text {
+            self.insert_text(&text, cx);
+        }
+    }
+
+    /// The places in the text being typed from UTF-16 offset `range.start` to `range.end` of
+    /// what the system sees, on the edges of characters, taking in any character they cut. An
+    /// empty range is a caret, before the character it's in.
+    fn places(&self, range: &Range<usize>, cx: &App) -> Option<(Pos, Pos)> {
+        let editing = self.editing(cx)?;
+        let (start, end) = (range.start.min(range.end), range.start.max(range.end));
+        let from = editing.system_pos(start, false);
+        let to = if end == start {
+            from
+        } else {
+            editing.system_pos(end, true)
+        };
+        Some((from, to))
     }
 
     /// After any key or click: the caret shows and blinks again, and a run of typing goes on
@@ -436,23 +500,6 @@ impl SlideEditor {
         self.apply(op, cx);
     }
 
-    fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let keystroke = &event.keystroke;
-        let modifiers = keystroke.modifiers;
-        // Ctrl and Alt together are AltGr, which types; either alone is a shortcut.
-        let shortcut =
-            modifiers.platform || modifiers.function || (modifiers.control != modifiers.alt);
-        let Some(text) = keystroke.key_char.as_deref() else {
-            return;
-        };
-        if shortcut || text.is_empty() || text.chars().any(char::is_control) || !self.is_editing(cx)
-        {
-            return;
-        }
-        cx.stop_propagation();
-        self.insert_text(text, cx);
-    }
-
     /// Where `position`, in the window, is on the slide, in slide units, if it's on it.
     fn slide_point(&self, position: Point<Pixels>, cx: &App) -> Option<(f32, f32)> {
         let slide = self.canvas.read(cx).slide_bounds()?;
@@ -601,30 +648,44 @@ impl SlideEditor {
         }
     }
 
+    /// Where the caret goes at `pos` of the text being typed, in slide units.
+    fn caret_at(&self, pos: Pos, cx: &mut Context<Self>) -> Option<CaretRect> {
+        let (_, flow, layout) = self.editing_place(cx)?;
+        if let Some(flow) = flow {
+            return layout.caret(flow, pos);
+        }
+        // An empty region, before anything is typed: the caret is at its start.
+        let editing = self.editing(cx)?;
+        let region = editing.flow.region()?;
+        let (rect, rotate) = layout.placeholder(region)?;
+        let line = if editing.is_title() {
+            EMPTY_TITLE_LINE
+        } else {
+            EMPTY_LINE
+        };
+        Some(CaretRect {
+            x: rect.x,
+            top: rect.y,
+            height: rect.h.min(line),
+            rotate,
+            centre: (rect.x + rect.w / 2., rect.y + rect.h / 2.),
+        })
+    }
+
+    /// Where the caret at `pos` of the text being typed is in the window.
+    fn caret_in_window(&self, pos: Pos, cx: &mut Context<Self>) -> Option<Bounds<Pixels>> {
+        let caret = self.caret_at(pos, cx)?;
+        let slide = self.canvas.read(cx).slide_bounds()?;
+        Some(caret_box(&caret, slide))
+    }
+
     /// The caret and the selection of the text being typed, in slide units.
     fn marks(&self, cx: &mut Context<Self>) -> Option<Marks> {
         let (_, flow, layout) = self.editing_place(cx)?;
-        let document = self.document.as_ref()?.read(cx);
-        let editing = document.text()?;
-        let selection = editing.edit.selection;
+        let selection = self.editing(cx)?.edit.selection;
         let Some(flow) = flow else {
-            // An empty region, before anything is typed: the caret is at its start.
-            let region = editing.flow.region()?;
-            let (rect, rotate) = layout.placeholder(region)?;
-            let line = if editing.is_title() {
-                EMPTY_TITLE_LINE
-            } else {
-                EMPTY_LINE
-            };
-            let caret = CaretRect {
-                x: rect.x,
-                top: rect.y,
-                height: rect.h.min(line),
-                rotate,
-                centre: (rect.x + rect.w / 2., rect.y + rect.h / 2.),
-            };
             return Some(Marks {
-                caret: Some(caret),
+                caret: self.caret_at(selection.head, cx),
                 selection: SelectionRects::default(),
             });
         };
@@ -700,6 +761,28 @@ fn caret_corners(caret: &CaretRect, unit: f32) -> [(f32, f32); 4] {
     )
 }
 
+/// The box the caret's corners fit in, in the window, on a slide drawn at `slide` there.
+fn caret_box(caret: &CaretRect, slide: Bounds<Pixels>) -> Bounds<Pixels> {
+    let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
+    if unit <= 0.0 {
+        return Bounds {
+            origin: slide.origin,
+            size: Size::default(),
+        };
+    }
+    let corners = caret_corners(caret, unit);
+    let (xs, ys): (Vec<f32>, Vec<f32>) = corners.iter().copied().unzip();
+    let fold = |values: &[f32], pick: fn(f32, f32) -> f32| {
+        values.iter().copied().reduce(pick).unwrap_or(0.)
+    };
+    let (left, right) = (fold(&xs, f32::min), fold(&xs, f32::max));
+    let (top, bottom) = (fold(&ys, f32::min), fold(&ys, f32::max));
+    Bounds {
+        origin: slide.origin + point(px(left * unit), px(top * unit)),
+        size: size(px((right - left) * unit), px((bottom - top) * unit)),
+    }
+}
+
 fn paint_polygon(
     points: &[(f32, f32)],
     slide: Bounds<Pixels>,
@@ -724,34 +807,42 @@ impl Render for SlideEditor {
         let marks = self.marks(cx);
         let caret_color = cx.theme().caret;
         let selection_color = cx.theme().selection.opacity(0.6);
+        let (composition_color, composition_background) =
+            (cx.theme().foreground, cx.theme().background);
         let caret_on = self.caret_on;
         let placed = {
             let canvas = self.canvas.read(cx);
             canvas.slide_bounds().zip(canvas.area())
+        };
+        let in_editor = |bounds: Bounds<Pixels>, area: Bounds<Pixels>| Bounds {
+            origin: bounds.origin - area.origin,
+            size: bounds.size,
         };
         // Where the caret is in the editor, for whoever looks for it.
         let caret_box = marks
             .as_ref()
             .and_then(|marks| marks.caret)
             .zip(placed)
-            .map(|(caret, (slide, area))| {
-                let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
-                let corners = caret_corners(&caret, unit);
-                let (xs, ys): (Vec<f32>, Vec<f32>) = corners.iter().copied().unzip();
-                let fold = |values: &[f32], pick: fn(f32, f32) -> f32| {
-                    values.iter().copied().reduce(pick).unwrap_or(0.)
-                };
-                let (left, right) = (fold(&xs, f32::min), fold(&xs, f32::max));
-                let (top, bottom) = (fold(&ys, f32::min), fold(&ys, f32::max));
-                let offset = slide.origin - area.origin;
-                Bounds {
-                    origin: offset + point(px(left * unit), px(top * unit)),
-                    size: size(px((right - left) * unit), px((bottom - top) * unit)),
-                }
-            });
+            .map(|(caret, (slide, area))| in_editor(caret_box(&caret, slide), area));
+        // What the system is composing, at the caret, where the selection it stands for starts.
+        let composing = self.editing(cx).and_then(|editing| {
+            let composing = editing.composing.as_ref()?;
+            Some((composing.text.clone(), editing.edit.selection.start()))
+        });
+        let composition = composing.and_then(|(text, at)| {
+            let caret = self.caret_in_window(at, cx)?;
+            Some((text, in_editor(caret, placed?.1)))
+        });
+        // While text is typed, the system's input method types it.
+        let input = self
+            .is_editing(cx)
+            .then(|| (self.focus_handle.clone(), cx.entity()));
         let overlay = canvas(
             |_, _, _| {},
-            move |area, _, window, _| {
+            move |area, _, window, cx| {
+                if let Some((focus, editor)) = &input {
+                    window.handle_input(focus, ElementInputHandler::new(area, editor.clone()), cx);
+                }
                 // A drag goes on selecting wherever the mouse goes, off the slide and off the
                 // editor too, until it's let go of anywhere.
                 let moved = editor.clone();
@@ -805,7 +896,6 @@ impl Render for SlideEditor {
             .absolute()
             .size_full()
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
-            .on_key_down(cx.listener(Self::key_down))
             .on_action(
                 cx.listener(|this, _: &MoveLeft, _, cx| this.go(Go::By(Motion::Left), false, cx)),
             )
@@ -902,5 +992,163 @@ impl Render for SlideEditor {
                         .h(caret.size.height),
                 )
             })
+            .when_some(composition, |this, (text, at)| {
+                let height = at.size.height;
+                this.child(
+                    div()
+                        .id(COMPOSITION_ID)
+                        .test_support()
+                        .aria_label(text.clone())
+                        .absolute()
+                        .left(at.origin.x + at.size.width)
+                        .top(at.origin.y)
+                        .h(height)
+                        .flex()
+                        .items_center()
+                        .bg(composition_background)
+                        .text_color(composition_color)
+                        .text_size(height * COMPOSITION_TEXT)
+                        .line_height(height)
+                        .underline()
+                        .whitespace_nowrap()
+                        .child(text),
+                )
+            })
+    }
+}
+
+/// The system's input method types through this: what it sees is the text being typed, with
+/// what it's composing in place of the selection, and its offsets are UTF-16 (see
+/// [`EditingText::system_text`]). What it composes isn't in the talk until it's committed, which
+/// types it, as a key would; a composition that's cancelled leaves nothing.
+impl EntityInputHandler for SlideEditor {
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let (text, range) = utf16_slice(&self.editing(cx)?.system_text(), range);
+        *adjusted_range = Some(range);
+        Some(text)
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let (range, reversed) = self.editing(cx)?.system_selection();
+        Some(UTF16Selection { range, reversed })
+    }
+
+    fn marked_text_range(&self, _: &mut Window, cx: &mut Context<Self>) -> Option<Range<usize>> {
+        self.editing(cx)?.marked_range()
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.commit_composing(cx);
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editing) = self.editing(cx) else {
+            return;
+        };
+        let composing = editing.composing.is_some();
+        // The composition's own range is the selection it stands in for.
+        let range = range.filter(|range| Some(range) != editing.marked_range().as_ref());
+        if text.is_empty() && range.is_none() {
+            // A composition cancelled, or nothing typed: nothing changes.
+            if composing {
+                self.set_composing(None, cx);
+            }
+            return;
+        }
+        let over = range.and_then(|range| self.places(&range, cx));
+        self.type_over(over, text, cx);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        selected: Option<Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editing) = self.editing(cx) else {
+            return;
+        };
+        let range = range.filter(|range| Some(range) != editing.marked_range().as_ref());
+        if let Some((from, to)) = range.and_then(|range| self.places(&range, cx)) {
+            // The system composes over text of its own choosing: that's what's selected.
+            self.wanted_x = None;
+            self.apply(|edit| edit.move_to(from, false).move_to(to, true), cx);
+        }
+        self.set_composing(Composing::new(text, selected), cx);
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range: Range<usize>,
+        _: Bounds<Pixels>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let at = self.editing(cx)?.system_pos(range.start, false);
+        self.caret_in_window(at, cx)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        position: Point<Pixels>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let point = self.slide_point(position, cx)?;
+        let (slide, Hit::Text { flow, pos }) = self.hit(point, cx)? else {
+            return None;
+        };
+        if !self.editing_flow(slide, flow, cx) {
+            return None;
+        }
+        Some(self.editing(cx)?.system_offset(pos))
+    }
+
+    fn set_selected_text_range(
+        &mut self,
+        range: Range<usize>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editing) = self.editing(cx) else {
+            return;
+        };
+        if let (Some(composing), Some(marked)) = (&editing.composing, editing.marked_range())
+            && marked.start <= range.start
+            && range.end <= marked.end
+        {
+            // The system's caret moves inside what it's composing.
+            let selected = range.start - marked.start..range.end - marked.start;
+            let composing = Composing::new(&composing.text, Some(selected));
+            self.set_composing(composing, cx);
+            return;
+        }
+        if let Some((from, to)) = self.places(&range, cx) {
+            self.wanted_x = None;
+            self.apply(|edit| edit.move_to(from, false).move_to(to, true), cx);
+        }
+    }
+
+    fn accepts_text_input(&self, _: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.is_editing(cx)
     }
 }
