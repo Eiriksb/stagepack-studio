@@ -2378,3 +2378,144 @@ mod tools {
         assert!(typing.caret(cx).is_some());
     }
 }
+
+/// `start..end`, the wrong way round, as the system may give it.
+fn backwards(start: usize, end: usize) -> std::ops::Range<usize> {
+    start..end
+}
+
+#[gpui_kit::test]
+fn reversed_or_out_of_range_ranges_from_the_system_are_taken_in_order(cx: &mut TestAppContext) {
+    let typing = open(cx, TWO);
+    typing.click_text(cx, 1, pos(0, 4));
+    // A reversed selection inside the composition, and then across it.
+    typing.compose(cx, "abc");
+    assert_eq!(typing.marked(cx), Some(4..7));
+    typing.system(cx, |editor, window, cx| {
+        editor.replace_and_mark_text_in_range(None, "abc", Some(backwards(3, 1)), window, cx)
+    });
+    assert_eq!(typing.system_selection(cx), 5..7);
+    typing.system(cx, |editor, window, cx| {
+        editor.set_selected_text_range(backwards(6, 5), window, cx)
+    });
+    assert_eq!(typing.system_selection(cx), 5..6);
+    typing.system(cx, |editor, window, cx| {
+        editor.set_selected_text_range(backwards(6, 2), window, cx)
+    });
+    assert_eq!(typing.composing(cx), None, "a selection outside it ends it");
+    assert_eq!(
+        typing.selection(cx),
+        Selection {
+            anchor: pos(0, 2),
+            head: pos(0, 4)
+        }
+    );
+    assert_eq!(typing.source(cx), TWO);
+    // Each of the others, reversed and past the end.
+    let text_for = |cx: &mut TestAppContext, range: std::ops::Range<usize>| {
+        typing.system(cx, |editor, window, cx| {
+            let mut adjusted = None;
+            let text = editor.text_for_range(range, &mut adjusted, window, cx);
+            (text, adjusted)
+        })
+    };
+    assert_eq!(text_for(cx, backwards(10, 5)), (Some("words".into()), Some(5..10)));
+    assert_eq!(text_for(cx, 100..200), (Some(String::new()), Some(15..15)));
+    for range in [backwards(10, 5), 100..200] {
+        let bounds = typing.system(cx, |editor, window, cx| {
+            editor.bounds_for_range(range, Bounds::default(), window, cx)
+        });
+        assert!(bounds.is_some());
+    }
+    typing.system(cx, |editor, window, cx| {
+        editor.set_selected_text_range(backwards(300, 100), window, cx)
+    });
+    assert_eq!(typing.selection(cx), caret_at(pos(0, WORDS.len())));
+    let replace = |cx: &mut TestAppContext, range: std::ops::Range<usize>, text: &str| {
+        typing.system(cx, |editor, window, cx| {
+            editor.replace_text_in_range(Some(range), text, window, cx)
+        });
+    };
+    replace(cx, backwards(10, 5), "WORDS");
+    replace(cx, backwards(200, 100), "!");
+    assert_eq!(typing.text_of(cx, 0, 1), ["Some WORDS here!"]);
+    typing.system(cx, |editor, window, cx| {
+        let (range, selected) = (Some(backwards(4, 0)), Some(backwards(9, 4)));
+        editor.replace_and_mark_text_in_range(range, "x", selected, window, cx)
+    });
+    assert_eq!(typing.marked(cx), Some(0..1));
+    assert_eq!(typing.system_selection(cx), 1..1);
+    assert_eq!(typing.text_of(cx, 0, 1), ["Some WORDS here!"]);
+}
+
+#[gpui_kit::test]
+fn text_from_the_system_is_cleaned_as_typed_text_is(cx: &mut TestAppContext) {
+    let typing = open(cx, TWO);
+    typing.click_text(cx, 1, pos(0, 4));
+    typing.commit(cx, "a\r\nb");
+    assert_eq!(typing.text_of(cx, 0, 1), ["Somea", "b words here"]);
+    typing.commit(cx, "\u{1b}x");
+    assert_eq!(typing.text_of(cx, 0, 1), ["Somea", "bx words here"]);
+    // What's shown while composing is what's committed.
+    typing.compose(cx, "\u{7}´\r");
+    assert_eq!(typing.composing(cx).as_deref(), Some("´\n"));
+    typing.compose(cx, "\u{7}´");
+    assert_eq!(typing.composition(cx).unwrap().1, "´");
+    typing.system(cx, |editor, window, cx| editor.unmark_text(window, cx));
+    assert_eq!(typing.text_of(cx, 0, 1), ["Somea", "bx´ words here"]);
+}
+
+#[gpui_kit::test]
+fn a_shortcut_during_a_composition_leaves_no_stale_composition(cx: &mut TestAppContext) {
+    let typing = open(cx, TWO);
+    typing.click_text(cx, 1, pos(0, 4));
+    // On Linux, a dead key then Ctrl+S: the system composes the letter with Ctrl held, and
+    // drops its own composition without saying so.
+    typing.compose(cx, "´");
+    let ctrl = Modifiers {
+        control: true,
+        ..Modifiers::default()
+    };
+    // Only the key-down, as Linux types nothing with Ctrl held.
+    typing.with_window(cx, |window, cx| {
+        window.dispatch_event(
+            KeyDownEvent {
+                keystroke: Keystroke {
+                    modifiers: ctrl,
+                    key: "sacute".into(),
+                    key_char: Some("ś".into()),
+                },
+                is_held: false,
+                prefer_character_input: false,
+            }
+            .to_platform_input(),
+            cx,
+        );
+    });
+    typing.settle(cx);
+    assert_eq!(typing.composing(cx), None);
+    assert!(typing.composition(cx).is_none());
+    assert_eq!(typing.source(cx), TWO, "and nothing is typed");
+    // AltGr typing a character is text, and the composition stays until the system ends it.
+    typing.compose(cx, "´");
+    typing.with_window(cx, |window, cx| {
+        window.dispatch_event(
+            KeyDownEvent {
+                keystroke: Keystroke {
+                    modifiers: ctrl_alt(),
+                    key: "e".into(),
+                    key_char: None,
+                },
+                is_held: false,
+                prefer_character_input: false,
+            }
+            .to_platform_input(),
+            cx,
+        );
+    });
+    typing.settle(cx);
+    assert_eq!(typing.composing(cx), None, "a Ctrl and Alt key that types nothing is a shortcut");
+    typing.compose(cx, "´");
+    typing.key(cx, "e", ctrl_alt(), "€");
+    assert_eq!(typing.source(cx), TWO.replacen("Some words", "Some€ words", 1));
+}

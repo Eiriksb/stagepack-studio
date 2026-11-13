@@ -130,7 +130,8 @@ impl Composing {
     pub fn new(text: &str, selected: Option<Range<usize>>) -> Option<Composing> {
         let len = utf16_len(text);
         let selected = selected.map_or(len..len, |range| {
-            range.start.min(len)..range.end.clamp(range.start.min(len), len)
+            let (start, end) = (range.start.min(range.end), range.start.max(range.end));
+            start.min(len)..end.min(len)
         });
         (!text.is_empty()).then(|| Composing {
             text: text.to_string(),
@@ -224,6 +225,16 @@ impl EditingText {
         let start = utf16_in_flow(&self.edit.paras, self.edit.selection.start());
         Some(start..start + composing.len())
     }
+}
+
+/// `text` from the system as the text holds it, as typing it would leave it: line endings as
+/// newlines, control characters other than tab and newline dropped, and no byte order mark.
+pub fn clean_typed(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .filter(|&c| c == '\t' || c == '\n' || !(c.is_control() || c == '\u{feff}'))
+        .collect()
 }
 
 /// The part of `text` in UTF-16 range `range`, widened onto whole characters, and the range it

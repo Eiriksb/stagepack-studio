@@ -17,11 +17,11 @@ use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use slides_engine::{Align, CaretRect, Hit, LineMove, SelectionRects, TextLayout};
-use slides_format::{Motion, Pos, StyleBit, TextEdit};
+use slides_format::{Motion, Pos, Selection, StyleBit, TextEdit};
 
 use crate::document::{Document, EditRefused};
 use crate::slide_canvas::{SLIDE_WIDTH, SlideCanvas, letterbox};
-use crate::text_editing::{Composing, EditingText, utf16_slice};
+use crate::text_editing::{Composing, EditingText, clean_typed, utf16_slice};
 use crate::text_tools::{
     SetTextSize, ToggleBold, ToggleBullets, ToggleItalic, ToggleNumbering, ToggleUnderline,
 };
@@ -162,8 +162,19 @@ pub struct SlideEditor {
     wanted_x: Option<f32>,
     /// Whether a press on the text is being dragged, selecting.
     dragging: bool,
+    /// Where the caret and any composition were last drawn, so that the system's input method
+    /// is told when they move, and only then.
+    ime_place: Option<ImePlace>,
     _subscriptions: Vec<Subscription>,
 }
+
+/// What the system's input method places its window by: the selection, and where the caret
+/// and the composition are drawn.
+type ImePlace = (
+    Selection,
+    Option<Bounds<Pixels>>,
+    Option<(String, Bounds<Pixels>)>,
+);
 
 impl EventEmitter<EditorEvent> for SlideEditor {}
 
@@ -202,6 +213,26 @@ impl SlideEditor {
                 this.document_changed(window, cx)
             }));
         }
+        // A shortcut pressed while the system composes ends the composition, before anything
+        // the shortcut does: a platform that drops its own composition then, as Linux does on
+        // Ctrl and a letter, doesn't say so, and what it was composing mustn't stay shown.
+        let editor = cx.entity().downgrade();
+        let focus = focus_handle.clone();
+        subscriptions.push(cx.intercept_keystrokes(move |event, window, cx| {
+            if !focus.is_focused(window) || !is_shortcut(&event.keystroke) {
+                return;
+            }
+            editor
+                .update(cx, |editor, cx| {
+                    let composing = editor
+                        .editing(cx)
+                        .is_some_and(|editing| editing.composing.is_some());
+                    if composing {
+                        editor.set_composing(None, cx);
+                    }
+                })
+                .ok();
+        }));
         SlideEditor {
             document,
             canvas,
@@ -215,6 +246,7 @@ impl SlideEditor {
             pause: None,
             wanted_x: None,
             dragging: false,
+            ime_place: None,
             _subscriptions: subscriptions,
         }
     }
@@ -801,6 +833,19 @@ fn caret_corners(caret: &CaretRect, unit: f32) -> [(f32, f32); 4] {
     )
 }
 
+/// Whether `keystroke` is a shortcut rather than text: with Ctrl, Alt, the platform key or Fn
+/// held, apart from Ctrl and Alt together giving a character, which is AltGr typing.
+fn is_shortcut(keystroke: &Keystroke) -> bool {
+    let modifiers = keystroke.modifiers;
+    let altgr = modifiers.control && modifiers.alt && keystroke.key_char.is_some();
+    (modifiers.control || modifiers.alt || modifiers.platform || modifiers.function) && !altgr
+}
+
+/// `range` from its lower end to its higher, as the system may give it either way round.
+fn ordered(range: Range<usize>) -> Range<usize> {
+    range.start.min(range.end)..range.start.max(range.end)
+}
+
 /// The box the caret's corners fit in, in the window, on a slide drawn at `slide` there.
 fn caret_box(caret: &CaretRect, slide: Bounds<Pixels>) -> Bounds<Pixels> {
     let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
@@ -842,7 +887,7 @@ fn paint_polygon(
 }
 
 impl Render for SlideEditor {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = cx.entity().downgrade();
         let marks = self.marks(cx);
         let caret_color = cx.theme().caret;
@@ -873,6 +918,16 @@ impl Render for SlideEditor {
             let caret = self.caret_in_window(at, cx)?;
             Some((text, in_editor(caret, placed?.1)))
         });
+        // The system's input method places its window by the caret: it's told when that moves.
+        let place = self
+            .editing(cx)
+            .map(|editing| (editing.edit.selection, caret_box, composition.clone()));
+        if place != self.ime_place {
+            if place.is_some() {
+                window.invalidate_character_coordinates();
+            }
+            self.ime_place = place;
+        }
         // While text is typed, the system's input method types it.
         let input = self
             .is_editing(cx)
@@ -1084,7 +1139,7 @@ impl EntityInputHandler for SlideEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
-        let (text, range) = utf16_slice(&self.editing(cx)?.system_text(), range);
+        let (text, range) = utf16_slice(&self.editing(cx)?.system_text(), ordered(range));
         *adjusted_range = Some(range);
         Some(text)
     }
@@ -1117,9 +1172,12 @@ impl EntityInputHandler for SlideEditor {
         let Some(editing) = self.editing(cx) else {
             return;
         };
+        let text = clean_typed(text);
         let composing = editing.composing.is_some();
         // The composition's own range is the selection it stands in for.
-        let range = range.filter(|range| Some(range) != editing.marked_range().as_ref());
+        let range = range
+            .map(ordered)
+            .filter(|range| Some(range) != editing.marked_range().as_ref());
         if text.is_empty() && range.is_none() {
             // A composition cancelled, or nothing typed: nothing changes.
             if composing {
@@ -1128,7 +1186,7 @@ impl EntityInputHandler for SlideEditor {
             return;
         }
         let over = range.and_then(|range| self.places(&range, cx));
-        self.type_over(over, text, cx);
+        self.type_over(over, &text, cx);
     }
 
     fn replace_and_mark_text_in_range(
@@ -1142,13 +1200,18 @@ impl EntityInputHandler for SlideEditor {
         let Some(editing) = self.editing(cx) else {
             return;
         };
-        let range = range.filter(|range| Some(range) != editing.marked_range().as_ref());
+        let range = range
+            .map(ordered)
+            .filter(|range| Some(range) != editing.marked_range().as_ref());
         if let Some((from, to)) = range.and_then(|range| self.places(&range, cx)) {
             // The system composes over text of its own choosing: that's what's selected.
             self.wanted_x = None;
             self.apply(|edit| edit.move_to(from, false).move_to(to, true), cx);
         }
-        self.set_composing(Composing::new(text, selected), cx);
+        // Shown as it'll be typed. A selection inside text that cleaning changed is its end.
+        let cleaned = clean_typed(text);
+        let selected = selected.map(ordered).filter(|_| cleaned == text);
+        self.set_composing(Composing::new(&cleaned, selected), cx);
     }
 
     fn bounds_for_range(
@@ -1158,7 +1221,7 @@ impl EntityInputHandler for SlideEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let at = self.editing(cx)?.system_pos(range.start, false);
+        let at = self.editing(cx)?.system_pos(ordered(range).start, false);
         self.caret_in_window(at, cx)
     }
 
@@ -1184,6 +1247,7 @@ impl EntityInputHandler for SlideEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let range = ordered(range);
         let Some(editing) = self.editing(cx) else {
             return;
         };
