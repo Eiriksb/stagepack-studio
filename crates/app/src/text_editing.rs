@@ -13,6 +13,9 @@ use crate::history::RunId;
 pub const TYPING: &str = "Typing";
 /// What Undo calls a change to how text looks or what kind of paragraph it is.
 pub const FORMAT_TEXT: &str = "Format text";
+/// What Undo calls a paste into text, and a cut from it.
+pub const PASTE: &str = "Paste";
+pub const CUT: &str = "Cut";
 /// What Undo calls aligning a region's or a box's text.
 pub const ALIGN_TEXT: &str = "Align text";
 

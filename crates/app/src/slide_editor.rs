@@ -17,15 +17,19 @@ use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use slides_engine::{Align, CaretRect, Hit, LineMove, SelectionRects, TextLayout};
-use slides_format::{Motion, Pos, Selection, StyleBit, TextEdit};
+use slides_format::{Motion, Para, Pos, Selection, Span, StyleBit, TextEdit};
 
+use crate::clipboard::{self, ClipboardOp, TextPaste};
+use crate::clipboard_tools::{read_clipboard, write_clipboard};
 use crate::document::{Document, EditRefused};
 use crate::slide_canvas::{SLIDE_WIDTH, SlideCanvas, letterbox};
 use crate::text_editing::{Composing, EditingText, clean_typed, utf16_slice};
 use crate::text_tools::{
     SetTextSize, ToggleBold, ToggleBullets, ToggleItalic, ToggleNumbering, ToggleUnderline,
 };
-use crate::workspace_view::CARET_BLINKS_FOR;
+use crate::workspace_view::{
+    CARET_BLINKS_FOR, CopyToClipboard, CutToClipboard, PasteFromClipboard,
+};
 
 pub const SLIDE_EDITOR_ID: &str = "slide-editor";
 pub const CARET_ID: &str = "caret";
@@ -116,6 +120,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("pageup", NoAction, context),
         KeyBinding::new("ctrl-m", NoAction, context),
         KeyBinding::new("ctrl-d", NoAction, context),
+        KeyBinding::new("ctrl-c", CopyToClipboard, context),
+        KeyBinding::new("ctrl-x", CutToClipboard, context),
+        KeyBinding::new("ctrl-v", PasteFromClipboard, context),
     ]);
     crate::text_tools::bind_keys(cx);
 }
@@ -334,6 +341,87 @@ impl SlideEditor {
         };
         self.run(|document| document.align_text(align), cx);
         self.typed(cx);
+    }
+
+    /// Copies, cuts or pastes in the text being typed.
+    pub fn clipboard(&mut self, op: ClipboardOp, cx: &mut Context<Self>) {
+        match op {
+            ClipboardOp::Copy => {
+                self.copy_text(cx);
+            }
+            ClipboardOp::Cut => self.cut_text(cx),
+            ClipboardOp::Paste => self.paste_text(cx),
+        }
+    }
+
+    /// Puts the selected text on the clipboard, and says whether there was any to put there.
+    /// With nothing selected, it does nothing.
+    fn copy_text(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(paras) = self.editing(cx).map(|editing| editing.edit.copied()) else {
+            return false;
+        };
+        if paras.is_empty() {
+            return false;
+        }
+        write_clipboard(clipboard::text_entry(&paras), cx);
+        true
+    }
+
+    /// Copies the selected text and deletes it, as one step to undo. Nothing is deleted that
+    /// wasn't copied.
+    fn cut_text(&mut self, cx: &mut Context<Self>) {
+        self.drop_composing(cx);
+        if !self.copy_text(cx) {
+            return;
+        }
+        self.wanted_x = None;
+        self.run(Document::cut_text, cx);
+        self.typed(cx);
+    }
+
+    /// Puts what's on the clipboard in place of the selection, as one step to undo: the styled
+    /// text the app copied, or else plain text, a paragraph to a line, in the style at the
+    /// caret. In a title, which is one paragraph, the paragraphs are joined by line breaks.
+    fn paste_text(&mut self, cx: &mut Context<Self>) {
+        self.drop_composing(cx);
+        let Some(editing) = self.editing(cx) else {
+            return;
+        };
+        let title = editing.is_title();
+        let edit = &editing.edit;
+        let kind = edit.paras.get(edit.selection.start().para).map(|para| para.kind);
+        let (plain, metadata) = read_clipboard(cx);
+        let paste = match clipboard::text_to_paste(plain.as_deref(), metadata.as_deref()) {
+            Ok(paste) => paste,
+            Err(clipboard::TooLarge) => {
+                cx.emit(EditorEvent::Said(clipboard::TOO_LARGE.into()));
+                return;
+            }
+        };
+        self.wanted_x = None;
+        match paste {
+            TextPaste::Nothing => return,
+            TextPaste::Styled(paras) => {
+                let paras = match kind {
+                    Some(kind) if title => vec![one_paragraph(paras, kind)],
+                    _ => paras,
+                };
+                self.run(|document| document.paste_text(|edit| edit.paste(&paras)), cx);
+            }
+            TextPaste::Plain(text) => {
+                // A line separator is a line break inside the paragraph.
+                let text = if title { text.replace(['\n', '\u{2029}'], "\u{2028}") } else { text };
+                self.run(|document| document.paste_text(|edit| edit.insert(&text)), cx);
+            }
+        }
+        self.typed(cx);
+    }
+
+    /// Drops what the system was composing, as before a cut or a paste.
+    fn drop_composing(&mut self, cx: &mut Context<Self>) {
+        if self.editing(cx).is_some_and(|editing| editing.composing.is_some()) {
+            self.set_composing(None, cx);
+        }
     }
 
     /// Gives the keyboard back to the text being typed, if any is, as a text tool does once
@@ -841,6 +929,22 @@ fn is_shortcut(keystroke: &Keystroke) -> bool {
     (modifiers.control || modifiers.alt || modifiers.platform || modifiers.function) && !altgr
 }
 
+/// `paras` as one paragraph of `kind`, each joined to the next by a line break.
+fn one_paragraph(paras: Vec<Para>, kind: slides_format::ParaKind) -> Para {
+    let mut spans: Vec<Span> = Vec::new();
+    for (index, para) in paras.into_iter().enumerate() {
+        if index > 0 {
+            let style = spans.last().map(|span| span.style.clone()).unwrap_or_default();
+            spans.push(Span {
+                text: "\n".to_string(),
+                style,
+            });
+        }
+        spans.extend(para.spans);
+    }
+    Para { kind, spans }
+}
+
 /// `range` from its lower end to its higher, as the system may give it either way round.
 fn ordered(range: Range<usize>) -> Range<usize> {
     range.start.min(range.end)..range.start.max(range.end)
@@ -1073,6 +1177,15 @@ impl Render for SlideEditor {
             .on_action(
                 cx.listener(|this, _: &StopEditing, window, cx| this.end_editing(true, window, cx)),
             )
+            .on_action(cx.listener(|this, _: &CopyToClipboard, _, cx| {
+                this.clipboard(ClipboardOp::Copy, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CutToClipboard, _, cx| {
+                this.clipboard(ClipboardOp::Cut, cx)
+            }))
+            .on_action(cx.listener(|this, _: &PasteFromClipboard, _, cx| {
+                this.clipboard(ClipboardOp::Paste, cx)
+            }))
             .on_action(cx.listener(|this, _: &ToggleBold, _, cx| {
                 this.format(|edit| edit.toggle(StyleBit::Bold), cx)
             }))

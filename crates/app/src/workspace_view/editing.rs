@@ -2,6 +2,8 @@
 //! between slides, and the panels around the slide.
 
 use super::*;
+use crate::clipboard::{self, TooLarge};
+use crate::clipboard_tools::{read_clipboard, write_clipboard};
 
 impl WorkspaceView {
     /// Moves to another slide, unless the notes field has the keyboard: its keys move the caret.
@@ -179,6 +181,83 @@ impl WorkspaceView {
             },
             cx,
         );
+    }
+
+    /// Copies, cuts or pastes what has the keyboard: the text being typed, or else the current
+    /// slide. The notes field has its own.
+    pub(super) fn clipboard(&mut self, op: ClipboardOp, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        if self.notes_panel.read(cx).is_focused(window, cx) {
+            return;
+        }
+        if document.read(cx).text().is_some() {
+            // From a text tool that has the keyboard: it goes back to the text, as after any tool.
+            self.slide_editor.update(cx, |editor, cx| {
+                editor.focus_text(window, cx);
+                editor.clipboard(op, cx);
+            });
+            return;
+        }
+        match op {
+            ClipboardOp::Copy => {
+                self.copy_slide(cx);
+            }
+            ClipboardOp::Cut => self.cut_slide(cx),
+            ClipboardOp::Paste => self.paste_slide(cx),
+        }
+    }
+
+    /// Puts the current slide's own text on the clipboard, and says whether it did.
+    fn copy_slide(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(document) = self.document.clone() else {
+            return false;
+        };
+        let Some(text) = document.read(cx).current_for_copy() else {
+            self.say(EditRefused::CouldNotBeMade.to_string(), cx);
+            return false;
+        };
+        let Some(entry) = clipboard::slide_entry(&text) else {
+            self.say(clipboard::SLIDE_TOO_BIG, cx);
+            return false;
+        };
+        write_clipboard(entry, cx);
+        true
+    }
+
+    /// Copies the current slide and takes it out, unless it's the only one, or it couldn't be
+    /// copied.
+    fn cut_slide(&mut self, cx: &mut Context<Self>) {
+        let several = self
+            .document
+            .as_ref()
+            .is_some_and(|document| document.read(cx).slide_count() > 1);
+        if several && self.copy_slide(cx) {
+            self.edit(Document::cut_current, cx);
+        }
+    }
+
+    /// Pastes the slide on the clipboard after the current one. If it shows a picture or a
+    /// component this talk lacks, that's said, once.
+    fn paste_slide(&mut self, cx: &mut Context<Self>) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        let (_, metadata) = read_clipboard(cx);
+        let markdown = match clipboard::slide_to_paste(metadata.as_deref()) {
+            Ok(Some(markdown)) => markdown,
+            Ok(None) => return self.say(clipboard::NO_SLIDE, cx),
+            Err(TooLarge) => return self.say(clipboard::TOO_LARGE, cx),
+        };
+        let before = document.read(cx).slide_count();
+        self.edit(|document| document.paste_slide(&markdown), cx);
+        if document.read(cx).slide_count() == before + 1 {
+            let notices = document.update(cx, |document, _| document.notices());
+            if clipboard::shows_something_missing(&notices) {
+                self.say(clipboard::MISSING_PICTURES, cx);
+            }
+        }
     }
 
     fn panels(&self) -> Panels {

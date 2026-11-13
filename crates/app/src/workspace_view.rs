@@ -21,6 +21,8 @@ use slides_engine::{ComponentState, Fonts};
 
 use crate::builds::{self, BuildOutcome, Compile};
 use crate::cargo_file::{self, write_cargo_file};
+use crate::clipboard::ClipboardOp;
+use crate::clipboard_tools::ClipboardTools;
 use crate::document::{Document, EditRefused, OpenProblem, Reload, SLIDES_FILE, TalkPlace, UNREADABLE_FILE};
 use crate::export::{self, ExportKind, run_export, stagepack_executable};
 use crate::markdown_panel::MarkdownPanel;
@@ -134,6 +136,9 @@ actions!(
         MoveSlideDown,
         ToggleNotes,
         ToggleSlideList,
+        CopyToClipboard,
+        CutToClipboard,
+        PasteFromClipboard,
     ]
 );
 
@@ -196,6 +201,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("delete", DeleteSlide, Some(STRIP_CONTEXT)),
         KeyBinding::new("ctrl-up", MoveSlideUp, Some(STRIP_CONTEXT)),
         KeyBinding::new("ctrl-down", MoveSlideDown, Some(STRIP_CONTEXT)),
+        KeyBinding::new("ctrl-c", CopyToClipboard, Some(STRIP_CONTEXT)),
+        KeyBinding::new("ctrl-x", CutToClipboard, Some(STRIP_CONTEXT)),
+        KeyBinding::new("ctrl-v", PasteFromClipboard, Some(STRIP_CONTEXT)),
         KeyBinding::new("ctrl-s", Save, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-shift-s", SaveAs, Some(KEY_CONTEXT)),
         KeyBinding::new("f5", Present, Some(KEY_CONTEXT)),
@@ -406,7 +414,8 @@ impl WorkspaceView {
             slide_list: true,
             markdown: false,
         };
-        let ribbon = cx.new(|cx| Ribbon::new(document.clone(), text_tools, panels, cx));
+        let clipboard_tools = cx.new(|cx| ClipboardTools::new(document.clone(), &slide_editor, cx));
+        let ribbon = cx.new(|cx| Ribbon::new(document.clone(), clipboard_tools, text_tools, panels, cx));
         let slide_strip = cx.new(|cx| SlideStrip::new(document.clone(), cx));
         let notes_panel = cx.new(|cx| NotesPanel::new(document.clone(), window, cx));
         let notes_edited = cx.subscribe_in(
@@ -1239,6 +1248,15 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &MoveSlideDown, _, cx| this.move_slide(true, cx)))
             .on_action(cx.listener(|this, action: &MoveSlideTo, _, cx| {
                 this.move_slide_to(action.from, action.to, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CopyToClipboard, window, cx| {
+                this.clipboard(ClipboardOp::Copy, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CutToClipboard, window, cx| {
+                this.clipboard(ClipboardOp::Cut, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &PasteFromClipboard, window, cx| {
+                this.clipboard(ClipboardOp::Paste, window, cx)
             }))
             .on_action(cx.listener(|this, _: &Undo, _, cx| this.step_history(Document::undo, cx)))
             .on_action(cx.listener(|this, _: &Redo, _, cx| this.step_history(Document::redo, cx)))

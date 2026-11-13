@@ -10,6 +10,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::*;
 
+use crate::clipboard_tools::ClipboardTools;
 use crate::document::Document;
 use crate::text_tools::TextTools;
 use crate::workspace_view::{
@@ -110,6 +111,8 @@ pub struct Panels {
 
 pub struct Ribbon {
     document: Option<Entity<Document>>,
+    /// Paste, Cut and Copy, first on the Home tab.
+    clipboard_tools: Entity<ClipboardTools>,
     /// The tools for text being typed, on the Home tab.
     text_tools: Entity<TextTools>,
     tab: RibbonTab,
@@ -120,6 +123,7 @@ pub struct Ribbon {
 impl Ribbon {
     pub fn new(
         document: Option<Entity<Document>>,
+        clipboard_tools: Entity<ClipboardTools>,
         text_tools: Entity<TextTools>,
         panels: Panels,
         cx: &mut Context<Self>,
@@ -129,6 +133,7 @@ impl Ribbon {
             .map(|document| cx.observe(document, |_, _, cx| cx.notify()));
         Ribbon {
             document,
+            clipboard_tools,
             text_tools,
             tab: RibbonTab::default(),
             panels,
@@ -213,6 +218,7 @@ impl Ribbon {
             "Leave this slide out of the show"
         };
         vec![
+            self.clipboard_tools.clone().into_any_element(),
             group(
                 "File",
                 vec![

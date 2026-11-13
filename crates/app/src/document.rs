@@ -21,7 +21,7 @@ use crate::history::{History, RunId};
 use crate::present::TalkShape;
 use crate::saving::{SaveJob, SaveTarget, Saved};
 use crate::text_editing::{
-    ALIGN_TEXT, COULD_NOT_TYPE, Composing, EditingText, FORMAT_TEXT, FlowKey, Kind, TYPING, TextMark,
+    ALIGN_TEXT, COULD_NOT_TYPE, CUT, Composing, EditingText, FORMAT_TEXT, FlowKey, Kind, PASTE, TYPING, TextMark,
     holds_no_words, holds_something, region_has_text,
 };
 
@@ -120,12 +120,17 @@ enum Holds {
     Count(isize),
     /// Only this slide may change, and the number of slides stays the same.
     Slide(usize),
+    /// A slide is added at this index, and every other slide keeps its text, but for the line
+    /// ending a slide that ended the file without one gains.
+    Inserted(usize),
 }
 
 /// What Undo shows for each kind of edit.
 const ADD_SLIDE: &str = "Add slide";
 const DUPLICATE_SLIDE: &str = "Duplicate slide";
 const DELETE_SLIDE: &str = "Delete slide";
+const CUT_SLIDE: &str = "Cut slide";
+const PASTE_SLIDE: &str = "Paste slide";
 const MOVE_SLIDE: &str = "Move slide";
 const HIDE_SLIDE: &str = "Hide slide";
 const SHOW_SLIDE: &str = "Show slide";
@@ -659,12 +664,18 @@ impl Document {
         let slides = match holds {
             Holds::Count(slides) => slides,
             Holds::Slide(_) => 0,
+            Holds::Inserted(_) => 1,
         };
         if old_count.checked_add_signed(slides) != Some(candidate.slides.len()) {
             return Err(EditRefused::WouldChangeTheSlides);
         }
         if let Holds::Slide(index) = holds
             && !others_alike(self.talk(), &candidate, index)
+        {
+            return Err(EditRefused::WouldChangeAnotherSlide);
+        }
+        if let Holds::Inserted(index) = holds
+            && !others_kept(self.talk(), &candidate, index)
         {
             return Err(EditRefused::WouldChangeAnotherSlide);
         }
@@ -849,6 +860,34 @@ impl Document {
         self.make(DELETE_SLIDE, change, Holds::Count(-1), at, after, None)
     }
 
+    /// Takes the current slide out, as [`Self::delete_current`] does, named for Undo as a cut.
+    pub fn cut_current(&mut self) -> Result<Vec<usize>, EditRefused> {
+        let at = self.current;
+        let Some(change) = self.build(|talk| slides_format::delete_slide(talk, at))? else {
+            return Ok(Vec::new());
+        };
+        let after = at.min(self.slide_count() - 2);
+        self.make(CUT_SLIDE, change, Holds::Count(-1), at, after, None)
+    }
+
+    /// The current slide's own text, to copy it: see [`slides_format::slide_text_for_copy`].
+    /// Text being typed on it is in the talk already. `None` if working it out goes wrong.
+    pub fn current_for_copy(&self) -> Option<String> {
+        let at = self.current;
+        worked_out(|| slides_format::slide_text_for_copy(self.talk(), at)).ok()
+    }
+
+    /// Adds a slide holding `text`, a slide's own text as [`Self::current_for_copy`] gives it,
+    /// perhaps from another talk, after the current one, and makes it current. It's refused,
+    /// with nothing changed, unless it makes exactly one slide there, every other slide keeping
+    /// its text: a text that would split into several slides, or take in the slide after it,
+    /// isn't pasted.
+    pub fn paste_slide(&mut self, text: &str) -> Result<Vec<usize>, EditRefused> {
+        let at = self.current;
+        let change = self.build(|talk| slides_format::insert_slide(talk, Some(at), text))?;
+        self.make(PASTE_SLIDE, change, Holds::Inserted(at + 1), at, at + 1, None)
+    }
+
     /// Moves slide `from` so that `to` is its place afterwards, and makes it current.
     pub fn move_slide(&mut self, from: usize, to: usize) -> Result<Vec<usize>, EditRefused> {
         let change = self.build(|talk| slides_format::move_slide(talk, from, to))?;
@@ -997,6 +1036,42 @@ impl Document {
         &mut self,
         op: impl FnOnce(&TextEdit) -> TextEdit,
     ) -> Result<Vec<usize>, EditRefused> {
+        self.write_text(op, None)
+    }
+
+    /// Makes `op`, a paste, to the text being typed, as [`Self::apply_text`] does, but as a step
+    /// of its own to undo, named "Paste": the run of typing before it ends, and typing after it
+    /// starts another.
+    pub fn paste_text(
+        &mut self,
+        op: impl FnOnce(&TextEdit) -> TextEdit,
+    ) -> Result<Vec<usize>, EditRefused> {
+        self.text_step(PASTE, op)
+    }
+
+    /// Deletes the selection of the text being typed, once it's been copied, as a step of its
+    /// own to undo, named "Cut", as [`Self::paste_text`] is.
+    pub fn cut_text(&mut self) -> Result<Vec<usize>, EditRefused> {
+        self.text_step(CUT, TextEdit::delete)
+    }
+
+    fn text_step(
+        &mut self,
+        label: &'static str,
+        op: impl FnOnce(&TextEdit) -> TextEdit,
+    ) -> Result<Vec<usize>, EditRefused> {
+        self.end_typing_run();
+        let made = self.write_text(op, Some(label));
+        self.end_typing_run();
+        made
+    }
+
+    /// [`Self::apply_text`], the step named `label` if it's given.
+    fn write_text(
+        &mut self,
+        op: impl FnOnce(&TextEdit) -> TextEdit,
+        label: Option<&'static str>,
+    ) -> Result<Vec<usize>, EditRefused> {
         // Anything done to the text drops what the system was composing: a commit types it.
         self.compose(None);
         let Some(editing) = self.editing.clone() else {
@@ -1055,7 +1130,7 @@ impl Document {
                     .find(&flows)
                     .is_some_and(|index| flows[index].paras == expected)
         };
-        let label = if typed { TYPING } else { FORMAT_TEXT };
+        let label = label.unwrap_or(if typed { TYPING } else { FORMAT_TEXT });
         let changed = self.make_text(label, slide, change, Join::Run(run), &reads_back)?;
         self.note_step(
             run,
@@ -1590,6 +1665,21 @@ fn others_alike(before: &Talk, after: &Talk, index: usize) -> bool {
         && (0..before.slides.len())
             .filter(|&at| at != index)
             .all(|at| text(before, at) == text(after, at))
+}
+
+/// Whether every slide of `before` keeps its text in `after`, which has a slide added at
+/// `index`, but for the line endings at a slide's end, which a slide that ended the file gains
+/// once another follows it.
+fn others_kept(before: &Talk, after: &Talk, index: usize) -> bool {
+    fn text(talk: &Talk, at: usize) -> Option<&str> {
+        let range = talk.slides.get(at)?.range.clone();
+        Some(talk.source.get(range)?.trim_end_matches(['\r', '\n']))
+    }
+    after.slides.len() == before.slides.len() + 1
+        && (0..before.slides.len()).all(|at| {
+            let moved_to = if at < index { at } else { at + 1 };
+            text(before, at).is_some() && text(before, at) == text(after, moved_to)
+        })
 }
 
 /// The folder's own name, even for a path like `talk/..`.

@@ -7151,6 +7151,7 @@ dependencies = [
  "futures",
  "gpui-kit",
  "notify",
+ "proptest",
  "serde",
  "serde_json",
  "sha2 0.10.9",

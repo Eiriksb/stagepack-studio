@@ -2,6 +2,8 @@
 
 pub mod builds;
 pub mod cargo_file;
+pub mod clipboard;
+pub mod clipboard_tools;
 pub mod document;
 pub mod export;
 pub mod history;

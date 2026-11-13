@@ -1230,13 +1230,18 @@ fn pick_from_rows_menu(cx: &mut TestAppContext, handle: AnyWindowHandle, row: us
     settle(cx, handle);
 }
 
-const MENU: [&str; 6] = [
+/// The menu's items, a line between the last two groups.
+const MENU: [&str; 10] = [
     "New slide",
     "Duplicate",
     "Delete",
     "Hide slide",
     "Move up",
     "Move down",
+    "",
+    "Cut",
+    "Copy",
+    "Paste",
 ];
 
 #[gpui_kit::test]
