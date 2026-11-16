@@ -198,6 +198,31 @@ fn a_caret_in_an_empty_cell_sits_in_the_cell() {
         assert!(near(caret.height, rect.h.min(50.0), 0.5), "as tall as a line of the cell's text, as the cell lets it be: {caret:?}");
         assert_eq!(hit_at(&layout, centre(rect)), Hit::Text { flow, pos: at(0, 0) });
     }
+    // Where text typed in a cell of spaces starts.
+    let typed = |text: &str| {
+        let source = format!("# T\n\n| a |{text}|\n|---|---|\n");
+        let mut deck = self::deck(&source);
+        let layout = deck.text_layout(0);
+        let flow = cell_flow(&text_flows(deck.talk(), 0), 0, 1);
+        caret(&layout, flow, at(0, 0))
+    };
+    let (empty, written) = (typed("  "), typed(" x "));
+    assert!(near(empty.x, written.x, 0.01) && near(empty.top, written.top, 0.01), "{empty:?} and {written:?}");
+}
+
+#[test]
+fn a_click_below_or_beside_a_table_is_not_in_a_cell() {
+    let table = "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n";
+    let after_text = format!("# T\n\nText\n\n{table}");
+    let layout = layout(&after_text);
+    for point in [(300.0, 1000.0), (1800.0, 1000.0)] {
+        assert_eq!(hit_at(&layout, point), Hit::Text { flow: 1, pos: at(0, 4) }, "the region's last text, at {point:?}");
+    }
+    let alone = format!("# T\n\n{table}");
+    let layout = self::layout(&alone);
+    for point in [(300.0, 1000.0), (1800.0, 1000.0)] {
+        assert_eq!(hit_at(&layout, point), Hit::Nothing, "no text in the region but the table's, at {point:?}");
+    }
 }
 
 #[test]

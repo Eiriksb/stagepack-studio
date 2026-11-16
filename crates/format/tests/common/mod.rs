@@ -369,7 +369,7 @@ impl GenTable {
 pub fn cell_content() -> impl Strategy<Value = String> {
     prop::sample::select(vec![
         "a", "two words", "**bold**", "*it*", "<Text color=\"red\">red</Text>", "<Text bold>b</Text> c", "\\|", "x \\| y", "`c\\|d`",
-        "`code`", "", "", "é 🎉", "1. x", "# h", "- l", "a\\\\", "<Icon name=\"star\" />", "[l](http://x)", "&amp;", "{x}",
+        "`code`", "", "", "é 🎉", "1. x", "# h", "- l", "a\\\\", "<Icon name=\"star\" />", "[l](http://x)", "[l](a\\|b) x", "<Text color=\"a\\|b\">c</Text>", "&amp;", "{x}",
     ])
     .prop_map(str::to_string)
 }

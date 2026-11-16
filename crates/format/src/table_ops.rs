@@ -19,7 +19,7 @@ pub const MAX_TABLE_COLUMNS: usize = 20;
 pub const MAX_TABLE_ROWS: usize = 51;
 
 /// A new table of `columns` columns, 1 to 20, and `rows` rows under its header, 1 to 50: every
-/// cell a single space, the alignment row `| --- |`, and each line starting and ending with
+/// cell two spaces, the alignment row `| --- |`, and each line starting and ending with
 /// `|`. Its lines end with `\n`, and the last has none.
 pub fn new_table(columns: usize, rows: usize) -> Option<String> {
     if !(1..=MAX_TABLE_COLUMNS).contains(&columns) || !(1..MAX_TABLE_ROWS).contains(&rows) {
@@ -63,12 +63,13 @@ pub fn add_row(talk: &Talk, slide: usize, table: &Range<usize>, after: usize) ->
 }
 
 /// The edit that takes row `row` of the table at `table` on slide `slide` away: its line, and
-/// for the last row, the line ending before it in place of its own.
-/// `None` for the header, row 0, for the table's only row under it, and past its last row.
+/// for the last row, the line ending before it in place of its own. Any row under the header
+/// can go, leaving the header alone at the last, which is a table still. `None` for the
+/// header, row 0, and past the last row.
 pub fn remove_row(talk: &Talk, slide: usize, table: &Range<usize>, row: usize) -> Option<Change> {
     guarded(|| {
         let found = find(talk, slide, table)?;
-        if row == 0 || row >= found.rows.len() || found.rows.len() <= 2 {
+        if row == 0 || row >= found.rows.len() {
             return None;
         }
         let source = talk.source.as_str();
@@ -108,7 +109,7 @@ pub fn add_column(talk: &Talk, slide: usize, table: &Range<usize>, after: Option
         }
         let mut edits = Vec::new();
         for (r, cells) in found.cells.iter().enumerate() {
-            edits.push(insert_cell(&row_cells(source, cells)?, at, " "));
+            edits.push(insert_cell(&row_cells(source, cells)?, at, EMPTY_CELL));
             if r == 0 {
                 edits.push(insert_cell(&rule, at, " --- "));
             }
@@ -172,9 +173,12 @@ fn guarded(make: impl FnOnce() -> Option<Change>) -> Option<Change> {
     catch_unwind(AssertUnwindSafe(make)).ok().flatten()
 }
 
-/// An empty row of `columns` cells, each a single space, with a `|` at each end.
+/// What's between the `|`s of an empty cell the app writes.
+const EMPTY_CELL: &str = "  ";
+
+/// An empty row of `columns` cells, with a `|` at each end.
 fn empty_row(columns: usize) -> String {
-    format!("|{}", " |".repeat(columns))
+    format!("|{}", format!("{EMPTY_CELL}|").repeat(columns))
 }
 
 /// A table found on a slide.
@@ -253,7 +257,7 @@ fn rule_cells(source: &str, rule: &Range<usize>) -> Option<RowCells> {
 }
 
 /// The edit that puts a cell whose bytes between its `|`s are `inside` at column `at` of
-/// `row`, after empty cells, ` ` between `|`s, up to it where the row ends before it.
+/// `row`, after empty cells up to it where the row ends before it.
 fn insert_cell(row: &RowCells, at: usize, inside: &str) -> SourceEdit {
     let cells = row.cells();
     if at < cells {
@@ -272,7 +276,8 @@ fn insert_cell(row: &RowCells, at: usize, inside: &str) -> SourceEdit {
         text.push_str(" |");
     }
     for _ in cells..at {
-        text.push_str(" |");
+        text.push_str(EMPTY_CELL);
+        text.push('|');
     }
     text.push_str(inside);
     text.push('|');
@@ -286,7 +291,7 @@ fn remove_cell(row: &RowCells, column: usize) -> SourceEdit {
     let start = row.starts[column];
     if cells == 1 {
         // A row's only cell: what's in it goes, and the row keeps one empty cell.
-        return SourceEdit { range: start..row.end, text: "| |".to_string() };
+        return SourceEdit { range: start..row.end, text: format!("|{EMPTY_CELL}|") };
     }
     if column + 1 < cells {
         return SourceEdit { range: start..row.starts[column + 1], text: String::new() };

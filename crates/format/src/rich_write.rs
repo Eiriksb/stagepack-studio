@@ -206,7 +206,9 @@ fn render(spans: &[Span], ctx: &Inline, form: Form, escapes: Escapes, nothing: &
             }
         }
     }
-    writer.out
+    // In a cell, a `|` anywhere, in text, code, a link's address or a tag's attribute, would end
+    // the cell; escaped, it reads as itself there.
+    if ctx.cell { writer.out.replace('|', "\\|") } else { writer.out }
 }
 
 /// The attributes of a `<Text>` tag giving these styles, each with a space before it.
@@ -385,7 +387,8 @@ impl Writer<'_> {
                     self.line_start || around != (true, true)
                 }
                 '\\' if least => after.is_none_or(|after| after.is_ascii_punctuation()),
-                '|' if least && !self.ctx.cell => false,
+                // In a cell, every `|` written is escaped once the content is rendered.
+                '|' if least || self.ctx.cell => false,
                 // Before a link, `!` would make it a picture.
                 '!' if least => after.is_none() && at + 1 < self.edge.len(),
                 '!' => true,
@@ -423,9 +426,6 @@ impl Writer<'_> {
             if piece.is_empty() {
                 continue;
             }
-            // In a cell, a `|` is escaped even in code, and reads as itself there.
-            let piece = if self.ctx.cell { piece.replace('|', "\\|") } else { piece.to_string() };
-            let piece = piece.as_str();
             let longest = piece.split(|c| c != '`').map(str::len).max().unwrap_or(0);
             let fence = "`".repeat(longest + 1);
             let pad = piece.starts_with('`')
@@ -1120,8 +1120,9 @@ fn flow_change(talk: &Talk, index: usize, flow: &TextFlow, paras: &[Para]) -> Op
 const EMPTY_CELL: &str = "<Text></Text>";
 
 /// The edit that makes `flow`, a cell's flow, hold `paras`: one body paragraph of one line, or
-/// none, which empties it. Only the cell's content is written, with its `|`s escaped; an
-/// emptied cell is one space between its `|`s.
+/// none, which empties it. Only the cell's content is written, with its `|`s escaped, and in a
+/// cell of white space alone, with a space each side. An emptied cell is two spaces between
+/// its `|`s.
 fn cell_change(talk: &Talk, index: usize, flow: &TextFlow, paras: &[Para]) -> Option<Change> {
     let slide = talk.slides.get(index)?;
     let flows = text_flows(talk, index);
@@ -1149,15 +1150,16 @@ fn cell_change(talk: &Talk, index: usize, flow: &TextFlow, paras: &[Para]) -> Op
         let closed = cell.block.end > start && bytes.get(cell.block.end - 1) == Some(&b'|') && cell.inline.end < cell.block.end;
         let end = if closed { cell.block.end - 1 } else { cell.block.end };
         vec![
-            SourceEdit { range: start..end, text: " ".to_string() },
+            SourceEdit { range: start..end, text: "  ".to_string() },
             SourceEdit { range: cell.inline.clone(), text: EMPTY_CELL.to_string() },
         ]
     } else {
         let ctx = Inline { heading: false, indent: "", eol: eol_in(source), cell: true };
+        let spaces = source.get(cell.inline.clone()).is_some_and(|content| content.trim().is_empty());
         [PLAIN, GUARDED]
             .iter()
             .filter_map(|ways| inline_for(spans, Probe::Cell, &ctx, *ways))
-            .map(|text| SourceEdit { range: cell.inline.clone(), text })
+            .map(|text| SourceEdit { range: cell.inline.clone(), text: if spaces { format!(" {text} ") } else { text } })
             .collect()
     };
     edits.into_iter().map(Change::single).find(|change| reads_as(talk, slide, change, &expected))

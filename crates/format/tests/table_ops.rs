@@ -64,6 +64,21 @@ fn in_eol(talk: &str, text: &str) -> String {
     if talk.contains("\r\n") { text.replace('\n', "\r\n") } else { text.to_string() }
 }
 
+/// Whether the table's every row has the header's cells and `|` at both ends.
+fn is_regular(source: &str, rows: &Rows, cells: &[Vec<CellSource>]) -> bool {
+    rows.iter().all(|row| row.len() == rows[0].len())
+        && cells.iter().all(|row| {
+            let (first, last) = (&row[0], &row[row.len() - 1]);
+            source[first.range.clone()].starts_with('|') && source[last.range.clone()].ends_with('|') && last.inline.end < last.range.end
+        })
+}
+
+/// Whether `text` can be typed in a cell: one line, and nothing the parser reads as another
+/// character.
+fn typeable(text: &str) -> bool {
+    !text.contains(['\n', '\0'])
+}
+
 /// What can be typed in a cell: everything that means something to Markdown or to a tag.
 fn typed_cell_text() -> impl Strategy<Value = String> {
     prop_oneof![
@@ -86,6 +101,7 @@ fn new_table_reads_back_as_that_many_cells() {
         let table = new_table(columns, rows).expect("a table of that size");
         assert!(table.lines().all(|line| line.starts_with('|') && line.ends_with('|')), "{table}");
         assert_eq!(table.lines().nth(1).unwrap(), format!("|{}", " --- |".repeat(columns)));
+        assert!(table.lines().enumerate().filter(|(n, _)| *n != 1).all(|(_, line)| line == format!("|{}", "  |".repeat(columns))), "two spaces in each empty cell");
         let talk = parse_talk(&format!("# T\n\n{table}\n"));
         let Block::Table { range, rows: read, .. } = &talk.slides[0].blocks[1] else { panic!("{table} isn't a table") };
         assert_eq!(table_size(&talk, 0, range), Some((columns, rows + 1)));
@@ -107,10 +123,26 @@ fn the_header_cannot_be_removed() {
     assert_eq!(remove_row(&talk, 0, &table, 0), None);
     assert_eq!(remove_row(&talk, 0, &table, 3), None, "past the last row");
     let change = remove_row(&talk, 0, &table, 1).expect("a body row");
-    assert_eq!(change.apply(source), "# T\n\n| a | b |\n| - | - |\n| 3 | 4 |\n");
-    let talk = parse_talk(&change.apply(source));
+    let one = change.apply(source);
+    assert_eq!(one, "# T\n\n| a | b |\n| - | - |\n| 3 | 4 |\n");
+    let talk = parse_talk(&one);
     let table = talk.slides[0].blocks[1].range().clone();
-    assert_eq!(remove_row(&talk, 0, &table, 1), None, "the only body row");
+    let none = remove_row(&talk, 0, &table, 1).expect("the last body row too").apply(&one);
+    assert_eq!(none, "# T\n\n| a | b |\n| - | - |\n", "a table of its header alone");
+    let talk = parse_talk(&none);
+    let table = talk.slides[0].blocks[1].range().clone();
+    assert_eq!(table_size(&talk, 0, &table), Some((2, 1)));
+    assert_eq!(remove_row(&talk, 0, &table, 0), None, "the header stays");
+    assert_eq!(remove_row(&talk, 0, &table, 1), None, "there's no body row");
+    // A row added to a table of its header alone can be taken away again, byte for byte.
+    for header_only in [none.as_str(), "| a |\r\n|---|", "a | b\n--|--\n\nAfter\n"] {
+        let talk = parse_talk(header_only);
+        let table = talk.slides[0].blocks.iter().find(|block| matches!(block, Block::Table { .. })).unwrap().range().clone();
+        let added = add_row(&talk, 0, &table, 0).expect("a row").apply(header_only);
+        let talk = parse_talk(&added);
+        let table = talk.slides[0].blocks.iter().find(|block| matches!(block, Block::Table { .. })).unwrap().range().clone();
+        assert_eq!(remove_row(&talk, 0, &table, 1).expect("the row").apply(&added), header_only, "{added:?}");
+    }
     assert_eq!(remove_column(&parse_talk("| a |\n| - |\n| 1 |\n"), 0, &(0..17), 0), None, "the only column");
 }
 
@@ -120,11 +152,11 @@ fn rows_and_columns_go_where_they_are_asked_for() {
     let talk = parse_talk(source);
     let table = talk.slides[0].blocks[1].range().clone();
     let apply = |change: Option<Change>| change.expect("a change").apply(source);
-    assert_eq!(apply(add_row(&talk, 0, &table, 0)), "# T\n\n| a | b |\n|---|:-:|\n| | |\n| 1 | 2 |\n");
-    assert_eq!(apply(add_row(&talk, 0, &table, 1)), "# T\n\n| a | b |\n|---|:-:|\n| 1 | 2 |\n| | |\n");
-    assert_eq!(apply(add_column(&talk, 0, &table, None)), "# T\n\n| | a | b |\n| --- |---|:-:|\n| | 1 | 2 |\n");
-    assert_eq!(apply(add_column(&talk, 0, &table, Some(0))), "# T\n\n| a | | b |\n|---| --- |:-:|\n| 1 | | 2 |\n");
-    assert_eq!(apply(add_column(&talk, 0, &table, Some(1))), "# T\n\n| a | b | |\n|---|:-:| --- |\n| 1 | 2 | |\n");
+    assert_eq!(apply(add_row(&talk, 0, &table, 0)), "# T\n\n| a | b |\n|---|:-:|\n|  |  |\n| 1 | 2 |\n");
+    assert_eq!(apply(add_row(&talk, 0, &table, 1)), "# T\n\n| a | b |\n|---|:-:|\n| 1 | 2 |\n|  |  |\n");
+    assert_eq!(apply(add_column(&talk, 0, &table, None)), "# T\n\n|  | a | b |\n| --- |---|:-:|\n|  | 1 | 2 |\n");
+    assert_eq!(apply(add_column(&talk, 0, &table, Some(0))), "# T\n\n| a |  | b |\n|---| --- |:-:|\n| 1 |  | 2 |\n");
+    assert_eq!(apply(add_column(&talk, 0, &table, Some(1))), "# T\n\n| a | b |  |\n|---|:-:| --- |\n| 1 | 2 |  |\n");
     assert_eq!(apply(remove_column(&talk, 0, &table, 0)), "# T\n\n| b |\n|:-:|\n| 2 |\n");
     assert_eq!(apply(remove_column(&talk, 0, &table, 1)), "# T\n\n| a |\n|---|\n| 1 |\n");
     assert_eq!(add_column(&talk, 0, &table, Some(2)), None, "past the last column");
@@ -136,9 +168,9 @@ fn rows_and_columns_go_where_they_are_asked_for() {
     let Block::List { items, .. } = &talk.slides[0].blocks[0] else { panic!() };
     let table = items[0][1].range().clone();
     let apply = |change: Option<Change>| change.expect("a change").apply(&source);
-    assert_eq!(apply(add_row(&talk, 0, &table, 1)), "- item\r\n\r\n  a | b\r\n  --|--\r\n  1 | 2\r\n  | | |\r\n");
-    assert_eq!(apply(add_column(&talk, 0, &table, None)), "- item\r\n\r\n  | | a | b\r\n  | --- | --|--\r\n  | | 1 | 2\r\n");
-    assert_eq!(apply(add_column(&talk, 0, &table, Some(1))), "- item\r\n\r\n  a | b | |\r\n  --|-- | --- |\r\n  1 | 2 | |\r\n");
+    assert_eq!(apply(add_row(&talk, 0, &table, 1)), "- item\r\n\r\n  a | b\r\n  --|--\r\n  1 | 2\r\n  |  |  |\r\n");
+    assert_eq!(apply(add_column(&talk, 0, &table, None)), "- item\r\n\r\n  |  | a | b\r\n  | --- | --|--\r\n  |  | 1 | 2\r\n");
+    assert_eq!(apply(add_column(&talk, 0, &table, Some(1))), "- item\r\n\r\n  a | b |  |\r\n  --|-- | --- |\r\n  1 | 2 |  |\r\n");
     assert_eq!(apply(remove_column(&talk, 0, &table, 0)), "- item\r\n\r\n  | b\r\n  |--\r\n  | 2\r\n");
     assert_eq!(apply(remove_column(&talk, 0, &table, 1)), "- item\r\n\r\n  a |\r\n  --|\r\n  1 |\r\n");
 }
@@ -149,9 +181,9 @@ fn a_short_row_is_filled_only_as_far_as_needed() {
     let talk = parse_talk(source);
     let table = talk.slides[0].blocks[0].range().clone();
     let change = add_column(&talk, 0, &table, Some(1)).expect("a change");
-    assert_eq!(change.apply(source), "| a | b | | c | d |\n| - | - | --- | - | - |\n| x | | |\n");
+    assert_eq!(change.apply(source), "| a | b |  | c | d |\n| - | - | --- | - | - |\n| x |  |  |\n");
     let change = add_column(&talk, 0, &table, Some(0)).expect("a change");
-    assert_eq!(change.apply(source), "| a | | b | c | d |\n| - | --- | - | - | - |\n| x | |\n");
+    assert_eq!(change.apply(source), "| a |  | b | c | d |\n| - | --- | - | - | - |\n| x |  |\n");
     let change = remove_column(&talk, 0, &table, 2).expect("a change");
     assert_eq!(change.apply(source), "| a | b | d |\n| - | - | - |\n| x |\n", "a row without that cell is left alone");
 }
@@ -163,7 +195,7 @@ fn a_row_longer_than_the_header_stops_column_changes() {
     let table = talk.slides[0].blocks[0].range().clone();
     assert_eq!(add_column(&talk, 0, &table, Some(0)), None);
     assert_eq!(remove_column(&talk, 0, &table, 0), None);
-    assert_eq!(add_row(&talk, 0, &table, 1).expect("rows still can").apply(source), "| a | b |\n| - | - |\n| 1 | 2 | 3 |\n| | |\n");
+    assert_eq!(add_row(&talk, 0, &table, 1).expect("rows still can").apply(source), "| a | b |\n| - | - |\n| 1 | 2 | 3 |\n|  |  |\n");
 }
 
 #[test]
@@ -197,6 +229,28 @@ fn an_empty_cell_can_be_typed_in_and_emptied_again() {
     }
     assert_eq!(source, start, "the bytes are back as they were");
 
+    // A hand-written empty cell with other spacing between its `|`s takes typed text between
+    // a space on each side, and ends as the app writes an empty cell: two spaces.
+    for (empty, typed) in [("||", "| x |"), ("| |", "| x |"), ("|   |", "| x |"), ("|\t|", "| x |"), ("|  |", "| x |")] {
+        let source = format!("| a | b |\n|---|---|\n| c {empty}\n");
+        let talk = parse_talk(&source);
+        let flows = text_flows(&talk, 0);
+        let flow = flows.iter().find(|flow| matches!(flow.place, FlowPlace::Cell { row: 1, column: 1, .. })).unwrap();
+        let after = write_flow(&talk, 0, flow, &body("x")).expect("typed").apply(&source);
+        assert_eq!(after, format!("| a | b |\n|---|---|\n| c {typed}\n"), "{empty:?}");
+        let talk = parse_talk(&after);
+        let flows = text_flows(&talk, 0);
+        let flow = flows.iter().find(|flow| matches!(flow.place, FlowPlace::Cell { row: 1, column: 1, .. })).unwrap();
+        let emptied = write_flow(&talk, 0, flow, &body("")).expect("emptied").apply(&after);
+        assert_eq!(emptied, "| a | b |\n|---|---|\n| c |  |\n", "{empty:?} ends as two spaces");
+    }
+    // A cell with text keeps its own spacing.
+    let source = "|a|   b |\n|-|-|\n";
+    let talk = parse_talk(source);
+    let flows = text_flows(&talk, 0);
+    assert_eq!(write_flow(&talk, 0, &flows[1], &body("bc")).unwrap().apply(source), "|a|   bc |\n|-|-|\n");
+    assert_eq!(write_flow(&talk, 0, &flows[0], &body("")).unwrap().apply(source), "|  |   b |\n|-|-|\n");
+
     // Where a space won't do, at an edge with no `|`.
     let source = "a | b\n--|--\nc | d\n";
     let talk = parse_talk(source);
@@ -206,6 +260,37 @@ fn an_empty_cell_can_be_typed_in_and_emptied_again() {
     let flows = text_flows(&parse_talk(&emptied), 0);
     assert_eq!(flows.iter().filter(|flow| matches!(flow.place, FlowPlace::Cell { .. })).count(), 4, "{emptied}");
     assert_eq!(flows[3].paras, body(""), "{emptied}");
+}
+
+#[test]
+fn an_app_made_table_reads_like_a_hand_written_one() {
+    let mut source = format!("{}\n", new_table(3, 2).unwrap());
+    for (column, text) in ["a", "bb", "ccc"].into_iter().enumerate() {
+        let talk = parse_talk(&source);
+        let flows = text_flows(&talk, 0);
+        let flow = flows.iter().find(|flow| matches!(flow.place, FlowPlace::Cell { row: 1, column: c, .. } if c == column)).unwrap();
+        source = write_flow(&talk, 0, flow, &body(text)).expect("typed").apply(&source);
+    }
+    assert_eq!(source, "|  |  |  |\n| --- | --- | --- |\n| a | bb | ccc |\n|  |  |  |\n");
+}
+
+#[test]
+fn a_link_with_a_pipe_in_a_cell_can_be_typed_in() {
+    let source = "# T\n\n| [l](a\\|b) x | c |\n|---|---|\n| 1 | 2 |\n";
+    let talk = parse_talk(source);
+    let flows = text_flows(&talk, 0);
+    let flow = flows.iter().find(|flow| matches!(flow.place, FlowPlace::Cell { row: 0, column: 0, .. })).unwrap();
+    let spans = flow.paras[0].spans.clone();
+    assert_eq!(spans[0].style.link.as_deref(), Some("a|b"));
+    let mut typed = spans.clone();
+    typed.push(plain("Q"));
+    for paras in [flow.paras.clone(), vec![Para { kind: ParaKind::Body, spans: typed }]] {
+        let Some(change) = write_flow(&talk, 0, flow, &paras) else { panic!("refused {paras:?}") };
+        let after = parse_talk(&change.apply(source));
+        let flows = text_flows(&after, 0);
+        let now = flows.iter().find(|flow| matches!(flow.place, FlowPlace::Cell { row: 0, column: 0, .. })).unwrap();
+        assert_eq!(now.paras, storable(&paras));
+    }
 }
 
 #[test]
@@ -293,11 +378,14 @@ proptest! {
     #[test]
     fn typing_in_a_cell_changes_only_that_cell((source, slide, _) in talk_with_a_table(), cell in any::<prop::sample::Index>(), text in typed_cell_text()) {
         let talk = parse_talk(&source);
-        let Some((table, rows, _)) = marked_table(&talk, slide) else { return Ok(()) };
+        let Some((table, rows, sources)) = marked_table(&talk, slide) else { return Ok(()) };
         let cells = cell_flows(&talk, slide, &table);
         prop_assume!(!cells.is_empty());
         let (row, column, flow) = &cells[cell.index(cells.len())];
-        let Some(change) = write_flow(&talk, slide, flow, &body(text.trim_matches(' '))) else { return Ok(()) };
+        let Some(change) = write_flow(&talk, slide, flow, &body(text.trim_matches(' '))) else {
+            prop_assert!(!(typeable(&text) && is_regular(&source, &rows, &sources)), "refused {:?} in a regular table {:?}", text, &source);
+            return Ok(());
+        };
         let after = change.apply(&source);
         let own = &flow.source[0];
         // Only the cell's content changes, or, for an emptied cell, what's between its `|`s.
@@ -320,11 +408,12 @@ proptest! {
     #[test]
     fn any_cell_text_reads_back_as_typed((source, slide, _) in talk_with_a_table(), cell in any::<prop::sample::Index>(), text in typed_cell_text()) {
         let talk = parse_talk(&source);
-        let Some((table, rows, _)) = marked_table(&talk, slide) else { return Ok(()) };
+        let Some((table, rows, sources)) = marked_table(&talk, slide) else { return Ok(()) };
         let cells = cell_flows(&talk, slide, &table);
         prop_assume!(!cells.is_empty());
         let (row, column, flow) = &cells[cell.index(cells.len())];
         let Some(change) = write_flow(&talk, slide, flow, &body(&text)) else {
+            prop_assert!(!(typeable(&text) && is_regular(&source, &rows, &sources)), "refused {:?} in a regular table {:?}", text, &source);
             return Ok(());
         };
         prop_assert!(!text.contains('\n'), "a new line is refused");

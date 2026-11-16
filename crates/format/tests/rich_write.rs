@@ -984,5 +984,5 @@ fn what_a_cell_cannot_hold_is_refused() {
     assert_eq!(write_flow(&talk, 0, flow, &[para(BODY, "x"), para(BODY, "y")]), None);
     assert_eq!(set_align(&talk, 0, &flow.place, "center"), None, "a cell has no alignment of its own");
     let (after, _) = written(source, 0, cell_in(&flows, 1, 0), &[]);
-    assert_eq!(after, "| a |\n| - |\n| |\n", "no paragraph at all empties it");
+    assert_eq!(after, "| a |\n| - |\n|  |\n", "no paragraph at all empties it");
 }

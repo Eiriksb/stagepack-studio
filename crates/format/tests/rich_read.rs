@@ -150,13 +150,13 @@ fn each_cell_of_a_table_is_a_flow_after_the_others() {
             (cell(0, 0), vec![para(ParaKind::Body, "a")], "a"),
             (cell(0, 1), vec![Para { kind: ParaKind::Body, spans: vec![code] }], "`b\\|c`"),
             (cell(1, 0), vec![Para { kind: ParaKind::Body, spans: vec![bold] }], "**1**"),
-            (cell(1, 1), vec![Para { kind: ParaKind::Body, spans: Vec::new() }], ""),
+            (cell(1, 1), vec![Para { kind: ParaKind::Body, spans: Vec::new() }], "  "),
             (cell(2, 0), vec![para(ParaKind::Body, "x")], "x"),
         ],
         "a row shorter than the header has only its own cells"
     );
     let empty = &flows[5].source[0];
-    assert_eq!(&source[empty.block.start..empty.inline.start], "| ", "an empty cell's text goes after its `|` and a space");
+    assert_eq!(&source[empty.inline.clone()], "  ", "an empty cell's content is all the space between its `|`s");
     let Block::Table { rule, .. } = &parse_talk(source).slides[0].blocks[1] else { panic!() };
     assert_eq!(&source[rule.clone()], "| :- | -: |");
 }

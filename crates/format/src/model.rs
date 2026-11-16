@@ -117,8 +117,8 @@ pub struct CellSource {
     /// The cell's bytes: from the `|` before it, if it has one, to the next `|`, and, for the
     /// row's last cell, through the `|` after it.
     pub range: Range<usize>,
-    /// The cell's content, without the spaces around it. An empty cell's is empty, after the
-    /// `|` before it and one space, if there is one: where text typed in it goes.
+    /// The cell's content, without the spaces around it. For a cell of nothing but white space
+    /// it's all of that white space, between its `|`s: where text typed in it goes.
     pub inline: Range<usize>,
     /// Whether the content is text alone, as [`Block::Paragraph`]'s `only_text` says.
     pub only_text: bool,

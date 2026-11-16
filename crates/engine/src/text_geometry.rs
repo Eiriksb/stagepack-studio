@@ -232,6 +232,8 @@ struct Frame {
 pub struct TextLayout {
     paras: Vec<PlacedPara>,
     lines: Vec<ParaLines>,
+    /// The flows that are tables' cells.
+    cell_flows: std::collections::HashSet<usize>,
     frames: Vec<Frame>,
     /// What can't be edited, by layer, and why, with the element it is if it's one: innermost
     /// first among those that overlap.
@@ -461,6 +463,9 @@ impl TextLayout {
                 let origin = specs[layer].rect;
                 let rect = Rect { x: origin.x + text.rect.x, y: origin.y + text.rect.y, ..text.rect };
                 layout.paras.push(PlacedPara { flow: f, para: p, layer, rect });
+                if matches!(flow.place, FlowPlace::Cell { .. }) {
+                    layout.cell_flows.insert(f);
+                }
                 let cell = text.cell.map(|cell| Rect { x: origin.x + cell.x, y: origin.y + cell.y, ..cell });
                 layout.lines.push(para_lines(text, rect, cell));
                 placed_text.push(source.block.clone());
@@ -649,11 +654,12 @@ impl TextLayout {
             }
         }
         // So it does in a region of text away from its text: between paragraphs, on a marker,
-        // below the last.
+        // below the last. Never to a table's cell: a cell is typed in by a click in it.
         for frame in self.frames.iter().rev() {
             let Some((name, area)) = frame.region else { continue };
+            let in_region = |placed: &PlacedPara| self.frames[placed.layer].region.is_some_and(|(other, _)| other == name);
             if contains(&area, turned(x, y, frame.centre, -frame.rotate))
-                && let Some(hit) = self.nearest(|placed| self.frames[placed.layer].region.is_some_and(|(other, _)| other == name), (x, y))
+                && let Some(hit) = self.nearest(|placed| in_region(placed) && !self.is_a_cell(placed), (x, y))
             {
                 return Some(hit);
             }
@@ -696,6 +702,11 @@ impl TextLayout {
     /// The element whose source is `source`, as `element_at` would give it.
     pub fn element(&self, source: &Range<usize>) -> Option<ElementBox> {
         self.elements.iter().rev().find(|element| element.source == *source).cloned()
+    }
+
+    /// Whether `placed`, one of the placed paragraphs, is a table's cell.
+    fn is_a_cell(&self, placed: &PlacedPara) -> bool {
+        self.cell_flows.contains(&placed.flow)
     }
 
     /// The place in the paragraphs `among` takes nearest the point (`x`, `y`) of the slide:

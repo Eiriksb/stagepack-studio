@@ -340,20 +340,16 @@ impl Ctx<'_> {
         }
     }
 
-    /// The content of a table cell whose bytes are `cell`: as a paragraph's, or for an empty
-    /// cell, an empty range after its `|` and one space, if it has them.
+    /// The content of a table cell whose bytes are `cell`: as a paragraph's, or for a cell of
+    /// nothing but white space, all of what's between its `|`s, where typed text goes.
     fn cell_inline(&self, nodes: &[Node], cell: &Range<usize>) -> Range<usize> {
         if !nodes.is_empty() {
             return self.inline_range(nodes, cell);
         }
         let bytes = self.source.as_bytes();
-        let mut at = cell.start;
-        for skip in *b"| " {
-            if at < cell.end && bytes.get(at) == Some(&skip) {
-                at += 1;
-            }
-        }
-        at..at
+        let start = (cell.start + usize::from(bytes.get(cell.start) == Some(&b'|'))).min(cell.end);
+        let end = if cell.end > start && bytes.get(cell.end - 1) == Some(&b'|') { cell.end - 1 } else { cell.end };
+        start..end
     }
 
     /// A table's alignment row: the line after its header, which ends at `header_end`, from
