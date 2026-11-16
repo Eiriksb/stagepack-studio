@@ -108,7 +108,7 @@ fn a_click_selects_and_escape_lets_go(cx: &mut TestAppContext) {
         ("<Shape kind=\"arrow\"", "Shape selected"),
         ("<Icon", "Icon selected"),
         ("| Layout", "Table selected"),
-        ("<Box", "Box selected"),
+        ("<Box", "Text box selected"),
     ] {
         let element = thing(&typing, cx, start);
         let at = middle(&typing, cx, &element);
@@ -122,7 +122,7 @@ fn a_click_selects_and_escape_lets_go(cx: &mut TestAppContext) {
     typing.press(cx, "escape");
     assert_eq!(selected(&typing, cx), None);
     assert!(outline(&typing, cx).is_none());
-    assert_ne!(typing.status(cx).as_deref(), Some("Box selected"));
+    assert_ne!(typing.status(cx).as_deref(), Some("Text box selected"));
     assert_eq!(typing.source(cx), SHOWCASE, "selecting writes nothing");
     let unsaved = typing.document(cx).read_with(cx, |document, _| document.has_unsaved_changes());
     assert!(!unsaved, "and leaves nothing unsaved");
@@ -431,4 +431,31 @@ fn nothing_redraws_while_a_thing_sits_selected(cx: &mut TestAppContext) {
     wait(cx, 20_000);
     assert_eq!((editor_count.get(), view_count.get(), canvas_count.get()), (0, 0, 0));
     assert!(outline(&typing, cx).is_some());
+}
+
+#[gpui_kit::test]
+fn typing_given_back_by_undo_or_redo_drops_the_selection(cx: &mut TestAppContext) {
+    for redo in [false, true] {
+        let typing = open(cx, SHOWCASE);
+        go_to(&typing, cx, THINGS);
+        let title = typing.point_of(cx, 0, pos(0, 3));
+        typing.click(cx, title);
+        typing.type_text(cx, "Z");
+        assert!(typing.source(cx).contains("# ShaZpes"));
+        typing.press(cx, "escape");
+        if redo {
+            typing.press(cx, "ctrl-z");
+            typing.press(cx, "escape");
+        }
+        let picture = thing(&typing, cx, "<Picture");
+        let at = middle(&typing, cx, &picture);
+        typing.click(cx, at);
+        assert!(selected(&typing, cx).is_some());
+        typing.press(cx, if redo { "ctrl-shift-z" } else { "ctrl-z" });
+        assert!(typing.editing(cx).is_some(), "redo {redo}: typing goes on in the title");
+        assert_eq!(selected(&typing, cx), None, "redo {redo}: and the picture is let go of");
+        assert!(outline(&typing, cx).is_none());
+        typing.press(cx, "delete");
+        assert!(typing.source(cx).contains("<Picture"), "redo {redo}: delete is the text's");
+    }
 }

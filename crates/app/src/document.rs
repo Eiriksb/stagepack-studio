@@ -777,6 +777,7 @@ impl Document {
         let changed = self.take_step(step.current, &step.change, talk);
         self.resume_text(step.mark, true);
         self.select_marked(step.selects.map(|selects| selects.before));
+        self.keep_selection_with_typing();
         Ok(Some(changed))
     }
 
@@ -794,6 +795,7 @@ impl Document {
         let changed = self.take_step(step.current, &step.change, talk);
         self.resume_text(step.mark, false);
         self.select_marked(step.selects.map(|selects| selects.after));
+        self.keep_selection_with_typing();
         Ok(Some(changed))
     }
 
@@ -1204,6 +1206,25 @@ impl Document {
         });
     }
 
+    /// Lets go of the thing selected if text is being typed on its slide outside it: typing
+    /// in the thing keeps it selected, and typing on another slide leaves it be. Whatever starts
+    /// or brings back typing, a click, an undo or a redo, ends with this.
+    fn keep_selection_with_typing(&mut self) {
+        let (Some(editing), Some(selected)) = (&self.editing, &self.selected) else {
+            return;
+        };
+        if editing.slide != selected.slide {
+            return;
+        }
+        let para = editing.edit.selection.head.para;
+        let inside = self
+            .text_flow()
+            .is_some_and(|flow| selection::holds_para(self.talk(), editing.slide, flow, para, &selected.source));
+        if !inside {
+            self.selected = None;
+        }
+    }
+
     /// Selects what a step of the history marked, once it's undone or made again: the thing at
     /// `source`, or nothing.
     fn select_marked(&mut self, source: Option<Option<Range<usize>>>) {
@@ -1273,13 +1294,7 @@ impl Document {
             session: self.new_session(),
             composing: None,
         });
-        // Typing in the thing selected keeps it selected; typing elsewhere on its slide doesn't.
-        let inside = self.selected.as_ref().is_some_and(|selected| {
-            selected.slide != slide || selection::holds_para(self.talk(), slide, flow, pos.para, &selected.source)
-        });
-        if !inside {
-            self.selected = None;
-        }
+        self.keep_selection_with_typing();
         true
     }
 
@@ -1311,9 +1326,7 @@ impl Document {
             session: self.new_session(),
             ..EditingText::in_empty_region(slide, region)
         });
-        if self.selected.as_ref().is_some_and(|selected| selected.slide == slide) {
-            self.selected = None;
-        }
+        self.keep_selection_with_typing();
         true
     }
 

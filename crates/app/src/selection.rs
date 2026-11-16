@@ -106,7 +106,8 @@ pub fn said_of(talk: &Talk, slide: usize, range: &Range<usize>) -> Option<String
         Block::Table { .. } => "Table".to_string(),
         Block::Tag(tag) => match tag.name.as_str() {
             "Picture" | "Shape" | "Icon" | "Table" | "Chart" => tag.name.clone(),
-            "Text" => "Text box".to_string(),
+            // Text boxes, as the Insert tab and the format name them.
+            "Text" | "Box" => "Text box".to_string(),
             name => spaced(name),
         },
         _ => return None,
@@ -155,7 +156,7 @@ mod tests {
     #[test]
     fn a_name_is_spaced_at_its_capitals() {
         assert_eq!(spaced("StatCard"), "Stat Card");
-        assert_eq!(spaced("Box"), "Box");
+        assert_eq!(spaced("Chart"), "Chart");
         assert_eq!(spaced("myThing"), "my Thing");
     }
 }

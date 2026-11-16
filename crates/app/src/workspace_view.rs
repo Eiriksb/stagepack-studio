@@ -1041,12 +1041,12 @@ fn export_menu(has_talk: bool) -> impl IntoElement {
         })
 }
 
-/// One line of small print under the slide.
 /// A footer line with nothing on it, as tall as one with something.
 fn blank_footer_line() -> impl IntoElement {
     div().w_full().px_2().py_1().text_xs().child("\u{a0}")
 }
 
+/// One line of small print under the slide.
 fn footer_line(id: &'static str, line: SharedString, color: Hsla) -> impl IntoElement {
     div()
         .id(id)
