@@ -21,7 +21,8 @@ use stagepack_studio::export::{ExportKind, run_export};
 use stagepack_studio::insert::place_for;
 use stagepack_studio::insert_tools::{INSERT_PICTURE_ID, INSERT_SHAPES_ID, INSERT_TEXT_BOX_ID, shape_id};
 use stagepack_studio::recovery::Recovery;
-use stagepack_studio::ribbon::{MORE_RIGHT_ID, RIBBON_ID, TAB_INSERT_ID};
+use stagepack_studio::ribbon::{MORE_RIGHT_ID, RIBBON_ID, TAB_HOME_ID, TAB_INSERT_ID};
+use stagepack_studio::text_tools::{ALIGN_CENTER_ID, BOLD_ID, BULLETS_ID, NUMBERING_ID};
 use stagepack_studio::inspector::{INSPECTOR_HEADING_ID, INSPECTOR_MESSAGE_ID};
 use stagepack_studio::slide_editor::{NEW_BOX_ID, SlideEditor};
 use stagepack_studio::slide_strip::STRIP_ID;
@@ -872,10 +873,20 @@ fn a_paste_starting_with_blank_lines_writes_from_its_first_words(cx: &mut TestAp
     assert_eq!(undo_label(&typing, cx), Some("Insert text box"));
 }
 
+/// What can't be seen: white space, and characters that draw nothing. The property below takes
+/// its inputs from these and from `VISIBLE`, so it knows which inputs should write a box without
+/// asking the app.
+const INVISIBLE: [&str; 15] = [
+    " ", "\u{a0}", "\t", "\n", "\u{2028}", "\u{200b}", "\u{200c}", "\u{200d}", "\u{2060}", "\u{feff}", "\u{ad}",
+    "\u{fffc}", "\u{fe0f}", "\u{e0100}", "\u{3000}",
+];
+/// What can be seen, a lone combining mark among them, as it draws.
+const VISIBLE: [&str; 3] = ["a", "é", "\u{301}"];
+
 /// A step of typing into a new text box, for the property below.
 #[derive(Clone, Debug)]
 enum Input {
-    Text(String),
+    Text(Vec<(&'static str, bool)>),
     Enter,
     LineBreak,
     Backspace,
@@ -883,9 +894,12 @@ enum Input {
 
 fn input() -> impl proptest::strategy::Strategy<Value = Input> {
     use proptest::prelude::*;
+    let piece = prop_oneof![
+        4 => prop::sample::select(INVISIBLE.to_vec()).prop_map(|text| (text, false)),
+        1 => prop::sample::select(VISIBLE.to_vec()).prop_map(|text| (text, true)),
+    ];
     prop_oneof![
-        proptest::collection::vec(prop::sample::select(vec![" ", "\u{a0}", "\t", "\n", "\u{2028}", "a", "é", "\u{200b}"]), 1..4)
-            .prop_map(|parts| Input::Text(parts.concat())),
+        proptest::collection::vec(piece, 1..4).prop_map(Input::Text),
         Just(Input::Enter),
         Just(Input::LineBreak),
         Just(Input::Backspace),
@@ -893,33 +907,119 @@ fn input() -> impl proptest::strategy::Strategy<Value = Input> {
 }
 
 proptest::proptest! {
-    #![proptest_config(proptest::prelude::ProptestConfig { cases: 48, ..Default::default() })]
+    #![proptest_config(proptest::prelude::ProptestConfig { cases: 64, ..Default::default() })]
 
     #[test]
-    fn typing_into_a_new_box_never_writes_a_box_with_no_visible_character(inputs in proptest::collection::vec(input(), 1..6)) {
+    fn typing_into_a_new_box_writes_it_only_with_something_visible(inputs in proptest::collection::vec(input(), 1..6)) {
         let folder = tempfile::tempdir().unwrap();
         std::fs::write(folder.path().join("slides.md"), TALK).unwrap();
         let mut document = stagepack_studio::document::Document::open(folder.path(), Fonts::bundled_only()).unwrap();
         document.insert_text_box().unwrap();
+        let mut seen = false;
         for input in inputs {
+            if let Input::Text(pieces) = &input {
+                seen |= pieces.iter().any(|(_, visible)| *visible);
+            }
             let _ = document.apply_text(|edit| match &input {
-                Input::Text(text) => edit.insert(text),
+                Input::Text(pieces) => edit.insert(&pieces.iter().map(|(text, _)| *text).collect::<String>()),
                 Input::Enter => edit.enter(),
                 Input::LineBreak => edit.soft_break(),
                 Input::Backspace => edit.backspace(),
             });
-            let talk = document.talk();
-            let source = talk.source.clone();
-            match source.find("<Box") {
-                None => proptest::prop_assert_eq!(&source, TALK),
-                Some(_) => {
-                    let flows = slides_format::text_flows(talk, 0);
-                    let visible = flows.iter().filter(|flow| matches!(flow.place, slides_format::FlowPlace::Tag(_))).any(|flow| {
-                        flow.paras.iter().flat_map(|para| &para.spans).any(|span| span.text.chars().any(|c| !c.is_whitespace()))
-                    });
-                    proptest::prop_assert!(visible || document.undo_label() == Some("Typing"), "an empty box was written: {:?}", source);
-                }
+            let source = document.source().to_string();
+            if seen {
+                proptest::prop_assert!(source.contains("<Box"), "something visible was typed: {:?}", source);
+            } else {
+                proptest::prop_assert_eq!(&source, TALK);
+                proptest::prop_assert!(document.new_box().is_some());
             }
         }
+    }
+}
+
+#[gpui_kit::test]
+fn invisible_characters_leave_a_text_box_pending(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    insert_text_box(&typing, cx);
+    for text in ["\u{200b}", "\u{200c}", "\u{200d}", "\u{2060}", "\u{fffc}", "\u{fe0f}", "\u{e0100}", "\u{ad}"] {
+        commit(&typing, cx, text);
+        assert_eq!(typing.source(cx), TALK, "{text:?}");
+        assert!(!can_undo(&typing, cx), "{text:?}");
+        assert!(new_box(&typing, cx).is_some(), "{text:?}");
+        put_on_clipboard(cx, vec![ClipboardEntry::String(format!("{text}\n{text}").into())]);
+        typing.press(cx, "ctrl-v");
+        assert_eq!(typing.source(cx), TALK, "pasted {text:?}");
+    }
+    // A combining mark draws, even alone.
+    commit(&typing, cx, "\u{301}");
+    assert!(typing.source(cx).contains("<Box"));
+}
+
+#[test]
+fn what_is_visible_is_what_draws() {
+    use slides_format::is_visible_char;
+    for c in [' ', '\u{a0}', '\t', '\n', '\u{2028}', '\u{3000}', '\u{200b}', '\u{200c}', '\u{200d}', '\u{2060}', '\u{feff}', '\u{ad}', '\u{fffc}', '\u{fe00}', '\u{fe0f}', '\u{e0100}', '\u{e01ef}', '\u{202e}', '\u{7}'] {
+        assert!(!is_visible_char(c), "{c:?}");
+    }
+    for c in ['a', 'é', '\u{301}', '😀', '-', '中'] {
+        assert!(is_visible_char(c), "{c:?}");
+    }
+}
+
+#[gpui_kit::test]
+fn formatting_chosen_for_a_pending_box_is_written_with_it(cx: &mut TestAppContext) {
+    for (tool, written) in [
+        (BULLETS_ID, "- x".to_string()),
+        (NUMBERING_ID, "1. x".to_string()),
+        (BOLD_ID, "**x**".to_string()),
+    ] {
+        let typing = open(cx, TALK);
+        insert_text_box(&typing, cx);
+        click_on(&typing, cx, TAB_HOME_ID);
+        click_on(&typing, cx, tool);
+        assert_eq!(typing.source(cx), TALK, "{tool}: nothing written yet");
+        assert!(!can_undo(&typing, cx), "{tool}");
+        assert!(new_box(&typing, cx).is_some(), "{tool}: still pending");
+        // Blank input doesn't lose it.
+        typing.type_text(cx, " ");
+        typing.type_text(cx, "x");
+        assert_eq!(typing.source(cx), written_box(&written), "{tool}");
+        assert_eq!(undo_label(&typing, cx), Some("Insert text box"), "{tool}");
+    }
+}
+
+#[gpui_kit::test]
+fn an_alignment_chosen_for_a_pending_box_is_written_with_it(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    insert_text_box(&typing, cx);
+    click_on(&typing, cx, TAB_HOME_ID);
+    click_on(&typing, cx, ALIGN_CENTER_ID);
+    assert_eq!(typing.source(cx), TALK);
+    assert!(!can_undo(&typing, cx));
+    let shown = typing.document(cx).read_with(cx, |document, _| document.text_align());
+    assert_eq!(shown, Some(slides_engine::Align::Center), "the tool shows it");
+    typing.type_text(cx, "x");
+    assert_eq!(
+        typing.source(cx),
+        with_inserted("<Box x=\"640\" y=\"440\" w=\"640\" h=\"200\" align=\"center\">\n\nx\n\n</Box>")
+    );
+    assert_eq!(undo_label(&typing, cx), Some("Insert text box"));
+}
+
+#[gpui_kit::test]
+fn a_styled_paste_into_a_pending_box_keeps_what_the_paste_rules_give(cx: &mut TestAppContext) {
+    use slides_format::{Para, ParaKind, Span};
+    let para = |kind, text: &str| Para { kind, spans: vec![Span { text: text.to_string(), style: Default::default() }] };
+    let cases = [
+        (vec![para(ParaKind::Heading(2), "Head"), para(ParaKind::Body, "words")], "Head\n\nwords"),
+        (vec![para(ParaKind::Bullet { level: 0 }, "one"), para(ParaKind::Bullet { level: 0 }, "two")], "- one\n- two"),
+    ];
+    for (paras, written) in cases {
+        let typing = open(cx, TALK);
+        insert_text_box(&typing, cx);
+        let entry = stagepack_studio::clipboard::text_entry(&paras);
+        cx.write_to_clipboard(ClipboardItem::new_string_with_metadata(entry.text, entry.metadata.expect("the app's own")));
+        typing.press(cx, "ctrl-v");
+        assert_eq!(typing.source(cx), written_box(written));
     }
 }

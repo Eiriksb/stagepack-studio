@@ -14,7 +14,7 @@ use slides_engine::{
     read_talk_text,
 };
 use slides_format::{
-    Change, FlowPlace, MAX_SLIDE_BYTES, Para, Pos, Selection, SourceEdit, Talk, TextEdit, parse_talk, reparse, set_align,
+    Change, FlowPlace, MAX_SLIDE_BYTES, Para, Pos, Selection, SourceEdit, Talk, TextEdit, is_visible_char, parse_talk, reparse, set_align,
     Block, NewTag, Tag, delete_block, find_tag, insert_block, set_tag_attr, set_tag_body, split_slides, storable,
     tag_text, text_flows, write_flow, write_into_region,
 };
@@ -1436,15 +1436,18 @@ impl Document {
     /// text box", and goes on typing in it, at the end of what's written. Input with no visible
     /// character in it, as Enter, a space or a paste of blank lines, writes nothing, and the box
     /// stays as it was, waiting.
-    fn write_new_box(&mut self, editing: &EditingText, (x, y): (u32, u32), after: TextEdit) -> Result<Vec<usize>, EditRefused> {
+    fn write_new_box(&mut self, editing: &EditingText, (x, y): (u32, u32), after: TextEdit, kind: Kind) -> Result<Vec<usize>, EditRefused> {
         let Some(paras) = from_first_visible(&after.paras) else {
-            self.keep_typed(editing.edit.clone(), None);
+            // A choice of kind of paragraph is kept for what's typed next; blank text isn't.
+            let kept = if kind == Kind::Formatted { after } else { editing.edit.clone() };
+            self.keep_typed(kept, None);
             return Ok(Vec::new());
         };
         let end = TextEdit::new(paras.clone()).select_all().selection.end();
-        let after = TextEdit::new(paras).move_to(end, false);
+        let after = TextEdit { typing_style: after.typing_style.clone(), ..TextEdit::new(paras).move_to(end, false) };
         let slide = editing.slide;
-        let (change, start) = guarded(|| new_box_change(self.talk(), slide, (x, y), &after.paras))?
+        let align = editing.flow.new_box_align();
+        let (change, start) = guarded(|| new_box_change(self.talk(), slide, (x, y), align, &after.paras))?
             .ok_or(EditRefused::CouldNotBeTyped)?;
         let count = guarded(|| text_flows(self.talk(), slide).len())? + 1;
         let expected = storable(&after.paras);
@@ -1832,7 +1835,7 @@ impl Document {
         }
         if let Some(place) = editing.flow.new_box() {
             // Typed or pasted, what first goes in a new box writes it, as "Insert text box".
-            return self.write_new_box(&editing, place, after);
+            return self.write_new_box(&editing, place, after, kind);
         }
         let found = editing.flow.find(&flows);
         let change = match (found, editing.flow.region()) {
@@ -1904,7 +1907,19 @@ impl Document {
             return Ok(given);
         };
         let slide = editing.slide;
-        if slide >= self.slide_count() || editing.flow.new_box().is_some() {
+        if let FlowKey::NewBox { x, y, .. } = editing.flow {
+            // Kept for the box, which is written with it.
+            let align = match align {
+                Align::Left => None,
+                Align::Center => Some("center"),
+                Align::Right => Some("right"),
+            };
+            if let Some(editing) = &mut self.editing {
+                editing.flow = FlowKey::NewBox { x, y, align };
+            }
+            return Ok(given);
+        }
+        if slide >= self.slide_count() {
             return Ok(given);
         }
         let written = match align {
@@ -1947,6 +1962,13 @@ impl Document {
     /// any text is being typed.
     pub fn text_align(&self) -> Option<Align> {
         let editing = self.editing.as_ref()?;
+        if editing.flow.new_box().is_some() {
+            return Some(match editing.flow.new_box_align() {
+                Some("center") => Align::Center,
+                Some("right") => Align::Right,
+                _ => Align::Left,
+            });
+        }
         let talk = self.talk();
         guarded(|| text_align(talk, editing.slide, &typed_place(talk, editing)?))
             .ok()
@@ -2437,15 +2459,15 @@ fn tag_starting_at(talk: &Talk, slide: usize, start: usize) -> Option<&Tag> {
     within(&slide.blocks, start)
 }
 
-/// `paras` from their first visible character on: the paragraphs before it, and the white space
-/// before it in its own, left out. `None` if there's none.
+/// `paras` from their first visible character on ([`is_visible_char`]): the paragraphs before
+/// it, and what's before it in its own, left out. `None` if there's none.
 fn from_first_visible(paras: &[Para]) -> Option<Vec<Para>> {
-    let visible = |para: &Para| para.spans.iter().any(|span| span.text.chars().any(|c| !c.is_whitespace()));
+    let visible = |para: &Para| para.spans.iter().any(|span| span.text.chars().any(is_visible_char));
     let first = paras.iter().position(visible)?;
     let mut out = paras[first..].to_vec();
     let spans = &mut out[0].spans;
     while let Some(span) = spans.first_mut() {
-        let rest = span.text.trim_start();
+        let rest = span.text.trim_start_matches(|c: char| !is_visible_char(c));
         if rest.is_empty() {
             spans.remove(0);
         } else {
@@ -2460,9 +2482,10 @@ fn from_first_visible(paras: &[Para]) -> Option<Vec<Para>> {
 /// at the end of slide `slide`'s content, as one edit, and where its tag starts once it's made:
 /// the box is written holding one empty paragraph, and that then written as `paras`. `None` if
 /// it can't be.
-fn new_box_change(talk: &Talk, slide: usize, (x, y): (u32, u32), paras: &[Para]) -> Option<(Change, usize)> {
+fn new_box_change(talk: &Talk, slide: usize, (x, y): (u32, u32), align: Option<&str>, paras: &[Para]) -> Option<(Change, usize)> {
     let place = [x.to_string(), y.to_string(), insert::whole(TEXT_BOX_SIZE.0), insert::whole(TEXT_BOX_SIZE.1)];
-    let attrs: Vec<(&str, &str)> = ["x", "y", "w", "h"].into_iter().zip(place.iter().map(String::as_str)).collect();
+    let mut attrs: Vec<(&str, &str)> = ["x", "y", "w", "h"].into_iter().zip(place.iter().map(String::as_str)).collect();
+    attrs.extend(align.map(|align| ("align", align)));
     let text = tag_text(&NewTag { name: "Box", attrs: &attrs, body: Some("&nbsp;") })?;
     let opened = insert_block(talk, slide, &text)?;
     let edit = opened.edits.first()?;

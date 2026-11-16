@@ -36,7 +36,9 @@ pub enum FlowKey {
     Tag { start: usize },
     /// A text box that isn't in the talk yet, its top-left corner at (`x`, `y`) of the slide,
     /// in slide units. The first thing typed in it writes it; till then nothing of it is written.
-    NewBox { x: u32, y: u32 },
+    /// `align` is the alignment chosen for it meanwhile, as the box will be written with it:
+    /// `center` or `right`, or nothing for the left.
+    NewBox { x: u32, y: u32, align: Option<&'static str> },
 }
 
 impl FlowKey {
@@ -107,10 +109,18 @@ impl FlowKey {
         }
     }
 
+    /// The alignment chosen for the text box not yet written, if this is one: `None` for the left.
+    pub fn new_box_align(&self) -> Option<&'static str> {
+        match self {
+            FlowKey::NewBox { align, .. } => *align,
+            _ => None,
+        }
+    }
+
     /// Where the text box not yet written is, if this is one: its top-left corner.
     pub fn new_box(&self) -> Option<(u32, u32)> {
         match self {
-            FlowKey::NewBox { x, y } => Some((*x, *y)),
+            FlowKey::NewBox { x, y, .. } => Some((*x, *y)),
             _ => None,
         }
     }
@@ -424,7 +434,7 @@ impl EditingText {
     /// Text started in a text box on slide `slide`, its top-left corner at (`x`, `y`), that isn't
     /// written yet: one empty paragraph.
     pub fn in_new_box(slide: usize, x: u32, y: u32) -> EditingText {
-        EditingText { flow: FlowKey::NewBox { x, y }, ..EditingText::in_empty_tag(slide, 0) }
+        EditingText { flow: FlowKey::NewBox { x, y, align: None }, ..EditingText::in_empty_tag(slide, 0) }
     }
 
     /// Whether this is the slide's title, where a paragraph can't be ended.

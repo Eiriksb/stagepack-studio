@@ -1193,3 +1193,13 @@ fn bidi_overrides_and_isolates_are_dropped_but_joiners_and_marks_kept() {
         assert!(!is_bidi_control(c));
     }
 }
+
+#[test]
+fn a_character_is_visible_when_it_draws() {
+    for c in [' ', '\u{a0}', '\t', '\n', '\u{2028}', '\u{3000}', '\u{200b}', '\u{200c}', '\u{200d}', '\u{2060}', '\u{feff}', '\u{ad}', '\u{fffc}', '\u{fe00}', '\u{fe0f}', '\u{e0100}', '\u{e01ef}', '\u{202a}', '\u{2069}', '\u{7}', '\u{0}'] {
+        assert!(!slides_format::is_visible_char(c), "{c:?}");
+    }
+    for c in ['a', 'é', '\u{301}', '😀', '-', '中'] {
+        assert!(slides_format::is_visible_char(c), "{c:?}");
+    }
+}
