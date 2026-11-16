@@ -484,6 +484,17 @@ fn a_blank_line_before_an_untouched_item_stays() {
 }
 
 #[test]
+fn a_link_starting_a_paragraph_with_a_bracket_in_its_code_is_written() {
+    let source = "# Title\n\nOld words.\n";
+    let link = |code: bool| Style { code, link: Some("(x)".to_string()), ..Style::default() };
+    for spans in [vec![styled("]:", link(true))], vec![styled("]:", link(true)), styled(" after", link(false))]] {
+        let paras = [Para { kind: BODY, spans }];
+        let (after, flows) = written(source, 0, 1, &paras);
+        assert_eq!(flows[1].paras, storable(&paras), "{after:?}");
+    }
+}
+
+#[test]
 fn code_of_three_backticks_is_written() {
     let code = Style { code: true, ..Style::default() };
     let paras = [Para { kind: BODY, spans: vec![styled("```", code.clone())] }];

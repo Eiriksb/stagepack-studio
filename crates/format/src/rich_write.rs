@@ -284,6 +284,14 @@ impl Writer<'_> {
             let end = run_end(spans, index, |a, b| a.style.link == b.style.link);
             let link = spans[index].style.link.clone();
             if link.is_some() {
+                // At a paragraph's start, a `]` in code or in a colour would end what's read
+                // as a link reference's label, so something empty goes first.
+                let bracket = spans[index..end].iter().any(|span| {
+                    (span.style.code && span.text.contains(']')) || span.style.color.as_deref().is_some_and(|color| color.contains(']'))
+                });
+                if self.out.is_empty() && bracket {
+                    self.raw("<Text></Text>");
+                }
                 self.raw("[");
             }
             for span in &spans[index..end] {
