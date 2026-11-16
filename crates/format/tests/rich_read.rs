@@ -129,10 +129,47 @@ fn text_tags_and_links_the_model_cannot_hold_are_in_no_flow() {
 #[test]
 fn a_table_splits_the_text_around_it() {
     let flows = flows("# T\n\nBefore.\n\n| a | b |\n| - | - |\n| 1 | 2 |\n\nAfter.\n");
-    assert_eq!(flows.len(), 3);
+    assert_eq!(flows.len(), 3 + 4, "the region's three, then the table's four cells");
     assert_eq!(flows[1].paras, vec![para(ParaKind::Body, "Before.")]);
     assert_eq!(flows[2].paras, vec![para(ParaKind::Body, "After.")]);
     assert_eq!(flows[1].place, flows[2].place);
+}
+
+#[test]
+fn each_cell_of_a_table_is_a_flow_after_the_others() {
+    let source = "# T\n\n| a | `b\\|c` |\n| :- | -: |\n| **1** |  |\n| x |\n\nAfter.\n";
+    let flows = flows(source);
+    let table = 5..source.find("\n\nAfter").unwrap();
+    let cells: Vec<_> = flows[2..].iter().map(|flow| (flow.place.clone(), flow.paras.clone(), &source[flow.source[0].inline.clone()])).collect();
+    let cell = |row, column| FlowPlace::Cell { table: table.clone(), row, column };
+    let code = Span { text: "b|c".into(), style: Style { code: true, ..Style::default() } };
+    let bold = Span { text: "1".into(), style: Style { bold: true, ..Style::default() } };
+    assert_eq!(
+        cells,
+        [
+            (cell(0, 0), vec![para(ParaKind::Body, "a")], "a"),
+            (cell(0, 1), vec![Para { kind: ParaKind::Body, spans: vec![code] }], "`b\\|c`"),
+            (cell(1, 0), vec![Para { kind: ParaKind::Body, spans: vec![bold] }], "**1**"),
+            (cell(1, 1), vec![Para { kind: ParaKind::Body, spans: Vec::new() }], ""),
+            (cell(2, 0), vec![para(ParaKind::Body, "x")], "x"),
+        ],
+        "a row shorter than the header has only its own cells"
+    );
+    let empty = &flows[5].source[0];
+    assert_eq!(&source[empty.block.start..empty.inline.start], "| ", "an empty cell's text goes after its `|` and a space");
+    let Block::Table { rule, .. } = &parse_talk(source).slides[0].blocks[1] else { panic!() };
+    assert_eq!(&source[rule.clone()], "| :- | -: |");
+}
+
+#[test]
+fn a_table_in_a_quote_or_a_component_has_no_flows() {
+    for source in ["> | a |\n> | - |\n> | 1 |\n", "<Chart>\n\n| a |\n| - |\n| 1 |\n\n</Chart>\n"] {
+        assert!(flows(source).is_empty(), "{source:?}");
+        assert!(uneditable_reason(&parse_talk(source), 0, source.find('1').unwrap()).is_some(), "{source:?}");
+    }
+    let boxed = "<Box x=\"10\" y=\"10\">\n\n| a |\n| - |\n| 1 |\n\n</Box>\n\n- item\n\n  | b |\n  | - |\n";
+    let places: Vec<_> = flows(boxed).into_iter().map(|flow| flow.place).collect();
+    assert!(places.iter().all(|place| matches!(place, FlowPlace::Cell { .. })) && places.len() == 3, "{places:?}");
 }
 
 #[test]
@@ -298,7 +335,7 @@ fn uneditable_reason_names_tables_code_and_quotes() {
     let source = "# T\n\n| a | b |\n| - | - |\n| 1 | 2 |\n\n```\nlet x = 1;\n```\n\n> A quote\n\nWords.\n";
     let talk = parse_talk(source);
     let reason = |text: &str| uneditable_reason(&talk, 0, source.find(text).unwrap());
-    assert_eq!(reason("| 1"), Some("Tables can't be edited on the slide yet."));
+    assert_eq!(reason("| 1"), None, "a table's cells can be typed in");
     assert_eq!(reason("let x"), Some("Code can't be edited on the slide yet."));
     assert_eq!(reason("A quote"), Some("Quotes can't be edited on the slide yet."));
     assert_eq!(reason("Words"), None);
@@ -355,8 +392,13 @@ fn mixed_source() -> impl Strategy<Value = String> {
 fn assert_flows_are_sound(talk: &Talk) -> Result<(), TestCaseError> {
     for (index, slide) in talk.slides.iter().enumerate() {
         let flows = text_flows(talk, index);
-        let mut blocks = Vec::new();
+        // A table's cells come after the other flows, so they're in order among themselves.
+        let (mut blocks, mut cells) = (Vec::new(), Vec::new());
         for flow in &flows {
+            let in_a_cell = matches!(flow.place, FlowPlace::Cell { .. });
+            if in_a_cell {
+                prop_assert!(flow.paras.len() == 1 && flow.paras[0].kind == ParaKind::Body);
+            }
             prop_assert_eq!(flow.paras.len(), flow.source.len());
             prop_assert!(!flow.paras.is_empty());
             if let FlowPlace::Tag(range) = &flow.place {
@@ -385,6 +427,8 @@ fn assert_flows_are_sound(talk: &Talk) -> Result<(), TestCaseError> {
                         vec![]
                     }
                     ParaKind::Bullet { .. } | ParaKind::Numbered { .. } => vec![format!("- {content}")],
+                    // A cell's content is read alone in a cell: a `|` in it is escaped there.
+                    ParaKind::Body if in_a_cell => vec![format!("| {content} |\n| - |")],
                     ParaKind::Body => vec![content.to_string()],
                 };
                 let read_alone: Vec<Vec<Span>> = alone
@@ -402,12 +446,13 @@ fn assert_flows_are_sound(talk: &Talk) -> Result<(), TestCaseError> {
                 } else if !read_alone.is_empty() {
                     prop_assert!(read_alone.contains(&para.spans), "content {:?} of {:?} reads alone as {:?}", content, &talk.source, read_alone);
                 }
-                blocks.push(at.block.clone());
+                if in_a_cell { cells.push(at.block.clone()) } else { blocks.push(at.block.clone()) }
             }
             // Every byte of what the flow was read from is in it: a box from its opening tag
             // to its closing one, a list's markers and the lines between its items.
             let read: Vec<std::ops::Range<usize>> = match &flow.place {
                 FlowPlace::Tag(range) => vec![range.clone()],
+                FlowPlace::Cell { .. } => flow.source.iter().map(|at| at.block.clone()).collect(),
                 FlowPlace::Region(_) => slide
                     .blocks
                     .iter()
@@ -421,10 +466,12 @@ fn assert_flows_are_sound(talk: &Talk) -> Result<(), TestCaseError> {
                 }
             }
         }
-        let in_file_order = blocks.clone();
-        blocks.sort_by_key(|block| block.start);
-        prop_assert_eq!(&blocks, &in_file_order);
-        prop_assert!(blocks.windows(2).all(|pair| pair[0].end <= pair[1].start), "overlapping: {:?}", blocks);
+        for blocks in [&mut blocks, &mut cells] {
+            let in_file_order = blocks.clone();
+            blocks.sort_by_key(|block| block.start);
+            prop_assert_eq!(&*blocks, &in_file_order);
+            prop_assert!(blocks.windows(2).all(|pair| pair[0].end <= pair[1].start), "overlapping: {:?}", blocks);
+        }
     }
     Ok(())
 }

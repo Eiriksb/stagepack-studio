@@ -2536,7 +2536,7 @@ fn joined(mut a: Vec<usize>, b: Vec<usize>) -> Vec<usize> {
 fn typed_place(talk: &Talk, editing: &EditingText) -> Option<FlowPlace> {
     match &editing.flow {
         FlowKey::Region { name, .. } => Some(FlowPlace::Region(name.clone())),
-        FlowKey::Box { .. } => {
+        FlowKey::Box { .. } | FlowKey::Cell { .. } => {
             let flows = text_flows(talk, editing.slide);
             editing.flow.find(&flows).map(|index| flows[index].place.clone())
         }
@@ -2547,13 +2547,14 @@ fn typed_place(talk: &Talk, editing: &EditingText) -> Option<FlowPlace> {
     }
 }
 
-/// Whether `a` and `b` are the same kind of place: the same region, or both boxes, whose
-/// ranges move with the text before them.
+/// Whether `a` and `b` are the same kind of place: the same region, both boxes, or the same
+/// cell of a table, whose ranges move with the text before them.
 fn same_place(a: &slides_format::FlowPlace, b: &slides_format::FlowPlace) -> bool {
-    use slides_format::FlowPlace::{Region, Tag};
+    use slides_format::FlowPlace::{Cell, Region, Tag};
     match (a, b) {
         (Region(a), Region(b)) => a == b,
         (Tag(_), Tag(_)) => true,
+        (Cell { row: r1, column: c1, .. }, Cell { row: r2, column: c2, .. }) => (r1, c1) == (r2, c2),
         _ => false,
     }
 }

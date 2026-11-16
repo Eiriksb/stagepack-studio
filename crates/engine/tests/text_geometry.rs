@@ -137,11 +137,117 @@ fn a_click_in_a_turned_box_is_turned_back() {
     assert!(!matches!(hit_at(&layout, (third.x, third.top + third.height / 2.0)), Hit::Text { .. }), "the box isn't there unturned");
 }
 
+/// The index among `flows` of the flow of the cell at `row` and `column`.
+fn cell_flow(flows: &[slides_format::TextFlow], row: usize, column: usize) -> usize {
+    flows
+        .iter()
+        .position(|flow| matches!(flow.place, FlowPlace::Cell { row: r, column: c, .. } if (r, c) == (row, column)))
+        .unwrap_or_else(|| panic!("no flow for cell {row} {column}"))
+}
+
 #[test]
-fn a_click_on_a_table_says_why_it_cannot_be_edited() {
+fn a_click_on_a_tables_text_gives_its_cell() {
     let source = "# T\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
-    let layout = layout(source);
-    assert_eq!(hit_source(source, &hit_at(&layout, (300.0, 240.0))), "| a | b |\n|---|---|\n| 1 | 2 |", "the table, as a whole");
+    let mut deck = deck(source);
+    let layout = deck.text_layout(0);
+    let flows = text_flows(deck.talk(), 0);
+    let Hit::Text { flow, .. } = hit_at(&layout, (300.0, 240.0)) else { panic!("not on text") };
+    assert_eq!(flow, cell_flow(&flows, 0, 0));
+}
+
+#[test]
+fn a_click_in_each_cell_gives_its_flow() {
+    let mut showcase = fixture("showcase");
+    let index = slide_with(&showcase, "| Layout |");
+    let layout = showcase.text_layout(index);
+    let table = block_starting(&showcase, index, "| Layout |");
+    let flows = text_flows(showcase.talk(), index);
+    for row in 0..3 {
+        for column in 0..2 {
+            let rect = layout.cell_rect(&table, row, column).unwrap_or_else(|| panic!("cell {row} {column}"));
+            let flow = cell_flow(&flows, row, column);
+            // On its text, and anywhere else in the cell away from its lines: its corners, below its text.
+            let corners = [(rect.x + 8.0, rect.y + 8.0), (rect.x + rect.w - 8.0, rect.y + rect.h - 8.0), centre(rect)];
+            for point in corners {
+                let Hit::Text { flow: found, pos } = hit_at(&layout, point) else { panic!("{point:?} of cell {row} {column} isn't on its text") };
+                assert_eq!((found, pos.para), (flow, 0), "cell {row} {column} at {point:?}");
+            }
+            let words: String = flows[flow].paras[0].spans.iter().map(|span| span.text.as_str()).collect();
+            let Hit::Text { pos, .. } = hit_at(&layout, (rect.x + rect.w - 8.0, rect.y + 8.0)) else { panic!() };
+            assert_eq!(pos.offset, words.len(), "the nearest place, at the end of the words");
+        }
+    }
+    assert_eq!(layout.cell_rect(&table, 3, 0), None);
+    assert_eq!(layout.cell_rect(&table, 0, 2), None);
+}
+
+#[test]
+fn a_caret_in_an_empty_cell_sits_in_the_cell() {
+    let source = "# T\n\n| a | b |\n|---|---|\n| | c |\n| | |\n";
+    let mut deck = deck(source);
+    let layout = deck.text_layout(0);
+    let talk = deck.talk();
+    let table = talk.slides[0].blocks[1].range().clone();
+    let flows = text_flows(talk, 0);
+    for (row, column) in [(1, 0), (2, 0), (2, 1)] {
+        let flow = cell_flow(&flows, row, column);
+        let rect = layout.cell_rect(&table, row, column).unwrap();
+        let caret = caret(&layout, flow, at(0, 0));
+        assert!(caret.x > rect.x && caret.x < rect.x + rect.w / 2.0, "{caret:?} in {rect:?}");
+        assert!(caret.top >= rect.y && caret.top + caret.height <= rect.y + rect.h + 0.01, "{caret:?} in {rect:?}");
+        assert!(near(caret.height, rect.h.min(50.0), 0.5), "as tall as a line of the cell's text, as the cell lets it be: {caret:?}");
+        assert_eq!(hit_at(&layout, centre(rect)), Hit::Text { flow, pos: at(0, 0) });
+    }
+}
+
+#[test]
+fn a_click_on_a_tables_border_gives_the_table() {
+    let source = "# T\n\n| a | <Icon name=\"star\" /> |\n|---|---|\n| 1 | 2 |\n| 3 |\n";
+    let mut deck = deck(source);
+    let layout = deck.text_layout(0);
+    let table = deck.talk().slides[0].blocks[1].range().clone();
+    let whole = "| a | <Icon name=\"star\" /> |\n|---|---|\n| 1 | 2 |\n| 3 |";
+    let (first, second, short) = (layout.cell_rect(&table, 1, 0).unwrap(), layout.cell_rect(&table, 1, 1).unwrap(), layout.cell_rect(&table, 2, 0).unwrap());
+    let middle = first.y + first.h / 2.0;
+    let points = [
+        (first.x + 0.5, middle),
+        (second.x + 0.5, middle),
+        (second.x + 3.0, middle),
+        (second.x + second.w + 0.5, middle),
+        (first.x + first.w / 2.0, first.y + 0.5),
+        (first.x + first.w / 2.0, first.y + first.h + 0.5),
+    ];
+    for point in points {
+        assert_eq!(hit_source(source, &hit_at(&layout, point)), whole, "on a line at {point:?}");
+    }
+    let icon = layout.cell_rect(&table, 0, 1).unwrap();
+    assert_eq!(hit_source(source, &hit_at(&layout, centre(icon))), whole, "a cell holding more than text");
+    assert_eq!(layout.cell_rect(&table, 2, 1), None, "a row shorter than the header has no cell there");
+    let missing = (second.x + second.w / 2.0, short.y + short.h / 2.0);
+    assert_eq!(hit_source(source, &hit_at(&layout, missing)), whole, "where a short row has no cell");
+    for point in points.into_iter().chain([centre(first), centre(icon), missing]) {
+        assert_eq!(source_at(&deck, &layout, point), whole, "the table is picked anywhere on it at {point:?}");
+    }
+    assert!(layout.element(&table).unwrap().holds_text);
+}
+
+#[test]
+fn cell_rects_tile_the_table() {
+    let mut showcase = fixture("showcase");
+    let index = slide_with(&showcase, "| Layout |");
+    let layout = showcase.text_layout(index);
+    let table = block_starting(&showcase, index, "| Layout |");
+    let drawn = layout.element(&table).unwrap().rect;
+    let cell = |row, column| layout.cell_rect(&table, row, column).unwrap();
+    for row in 0..3 {
+        assert!(near(cell(row, 0).x, drawn.x, 0.01), "each row starts at the table's left");
+        assert!(near(cell(row, 1).x, cell(row, 0).x + cell(row, 0).w, 0.01), "its cells meet");
+        assert!(near(cell(row, 1).x + cell(row, 1).w + 1.0, drawn.x + drawn.w, 0.01), "and end at its right, but for the last line");
+        assert!(near(cell(row, 0).h, cell(row, 1).h, 0.01), "a row's cells are as tall as each other");
+        let top = if row == 0 { drawn.y } else { cell(row - 1, 0).y + cell(row - 1, 0).h };
+        assert!(near(cell(row, 0).y, top, 0.01), "the rows meet");
+    }
+    assert!(near(cell(2, 0).y + cell(2, 0).h + 1.0, drawn.y + drawn.h, 0.01), "the last row ends at its bottom, but for the last line");
 }
 
 #[test]
@@ -217,6 +323,11 @@ fn mixed_slides() -> Vec<String> {
         "---\nregion.body: align=right\n---\n\n# Right\n\nTo the right\n\n<Text x=\"100\" y=\"700\" w=\"800\" h=\"200\" align=\"center\">\n\nCentred box\n\n</Text>\n".to_string(),
     ];
     slides.push("# Each\n\n- one\n- two\n\nAnd more\n".replace("# Each", "---\nregion.body: click=each\n---\n\n# Each"));
+    // Tables, whose cells are flows after the others: by hand, with empty cells and short rows,
+    // in a box and in a list, and after more text.
+    slides.push("# Tables\n\nBefore\n\n| a | **b** `c\\|d` |\n|:--|--:|\n| | x \\| y |\n| short |\n\nAfter\n".to_string());
+    slides.push("# Edges\n\na | b\n--|--\n| | |\nCafé e\u{301} | 👍🏽 <Text color=\"red\">red</Text>\n".to_string());
+    slides.push("<Box x=\"900\" y=\"650\" w=\"900\" h=\"380\">\n\n| in | a box |\n|---|---|\n| one | two |\n\n</Box>\n\n- item\n\n  | in a | list |\n  |---|---|\n  | 1 | 2 |\n".to_string());
     // Empty paragraphs and breaks at a paragraph's edges, as the format crate writes them,
     // and as it wrote them before.
     slides.push("# Edges\n\n&nbsp;\n\nMiddle\n\n&nbsp;\n\nEnds in a break\\\n**<Text></Text>**\n\n\\\nStarts with one\n\n&nbsp;\n".to_string());
@@ -424,7 +535,8 @@ fn a_click_on_a_component_says_why() {
     let source = "# T\n\n<Box fill=\"#dbeafe\">\n\nBoxed but not placed\n\n</Box>\n\n<Text x=\"1000\" y=\"600\" w=\"400\" h=\"200\">\n\n| a |\n|---|\n| b |\n\n</Text>\n";
     let layout = layout(source);
     assert!(hit_source(source, &hit_at(&layout, (300.0, 250.0))).starts_with("<Box fill="), "its words are part of it");
-    assert_eq!(hit_source(source, &hit_at(&layout, (1100.0, 620.0))), "| a |\n|---|\n| b |", "a table in a box is a thing of its own");
+    let Hit::Text { flow, .. } = hit_at(&layout, (1100.0, 620.0)) else { panic!("a table's cell in a box can be typed in") };
+    assert!(matches!(text_flows(&slides_format::parse_talk(source), 0)[flow].place, FlowPlace::Cell { row: 0, column: 0, .. }));
     assert!(hit_source(source, &hit_at(&layout, (1350.0, 780.0))).starts_with("<Text x=\"1000\""), "the box, away from its table");
 }
 
@@ -502,7 +614,8 @@ fn a_click_below_the_last_paragraph_goes_to_it() {
     assert_eq!(hit_at(&layout, (50.0, 900.0)), Hit::Nothing, "outside the region");
     let with_table = "# T\n\nText\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
     let table = self::layout(with_table);
-    assert_eq!(hit_source(with_table, &hit_at(&table, (300.0, 320.0))), "| a | b |\n|---|---|\n| 1 | 2 |", "the table is still the table");
+    let Hit::Text { flow, .. } = hit_at(&table, (300.0, 320.0)) else { panic!("on the table's text") };
+    assert!(matches!(text_flows(&slides_format::parse_talk(with_table), 0)[flow].place, FlowPlace::Cell { .. }), "a cell, not the text above");
 }
 
 #[test]
@@ -630,7 +743,7 @@ fn a_click_on_each_kind_of_thing_gives_its_source() {
     let drawn = layout.element(&table).expect("the table is drawn");
     assert!(drawn.rect.y > 200.0 && drawn.rect.w > 100.0 && drawn.rect.h > 50.0, "{drawn:?}");
     assert!(source_at(&showcase, &layout, centre(drawn.rect)).starts_with("| Layout | Regions |"));
-    assert!(!drawn.holds_text);
+    assert!(drawn.holds_text, "its cells can be typed in");
 
     let picture = "# A picture\n\n![A photo](assets/photo.png)\n";
     let mut flowing = Deck::open(Box::new(FolderFiles::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/showcase"))), Fonts::bundled_only(), picture.to_string());
@@ -859,4 +972,56 @@ fn an_element_moves_with_its_slide_when_text_before_it_changes() {
     let moved = d.text_layout(1).element(&icon(&after)).expect("the icon is found where it's written now");
     assert_eq!(moved.source, icon(&after));
     assert!(d.text_layout(1).element(&icon(before)).is_none());
+}
+
+/// How long a table's cells take to be read as flows and laid out, as each keystroke in a cell
+/// needs. Only meaningful in a release build:
+/// `scripts/cargo-safe.sh test --release -p slides-engine --test text_geometry -- --ignored big_tables`.
+#[test]
+#[ignore = "timing; run in release"]
+fn big_tables_are_read_and_laid_out_quickly() {
+    use std::time::{Duration, Instant};
+    for (columns, rows) in [(6, 8), (20, 50)] {
+        let mut table = slides_format::new_table(columns, rows).unwrap();
+        table = table.replace("| |", "| word |").replace("| |", "| word |");
+        let source = format!("# A table\n\n{table}\n");
+        let mut deck = deck(&source);
+        deck.text_layout(0);
+        let median = |mut times: Vec<Duration>| {
+            times.sort();
+            times[times.len() / 2]
+        };
+        let (mut flows_took, mut layout_took, mut write_took, mut slide_took) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut source = source;
+        for key in 0..60 {
+            let talk = slides_format::parse_talk(&source);
+            let start = Instant::now();
+            let flows = text_flows(&talk, 0);
+            flows_took.push(start.elapsed());
+            let cell = flows.iter().position(|flow| matches!(flow.place, FlowPlace::Cell { row: 1, column: 0, .. })).unwrap();
+            let text = format!("word{}", "a".repeat(key + 1));
+            let paras = [slides_format::Para { kind: slides_format::ParaKind::Body, spans: vec![slides_format::Span { text, style: Default::default() }] }];
+            let start = Instant::now();
+            let change = slides_format::write_flow(&talk, 0, &flows[cell], &paras).expect("a cell's text");
+            write_took.push(start.elapsed());
+            source = change.apply(&source);
+            let start = Instant::now();
+            deck.update_text(slides_format::parse_talk(&source));
+            // The slide's own layout, which its text's is read from.
+            deck.specs(0);
+            slide_took.push(start.elapsed());
+            let layout = deck.text_layout(0);
+            assert!(layout.caret(cell, at(0, key + 5)).is_some());
+            layout_took.push(start.elapsed());
+        }
+        let cells = text_flows(deck.talk(), 0).len() - 1;
+        println!(
+            "{columns} by {} table, {cells} cells: text_flows {:?}, text_layout after an edit {:?} of which the slide's layout {:?}, write_flow {:?} (medians)",
+            rows + 1,
+            median(flows_took),
+            median(layout_took),
+            median(slide_took),
+            median(write_took)
+        );
+    }
 }

@@ -32,6 +32,9 @@ pub enum FlowPlace {
     Region(String),
     /// The positioned tag, by its range, whose text this is.
     Tag(Range<usize>),
+    /// A cell of the table whose range is `table`: row `row`, the header being row 0, and
+    /// column `column`.
+    Cell { table: Range<usize>, row: usize, column: usize },
 }
 
 /// Where one paragraph is in the talk's source.
@@ -53,6 +56,7 @@ pub struct TextFlow {
 }
 
 const TABLE: &str = "Tables can't be edited on the slide yet.";
+const CELL_WITH_MORE: &str = "This cell holds more than text, so it can't be typed in yet.";
 const CODE: &str = "Code can't be edited on the slide yet.";
 const QUOTE: &str = "Quotes can't be edited on the slide yet.";
 const PICTURE: &str = "Pictures can't be edited on the slide yet.";
@@ -99,7 +103,9 @@ pub(crate) fn is_positioned(tag: &Tag) -> bool {
 /// Each run of editable text on slide `slide`, in the order it's in the file. A region's
 /// text is one flow per unbroken run of headings, paragraphs and lists. Anything else ends
 /// the run and belongs to no flow, as does a positioned tag, whose own text is a flow if
-/// it's a box of editable text.
+/// it's a box of editable text. After all those come the cells of the slide's tables whose
+/// cells can be typed in, table by table, each row's cells in turn: each cell holding only
+/// text is a flow of one body paragraph.
 pub fn text_flows(talk: &Talk, slide: usize) -> Vec<TextFlow> {
     let Some(slide) = talk.slides.get(slide) else { return Vec::new() };
     if slide.error.is_some() {
@@ -145,7 +151,46 @@ pub fn text_flows(talk: &Talk, slide: usize) -> Vec<TextFlow> {
         }
     }
     end_run(&mut run, &mut flows);
+    for table in typed_tables(slide) {
+        let Block::Table { rows, cells, range, .. } = table else { continue };
+        for (r, (spans, sources)) in rows.iter().zip(cells).enumerate() {
+            for (c, (spans, source)) in spans.iter().zip(sources).enumerate() {
+                if source.only_text {
+                    flows.push(TextFlow {
+                        place: FlowPlace::Cell { table: range.clone(), row: r, column: c },
+                        paras: vec![para(ParaKind::Body, spans)],
+                        source: vec![ParaSource { block: source.range.clone(), inline: source.inline.clone() }],
+                    });
+                }
+            }
+        }
+    }
     flows
+}
+
+/// The tables on `slide` whose cells can be typed in, in the order they're in the file: those
+/// in the slide's regions, in its lists and in its positioned boxes of text, but not in a quote.
+pub(crate) fn typed_tables(slide: &Slide) -> Vec<&Block> {
+    // `top` says whether `blocks` are the slide's own, where a positioned tag is a box.
+    fn walk<'a>(slide: &'a Slide, blocks: &'a [Block], top: bool, out: &mut Vec<&'a Block>) {
+        for block in blocks {
+            match block {
+                Block::Table { range, .. } if !is_quoted(slide, range) => out.push(block),
+                Block::List { items, .. } => {
+                    for item in items {
+                        walk(slide, item, false, out);
+                    }
+                }
+                Block::Tag(tag) if top && is_positioned(tag) && TEXT_BOXES.contains(&tag.name.as_str()) => walk(slide, &tag.children, false, out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if slide.error.is_none() {
+        walk(slide, &slide.blocks, true, &mut out);
+    }
+    out
 }
 
 /// The flow of a positioned tag's text, if it's a box holding only editable text.
@@ -273,6 +318,12 @@ pub fn uneditable_reason(talk: &Talk, slide: usize, at: usize) -> Option<&'stati
     }
     if slide.quotes.iter().any(|quote| quote.contains(&at)) {
         return Some(QUOTE);
+    }
+    // In a table whose cells can be typed in, only a cell holding more than text can't be:
+    // its `|`s and its alignment row are part of the table.
+    if let Some(Block::Table { cells, .. }) = typed_tables(slide).into_iter().find(|table| table.range().contains(&at)) {
+        let more = cells.iter().flatten().any(|cell| !cell.only_text && cell.inline.contains(&at));
+        return more.then_some(CELL_WITH_MORE);
     }
     reason_in(block?, at)
 }

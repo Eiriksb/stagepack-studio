@@ -953,3 +953,36 @@ proptest! {
         prop_assert!(after.ends_with(&source[end..]), "{:?} became {:?}", source, after);
     }
 }
+
+/// The flow of the cell at `row` and `column` among `flows`.
+fn cell_in(flows: &[TextFlow], row: usize, column: usize) -> usize {
+    flows
+        .iter()
+        .position(|flow| matches!(flow.place, FlowPlace::Cell { row: r, column: c, .. } if (r, c) == (row, column)))
+        .expect("a cell's flow")
+}
+
+#[test]
+fn typing_in_a_hand_written_cell_changes_its_content_alone() {
+    let source = "# T\n\nBefore\nc  |  d\n:-|-:\n  e |f\n";
+    let talk = parse_talk(source);
+    let flows = text_flows(&talk, 0);
+    let (after, flows) = written(source, 0, cell_in(&flows, 1, 1), &[Para { kind: BODY, spans: vec![plain("f"), styled("g", bold())] }]);
+    assert_eq!(after, "# T\n\nBefore\nc  |  d\n:-|-:\n  e |f**g**\n");
+    let (after, _) = written(&after, 0, cell_in(&flows, 0, 0), &[para(BODY, "a | b")]);
+    assert_eq!(after, "# T\n\nBefore\na \\| b  |  d\n:-|-:\n  e |f**g**\n");
+}
+
+#[test]
+fn what_a_cell_cannot_hold_is_refused() {
+    let source = "| a |\n| - |\n| b |\n";
+    let talk = parse_talk(source);
+    let flows = text_flows(&talk, 0);
+    let flow = &flows[cell_in(&flows, 1, 0)];
+    assert_eq!(write_flow(&talk, 0, flow, &[para(BODY, "two\nlines")]), None);
+    assert_eq!(write_flow(&talk, 0, flow, &[para(BULLET, "x")]), None);
+    assert_eq!(write_flow(&talk, 0, flow, &[para(BODY, "x"), para(BODY, "y")]), None);
+    assert_eq!(set_align(&talk, 0, &flow.place, "center"), None, "a cell has no alignment of its own");
+    let (after, _) = written(source, 0, cell_in(&flows, 1, 0), &[]);
+    assert_eq!(after, "| a |\n| - |\n| |\n", "no paragraph at all empties it");
+}

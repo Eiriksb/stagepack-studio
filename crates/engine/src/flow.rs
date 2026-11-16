@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use slides_format::{Block, Span, Style as TextStyle, Tag};
+use slides_format::{Block, CellSource, Span, Style as TextStyle, Tag};
 use taffy::compute_leaf_layout;
 use taffy::prelude::{
     AvailableSpace, Display, FlexDirection, NodeId, Size, Style, TaffyTree, auto, evenly_sized_tracks, length, line, zero,
@@ -15,7 +15,7 @@ use toolkit::{Color, Theme};
 use crate::elements::{PathLook, ShapeLook, path_items, shape_items};
 use crate::native::{MAX_TABLE_CELLS, Semantic, native_elements};
 use crate::placeholder::placeholder_items;
-use crate::text_geometry::{DrawnBlock, DrawnText, LayerText};
+use crate::text_geometry::{DrawnBlock, DrawnTable, DrawnText, LayerText};
 use slides_components::shortened;
 use crate::{
     Align, Bullet, DisplayItem, Fonts, LayoutEnv, NativeElement, NativeParagraph, NativeRun, Notice, Rect, RegionDef, ShapedText, TextRun,
@@ -125,6 +125,8 @@ struct ParaKey {
     range: Range<usize>,
     inline: Range<usize>,
     size: f32,
+    /// Whether it's a table's cell.
+    cell: bool,
 }
 
 /// The size and weight text takes before its spans have their say.
@@ -161,6 +163,8 @@ pub(crate) struct Flow<'a, 'env> {
     empty_items: HashMap<NodeId, Range<usize>>,
     /// The node of each block, by its bytes.
     blocks: HashMap<NodeId, Range<usize>>,
+    /// The cells of each table, row by row, by the table's node, with the table's bytes.
+    tables: HashMap<NodeId, (Range<usize>, Vec<Vec<NodeId>>)>,
     /// Where `draw` found those, for the editor.
     drawn: LayerText,
 }
@@ -284,6 +288,7 @@ impl<'a, 'env> Flow<'a, 'env> {
             paras: HashMap::new(),
             empty_items: HashMap::new(),
             blocks: HashMap::new(),
+            tables: HashMap::new(),
             drawn: LayerText::default(),
         }
     }
@@ -506,7 +511,7 @@ impl<'a, 'env> Flow<'a, 'env> {
             Block::Heading { level, spans, range, inline, .. } => Some(self.para(spans, self.heading_look(*level), align, range, inline)),
             Block::Paragraph { spans, range, inline, .. } => Some(self.para(spans, self.region_look(), align, range, inline)),
             Block::List { ordered, items, item_ranges, .. } => Some(self.list(*ordered, items, item_ranges)),
-            Block::Table { rows, .. } => Some(self.table(rows, align)),
+            Block::Table { rows, cells, range, .. } => Some(self.table(rows, cells, range, align)),
             Block::Code { language, code, .. } => Some(self.code(language.as_deref(), code)),
             Block::Picture { src, alt, .. } => Some(self.picture(src, alt, 0.0, 0.0, align, false)),
             Block::Tag(tag) => self.tag(tag, align),
@@ -517,7 +522,7 @@ impl<'a, 'env> Flow<'a, 'env> {
     /// A heading's or a paragraph's text, noted as the text of the block at `range`.
     fn para(&mut self, spans: &[Span], look: TextLook, align: Align, range: &Range<usize>, inline: &Range<usize>) -> NodeId {
         let node = self.text(spans, look, align);
-        self.paras.insert(node, ParaKey { range: range.clone(), inline: inline.clone(), size: look.size });
+        self.paras.insert(node, ParaKey { range: range.clone(), inline: inline.clone(), size: look.size, cell: false });
         node
     }
 
@@ -566,10 +571,12 @@ impl<'a, 'env> Flow<'a, 'env> {
     }
 
     /// Columns share the width evenly. Cells are placed by number, so a row with too
-    /// few cells leaves the end of the row empty.
-    fn table(&mut self, rows: &[Vec<Vec<Span>>], align: Align) -> NodeId {
+    /// few cells leaves the end of the row empty. Each cell's text is noted as the text of its
+    /// bytes, `sources` beside `rows`, for the editor.
+    fn table(&mut self, rows: &[Vec<Vec<Span>>], sources: &[Vec<CellSource>], range: &Range<usize>, align: Align) -> NodeId {
         let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
         let mut cells = Vec::new();
+        let mut grid = Vec::with_capacity(rows.len());
         let mut native_rows = Vec::with_capacity(rows.len());
         for (r, row) in rows.iter().enumerate() {
             let look = TextLook { bold: r == 0 || self.region.bold, ..self.region_look() };
@@ -586,9 +593,13 @@ impl<'a, 'env> Flow<'a, 'env> {
                 };
                 let (runs, native) = self.runs(spans, look);
                 let cell = self.leaf(style, Content::Text(Leaf { runs, align, wraps: true, end_line: false, frame: Frame::Outline }));
+                if let Some(source) = sources.get(r).and_then(|row| row.get(c)) {
+                    self.paras.insert(cell, ParaKey { range: source.range.clone(), inline: source.inline.clone(), size: look.size, cell: true });
+                }
                 native_row.push((cell, NativeParagraph::new(native, align)));
                 cells.push(cell);
             }
+            grid.push(native_row.iter().map(|(cell, _)| *cell).collect());
             native_rows.push(native_row);
         }
         let style = Style {
@@ -599,6 +610,7 @@ impl<'a, 'env> Flow<'a, 'env> {
             ..Style::default()
         };
         let table = self.node(style, &cells);
+        self.tables.insert(table, (range.clone(), grid));
         if rows.len() * columns > MAX_TABLE_CELLS {
             self.notice("This table is too big to export, so it's shown as text".to_string());
             self.note(table, Semantic::TableTooBig);
@@ -653,7 +665,8 @@ impl<'a, 'env> Flow<'a, 'env> {
                 if let Some(key) = self.paras.get(&node) {
                     let rect = Rect { x: x + layout.padding.left, y: y + layout.padding.top, w: layout.content_box_width(), h: layout.content_box_height() };
                     let (range, inline, size) = (key.range.clone(), key.inline.clone(), key.size);
-                    self.drawn.texts.push(DrawnText { range, inline, rect, size, align, shaped: Some((drawn, text.buffer.clone())) });
+                    let cell = key.cell.then_some(Rect { x, y, w, h });
+                    self.drawn.texts.push(DrawnText { range, inline, rect, size, align, shaped: Some((drawn, text.buffer.clone())), cell });
                 }
                 items.push(DisplayItem::Text { text, x: x + layout.padding.left, y: y + layout.padding.top });
             }
@@ -674,11 +687,25 @@ impl<'a, 'env> Flow<'a, 'env> {
         if let Some(range) = self.blocks.get(&node) {
             self.drawn.blocks.push(DrawnBlock { range: range.clone(), rect: Rect { x, y, w, h } });
         }
+        if let Some((range, grid)) = self.tables.get(&node) {
+            let cells = grid
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|cell| {
+                            let cell = self.tree.layout(*cell).expect("every node is in the tree");
+                            Rect { x: x + cell.location.x, y: y + cell.location.y, w: cell.size.width, h: cell.size.height }
+                        })
+                        .collect()
+                })
+                .collect();
+            self.drawn.tables.push(DrawnTable { range: range.clone(), cells });
+        }
         if let Some(range) = self.empty_items.get(&node) {
             let inline = range.end..range.end;
             let rect = Rect { x, y, w, h };
             let size = self.region.size;
-            self.drawn.texts.push(DrawnText { range: range.clone(), inline, rect, size, align: Align::Left, shaped: None });
+            self.drawn.texts.push(DrawnText { range: range.clone(), inline, rect, size, align: Align::Left, shaped: None, cell: None });
         }
         for child in self.tree.children(node).expect("every node is in the tree") {
             self.draw(child, (x, y), items);

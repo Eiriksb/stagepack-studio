@@ -39,6 +39,27 @@ pub enum FlowKey {
     /// `align` is the alignment chosen for it meanwhile, as the box will be written with it:
     /// `center` or `right`, or nothing for the left.
     NewBox { x: u32, y: u32, align: Option<&'static str> },
+    /// The cell at `row` and `column` of the `table`th table on the slide whose cells are
+    /// typed in. Typing in a cell changes only that cell's bytes, so its table stays the same
+    /// one of those.
+    Cell { table: usize, row: usize, column: usize },
+}
+
+/// Which of the slide's tables whose cells are typed in each of `flows` is a cell of, if any:
+/// they're counted in the order their cells come.
+fn tables_of(flows: &[TextFlow]) -> impl Iterator<Item = Option<usize>> + '_ {
+    let mut last: Option<&std::ops::Range<usize>> = None;
+    let mut count = 0;
+    flows.iter().map(move |flow| match &flow.place {
+        FlowPlace::Cell { table, .. } => {
+            if last != Some(table) {
+                count += usize::from(last.is_some());
+                last = Some(table);
+            }
+            Some(count)
+        }
+        _ => None,
+    })
 }
 
 impl FlowKey {
@@ -60,11 +81,19 @@ impl FlowKey {
                     .filter(|other| matches!(other.place, FlowPlace::Tag(_)))
                     .count(),
             },
+            FlowPlace::Cell { row, column, .. } => {
+                FlowKey::Cell { table: tables_of(flows).nth(index).flatten()?, row: *row, column: *column }
+            }
         })
     }
 
     /// Which of `flows` this is, if the slide has it.
     pub fn find(&self, flows: &[TextFlow]) -> Option<usize> {
+        if let FlowKey::Cell { table, row, column } = self {
+            return tables_of(flows).zip(flows).position(|(nth, flow)| {
+                nth == Some(*table) && matches!(flow.place, FlowPlace::Cell { row: r, column: c, .. } if (r, c) == (*row, *column))
+            });
+        }
         let mut seen = 0;
         for (index, flow) in flows.iter().enumerate() {
             let same_kind = match (self, &flow.place) {
@@ -83,7 +112,7 @@ impl FlowKey {
             }
             let nth = match self {
                 FlowKey::Region { nth, .. } | FlowKey::Box { nth } => *nth,
-                FlowKey::Tag { .. } | FlowKey::NewBox { .. } => continue,
+                FlowKey::Tag { .. } | FlowKey::NewBox { .. } | FlowKey::Cell { .. } => continue,
             };
             if seen == nth {
                 return Some(index);
@@ -97,7 +126,7 @@ impl FlowKey {
     pub fn region(&self) -> Option<&str> {
         match self {
             FlowKey::Region { name, .. } => Some(name),
-            FlowKey::Box { .. } | FlowKey::Tag { .. } | FlowKey::NewBox { .. } => None,
+            FlowKey::Box { .. } | FlowKey::Tag { .. } | FlowKey::NewBox { .. } | FlowKey::Cell { .. } => None,
         }
     }
 
