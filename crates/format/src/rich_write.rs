@@ -9,11 +9,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use crate::edit::{Change, SourceEdit, eol_in};
 use crate::model::{Block, Slide, Span, Style, Talk};
 use crate::parse::parse_talk;
-use crate::rich::{FlowPlace, Para, ParaKind, TextFlow, is_positioned, layout_of, text_flows};
+use crate::rich::{FlowPlace, MAX_LEVEL, Para, ParaKind, TextFlow, is_positioned, layout_of, text_flows};
 use crate::split::split_slides;
-
-/// The deepest a list can nest and still be read as editable.
-const MAX_LEVEL: u8 = 8;
 
 /// Markdown for one paragraph's content, as it's written on a line of its own: every
 /// character Markdown would read as structure is escaped, and `**` or `*` that can't close

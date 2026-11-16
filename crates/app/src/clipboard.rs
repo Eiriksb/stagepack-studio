@@ -13,7 +13,7 @@
 //! Nothing here touches the window: it's the clipboard's contents, in and out.
 
 use serde::{Deserialize, Serialize};
-use slides_format::{Para, ParaKind, Span, Style, parse_talk, slide_text_for_copy, storable, text_flows};
+use slides_format::{MAX_LEVEL, Para, ParaKind, Span, Style, parse_talk, slide_text_for_copy, storable, text_flows};
 
 use crate::text_editing::clean_typed;
 
@@ -32,8 +32,6 @@ pub const MAX_SPANS: usize = 16 * 1024;
 const MAX_LINK: usize = 2048;
 /// The sizes text can have.
 const SIZES: std::ops::RangeInclusive<u32> = 1..=512;
-/// The deepest a list item nests, as the text model holds it.
-const MAX_LEVEL: u8 = 8;
 /// The colours the talk's text takes by name, besides `#rgb` and `#rrggbb`.
 const NAMED_COLORS: [&str; 9] = ["black", "white", "red", "green", "blue", "yellow", "orange", "purple", "gray"];
 

@@ -10,7 +10,7 @@ use gpui_kit::{
 use proptest::prelude::*;
 use std::time::{Duration, Instant};
 use slides_engine::{Fonts, Pixmap};
-use slides_format::{MAX_SLIDE_BYTES, Para, ParaKind, Pos, Span, Style, TextFlow, is_hidden, parse_talk, storable, text_flows};
+use slides_format::{MAX_LEVEL, MAX_SLIDE_BYTES, Para, ParaKind, Pos, Span, Style, TextFlow, is_hidden, parse_talk, storable, text_flows};
 use stagepack_studio::clipboard::{
     self, APP_KEY, MAX_BYTES, MAX_PARAS, MAX_SPANS, MISSING_PICTURES, NO_SLIDE, TOO_LARGE,
     SlidePaste, TextPaste, decode_paras, encode_paras, text_entry, text_to_paste,
@@ -550,8 +550,8 @@ fn one_bad_field() -> Vec<(String, String)> {
         span("size", 513.into()),
         span("bold", "yes".into()),
         span("text", 5.into()),
-        para("level", 9.into()),
-        numbered("level", 9.into()),
+        para("level", (MAX_LEVEL + 1).into()),
+        numbered("level", (MAX_LEVEL + 1).into()),
         heading("level", 0.into()),
         heading("level", 7.into()),
         para("kind", "title".into()),
@@ -564,7 +564,7 @@ fn one_bad_field() -> Vec<(String, String)> {
 fn metadata_with_one_bad_field_falls_back_to_plain_text() {
     // Each kind at the deepest level it may have pastes styled, so the cases past them are the
     // only thing wrong.
-    for (kind, level) in [("numbered", 8), ("bullet", 8), ("heading", 1), ("heading", 6)] {
+    for (kind, level) in [("numbered", MAX_LEVEL), ("bullet", MAX_LEVEL), ("heading", 1), ("heading", 6)] {
         let mut para = good_para();
         para["kind"] = kind.into();
         para["level"] = level.into();
