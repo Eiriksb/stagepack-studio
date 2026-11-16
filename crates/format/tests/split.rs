@@ -63,9 +63,12 @@ fn a_fence_closes_only_on_as_many_of_its_marks_and_nothing_else() {
     assert_eq!(split_slides("````\n```\n---\n````\n").len(), 1);
     assert_eq!(split_slides("```\n```x\n---\n```\n").len(), 1);
     assert_eq!(split_slides("~~~\n~~~ \n---\n").len(), 2);
-    // Four spaces in, it's not a fence, at the top of a slide.
-    assert_eq!(split_slides("    ```\n---\n").len(), 2);
-    assert_eq!(split_slides("```\n    ```\n---\n```\n").len(), 1);
+}
+
+#[test]
+fn a_fence_nested_in_a_list_hides_the_rules_in_it() {
+    assert_eq!(split_slides("- a\n  - b\n\n    ```\n    ---\n    ```\n").len(), 1);
+    assert_eq!(split_slides("10. a\n\n    ```yaml\n    ---\n    x: 1\n    ```\n").len(), 1);
 }
 
 /// The options the slide parser reads a slide with.
@@ -92,7 +95,7 @@ fn slide_options() -> markdown::ParseOptions {
 /// it alone, or `None` where the `markdown` crate panics on it, as it does on `words`, `---`,
 /// `---`, `words`, `---`, and the slide parser turns that into a refusal.
 fn code_lines(source: &str) -> Option<Vec<bool>> {
-    let root = std::panic::catch_unwind(|| markdown::to_mdast(source, &slide_options())).ok()?.ok()?;
+    let root = std::panic::catch_unwind(|| markdown::to_mdast(source, &slide_options())).ok()?.expect("these lines are always read");
     let mut lines = vec![false; source.split('\n').count()];
     let mut to_visit = vec![&root];
     while let Some(node) = to_visit.pop() {
@@ -111,20 +114,21 @@ fn a_fence_in_a_list_item_closes_as_far_in_as_the_item_allows() {
     }
 }
 
-/// A line at the top level of a slide. Fence lines start at the line's start: one indented
-/// by one to three columns could be at the top level or in a list item, which the slide
-/// splitter can't tell apart, and there a closing line four to six columns in ends the
-/// fence only in a list item. Those come in list items, below.
+/// A line at the top level of a slide. The slide splitter can't see lists, so it takes a
+/// line of backticks or tildes as a fence however far in it is, as in a list item it may be.
+/// Markdown takes a top-level line four or more columns in as code by indentation instead,
+/// so that one shape, which the splitter knowingly reads otherwise, isn't here.
 fn top_level_line() -> impl Strategy<Value = String> {
     proptest::sample::select(vec![
-        "```", "````", "```rust", "```a```b", "``` a ` b", "```x", "```  ", "``", "    ```", "\t```", "~~~", "~~~~", "~~~a`b", "~~~ ```",
-        "~~~x", "---", "words", "", "`code` here",
+        "```", "````", "```rust", "```a```b", "``` a ` b", "```x", "```  ", "``", " ```", "   ```", "~~~", "~~~~", "~~~a`b", "~~~ ```",
+        "   ~~~", "~~~x", "---", "words", "", "`code` here",
     ])
     .prop_map(str::to_string)
 }
 
 /// A list item holding a fenced block, closed somewhere from the item's text column to three
-/// columns past it, a tab counting as up to four; or something else at the top level.
+/// columns past it, a tab counting as up to four, in an item nested or after a long number
+/// too, so four to eight columns in; or something else at the top level.
 fn fence_in_an_item() -> impl Strategy<Value = String> {
     proptest::sample::select(vec![
         "- a\n\n  ```\n  ---\n  ```",
@@ -135,6 +139,15 @@ fn fence_in_an_item() -> impl Strategy<Value = String> {
         "1. a\n   ```\n   x\n      ```",
         "1. a\n\n   ```rust\n   ---\n     ```",
         "- a\n  ``` x\n  ```",
+        "- a\n  - b\n\n    ```\n    ---\n    ```",
+        "- a\n  - b\n    ```\n    ---\n      ```",
+        "- a\n  - b\n    - c\n\n      ~~~\n      ---\n      ~~~",
+        "- a\n  - b\n    - c\n      ```\n      ---\n        ```",
+        "10. a\n\n    ```yaml\n    ---\n    x: 1\n    ```",
+        "10. a\n    ```\n    ---\n       ```",
+        "100. a\n\n     ```\n     ---\n     ```",
+        "1. a\n   1. b\n\n      ```\n      ---\n      ```",
+        "- a\n  1. b\n     - c\n\n       ```\n       ---\n          ```",
         "---",
         "words",
         "",
@@ -176,3 +189,4 @@ proptest::proptest! {
         rules_break_outside_code(&pieces)?;
     }
 }
+

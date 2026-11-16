@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 5d8de7966580de561a12dfcfcd3212625881fdf2a44d7f921e32e7e85bcd701c # shrinks to source = "# >```"
 cc 3deeee8c84e65bc02959ab423aecf4ee1eaa71aed86cb44064190054933c4595 # shrinks to generated = GenTalk { slides: [GenSlide { settings: [], blocks: ["- &nbsp;\n  - under\n- c"], notes: None, blank_after: false, notes_layout: NotesLayout { after_blocks: 0, indented: false, tight_before: false, tight_after: false }, key_values: false }], crlf: false, bom: false, final_newline: false, opening_rule: false, tail: None }
+cc 1fab7d8a1637e43b0a22a38c433f8afb1eea7a5cb73838477d9b7c25dd8a7841 # shrinks to source = "{\n- *\n\\<"

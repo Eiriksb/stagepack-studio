@@ -377,6 +377,13 @@ fn assert_flows_are_sound(talk: &Talk) -> Result<(), TestCaseError> {
                 // a quote, and after `# `, a `#` can be read as part of the marker.
                 let alone = match para.kind {
                     ParaKind::Heading(_) => vec![format!("{content}\n==="), format!("# {content}")],
+                    // An item whose first line is a marker alone, as `*` is, holds a list
+                    // when it's read alone, and its other lines go with that.
+                    ParaKind::Bullet { .. } | ParaKind::Numbered { .. }
+                        if matches!(content.split(['\n', '\r']).next().map(str::trim_end), Some("*" | "-" | "+")) =>
+                    {
+                        vec![]
+                    }
                     ParaKind::Bullet { .. } | ParaKind::Numbered { .. } => vec![format!("- {content}")],
                     ParaKind::Body => vec![content.to_string()],
                 };
