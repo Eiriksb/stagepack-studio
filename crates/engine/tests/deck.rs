@@ -35,6 +35,25 @@ fn only_changed_blocks_get_new_layers() {
 }
 
 #[test]
+fn text_aligned_anew_is_drawn_anew() {
+    // Seen in the real window: centring a region kept its words drawn at the left, as the
+    // layers were kept by where the text was and its size, which aligning doesn't change.
+    let left = "# One\n\n---\n\n# Title\n\nBody\n";
+    let centred = "# One\n\n---\nregion.body: align=center\n---\n\n# Title\n\nBody\n";
+    let mut d = deck(left);
+    let before = d.layers(1, 0.5);
+    d.update_text(slides_format::parse_talk(centred));
+    let after = d.layers(1, 0.5);
+    let fresh = deck(centred).layers(1, 0.5);
+    assert_eq!(after.len(), fresh.len());
+    assert_ne!(before[2].pixmap.data(), fresh[2].pixmap.data(), "centring moves the body");
+    for (after, fresh) in after.iter().zip(&fresh) {
+        assert_eq!((after.x, after.y), (fresh.x, fresh.y));
+        assert!(after.pixmap.data() == fresh.pixmap.data(), "drawn as the centred talk is drawn");
+    }
+}
+
+#[test]
 fn a_new_scale_redraws() {
     let mut d = deck(TALK);
     let small = d.layers(0, 0.5);

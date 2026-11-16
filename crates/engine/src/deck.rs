@@ -84,7 +84,13 @@ fn drawing_fingerprint(items: &[DisplayItem]) -> u64 {
                 let b = path.bounds();
                 (0u8, [b.left(), b.top(), b.right(), b.bottom()].map(f32::to_bits)).hash(&mut hasher);
             }
-            DisplayItem::Text { text, x, y } => (1u8, [*x, *y, text.width, text.height].map(f32::to_bits)).hash(&mut hasher),
+            DisplayItem::Text { text, x, y } => {
+                (1u8, [*x, *y, text.width, text.height].map(f32::to_bits)).hash(&mut hasher);
+                // Where each line starts, which aligning the text moves and nothing above sees.
+                for line in text.buffer.layout_runs() {
+                    line.glyphs.first().map(|glyph| glyph.x.to_bits()).hash(&mut hasher);
+                }
+            }
             DisplayItem::Picture { rect, .. } => (2u8, [rect.x, rect.y, rect.w, rect.h].map(f32::to_bits)).hash(&mut hasher),
         }
     }
