@@ -2,7 +2,7 @@
 //! between slides, and the panels around the slide.
 
 use super::*;
-use crate::clipboard::{self, TooLarge};
+use crate::clipboard::{self, SlidePaste, TooLarge};
 use crate::clipboard_tools::{read_clipboard, write_clipboard};
 
 impl WorkspaceView {
@@ -253,8 +253,9 @@ impl WorkspaceView {
         };
         let (plain, metadata) = read_clipboard(cx);
         let markdown = match clipboard::slide_to_paste(plain.as_deref(), metadata.as_deref()) {
-            Ok(Some(markdown)) => markdown,
-            Ok(None) => return self.say(clipboard::NO_SLIDE, cx),
+            Ok(SlidePaste::Slide(markdown)) => markdown,
+            Ok(SlidePaste::NoSlide) => return self.say(clipboard::NO_SLIDE, cx),
+            Ok(SlidePaste::NotOneSlide) => return self.say(EditRefused::WouldChangeTheSlides.to_string(), cx),
             Err(TooLarge) => return self.say(clipboard::TOO_LARGE, cx),
         };
         let before = document.read(cx).slide_count();

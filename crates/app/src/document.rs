@@ -902,21 +902,38 @@ impl Document {
     /// its text: a text that would split into several slides, or take in the slide after it,
     /// isn't pasted.
     ///
+    /// Whatever `text` is, it's first made a slide's own text by [`crate::clipboard::one_slide`],
+    /// with none of the talk's settings, so a pasted slide never sets them; text that doesn't
+    /// read as one slide is refused.
+    ///
     /// An empty talk, whose text is nothing but whitespace and perhaps a byte order mark, has one
     /// slide with nothing on it: the pasted slide takes its place as the talk's only slide, after
-    /// the byte order mark, with the talk's line endings. Any talk settings it holds stay its
-    /// own, as a pasted slide's always do. It's refused unless it makes exactly one slide.
+    /// the byte order mark, with the talk's line endings, and a break line before it if it starts
+    /// with settings of its own, which only then are read as its settings block. It's refused
+    /// unless that makes one slide with none of the talk's settings.
     pub fn paste_slide(&mut self, text: &str) -> Result<Vec<usize>, EditRefused> {
+        let Some(slide) = guarded(|| crate::clipboard::one_slide(text))? else {
+            return Err(EditRefused::WouldChangeTheSlides);
+        };
+        let text = slide.text;
         let source = self.source();
         let bom = if source.starts_with('\u{feff}') { "\u{feff}" } else { "" };
         if self.slide_count() == 1 && source[bom.len()..].trim().is_empty() {
             let eol = if source.contains("\r\n") { "\r\n" } else { "\n" };
-            let slide = guarded(|| first_slide_text(text))?.replace("\r\n", "\n").replace('\n', eol);
-            let change = Change::single(SourceEdit { range: 0..source.len(), text: format!("{bom}{slide}") });
+            let first = guarded(|| if parse_talk(&text).slides.len() == 1 { text.clone() } else { format!("---\n{text}") })?;
+            let new = format!("{bom}{}", first.replace('\n', eol));
+            let sets_nothing = guarded(|| {
+                let talk = parse_talk(&new);
+                talk.slides.len() == 1 && talk_settings(&talk).is_empty()
+            })?;
+            if !sets_nothing {
+                return Err(EditRefused::WouldChangeTheSlides);
+            }
+            let change = Change::single(SourceEdit { range: 0..source.len(), text: new });
             return self.make(PASTE_SLIDE, change, Holds::Count(0), 0, 0, None);
         }
         let at = self.current;
-        let change = self.build(|talk| slides_format::insert_slide(talk, Some(at), text))?;
+        let change = self.build(|talk| slides_format::insert_slide(talk, Some(at), &text))?;
         self.make(PASTE_SLIDE, change, Holds::Inserted(at + 1), at, at + 1, None)
     }
 
@@ -1821,18 +1838,14 @@ fn others_alike(before: &Talk, after: &Talk, index: usize) -> bool {
             .all(|at| text(before, at) == text(after, at))
 }
 
-/// `text`, a slide's own text as [`slides_format::slide_text_for_copy`] gives it, as a talk's
-/// first and only slide: with none of the talk's settings, which as the first slide it would
-/// otherwise become, and with a break line before it if it starts with settings of its own,
-/// which only then are read as its settings block. Text that isn't one slide is given as it is.
-fn first_slide_text(text: &str) -> String {
-    let later = format!("---\n{text}");
-    let talk = parse_talk(&later);
-    if talk.slides.len() != 1 {
-        return text.to_string();
-    }
-    let own = slides_format::slide_text_for_copy(&talk, 0);
-    if parse_talk(&own).slides.len() == 1 { own } else { format!("---\n{own}") }
+/// The talk's own settings, as the first slide's settings block holds them: each key of
+/// [`slides_format::TALK_SETTINGS`] it has, with its value.
+pub fn talk_settings(talk: &Talk) -> Vec<(&'static str, String)> {
+    let settings = talk.slides.first().and_then(|slide| slide.settings.as_ref());
+    slides_format::TALK_SETTINGS
+        .iter()
+        .filter_map(|&key| Some((key, settings?.get(key)?.to_string())))
+        .collect()
 }
 
 /// Whether every slide of `before` keeps its text in `after`, which has a slide added at

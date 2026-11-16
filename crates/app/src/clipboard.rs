@@ -230,74 +230,83 @@ pub fn text_to_paste(plain: Option<&str>, metadata: Option<&str>) -> Result<Text
     Ok(if text.is_empty() { TextPaste::Nothing } else { TextPaste::Plain(text) })
 }
 
-/// The text of the slide to paste from a clipboard holding `plain` text and `metadata`: the
+/// What a paste into the slide list takes from the clipboard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SlidePaste {
+    /// A slide's own text, as [`one_slide`] gives it.
+    Slide(String),
+    /// Nothing that holds a slide.
+    NoSlide,
+    /// Text that doesn't read as one slide, which isn't pasted.
+    NotOneSlide,
+}
+
+/// A slide's own text, as every slide that's pasted is made: see [`one_slide`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OneSlide {
+    pub text: String,
+    /// Whether the slide has nothing on it, settings aside.
+    pub holds_nothing: bool,
+}
+
+/// What to paste into the slide list from a clipboard holding `plain` text and `metadata`: the
 /// slide the app copied, if the metadata holds one, or else the plain text, as a slide copied
 /// by another running copy of the app arrives, or Markdown copied from an editor. Either is
-/// cleaned as typed text is. Plain text over [`MAX_BYTES`] is too much; plain text that's empty
-/// or only whitespace is no slide.
-///
-/// Of plain text, one break line at its start, with any blank lines before it, and one at its
-/// end are left out, and, as [`slides_format::slide_text_for_copy`] does for a copied first
-/// slide, the talk's own settings, if the text starts with a settings block (with or without
-/// its opening break line): the block's other settings are the slide's own. Text that's only a
-/// settings block holds no slide. Text that reads as more than one slide is given as it is,
-/// for the paste to refuse.
-pub fn slide_to_paste(plain: Option<&str>, metadata: Option<&str>) -> Result<Option<String>, TooLarge> {
+/// cleaned as typed text is and goes through [`one_slide`]. Plain text over [`MAX_BYTES`] is
+/// too much; plain text that's empty, only whitespace, or a slide with nothing on it but
+/// settings, is no slide. Of plain text, one break line at its end, and the line ending after
+/// it, is also left out, if it isn't the close of a settings block it starts with.
+pub fn slide_to_paste(plain: Option<&str>, metadata: Option<&str>) -> Result<SlidePaste, TooLarge> {
     if let Some(markdown) = metadata.filter(|metadata| metadata.len() <= MAX_BYTES).and_then(decode_slide) {
-        return Ok(Some(clean_typed(&markdown)));
+        // A slide the app copied may be one with nothing on it, as a new slide is.
+        return Ok(one_slide(&clean_typed(&markdown)).map_or(SlidePaste::NotOneSlide, |slide| SlidePaste::Slide(slide.text)));
     }
-    let Some(plain) = plain else { return Ok(None) };
+    let Some(plain) = plain else { return Ok(SlidePaste::NoSlide) };
     if plain.len() > MAX_BYTES {
         return Err(TooLarge);
     }
     let text = clean_typed(plain);
     if text.trim().is_empty() {
-        return Ok(None);
+        return Ok(SlidePaste::NoSlide);
     }
-    Ok(slide_from_plain(&text))
+    // As it is first: a break line at its end may close a settings block it starts with. Then
+    // without a break line at its end.
+    let body = text.strip_suffix('\n').unwrap_or(&text);
+    let last_start = body.rfind('\n').map_or(0, |at| at + 1);
+    let without_end = is_break_line(&body[last_start..]).then(|| &text[..last_start]);
+    let slide = one_slide(&text).or_else(|| without_end.and_then(one_slide));
+    Ok(match slide {
+        Some(slide) if slide.holds_nothing => SlidePaste::NoSlide,
+        Some(slide) => SlidePaste::Slide(slide.text),
+        None => SlidePaste::NotOneSlide,
+    })
 }
 
 /// Whether `line`, without its line ending, is a break between slides.
 fn is_break_line(line: &str) -> bool {
-    line.trim_end_matches(' ') == "---"
+    line.trim_end_matches([' ', '\r']) == "---"
 }
 
-/// `text`, plain text that holds a slide's Markdown, as a slide's own text, or `None` if it
-/// holds no slide: nothing but settings, or nothing at all. See [`slide_to_paste`].
-fn slide_from_plain(text: &str) -> Option<String> {
-    // Blank lines before a break line at the start go with it, as from an editor.
+/// `text` as the slide it holds, as every slide that's pasted is made, from the clipboard or
+/// anywhere else: blank lines before a break line at its start go with that break line, and
+/// what's left is read as a slide that follows another, so a settings block straight after the
+/// break line, or at the start without one, is the slide's. It must read as exactly one slide,
+/// or it's `None`. What's given is that slide's own text, as
+/// [`slides_format::slide_text_for_copy`] gives it, with none of the talk's settings: a pasted
+/// slide never sets them, wherever it lands. Giving it back to this gives it back as it is.
+pub fn one_slide(text: &str) -> Option<OneSlide> {
     let blank: usize = text.split_inclusive('\n').take_while(|line| line.trim().is_empty()).map(str::len).sum();
-    let text = if text[blank..].split('\n').next().is_some_and(is_break_line) { &text[blank..] } else { text };
-    // Read as a talk of its own, it starts with a break line, as a slide that follows another
-    // does: a settings block straight after it is the slide's, and a first slide's talk
-    // settings are left behind.
-    let as_talk = |text: &str| {
-        if text.split('\n').next().is_some_and(is_break_line) { text.to_string() } else { format!("---\n{text}") }
-    };
-    let one_slide = |as_talk: &str| {
-        std::panic::catch_unwind(|| {
-            let talk = parse_talk(as_talk);
-            let slide = talk.slides.first().filter(|_| talk.slides.len() == 1)?;
-            let holds_nothing = slide.blocks.is_empty() && slide.notes.is_none() && slide.error.is_none();
-            Some((!holds_nothing).then(|| slide_text_for_copy(&talk, 0)))
-        })
-        .ok()
-        .flatten()
-    };
-    // As it is first: a break line at its end may close a settings block it starts with.
-    if let Some(slide) = one_slide(&as_talk(text)) {
-        return slide;
-    }
-    // Then without a break line at its end, and the line ending after it.
-    let body = text.strip_suffix('\n').unwrap_or(text);
-    let last_start = body.rfind('\n').map_or(0, |at| at + 1);
-    let text = if is_break_line(&body[last_start..]) { &text[..last_start] } else { text };
-    let whole = as_talk(text);
-    match one_slide(&whole) {
-        Some(slide) => slide,
-        // More than one slide, or something that went wrong reading it: the paste refuses it.
-        None => Some(whole.split_once('\n').map_or(String::new(), |(_, rest)| rest.to_string())),
-    }
+    let starts_with_break = text[blank..].split('\n').next().is_some_and(is_break_line);
+    let as_talk = if starts_with_break { text[blank..].to_string() } else { format!("---\n{text}") };
+    std::panic::catch_unwind(|| {
+        let talk = parse_talk(&as_talk);
+        let slide = talk.slides.first().filter(|_| talk.slides.len() == 1)?;
+        let holds_nothing = slide.blocks.is_empty() && slide.notes.is_none() && slide.error.is_none();
+        let text = slide_text_for_copy(&talk, 0);
+        Some(OneSlide { text, holds_nothing })
+    })
+    .ok()
+    .flatten()
 }
 
 fn decode_slide(json: &str) -> Option<String> {

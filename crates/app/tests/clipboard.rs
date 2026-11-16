@@ -12,10 +12,10 @@ use slides_engine::{Fonts, Pixmap};
 use slides_format::{Para, ParaKind, Pos, Span, Style, TextFlow, is_hidden, parse_talk, storable, text_flows};
 use stagepack_studio::clipboard::{
     self, APP_KEY, MAX_BYTES, MAX_PARAS, MAX_SPANS, MISSING_PICTURES, NO_SLIDE, TOO_LARGE,
-    TextPaste, decode_paras, encode_paras, text_entry, text_to_paste,
+    SlidePaste, TextPaste, decode_paras, encode_paras, text_entry, text_to_paste,
 };
 use stagepack_studio::clipboard_tools::{COPY_ID, CUT_ID, PASTE_ID};
-use stagepack_studio::document::Document;
+use stagepack_studio::document::{Document, talk_settings};
 use stagepack_studio::notes_panel::NOTES_ID;
 use stagepack_studio::slide_editor::SlideEditor;
 use stagepack_studio::slide_strip::strip_row_id;
@@ -446,6 +446,15 @@ fn one_bad_field() -> Vec<(String, String)> {
         para[field] = value;
         (format!("{field} {}", para[field]), text_metadata(para))
     };
+    // As good a paragraph, numbered or a heading, at a level of its own kind's.
+    let of_kind = |kind: &str, field: &str, value: serde_json::Value| {
+        let mut para = good_para();
+        para["kind"] = kind.into();
+        para[field] = value;
+        (format!("{kind} {field} {}", para[field]), text_metadata(para))
+    };
+    let numbered = |field: &str, value: serde_json::Value| of_kind("numbered", field, value);
+    let heading = |field: &str, value: serde_json::Value| of_kind("heading", field, value);
     vec![
         span("link", "javascript:alert(1)".into()),
         span("link", "//host".into()),
@@ -462,6 +471,9 @@ fn one_bad_field() -> Vec<(String, String)> {
         span("bold", "yes".into()),
         span("text", 5.into()),
         para("level", 9.into()),
+        numbered("level", 9.into()),
+        heading("level", 0.into()),
+        heading("level", 7.into()),
         para("kind", "title".into()),
         // A body paragraph has no level; the good one's is 1.
         para("kind", "body".into()),
@@ -470,6 +482,15 @@ fn one_bad_field() -> Vec<(String, String)> {
 
 #[test]
 fn metadata_with_one_bad_field_falls_back_to_plain_text() {
+    // Each kind at the deepest level it may have pastes styled, so the cases past them are the
+    // only thing wrong.
+    for (kind, level) in [("numbered", 8), ("bullet", 8), ("heading", 1), ("heading", 6)] {
+        let mut para = good_para();
+        para["kind"] = kind.into();
+        para["level"] = level.into();
+        let pasted = text_to_paste(Some("plain"), Some(&text_metadata(para)));
+        assert!(matches!(pasted, Ok(TextPaste::Styled(_))), "{kind} {level}: {pasted:?}");
+    }
     // The good paragraph itself pastes with its styles: the bad field is all that's wrong.
     let good = text_metadata(good_para());
     let TextPaste::Styled(paras) = text_to_paste(Some("plain"), Some(&good)).unwrap() else { panic!("the good one pastes styled") };
@@ -741,7 +762,7 @@ fn document_of(source: &str) -> (tempfile::TempDir, Document) {
 fn a_slide_pastes_into_an_empty_talk_as_its_only_slide() {
     let (_from_folder, from) = document_of("---\ntitle: Theirs\nlayout: section\n---\n\n# One\n");
     let copied = from.current_for_copy().unwrap();
-    let plain = clipboard::slide_to_paste(Some("# Plain\n\nwords\n"), None).unwrap().unwrap();
+    let SlidePaste::Slide(plain) = clipboard::slide_to_paste(Some("# Plain\n\nwords\n"), None).unwrap() else { panic!("a slide") };
     let cases = [
         ("", &copied, "---\nlayout: section\n---\n\n# One\n"),
         ("", &plain, "# Plain\n\nwords\n"),
@@ -764,6 +785,116 @@ fn a_slide_pastes_into_an_empty_talk_as_its_only_slide() {
     let (_folder, mut document) = document_of("");
     assert!(document.paste_slide("# A\n\n---\n\n# B\n").is_err());
     assert_eq!(document.source(), "");
+}
+
+/// Slide text that tries to set the talk's own settings, by name: each pasted into an empty
+/// talk must set none of them.
+fn sets_talk_settings() -> Vec<(&'static str, String)> {
+    let evil = "---\ntitle: Evil\ncolor.background: #f00\n---\n# Hi\n";
+    vec![
+        ("block", evil.to_string()),
+        ("block, CRLF", evil.replace('\n', "\r\n")),
+        ("opening break with spaces", evil.replacen("---\n", "---  \n", 1)),
+        ("closing break with spaces", evil.replace("#f00\n---\n", "#f00\n---  \n")),
+        ("bidi override before the key", evil.replace("title", "\u{202e}title")),
+        ("no space after the colon", evil.replace("title: Evil", "title:Evil")),
+        ("among own settings", "---\nlayout: section\ntitle: Evil\ncolor.text: red\nfont.mono: M\n---\n# Hi\n".to_string()),
+        ("settings alone", "---\ntitle: Evil\n---\n".to_string()),
+        ("two breaks first", "---\n---\ntitle: Evil\n---\n# Hi".to_string()),
+        ("no opening break", "title: Evil\nfont: F\n---\n# Hi\n".to_string()),
+        ("blank lines first", "\n \n---\ntitle: Evil\n---\n# Hi\n".to_string()),
+    ]
+}
+
+/// The talks a slide is pasted into, empty and not.
+const INTO: [&str; 5] = ["", "\u{feff}", "  \r\n\r\n", "# A\n\n---\n\n# B\n", "---\ntitle: Mine\nfont: Own\n---\n\n# A\n"];
+
+/// Pastes `text` into `into` as the slide list does, from the metadata, or else from plain
+/// text, and says whether it was pasted. The talk's own settings are as they were either way.
+fn paste_keeps_the_talks_settings(into: &str, text: &str, from_metadata: bool) -> bool {
+    let (_folder, mut document) = document_of(into);
+    let before = talk_settings(document.talk());
+    let source = document.source().to_string();
+    let metadata = serde_json::json!({ APP_KEY: { "kind": "slide", "version": 1, "markdown": text } }).to_string();
+    let pasted = match clipboard::slide_to_paste(Some(text), from_metadata.then_some(metadata.as_str())).unwrap() {
+        SlidePaste::Slide(slide) => document.paste_slide(&slide).is_ok(),
+        _ => false,
+    };
+    // And straight to the talk, as anything else might.
+    let straight = {
+        let (_folder, mut document) = document_of(into);
+        let pasted = document.paste_slide(text).is_ok();
+        assert_eq!(talk_settings(document.talk()), before, "straight: {text:?} into {into:?}: {:?}", document.source());
+        pasted
+    };
+    assert_eq!(talk_settings(document.talk()), before, "{text:?} into {into:?}: {:?}", document.source());
+    if !pasted {
+        assert_eq!(document.source(), source);
+    }
+    pasted || straight
+}
+
+#[test]
+fn a_pasted_slide_never_sets_the_talks_settings() {
+    for (what, text) in sets_talk_settings() {
+        for into in INTO {
+            for from_metadata in [true, false] {
+                paste_keeps_the_talks_settings(into, &text, from_metadata);
+            }
+        }
+        // Into an empty talk, the slide is pasted, its own settings kept and the talk's not.
+        let (_folder, mut document) = document_of("");
+        let metadata = serde_json::json!({ APP_KEY: { "kind": "slide", "version": 1, "markdown": text } }).to_string();
+        if let Ok(SlidePaste::Slide(slide)) = clipboard::slide_to_paste(None, Some(&metadata))
+            && document.paste_slide(&slide).is_ok()
+        {
+            assert!(talk_settings(document.talk()).is_empty(), "{what}: {:?}", document.source());
+        }
+    }
+    // Own settings come along: here the layout, and nothing of the talk's.
+    let (_folder, mut document) = document_of("");
+    let text = "---\nlayout: section\ntitle: Evil\ncolor.text: red\nfont.mono: M\n---\n# Hi\n";
+    document.paste_slide(text).unwrap();
+    assert_eq!(document.source(), "---\nlayout: section\n---\n# Hi\n");
+}
+
+#[test]
+fn any_slide_pasted_into_any_talk_leaves_the_talks_settings_as_they_were() {
+    use proptest::test_runner::{Config, TestRunner};
+    let piece = prop_oneof![
+        Just("---"), Just("--- "), Just("---  "), Just("title: Evil"), Just("title:Evil"), Just("\u{202e}title: Evil"),
+        Just("color.background: #f00"), Just("color.text: red"), Just("color.accent: blue"), Just("font: F"), Just("font.mono: M"),
+        Just("layout: section"), Just("hidden: true"), Just("# Hi"), Just("words"), Just(""), Just(" "), Just("\r"), Just("\u{feff}"),
+        Just("a: b"), Just("```"), Just("<Notes>"), Just("</Notes>"),
+    ];
+    let text = prop::collection::vec(piece, 0..10).prop_map(|pieces| pieces.join("\n"));
+    let mut runner = TestRunner::new(Config { cases: 300, ..Config::default() });
+    let pasted = std::cell::Cell::new(0);
+    runner
+        .run(&(text, 0usize..INTO.len(), any::<bool>()), |(text, into, from_metadata)| {
+            if paste_keeps_the_talks_settings(INTO[into], &text, from_metadata) {
+                pasted.set(pasted.get() + 1);
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert!(pasted.get() > 30, "most cases paste something: {}", pasted.get());
+}
+
+#[gpui_kit::test]
+fn an_empty_talk_takes_a_pasted_slide_but_not_its_talk_settings(cx: &mut TestAppContext) {
+    let talk = open(cx, "");
+    talk.click(cx, strip_row_id(0));
+    let markdown = "---\ntitle: Evil\ncolor.background: #f00\n---\n# Hi\n";
+    put(cx, markdown, Some(&serde_json::json!({ APP_KEY: { "kind": "slide", "version": 1, "markdown": markdown } }).to_string()));
+    talk.press(cx, "ctrl-v");
+    assert_eq!(talk.source(cx), "# Hi\n");
+    // Two slides' worth is refused with the sentence for that.
+    talk.press(cx, "ctrl-z");
+    put(cx, "---\n---\ntitle: Evil\n---\n# Hi", None);
+    talk.press(cx, "ctrl-v");
+    assert_eq!(talk.source(cx), "");
+    assert!(talk.status(cx).is_some_and(|status| status.contains("joined or split slides")));
 }
 
 #[gpui_kit::test]
@@ -984,7 +1115,7 @@ proptest! {
         if let Ok(TextPaste::Styled(paras)) = text_to_paste(Some("plain"), Some(&json)) {
             prop_assert!(keeps_the_rules(&paras));
         }
-        if let Ok(Some(markdown)) = clipboard::slide_to_paste(None, Some(&json)) {
+        if let Ok(SlidePaste::Slide(markdown)) = clipboard::slide_to_paste(None, Some(&json)) {
             prop_assert!(markdown.len() <= MAX_BYTES);
             prop_assert!(!markdown.contains(|c: char| c.is_control() && c != '\n' && c != '\t'));
             let _ = parse_talk(&markdown);
@@ -1043,7 +1174,7 @@ fn plain_text_pastes_as_one_slide_or_none_and_leaves_the_others_alone() {
                 let count = document.slide_count();
                 document.select(at.min(count - 1));
                 let at = document.current();
-                let Ok(Some(markdown)) = clipboard::slide_to_paste(Some(&plain), None) else { return Ok(()) };
+                let Ok(SlidePaste::Slide(markdown)) = clipboard::slide_to_paste(Some(&plain), None) else { return Ok(()) };
                 match document.paste_slide(&markdown) {
                     Ok(_) => {
                         prop_assert_eq!(document.slide_count(), count + 1);
