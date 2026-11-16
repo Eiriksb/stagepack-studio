@@ -30,6 +30,10 @@ pub enum FlowKey {
     Region { name: String, nth: usize },
     /// The `nth` box of text on the slide.
     Box { nth: usize },
+    /// The box whose tag starts at byte `start` of the talk, which may have no text yet: a
+    /// shape typed on, or a text box just put on the slide. Typing in it changes only what's
+    /// inside the tag, so its start stays where it is.
+    Tag { start: usize },
 }
 
 impl FlowKey {
@@ -61,6 +65,12 @@ impl FlowKey {
             let same_kind = match (self, &flow.place) {
                 (FlowKey::Region { name, .. }, FlowPlace::Region(region)) => name == region,
                 (FlowKey::Box { .. }, FlowPlace::Tag(_)) => true,
+                (FlowKey::Tag { start }, FlowPlace::Tag(range)) => {
+                    if range.start == *start {
+                        return Some(index);
+                    }
+                    continue;
+                }
                 _ => false,
             };
             if !same_kind {
@@ -68,6 +78,7 @@ impl FlowKey {
             }
             let nth = match self {
                 FlowKey::Region { nth, .. } | FlowKey::Box { nth } => *nth,
+                FlowKey::Tag { .. } => continue,
             };
             if seen == nth {
                 return Some(index);
@@ -81,7 +92,15 @@ impl FlowKey {
     pub fn region(&self) -> Option<&str> {
         match self {
             FlowKey::Region { name, .. } => Some(name),
-            FlowKey::Box { .. } => None,
+            FlowKey::Box { .. } | FlowKey::Tag { .. } => None,
+        }
+    }
+
+    /// Where the tag this is the box of starts, if it's named by its tag.
+    pub fn tag_start(&self) -> Option<usize> {
+        match self {
+            FlowKey::Tag { start } => Some(*start),
+            _ => None,
         }
     }
 }
@@ -367,6 +386,22 @@ impl EditingText {
             },
             edit: TextEdit::new(vec![Para {
                 kind,
+                spans: Vec::new(),
+            }]),
+            run: None,
+            session: 0,
+            composing: None,
+        }
+    }
+
+    /// Text started in the box whose tag starts at byte `start` of slide `slide`, a shape or a
+    /// box with nothing in it yet: one empty paragraph, not written until something is typed.
+    pub fn in_empty_tag(slide: usize, start: usize) -> EditingText {
+        EditingText {
+            slide,
+            flow: FlowKey::Tag { start },
+            edit: TextEdit::new(vec![Para {
+                kind: ParaKind::Body,
                 spans: Vec::new(),
             }]),
             run: None,

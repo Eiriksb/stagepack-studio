@@ -20,7 +20,7 @@ use slides_engine::{Align, CaretRect, ElementBox, Hit, LineMove, Rect, Selection
 use slides_format::{Motion, Para, ParaKind, Pos, Selection, Span, StyleBit, TextEdit};
 
 use crate::clipboard::{self, ClipboardOp, TextPaste};
-use crate::clipboard_tools::{read_clipboard, write_clipboard};
+use crate::clipboard_tools::{holds_text, picture_or_files, read_clipboard, write_clipboard};
 use crate::document::{Document, EditRefused};
 use crate::selection::{self, Selected};
 use crate::slide_canvas::{SLIDE_WIDTH, SlideCanvas, letterbox};
@@ -143,6 +143,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("tab", SelectNextThing, selecting),
         KeyBinding::new("shift-tab", SelectPreviousThing, selecting),
         KeyBinding::new("escape", LetGoOfSelected, selecting),
+        // The window's paste, as with nothing selected.
+        KeyBinding::new("ctrl-v", PasteFromClipboard, selecting),
     ]);
     crate::text_tools::bind_keys(cx);
 }
@@ -1104,8 +1106,46 @@ impl SlideEditor {
             return layout.caret(flow, pos);
         }
         // An empty region, before anything is typed: the caret is where its text would start.
-        let region = self.editing(cx)?.flow.region()?;
-        layout.placeholder_caret(region)
+        let key = &self.editing(cx)?.flow;
+        if let Some(start) = key.tag_start() {
+            // An empty box: at its corner, or a shape's middle.
+            let element = layout.elements().iter().rev().find(|element| element.source.start == start)?.clone();
+            let shape = self.document.as_ref()?.read(cx).talk().source.get(start..)?.starts_with("<Shape");
+            return Some(empty_box_caret(&element, shape));
+        }
+        layout.placeholder_caret(key.region()?)
+    }
+
+    /// Whether the thing selected on the slide shown takes typing, with nothing being typed: a
+    /// shape or a box, which typing puts words in.
+    fn takes_typing(&self, cx: &App) -> bool {
+        !self.is_editing(cx)
+            && self.selection_here(cx).is_some()
+            && self.document.as_ref().is_some_and(|document| document.read(cx).selected_takes_text())
+    }
+
+    /// Starts typing in the thing selected, if it takes typing, as the first thing typed on it
+    /// does. Says whether text is being typed now.
+    fn start_typing_in_selected(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.is_editing(cx) {
+            return true;
+        }
+        if !self.takes_typing(cx) {
+            return false;
+        }
+        self.wanted_x = None;
+        self.run(
+            |document| {
+                document.begin_text_in_selected();
+                Ok(Vec::new())
+            },
+            cx,
+        );
+        if let Some(document) = &self.document {
+            document.update(cx, |_, cx| cx.notify());
+        }
+        self.wake(cx);
+        self.is_editing(cx)
     }
 
     /// Where the caret at `pos` of the text being typed is in the window.
@@ -1238,6 +1278,24 @@ fn caret_box(caret: &CaretRect, slide: Bounds<Pixels>) -> Bounds<Pixels> {
     corners_box(&caret_corners(caret, unit), slide, unit)
 }
 
+/// How tall the caret in a box with nothing in it is drawn, in slide units, at most.
+const EMPTY_BOX_CARET: f32 = 56.0;
+
+/// Where the caret goes in `element`, a box with nothing typed in it yet: at its top-left
+/// corner, or, in a shape, which centres its text, in its middle.
+fn empty_box_caret(element: &ElementBox, shape: bool) -> CaretRect {
+    let Rect { x, y, w, h } = element.rect;
+    let height = EMPTY_BOX_CARET.min(h.max(1.0));
+    let (x, top) = if shape { (x + w / 2., y + (h - height) / 2.) } else { (x, y) };
+    CaretRect {
+        x,
+        top,
+        height,
+        rotate: element.rotate,
+        centre: (element.rect.x + w / 2., element.rect.y + h / 2.),
+    }
+}
+
 /// The corners of the thing selected, `element`, turned with it, in slide units.
 fn outline_corners(element: &ElementBox) -> [(f32, f32); 4] {
     let Rect { x, y, w, h } = element.rect;
@@ -1353,9 +1411,9 @@ impl Render for SlideEditor {
             }
             self.ime_place = place;
         }
-        // While text is typed, the system's input method types it.
-        let input = self
-            .is_editing(cx)
+        // While text is typed, the system's input method types it, and on a shape or a box
+        // selected, where it starts the typing.
+        let input = (self.is_editing(cx) || self.takes_typing(cx))
             .then(|| (self.focus_handle.clone(), cx.entity()));
         let overlay = canvas(
             |_, _, _| {},
@@ -1516,6 +1574,15 @@ impl Render for SlideEditor {
                 this.clipboard(ClipboardOp::Cut, cx)
             }))
             .on_action(cx.listener(|this, _: &PasteFromClipboard, _, cx| {
+                // With nothing typed, or a picture or files and no text, the window's: it ends the
+                // typing and puts what's there on the slide.
+                let item = cx.read_from_clipboard();
+                let elsewhere = !this.is_editing(cx)
+                    || item.as_ref().is_some_and(|item| !holds_text(item) && picture_or_files(item).is_some());
+                if elsewhere {
+                    cx.propagate();
+                    return;
+                }
                 this.clipboard(ClipboardOp::Paste, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleBold, _, cx| {
@@ -1625,6 +1692,9 @@ impl EntityInputHandler for SlideEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !clean_typed(text).is_empty() {
+            self.start_typing_in_selected(cx);
+        }
         let Some(editing) = self.editing(cx) else {
             return;
         };
@@ -1653,6 +1723,9 @@ impl EntityInputHandler for SlideEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !text.is_empty() {
+            self.start_typing_in_selected(cx);
+        }
         let Some(editing) = self.editing(cx) else {
             return;
         };
@@ -1724,7 +1797,7 @@ impl EntityInputHandler for SlideEditor {
     }
 
     fn accepts_text_input(&self, _: &mut Window, cx: &mut Context<Self>) -> bool {
-        self.is_editing(cx)
+        self.is_editing(cx) || self.takes_typing(cx)
     }
 }
 

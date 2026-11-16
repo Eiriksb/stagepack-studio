@@ -3,6 +3,8 @@
 //! the current slide. Using one leaves the keyboard where it was. What goes on the clipboard,
 //! and what's taken from it, is [`crate::clipboard`]'s.
 
+use std::path::PathBuf;
+
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{Disableable as _, Sizable as _};
@@ -35,6 +37,34 @@ pub(crate) fn read_clipboard(cx: &App) -> (Option<String>, Option<String>) {
     cx.read_from_clipboard()
         .map(|item| (item.text(), item.metadata().cloned()))
         .unwrap_or_default()
+}
+
+/// What on the clipboard can be put on the slide, besides text.
+pub(crate) enum ClipboardThing {
+    Picture(Image),
+    Paths(Vec<PathBuf>),
+}
+
+/// The picture on the clipboard `item`, or else the files it names, if it holds either.
+pub(crate) fn picture_or_files(item: &ClipboardItem) -> Option<ClipboardThing> {
+    let entries = item.entries();
+    let picture = entries.iter().find_map(|entry| match entry {
+        ClipboardEntry::Image(image) => Some(ClipboardThing::Picture(image.clone())),
+        _ => None,
+    });
+    picture.or_else(|| {
+        entries.iter().find_map(|entry| match entry {
+            ClipboardEntry::ExternalPaths(paths) if !paths.paths().is_empty() => {
+                Some(ClipboardThing::Paths(paths.paths().to_vec()))
+            }
+            _ => None,
+        })
+    })
+}
+
+/// Whether the clipboard `item` holds text.
+pub(crate) fn holds_text(item: &ClipboardItem) -> bool {
+    item.entries().iter().any(|entry| matches!(entry, ClipboardEntry::String(_)))
 }
 
 /// What the tools last saw of the text being typed: whether there is any, and whether any of

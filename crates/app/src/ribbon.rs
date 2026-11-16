@@ -481,7 +481,8 @@ impl Render for Ribbon {
             RibbonTab::Home => self.home(cx),
             RibbonTab::SlideShow => self.slide_show(cx),
             RibbonTab::View => self.view(cx),
-            RibbonTab::Insert | RibbonTab::Animate => Self::on_the_way(cx),
+            RibbonTab::Insert => crate::insert_tools::insert_tab(self.document.is_some(), cx),
+            RibbonTab::Animate => Self::on_the_way(cx),
         };
         let mut tools = Vec::with_capacity(groups.len() * 2);
         for (index, group) in groups.into_iter().enumerate() {

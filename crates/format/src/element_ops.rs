@@ -97,6 +97,16 @@ pub fn set_tag_attr(talk: &Talk, slide: usize, tag: &Range<usize>, name: &str, v
     guarded(|| attr_change(talk, slide, tag, name, value))
 }
 
+/// The edit that gives the tag at exactly `tag` on slide `slide` the body `body`, Markdown, in
+/// place of what it holds: after its opening tag, a blank line, the body, a blank line and its
+/// closing tag, as [`tag_text`] writes one, in the talk's line ending and on lines indented as
+/// the tag's is. A self-closing tag is written open, its `/>` made `>`. Nothing outside the tag
+/// changes, nor does its opening tag but for that. `None` when there's no such tag, or the slide
+/// wouldn't read as it did with the tag holding what `body` reads as alone.
+pub fn set_tag_body(talk: &Talk, slide: usize, tag: &Range<usize>, body: &str) -> Option<Change> {
+    guarded(|| body_change(talk, slide, tag, body))
+}
+
 /// The bytes of the block at exactly `range` on slide `slide`, at any depth, with `\n` line
 /// endings.
 pub fn block_text(talk: &Talk, slide: usize, range: &Range<usize>) -> Option<String> {
@@ -383,6 +393,58 @@ fn attr_change(talk: &Talk, index: usize, range: &Range<usize>, name: &str, valu
         }
     });
     let change = Change { edits };
+    let after = reparse(talk, change.apply(source));
+    reads_as(talk, &after, index, &expected).then_some(change)
+}
+
+// ---------------------------------------------------------------------------------------
+// A tag's body
+
+fn body_change(talk: &Talk, index: usize, range: &Range<usize>, body: &str) -> Option<Change> {
+    let slide = readable(talk, index)?;
+    let tag = tag_at(talk, index, range)?;
+    let source = talk.source.as_str();
+    let eol = eol_in(source);
+    let indent = source.get(line_start(source, tag.range.start)..tag.range.start)?;
+    if !indent.chars().all(|c| c == ' ' || c == '\t') {
+        return None;
+    }
+    // What the body reads as alone: blocks, and nothing a slide has besides.
+    let body = one_line_ending(body);
+    let body = body.trim_matches('\n');
+    let alone = parse_talk(body);
+    let [own] = alone.slides.as_slice() else { return None };
+    if own.error.is_some() || own.notes.is_some() || own.settings.is_some() {
+        return None;
+    }
+
+    let open = source.get(tag.range.start..tag.open_end)?;
+    let (from, opening) = match open.strip_suffix("/>") {
+        // The space before `/>` goes with it.
+        Some(kept) => (tag.range.start + kept.trim_end_matches([' ', '\t', '\r', '\n']).len(), ">"),
+        None => (tag.open_end, ""),
+    };
+    let mut text = format!("{opening}{eol}{eol}");
+    if !own.blocks.is_empty() {
+        for line in body.split('\n') {
+            if !line.is_empty() {
+                text.push_str(indent);
+                text.push_str(line);
+            }
+            text.push_str(eol);
+        }
+        text.push_str(eol);
+    }
+    text.push_str(indent);
+    text.push_str(&format!("</{}>", tag.name));
+
+    let mut expected = slide.blocks.clone();
+    with_block(&mut expected, range, &mut |blocks, at| {
+        if let Block::Tag(tag) = &mut blocks[at] {
+            tag.children = own.blocks.clone();
+        }
+    });
+    let change = Change::single(SourceEdit { range: from..tag.range.end, text });
     let after = reparse(talk, change.apply(source));
     reads_as(talk, &after, index, &expected).then_some(change)
 }

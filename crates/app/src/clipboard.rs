@@ -144,6 +144,11 @@ fn is_zero(value: &u8) -> bool {
     *value == 0
 }
 
+/// Whether `metadata` is the app's own, a slide or text it copied.
+pub fn is_app_data(metadata: &str) -> bool {
+    metadata.len() <= MAX_BYTES && serde_json::from_str::<Envelope>(metadata).is_ok()
+}
+
 /// What copying `paras` puts on the clipboard: their text, a paragraph to a line, and the
 /// paragraphs themselves in the metadata, unless that would be more than a paste takes.
 pub fn text_entry(paras: &[Para]) -> Entry {

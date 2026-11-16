@@ -782,3 +782,79 @@ fn an_empty_column_slide_keeps_a_blank_line_before_its_notes() {
         assert_eq!(insert_block(&talk, 0, "<Icon />").unwrap().apply(&source), expected);
     });
 }
+
+#[test]
+fn a_tag_is_given_a_body_and_nothing_else_changes() {
+    let cases = [
+        ("<Shape kind=\"rect\" x=\"1\" />", "<Shape kind=\"rect\" x=\"1\">\n\nHello *there*\n\n</Shape>"),
+        ("<Shape kind=\"rect\" x=\"1\"/>", "<Shape kind=\"rect\" x=\"1\">\n\nHello *there*\n\n</Shape>"),
+        ("<Box x=\"1\">\n\n</Box>", "<Box x=\"1\">\n\nHello *there*\n\n</Box>"),
+        ("<Box x=\"1\">\n\nOld words\n\n</Box>", "<Box x=\"1\">\n\nHello *there*\n\n</Box>"),
+    ];
+    for (tag, given) in cases {
+        for crlf in [false, true] {
+            let eol = |text: &str| if crlf { text.replace('\n', "\r\n") } else { text.to_string() };
+            let source = eol(&format!("# Title\n\nBefore\n\n{tag}\n\nAfter\n\n---\n\n# Two\n"));
+            let talk = parse_talk(&source);
+            let (_, found) = all_tags(&talk).into_iter().next().expect("the tag");
+            let change = set_tag_body(&talk, 0, &found.range, "Hello *there*\n").unwrap_or_else(|| panic!("{tag}"));
+            let new = change.apply(&source);
+            assert_eq!(new, source.replacen(&eol(tag), &eol(given), 1), "{tag}");
+            for edit in &change.edits {
+                assert!(found.range.start < edit.range.start && edit.range.end <= found.range.end, "inside the tag: {edit:?}");
+            }
+            let after = parse_talk(&new);
+            let [_, _, Block::Tag(read), _] = after.slides[0].blocks.as_slice() else { panic!("{new:?}") };
+            assert_eq!(read.children.len(), 1);
+            assert_eq!(change.inverse(&source).apply(&new), source);
+        }
+    }
+}
+
+#[test]
+fn a_body_that_would_not_read_as_the_tags_is_refused() {
+    let source = "# Title\n\n<Shape kind=\"rect\" />\n";
+    let talk = parse_talk(source);
+    let (_, tag) = all_tags(&talk).into_iter().next().unwrap();
+    for body in ["---\n\n# Next", "</Shape>", "<Notes>\nSay\n</Notes>"] {
+        assert_eq!(set_tag_body(&talk, 0, &tag.range, body), None, "{body}");
+    }
+    assert_eq!(set_tag_body(&talk, 0, &(0..3), "Words"), None, "no tag there");
+    assert_eq!(set_tag_body(&talk, 1, &tag.range, "Words"), None, "no such slide");
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: cases(256), ..ProptestConfig::default() })]
+
+    #[test]
+    fn a_body_changes_only_its_tag(
+        generated in gen_talk(),
+        which in 0..64usize,
+        body in prop::sample::select(vec!["Hello", "Two\n\nparagraphs", "- a\n- b", "", "**bold** & <b>", "é"]),
+    ) {
+        let source = generated.text();
+        let talk = parse_talk(&source);
+        let tags = all_tags(&talk);
+        if tags.is_empty() {
+            return Ok(());
+        }
+        let (index, tag) = &tags[which % tags.len()];
+        let Some(change) = set_tag_body(&talk, *index, &tag.range, body) else {
+            return Ok(());
+        };
+        for edit in &change.edits {
+            prop_assert!(tag.range.start < edit.range.start && edit.range.end <= tag.range.end, "{:?}", edit);
+            if source.contains("\r\n") {
+                prop_assert!(!edit.text.replace("\r\n", "").contains('\n'), "{:?}", edit.text);
+            }
+        }
+        let new = change.apply(&source);
+        let after = parse_talk(&new);
+        prop_assert!(other_slides_alike(&talk, &after, *index));
+        let start = tag.range.start;
+        prop_assert_eq!(&new[..start], &source[..start]);
+        let shift = new.len() as isize - source.len() as isize;
+        prop_assert_eq!(&new[tag.range.end.wrapping_add_signed(shift)..], &source[tag.range.end..]);
+        prop_assert_eq!(change.inverse(&source).apply(&new), source);
+    }
+}

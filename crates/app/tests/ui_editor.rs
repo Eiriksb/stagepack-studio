@@ -13,6 +13,7 @@ use gpui_kit::{
 use slides_engine::{Fonts, pack_folder};
 use slides_format::is_hidden;
 use stagepack_studio::document::Document;
+use stagepack_studio::insert_tools::INSERT_PICTURE_ID;
 use stagepack_studio::notes_panel::{NOTES_CAPTION_ID, NOTES_ID, NOTES_PLACEHOLDER};
 use stagepack_studio::ribbon::{
     DELETE_ID, DUPLICATE_ID, HIDE_ID, MARKDOWN_TOGGLE_ID, NEW_SLIDE_ID, NEW_SLIDE_LAYOUTS_ID,
@@ -244,20 +245,25 @@ fn the_window_has_its_tabs_and_the_home_tab_is_open(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn each_tab_shows_its_own_tools(cx: &mut TestAppContext) {
     let (handle, _) = open(cx, THREE);
-    for tab in [TAB_INSERT_ID, TAB_ANIMATE_ID] {
-        click(cx, handle, tab);
-        with_window(cx, handle, |window, _| {
-            let line = window.find(ON_THE_WAY_ID);
-            assert!(line.visible());
-            assert_eq!(line.label(), Some(ON_THE_WAY));
-            assert_eq!(ON_THE_WAY, "Tools for this tab are on the way.");
-            assert!(
-                window.try_find(NEW_SLIDE_ID).is_none(),
-                "Home's tools are put away"
-            );
-            assert_eq!(window.find(tab).selected(), Some(true));
-        });
-    }
+    click(cx, handle, TAB_INSERT_ID);
+    with_window(cx, handle, |window, _| {
+        assert_eq!(window.find(INSERT_PICTURE_ID).label(), Some("Picture"));
+        assert!(window.try_find(ON_THE_WAY_ID).is_none(), "the Insert tab has its tools");
+        assert!(window.try_find(NEW_SLIDE_ID).is_none(), "Home's tools are put away");
+        assert_eq!(window.find(TAB_INSERT_ID).selected(), Some(true));
+    });
+    click(cx, handle, TAB_ANIMATE_ID);
+    with_window(cx, handle, |window, _| {
+        let line = window.find(ON_THE_WAY_ID);
+        assert!(line.visible());
+        assert_eq!(line.label(), Some(ON_THE_WAY));
+        assert_eq!(ON_THE_WAY, "Tools for this tab are on the way.");
+        assert!(
+            window.try_find(NEW_SLIDE_ID).is_none(),
+            "Home's tools are put away"
+        );
+        assert_eq!(window.find(TAB_ANIMATE_ID).selected(), Some(true));
+    });
     click(cx, handle, TAB_SLIDE_SHOW_ID);
     with_window(cx, handle, |window, _| {
         assert_eq!(window.find(PRESENT_ID).label(), Some("From the start"));

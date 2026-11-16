@@ -1,0 +1,122 @@
+//! Putting things on the slide from the window: pictures chosen in the system's dialog, dropped
+//! on the slide or pasted, shapes and text boxes from the Insert tab.
+
+use super::*;
+use crate::added_files::{MAX_ADDED_BYTES, NotAdded};
+use crate::clipboard_tools::ClipboardThing;
+use crate::document::InsertFailed;
+
+/// What the window says when a file that isn't a picture is dropped on the slide.
+pub const ONLY_PICTURES: &str = "Only pictures can be dropped on a slide.";
+/// What a picture pasted from the clipboard is named, as like as is safe.
+const PASTED_PICTURE: &str = "pasted-picture.png";
+
+impl WorkspaceView {
+    /// Asks for pictures in the system's dialog, and puts each on the slide.
+    pub(super) fn ask_for_pictures(&mut self, cx: &mut Context<Self>) {
+        if self.document.is_none() {
+            return;
+        }
+        let chosen = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Insert".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            match chosen.await {
+                Ok(Ok(Some(paths))) => {
+                    this.update(cx, |this, cx| this.chosen_pictures(paths, cx)).ok();
+                }
+                Ok(Err(error)) => {
+                    let problem = format!("Could not show the dialog to choose pictures: {error}");
+                    this.update(cx, |this, cx| this.say(problem, cx)).ok();
+                }
+                _ => {}
+            }
+        })
+        .detach();
+    }
+
+    /// Puts the pictures in the files at `paths` on the slide, each in turn, one step each, as
+    /// the dialog to choose them gives them. What isn't a picture is said, and left out.
+    pub fn chosen_pictures(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        for path in paths {
+            self.insert_file(&path, false, cx);
+        }
+    }
+
+    /// Puts the pictures in the files at `paths`, dropped on the slide from outside the app, on
+    /// it, each in turn, one step each. A file that isn't a picture is said, and left out.
+    pub(super) fn dropped(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        for path in paths {
+            self.insert_file(&path, true, cx);
+        }
+    }
+
+    /// Puts the picture in the file at `path`, from outside the talk, on the slide.
+    fn insert_file(&mut self, path: &Path, dropped: bool, cx: &mut Context<Self>) {
+        let suggested = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+        match Document::read_outside_file(path) {
+            Ok(bytes) => self.insert_picture(&suggested, bytes, dropped, cx),
+            Err(why) => self.say(not_added(why, dropped), cx),
+        }
+    }
+
+    /// Puts the picture on the clipboard on the slide.
+    pub(super) fn paste_picture(&mut self, picture: Image, cx: &mut Context<Self>) {
+        // Checked before it's looked at any closer.
+        if picture.bytes.len() > MAX_ADDED_BYTES {
+            return self.say(NotAdded::TooLarge.to_string(), cx);
+        }
+        self.insert_picture(PASTED_PICTURE, picture.bytes, false, cx);
+    }
+
+    /// Puts what's on the clipboard, a picture or the files it names, on the slide.
+    pub(super) fn paste_thing(&mut self, thing: ClipboardThing, cx: &mut Context<Self>) {
+        match thing {
+            ClipboardThing::Picture(picture) => self.paste_picture(picture, cx),
+            ClipboardThing::Paths(paths) => self.dropped(paths, cx),
+        }
+    }
+
+    /// Adds `bytes`, a picture named `suggested`, to the talk, and puts it on the slide, as one
+    /// edit. Why it couldn't be is said, as dropped on the slide if `dropped`.
+    fn insert_picture(&mut self, suggested: &str, bytes: Vec<u8>, dropped: bool, cx: &mut Context<Self>) {
+        let mut not_a_file = None;
+        // The edit's notice is what has the working copy keep the file added.
+        self.edit(
+            |document| match document.insert_picture(suggested, bytes) {
+                // What changed is seen in the talk itself.
+                Ok(()) => Ok(Vec::new()),
+                Err(InsertFailed::Edit(refused)) => Err(refused),
+                Err(InsertFailed::File(why)) => {
+                    not_a_file = Some(why);
+                    Ok(Vec::new())
+                }
+            },
+            cx,
+        );
+        if let Some(why) = not_a_file {
+            self.say(not_added(why, dropped), cx);
+        }
+    }
+
+    /// Puts a shape of kind `kind` on the slide.
+    pub(super) fn insert_shape(&mut self, kind: &str, cx: &mut Context<Self>) {
+        self.edit(|document| document.insert_shape(kind), cx);
+    }
+
+    /// Puts a box to type in on the slide, and starts typing in it.
+    pub(super) fn insert_text_box(&mut self, cx: &mut Context<Self>) {
+        self.edit(Document::insert_text_box, cx);
+    }
+}
+
+/// What the window says when a file wasn't added for `why`, dropped on the slide if `dropped`.
+fn not_added(why: NotAdded, dropped: bool) -> String {
+    match why {
+        NotAdded::NotAPicture | NotAdded::NotThatKind if dropped => ONLY_PICTURES.to_string(),
+        why => why.to_string(),
+    }
+}

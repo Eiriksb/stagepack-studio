@@ -9,6 +9,8 @@ pub mod clipboard_tools;
 pub mod document;
 pub mod export;
 pub mod history;
+pub mod insert;
+pub mod insert_tools;
 pub mod inspector;
 pub mod markdown_panel;
 pub mod notes_panel;

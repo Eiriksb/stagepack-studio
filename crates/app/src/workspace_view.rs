@@ -25,6 +25,7 @@ use crate::clipboard::ClipboardOp;
 use crate::clipboard_tools::ClipboardTools;
 use crate::document::{Document, EditRefused, OpenProblem, Reload, SLIDES_FILE, TalkPlace, UNREADABLE_FILE};
 use crate::export::{self, ExportKind, run_export, stagepack_executable};
+use crate::insert_tools::{InsertPicture, InsertShape, InsertTextBox};
 use crate::inspector::{self, Inspector};
 use crate::markdown_panel::MarkdownPanel;
 use crate::notes_panel::{
@@ -46,7 +47,10 @@ use crate::watcher::{self, Change};
 use crate::working_copies::{KEEP_FAILED, KeepFailed, WorkingCopies};
 
 mod editing;
+mod inserting;
 mod saving;
+
+pub use inserting::ONLY_PICTURES;
 
 pub const CANVAS_ID: &str = "canvas";
 pub const TITLE_ID: &str = "title";
@@ -1243,7 +1247,11 @@ impl Render for WorkspaceView {
             // A click on the slide gives it the keyboard, for its keys.
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                 focus_handle.focus(window, cx)
-            });
+            })
+            // Pictures dropped on it from outside the app go on the slide.
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                this.dropped(paths.paths().to_vec(), cx)
+            }));
         v_flex()
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus_handle)
@@ -1289,6 +1297,11 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &PasteFromClipboard, window, cx| {
                 this.clipboard(ClipboardOp::Paste, window, cx)
             }))
+            .on_action(cx.listener(|this, _: &InsertPicture, _, cx| this.ask_for_pictures(cx)))
+            .on_action(cx.listener(|this, action: &InsertShape, _, cx| {
+                this.insert_shape(action.kind, cx)
+            }))
+            .on_action(cx.listener(|this, _: &InsertTextBox, _, cx| this.insert_text_box(cx)))
             .on_action(cx.listener(|this, _: &Undo, _, cx| this.step_history(Document::undo, cx)))
             .on_action(cx.listener(|this, _: &Redo, _, cx| this.step_history(Document::redo, cx)))
             .on_action(cx.listener(|this, _: &OpenFolder, _, cx| this.ask_to_open(true, cx)))
