@@ -1,32 +1,9 @@
 use std::path::PathBuf;
 
-use gpui_kit::assets::{Assets, icon_assets};
 use gpui_kit::*;
+use stagepack_studio::app_assets::AppAssets;
 use stagepack_studio::recovery::{KEEP_FOR, Recovery};
 use stagepack_studio::workspace_view;
-
-// The editor's tools show these, beyond the icons that come with the components.
-icon_assets!(ToolIcons, [Save, SquarePlus, CopyPlus, Trash, Presentation, Timer, CodeXml]);
-
-/// The components' icons and the tools'.
-struct AppAssets;
-
-impl AssetSource for AppAssets {
-    fn load(&self, path: &str) -> Result<Option<std::borrow::Cow<'static, [u8]>>> {
-        if let Some(bytes) = ToolIcons.load(path)? {
-            return Ok(Some(bytes));
-        }
-        Assets.load(path)
-    }
-
-    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-        let mut paths = Assets.list(path)?;
-        paths.extend(ToolIcons.list(path)?);
-        paths.sort();
-        paths.dedup();
-        Ok(paths)
-    }
-}
 
 fn main() {
     // `stagepack-studio <folder or .sptx file>` opens that talk; with no argument, ask.
