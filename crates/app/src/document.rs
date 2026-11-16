@@ -12,7 +12,7 @@ use slides_engine::{
     read_talk_text,
 };
 use slides_format::{
-    Change, FlowPlace, Pos, SourceEdit, Talk, TextEdit, parse_talk, reparse, set_align,
+    Change, FlowPlace, Para, Pos, Selection, SourceEdit, Talk, TextEdit, parse_talk, reparse, set_align,
     split_slides, storable, text_flows, write_flow, write_into_region,
 };
 
@@ -271,6 +271,8 @@ pub struct Document {
     outside: Option<String>,
     /// The text being typed on a slide, if any.
     editing: Option<EditingText>,
+    /// A colour chosen for the selection of the text being typed, not yet given to it.
+    held_color: Option<HeldColor>,
     /// The number the next time of typing on a slide gets.
     next_session: u64,
     /// What the window should say about something that went wrong where nothing was refused
@@ -358,6 +360,7 @@ impl Document {
             history: History::new(),
             typing_notes: None,
             editing: None,
+            held_color: None,
             next_session: 0,
             message: None,
         })
@@ -462,6 +465,7 @@ impl Document {
     /// A slide couldn't be laid out for the editor: typing on it can't go on, and it's said.
     fn layout_failed(&mut self) {
         self.editing = None;
+        self.held_color = None;
         self.message = Some(LAYOUT_FAILED.to_string());
     }
 
@@ -624,6 +628,7 @@ impl Document {
         if made.is_ok() && !empty {
             // The text being typed may have moved, or gone: it's typed into again once clicked.
             self.editing = None;
+            self.held_color = None;
         }
         made
     }
@@ -764,6 +769,7 @@ impl Document {
         let mut changed = self.deck.update_text(talk);
         self.typing_notes = None;
         self.editing = None;
+        self.held_color = None;
         self.show(current, &mut changed);
         changed
     }
@@ -823,6 +829,7 @@ impl Document {
         self.history.record(label, undo, at, at, false);
         self.typing_notes = None;
         self.editing = None;
+        self.held_color = None;
         self.show(at, &mut changed);
         Ok(changed)
     }
@@ -1071,8 +1078,77 @@ impl Document {
         made
     }
 
-    /// [`Self::apply_text`], the step named `label` if it's given.
+    /// [`Self::apply_text`], the step named `label` if it's given. A colour held for the
+    /// selection is given to it first.
     fn write_text(
+        &mut self,
+        op: impl FnOnce(&TextEdit) -> TextEdit,
+        label: Option<&'static str>,
+    ) -> Result<Vec<usize>, EditRefused> {
+        let given = self.give_held_first();
+        Ok(joined(given, self.write_now(op, label)?))
+    }
+
+    /// Keeps `color` to give the selection of the text being typed: the selection as it is,
+    /// in the text as it is. It's given when [`Self::give_held_color`] is asked, or before
+    /// anything else is done to the text or typing ends; by then the selection may have moved,
+    /// and it's that selection that's coloured all the same. If the text itself has changed,
+    /// it's dropped instead.
+    pub fn hold_color(&mut self, color: String) {
+        self.held_color = self.editing.as_ref().map(|editing| HeldColor {
+            color,
+            slide: editing.slide,
+            flow: editing.flow.clone(),
+            selection: editing.edit.selection,
+            paras: editing.edit.paras.clone(),
+        });
+    }
+
+    /// Gives the colour held for a selection to it, as one step, leaving the selection as it
+    /// is now, and returns the slides to show again.
+    pub fn give_held_color(&mut self) -> Result<Vec<usize>, EditRefused> {
+        let Some(held) = self.held_color.take() else {
+            return Ok(Vec::new());
+        };
+        let Some(editing) = &self.editing else {
+            return Ok(Vec::new());
+        };
+        if editing.slide != held.slide || editing.flow != held.flow || editing.edit.paras != held.paras {
+            // The text it was chosen for isn't there as it was.
+            return Ok(Vec::new());
+        }
+        let (then, now) = (held.selection, editing.edit.selection);
+        if then.is_caret() && then != now {
+            // A colour for what was to be typed there, which wasn't.
+            return Ok(Vec::new());
+        }
+        let color = held.color;
+        self.write_now(
+            |edit| {
+                let colored = edit
+                    .move_to(then.anchor, false)
+                    .move_to(then.head, true)
+                    .set_color(Some(color));
+                if then == now {
+                    colored
+                } else {
+                    colored.move_to(now.anchor, false).move_to(now.head, true)
+                }
+            },
+            None,
+        )
+    }
+
+    /// [`Self::give_held_color`], before something else is done: what it refuses is said.
+    fn give_held_first(&mut self) -> Vec<usize> {
+        self.give_held_color().unwrap_or_else(|refused| {
+            self.say(refused);
+            Vec::new()
+        })
+    }
+
+    /// [`Self::write_text`], with no colour held given first.
+    fn write_now(
         &mut self,
         op: impl FnOnce(&TextEdit) -> TextEdit,
         label: Option<&'static str>,
@@ -1089,6 +1165,7 @@ impl Document {
         let Some(flows) = flows.filter(|flows| reads_as_typed(flows, &editing)) else {
             // The talk and what's typed have parted: nothing can be written safely.
             self.editing = None;
+            self.held_color = None;
             return Err(EditRefused::CouldNotBeTyped);
         };
         let after = guarded(|| op(&editing.edit)).map_err(|_| EditRefused::CouldNotBeTyped)?;
@@ -1158,12 +1235,13 @@ impl Document {
     /// changes. Aligning as it's set to be aligned already changes nothing and makes no step.
     pub fn align_text(&mut self, align: Align) -> Result<Vec<usize>, EditRefused> {
         self.compose(None);
+        let given = self.give_held_first();
         let Some(editing) = self.editing.clone() else {
-            return Ok(Vec::new());
+            return Ok(given);
         };
         let slide = editing.slide;
         if slide >= self.slide_count() {
-            return Ok(Vec::new());
+            return Ok(given);
         }
         let written = match align {
             Align::Left => "left",
@@ -1180,7 +1258,7 @@ impl Document {
         })?
         .ok_or(EditRefused::CouldNotBeMade)?;
         if change.is_empty() {
-            return Ok(Vec::new());
+            return Ok(given);
         }
         let depth = self.history.depth();
         // Not through `make`: the typing isn't finished first, as it goes on.
@@ -1198,7 +1276,7 @@ impl Document {
         }
         // What's typed next is a step of its own.
         self.end_typing_run();
-        Ok(changed)
+        Ok(joined(given, changed))
     }
 
     /// How the text being typed is set to be aligned: its region's or its box's alignment, if
@@ -1241,10 +1319,12 @@ impl Document {
     pub fn settle_text(&mut self) -> Result<Vec<usize>, EditRefused> {
         // What the system was composing isn't text yet, and isn't kept.
         self.compose(None);
+        let given = self.give_held_first();
         let Some(editing) = self.editing.clone() else {
-            return Ok(Vec::new());
+            return Ok(given);
         };
         let (changed, removed) = self.tidy(&editing)?;
+        let changed = joined(given, changed);
         if removed.is_some() {
             let region = editing.flow.region().unwrap_or_default();
             let flows = guarded(|| text_flows(self.talk(), editing.slide)).ok();
@@ -1260,10 +1340,12 @@ impl Document {
 
     /// [`Self::end_text`], which also gives the slide and the flow it took away, if it did.
     fn finish_text(&mut self) -> Result<EndedText, EditRefused> {
+        let given = self.give_held_first();
         let Some(editing) = self.editing.take() else {
-            return Ok((Vec::new(), None));
+            return Ok((given, None));
         };
-        self.tidy(&editing)
+        let (changed, removed) = self.tidy(&editing)?;
+        Ok((joined(given, changed), removed))
     }
 
     /// Takes away the region text `editing` is typing in, if it has no words at all, and gives
@@ -1602,6 +1684,7 @@ impl Document {
             self.typing_notes = None;
             // Nor does the text being typed: what was typed is in the talk, or the file.
             self.editing = None;
+            self.held_color = None;
         }
         if same_text && changed.is_empty() {
             return Reload::Unchanged;
@@ -1635,8 +1718,26 @@ fn reads_as_typed(flows: &[slides_format::TextFlow], editing: &EditingText) -> b
     }
 }
 
-/// Whether `a` and `b` are the same kind of place: the same region, or both boxes, whose
-/// ranges move with the text before them.
+/// A colour chosen for a selection of text being typed, and the text it was chosen in.
+#[derive(Clone, Debug)]
+struct HeldColor {
+    color: String,
+    slide: usize,
+    flow: FlowKey,
+    selection: Selection,
+    paras: Vec<Para>,
+}
+
+/// The slides `a` and `b` say to show again, each once.
+fn joined(mut a: Vec<usize>, b: Vec<usize>) -> Vec<usize> {
+    for slide in b {
+        if !a.contains(&slide) {
+            a.push(slide);
+        }
+    }
+    a
+}
+
 /// Where `editing`'s text is on its slide: its region, or the box it's in.
 fn typed_place(talk: &Talk, editing: &EditingText) -> Option<FlowPlace> {
     match &editing.flow {
@@ -1648,6 +1749,8 @@ fn typed_place(talk: &Talk, editing: &EditingText) -> Option<FlowPlace> {
     }
 }
 
+/// Whether `a` and `b` are the same kind of place: the same region, or both boxes, whose
+/// ranges move with the text before them.
 fn same_place(a: &slides_format::FlowPlace, b: &slides_format::FlowPlace) -> bool {
     use slides_format::FlowPlace::{Region, Tag};
     match (a, b) {

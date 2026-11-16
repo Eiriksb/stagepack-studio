@@ -1727,6 +1727,7 @@ mod tools {
     use gpui_kit::test::TestQueryExt as _;
     use gpui_kit::{ScrollDelta, ScrollEvent, TouchPhase};
     use stagepack_studio::clipboard_tools::{COPY_ID, CUT_ID, PASTE_ID};
+    use stagepack_studio::slide_strip::strip_row_id;
     use stagepack_studio::ribbon::{
         MORE_LEFT_ID, MORE_RIGHT_ID, REDO_ID, RIBBON_ID, RIBBON_TOOLS_ID,
         SAVE_ID, UNDO_ID,
@@ -2636,6 +2637,73 @@ mod tools {
         assert!(!typing.picker_shows(cx).1);
         assert_eq!(typing.source(cx), red_words, "closed by a click elsewhere");
     }
+
+    /// What the slider colour held for "words" comes to after `away` moves on from it: "words"
+    /// red, as one step, and the next letter typed, on the current slide's title, not red.
+    fn held_colour_goes_to_its_words(
+        cx: &mut TestAppContext,
+        away: impl FnOnce(&Typing, &mut TestAppContext),
+    ) {
+        let typing = open(cx, TWO);
+        drag_to_red(&typing, cx);
+        away(&typing, cx);
+        let red_words = TWO.replacen("words", "<Text color=\"#ff0000\">words</Text>", 1);
+        assert_eq!(typing.source(cx), red_words);
+        assert_eq!(typing.undo_label(cx), Some("Format text"));
+        if typing.picker_shows(cx).1 {
+            typing.press(cx, "escape");
+        }
+        typing.click_text(cx, 0, pos(0, 2));
+        typing.type_text(cx, "Z");
+        let source = typing.source(cx);
+        assert!(source.contains("Z"), "{source}");
+        assert!(!source.contains("#ff0000\">Z"), "the new caret carries no red: {source}");
+        assert_eq!(source.matches("#ff0000").count(), 1, "{source}");
+        // One step for the colour, one for the letter.
+        typing.press(cx, "ctrl-z");
+        typing.press(cx, "ctrl-z");
+        assert_eq!(typing.source(cx), TWO);
+        assert!(!typing.can_undo(cx), "the colour was one step");
+    }
+
+    #[gpui_kit::test]
+    fn a_held_colour_goes_to_its_words_when_the_title_is_clicked(cx: &mut TestAppContext) {
+        held_colour_goes_to_its_words(cx, |typing, cx| typing.click_text(cx, 0, pos(0, 2)));
+    }
+
+    #[gpui_kit::test]
+    fn a_held_colour_goes_to_its_words_when_another_word_is_clicked(cx: &mut TestAppContext) {
+        held_colour_goes_to_its_words(cx, |typing, cx| {
+            typing.click_text(cx, 1, pos(0, 12));
+            assert_eq!(typing.selection(cx), caret_at(pos(0, 12)), "the caret went there");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_held_colour_goes_to_its_words_when_the_desk_is_clicked(cx: &mut TestAppContext) {
+        held_colour_goes_to_its_words(cx, |typing, cx| {
+            let slide = typing.slide_bounds(cx);
+            typing.click(cx, slide.origin - point(px(8.), px(8.)));
+            assert!(typing.editing(cx).is_none(), "typing ended");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_held_colour_goes_to_its_words_when_another_slide_is_chosen(cx: &mut TestAppContext) {
+        held_colour_goes_to_its_words(cx, |typing, cx| {
+            typing.click_on(cx, strip_row_id(1));
+            assert_eq!(typing.current(cx), 1);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_held_colour_goes_to_its_words_when_the_picker_is_closed_with_escape(cx: &mut TestAppContext) {
+        held_colour_goes_to_its_words(cx, |typing, cx| {
+            typing.press(cx, "escape");
+            assert!(!typing.picker_shows(cx).1);
+        });
+    }
+
 }
 
 /// `start..end`, the wrong way round, as the system may give it.
@@ -2777,5 +2845,4 @@ fn a_shortcut_during_a_composition_leaves_no_stale_composition(cx: &mut TestAppC
     typing.compose(cx, "´");
     typing.key(cx, "e", ctrl_alt(), "€");
     assert_eq!(typing.source(cx), TWO.replacen("Some words", "Some€ words", 1));
-
 }

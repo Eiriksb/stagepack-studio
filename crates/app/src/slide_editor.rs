@@ -169,8 +169,7 @@ pub struct SlideEditor {
     wanted_x: Option<f32>,
     /// Whether a press on the text is being dragged, selecting.
     dragging: bool,
-    /// A colour the colour picker's sliders chose, to give the text once the picker closes.
-    held_color: Option<String>,
+
     /// Where the caret and any composition were last drawn, so that the system's input method
     /// is told when they move, and only then.
     ime_place: Option<ImePlace>,
@@ -255,7 +254,6 @@ impl SlideEditor {
             pause: None,
             wanted_x: None,
             dragging: false,
-            held_color: None,
             ime_place: None,
             _subscriptions: subscriptions,
         }
@@ -457,17 +455,18 @@ impl SlideEditor {
         }
     }
 
-    /// Keeps `color` to give the text being typed once the colour picker closes, as its sliders
-    /// choose one after another.
-    pub fn hold_color(&mut self, color: String) {
-        self.held_color = Some(color);
+    /// Keeps `color` to give the selection of the text being typed once the colour picker
+    /// closes, as its sliders choose one after another. The talk gives it to that selection
+    /// before anything else is done to the text.
+    pub fn hold_color(&mut self, color: String, cx: &mut Context<Self>) {
+        if let Some(document) = &self.document {
+            document.update(cx, |document, _| document.hold_color(color));
+        }
     }
 
-    /// Gives the text being typed the colour held for it, if one is.
+    /// Gives the colour held for the selection to it, if one is.
     pub fn give_held_color(&mut self, cx: &mut Context<Self>) {
-        if let Some(color) = self.held_color.take() {
-            self.format(|edit| edit.set_color(Some(color)), cx);
-        }
+        self.run(Document::give_held_color, cx);
     }
 
     /// Gives the keyboard back to the text being typed, if any is, as a text tool does once
@@ -622,8 +621,6 @@ impl SlideEditor {
     /// Ends typing on the slide. With `give_back`, the keyboard goes back to the window, if
     /// the editor has it.
     fn end_editing(&mut self, give_back: bool, window: &mut Window, cx: &mut Context<Self>) {
-        // A colour chosen and not yet given is given before the typing ends.
-        self.give_held_color(cx);
         self.stop(cx);
         if self.is_editing(cx) {
             self.run(Document::end_text, cx);
@@ -766,6 +763,8 @@ impl SlideEditor {
     }
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // A colour held for the selection goes to it before the click moves it.
+        self.give_held_color(cx);
         self.dragging = false;
         let Some(point) = self.slide_point(event.position, cx) else {
             // The desk around the slide.

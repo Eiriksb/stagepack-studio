@@ -276,7 +276,7 @@ impl TextTools {
                     this.editor.update(cx, |editor, cx| {
                         // A drag of the sliders is one change, given once the picker closes,
                         // however it does: the editor gives it before typing ends, too.
-                        editor.hold_color(color);
+                        editor.hold_color(color, cx);
                         if !open {
                             editor.give_held_color(cx);
                         }
