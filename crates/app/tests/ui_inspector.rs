@@ -30,6 +30,8 @@ const ICON: &str = "<Icon";
 
 const BOTH_QUOTES: &str = "That can't hold both kinds of quote mark or a new line.";
 const NOT_WHOLE: &str = "That has to be a whole number.";
+const NOT_A_NUMBER: &str = "That has to be a number.";
+const CONTROL: &str = "That can't hold a tab or other control character.";
 const NEEDS_BUILD: &str = "Build this talk's components to set this up.";
 const NO_SUCH_COMPONENT: &str = "This talk has no component of that name.";
 
@@ -472,7 +474,8 @@ fn anything_typed_in_a_text_field_reads_back_or_is_refused(cx: &mut TestAppConte
         assert!(talk.slides.iter().all(|slide| slide.error.is_none()), "{typed:?}");
         assert_eq!(now[after(&now)], before[after(&before)], "{typed:?}: the other slide");
         if now == before {
-            assert_eq!(label_of(&typing, cx, &problem_id("title")).as_deref(), Some(BOTH_QUOTES), "{typed:?}");
+            let said = label_of(&typing, cx, &problem_id("title"));
+            assert!(matches!(said.as_deref(), Some(BOTH_QUOTES | CONTROL)), "{typed:?}: {said:?}");
         } else {
             assert_eq!(attr(&typing, cx, "title").as_deref(), Some(in_field.as_str()), "{typed:?}");
         }
@@ -729,4 +732,193 @@ fn a_double_click_still_types_in_a_box_with_the_panel_appearing(cx: &mut TestApp
     let editing = typing.editing(cx).expect("the second click types in the box");
     assert_eq!(editing.edit.selection, caret_at(at), "where it was clicked");
     assert!(panel_shows(&typing, cx), "the box stays selected while it's typed in");
+}
+
+#[gpui_kit::test]
+fn stepping_a_field_that_holds_no_number_is_refused(cx: &mut TestAppContext) {
+    let typing = open(cx, SHOWCASE);
+    go_to(&typing, cx, THINGS);
+    select(&typing, cx, ELLIPSE);
+    for (name, key) in [("w", "up"), ("x", "down")] {
+        type_over(&typing, cx, name, "abc");
+        typing.press(cx, key);
+        assert_eq!(typing.source(cx), SHOWCASE, "{name}: nothing written");
+        assert_eq!(label_of(&typing, cx, &problem_id(name)).as_deref(), Some(NOT_A_NUMBER), "{name}");
+        assert_eq!(shown(&typing, cx, name).as_deref(), Some("abc"), "{name}: what was typed stays");
+        typing.press(cx, "escape");
+    }
+    let typing = open_folder(cx, talk_with_score(SCORE), None);
+    select(&typing, cx, "<Score");
+    type_over(&typing, cx, "points", "abc");
+    typing.press(cx, "down");
+    assert_eq!(typing.source(cx), SCORE);
+    assert_eq!(label_of(&typing, cx, &problem_id("points")).as_deref(), Some(NOT_A_NUMBER));
+}
+
+#[gpui_kit::test]
+fn a_comma_is_a_decimal_mark(cx: &mut TestAppContext) {
+    let typing = open(cx, SHOWCASE);
+    go_to(&typing, cx, THINGS);
+    select(&typing, cx, ELLIPSE);
+    enter(&typing, cx, "w", "12,5");
+    assert_eq!(attr(&typing, cx, "w").as_deref(), Some("12.5"), "written with a dot");
+    assert_eq!(shown(&typing, cx, "w").as_deref(), Some("12.5"));
+    type_over(&typing, cx, "x", "1,5");
+    typing.press(cx, "up");
+    assert_eq!(attr(&typing, cx, "x").as_deref(), Some("2.5"), "stepped from 1.5");
+    for refused in ["1.2,5", "1e3", "1,2,3"] {
+        let before = typing.source(cx);
+        enter(&typing, cx, "y", refused);
+        assert_eq!(typing.source(cx), before, "{refused}");
+        assert_eq!(label_of(&typing, cx, &problem_id("y")).as_deref(), Some(NOT_A_NUMBER), "{refused}");
+    }
+    let typing = open_folder(cx, talk_with_score(SCORE), None);
+    select(&typing, cx, "<Score");
+    for fraction in ["1,5", "1.5"] {
+        enter(&typing, cx, "points", fraction);
+        assert_eq!(typing.source(cx), SCORE, "{fraction}");
+        assert_eq!(label_of(&typing, cx, &problem_id("points")).as_deref(), Some(NOT_WHOLE), "{fraction}");
+    }
+}
+
+#[gpui_kit::test]
+fn a_number_with_no_range_of_its_own_is_held_to_a_million(cx: &mut TestAppContext) {
+    let typing = open(cx, SHOWCASE);
+    go_to(&typing, cx, THINGS);
+    select(&typing, cx, ICON);
+    enter(&typing, cx, "size", "5000000");
+    assert_eq!(attr(&typing, cx, "size").as_deref(), Some("1000000"));
+    enter(&typing, cx, "size", "-5000000");
+    assert_eq!(attr(&typing, cx, "size").as_deref(), Some("-1000000"));
+}
+
+#[gpui_kit::test]
+fn a_refusal_stays_when_the_field_is_left(cx: &mut TestAppContext) {
+    let typing = open(cx, CHART);
+    select(&typing, cx, "<Chart");
+    type_over(&typing, cx, "title", "Bob's \"best\"");
+    typing.press(cx, "tab");
+    assert_eq!(typing.source(cx), CHART);
+    assert!(!has_keyboard(&typing, cx, "title"), "the keyboard went on");
+    assert_eq!(shown(&typing, cx, "title").as_deref(), Some("Bob's \"best\""), "what was typed stays");
+    assert_eq!(label_of(&typing, cx, &problem_id("title")).as_deref(), Some(BOTH_QUOTES), "and says why");
+
+    // A number too, refused as the field is left by a click elsewhere in the window.
+    select(&typing, cx, "<Chart");
+    type_over(&typing, cx, "w", "abc");
+    let ribbon = gpui_kit::point(gpui_kit::px(640.), gpui_kit::px(60.));
+    typing.click(cx, ribbon);
+    assert_eq!(typing.source(cx), CHART);
+    assert_eq!(shown(&typing, cx, "w").as_deref(), Some("abc"));
+    assert_eq!(label_of(&typing, cx, &problem_id("w")).as_deref(), Some(NOT_A_NUMBER));
+
+    // Escape in the field puts the talk's value back, and the sentence goes.
+    click_field(&typing, cx, "title");
+    typing.press(cx, "escape");
+    assert_eq!(shown(&typing, cx, "title").as_deref(), Some("Sales"));
+    assert_eq!(label_of(&typing, cx, &problem_id("title")), None);
+}
+
+#[gpui_kit::test]
+fn a_dragged_colour_goes_to_its_own_thing_when_another_is_clicked(cx: &mut TestAppContext) {
+    let typing = open(cx, SHOWCASE);
+    go_to(&typing, cx, THINGS);
+    select(&typing, cx, ELLIPSE);
+    let picker = picker(&typing, cx, "outline");
+    typing.with_window(cx, |window, cx| {
+        picker.update(cx, |picker, cx| {
+            picker.set_open(true, cx);
+            picker.update_color(rgb(0x0000ff).into(), window, cx);
+        })
+    });
+    typing.settle(cx);
+    assert_eq!(typing.source(cx), SHOWCASE, "held while the picker's open");
+    let icon = thing(&typing, cx, ICON);
+    let at = typing.at(cx, icon.rect.x + icon.rect.w / 2., icon.rect.y + icon.rect.h / 2.);
+    typing.click(cx, at);
+    assert_eq!(typing.source(cx), SHOWCASE.replace("outline=\"black\"", "outline=\"#0000ff\""), "the ellipse's outline");
+    let icon_now = thing(&typing, cx, ICON);
+    assert_eq!(selected(&typing, cx), Some(icon_now.source.clone()), "the icon is selected");
+    let source = typing.source(cx);
+    assert_eq!(&source[icon_now.source], "<Icon name=\"arrow-right\" x=\"100\" y=\"840\" size=\"96\" />", "and unchanged");
+}
+
+#[gpui_kit::test]
+fn a_colour_the_toolkit_cannot_read_is_kept_until_changed(cx: &mut TestAppContext) {
+    let none = SHOWCASE.replace("fill=\"orange\"", "fill=\"none\"");
+    let typing = open(cx, &none);
+    go_to(&typing, cx, THINGS);
+    select(&typing, cx, ELLIPSE);
+    assert_eq!(shown(&typing, cx, "fill").as_deref(), Some(""), "no colour shown");
+    click_field(&typing, cx, "x");
+    typing.press(cx, "tab");
+    select(&typing, cx, ICON);
+    assert_eq!(typing.source(cx), none, "kept as written");
+    select(&typing, cx, ELLIPSE);
+    pick(&typing, cx, "fill", rgb(0xff0000).into());
+    assert_eq!(typing.source(cx), SHOWCASE.replace("fill=\"orange\"", "fill=\"#ff0000\""));
+}
+
+#[gpui_kit::test]
+fn the_panel_is_never_in_a_show_or_a_thumbnail(cx: &mut TestAppContext) {
+    use stagepack_studio::present_view::{AUDIENCE_ID, NOTES_ID};
+    let typing = open(cx, SHOWCASE);
+    go_to(&typing, cx, THINGS);
+    let document = typing.document(cx);
+    let before = document.update(cx, |document, _| document.thumbnail(THINGS, 320)).expect("a thumbnail");
+    select(&typing, cx, ELLIPSE);
+    assert!(panel_shows(&typing, cx));
+    document.update(cx, |document, _| document.set_memory_budget(64 << 20));
+    let after = document.update(cx, |document, _| document.thumbnail(THINGS, 320)).expect("a thumbnail");
+    assert_eq!(before.data(), after.data(), "a thumbnail is the same with a thing selected");
+    typing.press(cx, "shift-f5");
+    cx.run_until_parked();
+    let shows: Vec<_> = cx.read(|cx| cx.windows()).into_iter().filter(|window| *window != typing.handle).collect();
+    assert_eq!(shows.len(), 2, "the audience's and the presenter's");
+    let mut seen = Vec::new();
+    for window in shows {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find(INSPECTOR_ID).is_none(), "no panel in a show window");
+            seen.push((window.try_find(AUDIENCE_ID).is_some(), window.try_find(NOTES_ID).is_some()));
+        })
+        .unwrap();
+    }
+    assert!(seen.contains(&(true, false)) && seen.iter().any(|(_, notes)| *notes), "{seen:?}");
+    assert!(panel_shows(&typing, cx), "the editor still shows it");
+}
+
+#[gpui_kit::test]
+fn a_press_elsewhere_ends_the_double_click(cx: &mut TestAppContext) {
+    let typing = open(cx, SHOWCASE);
+    go_to(&typing, cx, BOX);
+    let at_pos = pos(0, 5);
+    let at = typing.point_of(cx, 0, at_pos);
+    typing.click(cx, at);
+    assert!(panel_shows(&typing, cx), "the box is selected, and the slide moved");
+    // A press on the panel, then a second press where the first was: it's no double click on
+    // the slide as it was, but a press on the slide as it is now.
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        window.click(INSPECTOR_HEADING_ID, cx);
+    });
+    typing.settle(cx);
+    typing.mouse_down(cx, at, 2, gpui_kit::Modifiers::default());
+    typing.mouse_up(cx, at, 2, gpui_kit::Modifiers::default());
+    let typed_at = typing.editing(cx).map(|editing| editing.edit.selection);
+    assert_ne!(typed_at, Some(caret_at(at_pos)), "not mapped through the slide's old place");
+}
+
+#[gpui_kit::test]
+fn a_second_press_long_after_the_first_is_no_double_click(cx: &mut TestAppContext) {
+    let typing = open(cx, SHOWCASE);
+    go_to(&typing, cx, BOX);
+    let at_pos = pos(0, 5);
+    let at = typing.point_of(cx, 0, at_pos);
+    typing.click(cx, at);
+    cx.executor().advance_clock(std::time::Duration::from_secs(2));
+    typing.mouse_down(cx, at, 2, gpui_kit::Modifiers::default());
+    typing.mouse_up(cx, at, 2, gpui_kit::Modifiers::default());
+    let typed_at = typing.editing(cx).map(|editing| editing.edit.selection);
+    assert_ne!(typed_at, Some(caret_at(at_pos)), "not mapped through the slide's old place");
 }

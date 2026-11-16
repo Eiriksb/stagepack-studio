@@ -11,7 +11,7 @@
 
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -196,7 +196,7 @@ pub struct SlideEditor {
     /// What the status line was told of the thing selected on the slide shown, if anything is.
     told: Option<SharedString>,
     /// Where the last first press of a click was, and where the slide was then.
-    gesture: Option<(Point<Pixels>, Bounds<Pixels>)>,
+    gesture: Option<Gesture>,
 
     /// Where the caret and any composition were last drawn, so that the system's input method
     /// is told when they move, and only then.
@@ -922,12 +922,18 @@ impl SlideEditor {
     /// select a thing, which brings the inspector and moves the slide, but it's one gesture.
     fn pressed_point(&mut self, event: &MouseDownEvent, cx: &App) -> Option<(f32, f32)> {
         let now = self.canvas.read(cx).slide_bounds()?;
-        let slide = match self.gesture {
-            Some((at, slide)) if event.click_count > 1 && (at - event.position).magnitude() <= GESTURE_SLACK => slide,
+        // The app's clock, which a test's runs as the test says.
+        let time = cx.background_executor().now();
+        let slide = match self.gesture.take() {
+            Some(Gesture { at, slide, when })
+                if event.click_count > 1 && (at - event.position).magnitude() <= GESTURE_SLACK && time.saturating_duration_since(when) <= GESTURE_TIME =>
+            {
+                slide
+            }
             _ => now,
         };
         if event.click_count <= 1 {
-            self.gesture = Some((event.position, now));
+            self.gesture = Some(Gesture { at: event.position, slide: now, when: time });
         }
         point_on(slide, event.position)
     }
@@ -936,6 +942,19 @@ impl SlideEditor {
 /// How far, in pixels, the presses of a double click can be apart and still be taken for the
 /// same place on the slide.
 const GESTURE_SLACK: f64 = 8.0;
+
+/// How long after the first press of a double click the slide's place then still counts. No
+/// system's double click is slower.
+const GESTURE_TIME: Duration = Duration::from_secs(1);
+
+/// The first press of what may be a double click on the slide: where it was, where the slide
+/// was then, and when. A press anywhere else ends it.
+#[derive(Clone, Copy)]
+struct Gesture {
+    at: Point<Pixels>,
+    slide: Bounds<Pixels>,
+    when: Instant,
+}
 
 /// Where `position`, in the window, is on `slide`, drawn there, in slide units, if it's on it.
 fn point_on(slide: Bounds<Pixels>, position: Point<Pixels>) -> Option<(f32, f32)> {
@@ -1477,6 +1496,8 @@ impl Render for SlideEditor {
             .absolute()
             .size_full()
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
+            // A press anywhere else ends any double click begun on the slide.
+            .on_mouse_down_out(cx.listener(|this, _, _, _| this.gesture = None))
             .on_action(
                 cx.listener(|this, _: &MoveLeft, _, cx| this.go(Go::By(Motion::Left), false, cx)),
             )

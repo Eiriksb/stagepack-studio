@@ -13,6 +13,11 @@ pub const BOTH_QUOTES: &str = "That can't hold both kinds of quote mark or a new
 pub const NOT_A_NUMBER: &str = "That has to be a number.";
 /// What's said under a whole-number field that holds a fraction.
 pub const NOT_WHOLE: &str = "That has to be a whole number.";
+/// What's said under a text field that holds a tab or another control character.
+pub const CONTROL: &str = "That can't hold a tab or other control character.";
+
+/// The furthest from 0 a number with no range of its own is held to.
+pub const NUMBER_LIMIT: f64 = 1_000_000.0;
 
 /// The farthest a thing can be placed from the slide's corner, in slide units, as the engine
 /// holds it.
@@ -111,17 +116,23 @@ pub enum Typed {
     PutBack,
 }
 
-/// Whether `value` can be written as an attribute's value: not both kinds of quote mark, and no
-/// new line or other control character.
-pub fn writable(value: &str) -> bool {
-    !(value.contains('"') && value.contains('\'')) && !value.chars().any(char::is_control)
+/// Why `value` can't be written as an attribute's value, if it can't: both kinds of quote mark
+/// or a new line, or a tab or another control character.
+pub fn unwritable(value: &str) -> Option<&'static str> {
+    if (value.contains('"') && value.contains('\'')) || value.contains(['\n', '\r']) {
+        Some(BOTH_QUOTES)
+    } else if value.chars().any(char::is_control) {
+        Some(CONTROL)
+    } else {
+        None
+    }
 }
 
 /// What text typed in a text field comes to. Emptied, an optional one is taken away, and a
 /// required one is written empty.
 pub fn text_typed(text: &str, optional: bool) -> Typed {
-    if !writable(text) {
-        Typed::Refused(BOTH_QUOTES)
+    if let Some(why) = unwritable(text) {
+        Typed::Refused(why)
     } else if text.is_empty() {
         Typed::Write((!optional).then(String::new))
     } else {
@@ -137,24 +148,55 @@ pub fn number_typed(text: &str, whole: bool, range: Option<(f64, f64)>, optional
     if text.is_empty() {
         return if optional { Typed::Write(None) } else { Typed::PutBack };
     }
-    let Some(value) = text.parse::<f64>().ok().filter(|value| value.is_finite()) else {
-        return Typed::Refused(NOT_A_NUMBER);
-    };
-    if whole && value.fract() != 0.0 {
-        return Typed::Refused(NOT_WHOLE);
+    match number_in(text, whole) {
+        Ok(value) => Typed::Write(Some(number_text(held(value, range)))),
+        Err(why) => Typed::Refused(why),
     }
-    Typed::Write(Some(number_text(held(value, range))))
 }
 
-/// The number one step up or down from what a number field holds, `text`, held to `range`.
-/// Something that isn't a number steps from 0.
-pub fn stepped(text: &str, up: bool, range: Option<(f64, f64)>) -> String {
-    let value = text.trim().parse::<f64>().ok().filter(|value| value.is_finite()).unwrap_or(0.0);
-    number_text(held(if up { value + 1.0 } else { value - 1.0 }, range))
+/// The number `text` says: digits, perhaps a sign in front, and at most one decimal mark, a dot
+/// or a comma, so `1,5` is one and a half. Anything else, an exponent such as `1e3` included,
+/// isn't a number.
+pub fn parse_number(text: &str) -> Result<f64, &'static str> {
+    let text = text.trim();
+    let unsigned = text.strip_prefix(['-', '+']).unwrap_or(text);
+    let marks = unsigned.chars().filter(|c| matches!(c, '.' | ',')).count();
+    let readable = marks <= 1
+        && unsigned.chars().any(|c| c.is_ascii_digit())
+        && unsigned.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | ','));
+    if !readable {
+        return Err(NOT_A_NUMBER);
+    }
+    unsigned
+        .replace(',', ".")
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+        .map(|value| if text.starts_with('-') { -value } else { value })
+        .ok_or(NOT_A_NUMBER)
 }
 
+/// The number `text` says, as [`parse_number`] reads it, refused if it's a fraction where a
+/// `whole` one is wanted.
+fn number_in(text: &str, whole: bool) -> Result<f64, &'static str> {
+    let value = parse_number(text)?;
+    if whole && value.fract() != 0.0 { Err(NOT_WHOLE) } else { Ok(value) }
+}
+
+/// The number one step up or down from what a number field holds, `text`, held to `range`, or
+/// from `talk`, the talk's value, when the field is empty; from 0 if both are. Something that
+/// isn't a number, or a fraction in a `whole` one, is refused, and nothing is stepped.
+pub fn stepped(text: &str, talk: &str, up: bool, whole: bool, range: Option<(f64, f64)>) -> Result<String, &'static str> {
+    let from = if text.trim().is_empty() { talk } else { text };
+    let value = if from.trim().is_empty() { 0.0 } else { number_in(from, whole)? };
+    Ok(number_text(held(if up { value + 1.0 } else { value - 1.0 }, range)))
+}
+
+/// `value` held to `range`, or to [`NUMBER_LIMIT`] either way for a number with no range of
+/// its own.
 fn held(value: f64, range: Option<(f64, f64)>) -> f64 {
-    range.map_or(value, |(low, high)| value.clamp(low, high))
+    let (low, high) = range.unwrap_or((-NUMBER_LIMIT, NUMBER_LIMIT));
+    value.clamp(low, high)
 }
 
 /// `value` as it's written: as few digits as say it, and never `-0`.
@@ -177,7 +219,9 @@ mod tests {
         assert_eq!(text_typed("Bob's", false), Typed::Write(Some("Bob's".into())));
         assert_eq!(text_typed("\"Hi\" Bob's", false), Typed::Refused(BOTH_QUOTES));
         assert_eq!(text_typed("a\nb", false), Typed::Refused(BOTH_QUOTES));
-        assert_eq!(text_typed("a\0b", false), Typed::Refused(BOTH_QUOTES));
+        assert_eq!(text_typed("a\0b", false), Typed::Refused(CONTROL));
+        assert_eq!(text_typed("a\tb", false), Typed::Refused(CONTROL));
+        assert_eq!(text_typed("a\rb", false), Typed::Refused(BOTH_QUOTES));
         assert_eq!(text_typed("", false), Typed::Write(Some(String::new())));
         assert_eq!(text_typed("", true), Typed::Write(None));
     }
@@ -195,16 +239,31 @@ mod tests {
         assert_eq!(number_typed("abc", false, None, false), Typed::Refused(NOT_A_NUMBER));
         assert_eq!(number_typed("inf", false, None, false), Typed::Refused(NOT_A_NUMBER));
         assert_eq!(number_typed("1e999", false, None, false), Typed::Refused(NOT_A_NUMBER));
+        assert_eq!(number_typed("1e3", false, None, false), Typed::Refused(NOT_A_NUMBER));
+        assert_eq!(number_typed("1,5", false, None, false), Typed::Write(Some("1.5".into())));
+        assert_eq!(number_typed("-0,25", false, None, false), Typed::Write(Some("-0.25".into())));
+        assert_eq!(number_typed("1.2,5", false, None, false), Typed::Refused(NOT_A_NUMBER));
+        assert_eq!(number_typed("1,5", true, None, false), Typed::Refused(NOT_WHOLE));
+        assert_eq!(number_typed("--1", false, None, false), Typed::Refused(NOT_A_NUMBER));
+        assert_eq!(number_typed(",", false, None, false), Typed::Refused(NOT_A_NUMBER));
+        assert_eq!(number_typed("1e300", false, None, false), Typed::Refused(NOT_A_NUMBER));
+        let huge = format!("1{}", "0".repeat(300));
+        assert_eq!(number_typed(&huge, true, None, false), Typed::Write(Some("1000000".into())));
+        assert_eq!(number_typed("-5000000", false, None, false), Typed::Write(Some("-1000000".into())));
         assert_eq!(number_typed("", false, None, true), Typed::Write(None));
         assert_eq!(number_typed("", false, None, false), Typed::PutBack);
     }
 
     #[test]
     fn a_step_goes_one_up_or_down_within_the_range() {
-        assert_eq!(stepped("560", true, None), "561");
-        assert_eq!(stepped("", false, None), "-1");
-        assert_eq!(stepped("7680", true, Some((0.0, MAX_POSITION))), "7680");
-        assert_eq!(stepped("1.5", false, Some((1.0, MAX_SIZE))), "1");
+        assert_eq!(stepped("560", "", true, false, None), Ok("561".into()));
+        assert_eq!(stepped("", "", false, false, None), Ok("-1".into()));
+        assert_eq!(stepped("", "96", true, false, None), Ok("97".into()), "an empty field steps from the talk's");
+        assert_eq!(stepped("7680", "", true, false, Some((0.0, MAX_POSITION))), Ok("7680".into()));
+        assert_eq!(stepped("1.5", "", false, false, Some((1.0, MAX_SIZE))), Ok("1".into()));
+        assert_eq!(stepped("1,5", "", true, false, None), Ok("2.5".into()));
+        assert_eq!(stepped("abc", "4", true, false, None), Err(NOT_A_NUMBER), "never from 0");
+        assert_eq!(stepped("1,5", "", true, true, None), Err(NOT_WHOLE));
     }
 
     #[test]

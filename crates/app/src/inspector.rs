@@ -15,7 +15,9 @@ use std::path::Path;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
-use gpui_kit::component::input::{self, Input, InputEvent, InputState, NumberInput, NumberInputEvent, StepAction};
+use gpui_kit::component::input::{
+    self, Input, InputEvent, InputState, MaskPattern, NumberInput, NumberInputEvent, StepAction,
+};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::{ActiveTheme as _, IndexPath, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -355,13 +357,63 @@ impl Inspector {
         let Some(field) = self.form.as_ref().and_then(|form| form.fields.get(index)) else {
             return;
         };
-        let (Widget::Input(input), Kind::Number { range, .. }) = (&field.widget, &field.spec.kind) else {
+        let Widget::Input(input) = &field.widget else {
             return;
         };
-        let input = input.clone();
-        let next = stepped(&input.read(cx).value(), up, *range);
-        input.update(cx, |input, cx| input.set_value(SharedString::from(next), window, cx));
-        self.commit(index, window, cx);
+        let (Kind::Number { whole, range }, attr) = (&field.spec.kind, field.spec.attr.clone()) else {
+            return;
+        };
+        let (whole, range, input) = (*whole, *range, input.clone());
+        let talk = self.talk_attr(&attr, cx).unwrap_or_default();
+        match stepped(&input.read(cx).value(), &talk, up, whole, range) {
+            Ok(next) => {
+                input.update(cx, |input, cx| input.set_value(SharedString::from(next), window, cx));
+                self.commit(index, window, cx);
+            }
+            // What's in the field stays, and nothing is written.
+            Err(why) => {
+                if let Some(field) = self.field_mut(&attr) {
+                    field.problem = Some(why.into());
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Takes back what was said of field `index`, if anything was.
+    fn clear_problem(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(field) = self.form.as_mut().and_then(|form| form.fields.get_mut(index))
+            && field.problem.take().is_some()
+        {
+            cx.notify();
+        }
+    }
+
+    /// Lets go of the form, as it's no longer for the thing selected. A colour still held in
+    /// an open picker is written to the thing it was dragged for, once the drawing is done.
+    fn drop_form(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = self.form.take() else {
+            return;
+        };
+        let held: Vec<(String, String)> = form
+            .fields
+            .into_iter()
+            .filter_map(|field| match field.widget {
+                Widget::Color { held: Some(color), .. } => Some((field.spec.attr, color)),
+                _ => None,
+            })
+            .collect();
+        if held.is_empty() {
+            return;
+        }
+        let (pick, target, workspace) = (form.shape.pick, form.target, self.workspace.clone());
+        cx.defer(move |cx| {
+            for (name, color) in held {
+                workspace
+                    .update(cx, |workspace, cx| workspace.set_attr_from_inspector(pick, &target, &name, Some(&color), cx))
+                    .ok();
+            }
+        });
     }
 
     /// Gives the next text or number field the keyboard, or the one before with `back`, from
@@ -380,6 +432,8 @@ impl Inspector {
             return false;
         };
         let next = if back { (at + inputs.len() - 1) % inputs.len() } else { (at + 1) % inputs.len() };
+        // What's typed is written, or refused, before the keyboard goes on.
+        self.commit_typing(window, cx);
         inputs[next].update(cx, |input, cx| input.focus(window, cx));
         true
     }
@@ -484,10 +538,15 @@ impl Inspector {
         for (index, spec) in shape.specs.iter().enumerate() {
             let widget = match &spec.kind {
                 Kind::Text | Kind::Number { .. } => {
-                    let input = cx.new(|cx| InputState::new(window, cx));
+                    // A number field takes whatever's typed, a comma for the decimal mark too, and
+                    // says what it can't take once it's committed.
+                    let input = cx.new(|cx| InputState::new(window, cx).mask_pattern(MaskPattern::None));
                     subscriptions.push(cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, window, cx| {
-                        if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
-                            this.commit(index, window, cx);
+                        match event {
+                            InputEvent::PressEnter { .. } | InputEvent::Blur => this.commit(index, window, cx),
+                            // Typing in it again takes back what was said of it.
+                            InputEvent::Change => this.clear_problem(index, cx),
+                            _ => {}
                         }
                     }));
                     if matches!(spec.kind, Kind::Number { .. }) {
@@ -588,7 +647,11 @@ impl Inspector {
             let value = tag.and_then(|tag| tag.attr(&field.spec.attr));
             match &field.widget {
                 Widget::Input(input) => {
-                    if input.read(cx).focus_handle(cx).is_focused(window) {
+                    // What was typed and refused stays, with why, until it's typed in again or
+                    // Escape puts the talk's value back; what was typed and not yet committed,
+                    // as the keyboard leaves the field, stays for the commit.
+                    let typed = input.read(cx).value().as_ref() != field.shown;
+                    if field.problem.is_some() || typed || input.read(cx).focus_handle(cx).is_focused(window) {
                         continue;
                     }
                     let wanted = value.unwrap_or_default();
@@ -784,12 +847,15 @@ impl Render for Inspector {
             Some((shape, target, tag)) => {
                 match &mut self.form {
                     Some(form) if form.shape == shape => form.target = target,
-                    _ => self.form = Some(self.build_form(shape, target, window, cx)),
+                    _ => {
+                        self.drop_form(cx);
+                        self.form = Some(self.build_form(shape, target, window, cx));
+                    }
                 }
                 tag
             }
             None => {
-                self.form = None;
+                self.drop_form(cx);
                 None
             }
         };
