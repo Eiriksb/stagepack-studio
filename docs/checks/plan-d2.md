@@ -1,6 +1,6 @@
 # Plan D2: what ran, and what to check by hand
 
-The run was on the `plan-d2` branch, starting from commit 3360958, on a 16-core Linux laptop, with Rust 1.98.0, in a release build, on 2026-11-16. It found eight things to fix, each fixed in its own commit with a test, from 62305e0 to cb5d506, and one test was changed to match the last of them at 4a12f92. The parts of the run each fix touched were run again on the release build with the fix. The branch hasn't been pushed or merged yet. Nothing here has run on Windows.
+The run was on the `plan-d2` branch, starting from commit 3360958, on a 16-core Linux laptop, with Rust 1.98.0, in a release build, on 2026-11-16. It found seven things to fix, fixed in eight commits with a test each, from 62305e0 to cb5d506, and one test was changed to match the last of them at 4a12f92. The parts of the run each fix touched were run again on the release build with the fix. After the run came the final review of the whole branch and one wave of fixes, which are under *The final review* at the end; where they change what this record says, it says so there. The branch hasn't been pushed or merged yet. Nothing here has run on Windows.
 
 ## Tests on Linux
 
@@ -54,7 +54,7 @@ What looks wrong and wasn't changed:
 - **The arrow at the row's end is small and pale**, and the fade under it barely shows, so the tools past it are easy to miss. At 800 pixels the size field is cut at the window's edge under it. The wheel scrolls the row too.
 - **A blank slide shows *Click to add text* at its top-left corner**, also a hand-written one holding only a box: the blank layout's text place is the whole slide, so its outline lies outside the slide and its words in the corner.
 - **A line at the bottom shrinks the slide**, as in D1: a notice such as *Uses a font on this computer for 😀*, which shows while an emoji is on the slide, or *Code can't be edited on the slide yet.*, which stays after moving to another slide.
-- **A typed 😀 was drawn in one colour**, from a font on this computer, while a pasted 🎉 and 👍🏽 were in colour.
+- **A 😀 was drawn in one colour**, from a font on this computer, while 🎉 and 👍🏽 were in colour. It wasn't typing against pasting: for each character the text engine tried this computer's DejaVu Sans before the app's own colour emoji font, and DejaVu has a 😀 and not the other two. The final review's fixes put the app's font first.
 
 ### What it did
 
@@ -71,11 +71,11 @@ What the reviews asked the real window to settle:
 
 1. **A colour from the sliders, then a click in the title:** with *X* typed in a paragraph, a word selected, the picker's HSLA sliders moved and the title clicked, the word was coloured and the letter typed next in the title wasn't, three times out of three, on different words: `<Text color="#e01a1a">Plenty</Text>` and the title `The cZZontent laQyout` with no colour in it.
 2. **The ribbon:** at 1,280 pixels every Home tool shows with room to spare and no arrow. At 800 pixels an arrow shows at the right; a click on it scrolls most of a row's width, after 10a3887 also over the greyed size field, and the arrow then shows at the left. The wheel scrolls the row. Every tool was reached. How it looks is under *How it looks*.
-3. **Empty lines:** Enter twice at the end of the left column's words and *Third line* typed on the third line drew an empty line of a line's height between them, on the slide, in the show, in the PDF and in the PowerPoint file. The Markdown written is exactly this, with a blank line before and after each line: `On the left, some words about the first idea.`, `**<Text></Text>**`, `Third line`. How an empty line is spelled is still the owner's question.
+3. **Empty lines:** Enter twice at the end of the left column's words and *Third line* typed on the third line drew an empty line of a line's height between them, on the slide, in the show, in the PDF and in the PowerPoint file. The Markdown written is exactly this, with a blank line before and after each line: `On the left, some words about the first idea.`, `**<Text></Text>**`, `Third line`. The final review's fixes changed the spelling to `&nbsp;`.
 4. **An emptied title:** in a talk starting `# Title`, `## Sub heading`, `Words`, the title emptied and New slide pressed said *The emptied text couldn't be taken away, so it's left on the slide.* and added nothing; a second press added the slide. Taking the title away would make the sub-heading the title. After cb5d506 the first press says it and adds the slide. The emptied title stays as `#`, with no offer. A title emptied with nothing under it, then Escape, gave *Click to add title* back.
 5. **Keys:** dead keys and AltGr as above. With the Norwegian layout, a dead key then Ctrl+S saved nothing and typed nothing, and left no stale accent: the system composes the two into `ś`. The next letter typed once. A dead key then Escape typed the accent and ended the typing; a dead key then a click typed the accent and moved the caret. A real input method, beyond dead keys, wasn't tried. An emoji with a skin tone, pasted, went in whole: Left stepped over 👍🏽 in one press, and Backspace took the space before it.
 6. **The clipboard:** two windows of the same running app couldn't be had, as the second needs the system's Open dialog, which the nested display can't show. Two separately started copies on the same display: a slide copied in one and pasted into the other's slide list arrived with its layout and words, through the plain Markdown on the clipboard (`---`, `layout: content`, `---` and the slide, ending in a `---` line). Styled words copied in one and pasted into the other came as plain words, as expected: the styles stay inside one copy of the app. Within one copy, styled words copied from one slide to another kept bold and italic, and took the bullet they came from. Markdown from an outside owner of the clipboard, `# From an editor`, words with `**bold**`, and a two-item list, pasted with the slide list focused, became a slide drawn as Markdown would.
-7. **Typing speed:** the release timing test, `scripts/cargo-safe.sh test --release -p stagepack-studio --test edit_speed -- --ignored`, three times: a keystroke typed on a slide of the 500-slide talk took a median of 2.66 to 2.69 ms before drawing, the slowest 8.6 to 13.8 ms; one in the notes 1.0 to 1.8 ms, the slowest 6.1 to 6.7 ms. The budget is 8 ms, on the median. In the window, on the 500-slide talk, typing at 10 keys a second for 30 seconds used 0.93 of a core, and on a 2-slide talk 0.95: it's the drawing in software, not the talk. A key showed on screen a median of about 95 ms after it was sent (from 42 to 188 ms, measured by pictures taken some 30 ms apart). It kept up, and felt slow but usable. Typing 70 keys a second for 30 seconds into one paragraph, which grew to 2,100 characters, used a whole core and fell seconds behind: when the typing stopped, the slide showed less than half of it, and caught up later; nothing was lost. Memory went from 250 MB to 1.4 to 1.6 GB doing that, fell to 0.9 GB, and stayed at 0.9 GB through another 30 seconds of the same. Typing 300 characters at 10 a second took it from 250 MB to 256 MB. Idle, after the caret stopped blinking, the app used 0.005 of a core.
+7. **Typing speed:** the release timing test, `scripts/cargo-safe.sh test --release -p stagepack-studio --test edit_speed -- --ignored`, three times: a keystroke typed on a slide of the 500-slide talk took a median of 2.66 to 2.69 ms, the slowest 8.6 to 13.8 ms; one in the notes 1.0 to 1.8 ms, the slowest 6.1 to 6.7 ms. The budget is 8 ms, on the median. The test stops before the slide is drawn: the final review measured that drawing a changed slide into its picture adds a median of about 3.9 ms, and up to 17 ms. In the window, on the 500-slide talk, typing at 10 keys a second for 30 seconds used 0.93 of a core, and on a 2-slide talk 0.95: it's the drawing in software, not the talk. A key showed on screen a median of about 95 ms after it was sent (from 42 to 188 ms, measured by pictures taken some 30 ms apart). It kept up, and felt slow but usable. Typing 70 keys a second for 30 seconds into one paragraph, which grew to 2,100 characters, used a whole core and fell seconds behind: when the typing stopped, the slide showed less than half of it, and caught up later; nothing was lost. Memory went from 250 MB to 1.4 to 1.6 GB doing that, fell to 0.9 GB, and stayed at 0.9 GB through another 30 seconds of the same. It isn't a leak: each change retires the slide's picture, and the retired ones wait for the next paint to be freed. Typing 300 characters at 10 a second took it from 250 MB to 256 MB. Idle, after the caret stopped blinking, the app used 0.005 of a core.
 8. **Killed mid-word:** with *and then a crash* typed and *in the midd* in bold, the app was killed with `kill -9` 1.5 s later. The file on disk was as before. Started again, the bar said *Changes from last time weren't saved*, and *Bring them back* gave the words back, the bold half-word too, with the unsaved mark.
 9. **Show and export:** F5 showed a slide with only its title typed without its *Click to add text*, the bold words bold, and the empty line's height. A talk with styled words (bold, italic, red, 64, underlined), an empty line and a new slide with an empty place was exported to PDF and PowerPoint through the code behind the Export menu, `run_export`, from a scratch test that was not committed, as the system's Save dialog can't be shown on the nested display. The PDF's pages, drawn as pictures with `pdftoppm`, and the PowerPoint file, turned into a PDF by LibreOffice and drawn the same way, showed no offers, every style, and the empty line's height. In the PowerPoint file the empty line is an empty paragraph of its own.
 
@@ -86,8 +86,8 @@ What the reviews asked the real window to settle:
 - **Right-to-left text**, which is outside this plan.
 - **A real GPU.** Every timing above is with software drawing.
 - **Wayland.** The run was on X11 only.
-- **Two windows of one running app**, as the second needs the system's Open dialog. Within one app the clipboard is covered by headless tests only.
-- **The system's Save and Open dialogs**, behind Export, Save As and Open. Export was run through the code behind its dialog.
+- **Two windows of one running app**, as the second needs the system's Open dialog. Within one app the clipboard is covered by headless tests only. It's in both hand checks below.
+- **The system's Save and Open dialogs**, behind Export, Save As and Open. Export was run through the code behind its dialog. They're in both hand checks below.
 - **Scaling above 100 %.** The nested display has a scale of 1.
 - **macOS**, which isn't a target of this plan.
 
@@ -111,6 +111,9 @@ The branch hasn't been pushed or merged yet. Once it's in `main`, this check sta
 14. Type a word, and end the app in Task Manager halfway through the next. Start it again on the same folder. A bar should offer the changes back. Press *Bring them back*, and say whether the half-word is there.
 15. F5: the offers shouldn't show, and the styled words should. Export to PDF and to PowerPoint: say whether the system's Save dialog shows, and open both files. In desktop PowerPoint, say whether the styles and the empty lines look as on the slide.
 16. Open the 500-slide talk (see `docs/checks/plan-d1.md`, step 11, for making it), click in a slide and type fast for 30 seconds. Say whether it keeps up, and what Task Manager shows for its CPU and memory during and after.
+17. In one running copy, use File, *Open talk folder…* to open `C:\StudioCheck\original` in a second window: say whether the system's Open dialog shows. Copy a slide with styled words in one window's slide list and paste it into the other's: it should keep its layout and styles. Copy styled words from a slide in one window into a slide in the other: they should keep bold, italic, colour and size.
+18. Save As, once as a talk folder and once as a packed talk: say whether the system's Save dialog shows each time, and whether the saved talk opens. While the Save dialog is up, try typing in the window behind it: if it takes the words, say whether they're in the saved talk.
+19. Type a 😀, a 🎉 and a 👍🏽: all three should be in colour.
 
 ## Linux check, by hand
 
@@ -129,20 +132,55 @@ Each item under both an X11 session and a Wayland session.
 11. The text being composed stays shown after the caret stops blinking.
 12. The Home row at 125 %, 150 % and 200 % scaling: the arrow, the wheel, every tool reached, nothing blurred.
 13. A slide copied between two copies of the app, and Markdown pasted from a text editor into the slide list, under Wayland too.
+14. In one running copy, a second window opened with File, *Open talk folder…*: the system's Open dialog shows. A slide with styled words copied in one window's slide list and pasted into the other's keeps its layout and styles, and styled words copied from a slide in one window into a slide in the other keep bold, italic, colour and size.
+15. Save As, once as a talk folder and once as a packed talk: the system's Save dialog shows each time, and the saved talk opens.
+16. A 😀, a 🎉 and a 👍🏽 are all in colour, also on a computer with DejaVu Sans installed.
 
 ## Known after the run
 
 Found in this run and not changed are under *How it looks*. These are known from the plan's reviews, and weren't changed:
 
-- **The empty line's spelling.** An empty line is written `**<Text></Text>**`, a line of its own. It reads back exactly, but it's ugly to a person reading the Markdown. A tag of its own could replace it later. This is the owner's question.
+- **The empty line's spelling.** In this run an empty line was written `**<Text></Text>**`, a line of its own. The final review's fixes changed it to `&nbsp;`; the old spelling is still read. Whether it should be a tag of its own is the owner's question.
 - **A title emptied above a smaller heading stays as `#`**, with a sentence saying so, and shows no *Click to add title*, as taking it away would make the smaller heading the title.
 - **The slowest keystroke goes past 8 ms** on the 500-slide talk (to 13.8 ms in this run). The median, which the budget is on, is about a third of it.
 - **A dead key then Ctrl+S on Linux saves nothing**, without a word, as the system makes a letter of the two.
 - **Text being composed is drawn as a label over the slide**, at the caret, not in the line. The candidate window is placed from where the composition starts only.
 - **Writing:** an edited paragraph's line breaks can change their spelling (a hard break for a soft one); in a list written out whole again, spaces after an untouched marker can close up, and an untouched item can be numbered again when the blank line before it is taken away; a typed paragraph's own escapes are made the plainest (`\\w` becomes `\w`); a paragraph put between two items has no blank line after it.
 - **Editing:** Backspace takes a whole cluster, such as a letter and its accent typed as two; a double-click at a paragraph's end takes the punctuation before it; Indent is offered for body paragraphs, where it does nothing; Tab onto a tool past the arrow doesn't scroll the row to it; a tidy-up folded into an earlier step can leave a blank line; a slide that fails to lay out ends the typing without tidying it.
-- **Drawing:** an empty heading (`#` alone) now takes a whole line, which talks using a bare `#` as a spacer will see; a paragraph ending in a line break gets an empty last line; a textless ellipse says it's *a box that holds more than text*; `align` on a tag that isn't placed is ignored without a word; a region's `align` takes the last one written, a tag's the first; the notice about `align` in a paragraph can come for inline code or an escaped tag.
+- **Drawing:** an empty heading (`#` alone) now takes a whole line, which talks using a bare `#` as a spacer will see; a paragraph ending in a line break gets an empty last line; a textless ellipse says it's *a box that holds more than text*; `align` on a tag that isn't placed is ignored without a word; the notice about `align` in a paragraph can come for inline code or an escaped tag.
 - **The clipboard:** a slide pasted into text over the limits of paragraphs and words does nothing, without a word; plain text starting `title: …` and `---` pastes as visible words; a blank line before a leading `---` makes the paste refused; a slide pasted from hand-written Markdown loses its direction marks; the sentence about missing pictures also comes for a picture that's there but can't be read, and can count one wrongly if the engine's notice was cut at 200 characters; a failed clipboard write can't be known, as GPUI doesn't say.
 - **Files:** a picture replaced on disk shows only after the next save or reload.
 - **The reader's property test** has a case its check doesn't allow for: `a`, then `- -`, then `&`, as above.
 - **Memory** rises to well over a gigabyte while typing very fast into one long paragraph with software drawing, and stays high, though it doesn't keep growing.
+
+## The final review
+
+After the run, the whole branch was reviewed once more, from 11341a6 to c3a3d3a. It ran 1,467 tests, and a random editing session of 67,000 operations in which the paragraphs on screen and the Markdown never differed, no other slide's bytes changed, and undoing everything gave the first text back exactly. It found the clipboard's checks sound. It found four things that mattered, and they were fixed in one wave of twelve commits, a975c99 to 52900cd, each with a test that failed before its fix:
+
+- **Typing re-indented hand-written lists.** One letter typed anywhere in a place rewrote the indentation of a nested list in the same place, if the list was nested with four spaces, a tab or one space. Every test before had nested with two. Typing and deleting characters now change only the lines of the paragraph typed in. (a975c99)
+- **A paste the slide can't hold froze the window** for one to four seconds, then said *That couldn't be typed here*. It's now refused at once, as too large, before anything is written. (7827357, 718228c)
+- **Bullets and then Tab on a first item made every key refuse** until Shift+Tab. A list item is now never made more than one level deeper than the item before it, and a first item stays at the first level. (209636b)
+- **Emoji were drawn from this computer's fonts before the app's own.** The app's colour emoji font is now tried first. Symbols the app's other fonts lack, such as ✔ and ♥, come from it too, as they already did in a PDF. (52900cd)
+
+The wave also made these smaller changes:
+
+- An empty line is written `&nbsp;`, and a paragraph that is one real no-break space `&#160;`. `**<Text></Text>**` is still read as an empty line, and both spellings draw and export the same. (383a72d)
+- A link whose text starts with code holding `]` can start a paragraph. (1a9bbdb)
+- A slide that fails as it's laid out gives no notices and no thumbnail, where it could have stopped the app. (ac12898)
+- Save As and Export tidy typing done while their dialog was up. (cb9c2e7)
+- A heading pasted outside a title takes the kind of the paragraph it lands in. (f0fb95f)
+- The deepest list level is written in one place, and a test holds the list of talk-wide settings to the ones the engine reads. (dae57b3, 0cb4fac)
+
+At 52900cd, `scripts/cargo-safe.sh test --workspace` passed: 1,485 tests, 0 failed, 10 ignored. `scripts/cargo-safe.sh clippy --workspace --all-targets` gave no warnings. The release timing test gave a median of 3.01 ms for a keystroke on a slide of the 500-slide talk, the slowest 12.0 ms, and 1.09 ms in the notes. The window wasn't run again after the wave, so the new spelling, the emoji and the paste refusal have been seen in tests only. They're in the hand checks.
+
+A second reviewer then checked the wave. It made 601 edits over 31 hand-written talks the tests don't hold (numbered lists three deep, tabs three deep, spaces and tabs mixed, blank lines between items, Windows line endings), and every one changed only its own paragraph. Of 54,033 random operations, 34 rewrote a neighbour, none of them from typing or deleting characters in a paragraph that still had text. 600 random runs of ordinary keys never left typing refused.
+
+Known after the final review, and not changed:
+
+- **Changes to a list's structure tidy its neighbours.** Changing a paragraph's kind, turning a list on or off, changing a level, pasting paragraphs, and Backspace or Delete joining items write the whole list again, and a hand-indented neighbour can come out with two-space indentation. Emptying a nested item does it too: in `- a`, `    - b`, `        - c`, `- d`, taking away the `c` re-indents `b`.
+- **A list holding a hand-written `- &nbsp;` item with items nested under it can't be typed in.** Each key is refused, and nothing is lost. Before the new spelling it read as a no-break space and could be.
+- **A line that starts with three backticks and has more backticks later** is taken as the start of code, though Markdown doesn't. From there to the next line of three backticks, a `---` is drawn as words and doesn't start a slide. This is what the reader's property test trips on at 1,000 cases. It's older than D2.
+- **The test of the paste refusal's speed** compares one timing with another with 50 ms to spare, so it could fail on a loaded computer.
+- **A paste right at the limit** can still be refused later with the plainer sentence, as styled words are counted without their Markdown. Tab on an item under an empty item is refused once, and typing goes on.
+- **The emoji font is found by its name**, so a computer's own copy of Noto Color Emoji could be the one used.
+- A trailing new line in pasted words leaves an empty line. Redo is lost by clicking away after an Undo that left a text empty. A slide near 32 KB types slowly.

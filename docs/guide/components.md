@@ -57,7 +57,7 @@ On a slide, it's used like this:
 
 Each attribute in the tag is given to the argument of the same name. An argument written with `_`, such as `outline_width`, is written with `-` in the tag: `outline-width="4"`.
 
-Some names are kept for the slide, for where a tag is placed and when it appears, and for what a later version may add: `x`, `y`, `w`, `h`, `rotate`, `click`, `enter`, `z`, `opacity`, `id`, `class`, `style`, `exit`, `key`, `ref` and `slot`. An argument can't have one of them, and building a component that tries says so.
+Some names are kept for the slide, for where a tag is placed and when it appears, and for what a later version may add: `x`, `y`, `w`, `h`, `rotate`, `align`, `click`, `enter`, `z`, `opacity`, `id`, `class`, `style`, `exit`, `key`, `ref` and `slot`. An argument can't have one of them, and building a component that tries says so.
 
 ## Arguments and their form fields
 
