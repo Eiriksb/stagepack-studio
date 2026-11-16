@@ -1146,7 +1146,14 @@ fn region_change(talk: &Talk, index: usize, region: &str, paras: &[Para]) -> Opt
             None => {
                 let rest = source.get(body..slide.range.end)?;
                 if rest.trim().is_empty() {
-                    at_end(body, text)
+                    // Under a blank line after the slide's opening lines, as for a title, and
+                    // with one before the next slide's.
+                    let skip = if source[..body].ends_with('\n') && rest.starts_with(eol) { eol.len() } else { 0 };
+                    let mut edit = at_end(body + skip, text);
+                    if skip > 0 && rest.len() == skip && slide.range.end < source.len() {
+                        edit.text.push_str(eol);
+                    }
+                    edit
                 } else {
                     SourceEdit { range: body..body, text: format!("{text}{eol}{eol}") }
                 }

@@ -219,6 +219,12 @@ fn text_goes_into_the_right_column_after_its_marker() {
     let after = write_into_region(&talk, 0, "right", &words).unwrap().apply(marked);
     assert_eq!(after, "---\nlayout: two-columns\n---\n# T\n\n<Region name=\"right\" />\n\nRight.\n");
 
+    // An empty slide, as the app adds it, between two others.
+    let new = "# A\n\n---\nlayout: blank\n---\n\n---\n\n# B\n";
+    let talk = parse_talk(new);
+    let after = write_into_region(&talk, 1, "body", &words).unwrap().apply(new);
+    assert_eq!(after, "# A\n\n---\nlayout: blank\n---\n\nRight.\n\n---\n\n# B\n", "the blank line stays above it");
+
     let main = "# T\n";
     let talk = parse_talk(main);
     let after = write_into_region(&talk, 0, "body", &[para(BULLET, "a"), para(BULLET, "b")]).unwrap().apply(main);
