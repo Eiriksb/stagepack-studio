@@ -151,3 +151,47 @@ fn a_keystroke_with_added_pictures_to_save_is_quick() {
     }
     report("keystroke typed with three pictures to save", times);
 }
+
+/// A letter typed in a cell of a table of 6 columns and 8 rows under its heading row, on a
+/// slide of the long talk: written to the talk, read back, and the slide laid out again.
+#[test]
+#[ignore = "timing; run in release"]
+fn a_keystroke_in_a_table_cell_is_quick() {
+    let slide = SLIDES / 2;
+    let table = slides_format::new_table(6, 8).unwrap();
+    let source = long_talk().replacen(
+        &format!("A closing line with `code` in it.\n\n<Notes>\nWhat to say on slide {slide}."),
+        &format!("A closing line with `code` in it.\n\n{table}\n\n<Notes>\nWhat to say on slide {slide}."),
+        1,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("slides.md"), source).unwrap();
+    let mut doc = Document::open(dir.path(), Fonts::bundled_only()).unwrap();
+    doc.go_to(slide);
+    let flows = text_flows(doc.talk(), slide);
+    let cell = flows
+        .iter()
+        .position(|flow| matches!(flow.place, FlowPlace::Cell { row: 4, column: 3, .. }))
+        .expect("the slide has the table");
+    assert_eq!(flows.iter().filter(|flow| matches!(flow.place, FlowPlace::Cell { .. })).count(), 6 * 9);
+    assert!(doc.begin_text(slide, cell, Pos::default()));
+    doc.text_layout(slide);
+
+    let mut times = Vec::with_capacity(KEYSTROKES);
+    for key in 0..KEYSTROKES {
+        let letter = if key % 6 == 5 { " " } else { "a" };
+        let start = Instant::now();
+        doc.apply_text(|edit| edit.insert(letter)).unwrap();
+        let head = doc.text().unwrap().edit.selection.head;
+        let layout = doc.text_layout(slide);
+        assert!(layout.caret(cell, head).is_some());
+        times.push(start.elapsed());
+    }
+    let flows = text_flows(doc.talk(), slide);
+    let text: String = flows[cell].paras[0].spans.iter().map(|span| span.text.as_str()).collect();
+    let typed: String = (0..KEYSTROKES).map(|key| if key % 6 == 5 { ' ' } else { 'a' }).collect();
+    assert_eq!(text, typed.trim_end());
+    assert_eq!(doc.undo_label(), Some("Typing"));
+    assert_eq!(doc.table_at_caret().map(|(_, row, column)| (row, column)), Some((4, 3)));
+    report("keystroke typed in a table cell", times);
+}

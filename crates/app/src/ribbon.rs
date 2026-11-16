@@ -14,6 +14,7 @@ use gpui_kit::*;
 use crate::clipboard_tools::ClipboardTools;
 use crate::document::Document;
 use crate::icon_picker::IconPicker;
+use crate::table_tools::{self, TableGrid};
 use crate::text_tools::TextTools;
 use crate::workspace_view::{
     AddSlide, DeleteSlide, DuplicateSlide, KEY_CONTEXT, NewSlide, Present, Redo, Rehearse, Save,
@@ -127,6 +128,8 @@ pub struct Ribbon {
     text_tools: Entity<TextTools>,
     /// What the Insert tab's Icon tool opens.
     icon_picker: Entity<IconPicker>,
+    /// What the Insert tab's Table tool opens.
+    table_grid: Entity<TableGrid>,
     tab: RibbonTab,
     panels: Panels,
     /// How far the row of tools is scrolled.
@@ -135,6 +138,7 @@ pub struct Ribbon {
     more: (bool, bool),
     _document_changed: Option<Subscription>,
     _picker_changed: Subscription,
+    _grid_changed: Subscription,
 }
 
 impl Ribbon {
@@ -151,17 +155,21 @@ impl Ribbon {
             .map(|document| cx.observe(document, |_, _, cx| cx.notify()));
         // The picker opens and closes in the tab's drawing.
         let picker_changed = cx.observe(&icon_picker, |_, _, cx| cx.notify());
+        let table_grid = cx.new(|_| TableGrid::new());
+        let grid_changed = cx.observe(&table_grid, |_, _, cx| cx.notify());
         Ribbon {
             document,
             clipboard_tools,
             text_tools,
             icon_picker,
+            table_grid,
             tab: RibbonTab::default(),
             panels,
             scroll: ScrollHandle::new(),
             more: (false, false),
             _document_changed: document_changed,
             _picker_changed: picker_changed,
+            _grid_changed: grid_changed,
         }
     }
 
@@ -172,6 +180,11 @@ impl Ribbon {
     /// The picker the Insert tab's Icon tool opens.
     pub fn icon_picker(&self) -> &Entity<IconPicker> {
         &self.icon_picker
+    }
+
+    /// The grid of sizes the Insert tab's Table tool opens.
+    pub fn table_grid(&self) -> &Entity<TableGrid> {
+        &self.table_grid
     }
 
     pub fn tab(&self) -> RibbonTab {
@@ -221,6 +234,8 @@ impl Ribbon {
         let unsaved = document.is_some_and(Document::has_unsaved_changes);
         let undo = document.and_then(Document::undo_label);
         let redo = document.and_then(Document::redo_label);
+        // While the caret is in a cell, or a table is selected, its tools come last.
+        let table = document.and_then(Document::table_here);
         let new_slide = DropdownButton::new(NEW_SLIDE_LAYOUTS_ID)
             .button(
                 tool(NEW_SLIDE_ID, Icons::SquarePlus, "New slide")
@@ -312,6 +327,9 @@ impl Ribbon {
                 cx,
             ),
         ]
+        .into_iter()
+        .chain(table.map(|table| table_tools::ribbon_group(&table, cx)))
+        .collect()
     }
 
     fn slide_show(&self, cx: &App) -> Vec<AnyElement> {
@@ -495,12 +513,15 @@ impl Render for Ribbon {
         self.icon_picker.update(cx, |picker, _| picker.release(window));
         if self.tab != RibbonTab::Insert {
             self.icon_picker.update(cx, |picker, cx| picker.close(cx));
+            self.table_grid.update(cx, |grid, cx| grid.set_open(false, cx));
         }
         let groups = match self.tab {
             RibbonTab::Home => self.home(cx),
             RibbonTab::SlideShow => self.slide_show(cx),
             RibbonTab::View => self.view(cx),
-            RibbonTab::Insert => crate::insert_tools::insert_tab(self.document.is_some(), &self.icon_picker, cx),
+            RibbonTab::Insert => {
+                crate::insert_tools::insert_tab(self.document.is_some(), &self.icon_picker, &self.table_grid, cx)
+            }
             RibbonTab::Animate => Self::on_the_way(cx),
         };
         let mut tools = Vec::with_capacity(groups.len() * 2);

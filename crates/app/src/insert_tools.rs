@@ -1,6 +1,7 @@
-//! The Insert tab's tools: Picture, the Shapes list, Text box and Icon. What they put on the
-//! slide is [`crate::insert`]'s and [`crate::document::Document`]'s; the window does what they
-//! ask. Icon opens the [`IconPicker`], whose pick the window hears of.
+//! The Insert tab's tools: Picture, the Shapes list, Text box, Icon and Table. What they put on
+//! the slide is [`crate::insert`]'s and [`crate::document::Document`]'s; the window does what
+//! they ask. Icon opens the [`IconPicker`], whose pick the window hears of, and Table the
+//! [`TableGrid`], whose square clicked asks for a table that size.
 
 use gpui_kit::assets::IconName as Icons;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -11,6 +12,7 @@ use gpui_kit::*;
 
 use crate::icon_picker::IconPicker;
 use crate::ribbon::group;
+use crate::table_tools::TableGrid;
 
 pub const INSERT_PICTURE_ID: &str = "insert-picture";
 /// The Shapes button, which lists the shapes.
@@ -18,6 +20,8 @@ pub const INSERT_SHAPES_ID: &str = "insert-shapes";
 pub const INSERT_TEXT_BOX_ID: &str = "insert-text-box";
 /// The Icon tool, which opens the icon picker.
 pub const INSERT_ICON_ID: &str = "insert-icon";
+/// The Table tool, which opens the grid of table sizes.
+pub const INSERT_TABLE_ID: &str = "insert-table";
 
 actions!(insert_tools, [InsertPicture, InsertTextBox]);
 
@@ -46,8 +50,8 @@ pub fn shape_id(kind: &str) -> &'static str {
 }
 
 /// The Insert tab's groups, for a window with a talk if `has_talk`, whose Icon tool opens
-/// `icon_picker`.
-pub fn insert_tab(has_talk: bool, icon_picker: &Entity<IconPicker>, cx: &App) -> Vec<AnyElement> {
+/// `icon_picker` and whose Table tool opens `table_grid`.
+pub fn insert_tab(has_talk: bool, icon_picker: &Entity<IconPicker>, table_grid: &Entity<TableGrid>, cx: &App) -> Vec<AnyElement> {
     let shapes = Button::new(INSERT_SHAPES_ID)
         .ghost()
         .small()
@@ -87,7 +91,23 @@ pub fn insert_tab(has_talk: bool, icon_picker: &Entity<IconPicker>, cx: &App) ->
             cx,
         ),
         group("Icons", vec![icon_tool(has_talk, icon_picker, cx)], cx),
+        group("Tables", vec![table_tool(has_talk, table_grid, cx)], cx),
     ]
+}
+
+/// The Table tool, which opens `grid` under it.
+fn table_tool(has_talk: bool, grid: &Entity<TableGrid>, cx: &App) -> AnyElement {
+    let button = tool(INSERT_TABLE_ID, Icons::Table, "Table").tooltip("Put a table on the slide");
+    if !has_talk {
+        return button.disabled(true).into_any_element();
+    }
+    let (opened, shown) = (grid.clone(), grid.clone());
+    Popover::new("insert-table-grid")
+        .open(grid.read(cx).is_open())
+        .on_open_change(move |open, _, cx| opened.update(cx, |grid, cx| grid.set_open(*open, cx)))
+        .trigger(button)
+        .content(move |_, _, _| shown.clone())
+        .into_any_element()
 }
 
 /// The Icon tool, which opens `picker` under it.

@@ -153,6 +153,11 @@ impl FlowKey {
             _ => None,
         }
     }
+
+    /// Whether this is a cell of a table.
+    pub fn is_cell(&self) -> bool {
+        matches!(self, FlowKey::Cell { .. })
+    }
 }
 
 /// Where a step of the history was typed: the selection before it and after it, so that
@@ -164,6 +169,9 @@ pub struct TextMark {
     pub flow: FlowKey,
     pub before: Selection,
     pub after: Option<Selection>,
+    /// Where `after` is, if that's another flow than `flow`: a step that changed a table puts the
+    /// caret in another of its cells.
+    pub flow_after: Option<FlowKey>,
     /// The time of typing the step was made in, from a click on the text until it ended.
     pub(crate) session: u64,
 }
@@ -470,6 +478,16 @@ impl EditingText {
     pub fn is_title(&self) -> bool {
         self.flow.region() == Some("title")
     }
+
+    /// Whether this is a cell of a table, which holds one line of text.
+    pub fn is_cell(&self) -> bool {
+        self.flow.is_cell()
+    }
+}
+
+/// `text` as one line, for a cell of a table: each new line in it a space.
+pub fn one_line(text: &str) -> String {
+    text.replace("\r\n", " ").replace(['\n', '\r', '\u{2028}', '\u{2029}'], " ")
 }
 
 /// What an operation on the text did.

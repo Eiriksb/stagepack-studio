@@ -9,7 +9,7 @@ use typing::*;
 
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{Bounds, Modifiers, Pixels, Point, TestAppContext, px, size};
-use slides_engine::ElementBox;
+use slides_engine::{ElementBox, Hit};
 use slides_format::FlowPlace;
 use stagepack_studio::slide_editor::SELECTION_OUTLINE_ID;
 
@@ -45,6 +45,20 @@ fn thing(typing: &Typing, cx: &mut TestAppContext, start: &str) -> ElementBox {
 fn middle(typing: &Typing, cx: &TestAppContext, element: &ElementBox) -> Point<Pixels> {
     let rect = element.rect;
     typing.at(cx, rect.x + rect.w / 2., rect.y + rect.h / 2.)
+}
+
+/// A point on the line under the first cell of the table `table`, in the window, which a click
+/// on picks the table: the middle of the band a click there does, whatever the rounding.
+fn border(typing: &Typing, cx: &mut TestAppContext, table: &ElementBox) -> Point<Pixels> {
+    let layout = typing.layout(cx);
+    let rect = layout.cell_rect(&table.source, 0, 0).expect("the table's first cell");
+    let x = rect.x + rect.w / 2.;
+    let band: Vec<f32> = (0..120)
+        .map(|step| rect.y + rect.h - 6. + step as f32 * 0.1)
+        .filter(|&y| matches!(layout.hit(x, y), Some(Hit::Element(element)) if element.source == table.source))
+        .collect();
+    assert!(!band.is_empty(), "the line under the cell picks the table");
+    typing.at(cx, x, band[band.len() / 2])
 }
 
 fn selected(typing: &Typing, cx: &TestAppContext) -> Option<(usize, Range<usize>)> {
@@ -111,7 +125,8 @@ fn a_click_selects_and_escape_lets_go(cx: &mut TestAppContext) {
         ("<Box", "Text box selected"),
     ] {
         let element = thing(&typing, cx, start);
-        let at = middle(&typing, cx, &element);
+        // A click in a table's cell types in it: the table is picked by a line around its cells.
+        let at = if start.starts_with('|') { border(&typing, cx, &element) } else { middle(&typing, cx, &element) };
         typing.click(cx, at);
         assert_eq!(selected(&typing, cx), Some((THINGS, element.source.clone())), "{start}");
         assert_eq!(typing.status(cx).as_deref(), Some(said));

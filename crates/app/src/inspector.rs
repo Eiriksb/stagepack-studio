@@ -33,6 +33,7 @@ use crate::added_files::{FileKind, NotAdded};
 use crate::document::{Document, EditRefused, Selected};
 use crate::icon_picker::{IconPicked, IconPicker};
 use crate::selection;
+use crate::table_tools;
 use crate::text_tools::written_color;
 use crate::workspace_view::WorkspaceView;
 use fields::{Choice, Kind, Spec, Typed, file_name, number_typed, stepped, text_typed};
@@ -508,13 +509,17 @@ impl Inspector {
         .detach();
     }
 
-    /// What the panel shows for the thing selected on the slide shown, if one is: the form's
-    /// shape, the thing, and its tag, if it's one.
+    /// What the panel shows for the thing selected on the slide shown, if one is, or else the
+    /// table the caret is in a cell of: the form's shape, the thing, and its tag, if it's one.
     fn subject(&mut self, cx: &mut Context<Self>) -> Option<(Shape, Selected, Option<Tag>)> {
         let document = self.document.clone()?;
         let (selected, pick, block, heading) = {
             let document = document.read(cx);
-            let selected = document.selected().filter(|selected| selected.slide == document.current())?.clone();
+            let in_cell = || {
+                let here = document.table_here().filter(|here| here.caret)?;
+                Some(Selected { slide: here.slide, source: here.table })
+            };
+            let selected = document.selected().cloned().or_else(in_cell).filter(|selected| selected.slide == document.current())?;
             let talk = document.talk();
             let block = selection::block_at(&talk.slides.get(selected.slide)?.blocks, &selected.source)?.clone();
             let heading = selection::name_of(talk, selected.slide, &selected.source)?;
@@ -1014,6 +1019,12 @@ impl Render for Inspector {
         };
         let heading = SharedString::from(form.shape.heading.clone());
         let message = form.shape.message.clone().map(SharedString::from);
+        // A table's rows and columns, while it's selected or the caret is in one of its cells.
+        let table = self.document.as_ref().and_then(|document| {
+            let document = document.read(cx);
+            document.table_here().filter(|here| here.slide == document.current())
+        });
+        let table = table.map(|here| table_tools::inspector_group(&here, cx));
         let mut settings = Vec::new();
         let mut place = Vec::new();
         for (index, field) in form.fields.iter().enumerate() {
@@ -1042,6 +1053,7 @@ impl Render for Inspector {
                         .child(message),
                 )
             })
+            .children(table)
             .children(settings)
             .when(!place.is_empty(), |this| {
                 this.child(div().pt_2().text_xs().font_weight(FontWeight::SEMIBOLD).child("Place"))

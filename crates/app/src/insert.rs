@@ -23,6 +23,7 @@ pub const INSERT_PICTURE: &str = "Insert picture";
 pub const INSERT_SHAPE: &str = "Insert shape";
 pub const INSERT_TEXT_BOX: &str = "Insert text box";
 pub const INSERT_ICON: &str = "Insert icon";
+pub const INSERT_TABLE: &str = "Insert table";
 
 /// How big a new icon is, as its `size` is written: its width and its height.
 pub const ICON_SIZE: &str = "128";

@@ -40,6 +40,9 @@ use crate::save_flow::{CloseAnswer, Effect, SaveFlow, SaveOutcome};
 use crate::saving::{SaveError, SaveJob, SaveTarget, Saved};
 use crate::slide_canvas::{ScaleChanged, SlideCanvas};
 use crate::slide_editor::{self, EditorEvent, SlideEditor};
+use crate::table_tools::{
+    InsertTable, TableColumnLeft, TableColumnRight, TableDeleteColumn, TableDeleteRow, TableRowAbove, TableRowBelow,
+};
 use crate::text_tools::TextTools;
 use crate::slide_strip::{
     self, STRIP_CONTEXT, STRIP_MAX_WIDTH, STRIP_MIN_WIDTH, STRIP_WIDTH, SlideStrip,
@@ -340,6 +343,8 @@ pub struct WorkspaceView {
     _working_copies_changed: Subscription,
     _keep_failed: Subscription,
     _icon_picked: Subscription,
+    /// A size chosen from the Insert tab's grid of tables.
+    _table_picked: Subscription,
 }
 
 impl WorkspaceView {
@@ -446,6 +451,11 @@ impl WorkspaceView {
         let ribbon = cx.new(|cx| {
             Ribbon::new(document.clone(), clipboard_tools.clone(), text_tools, icon_picker, panels, cx)
         });
+        let table_grid = ribbon.read(cx).table_grid().clone();
+        let table_picked = cx.subscribe(&table_grid, |this, _, picked: &InsertTable, cx| {
+            let InsertTable { columns, rows } = *picked;
+            this.edit(|document| document.insert_table(columns, rows), cx);
+        });
         let slide_strip = cx.new(|cx| SlideStrip::new(document.clone(), cx));
         let notes_panel = cx.new(|cx| NotesPanel::new(document.clone(), window, cx));
         let workspace = cx.weak_entity();
@@ -540,6 +550,7 @@ impl WorkspaceView {
             _working_copies_changed: working_copies_changed,
             _keep_failed: keep_failed,
             _icon_picked: icon_picked,
+            _table_picked: table_picked,
         };
         view.always_build = view.is_always_built();
         view
@@ -1325,6 +1336,12 @@ impl Render for WorkspaceView {
                 this.insert_shape(action.kind, cx)
             }))
             .on_action(cx.listener(|this, _: &InsertTextBox, _, cx| this.insert_text_box(cx)))
+            .on_action(cx.listener(|this, _: &TableRowAbove, _, cx| this.edit(|document| document.add_row(false), cx)))
+            .on_action(cx.listener(|this, _: &TableRowBelow, _, cx| this.edit(|document| document.add_row(true), cx)))
+            .on_action(cx.listener(|this, _: &TableColumnLeft, _, cx| this.edit(|document| document.add_column(false), cx)))
+            .on_action(cx.listener(|this, _: &TableColumnRight, _, cx| this.edit(|document| document.add_column(true), cx)))
+            .on_action(cx.listener(|this, _: &TableDeleteRow, _, cx| this.edit(Document::remove_row, cx)))
+            .on_action(cx.listener(|this, _: &TableDeleteColumn, _, cx| this.edit(Document::remove_column, cx)))
             .on_action(cx.listener(|this, _: &Undo, _, cx| this.step_history(Document::undo, cx)))
             .on_action(cx.listener(|this, _: &Redo, _, cx| this.step_history(Document::redo, cx)))
             .on_action(cx.listener(|this, _: &OpenFolder, _, cx| this.ask_to_open(true, cx)))

@@ -17,15 +17,15 @@ use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use slides_engine::{Align, CaretRect, ElementBox, Hit, LineMove, Rect, SelectionRects, TextLayout};
-use slides_format::{Motion, Para, ParaKind, Pos, Selection, Span, StyleBit, TextEdit};
+use slides_format::{Block, FlowPlace, Motion, Para, ParaKind, Pos, Selection, Span, StyleBit, TextEdit, text_flows, uneditable_reason};
 
 use crate::clipboard::{self, TextPaste};
 use crate::clipboard_tools::write_clipboard;
-use crate::document::{Document, EditRefused};
+use crate::document::{Beside, CellMove, Document, EditRefused};
 use crate::selection::{self, Selected};
 use crate::slide_canvas::{SLIDE_WIDTH, SlideCanvas, letterbox};
 use crate::insert::TEXT_BOX_SIZE;
-use crate::text_editing::{Composing, EditingText, clean_typed, utf16_slice};
+use crate::text_editing::{Composing, EditingText, clean_typed, one_line, utf16_slice};
 use crate::text_tools::{
     SetTextSize, ToggleBold, ToggleBullets, ToggleItalic, ToggleNumbering, ToggleUnderline,
 };
@@ -459,10 +459,31 @@ impl SlideEditor {
 
     /// The thing a click on paragraph `para` of flow `flow` of slide `slide`, at `point`, would
     /// select before typing in it: the box the text is written in, if it's one.
+    /// A cell of a table is typed in at once.
     fn box_of_text(&self, slide: usize, flow: usize, para: usize, (x, y): (f32, f32), cx: &mut Context<Self>) -> Option<Range<usize>> {
         let element = self.layout(slide, cx)?.element_at(x, y)?;
         let talk = self.document.as_ref()?.read(cx).talk();
-        (element.holds_text && selection::holds_para(talk, slide, flow, para, &element.source)).then_some(element.source)
+        let in_cell = text_flows(talk, slide).get(flow).is_some_and(|flow| matches!(flow.place, FlowPlace::Cell { .. }));
+        (!in_cell && element.holds_text && selection::holds_para(talk, slide, flow, para, &element.source)).then_some(element.source)
+    }
+
+    /// Why the cell of the table `table` on slide `slide` that (`x`, `y`) is well inside can't be
+    /// typed in, if it's one that holds more than text.
+    fn cell_reason(&self, slide: usize, table: &Range<usize>, (x, y): (f32, f32), cx: &mut Context<Self>) -> Option<&'static str> {
+        let layout = self.layout(slide, cx)?;
+        let talk = self.document.as_ref()?.read(cx).talk();
+        let Some(Block::Table { cells, .. }) = selection::block_at(&talk.slides.get(slide)?.blocks, table) else {
+            return None;
+        };
+        // Away from its edges, which pick the table.
+        let inside = |rect: Rect| rect.x + EDGE < x && x < rect.x + rect.w - EDGE && rect.y + EDGE < y && y < rect.y + rect.h - EDGE;
+        let cell = cells.iter().enumerate().find_map(|(row, cells)| {
+            cells.iter().enumerate().find(|(column, _)| layout.cell_rect(table, row, *column).is_some_and(inside)).map(|(_, cell)| cell)
+        })?;
+        if cell.only_text {
+            return None;
+        }
+        uneditable_reason(talk, slide, cell.inline.start)
     }
 
     /// Whether the thing on slide `slide` at `source` is the one selected.
@@ -484,8 +505,12 @@ impl SlideEditor {
     ) -> Option<Vec<usize>> {
         let document = self.document.clone()?;
         let (made, message) = document.update(cx, |document, cx| {
+            let cell = |document: &Document| document.text().filter(|editing| editing.is_cell()).map(|editing| (editing.slide, editing.flow.clone()));
+            let was = cell(document);
             let made = work(document);
-            if made.as_ref().is_ok_and(|changed| !changed.is_empty()) {
+            // The table tools follow the caret from cell to cell, which changes nothing of the
+            // talk: they're told all the same.
+            if made.as_ref().is_ok_and(|changed| !changed.is_empty()) || cell(document) != was {
                 cx.notify();
             }
             (made, document.take_message())
@@ -523,7 +548,8 @@ impl SlideEditor {
     /// Aligns the text being typed: all of its region, or its box.
     /// Text that's all list items isn't aligned: lists stay at the left.
     pub fn align_text(&mut self, align: Align, cx: &mut Context<Self>) {
-        if self.editing(cx).is_some_and(|editing| only_lists(&editing.edit.paras)) {
+        // A cell is aligned with its column, which isn't changed from here.
+        if self.editing(cx).is_some_and(|editing| editing.is_cell() || only_lists(&editing.edit.paras)) {
             return;
         }
         self.run(|document| document.align_text(align), cx);
@@ -606,6 +632,7 @@ impl SlideEditor {
             return;
         };
         let title = editing.is_title();
+        let in_cell = editing.is_cell();
         let edit = &editing.edit;
         let kind = edit.paras.get(edit.selection.start().para).map(|para| para.kind);
         let paste = match clipboard::text_to_paste(plain, metadata) {
@@ -631,6 +658,8 @@ impl SlideEditor {
             TextPaste::Nothing => return,
             TextPaste::Styled(paras) => {
                 let paras = match kind {
+                    // A cell holds one line: its paragraphs go in one after another, a space apart.
+                    Some(kind) if in_cell => vec![one_line_para(paras, kind)],
                     Some(kind) if title => vec![one_paragraph(paras, kind)],
                     // Outside a title, a heading would be a second title, or a heading where
                     // there was none: it takes the kind of the paragraph it goes into.
@@ -645,8 +674,14 @@ impl SlideEditor {
                 self.run(|document| document.paste_text(|edit| edit.paste(&paras)), cx);
             }
             TextPaste::Plain(text) => {
-                // A line separator is a line break inside the paragraph.
-                let text = if title { text.replace(['\n', '\u{2029}'], "\u{2028}") } else { text };
+                // A line separator is a line break inside the paragraph; in a cell, a space.
+                let text = if in_cell {
+                    one_line(&text)
+                } else if title {
+                    text.replace(['\n', '\u{2029}'], "\u{2028}")
+                } else {
+                    text
+                };
                 self.run(|document| document.paste_text(|edit| edit.insert(&text)), cx);
             }
         }
@@ -692,6 +727,14 @@ impl SlideEditor {
     /// Puts `text` in place of what's from `over.0` to `over.1`, or the selection, as typed.
     fn type_over(&mut self, over: Option<(Pos, Pos)>, text: &str, cx: &mut Context<Self>) {
         self.wanted_x = None;
+        // A cell holds one line: a new line typed in one is a space.
+        let lined;
+        let text = if self.editing(cx).is_some_and(EditingText::is_cell) {
+            lined = one_line(text);
+            lined.as_str()
+        } else {
+            text
+        };
         self.apply(
             |edit| match over {
                 Some((from, to)) => edit.move_to(from, false).move_to(to, true).insert(text),
@@ -896,6 +939,10 @@ impl SlideEditor {
 
     fn enter(&mut self, cx: &mut Context<Self>) {
         self.wanted_x = None;
+        if self.in_cell(cx) {
+            self.move_in_table(CellMove::Below, cx);
+            return;
+        }
         // A title is one paragraph, so Enter in it goes on to a new line.
         let title = self.document.as_ref().is_some_and(|document| {
             document
@@ -913,7 +960,7 @@ impl SlideEditor {
     /// Makes the paragraphs a list, numbered with `numbered`, or not, as the Bullets and
     /// Numbering tools do. A title can't be a list.
     pub fn toggle_list(&mut self, numbered: bool, cx: &mut Context<Self>) {
-        if self.editing(cx).is_some_and(EditingText::is_title) {
+        if self.editing(cx).is_some_and(|editing| editing.is_title() || editing.is_cell()) {
             return;
         }
         self.format(|edit| edit.toggle_list(numbered), cx);
@@ -922,6 +969,115 @@ impl SlideEditor {
     fn edit_with(&mut self, op: fn(&TextEdit) -> TextEdit, cx: &mut Context<Self>) {
         self.wanted_x = None;
         self.apply(op, cx);
+    }
+
+    /// Whether the text being typed is a cell of a table.
+    fn in_cell(&self, cx: &App) -> bool {
+        self.editing(cx).is_some_and(EditingText::is_cell)
+    }
+
+    /// Takes the caret from the cell it's in to another, as Tab, Shift+Tab and Enter do.
+    fn move_in_table(&mut self, step: CellMove, cx: &mut Context<Self>) {
+        self.wanted_x = None;
+        self.run(|document| document.move_in_table(step), cx);
+        self.typed(cx);
+    }
+
+    /// Tab and Shift+Tab: in a cell, on to the next one or back; elsewhere, a list item in or out.
+    fn tab(&mut self, back: bool, cx: &mut Context<Self>) {
+        if self.in_cell(cx) {
+            self.move_in_table(if back { CellMove::Previous } else { CellMove::Next }, cx);
+        } else {
+            self.edit_with(if back { TextEdit::outdent } else { TextEdit::indent }, cx);
+        }
+    }
+
+    /// Shift+Enter: a line break, which a cell, one line, has no place for.
+    fn line_break(&mut self, cx: &mut Context<Self>) {
+        if !self.in_cell(cx) {
+            self.edit_with(TextEdit::soft_break, cx);
+        }
+    }
+
+    /// Escape: typing ends. In a cell, its table is selected then, as a box typed in stays
+    /// selected.
+    fn stop_editing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let table = self.document.as_ref().and_then(|document| {
+            let document = document.read(cx);
+            Some((document.text()?.slide, document.table_at_caret()?.0))
+        });
+        match table {
+            Some((slide, table)) => self.select_thing(slide, table, window, cx),
+            None => self.end_editing(true, window, cx),
+        }
+    }
+
+    /// An arrow key, which moves the caret `go`, but at a cell's edge that way goes on into the
+    /// cell `beside` it: Left at its start, Right at its end, Up on its first line and Down on its
+    /// last.
+    fn arrow(&mut self, go: Go, beside: Beside, cx: &mut Context<Self>) {
+        if !self.across_cells(beside, cx) {
+            self.go(go, false, cx);
+        }
+    }
+
+    /// Moves the caret into the cell `beside` the one it's in, if it's at the edge of that one that
+    /// way and there's a cell there to type in. Says whether it did.
+    fn across_cells(&mut self, beside: Beside, cx: &mut Context<Self>) -> bool {
+        let Some(editing) = self.editing(cx).filter(|editing| editing.is_cell() && editing.edit.selection.is_caret()) else {
+            return false;
+        };
+        let (slide, head) = (editing.slide, editing.edit.selection.head);
+        let end = TextEdit::new(editing.edit.paras.clone()).select_all().selection.end();
+        let Some((_, Some(flow), layout)) = self.editing_place(cx) else {
+            return false;
+        };
+        let top = |pos: Pos| layout.caret(flow, pos).map(|caret| caret.top);
+        let at_edge = match beside {
+            Beside::Before => head == Pos::default(),
+            Beside::After => head == end,
+            // On the first line, or the last: where the caret's top is that of the start, or the end.
+            Beside::Above => top(head).zip(top(Pos::default())).is_some_and(|(a, b)| (a - b).abs() < 0.5),
+            Beside::Below => top(head).zip(top(end)).is_some_and(|(a, b)| (a - b).abs() < 0.5),
+        };
+        let Some(document) = self.document.clone() else {
+            return false;
+        };
+        let Some(target) = at_edge.then(|| document.read(cx).cell_beside(beside)).flatten() else {
+            return false;
+        };
+        let paras = text_flows(document.read(cx).talk(), slide).get(target).map(|flow| flow.paras.clone()).unwrap_or_default();
+        let target_end = TextEdit::new(paras).select_all().selection.end();
+        let x = self.wanted_x.or_else(|| layout.caret(flow, head).map(|caret| caret.x));
+        let pos = match beside {
+            Beside::Before => target_end,
+            Beside::After => Pos::default(),
+            // As near as can be across from where the caret was, on the line next to it.
+            Beside::Above | Beside::Below => {
+                let line = if beside == Beside::Above { target_end } else { Pos::default() };
+                layout
+                    .caret(target, line)
+                    .zip(x)
+                    .and_then(|(caret, x)| {
+                        let (px, py) = caret.on_slide(x, caret.top + caret.height / 2.);
+                        match layout.hit(px, py) {
+                            Some(Hit::Text { flow, pos }) if flow == target => Some(pos),
+                            _ => None,
+                        }
+                    })
+                    .unwrap_or(line)
+            }
+        };
+        self.run(
+            |document| {
+                document.begin_text(slide, target, pos);
+                Ok(Vec::new())
+            },
+            cx,
+        );
+        self.wanted_x = if matches!(beside, Beside::Above | Beside::Below) { x } else { None };
+        self.typed(cx);
+        true
     }
 
     /// Where `position`, in the window, is on the slide, in slide units, if it's on it.
@@ -1052,7 +1208,11 @@ impl SlideEditor {
             }
             Hit::Element(element) => {
                 cx.stop_propagation();
+                let reason = self.cell_reason(slide, &element.source, point, cx);
                 self.select_thing(slide, element.source, window, cx);
+                if let Some(reason) = reason {
+                    cx.emit(EditorEvent::Said(reason.into()));
+                }
             }
             Hit::Placeholder(region) => {
                 cx.stop_propagation();
@@ -1272,6 +1432,24 @@ fn one_paragraph(paras: Vec<Para>, kind: slides_format::ParaKind) -> Para {
     }
     Para { kind, spans }
 }
+
+/// `paras` as one paragraph of `kind`, each joined to the next by a space of no style of its
+/// own, and each new line in them a space too: what goes in a cell of a table, which holds one
+/// line.
+fn one_line_para(paras: Vec<Para>, kind: slides_format::ParaKind) -> Para {
+    let mut spans: Vec<Span> = Vec::new();
+    for (index, para) in paras.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span { text: " ".to_string(), style: Default::default() });
+        }
+        spans.extend(para.spans.into_iter().map(|span| Span { text: one_line(&span.text), ..span }));
+    }
+    Para { kind, spans }
+}
+
+/// How far inside a cell of a table, in slide units, a click is on the cell rather than on the
+/// lines around it, which pick the table.
+const EDGE: f32 = 4.5;
 
 /// `range` from its lower end to its higher, as the system may give it either way round.
 fn ordered(range: Range<usize>) -> Range<usize> {
@@ -1527,20 +1705,18 @@ impl Render for SlideEditor {
             .absolute()
             .size_full()
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
-            .on_action(
-                cx.listener(|this, _: &MoveLeft, _, cx| this.go(Go::By(Motion::Left), false, cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &MoveRight, _, cx| this.go(Go::By(Motion::Right), false, cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &MoveUp, _, cx| this.go(Go::Line(LineMove::Up), false, cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &MoveDown, _, cx| {
-                    this.go(Go::Line(LineMove::Down), false, cx)
-                }),
-            )
+            .on_action(cx.listener(|this, _: &MoveLeft, _, cx| {
+                this.arrow(Go::By(Motion::Left), Beside::Before, cx)
+            }))
+            .on_action(cx.listener(|this, _: &MoveRight, _, cx| {
+                this.arrow(Go::By(Motion::Right), Beside::After, cx)
+            }))
+            .on_action(cx.listener(|this, _: &MoveUp, _, cx| {
+                this.arrow(Go::Line(LineMove::Up), Beside::Above, cx)
+            }))
+            .on_action(cx.listener(|this, _: &MoveDown, _, cx| {
+                this.arrow(Go::Line(LineMove::Down), Beside::Below, cx)
+            }))
             .on_action(cx.listener(|this, _: &MoveWordLeft, _, cx| {
                 this.go(Go::By(Motion::WordLeft), false, cx)
             }))
@@ -1599,16 +1775,10 @@ impl Render for SlideEditor {
             )
             .on_action(cx.listener(|this, _: &Delete, _, cx| this.edit_with(TextEdit::delete, cx)))
             .on_action(cx.listener(|this, _: &Enter, _, cx| this.enter(cx)))
-            .on_action(
-                cx.listener(|this, _: &LineBreak, _, cx| this.edit_with(TextEdit::soft_break, cx)),
-            )
-            .on_action(cx.listener(|this, _: &Indent, _, cx| this.edit_with(TextEdit::indent, cx)))
-            .on_action(
-                cx.listener(|this, _: &Outdent, _, cx| this.edit_with(TextEdit::outdent, cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &StopEditing, window, cx| this.end_editing(true, window, cx)),
-            )
+            .on_action(cx.listener(|this, _: &LineBreak, _, cx| this.line_break(cx)))
+            .on_action(cx.listener(|this, _: &Indent, _, cx| this.tab(false, cx)))
+            .on_action(cx.listener(|this, _: &Outdent, _, cx| this.tab(true, cx)))
+            .on_action(cx.listener(|this, _: &StopEditing, window, cx| this.stop_editing(window, cx)))
             .on_action(cx.listener(|this, _: &TakeAwaySelected, _, cx| this.take_away(cx)))
             .on_action(cx.listener(|this, _: &SelectNextThing, window, cx| {
                 this.select_along(false, window, cx)

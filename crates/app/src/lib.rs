@@ -26,6 +26,7 @@ pub mod selection;
 pub mod slide_canvas;
 pub mod slide_editor;
 pub mod slide_strip;
+pub mod table_tools;
 pub mod text_editing;
 pub mod text_tools;
 pub mod watcher;
