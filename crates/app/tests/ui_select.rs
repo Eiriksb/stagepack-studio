@@ -1,5 +1,6 @@
 //! Picking a thing on the slide with a click, the outline that shows it, and taking it away.
 
+use std::collections::BTreeSet;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1107,4 +1108,178 @@ fn a_reference_that_was_not_pasted_never_comes_to_name_a_pasted_file() {
     into.paste_element(markdown, files).unwrap();
     assert!(into.source().contains("src=\"assets/photo-2.png\" data=\"assets/photo.png\""), "{}", into.source());
     assert!(!into.has_file("assets/photo.png"));
+}
+
+// Fix round 2: a save adds to the index it finds, and never takes from it.
+
+/// Score's source and build as another component, `name`, whose file is `name` in lower case.
+fn component_named(name: &str) -> (String, PastedFiles) {
+    let source = SCORE_SOURCE.replace("fn Score(", &format!("fn {name}("));
+    let markdown = format!("<{name} team=\"A\" points=\"1\" x=\"10\" y=\"10\" w=\"100\" h=\"100\" />");
+    let stem = name.to_lowercase();
+    let hash = Some(slides_components::source_hash(source.as_bytes()));
+    let files = element_with(
+        &markdown,
+        &[(&format!("components/{stem}.rs"), source.as_bytes(), None), (&format!("build/{stem}.wasm"), SCORE_BUILD, hash)],
+    );
+    (markdown, files)
+}
+
+fn state_in(document: &Document, tag: &str) -> Option<ComponentState> {
+    document.components().iter().find(|info| info.tag == tag).map(|info| info.state)
+}
+
+/// Takes the thing whose text starts with `start` off the first slide.
+fn delete_thing(document: &mut Document, start: &str) {
+    let at = document.source().find(start).unwrap();
+    let end = at + document.source()[at..].find("/>").unwrap() + 2;
+    assert!(document.select(0, at..end));
+    document.delete_selected().unwrap();
+}
+
+#[test]
+fn a_pack_saved_in_place_keeps_an_entry_once_its_component_is_taken_off() {
+    let (_dir, at, mut into) = into_talk(true);
+    let (score, files) = component_named("Score");
+    into.paste_element(&score, files).unwrap();
+    save_document(&mut into, None);
+    delete_thing(&mut into, "<Score");
+    let (gauge, files) = component_named("Gauge");
+    into.paste_element(&gauge, files).unwrap();
+    save_document(&mut into, None);
+    let reopened = reopen(&at);
+    assert!(reopened.has_file("components/score.rs") && reopened.has_file("build/score.wasm"));
+    assert_eq!(state_in(&reopened, "Score"), Some(ComponentState::UpToDate), "its entry is kept");
+    assert_eq!(state_in(&reopened, "Gauge"), Some(ComponentState::UpToDate));
+}
+
+#[test]
+fn a_folder_save_never_replaces_an_entry_that_came_after_the_paste() {
+    let (_dir, folder, mut into) = into_talk(false);
+    let (score, files) = component_named("Score");
+    into.paste_element(&score, files).unwrap();
+    // A build, or another copy of the app, enters Score meanwhile.
+    std::fs::create_dir(folder.join("build")).unwrap();
+    let theirs = format!(r#"{{"format":1,"components":[{{"tag":"Score","file":"score","source_hash":"{}"}}]}}"#, "c".repeat(64));
+    std::fs::write(folder.join("build/index.json"), &theirs).unwrap();
+    let notices = save_document(&mut into, None);
+    assert!(notices.is_empty(), "{notices:?}");
+    assert_eq!(std::fs::read_to_string(folder.join("build/index.json")).unwrap(), theirs);
+}
+
+#[test]
+fn what_the_pasted_thing_does_not_use_says_nothing() {
+    let shape = "<Shape kind=\"rect\" x=\"10\" y=\"10\" w=\"100\" h=\"100\" />";
+    for (what, files) in [
+        ("a build alone", element_with(shape, &[("build/gauge.wasm", SCORE_BUILD, Some("a".repeat(64)))])),
+        ("a picture that isn't one", element_with(shape, &[("assets/x.png", b"not a picture", None)])),
+    ] {
+        let (_dir, _folder, mut into) = into_talk(false);
+        let (_, brought) = into.paste_element(shape, files).unwrap();
+        assert_eq!(brought.said(), None, "{what}");
+        assert!(into.notices().is_empty(), "{what}");
+    }
+}
+
+/// What can be done to a talk, for the property below.
+#[derive(Clone, Copy, Debug)]
+enum Step {
+    Paste(usize),
+    Delete(usize),
+    Undo,
+    Redo,
+    Save,
+}
+
+const NAMES: [&str; 3] = ["Alpha", "Beta", "Gamma"];
+
+fn step() -> impl proptest::strategy::Strategy<Value = Step> {
+    use proptest::prelude::*;
+    prop_oneof![
+        (0..3usize).prop_map(Step::Paste),
+        (0..3usize).prop_map(Step::Delete),
+        Just(Step::Undo),
+        Just(Step::Redo),
+        Just(Step::Save),
+        Just(Step::Save),
+    ]
+}
+
+/// The files of the talk saved at `at`, read fresh from where it's kept.
+fn files_at(at: &std::path::Path) -> std::rc::Rc<dyn slides_engine::TalkFiles> {
+    if at.extension().is_some_and(|ext| ext == "sptx") {
+        std::rc::Rc::new(slides_engine::open_packed(at).unwrap())
+    } else {
+        std::rc::Rc::new(slides_engine::FolderFiles::new(at.to_path_buf()))
+    }
+}
+
+/// Runs `steps` on a talk, packed if `packed`, and after each save reads it fresh from where it's
+/// kept, pairing its builds as the engine does when it's opened: a component whose files are in
+/// it and that was once saved with an entry still has one, and no entry is for files it hasn't
+/// got.
+fn saves_only_add_entries(packed: bool, steps: &[Step]) -> Result<(), proptest::test_runner::TestCaseError> {
+    let pasted: Vec<(String, PastedFiles)> = NAMES.iter().map(|name| component_named(name)).collect();
+    let (_dir, at, mut talk) = into_talk(packed);
+    let mut entered: BTreeSet<&str> = BTreeSet::new();
+    for step in steps {
+        match *step {
+            Step::Paste(which) => {
+                talk.paste_element(&pasted[which].0, pasted[which].1.clone()).ok();
+            }
+            Step::Delete(which) => {
+                let start = format!("<{}", NAMES[which]);
+                if let Some(at) = talk.source().find(&start) {
+                    let end = at + talk.source()[at..].find("/>").unwrap() + 2;
+                    if talk.select(0, at..end) {
+                        talk.delete_selected().ok();
+                    }
+                }
+            }
+            Step::Undo => {
+                talk.undo().ok();
+            }
+            Step::Redo => {
+                talk.redo().ok();
+            }
+            Step::Save => {
+                save_document(&mut talk, None);
+                let files = files_at(&at);
+                let scanned = slides_engine::TalkComponents::scan(files.clone());
+                for name in NAMES {
+                    let stem = name.to_lowercase();
+                    let has_files = files.len(&format!("components/{stem}.rs")).is_some() && files.len(&format!("build/{stem}.wasm")).is_some();
+                    let state = scanned.infos().iter().find(|info| info.tag == name).map(|info| info.state);
+                    if state == Some(ComponentState::UpToDate) {
+                        entered.insert(name);
+                    }
+                    if has_files && entered.contains(name) {
+                        proptest::prop_assert_eq!(state, Some(ComponentState::UpToDate), "{} after {:?}", name, steps);
+                    }
+                }
+                let index: Option<serde_json::Value> = files.read("build/index.json").map(|bytes| serde_json::from_slice(&bytes).unwrap());
+                for entry in index.iter().flat_map(|index| index["components"].as_array().cloned().unwrap_or_default()) {
+                    let file = entry["file"].as_str().unwrap();
+                    proptest::prop_assert!(files.len(&format!("build/{file}.wasm")).is_some(), "{} without its build after {:?}", file, steps);
+                    proptest::prop_assert!(files.len(&format!("components/{file}.rs")).is_some(), "{} without its source after {:?}", file, steps);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn any_run_of_pastes_deletes_undos_and_saves_only_ever_adds_index_entries() {
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config, TestRunner};
+    // The run that once lost an entry, then others.
+    let known = [Step::Paste(0), Step::Save, Step::Delete(0), Step::Paste(1), Step::Save];
+    for packed in [false, true] {
+        saves_only_add_entries(packed, &known).unwrap_or_else(|failure| panic!("packed {packed}: {failure}"));
+        let mut runner = TestRunner::new(Config { cases: 4, ..Config::default() });
+        runner
+            .run(&prop::collection::vec(step(), 1..8), |steps| saves_only_add_entries(packed, &steps))
+            .unwrap_or_else(|failure| panic!("packed {packed}: {failure}"));
+    }
 }

@@ -1069,15 +1069,17 @@ fn a_build_entered_with_the_added_files_pairs_as_the_index_would() {
 }
 
 #[test]
-fn a_build_entered_keeps_the_talks_own_index_and_an_unreadable_one_is_left_as_it_is() {
+fn a_build_entered_never_replaces_the_talks_own_entries_and_an_unreadable_index_is_left_as_it_is() {
     let (_dir, added, mut deck) = hello_with_added(Some(index(&[("Other", "other", "x"), ("Hello", "hello", "older")])));
     assert_eq!(info(&deck, "Hello").state, ComponentState::OutOfDate);
+    // The talk's own entry for Hello is never replaced; one for a new component is added.
     added.enter_build(entry("Hello", "hello", &source("Hello")));
+    added.enter_build(entry("Hi", "hi", "y"));
     deck.files_added();
-    assert_eq!(info(&deck, "Hello").state, ComponentState::UpToDate);
+    assert_eq!(info(&deck, "Hello").state, ComponentState::OutOfDate);
     let files = WithAdded::new(std::sync::Arc::new(FolderFiles::new(_dir.path().to_path_buf())), added.clone());
     let read: BuildIndex = serde_json::from_slice(&files.read(INDEX_FILE).unwrap()).unwrap();
-    assert_eq!(read.components, [entry("Other", "other", "x"), entry("Hello", "hello", &source("Hello"))]);
+    assert_eq!(read.components, [entry("Other", "other", "x"), entry("Hello", "hello", "older"), entry("Hi", "hi", "y")]);
     assert_eq!(files.len(INDEX_FILE), Some(files.read(INDEX_FILE).unwrap().len() as u64));
 
     let (_dir, added, mut deck) = hello_with_added(Some(b"this isn't JSON".to_vec()));

@@ -171,7 +171,8 @@ impl TalkFiles for std::sync::Arc<dyn TalkFiles + Send + Sync> {
 ///
 /// It also holds builds entered in the talk's build index that no save has written yet, as
 /// for a component pasted with its build: the index the talk's files give is the talk's own
-/// with these entered in it, each in place of any entry for the same component or file.
+/// with these added to it, each but one for a component or file the talk's own has an entry
+/// for, which is never replaced.
 #[derive(Default)]
 pub struct AddedSet {
     files: Mutex<BTreeMap<String, Arc<[u8]>>>,
@@ -277,8 +278,11 @@ impl AddedSet {
                 Some(bytes) => serde_json::from_slice::<BuildIndex>(&bytes).ok()?,
             },
         };
+        // Added beside the talk's own, never in place of one of them.
         for entry in builds {
-            index.enter(entry);
+            if !index.components.iter().any(|kept| kept.tag == entry.tag || kept.file == entry.file) {
+                index.components.push(entry);
+            }
         }
         index.format = index.format.max(1);
         serde_json::to_vec_pretty(&index).ok()

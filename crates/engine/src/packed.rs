@@ -191,6 +191,10 @@ fn new_files<'a>(
         if indexes.next().is_some() || !readable {
             return Err(PackError::UnsafeName(name.clone()));
         }
+        // Only the index itself: a file whose name differs from it but for case is another.
+        if names.iter().any(|other| other != INDEX_FILE && other.eq_ignore_ascii_case(INDEX_FILE)) {
+            return Err(PackError::NameTaken(name.clone()));
+        }
         new.push(index);
     }
     for file in extra.iter().filter(|(name, _)| name != INDEX_FILE) {
@@ -583,6 +587,11 @@ fn replaces_index(extra: &[&NewFile]) -> bool {
     extra.iter().any(|(name, _)| name == INDEX_FILE)
 }
 
+/// `files`, without the talk's own build index if `extra` replaces it.
+fn without_replaced_index(files: &[(String, std::path::PathBuf)], extra: &[&NewFile]) -> Vec<(String, std::path::PathBuf)> {
+    files.iter().filter(|(name, _)| !replaces_index(extra) || name != INDEX_FILE).cloned().collect()
+}
+
 /// The files of `extra` that the talk whose files are `files` doesn't have yet, as [`new_files`]
 /// finds them.
 fn new_folder_files<'a>(
@@ -634,7 +643,7 @@ fn pack(
     let files = collect(folder, &mut skipped)?;
     let limits = PackLimits::default();
     let extra = new_folder_files(&files, extra, limits)?;
-    check_sizes(&files, slides, &extra, limits)?;
+    check_sizes(&without_replaced_index(&files, &extra), slides, &extra, limits)?;
     let manifest = manifest_for(app_version);
     // Read once, so that what's packed and what's reported come from the same text.
     let source = match slides {
@@ -845,6 +854,8 @@ pub fn repack_with_slides(
     let extra = new_files(&names, read, extra, files.entry_bytes)?;
     if !extra.is_empty() {
         let limits = PackLimits::default();
+        // The index that's replaced isn't kept, so it isn't counted.
+        let names: Vec<String> = names.iter().filter(|name| !replaces_index(&extra) || *name != INDEX_FILE).cloned().collect();
         if names.len() + files.directories.len() + extra.len() > limits.entries {
             return Err(PackError::TooLarge(format!("it would hold more than {} files", limits.entries)));
         }
@@ -910,7 +921,7 @@ pub fn copy_talk_folder(from: &Path, to: &Path, slides: &str, extra: &[NewFile])
     let files = collect(from, &mut skipped)?;
     let limits = PackLimits::default();
     let extra = new_folder_files(&files, extra, limits)?;
-    check_sizes(&files, Some(slides), &extra, limits)?;
+    check_sizes(&without_replaced_index(&files, &extra), Some(slides), &extra, limits)?;
     let existed = missing_or_empty(to)?;
     let result = copy_into(&files, to, slides, &extra, limits);
     if result.is_err() {

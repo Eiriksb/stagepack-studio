@@ -1112,3 +1112,46 @@ fn only_the_build_index_is_taken_in_place_and_only_as_an_index() {
     assert!(matches!(pack_folder_with_slides(dir.path(), &out, "# C\n", "0.1.0", &other), Err(PackError::NameTaken(_))));
     assert!(!out.exists());
 }
+
+#[test]
+fn a_file_named_as_the_index_but_for_case_is_another_and_never_gets_a_second_beside_it() {
+    let dir = talk_folder();
+    std::fs::write(dir.path().join("build/Index.json"), an_index("Theirs")).unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let extra = [new_file("build/index.json", &an_index("Merged"))];
+    let out = work.path().join("out.sptx");
+    assert!(matches!(pack_folder_with_slides(dir.path(), &out, "# C\n", "0.1.0", &extra), Err(PackError::NameTaken(_))));
+    assert!(!out.exists(), "nothing is written");
+    let copy = work.path().join("copy");
+    assert!(matches!(copy_talk_folder(dir.path(), &copy, "# C\n", &extra), Err(PackError::NameTaken(_))));
+    assert!(!copy.exists());
+    let packed = work.path().join("talk.sptx");
+    pack_folder(dir.path(), &packed, "0.1.0").unwrap();
+    let before = entries_of(&packed);
+    assert!(matches!(repack_with_slides(&packed, &packed, "# C\n", "0.1.0", &extra), Err(PackError::NameTaken(_))));
+    assert_eq!(entries_of(&packed), before);
+    let unpacked = work.path().join("unpacked");
+    assert!(matches!(unpack_with_slides(&packed, &unpacked, "# C\n", &extra), Err(PackError::NameTaken(_))));
+    assert!(!unpacked.exists());
+}
+
+#[test]
+fn the_index_replaced_is_not_counted_against_a_packs_limits() {
+    // As many files as a pack can hold, counting the talk's index and its manifest.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("slides.md"), "# A\n").unwrap();
+    std::fs::create_dir(dir.path().join("assets")).unwrap();
+    std::fs::create_dir(dir.path().join("build")).unwrap();
+    std::fs::write(dir.path().join("build/index.json"), an_index("Old")).unwrap();
+    let limit = PackLimits::default().entries;
+    for at in 0..limit - 3 {
+        std::fs::write(dir.path().join(format!("assets/f{at}.csv")), "a").unwrap();
+    }
+    let work = tempfile::tempdir().unwrap();
+    let out = work.path().join("full.sptx");
+    let extra = [new_file("build/index.json", &an_index("Merged"))];
+    pack_folder_with_slides(dir.path(), &out, "# A\n", "0.1.0", &extra).unwrap();
+    assert_eq!(open_packed(&out).unwrap().read("build/index.json").unwrap(), an_index("Merged"));
+    repack_with_slides(&out, &out, "# B\n", "0.1.0", &[new_file("build/index.json", &an_index("Again"))]).unwrap();
+    assert_eq!(open_packed(&out).unwrap().read("build/index.json").unwrap(), an_index("Again"));
+}

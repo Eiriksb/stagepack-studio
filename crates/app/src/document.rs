@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use slides_components::{BuildEntry, Diagnostic, source_hash};
+use slides_components::{BuildEntry, BuildIndex, Diagnostic, INDEX_FILE, source_hash};
 use slides_engine::{
     AddedSet, Align, ComponentInfo, ComponentState, Deck, SchemaLoad, ElementBox, FolderFiles, Fonts, Layer, LayerTiming, Moment, PackError, Pixmap,
     SlideTimeline, TalkFiles, TextLayout, Transition, WithAdded, layout_by_name, open_packed, text_align,
@@ -170,11 +170,24 @@ pub struct Brought {
     pub different: Option<String>,
     /// A pasted component had the name of one every talk has.
     pub built_in: bool,
-    /// A component's build came without its source, so it couldn't be brought.
+    /// A component the slide shows came as a build without its source, so it couldn't be brought.
     pub component_left_out: bool,
+    /// The stems of the builds that came without their sources.
+    builds_alone: Vec<String>,
 }
 
 impl Brought {
+    /// Marks a component left out if the current slide of `document`, as pasted, shows one missing
+    /// that came only as a build.
+    fn look_for_lone_builds(&mut self, document: &mut Document) {
+        if self.builds_alone.is_empty() {
+            return;
+        }
+        let notices = document.notices();
+        let missing = clipboard::missing_components(&notices);
+        self.component_left_out = missing.iter().any(|name| self.builds_alone.iter().any(|stem| stem.eq_ignore_ascii_case(name)));
+    }
+
     /// The one thing to say of it, if any: a different component first, then one with a
     /// built-in's name, then files too big, then pictures left out, then a component left out.
     pub fn said(&self) -> Option<String> {
@@ -385,6 +398,8 @@ pub struct Document {
     files: Arc<dyn TalkFiles + Send + Sync>,
     /// The files added to the talk while it's open, which [`Self::files`] reads first.
     added: Arc<AddedSet>,
+    /// The talk's files where it's kept, without those added: what a save writes over.
+    own_files: Arc<dyn TalkFiles + Send + Sync>,
     /// The files added that no save has written yet.
     pending: BTreeSet<String>,
     /// The talk's own fonts, for exports to load into decks of their own.
@@ -498,8 +513,10 @@ impl Document {
             fonts.load_talk_font(font.clone());
         }
         let added = Arc::new(AddedSet::new());
+        let own_files = files.clone();
         let files: Arc<dyn TalkFiles + Send + Sync> = Arc::new(WithAdded::new(files, added.clone()));
         let mut document = Document {
+            own_files,
             on_disk: source,
             outside: None,
             deck: Deck::open_parsed(Box::new(files.clone()), fonts, talk),
@@ -1327,8 +1344,10 @@ impl Document {
         if guarded(|| crate::clipboard::one_slide(text))?.is_none() {
             return Err(EditRefused::WouldChangeTheSlides);
         }
-        let (text, brought) = self.bring_files_for(text, files);
-        self.paste_slide(&text).map(|changed| (changed, brought))
+        let (text, mut brought) = self.bring_files_for(text, files);
+        let changed = self.paste_slide(&text)?;
+        brought.look_for_lone_builds(self);
+        Ok((changed, brought))
     }
 
     /// Adds those of `files` that `text` uses, as [`Self::bring_files`] says, and gives `text`
@@ -1374,15 +1393,21 @@ impl Document {
     /// source, exactly as a talk's own index does when the talk is opened. The module runs
     /// sandboxed, as any component does, and is used only if it says it is that component.
     fn bring_files(&mut self, text: &str, files: PastedFiles) -> (Vec<(String, String)>, Brought) {
-        let mut brought = Brought { left_out: files.left_out, too_large: files.too_large, ..Brought::default() };
+        // Only what's used is spoken of: a file that came and failed its checks is missing from the
+        // slide, if the slide uses it, which is said once it's pasted.
+        let mut brought = Brought { too_large: files.too_large, ..Brought::default() };
         let stem_of = |path: &str| path.split_once('/').and_then(|(_, name)| name.rsplit_once('.')).map(|(stem, _)| stem.to_string());
-        // A build carried without its source was the copied talk's, but can't be paired here.
+        // A build carried without its source was the copied talk's, but can't be paired here:
+        // said once pasted, if the slide shows that component missing.
         let sources: BTreeSet<String> =
             files.files.iter().filter(|file| file.kind == FileKind::ComponentSource).filter_map(|file| stem_of(&file.path)).collect();
-        brought.component_left_out = files
+        brought.builds_alone = files
             .files
             .iter()
-            .any(|file| file.kind == FileKind::ComponentBuild && stem_of(&file.path).is_none_or(|stem| !sources.contains(&stem)));
+            .filter(|file| file.kind == FileKind::ComponentBuild)
+            .filter_map(|file| stem_of(&file.path))
+            .filter(|stem| !sources.contains(stem))
+            .collect();
         let Ok(pasted) = guarded(|| parse_talk(text)) else {
             brought.left_out = true;
             return (Vec::new(), brought);
@@ -1541,6 +1566,8 @@ impl Document {
         let (text, brought) = self.bring_files_for(&text, files);
         let text = self.stepped_aside(&text);
         let changed = self.insert_text(label, &text, tidied)?;
+        let mut brought = brought;
+        brought.look_for_lone_builds(self);
         Ok((changed, brought))
     }
 
@@ -3129,20 +3156,33 @@ impl Document {
             .collect()
     }
 
-    /// The builds a save enters in the talk's index, as [`Self::builds_to_enter`] gives them,
-    /// and the index with them entered in it, as a save anywhere but the talk's own folder
-    /// writes it: the talk's own, with none of the entries of builds the text no longer uses.
-    /// `None` for the index if the talk's own can't be read, which a save leaves as it is.
+    /// The builds a save enters in the talk's index, and the index with them entered in it, as a
+    /// save anywhere but the talk's own folder writes it. It's the talk's own index as it's kept,
+    /// every entry as it is, with an entry added for each component pasted whose source and build
+    /// this save writes, as [`Self::builds_to_enter`] gives them, but for one the index has an
+    /// entry for the same component or file: that's the talk's, and never replaced. An entry
+    /// whose files this save doesn't write stays to be entered. `None` for the index if the
+    /// talk's own can't be read, which a save leaves as it is.
     fn index_for_save(&self) -> (Vec<BuildEntry>, Option<Vec<u8>>) {
-        let builds = self.builds_to_enter();
+        let writing: BTreeSet<String> = self.added_files().into_iter().map(|(path, _)| path).collect();
+        let own = &*self.own_files;
+        let index = match own.len(INDEX_FILE) {
+            None if own.read(INDEX_FILE).is_none() => Some(BuildIndex { format: 1, components: Vec::new() }),
+            _ => added_files::build_index(own),
+        };
+        let builds: Vec<BuildEntry> = self
+            .builds_to_enter()
+            .into_iter()
+            .filter(|entry| writing.contains(&format!("build/{}.wasm", entry.file)) && writing.contains(&format!("components/{}.rs", entry.file)))
+            .filter(|entry| index.as_ref().is_none_or(|index| !index.components.iter().any(|kept| kept.tag == entry.tag || kept.file == entry.file)))
+            .collect();
         if builds.is_empty() {
             return (builds, None);
         }
-        let unused: Vec<BuildEntry> = self.added.builds_entered().into_iter().filter(|entry| !builds.contains(entry)).collect();
-        let index = added_files::build_index(&*self.files).and_then(|mut index| {
-            index.components.retain(|entry| !unused.contains(entry));
-            // The talk's own index couldn't be read, so none were entered in it.
-            builds.iter().all(|entry| index.components.contains(entry)).then(|| serde_json::to_vec_pretty(&index).ok()).flatten()
+        let index = index.and_then(|mut index| {
+            index.components.extend(builds.iter().cloned());
+            index.format = index.format.max(1);
+            serde_json::to_vec_pretty(&index).ok()
         });
         (builds, index)
     }
@@ -3155,11 +3195,18 @@ impl Document {
         for path in &saved.files_written {
             self.pending.remove(path);
         }
-        // In the index on disk now, which is read as it is from here on.
+        // In the index where the talk is kept now, which is read as it is from here on.
         self.added.forget_builds(&saved.builds_written);
+        if let Some(files) = saved.reopened {
+            self.own_files = files.clone();
+            self.files = Arc::new(WithAdded::new(files, self.added.clone()));
+            self.deck.set_files(Box::new(self.files.clone()));
+            self.components_looked_at();
+        }
         if let Some((place, files)) = saved.moved_to {
             self.place_name = place.name();
             self.place = place;
+            self.own_files = files.clone();
             self.files = Arc::new(WithAdded::new(files, self.added.clone()));
             self.deck.set_files(Box::new(self.files.clone()));
             self.components_looked_at();

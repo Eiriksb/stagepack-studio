@@ -95,6 +95,11 @@ const PICTURE_NOTICE: &str = "Can't show the picture ";
 /// How the engine starts the notice for a component the talk doesn't have.
 const COMPONENT_NOTICE: &str = "There is no component called ";
 
+/// The components `notices`, a slide's, say the talk lacks, by their names.
+pub fn missing_components(notices: &[String]) -> Vec<&str> {
+    notices.iter().filter_map(|notice| notice.strip_prefix(COMPONENT_NOTICE)).map(str::trim).collect()
+}
+
 /// Whether `notices`, a slide's, say it shows a picture or a component the talk lacks: a
 /// component it doesn't have, or a picture it can't show whose file isn't there, as `has_file`
 /// says. A picture whose file is there, but can't be read as one, or is too big, isn't missing.

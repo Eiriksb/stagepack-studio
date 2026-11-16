@@ -166,13 +166,16 @@ fn write_build(folder: &Path, entry: &BuildEntry, module: &[u8]) -> io::Result<(
     merge_into_index(folder, std::slice::from_ref(entry), Unreadable::Replace).map(|_| ())
 }
 
-/// What [`merge_into_index`] does with an index on disk that can't be read.
+/// Who [`merge_into_index`] merges for, which says what it may change.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Unreadable {
-    /// It's taken as empty, as the scan already counts it as no builds at all: a build does
-    /// this, as what it writes is true of the talk.
+    /// A build: what it writes is true of the talk, so its entry takes the place of any for
+    /// the same component or file, and an index that can't be read is taken as empty, as the
+    /// scan already counts it as no builds at all.
     Replace,
-    /// It's left as it is, and nothing is entered: a save does this for builds a paste brought.
+    /// A save, for builds a paste brought: an entry is only ever added, beside the index's own,
+    /// and never for a component or file it has an entry for; an index that can't be read is
+    /// left as it is, and nothing is entered.
     Keep,
 }
 
@@ -180,13 +183,13 @@ pub(crate) enum Unreadable {
 /// app, so a save and a build can't each write the index whole and lose the other's entry.
 static INDEX_WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Enters `entries` in the index of the talk in `folder`, each in place of any entry for the same
-/// component or the same file, keeping its others, and says whether they were entered: not if
-/// there are none, nor if the index there can't be read and `unreadable` says to keep it.
-/// Nothing is written through a link, nor outside the talk's own `build` folder.
-pub(crate) fn merge_into_index(folder: &Path, entries: &[BuildEntry], unreadable: Unreadable) -> io::Result<bool> {
+/// Enters `entries` in the index of the talk in `folder`, keeping its others, as `unreadable`
+/// says, and gives those entered, or `None` if the index there can't be read and is kept as it
+/// is. Nothing is written through a link, nor outside the talk's own `build` folder, nor when
+/// nothing is entered.
+pub(crate) fn merge_into_index(folder: &Path, entries: &[BuildEntry], unreadable: Unreadable) -> io::Result<Option<Vec<BuildEntry>>> {
     if entries.is_empty() {
-        return Ok(false);
+        return Ok(Some(Vec::new()));
     }
     let _one_at_a_time = INDEX_WRITES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let index_file = folder.join(INDEX_FILE);
@@ -194,17 +197,25 @@ pub(crate) fn merge_into_index(folder: &Path, entries: &[BuildEntry], unreadable
     refuse_a_link(&index_file)?;
     let mut index = match read_index(&index_file) {
         Some(index) => index,
-        None if unreadable == Unreadable::Keep && std::fs::symlink_metadata(&index_file).is_ok() => return Ok(false),
+        None if unreadable == Unreadable::Keep && std::fs::symlink_metadata(&index_file).is_ok() => return Ok(None),
         None => BuildIndex { format: INDEX_FORMAT, components: Vec::new() },
     };
+    let mut entered = Vec::new();
     for entry in entries {
-        index.enter(entry.clone());
+        let there = index.components.iter().any(|kept| kept.tag == entry.tag || kept.file == entry.file);
+        if unreadable == Unreadable::Replace || !there {
+            index.enter(entry.clone());
+            entered.push(entry.clone());
+        }
+    }
+    if entered.is_empty() {
+        return Ok(Some(entered));
     }
     index.format = INDEX_FORMAT;
     let json = serde_json::to_vec_pretty(&index).map_err(io::Error::other)?;
     build_folder_is_the_talks(folder)?;
     write_atomically(&index_file, |out| out.write_all(&json))?;
-    Ok(true)
+    Ok(Some(entered))
 }
 
 /// Fails unless the talk's `build` folder is where it seems to be, and not a link, even one to
@@ -320,14 +331,32 @@ mod tests {
         std::fs::create_dir(talk.path().join("build")).unwrap();
         let file = talk.path().join(INDEX_FILE);
         std::fs::write(&file, "not an index").unwrap();
-        assert!(!merge_into_index(talk.path(), &[entry("A")], Unreadable::Keep).unwrap());
+        assert_eq!(merge_into_index(talk.path(), &[entry("A")], Unreadable::Keep).unwrap(), None);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "not an index");
-        assert!(merge_into_index(talk.path(), &[entry("A")], Unreadable::Replace).unwrap());
+        assert_eq!(merge_into_index(talk.path(), &[entry("A")], Unreadable::Replace).unwrap(), Some(vec![entry("A")]));
         assert_eq!(read_index(&file).unwrap().components, [entry("A")]);
         // Missing, it's made, either way.
         std::fs::remove_file(&file).unwrap();
-        assert!(merge_into_index(talk.path(), &[entry("B")], Unreadable::Keep).unwrap());
+        assert_eq!(merge_into_index(talk.path(), &[entry("B")], Unreadable::Keep).unwrap(), Some(vec![entry("B")]));
         assert_eq!(read_index(&file).unwrap().components, [entry("B")]);
+    }
+
+    #[test]
+    fn a_save_never_replaces_an_entry_and_a_build_does() {
+        let talk = tempfile::tempdir().unwrap();
+        std::fs::create_dir(talk.path().join("build")).unwrap();
+        let file = talk.path().join(INDEX_FILE);
+        let theirs = BuildEntry { source_hash: "b".repeat(64), ..entry("A") };
+        merge_into_index(talk.path(), std::slice::from_ref(&theirs), Unreadable::Replace).unwrap();
+        // The same component, and another component built to the same file, are left out.
+        let same_file = BuildEntry { tag: "Z".into(), ..entry("A") };
+        let written = std::fs::read(&file).unwrap();
+        assert_eq!(merge_into_index(talk.path(), &[entry("A"), same_file], Unreadable::Keep).unwrap(), Some(Vec::new()));
+        assert_eq!(std::fs::read(&file).unwrap(), written, "nothing is written");
+        assert_eq!(merge_into_index(talk.path(), &[entry("A"), entry("B")], Unreadable::Keep).unwrap(), Some(vec![entry("B")]));
+        assert_eq!(read_index(&file).unwrap().components, [theirs, entry("B")]);
+        assert_eq!(merge_into_index(talk.path(), &[entry("A")], Unreadable::Replace).unwrap(), Some(vec![entry("A")]));
+        assert_eq!(read_index(&file).unwrap().components, [entry("B"), entry("A")]);
     }
 
     #[test]

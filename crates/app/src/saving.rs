@@ -88,6 +88,8 @@ pub struct Saved {
     /// The builds entered in the index of the place the talk is read from from now on, which
     /// no longer need entering.
     pub(crate) builds_written: Vec<BuildEntry>,
+    /// The pack the talk was saved in place in, opened again, to read the talk from now on.
+    pub(crate) reopened: Option<SharedFiles>,
     notices: Vec<String>,
 }
 
@@ -141,6 +143,7 @@ impl SaveJob {
             index,
         } = self;
         let mut builds_written = Vec::new();
+        let mut reopened = None;
         let files_written: Vec<String> = added.iter().map(|(path, _)| path.clone()).collect();
         let index_kept = |place: &Path| failed(&place.join(INDEX_FILE), "it can't be read, so a pasted component needs building.");
         // The merged index goes with the files, in place of the talk's own.
@@ -173,10 +176,8 @@ impl SaveJob {
                     write_added(folder, path, bytes)?;
                 }
                 let entered = builds::merge_into_index(folder, &builds, Unreadable::Keep).map_err(|e| failed(&folder.join(INDEX_FILE), e))?;
-                let notices = (!builds.is_empty() && !entered).then(|| index_kept(folder)).into_iter().collect();
-                if entered {
-                    builds_written = builds.clone();
-                }
+                let notices = entered.is_none().then(|| index_kept(folder)).into_iter().collect();
+                builds_written = entered.unwrap_or_default();
                 write_slides(folder, &text)?;
                 (None, notices)
             }
@@ -186,6 +187,11 @@ impl SaveJob {
                     changed_outside(found, &on_disk, &text)?;
                 }
                 repack_with_slides(file, file, &text, APP_VERSION, &extra()).map_err(|e| failed(file, e))?;
+                // The talk is read from the pack as it's written from now on, so what it holds,
+                // entries and all, is the talk's, as after a save in a folder.
+                if index_written {
+                    reopened = Some(in_pack(file.clone())?.1);
+                }
                 (None, index_notice(file).into_iter().collect())
             }
             (TalkPlace::Folder(folder), Some(SaveTarget::Folder(to))) => {
@@ -224,9 +230,7 @@ impl SaveJob {
                 (Some(in_folder(to)), kept)
             }
         };
-        // A pack saved in place is still read from the pack the talk opened, which holds none
-        // of them: they stay entered, for the talk as it shows now and the next save.
-        if moved_to.is_some() && index_written {
+        if (moved_to.is_some() || reopened.is_some()) && index_written {
             builds_written = builds;
         }
         Ok(Saved {
@@ -234,6 +238,7 @@ impl SaveJob {
             moved_to,
             files_written,
             builds_written,
+            reopened,
             notices,
         })
     }
