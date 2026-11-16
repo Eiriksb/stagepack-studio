@@ -16,6 +16,7 @@ use stagepack_studio::clipboard::{
 };
 use stagepack_studio::clipboard_tools::{COPY_ID, CUT_ID, PASTE_ID};
 use stagepack_studio::document::Document;
+use stagepack_studio::notes_panel::NOTES_ID;
 use stagepack_studio::slide_editor::SlideEditor;
 use stagepack_studio::slide_strip::strip_row_id;
 use stagepack_studio::text_editing::EditingText;
@@ -405,7 +406,6 @@ fn broken_clipboard_data_falls_back_to_plain_text(cx: &mut TestAppContext) {
     let wrap = |paras: &str| format!(r#"{{"{APP_KEY}":{{"kind":"text","version":1,"paras":{paras}}}}}"#);
     let span = |extra: &str| wrap(&format!(r#"[{{"kind":"body","spans":[{{"text":"styled"{extra}}}]}}]"#));
     let huge = wrap(&format!(r#"[{{"kind":"body","spans":[{{"text":"{}"}}]}}]"#, "y".repeat(MAX_BYTES)));
-    let many = wrap(&format!("[{}]", vec![r#"{"kind":"body"}"#; MAX_PARAS + 1].join(",")));
     let broken = [
         "not json".to_string(),
         r#"{"other-app":{"kind":"text","version":1,"paras":[]}}"#.to_string(),
@@ -423,7 +423,6 @@ fn broken_clipboard_data_falls_back_to_plain_text(cx: &mut TestAppContext) {
         span(r#","link":"a\u0001b"#),
         span(r#","bold":"yes"#),
         huge,
-        many,
     ];
     for metadata in broken {
         talk.click_text(cx, 1, pos(0, 0));
@@ -435,6 +434,36 @@ fn broken_clipboard_data_falls_back_to_plain_text(cx: &mut TestAppContext) {
         talk.press(cx, "ctrl-z");
         assert_eq!(talk.source(cx), TWO);
     }
+}
+
+#[gpui_kit::test]
+fn styled_text_over_the_caps_is_too_much_and_wordless_styled_text_gives_way(cx: &mut TestAppContext) {
+    let talk = open(cx, TWO);
+    talk.click_text(cx, 1, pos(0, 15));
+    let wrap = |paras: String| format!(r#"{{"{APP_KEY}":{{"kind":"text","version":1,"paras":[{paras}]}}}}"#);
+    let many = wrap(vec![r#"{"kind":"body"}"#; MAX_PARAS + 1].join(","));
+    put(cx, "a few words", Some(&many));
+    talk.press(cx, "ctrl-v");
+    assert_eq!(talk.status(cx).as_deref(), Some(TOO_LARGE));
+    assert_eq!(talk.source(cx), TWO);
+    // Paragraphs with no words, beside plain text that has some: the plain text is pasted.
+    put(cx, "the words", Some(&wrap(r#"{"kind":"body"},{"kind":"body"}"#.to_string())));
+    talk.press(cx, "ctrl-v");
+    assert_eq!(talk.text_of(cx, 0, 1), ["Some words herethe words"]);
+}
+
+#[gpui_kit::test]
+fn bidi_overrides_never_reach_the_talk(cx: &mut TestAppContext) {
+    let talk = open(cx, TWO);
+    talk.click_text(cx, 1, pos(0, 15));
+    put(cx, "\u{202e}evil\u{2066}x\u{2069}", None);
+    talk.press(cx, "ctrl-v");
+    talk.type_text(cx, "\u{202d}y\u{200d}");
+    assert_eq!(talk.text_of(cx, 0, 1), ["Some words hereevilxy\u{200d}"]);
+    let entry = text_entry(&[Para { kind: ParaKind::Body, spans: vec![Span { text: "\u{202b}z".into(), style: Style::default() }] }]);
+    put(cx, &entry.text, entry.metadata.as_deref());
+    talk.press(cx, "ctrl-v");
+    assert_eq!(talk.text_of(cx, 0, 1), ["Some words hereevilxy\u{200d}z"]);
 }
 
 // Slides.
@@ -544,6 +573,19 @@ fn a_pasted_slide_missing_its_picture_says_so(cx: &mut TestAppContext) {
         assert_eq!(into.count(cx), 2);
         assert_eq!(into.status(cx).as_deref() == Some(MISSING_PICTURES), says, "row {row}");
     }
+    // A picture that's there, but can't be read as one, isn't missing.
+    let corrupt = tempfile::tempdir().unwrap();
+    std::fs::create_dir(corrupt.path().join("assets")).unwrap();
+    std::fs::write(corrupt.path().join("assets/chart.png"), "not a picture").unwrap();
+    let into = open_in(cx, corrupt, "# A\n");
+    from.click(cx, strip_row_id(0));
+    from.press(cx, "ctrl-c");
+    into.click(cx, strip_row_id(0));
+    into.press(cx, "ctrl-v");
+    assert_eq!(into.count(cx), 2);
+    let notices = into.document(cx).update(cx, |document, _| document.notices());
+    assert!(notices.iter().any(|notice| notice.starts_with("Can't show the picture")), "{notices:?}");
+    assert_eq!(into.status(cx), None);
     // Pasting into the talk it came from, where the picture is, says nothing either.
     from.click(cx, strip_row_id(0));
     from.press(cx, "ctrl-c");
@@ -566,11 +608,87 @@ fn a_pasted_slide_that_would_split_or_join_slides_is_refused(cx: &mut TestAppCon
         assert!(!talk.can_undo(cx));
         assert!(talk.status(cx).is_some_and(|status| status.contains("wasn't made")), "{markdown:?}");
     }
-    // Plain text isn't a slide.
-    put(cx, "# Words\n", None);
+    // Plain text the same.
+    for markdown in ["# A\n\n---\n\n# B\n", "---\n# A\n---\n# B\n---\n"] {
+        put(cx, markdown, None);
+        talk.press(cx, "ctrl-v");
+        assert_eq!(talk.source(cx), THREE, "{markdown:?}");
+        assert!(!talk.can_undo(cx));
+    }
+}
+
+#[gpui_kit::test]
+fn plain_text_pastes_as_a_slide(cx: &mut TestAppContext) {
+    // As a slide copied in another running copy of the app arrives, or Markdown from an editor.
+    let talk = open(cx, THREE);
+    talk.click(cx, strip_row_id(0));
+    put(cx, "# Words\n\nsome text\n", None);
     talk.press(cx, "ctrl-v");
-    assert_eq!(talk.source(cx), THREE);
+    assert_eq!(talk.titles(cx), ["One", "Words", "Two", "Three"]);
+    assert_eq!(talk.text_of(cx, 1, 1), ["some text"]);
+    assert_eq!(talk.undo_label(cx), Some("Paste slide"));
+
+    // One break line before it and one after it are left out.
+    put(cx, "---\n# Lead\n---  \n", None);
+    talk.press(cx, "ctrl-v");
+    assert_eq!(talk.titles(cx), ["One", "Words", "Lead", "Two", "Three"]);
+
+    // A settings block is the slide's own, but for the talk's settings, as for a copied first
+    // slide; with its opening break line or without it, as the app copies a slide's text.
+    put(cx, "---\ntitle: Theirs\nlayout: section\n---\n\n# Set\n", None);
+    talk.press(cx, "ctrl-v");
+    put(cx, "hidden: true\n---\n\n# Hid\n", None);
+    talk.press(cx, "ctrl-v");
+    assert_eq!(talk.titles(cx), ["One", "Words", "Lead", "Set", "Hid", "Two", "Three"]);
+    talk.document(cx).read_with(cx, |document, _| {
+        let slides = &document.talk().slides;
+        let set = slides[3].settings.as_ref().unwrap();
+        assert_eq!(set.get("layout"), Some("section"));
+        assert_eq!(set.get("title"), None, "the talk's settings are left behind");
+        assert!(is_hidden(&slides[4]));
+        assert!(slides[0].settings.is_none(), "this talk's own are as they were");
+    });
+
+    // Line endings become the talk's.
+    put(cx, "# Crlf\r\n\r\nline\r\n", None);
+    talk.press(cx, "ctrl-v");
+    let source = talk.source(cx);
+    assert!(!source.contains('\r'), "{source:?}");
+    assert_eq!(talk.titles(cx)[5], "Crlf");
+
+    // Nothing, or only whitespace, is no slide; too much is too much.
+    let before = talk.source(cx);
+    put(cx, " \n\t\n", None);
+    talk.press(cx, "ctrl-v");
     assert_eq!(talk.status(cx).as_deref(), Some(NO_SLIDE));
+    put(cx, &format!("# Big\n\n{}", "x".repeat(MAX_BYTES)), None);
+    talk.press(cx, "ctrl-v");
+    assert_eq!(talk.status(cx).as_deref(), Some(TOO_LARGE));
+    assert_eq!(talk.source(cx), before);
+}
+
+#[gpui_kit::test]
+fn copied_words_paste_in_the_list_as_a_slide_holding_them(cx: &mut TestAppContext) {
+    let talk = open(cx, THREE);
+    talk.click_text(cx, 1, pos(0, 0));
+    talk.press(cx, "shift-end");
+    talk.press(cx, "ctrl-c");
+    assert!(on_clipboard(cx).1.is_some_and(|metadata| metadata.contains("\"text\"")));
+    talk.click(cx, strip_row_id(2));
+    talk.press(cx, "ctrl-v");
+    assert_eq!(talk.count(cx), 4);
+    assert_eq!(talk.titles(cx)[3], "first words");
+}
+
+#[gpui_kit::test]
+fn the_tools_act_on_the_notes_when_they_have_the_keyboard(cx: &mut TestAppContext) {
+    let talk = open(cx, THREE);
+    talk.click(cx, NOTES_ID);
+    assert!(!talk.disabled(cx, PASTE_ID) && !talk.disabled(cx, COPY_ID) && !talk.disabled(cx, CUT_ID));
+    put(cx, "say this", None);
+    talk.click(cx, PASTE_ID);
+    assert_eq!(cx.read(|cx| talk.view.read(cx).notes_panel().read(cx).text(cx)), "say this");
+    assert_eq!(talk.count(cx), 3, "no slide is pasted");
 }
 
 #[gpui_kit::test]
@@ -645,14 +763,55 @@ fn keeps_the_rules(paras: &[Para]) -> bool {
     let styles = spans.iter().all(|span| {
         let style = &span.style;
         style.size.is_none_or(|size| (1..=512).contains(&size))
-            && style.color.as_deref().is_none_or(|color| !color.contains(|c: char| c.is_control() || "\"'<>&".contains(c)))
-            && style.link.as_deref().is_none_or(|link| {
-                !link.contains(|c: char| c.is_control() || c.is_whitespace() || "\"'<>".contains(c))
-                    && !link.to_ascii_lowercase().starts_with("javascript:")
-            })
+            && style.color.as_deref().is_none_or(colour_rule)
+            && style.link.as_deref().is_none_or(link_rule)
     });
     let tidy = paras.iter().all(|para| para.spans.windows(2).all(|pair| pair[0].style != pair[1].style));
     kinds && texts && styles && tidy && paras.len() <= MAX_PARAS && spans.len() <= MAX_SPANS
+}
+
+/// The colours a paste may give, written out here on their own, to hold the app's rule to.
+fn colour_rule(color: &str) -> bool {
+    let hex = |digits: &str| matches!(digits.len(), 3 | 6) && digits.chars().all(|c| c.is_ascii_hexdigit());
+    match color.strip_prefix('#') {
+        Some(digits) => hex(digits),
+        None => ["black", "white", "red", "green", "blue", "yellow", "orange", "purple", "gray"].contains(&color),
+    }
+}
+
+/// The links a paste may give, written out here on their own.
+fn link_rule(link: &str) -> bool {
+    let clean = !link.is_empty() && link.len() <= 2048 && !link.contains(|c: char| c.is_control() || c.is_whitespace() || "\"'<>\\`".contains(c));
+    let lower = link.to_ascii_lowercase();
+    let web = ["http://", "https://"].iter().any(|start| lower.starts_with(start) && lower.len() > start.len());
+    let mail = lower.starts_with("mailto:");
+    let scheme = link.find(':').is_some_and(|colon| !link[..colon].contains(['/', '?', '#']));
+    let path = link.split(['?', '#']).next().unwrap_or_default();
+    let within = !scheme && !link.starts_with("//") && !path.split('/').any(|seg| seg.to_ascii_lowercase().replace("%2e", ".") == "..");
+    clean && (web || mail || within)
+}
+
+#[test]
+fn the_colour_and_link_rules_are_exact() {
+    for color in ["#abc", "#ABCDEF", "#00ff7f", "red", "gray"] {
+        assert!(clipboard::color_allowed(color), "{color}");
+    }
+    for color in ["", "#ab", "#abcd", "#12345g", "Red", "grey", " red", "red;", "#fff\"", "<b>", "rgb(1,2,3)", "#ｆｆｆ"] {
+        assert!(!clipboard::color_allowed(color), "{color}");
+    }
+    for link in ["https://example.com/a?b=c", "http://x", "HTTPS://X.Y", "mailto:a@b.c", "#next", "notes/more.html", "a/b..c/d", "?q=1", "page#x:y"] {
+        assert!(clipboard::link_allowed(link), "{link}");
+        assert!(link_rule(link), "{link}");
+    }
+    let refused = [
+        "", "javascript:alert(1)", "JavaScript:x", "data:text/html,x", "vbscript:x", "file:///etc/passwd", "http:x", "https:", "http:/x",
+        "https://", "//elsewhere.com/x", "../up", "a/../b", "a/..", "%2e%2e/x", "a/%2E%2e/b", "a b", "a\u{1}b", "a\"b", "a'b", "a<b", "a\\b", "a`b",
+    ];
+    for link in refused {
+        assert!(!clipboard::link_allowed(link), "{link}");
+        assert!(!link_rule(link), "{link}");
+    }
+    assert!(!clipboard::link_allowed(&format!("https://x/{}", "a".repeat(2048))));
 }
 
 fn json() -> impl Strategy<Value = serde_json::Value> {
@@ -707,7 +866,8 @@ proptest! {
             Ok(TextPaste::Plain(plain)) => prop_assert!(!plain.contains(|c: char| c.is_control() && c != '\n' && c != '\t')),
             _ => {}
         }
-        let _ = clipboard::slide_to_paste(Some(&text));
+        let _ = clipboard::slide_to_paste(Some(&text), Some(&text));
+        let _ = clipboard::slide_to_paste(Some(&text), None);
     }
 
     #[test]
@@ -725,7 +885,7 @@ proptest! {
         if let Ok(TextPaste::Styled(paras)) = text_to_paste(Some("plain"), Some(&json)) {
             prop_assert!(keeps_the_rules(&paras));
         }
-        if let Ok(Some(markdown)) = clipboard::slide_to_paste(Some(&json)) {
+        if let Ok(Some(markdown)) = clipboard::slide_to_paste(None, Some(&json)) {
             prop_assert!(markdown.len() <= MAX_BYTES);
             prop_assert!(!markdown.contains(|c: char| c.is_control() && c != '\n' && c != '\t'));
             let _ = parse_talk(&markdown);
@@ -737,8 +897,69 @@ proptest! {
 fn a_slides_words_are_held_to_the_rules_too() {
     let markdown = "# Title\n\n[click](javascript:alert(1)) and <Text size=\"9000\">big</Text>\n";
     let metadata = serde_json::json!({ APP_KEY: { "kind": "slide", "version": 1, "markdown": markdown } }).to_string();
-    match text_to_paste(Some(markdown), Some(&metadata)).unwrap() {
-        TextPaste::Styled(paras) => assert!(keeps_the_rules(&paras), "{paras:?}"),
-        other => assert_eq!(other, TextPaste::Nothing),
+    let TextPaste::Styled(paras) = text_to_paste(Some(markdown), Some(&metadata)).unwrap() else {
+        panic!("a slide's words paste");
+    };
+    assert!(keeps_the_rules(&paras), "{paras:?}");
+    assert_eq!(paras.iter().map(para_text).collect::<Vec<_>>(), ["Title", "click and big"]);
+    let spans = &paras[1].spans;
+    assert!(spans.iter().all(|span| span.style.link.is_none() && span.style.size.is_none()), "{spans:?}");
+    // A link that's allowed stays.
+    let markdown = "[here](https://example.com)";
+    let metadata = serde_json::json!({ APP_KEY: { "kind": "slide", "version": 1, "markdown": markdown } }).to_string();
+    let TextPaste::Styled(paras) = text_to_paste(None, Some(&metadata)).unwrap() else { panic!("words") };
+    assert_eq!(paras[0].spans[0].style.link.as_deref(), Some("https://example.com"));
+}
+
+/// Lines plain text on the clipboard is made of, as someone might copy them.
+fn plain_slide() -> impl Strategy<Value = String> {
+    let line = prop_oneof![
+        Just("---"), Just("--- "), Just("# Head"), Just("words"), Just(""), Just("title: Theirs"), Just("hidden: true"),
+        Just("layout: section"), Just("a: b"), Just("```"), Just("<Notes>"), Just("</Notes>"), Just("- item"), Just("<Text x=\"1\">"),
+        Just("</Text>"), Just("\u{feff}"), Just("\r"), Just("<Region name=\"right\" />"),
+    ];
+    prop::collection::vec(line, 0..12).prop_map(|lines| lines.join("\n"))
+}
+
+/// Each slide's text, without the line endings at its end.
+fn slide_texts(source: &str) -> Vec<String> {
+    slides_format::split_slides(source)
+        .iter()
+        .map(|slide| source[slide.range.clone()].trim_end_matches(['\r', '\n']).to_string())
+        .collect()
+}
+
+#[test]
+fn plain_text_pastes_as_one_slide_or_none_and_leaves_the_others_alone() {
+    use proptest::test_runner::{Config, TestRunner};
+    for talk in [THREE, "---\ntitle: T\n---\n\n# One\n\n---\n\n# Two", "# A\r\n\r\n---\r\n\r\n# B\r\n"] {
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(folder.path().join("slides.md"), talk).unwrap();
+        let document = std::cell::RefCell::new(Document::open(folder.path(), Fonts::bundled_only()).unwrap());
+        let mut runner = TestRunner::new(Config { cases: 200, ..Config::default() });
+        runner
+            .run(&(plain_slide(), 0usize..3), |(plain, at)| {
+                let mut document = document.borrow_mut();
+                let before = document.source().to_string();
+                let count = document.slide_count();
+                document.select(at.min(count - 1));
+                let at = document.current();
+                let Ok(Some(markdown)) = clipboard::slide_to_paste(Some(&plain), None) else { return Ok(()) };
+                match document.paste_slide(&markdown) {
+                    Ok(_) => {
+                        prop_assert_eq!(document.slide_count(), count + 1);
+                        let (old, new) = (slide_texts(&before), slide_texts(document.source()));
+                        for (index, text) in old.iter().enumerate() {
+                            let moved = if index <= at { index } else { index + 1 };
+                            prop_assert_eq!(text, &new[moved], "slide {} of {:?} after pasting {:?}", index, before, plain);
+                        }
+                        document.undo().unwrap();
+                        prop_assert_eq!(document.source(), before.as_str());
+                    }
+                    Err(_) => prop_assert_eq!(document.source(), before.as_str()),
+                }
+                Ok(())
+            })
+            .unwrap();
     }
 }

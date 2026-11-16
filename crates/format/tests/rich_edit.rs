@@ -1104,3 +1104,20 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn bidi_overrides_and_isolates_are_dropped_but_joiners_and_marks_kept() {
+    let edit = TextEdit::new(vec![para(ParaKind::Body, "")]);
+    let hostile = "a\u{202a}b\u{202b}c\u{202c}d\u{202d}e\u{202e}f\u{2066}g\u{2067}h\u{2068}i\u{2069}j";
+    let kept = "👨\u{200d}👩 x\u{200c}y \u{200e}z\u{200f}";
+    let typed = edit.insert(&format!("{hostile}{kept}"));
+    assert_eq!(typed.paras[0].spans[0].text, format!("abcdefghij{kept}"));
+    let pasted = edit.paste(&[para(ParaKind::Body, &format!("{hostile}{kept}"))]);
+    assert_eq!(pasted.paras[0].spans[0].text, format!("abcdefghij{kept}"));
+    for c in ['\u{202a}', '\u{202e}', '\u{2066}', '\u{2069}'] {
+        assert!(is_bidi_control(c));
+    }
+    for c in ['\u{200d}', '\u{200c}', '\u{200e}', '\u{200f}', '\u{2029}', 'a'] {
+        assert!(!is_bidi_control(c));
+    }
+}

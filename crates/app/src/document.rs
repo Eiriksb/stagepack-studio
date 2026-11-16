@@ -870,6 +870,11 @@ impl Document {
         self.make(CUT_SLIDE, change, Holds::Count(-1), at, after, None)
     }
 
+    /// Whether the talk has a file at `path`, relative to it, as a picture's is written.
+    pub fn has_file(&self, path: &str) -> bool {
+        self.files.len(path).is_some()
+    }
+
     /// The current slide's own text, to copy it: see [`slides_format::slide_text_for_copy`].
     /// Text being typed on it is in the talk already. `None` if working it out goes wrong.
     pub fn current_for_copy(&self) -> Option<String> {

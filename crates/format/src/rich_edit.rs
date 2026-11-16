@@ -667,9 +667,18 @@ const LINE_SEPARATOR: char = '\u{2028}';
 const PARA_SEPARATOR: char = '\u{2029}';
 const BYTE_ORDER_MARK: char = '\u{feff}';
 
-/// Whether `c` is a control character the model never holds.
-fn is_dropped(c: char) -> bool {
-    c == BYTE_ORDER_MARK || (c.is_control() && c != '\t' && c != '\n')
+/// Whether `c` is a control character the model never holds: a byte order mark, a control
+/// character other than tab and newline, or a bidirectional embedding, override or isolate,
+/// which could make text read otherwise than it is. Joiners and direction marks are kept, as
+/// emoji and several scripts need them.
+pub(crate) fn is_dropped(c: char) -> bool {
+    c == BYTE_ORDER_MARK || is_bidi_control(c) || (c.is_control() && c != '\t' && c != '\n')
+}
+
+/// Whether `c` is a bidirectional embedding, override or isolate: U+202A to U+202E, or U+2066
+/// to U+2069.
+pub fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
 /// A line of typed text as the model holds it: a line separator a line break, other

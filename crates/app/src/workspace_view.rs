@@ -415,9 +415,11 @@ impl WorkspaceView {
             markdown: false,
         };
         let clipboard_tools = cx.new(|cx| ClipboardTools::new(document.clone(), &slide_editor, cx));
-        let ribbon = cx.new(|cx| Ribbon::new(document.clone(), clipboard_tools, text_tools, panels, cx));
+        let ribbon = cx.new(|cx| Ribbon::new(document.clone(), clipboard_tools.clone(), text_tools, panels, cx));
         let slide_strip = cx.new(|cx| SlideStrip::new(document.clone(), cx));
         let notes_panel = cx.new(|cx| NotesPanel::new(document.clone(), window, cx));
+        let notes_focus = notes_panel.read(cx).field().focus_handle(cx);
+        clipboard_tools.update(cx, |tools, cx| tools.follow_notes(notes_focus, window, cx));
         let notes_edited = cx.subscribe_in(
             &notes_panel,
             window,

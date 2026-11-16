@@ -48,6 +48,8 @@ struct Seen {
 pub struct ClipboardTools {
     document: Option<Entity<Document>>,
     seen: Seen,
+    /// The notes field's keyboard: while it has it, the tools act on its text.
+    notes: Option<FocusHandle>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -75,8 +77,17 @@ impl ClipboardTools {
         ClipboardTools {
             document,
             seen: Seen::default(),
+            notes: None,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Has the tools act on the notes field's text while `notes`, its keyboard, is with it, and
+    /// show so as it comes and goes.
+    pub fn follow_notes(&mut self, notes: FocusHandle, window: &mut Window, cx: &mut Context<Self>) {
+        self._subscriptions.push(cx.on_focus_in(&notes, window, |_, _, cx| cx.notify()));
+        self._subscriptions.push(cx.on_focus_out(&notes, window, |_, _, _, cx| cx.notify()));
+        self.notes = Some(notes);
     }
 
     fn seen(&self, cx: &App) -> Seen {
@@ -108,7 +119,7 @@ fn tool(
 }
 
 impl Render for ClipboardTools {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let seen = self.seen(cx);
         self.seen = seen;
         let slides = self.document.as_ref().map(|document| document.read(cx).slide_count());
@@ -116,7 +127,11 @@ impl Render for ClipboardTools {
         // Only Paste shows its name, as there's room on the tab for no more.
         // With text being typed, they're for its selection; Cut and Copy need some selected.
         // Otherwise they're for the current slide, which can't be cut if it's the only one.
-        let (copy, cut, context) = if seen.typing {
+        // In the notes field, they do what its own keys do, to its selection.
+        let in_notes = self.notes.as_ref().is_some_and(|notes| notes.contains_focused(window, cx));
+        let (copy, cut, context) = if in_notes {
+            (has_talk, has_talk, STRIP_CONTEXT)
+        } else if seen.typing {
             (seen.selected, seen.selected, EDITOR_CONTEXT)
         } else {
             (has_talk, slides.is_some_and(|count| count > 1), STRIP_CONTEXT)

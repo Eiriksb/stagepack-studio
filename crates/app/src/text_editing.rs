@@ -4,7 +4,7 @@
 
 use std::ops::Range;
 
-use slides_format::{FlowPlace, Para, ParaKind, Pos, Selection, TextEdit, TextFlow};
+use slides_format::{FlowPlace, Para, ParaKind, Pos, Selection, TextEdit, TextFlow, is_bidi_control};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::history::RunId;
@@ -231,12 +231,14 @@ impl EditingText {
 }
 
 /// `text` from the system as the text holds it, as typing it would leave it: line endings as
-/// newlines, control characters other than tab and newline dropped, and no byte order mark.
+/// newlines, control characters other than tab and newline dropped, no byte order mark, and no
+/// bidirectional embedding, override or isolate, as the text model holds none
+/// ([`is_bidi_control`]).
 pub fn clean_typed(text: &str) -> String {
     text.replace("\r\n", "\n")
         .replace('\r', "\n")
         .chars()
-        .filter(|&c| c == '\t' || c == '\n' || !(c.is_control() || c == '\u{feff}'))
+        .filter(|&c| c == '\t' || c == '\n' || !(c.is_control() || c == '\u{feff}' || is_bidi_control(c)))
         .collect()
 }
 

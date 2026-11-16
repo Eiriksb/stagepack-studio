@@ -190,6 +190,13 @@ impl WorkspaceView {
             return;
         };
         if self.notes_panel.read(cx).is_focused(window, cx) {
+            // The notes field has the keyboard: the tool does what its own keys do there.
+            let action: Box<dyn Action> = match op {
+                ClipboardOp::Copy => Box::new(input::Copy),
+                ClipboardOp::Cut => Box::new(input::Cut),
+                ClipboardOp::Paste => Box::new(input::Paste),
+            };
+            window.dispatch_action(action, cx);
             return;
         }
         if document.read(cx).text().is_some() {
@@ -244,8 +251,8 @@ impl WorkspaceView {
         let Some(document) = self.document.clone() else {
             return;
         };
-        let (_, metadata) = read_clipboard(cx);
-        let markdown = match clipboard::slide_to_paste(metadata.as_deref()) {
+        let (plain, metadata) = read_clipboard(cx);
+        let markdown = match clipboard::slide_to_paste(plain.as_deref(), metadata.as_deref()) {
             Ok(Some(markdown)) => markdown,
             Ok(None) => return self.say(clipboard::NO_SLIDE, cx),
             Err(TooLarge) => return self.say(clipboard::TOO_LARGE, cx),
@@ -254,7 +261,8 @@ impl WorkspaceView {
         self.edit(|document| document.paste_slide(&markdown), cx);
         if document.read(cx).slide_count() == before + 1 {
             let notices = document.update(cx, |document, _| document.notices());
-            if clipboard::shows_something_missing(&notices) {
+            let document = document.read(cx);
+            if clipboard::shows_something_missing(&notices, |path| document.has_file(path)) {
                 self.say(clipboard::MISSING_PICTURES, cx);
             }
         }
