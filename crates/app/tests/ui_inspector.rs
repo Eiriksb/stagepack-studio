@@ -989,3 +989,95 @@ fn a_dragged_colour_is_let_go_of_when_its_thing_is_deleted(cx: &mut TestAppConte
     let _ = ellipse;
 }
 
+
+#[gpui_kit::test]
+fn nothing_lies_under_another_panel_at_any_allowed_size(cx: &mut TestAppContext) {
+    use gpui_kit::{Bounds, Pixels, px, size};
+    use stagepack_studio::notes_panel::NOTES_ID;
+    use stagepack_studio::slide_strip::STRIP_ID;
+    use stagepack_studio::workspace_view::{
+        MARKDOWN_ID, MIN_WINDOW_WIDTH, SLIDE_COLUMN_ID, ToggleMarkdown, ToggleNotes, ToggleSlideList,
+    };
+    assert_eq!(MIN_WINDOW_WIDTH, px(1024.));
+    let typing = open(cx, SHOWCASE);
+    let find = |typing: &Typing, cx: &mut TestAppContext, id: &'static str| -> Option<Bounds<Pixels>> {
+        typing.with_window(cx, |window, cx| {
+            window.render_frame(cx);
+            window.try_find(id).map(|found| found.bounds())
+        })
+    };
+    // As the window opens: the list and the notes shown, the Markdown not.
+    let (mut strip, mut notes, mut markdown) = (true, true, false);
+    for (width, height) in [(1024., 600.), (1280., 800.), (1920., 1080.)] {
+        cx.simulate_window_resize(typing.handle, size(px(width), px(height)));
+        typing.settle(cx);
+        for wanted in 0..8 {
+            let (want_strip, want_notes, want_markdown) = (wanted & 1 == 0, wanted & 2 == 0, wanted & 4 != 0);
+            let toggles: [(bool, &mut bool, Box<dyn gpui_kit::Action>); 3] = [
+                (want_strip, &mut strip, Box::new(ToggleSlideList)),
+                (want_notes, &mut notes, Box::new(ToggleNotes)),
+                (want_markdown, &mut markdown, Box::new(ToggleMarkdown)),
+            ];
+            for (want, shown, action) in toggles {
+                if want != *shown {
+                    typing.with_window(cx, |window, cx| window.dispatch_action(action, cx));
+                    *shown = want;
+                }
+            }
+            typing.settle(cx);
+            typing.settle(cx);
+            let case = format!("{width}x{height}, list {strip}, notes {notes}, Markdown {markdown}");
+            let window = Bounds { origin: gpui_kit::point(px(0.), px(0.)), size: size(px(width), px(height)) };
+            let inside = |bounds: Bounds<Pixels>| {
+                bounds.left() >= window.left() && bounds.right() <= window.right() + px(0.5) && bounds.bottom() <= window.bottom() + px(0.5)
+            };
+            let column = find(&typing, cx, SLIDE_COLUMN_ID).expect("the slide's column");
+            let inspector = find(&typing, cx, INSPECTOR_ID).expect("the inspector");
+            assert_eq!(inspector.size.width, px(300.), "{case}");
+            assert!(column.size.width >= px(240.) - px(0.5), "{case}: the slide's column is {column:?}");
+            let mut across = vec![("slide", column), ("inspector", inspector)];
+            if let Some(list) = find(&typing, cx, STRIP_ID) {
+                assert!(strip, "{case}");
+                across.push(("list", list));
+            }
+            if let Some(panel) = find(&typing, cx, MARKDOWN_ID) {
+                assert!(markdown, "{case}");
+                assert!(panel.size.width >= px(240.) - px(0.5), "{case}: {panel:?}");
+                across.push(("Markdown", panel));
+            }
+            assert_eq!(across.len(), 2 + usize::from(strip) + usize::from(markdown), "{case}");
+            for (name, bounds) in &across {
+                assert!(inside(*bounds), "{case}: {name} {bounds:?} is cut off");
+            }
+            for (a, first) in &across {
+                for (b, second) in &across {
+                    let apart = first.right() <= second.left() + px(0.5) || second.right() <= first.left() + px(0.5);
+                    assert!(a == b || apart, "{case}: {a} {first:?} lies over {b} {second:?}");
+                }
+            }
+            if notes {
+                let under = find(&typing, cx, NOTES_ID).expect("the notes");
+                assert!(inside(under), "{case}: the notes {under:?}");
+                assert!(under.left() >= column.left() - px(0.5) && under.right() <= column.right() + px(0.5), "{case}: notes {under:?} beside {column:?}");
+            }
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn a_dragged_colour_survives_a_change_that_leaves_the_text(cx: &mut TestAppContext) {
+    let typing = open(cx, SHOWCASE);
+    go_to(&typing, cx, THINGS);
+    select(&typing, cx, ELLIPSE);
+    let picker = drag_outline_blue(&typing, cx);
+    // A file added changes how the talk is drawn, but not its text.
+    let document = typing.document(cx);
+    document.update(cx, |document, cx| {
+        document.add_file(stagepack_studio::added_files::FileKind::Data, "figures.csv", b"a,1\n".to_vec()).unwrap();
+        cx.notify();
+    });
+    typing.settle(cx);
+    typing.with_window(cx, |_, cx| picker.update(cx, |picker, cx| picker.set_open(false, cx)));
+    typing.settle(cx);
+    assert_eq!(typing.source(cx), SHOWCASE.replace("outline=\"black\"", "outline=\"#0000ff\""));
+}

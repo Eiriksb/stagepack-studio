@@ -768,9 +768,9 @@ fn inserting_on_a_slide_with_notes_goes_before_them(cx: &mut TestAppContext) {
 // The tab
 
 #[gpui_kit::test]
-fn the_insert_tab_fits_at_800_pixels_or_scrolls(cx: &mut TestAppContext) {
+fn the_insert_tab_fits_at_1024_pixels_or_scrolls(cx: &mut TestAppContext) {
     let typing = open(cx, TALK);
-    cx.simulate_window_resize(typing.handle, size(px(800.), px(500.)));
+    cx.simulate_window_resize(typing.handle, size(px(1024.), px(600.)));
     typing.settle(cx);
     insert_tab(&typing, cx);
     let ribbon = bounds_of(&typing, cx, RIBBON_ID).unwrap();

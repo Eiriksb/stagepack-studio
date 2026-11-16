@@ -2224,7 +2224,7 @@ mod tools {
     #[gpui_kit::test]
     fn in_a_narrow_window_the_tools_scroll_and_every_one_can_be_reached(cx: &mut TestAppContext) {
         let typing = open(cx, TWO);
-        typing.resize(cx, 800., 500.);
+        typing.resize(cx, 1024., 600.);
         typing.select_word(cx, 6);
         assert!(typing.bounds_of(cx, MORE_RIGHT_ID).is_some(), "an arrow says there's more");
         assert!(typing.bounds_of(cx, MORE_LEFT_ID).is_none(), "but not to the left yet");
@@ -2254,7 +2254,7 @@ mod tools {
         // Seen in the real window: with nothing being typed, a click on the right arrow, over
         // the greyed size field, did nothing, and the field's tooltip showed through it.
         let typing = open(cx, TWO);
-        typing.resize(cx, 800., 500.);
+        typing.resize(cx, 1024., 600.);
         assert!(typing.editing(cx).is_none());
         // Wide enough for the arrow to lie over the size field.
         let size = typing.bounds_of(cx, SIZE_ID).unwrap();
@@ -2283,7 +2283,7 @@ mod tools {
             assert!(bounds.right() <= ribbon.right(), "{tool} is cut off");
         }
         // Narrowed, it does; widened again, it doesn't.
-        typing.resize(cx, 800., 500.);
+        typing.resize(cx, 1024., 600.);
         assert!(typing.bounds_of(cx, MORE_RIGHT_ID).is_some());
         typing.resize(cx, 1400., 800.);
         assert!(typing.bounds_of(cx, MORE_RIGHT_ID).is_none());

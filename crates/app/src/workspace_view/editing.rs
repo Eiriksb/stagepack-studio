@@ -387,13 +387,22 @@ impl WorkspaceView {
     }
 
     /// The list of slides, the slide with its notes under it, and the Markdown, side by side.
+    /// `width` is the window's. The panels beside the slide give way as it narrows, the
+    /// Markdown first, so the slide's column is never narrower than [`SLIDE_COLUMN_MIN_WIDTH`]
+    /// and nothing lies under the inspector.
     pub(super) fn editor_area(
         &self,
         canvas: impl IntoElement,
         bars: Vec<AnyElement>,
+        width: Pixels,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let has_talk = self.document.is_some();
+        let inspector = self.shows_inspector().then(|| self.inspector.clone());
+        let strip_shown = has_talk && self.show_slide_list;
+        let room = width - if inspector.is_some() { INSPECTOR_WIDTH } else { px(0.) };
+        let strip_now = strip_shown.then(|| self.columns.read(cx).sizes().first().copied()).flatten();
+        let (strip_widest, markdown_widest) = column_limits(room, strip_shown.then(|| strip_now.unwrap_or(STRIP_WIDTH)), self.show_markdown);
         let slide_and_notes = v_resizable("slide-and-notes")
             .child(
                 resizable_panel().child(
@@ -401,6 +410,8 @@ impl WorkspaceView {
                     // the tools. The bars that need an answer lie over the top of the desk, so
                     // that the slide keeps its size as they come and go.
                     div()
+                        .id(SLIDE_COLUMN_ID)
+                        .test_support()
                         .relative()
                         .size_full()
                         .p_4()
@@ -432,7 +443,6 @@ impl WorkspaceView {
                     .visible(has_talk && self.show_notes)
                     .child(self.notes_panel.clone()),
             );
-        let inspector = self.shows_inspector().then(|| self.inspector.clone());
         h_flex()
             .flex_1()
             .min_h_0()
@@ -441,19 +451,20 @@ impl WorkspaceView {
             .child(
                 div().flex_1().min_w_0().h_full().child(
                 h_resizable("editor-columns")
+                    .with_state(&self.columns)
                     .child(
                         resizable_panel()
                             .size(STRIP_WIDTH)
-                            .size_range(STRIP_MIN_WIDTH..STRIP_MAX_WIDTH)
+                            .size_range(STRIP_MIN_WIDTH..strip_widest)
                             .fixed()
                             .visible(has_talk && self.show_slide_list)
                             .child(self.slide_strip.clone()),
                     )
-                    .child(resizable_panel().child(slide_and_notes))
+                    .child(resizable_panel().size_range(SLIDE_COLUMN_MIN_WIDTH..Pixels::MAX).child(slide_and_notes))
                     .child(
                         resizable_panel()
                             .size(MARKDOWN_WIDTH)
-                            .size_range(MARKDOWN_MIN_WIDTH..MARKDOWN_MAX_WIDTH)
+                            .size_range(MARKDOWN_MIN_WIDTH..markdown_widest)
                             .fixed()
                             .visible(self.show_markdown)
                             .child(
@@ -474,6 +485,17 @@ impl WorkspaceView {
     }
 }
 
+/// How wide the slide list and the Markdown can be, `(list, markdown)`, beside a slide's column
+/// of at least [`SLIDE_COLUMN_MIN_WIDTH`], in `room` across: the list, if it's shown, is
+/// `strip` wide now. The Markdown gives way first, down to its narrowest, then the list.
+pub(super) fn column_limits(room: Pixels, strip: Option<Pixels>, markdown: bool) -> (Pixels, Pixels) {
+    let markdown_least = if markdown { MARKDOWN_MIN_WIDTH } else { px(0.) };
+    let strip_widest = (room - SLIDE_COLUMN_MIN_WIDTH - markdown_least).clamp(STRIP_MIN_WIDTH, STRIP_MAX_WIDTH);
+    let strip_now = strip.map_or(px(0.), |strip| strip.min(strip_widest));
+    let markdown_widest = (room - SLIDE_COLUMN_MIN_WIDTH - strip_now).clamp(MARKDOWN_MIN_WIDTH, MARKDOWN_MAX_WIDTH);
+    (strip_widest, markdown_widest)
+}
+
 /// What tells one state of the talk from another: its text, and where its history stands.
 fn talk_state(
     document: &Document,
@@ -487,4 +509,23 @@ fn talk_state(
         document.undo_label(),
         document.redo_label(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::px;
+
+    use super::{MARKDOWN_MAX_WIDTH, column_limits};
+    use crate::slide_strip::{STRIP_MAX_WIDTH, STRIP_WIDTH};
+
+    #[test]
+    fn the_markdown_gives_way_first_then_the_list() {
+        // 1024 across, less the inspector's 300.
+        let room = px(724.);
+        assert_eq!(column_limits(room, Some(STRIP_WIDTH), true), (px(244.), px(264.)));
+        assert_eq!(column_limits(room, Some(STRIP_MAX_WIDTH), true), (px(244.), px(240.)), "a widened list gives way too");
+        assert_eq!(column_limits(room, None, true).1, px(484.).min(MARKDOWN_MAX_WIDTH));
+        assert_eq!(column_limits(room, Some(STRIP_WIDTH), false).0, STRIP_MAX_WIDTH);
+        assert_eq!(column_limits(px(2000.), Some(STRIP_WIDTH), true), (STRIP_MAX_WIDTH, MARKDOWN_MAX_WIDTH));
+    }
 }

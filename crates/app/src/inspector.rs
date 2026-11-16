@@ -110,11 +110,11 @@ enum Widget {
     File,
 }
 
-/// A colour dragged on a picker's sliders, and the version of the talk's text it was dragged
-/// on: once the text has changed since, by an undo, a redo or a delete, it's let go of unwritten.
+/// A colour dragged on a picker's sliders, and the talk's text it was dragged on, by its hash:
+/// once the text has changed since, by an undo, a redo or a delete, it's let go of unwritten.
 struct Held {
     color: String,
-    version: u64,
+    text: u64,
 }
 
 struct Field {
@@ -418,7 +418,7 @@ impl Inspector {
             .fields
             .into_iter()
             .filter_map(|field| match field.widget {
-                Widget::Color { held: Some(held), .. } if self.is_current(held.version, cx) => Some((field.spec.attr, held.color)),
+                Widget::Color { held: Some(held), .. } if self.is_current(held.text, cx) => Some((field.spec.attr, held.color)),
                 _ => None,
             })
             .collect();
@@ -632,9 +632,9 @@ impl Inspector {
     /// Keeps `color`, dragged in colour field `name`'s picker, for when the picker closes, or
     /// with `None` lets go of what's held. A drag is of the talk as it was when it began.
     fn hold_color(&mut self, name: &str, color: Option<String>, cx: &App) {
-        let version = self.text_version(cx);
+        let text = self.text_hash(cx);
         if let Some(Field { widget: Widget::Color { held, .. }, .. }) = self.field_mut(name) {
-            *held = color.map(|color| Held { version: held.as_ref().map_or(version, |held| held.version), color });
+            *held = color.map(|color| Held { text: held.as_ref().map_or(text, |held| held.text), color });
         }
     }
 
@@ -646,21 +646,26 @@ impl Inspector {
             _ => None,
         };
         if let Some(held) = held {
-            if self.is_current(held.version, cx) {
+            if self.is_current(held.text, cx) {
                 self.write_color(name, &held.color, cx);
             }
             cx.notify();
         }
     }
 
-    /// The version of the talk's text now.
-    fn text_version(&self, cx: &App) -> u64 {
-        self.document.as_ref().map_or(0, |document| document.read(cx).text_version())
+    /// A hash of the talk's text now. A build of its components or a save to another place
+    /// leaves it as it is.
+    fn text_hash(&self, cx: &App) -> u64 {
+        let mut hasher = std::hash::DefaultHasher::new();
+        if let Some(document) = &self.document {
+            std::hash::Hash::hash(document.read(cx).source(), &mut hasher);
+        }
+        std::hash::Hasher::finish(&hasher)
     }
 
-    /// Whether the talk's text is still at `version`.
-    fn is_current(&self, version: u64, cx: &App) -> bool {
-        self.text_version(cx) == version
+    /// Whether the talk's text is still what hashed to `text`.
+    fn is_current(&self, text: u64, cx: &App) -> bool {
+        self.text_hash(cx) == text
     }
 
     /// Writes `color`, as `#rrggbb`, to colour field `name`, unless it's the colour the talk

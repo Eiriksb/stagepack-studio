@@ -10,7 +10,7 @@ use futures::channel::mpsc;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input;
 use gpui_kit::component::menu::DropdownMenu as _;
-use gpui_kit::component::resizable::{h_resizable, resizable_panel, v_resizable};
+use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
 use gpui_kit::component::{
     ActiveTheme as _, Sizable as _, TitleBar, WindowExt as _, h_flex, v_flex,
 };
@@ -56,6 +56,14 @@ pub const CANVAS_ID: &str = "canvas";
 pub const TITLE_ID: &str = "title";
 pub const NOTICES_ID: &str = "notices";
 pub const STATUS_ID: &str = "status";
+/// The slide's column: the slide on its desk, and the notes under it.
+pub const SLIDE_COLUMN_ID: &str = "slide-column";
+
+/// The narrowest the window can be: room for the slide list, the slide, the Markdown and the
+/// inspector, each at its narrowest or more.
+pub const MIN_WINDOW_WIDTH: Pixels = px(1024.);
+/// The narrowest the slide's column is ever made by the panels beside it.
+pub const SLIDE_COLUMN_MIN_WIDTH: Pixels = px(240.);
 pub const PROBLEM_ID: &str = "problem";
 pub const MARKDOWN_ID: &str = "markdown";
 pub const FILE_MENU_ID: &str = "file-menu";
@@ -94,7 +102,8 @@ const RELOAD_DELAY: Duration = Duration::from_millis(100);
 const STATUS_FADE: Duration = Duration::from_secs(5);
 
 const MARKDOWN_WIDTH: Pixels = px(380.);
-const MARKDOWN_MIN_WIDTH: Pixels = px(200.);
+/// The Markdown panel gives way down to this before the slide does.
+const MARKDOWN_MIN_WIDTH: Pixels = px(240.);
 const MARKDOWN_MAX_WIDTH: Pixels = px(800.);
 
 const SLIDEV_TALK: &str =
@@ -274,8 +283,10 @@ pub struct WorkspaceView {
     show_slide_list: bool,
     notes_panel: Entity<NotesPanel>,
     show_notes: bool,
-    /// The form for the thing selected, at the right while one is.
+    /// The form for the thing selected, always at the right.
     inspector: Entity<Inspector>,
+    /// How wide the slide list, the slide's column and the Markdown are.
+    columns: Entity<ResizableState>,
     focus_handle: FocusHandle,
     /// Keeps the talk's folder watched for as long as the window is open.
     watcher: Option<watcher::TalkWatcher>,
@@ -490,6 +501,7 @@ impl WorkspaceView {
             notes_panel,
             show_notes: panels.notes,
             inspector,
+            columns: cx.new(|_| ResizableState::default()),
             focus_handle,
             watcher: None,
             opened_from_path: false,
@@ -606,7 +618,7 @@ impl WorkspaceView {
                 title: Some("Stagepack Studio".into()),
                 ..TitleBar::title_bar_options()
             }),
-            window_min_size: Some(size(px(800.), px(500.))),
+            window_min_size: Some(size(MIN_WINDOW_WIDTH, px(500.))),
             app_id: Some(APP_ID.into()),
             ..TitleBar::window_options()
         }
@@ -1182,7 +1194,7 @@ impl WorkspaceView {
 }
 
 impl Render for WorkspaceView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let build_bar = self.build_bar(cx);
         // The bars that need an answer.
         let bars: Vec<AnyElement> = self
@@ -1339,7 +1351,7 @@ impl Render for WorkspaceView {
                 ),
             )
             .child(self.ribbon.clone())
-            .child(self.editor_area(canvas, bars, cx))
+            .child(self.editor_area(canvas, bars, window.viewport_size().width, cx))
             .children(component_problems)
             .children(build_bar)
             .when(!notices.is_empty(), |this| {
