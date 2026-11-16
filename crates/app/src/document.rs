@@ -894,7 +894,20 @@ impl Document {
     /// with nothing changed, unless it makes exactly one slide there, every other slide keeping
     /// its text: a text that would split into several slides, or take in the slide after it,
     /// isn't pasted.
+    ///
+    /// An empty talk, whose text is nothing but whitespace and perhaps a byte order mark, has one
+    /// slide with nothing on it: the pasted slide takes its place as the talk's only slide, after
+    /// the byte order mark, with the talk's line endings. Any talk settings it holds stay its
+    /// own, as a pasted slide's always do. It's refused unless it makes exactly one slide.
     pub fn paste_slide(&mut self, text: &str) -> Result<Vec<usize>, EditRefused> {
+        let source = self.source();
+        let bom = if source.starts_with('\u{feff}') { "\u{feff}" } else { "" };
+        if self.slide_count() == 1 && source[bom.len()..].trim().is_empty() {
+            let eol = if source.contains("\r\n") { "\r\n" } else { "\n" };
+            let slide = guarded(|| first_slide_text(text))?.replace("\r\n", "\n").replace('\n', eol);
+            let change = Change::single(SourceEdit { range: 0..source.len(), text: format!("{bom}{slide}") });
+            return self.make(PASTE_SLIDE, change, Holds::Count(0), 0, 0, None);
+        }
         let at = self.current;
         let change = self.build(|talk| slides_format::insert_slide(talk, Some(at), text))?;
         self.make(PASTE_SLIDE, change, Holds::Inserted(at + 1), at, at + 1, None)
@@ -1799,6 +1812,20 @@ fn others_alike(before: &Talk, after: &Talk, index: usize) -> bool {
         && (0..before.slides.len())
             .filter(|&at| at != index)
             .all(|at| text(before, at) == text(after, at))
+}
+
+/// `text`, a slide's own text as [`slides_format::slide_text_for_copy`] gives it, as a talk's
+/// first and only slide: with none of the talk's settings, which as the first slide it would
+/// otherwise become, and with a break line before it if it starts with settings of its own,
+/// which only then are read as its settings block. Text that isn't one slide is given as it is.
+fn first_slide_text(text: &str) -> String {
+    let later = format!("---\n{text}");
+    let talk = parse_talk(&later);
+    if talk.slides.len() != 1 {
+        return text.to_string();
+    }
+    let own = slides_format::slide_text_for_copy(&talk, 0);
+    if parse_talk(&own).slides.len() == 1 { own } else { format!("---\n{own}") }
 }
 
 /// Whether every slide of `before` keeps its text in `after`, which has a slide added at

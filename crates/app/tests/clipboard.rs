@@ -403,28 +403,16 @@ fn a_paste_too_large_is_refused(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn broken_clipboard_data_falls_back_to_plain_text(cx: &mut TestAppContext) {
     let talk = open(cx, TWO);
-    let wrap = |paras: &str| format!(r#"{{"{APP_KEY}":{{"kind":"text","version":1,"paras":{paras}}}}}"#);
-    let span = |extra: &str| wrap(&format!(r#"[{{"kind":"body","spans":[{{"text":"styled"{extra}}}]}}]"#));
-    let huge = wrap(&format!(r#"[{{"kind":"body","spans":[{{"text":"{}"}}]}}]"#, "y".repeat(MAX_BYTES)));
-    let broken = [
+    let huge = text_metadata(serde_json::json!({ "kind": "body", "spans": [{ "text": "y".repeat(MAX_BYTES) }] }));
+    let mut broken = vec![
         "not json".to_string(),
-        r#"{"other-app":{"kind":"text","version":1,"paras":[]}}"#.to_string(),
-        wrap(r#"[{"kind":"body","spans":[{"text":"styled"}]}]"#).replace("\"version\":1", "\"version\":2"),
-        wrap(r#"[{"kind":"bullet","level":99,"spans":[{"text":"styled"}]}]"#),
-        wrap(r#"[{"kind":"heading","level":0,"spans":[{"text":"styled"}]}]"#),
-        wrap(r#"[{"kind":"title","spans":[{"text":"styled"}]}]"#),
-        span(r#","size":0"#),
-        span(r#","size":513"#),
-        span(r#","color":"red\" onclick=\"x"#),
-        span(r#","color":"<b>"#),
-        span(r##","color":"#12345g"##),
-        span(r#","link":"javascript:alert(1)"#),
-        span(r#","link":"data:text/html,x"#),
-        span(r#","link":"a\u0001b"#),
-        span(r#","bold":"yes"#),
+        serde_json::json!({ "other-app": { "kind": "text", "version": 1, "paras": [] } }).to_string(),
+        serde_json::json!({ APP_KEY: { "kind": "text", "version": 2, "paras": [{ "kind": "body", "spans": [{ "text": "styled" }] }] } }).to_string(),
         huge,
     ];
+    broken.extend(one_bad_field().into_iter().map(|(_, metadata)| metadata));
     for metadata in broken {
+        assert!(metadata == "not json" || serde_json::from_str::<serde_json::Value>(&metadata).is_ok(), "well formed: {metadata:.80}");
         talk.click_text(cx, 1, pos(0, 0));
         put(cx, "plain\u{0}words ", Some(&metadata));
         talk.press(cx, "ctrl-v");
@@ -433,6 +421,64 @@ fn broken_clipboard_data_falls_back_to_plain_text(cx: &mut TestAppContext) {
         assert!(para.spans.iter().all(|span| span.style == Style::default()), "{metadata:.80}");
         talk.press(cx, "ctrl-z");
         assert_eq!(talk.source(cx), TWO);
+    }
+}
+
+/// The app's text metadata holding the one paragraph `para`.
+fn text_metadata(para: serde_json::Value) -> String {
+    serde_json::json!({ APP_KEY: { "kind": "text", "version": 1, "paras": [para] } }).to_string()
+}
+
+/// A good paragraph, a bold span of "styled", as the app's metadata holds it.
+fn good_para() -> serde_json::Value {
+    serde_json::json!({ "kind": "bullet", "level": 1, "spans": [{ "text": "styled", "bold": true, "color": "#00ff7f", "size": 40, "link": "https://example.com" }] })
+}
+
+/// Well-formed metadata, each with exactly one field of [`good_para`] made bad, and what it is.
+fn one_bad_field() -> Vec<(String, String)> {
+    let span = |field: &str, value: serde_json::Value| {
+        let mut para = good_para();
+        para["spans"][0][field] = value;
+        (format!("{field} {}", para["spans"][0][field]), text_metadata(para))
+    };
+    let para = |field: &str, value: serde_json::Value| {
+        let mut para = good_para();
+        para[field] = value;
+        (format!("{field} {}", para[field]), text_metadata(para))
+    };
+    vec![
+        span("link", "javascript:alert(1)".into()),
+        span("link", "//host".into()),
+        span("link", "a/../b".into()),
+        span("link", "http:x".into()),
+        span("link", "data:text/html,x".into()),
+        span("link", "a\u{1}b".into()),
+        span("color", "red\" x=\"".into()),
+        span("color", "#ffff".into()),
+        span("color", "url(x)".into()),
+        span("color", "<b>".into()),
+        span("size", 0.into()),
+        span("size", 513.into()),
+        span("bold", "yes".into()),
+        span("text", 5.into()),
+        para("level", 9.into()),
+        para("kind", "title".into()),
+        // A body paragraph has no level; the good one's is 1.
+        para("kind", "body".into()),
+    ]
+}
+
+#[test]
+fn metadata_with_one_bad_field_falls_back_to_plain_text() {
+    // The good paragraph itself pastes with its styles: the bad field is all that's wrong.
+    let good = text_metadata(good_para());
+    let TextPaste::Styled(paras) = text_to_paste(Some("plain"), Some(&good)).unwrap() else { panic!("the good one pastes styled") };
+    let style = &paras[0].spans[0].style;
+    assert_eq!((style.color.as_deref(), style.size, style.link.as_deref()), (Some("#00ff7f"), Some(40), Some("https://example.com")));
+    for (what, metadata) in one_bad_field() {
+        assert!(serde_json::from_str::<serde_json::Value>(&metadata).is_ok(), "{what}: well formed");
+        assert_eq!(decode_paras(&metadata), None, "{what}");
+        assert_eq!(text_to_paste(Some("plain"), Some(&metadata)), Ok(TextPaste::Plain("plain".to_string())), "{what}");
     }
 }
 
@@ -665,6 +711,59 @@ fn plain_text_pastes_as_a_slide(cx: &mut TestAppContext) {
     talk.press(cx, "ctrl-v");
     assert_eq!(talk.status(cx).as_deref(), Some(TOO_LARGE));
     assert_eq!(talk.source(cx), before);
+}
+
+#[gpui_kit::test]
+fn plain_text_of_settings_alone_is_no_slide_and_blank_lines_go_with_a_leading_break(cx: &mut TestAppContext) {
+    let talk = open(cx, THREE);
+    talk.click(cx, strip_row_id(0));
+    for plain in ["title: Evil\n---\n", "---\ntitle: Evil\n---\n", "\n  \n---\ntitle: Evil\nlayout: section\n---\n", "hidden: true\n---\n\n"] {
+        put(cx, plain, None);
+        talk.press(cx, "ctrl-v");
+        assert_eq!(talk.source(cx), THREE, "{plain:?}");
+        assert_eq!(talk.status(cx).as_deref(), Some(NO_SLIDE), "{plain:?}");
+    }
+    put(cx, "\n \t\n---\n# From an editor\n", None);
+    talk.press(cx, "ctrl-v");
+    assert_eq!(talk.titles(cx), ["One", "From an editor", "Two", "Three"]);
+    assert!(talk.source(cx).starts_with("# One\n\nfirst words\n\n---\n# From an editor\n"), "{:?}", talk.source(cx));
+}
+
+/// Opens `source` as a talk, with no window.
+fn document_of(source: &str) -> (tempfile::TempDir, Document) {
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::write(folder.path().join("slides.md"), source).unwrap();
+    let document = Document::open(folder.path(), Fonts::bundled_only()).unwrap();
+    (folder, document)
+}
+
+#[test]
+fn a_slide_pastes_into_an_empty_talk_as_its_only_slide() {
+    let (_from_folder, from) = document_of("---\ntitle: Theirs\nlayout: section\n---\n\n# One\n");
+    let copied = from.current_for_copy().unwrap();
+    let plain = clipboard::slide_to_paste(Some("# Plain\n\nwords\n"), None).unwrap().unwrap();
+    let cases = [
+        ("", &copied, "---\nlayout: section\n---\n\n# One\n"),
+        ("", &plain, "# Plain\n\nwords\n"),
+        ("\u{feff}", &plain, "\u{feff}# Plain\n\nwords\n"),
+        ("\u{feff}", &copied, "\u{feff}---\nlayout: section\n---\n\n# One\n"),
+        ("  \r\n\r\n", &plain, "# Plain\r\n\r\nwords\r\n"),
+    ];
+    for (empty, text, expected) in cases {
+        let (_folder, mut document) = document_of(empty);
+        document.paste_slide(text).unwrap();
+        assert_eq!(document.source(), expected, "{empty:?} {text:?}");
+        assert_eq!(document.slide_count(), 1);
+        assert_eq!(document.undo_label(), Some("Paste slide"));
+        let settings = document.talk().slides[0].settings.clone();
+        assert!(settings.as_ref().is_none_or(|settings| settings.get("title").is_none()), "the talk settings stay behind");
+        document.undo().unwrap();
+        assert_eq!(document.source(), empty, "one undo gives the empty talk back");
+    }
+    // Two slides' worth is refused there too.
+    let (_folder, mut document) = document_of("");
+    assert!(document.paste_slide("# A\n\n---\n\n# B\n").is_err());
+    assert_eq!(document.source(), "");
 }
 
 #[gpui_kit::test]
