@@ -655,7 +655,6 @@ fn a_new_pictures_size_fits_and_keeps_its_shape() {
     assert_eq!(picture(&mut d, "drawn.svg"), (200.0, 100.0));
     assert_eq!(picture(&mut d, "bad.png"), (640.0, 360.0), "unreadable");
     assert_eq!(picture(&mut d, "missing.png"), (640.0, 360.0));
-    assert_eq!(picture(&mut d, "../outside.png"), (640.0, 360.0));
     assert_eq!(d.default_size("Picture", &[]), (640.0, 360.0));
     assert_eq!(d.default_size("Icon", &[("name", "star"), ("size", "96")]), (96.0, 96.0));
     assert_eq!(d.default_size("Icon", &[("name", "star")]), (64.0, 64.0), "an icon's own size");
@@ -663,4 +662,18 @@ fn a_new_pictures_size_fits_and_keeps_its_shape() {
     assert_eq!(d.default_size("Icon", &[("size", "1e30")]), (3840.0, 3840.0), "held to the most a box can be");
     assert_eq!(d.default_size("Box", &[]), (640.0, 360.0));
     assert_eq!(d.default_size("Chart", &[("kind", "bar")]), (640.0, 360.0));
+}
+
+#[test]
+fn a_picture_outside_the_talks_folder_is_not_measured() {
+    let dir = tempfile::tempdir().unwrap();
+    let talk = dir.path().join("talk");
+    std::fs::create_dir_all(talk.join("assets")).unwrap();
+    std::fs::write(dir.path().join("outside.png"), blank_png(100, 50)).unwrap();
+    std::fs::write(talk.join("assets/inside.png"), blank_png(100, 50)).unwrap();
+    let mut d = Deck::open(Box::new(FolderFiles::new(talk.clone())), Fonts::bundled_only(), "# One\n".to_string());
+    assert_eq!(d.default_size("Picture", &[("src", "assets/inside.png")]), (100.0, 50.0), "one in the folder is");
+    assert_eq!(d.default_size("Picture", &[("src", "../outside.png")]), (640.0, 360.0));
+    let absolute = dir.path().join("outside.png");
+    assert_eq!(d.default_size("Picture", &[("src", absolute.to_str().unwrap())]), (640.0, 360.0));
 }

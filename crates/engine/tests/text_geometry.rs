@@ -418,7 +418,7 @@ fn a_click_in_a_box_away_from_its_text_goes_to_the_nearest_paragraph() {
 fn a_click_on_a_component_says_why() {
     let source = "# T\n\n<Box fill=\"#dbeafe\">\n\nBoxed but not placed\n\n</Box>\n\n<Text x=\"1000\" y=\"600\" w=\"400\" h=\"200\">\n\n| a |\n|---|\n| b |\n\n</Text>\n";
     let layout = layout(source);
-    assert_eq!(hit_at(&layout, (300.0, 250.0)), Hit::Uneditable("Text inside a component can't be edited on the slide yet."), "its text");
+    assert!(hit_source(source, &hit_at(&layout, (300.0, 250.0))).starts_with("<Box fill="), "its words are part of it");
     assert_eq!(hit_source(source, &hit_at(&layout, (1100.0, 620.0))), "| a |\n|---|\n| b |", "a table in a box is a thing of its own");
     assert!(hit_source(source, &hit_at(&layout, (1350.0, 780.0))).starts_with("<Text x=\"1000\""), "the box, away from its table");
 }
@@ -714,10 +714,12 @@ fn a_point_on_nothing_gives_nothing() {
     assert_eq!(element_at(&layout, code), None);
 }
 
-/// The points just outside `element`'s rectangle, on each side, turned with it.
+/// The points just outside where `element` is picked, on each side, turned with it.
 fn just_outside(element: &ElementBox) -> [(f32, f32); 4] {
-    let Rect { x, y, w, h } = element.rect;
+    // Picked as at least 16 thick, about its middle.
     let (cx, cy) = centre(element.rect);
+    let (w, h) = (element.rect.w.max(16.0), element.rect.h.max(16.0));
+    let (x, y) = (cx - w / 2.0, cy - h / 2.0);
     [(x - 0.5, cy), (x + w + 0.5, cy), (cx, y - 0.5), (cx, y + h + 0.5)].map(|point| on_slide(element, point))
 }
 
@@ -782,4 +784,58 @@ fn geometry_never_panics_on_any_point() {
             let _ = layout.element(&range);
         }
     }
+}
+
+#[test]
+fn what_cannot_be_typed_in_a_component_is_the_component() {
+    let source = "# T\n\n<Box fill=\"#ff0000\">\n\nBoxed words\n\n```\ncode\n```\n\n</Box>\n";
+    let layout = layout(source);
+    let boxed = "<Box fill=\"#ff0000\">\n\nBoxed words\n\n```\ncode\n```\n\n</Box>";
+    assert_eq!(hit_source(source, &hit_at(&layout, (103.0, 223.0))), boxed, "its padding");
+    let words = (160.0, 260.0);
+    assert_eq!(hit_source(source, &hit_at(&layout, words)), boxed, "its words");
+    let code = layout.element_at(150.0, 340.0).expect("the box is under its code");
+    assert_eq!(hit_at(&layout, (150.0, 340.0)), Hit::Element(code), "code in it");
+    // Outside a component, they still say why.
+    let mixed = self::layout("# T\n\nWords and ![a picture](x.png) mixed\n");
+    assert!(matches!(hit_at(&mixed, (120.0, 240.0)), Hit::Uneditable(_)), "{:?}", hit_at(&mixed, (120.0, 240.0)));
+    let quote = self::layout("# T\n\n> A quote\n");
+    assert_eq!(hit_at(&quote, (130.0, 240.0)), Hit::Uneditable("Quotes can't be edited on the slide yet."));
+}
+
+#[test]
+fn an_icon_in_a_quote_is_the_icon() {
+    let source = "# T\n\n> <Icon name=\"star\" />\n";
+    let layout = layout(source);
+    let tag = "<Icon name=\"star\" />";
+    let start = source.find(tag).unwrap();
+    let icon = layout.element(&(start..start + tag.len())).expect("the icon is a thing of its own, with its tag's exact range");
+    let at = centre(icon.rect);
+    assert_eq!(hit_at(&layout, at), Hit::Element(icon.clone()), "a click on it is on the icon, not the quote");
+    assert_eq!(hit_source(source, &hit_at(&layout, at)), tag);
+    assert_eq!(layout.element_at(at.0, at.1), Some(icon));
+}
+
+#[test]
+fn a_thin_line_is_picked_near_it() {
+    let source = "# T\n\n<Shape kind=\"line\" x=\"100\" y=\"500\" w=\"400\" h=\"0\" outline=\"black\" />\n\n<Box x=\"350\" y=\"504\" w=\"200\" h=\"100\" fill=\"blue\" />\n";
+    let mut d = deck(source);
+    let layout = d.text_layout(0);
+    let line = layout.element(&block_starting(&d, 0, "<Shape")).expect("the line");
+    assert_eq!(line.rect, Rect { x: 100.0, y: 500.0, w: 400.0, h: 0.0 }, "its box is as drawn");
+    for y in [493.0, 500.0, 507.0] {
+        assert!(source_at(&d, &layout, (200.0, y)).starts_with("<Shape"), "at y {y}");
+        assert!(hit_source(d.source(), &hit_at(&layout, (200.0, y))).starts_with("<Shape"), "hit at y {y}");
+    }
+    assert_eq!(source_at(&d, &layout, (200.0, 509.0)), "", "too far below");
+    assert!(source_at(&d, &layout, (400.0, 506.0)).starts_with("<Box"), "the box drawn after it is on top");
+    assert!(hit_source(d.source(), &hit_at(&layout, (400.0, 506.0))).starts_with("<Box"));
+    assert!(source_at(&d, &layout, (400.0, 502.0)).starts_with("<Shape"), "above the box, the line's own");
+    // Turned a quarter about its centre (300, 500), it stands upright from y 300 to 700.
+    let turned = source.replace("h=\"0\"", "h=\"0\" rotate=\"90\"");
+    let mut d = deck(&turned);
+    let layout = d.text_layout(0);
+    assert!(source_at(&d, &layout, (293.0, 400.0)).starts_with("<Shape"));
+    assert_eq!(source_at(&d, &layout, (291.0, 400.0)), "");
+    assert_eq!(source_at(&d, &layout, (200.0, 500.0)), "", "where it would be unturned");
 }

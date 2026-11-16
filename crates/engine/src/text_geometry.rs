@@ -275,6 +275,16 @@ fn is_element(block: &Block) -> bool {
     }
 }
 
+/// The least an element is thick where it's picked, so that a line can be.
+const PICK_THICKNESS: f32 = 16.0;
+
+/// Where an element drawn in `rect` is picked: at least `PICK_THICKNESS` each way, about
+/// its middle.
+fn picked(rect: Rect) -> Rect {
+    let (w, h) = (rect.w.max(PICK_THICKNESS), rect.h.max(PICK_THICKNESS));
+    Rect { x: rect.x + (rect.w - w) / 2.0, y: rect.y + (rect.h - h) / 2.0, w, h }
+}
+
 fn frame_of(rect: Rect, rotate: f32, whole: bool, region: Option<(&'static str, Rect)>) -> Frame {
     Frame { rect, rotate, centre: (rect.x + rect.w / 2.0, rect.y + rect.h / 2.0), whole, region }
 }
@@ -405,13 +415,13 @@ impl TextLayout {
                 let rect = Rect { x: origin.x + block.rect.x, y: origin.y + block.rect.y, ..block.rect };
                 let at = block_at(blocks, &block.range).filter(|block| is_element(block)).map(|_| element(&block.range, rect));
                 if let Some(reason) = uneditable_reason(talk, index, block.range.start) {
-                    found.push((rect, reason, at));
+                    found.push((if at.is_some() { picked(rect) } else { rect }, reason, at));
                 }
             }
             if text.whole
                 && let Some(reason) = specs[layer].source.as_ref().and_then(|source| uneditable_reason(talk, index, source.start))
             {
-                found.push((origin, reason, whole));
+                found.push((if whole.is_some() { picked(origin) } else { origin }, reason, whole));
             }
             found.sort_by(|a, b| (a.0.w * a.0.h).total_cmp(&(b.0.w * b.0.h)));
             layout.uneditable.extend(found.into_iter().map(|(rect, reason, element)| (layer, rect, reason, element)));
@@ -522,10 +532,12 @@ impl TextLayout {
                 let placed = &self.paras[at];
                 return Some(Hit::Text { flow: placed.flow, pos: Pos { para: placed.para, offset: self.offset_at(at, point) } });
             }
-            let why = self.uneditable.iter().find(|(on, rect, ..)| *on == layer && contains(rect, point));
-            if let Some((_, _, reason, element)) = why {
+            let under = |(on, rect, ..): &&(usize, Rect, &'static str, Option<usize>)| *on == layer && contains(rect, point);
+            if let Some((_, _, reason, element)) = self.uneditable.iter().find(under) {
+                // What can't be typed in an element is part of it: the innermost that holds it.
+                let element = element.or_else(|| self.uneditable.iter().filter(under).find_map(|(.., element)| *element));
                 return Some(match element {
-                    Some(at) => Hit::Element(self.elements[*at].clone()),
+                    Some(at) => Hit::Element(self.elements[at].clone()),
                     None => Hit::Uneditable(reason),
                 });
             }
@@ -556,14 +568,15 @@ impl TextLayout {
     }
 
     /// The topmost element under the point (`x`, `y`) of the slide, whether or not the point
-    /// is on its text: the one drawn last, each in its turned shape.
+    /// is on its text: the one drawn last, each in its turned shape and at least
+    /// `PICK_THICKNESS` thick.
     pub fn element_at(&self, x: f32, y: f32) -> Option<ElementBox> {
         if !x.is_finite() || !y.is_finite() {
             return None;
         }
         let under = |element: &&ElementBox| {
             let Rect { x: left, y: top, w, h } = element.rect;
-            contains(&element.rect, turned(x, y, (left + w / 2.0, top + h / 2.0), -element.rotate))
+            contains(&picked(element.rect), turned(x, y, (left + w / 2.0, top + h / 2.0), -element.rotate))
         };
         self.elements.iter().rev().find(under).cloned()
     }
