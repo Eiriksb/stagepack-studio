@@ -527,5 +527,6 @@ fn a_slides_file_that_is_there_but_cannot_be_read_is_not_written_over() {
 fn a_missing_slides_file_is_written_without_asking() {
     let (problem, dir) = save_over(|file| std::fs::remove_file(file).unwrap());
     assert_eq!(problem, None);
-    assert!(read(&dir.path().join("slides.md")).contains("# \n"), "the edit was saved");
+    let saved = read(&dir.path().join("slides.md"));
+    assert_eq!(saved.lines().filter(|line| *line == "---").count(), 4, "the edit was saved: {saved}");
 }

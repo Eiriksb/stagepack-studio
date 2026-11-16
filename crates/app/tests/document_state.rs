@@ -661,7 +661,7 @@ fn adding_a_slide_makes_it_the_current_one() {
 fn a_content_slide_needs_no_settings() {
     let (_d, mut doc) = talk("# One\n");
     doc.add_slide("content").unwrap();
-    assert_eq!(doc.source(), "# One\n---\n# \n");
+    assert_eq!(doc.source(), "# One\n---\n\n");
     assert!(doc.talk().slides[1].settings.is_none());
 }
 

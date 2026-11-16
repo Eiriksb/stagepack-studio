@@ -14,7 +14,7 @@ use gpui_kit::{
     MouseMoveEvent, MouseUpEvent, Pixels, Point, TestAppContext, VisualTestContext, Window,
     WindowBounds, WindowOptions, point, px, size,
 };
-use slides_engine::{Fonts, Hit, TextLayout};
+use slides_engine::{Fonts, Hit, TextLayout, layout_by_name};
 use slides_format::{FlowPlace, ParaKind, Pos, Selection, TextFlow, text_flows};
 use stagepack_studio::document::{Document, LAYOUT_FAILED, TalkPlace, panic_in_next_layout};
 use stagepack_studio::ribbon::{DELETE_ID, DUPLICATE_ID, HIDE_ID, NEW_SLIDE_ID};
@@ -717,8 +717,7 @@ fn a_new_slide_can_be_typed_into_straight_away(cx: &mut TestAppContext) {
     let typing = open(cx, "# One\n");
     typing.press(cx, "ctrl-m");
     assert_eq!((typing.slide_count(cx), typing.current(cx)), (2, 1));
-    let title = typing.layout(cx).paras()[0].rect;
-    let at = typing.at(cx, title.x + title.w / 2., title.y + title.h / 2.);
+    let at = typing.placeholder_point(cx, "title");
     typing.click(cx, at);
     typing.type_text(cx, "Two");
     let at = typing.placeholder_point(cx, "body");
@@ -728,6 +727,30 @@ fn a_new_slide_can_be_typed_into_straight_away(cx: &mut TestAppContext) {
     assert_eq!(typing.text_of(cx, 1, 1), ["Its words"]);
     assert_eq!(typing.text_of(cx, 0, 0), ["One"]);
     assert_eq!(typing.slide_count(cx), 2);
+}
+
+#[gpui_kit::test]
+fn a_new_slide_of_each_layout_offers_each_of_its_places(cx: &mut TestAppContext) {
+    // Seen in the real window: a new slide's title was an empty heading, so it was drawn as
+    // nothing, with no "Click to add title" to click.
+    for name in ["title", "content", "two-columns", "section", "blank"] {
+        let typing = open(cx, "# One\n");
+        let document = typing.document(cx);
+        cx.update(|cx| document.update(cx, |document, _| document.add_slide(name)))
+            .unwrap();
+        typing.settle(cx);
+        assert_eq!(typing.current(cx), 1);
+        let layout = typing.layout(cx);
+        for region in layout_by_name(name).unwrap().regions {
+            assert!(
+                layout.placeholder(region.name).is_some(),
+                "a new {name} slide offers its {} region: {}",
+                region.name,
+                typing.source(cx)
+            );
+        }
+        assert_eq!(typing.text_of(cx, 0, 0), ["One"]);
+    }
 }
 
 #[gpui_kit::test]

@@ -834,15 +834,15 @@ impl Document {
         Ok(changed)
     }
 
-    /// Adds a slide with the layout called `layout` after the current one, with an empty
-    /// heading, and makes it the current slide. A name that isn't a layout's is taken as the
-    /// default one.
+    /// Adds a slide with the layout called `layout` after the current one, with nothing in
+    /// it, so each of its places offers to be typed in, and makes it the current slide. A
+    /// name that isn't a layout's is taken as the default one.
     pub fn add_slide(&mut self, layout: &str) -> Result<Vec<usize>, EditRefused> {
         let layout = layout_by_name(layout).map_or(DEFAULT_LAYOUT, |layout| layout.name);
         let text = if layout == DEFAULT_LAYOUT {
-            "# \n".to_string()
+            "\n".to_string()
         } else {
-            format!("layout: {layout}\n---\n\n# \n")
+            format!("layout: {layout}\n---\n\n")
         };
         let at = self.current;
         let change = self.build(|talk| slides_format::insert_slide(talk, Some(at), &text))?;

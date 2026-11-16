@@ -1931,7 +1931,8 @@ fn closing_with_save_while_a_save_runs_writes_the_last_edits(cx: &mut TestAppCon
     cx.run_until_parked();
 
     assert_eq!(std::fs::read_to_string(&talk.file).unwrap(), source_of(cx, &talk.view));
-    assert!(source_of(cx, &talk.view).matches("# ").count() >= 3, "both slides were added");
+    let rules = source_of(cx, &talk.view).lines().filter(|line| *line == "---").count();
+    assert_eq!(rules, 4, "both slides were added");
     assert!(!is_open(cx, talk.handle));
 }
 
