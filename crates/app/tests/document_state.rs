@@ -923,7 +923,7 @@ fn with_empty_lines() -> (tempfile::TempDir, Document) {
     assert!(doc.begin_text_in_region(0, "body"));
     doc.apply_text(|edit| edit.enter()).unwrap();
     doc.apply_text(|edit| edit.enter()).unwrap();
-    assert!(doc.source().contains("<Text></Text>"), "{}", doc.source());
+    assert!(doc.source().contains("&nbsp;"), "{}", doc.source());
     (dir, doc)
 }
 

@@ -1092,7 +1092,7 @@ fn typed_empty_lines(cx: &mut TestAppContext) -> Typing {
     typing.click(cx, at);
     typing.press(cx, "enter");
     typing.press(cx, "enter");
-    assert!(typing.source(cx).contains("<Text></Text>"), "{}", typing.source(cx));
+    assert!(typing.source(cx).contains("&nbsp;"), "{}", typing.source(cx));
     assert!(typing.editing(cx).is_some());
     typing
 }

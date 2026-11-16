@@ -160,8 +160,12 @@ fn tidy(spans: &[Span]) -> Vec<Span> {
     out
 }
 
-/// Something that's read as text, and holds none: an empty tag in marks, as a line holding
-/// only a tag is read as a block of its own.
+/// An empty paragraph: a no-break space, which is read as no text when it's all a
+/// paragraph holds. A paragraph that's one no-break space is written as `&#160;`.
+const EMPTY_LINE: &str = "&nbsp;";
+/// Something that's read as text, and holds none, for the line after a line break that ends
+/// a paragraph: an empty tag in marks, as a line holding only a tag is read as a block of
+/// its own.
 const NOTHING: &str = "**<Text></Text>**";
 /// The same, for where `**` can't open, as straight after a byte order mark.
 const NOTHING_AFTER_ANYTHING: &str = "<Text></Text>**<Text></Text>**";
@@ -357,6 +361,11 @@ impl Writer<'_> {
             }
             if self.edge.get(at).copied().unwrap_or(false) {
                 self.raw(if c == '\t' { "&#9;" } else { "&#32;" });
+                continue;
+            }
+            if c == '\u{a0}' && self.edge.len() == c.len_utf8() {
+                // Alone, `&nbsp;` is an empty paragraph, and the character itself may be.
+                self.raw("&#160;");
                 continue;
             }
             let before = index.checked_sub(1).map(|i| chars[i].1);
@@ -708,7 +717,7 @@ fn block_text(para: &Para, shape: Option<&Shape>, src: &Source, keep: Option<&st
         None => inline_for(&para.spans, probe, &Inline { heading, indent, eol: src.eol }, src.ways),
     };
     match para.kind {
-        ParaKind::Body if para.spans.is_empty() => Some(src.ways.nothing.to_string()),
+        ParaKind::Body if para.spans.is_empty() => Some(EMPTY_LINE.to_string()),
         ParaKind::Body => inline(Probe::Body, false, &src.base),
         ParaKind::Heading(level) => {
             let hashes = "#".repeat(usize::from(level));

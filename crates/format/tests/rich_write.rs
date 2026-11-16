@@ -342,7 +342,7 @@ fn enter_at_the_end_of_a_paragraph_is_not_refused() {
     let paras = [para(BODY, "a"), Para { kind: BODY, spans: vec![] }];
     assert_eq!(storable(&paras), paras);
     let (after, flows) = written(source, 0, 1, &paras);
-    assert_eq!(after, "# T\n\na\n\n**<Text></Text>**\n");
+    assert_eq!(after, "# T\n\na\n\n&nbsp;\n");
     assert_eq!(flows[1].paras, paras);
     // Typing into the empty paragraph.
     let (after, flows) = written(&after, 0, 1, &[para(BODY, "a"), para(BODY, "b")]);
@@ -352,6 +352,37 @@ fn enter_at_the_end_of_a_paragraph_is_not_refused() {
     let (after, flows) = written(source, 0, 1, &[para(BODY, "a"), Para { kind: BULLET, spans: vec![] }, Para { kind: ParaKind::Heading(2), spans: vec![] }]);
     assert_eq!(after, "# T\n\na\n\n-\n\n##\n");
     assert_eq!(flows[1].paras.len(), 3);
+}
+
+#[test]
+fn an_empty_line_is_written_as_a_no_break_space() {
+    let empty = Para { kind: BODY, spans: vec![] };
+    let (after, flows) = written("# T\n\nOld.\n", 0, 1, &[para(BODY, "a"), empty.clone(), para(BODY, "b")]);
+    assert_eq!(after, "# T\n\na\n\n&nbsp;\n\nb\n");
+    assert_eq!(flows[1].paras, [para(BODY, "a"), empty.clone(), para(BODY, "b")]);
+    // Straight after a byte order mark, and in a box, the same.
+    let (after, flows) = written("\u{feff}Old.\n", 0, 0, &[empty.clone(), para(BODY, "b")]);
+    assert_eq!(after, "\u{feff}&nbsp;\n\nb\n");
+    assert_eq!(flows[0].paras, [empty.clone(), para(BODY, "b")]);
+    let boxed = "# T\n\n<Box x=\"10\" y=\"10\">\n\nIn a box\n\n</Box>\n";
+    let (after, flows) = written(boxed, 0, 1, &[empty.clone(), para(BODY, "In a box")]);
+    assert!(after.contains("\n\n&nbsp;\n\nIn a box\n"), "{after:?}");
+    assert_eq!(flows[1].paras, [empty, para(BODY, "In a box")]);
+}
+
+#[test]
+fn a_paragraph_of_one_no_break_space_stays_one() {
+    for spans in [vec![plain("\u{a0}")], vec![styled("\u{a0}", bold())]] {
+        let paras = [Para { kind: BODY, spans }];
+        let (after, flows) = written("# T\n\nOld.\n", 0, 1, &paras);
+        assert!(after.contains("&#160;"), "{after:?}");
+        assert_eq!(flows[1].paras, paras, "{after:?}");
+    }
+    // Beside other text it's the character itself.
+    let paras = [para(BODY, "a\u{a0}b")];
+    let (after, flows) = written("# T\n\nOld.\n", 0, 1, &paras);
+    assert_eq!(after, "# T\n\na\u{a0}b\n");
+    assert_eq!(flows[1].paras, paras);
 }
 
 #[test]
@@ -521,7 +552,7 @@ fn text_piece() -> impl Strategy<Value = &'static str> {
     prop::sample::select(vec![
         "a", "Z", "word", "é", "e\u{301}", "🎉", "👨\u{200d}👩\u{200d}👧", "🇳🇴", " ", "  ", "\t", "*", "**", "_", "#", "-", "+", "=", "1.", "2)",
         ">", "<", "</Text>", "<Text>", "&", "&amp;", "&#32;", "\\", "`", "```", "~~~", "[", "]", "(", ")", "[x](y)", "|", "!", ":", "{", "}",
-        "\"", "'", "---", "***", "    ", "\n", "\n", ".",
+        "\"", "'", "---", "***", "    ", "\n", "\n", ".", "\u{a0}", "&nbsp;",
     ])
 }
 

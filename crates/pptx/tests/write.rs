@@ -484,3 +484,11 @@ fn a_hidden_slide_is_hidden_in_powerpoint_too() {
     }
     assert!(part(&out.bytes, "ppt/presentation.xml").matches("<p:sldId ").count() == 3);
 }
+
+#[test]
+fn an_empty_line_exports_the_same_in_either_spelling() {
+    let slide = |line: &str| part(&export(&format!("# T\n\nFirst\n\n{line}\n\nThird\n")).bytes, "ppt/slides/slide1.xml");
+    let new = slide("&nbsp;");
+    assert_eq!(new, slide("**<Text></Text>**"));
+    assert!(!new.contains('\u{a0}') && !new.contains("&#160;") && !new.contains("nbsp"), "no space is written for it: {new}");
+}

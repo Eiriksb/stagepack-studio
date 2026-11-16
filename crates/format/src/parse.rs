@@ -19,6 +19,8 @@ const TOO_DEEP: &str = "This slide is nested too deeply to read";
 /// found at this size takes about 4 seconds in a release build: a long run of `*`.
 pub const MAX_BODY: usize = 32 * 1024;
 const TOO_LARGE: &str = "This slide is too large to read";
+/// A paragraph that holds this and nothing else is read as an empty one.
+const EMPTY_PARAGRAPH: &str = "&nbsp;";
 const UNREADABLE: &str = "This slide could not be read";
 /// The `markdown` crate goes further down the stack for every level of a slide, however
 /// deep, and so does dropping its tree. Only what gets used of this is ever more than
@@ -223,12 +225,17 @@ impl Ctx<'_> {
                     alt: image.alt.clone(),
                     range,
                 }),
-                children => out.push(Block::Paragraph {
-                    spans: self.spans(children),
-                    inline: self.inline_range(children, &range),
-                    only_text: only_text(children),
-                    range,
-                }),
+                children => {
+                    let inline = self.inline_range(children, &range);
+                    // `&nbsp;` alone is how an empty paragraph is written.
+                    let empty = self.source.get(inline.clone()) == Some(EMPTY_PARAGRAPH);
+                    out.push(Block::Paragraph {
+                        spans: if empty { Vec::new() } else { self.spans(children) },
+                        inline,
+                        only_text: empty || only_text(children),
+                        range,
+                    })
+                }
             },
             Node::List(list) => out.push(Block::List {
                 ordered: list.ordered,

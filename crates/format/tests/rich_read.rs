@@ -65,6 +65,18 @@ fn an_empty_item_is_an_empty_paragraph() {
 }
 
 #[test]
+fn an_empty_line_reads_as_an_empty_paragraph_in_either_spelling() {
+    let empty = Para { kind: ParaKind::Body, spans: vec![] };
+    for line in ["&nbsp;", "**<Text></Text>**"] {
+        let flows = flows(&format!("# T\n\na\n\n{line}\n\nb\n"));
+        assert_eq!(flows[1].paras, [para(ParaKind::Body, "a"), empty.clone(), para(ParaKind::Body, "b")], "{line}");
+    }
+    // Only alone: beside other text, or written as a number, it's the character.
+    assert_eq!(flows("# T\n\na&nbsp;\n")[1].paras, [para(ParaKind::Body, "a\u{a0}")]);
+    assert_eq!(flows("# T\n\n&#160;\n")[1].paras, [para(ParaKind::Body, "\u{a0}")]);
+}
+
+#[test]
 fn an_item_whose_content_the_parser_drops_is_in_no_flow() {
     for source in ["- ***\n- a\n", "- [r]: http://x\n- a\n"] {
         assert!(flows(source).is_empty(), "{source:?}");

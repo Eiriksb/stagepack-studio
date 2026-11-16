@@ -203,7 +203,10 @@ fn mixed_slides() -> Vec<String> {
         "---\nregion.body: align=right\n---\n\n# Right\n\nTo the right\n\n<Text x=\"100\" y=\"700\" w=\"800\" h=\"200\" align=\"center\">\n\nCentred box\n\n</Text>\n".to_string(),
     ];
     slides.push("# Each\n\n- one\n- two\n\nAnd more\n".replace("# Each", "---\nregion.body: click=each\n---\n\n# Each"));
-    // Empty paragraphs and breaks at a paragraph's edges, as the format crate writes them.
+    // Empty paragraphs and breaks at a paragraph's edges, as the format crate writes them,
+    // and as it wrote them before.
+    slides.push("# Edges\n\n&nbsp;\n\nMiddle\n\n&nbsp;\n\nEnds in a break\\\n**<Text></Text>**\n\n\\\nStarts with one\n\n&nbsp;\n".to_string());
+    slides.push("<Text x=\"1000\" y=\"500\" w=\"700\" h=\"300\">\n\n&nbsp;\n\nA *break\\\n<Text></Text>*\n\n</Text>\n\n- \n- item\\\n**<Text></Text>**\n".to_string());
     slides.push("# Edges\n\n**<Text></Text>**\n\nMiddle\n\n**<Text></Text>**\n\nEnds in a break\\\n**<Text></Text>**\n\n\\\nStarts with one\n\n**<Text></Text>**\n".to_string());
     slides.push("<Text x=\"1000\" y=\"500\" w=\"700\" h=\"300\">\n\n**<Text></Text>**\n\nA *break\\\n<Text></Text>*\n\n</Text>\n\n- \n- item\\\n**<Text></Text>**\n".to_string());
     slides
@@ -407,7 +410,21 @@ fn a_click_on_a_component_says_why() {
 
 #[test]
 fn an_empty_paragraph_is_a_line_with_a_caret() {
-    let source = "# T\n\nFirst\n\n**<Text></Text>**\n\nThird\n";
+    for line in ["&nbsp;", "**<Text></Text>**"] {
+        an_empty_line_is_a_line_with_a_caret(&format!("# T\n\nFirst\n\n{line}\n\nThird\n"));
+    }
+}
+
+#[test]
+fn an_empty_line_is_drawn_the_same_in_either_spelling() {
+    let (mut new, mut old) = (deck("# T\n\nFirst\n\n&nbsp;\n\nThird\n"), deck("# T\n\nFirst\n\n**<Text></Text>**\n\nThird\n"));
+    let rects = |d: &mut Deck| d.text_layout(0).paras().iter().map(|placed| (placed.flow, placed.para, placed.rect)).collect::<Vec<_>>();
+    assert_eq!(rects(&mut new), rects(&mut old));
+    assert_eq!(texts_in(new.specs(0)), texts_in(old.specs(0)));
+    assert_eq!(new.thumbnail(0, 960).unwrap().data(), old.thumbnail(0, 960).unwrap().data(), "the same pixels");
+}
+
+fn an_empty_line_is_a_line_with_a_caret(source: &str) {
     let mut d = deck(source);
     let layout = d.text_layout(0);
     let body: Vec<_> = layout.paras().iter().filter(|placed| placed.flow == 1).collect();
