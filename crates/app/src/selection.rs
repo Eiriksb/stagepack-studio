@@ -75,7 +75,7 @@ pub(crate) fn has_block(talk: &Talk, slide: usize, range: &Range<usize>) -> bool
 }
 
 /// The block or tag of `blocks`, at any depth, whose source is `range`.
-fn block_at<'a>(blocks: &'a [Block], range: &Range<usize>) -> Option<&'a Block> {
+pub(crate) fn block_at<'a>(blocks: &'a [Block], range: &Range<usize>) -> Option<&'a Block> {
     blocks.iter().find_map(|block| {
         if block.range() == range {
             return Some(block);
@@ -100,6 +100,11 @@ pub(crate) fn holds_para(talk: &Talk, slide: usize, flow: usize, para: usize, ra
 /// What the status line says of the thing at `range` on slide `slide` once it's selected, such
 /// as "Picture selected".
 pub fn said_of(talk: &Talk, slide: usize, range: &Range<usize>) -> Option<String> {
+    Some(format!("{} selected", name_of(talk, slide, range)?))
+}
+
+/// What the thing at `range` on slide `slide` is called, such as "Picture" or "Text box".
+pub fn name_of(talk: &Talk, slide: usize, range: &Range<usize>) -> Option<String> {
     let slide = talk.slides.get(slide)?;
     let what = match block_at(&slide.blocks, range)? {
         Block::Picture { .. } => "Picture".to_string(),
@@ -112,7 +117,7 @@ pub fn said_of(talk: &Talk, slide: usize, range: &Range<usize>) -> Option<String
         },
         _ => return None,
     };
-    Some(format!("{what} selected"))
+    Some(what)
 }
 
 /// `name` with a space before each capital letter but the first: "StatCard" is "Stat Card".

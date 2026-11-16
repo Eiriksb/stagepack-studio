@@ -36,8 +36,13 @@ pub fn open(cx: &mut TestAppContext, source: &str) -> Typing {
 
 pub fn open_with(cx: &mut TestAppContext, source: &str, recovery: Option<Recovery>) -> Typing {
     let folder = tempfile::tempdir().unwrap();
+    std::fs::write(folder.path().join("slides.md"), source).unwrap();
+    open_folder(cx, folder, recovery)
+}
+
+/// Opens the talk already in `folder`, with its working copies kept in `recovery`, if given.
+pub fn open_folder(cx: &mut TestAppContext, folder: tempfile::TempDir, recovery: Option<Recovery>) -> Typing {
     let file = folder.path().join("slides.md");
-    std::fs::write(&file, source).unwrap();
     let talk = Document::open(folder.path(), Fonts::bundled_only()).unwrap();
     let (handle, view) = cx.update(|cx: &mut App| {
         gpui_kit::init(cx);

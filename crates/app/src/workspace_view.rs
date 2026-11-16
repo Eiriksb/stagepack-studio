@@ -25,6 +25,7 @@ use crate::clipboard::ClipboardOp;
 use crate::clipboard_tools::ClipboardTools;
 use crate::document::{Document, EditRefused, OpenProblem, Reload, SLIDES_FILE, TalkPlace, UNREADABLE_FILE};
 use crate::export::{self, ExportKind, run_export, stagepack_executable};
+use crate::inspector::{self, Inspector};
 use crate::markdown_panel::MarkdownPanel;
 use crate::notes_panel::{
     NOTES_HEIGHT, NOTES_MAX_HEIGHT, NOTES_MIN_HEIGHT, NotesEdited, NotesPanel,
@@ -211,6 +212,7 @@ pub fn bind_keys(cx: &mut App) {
     ]);
     slide_strip::bind_keys(cx);
     slide_editor::bind_keys(cx);
+    inspector::bind_keys(cx);
     present_view::bind_keys(cx);
 }
 
@@ -268,6 +270,8 @@ pub struct WorkspaceView {
     show_slide_list: bool,
     notes_panel: Entity<NotesPanel>,
     show_notes: bool,
+    /// The form for the thing selected, at the right while one is.
+    inspector: Entity<Inspector>,
     focus_handle: FocusHandle,
     /// Keeps the talk's folder watched for as long as the window is open.
     watcher: Option<watcher::TalkWatcher>,
@@ -419,6 +423,8 @@ impl WorkspaceView {
         let ribbon = cx.new(|cx| Ribbon::new(document.clone(), clipboard_tools.clone(), text_tools, panels, cx));
         let slide_strip = cx.new(|cx| SlideStrip::new(document.clone(), cx));
         let notes_panel = cx.new(|cx| NotesPanel::new(document.clone(), window, cx));
+        let workspace = cx.weak_entity();
+        let inspector = cx.new(|cx| Inspector::new(document.clone(), workspace, cx));
         let notes_focus = notes_panel.read(cx).field().focus_handle(cx);
         clipboard_tools.update(cx, |tools, cx| tools.follow_notes(notes_focus, window, cx));
         let notes_edited = cx.subscribe_in(
@@ -479,6 +485,7 @@ impl WorkspaceView {
             show_slide_list: panels.slide_list,
             notes_panel,
             show_notes: panels.notes,
+            inspector,
             focus_handle,
             watcher: None,
             opened_from_path: false,
@@ -571,6 +578,10 @@ impl WorkspaceView {
 
     pub fn notes_panel(&self) -> &Entity<NotesPanel> {
         &self.notes_panel
+    }
+
+    pub fn inspector(&self) -> &Entity<Inspector> {
+        &self.inspector
     }
 
     /// Whether the talk's folder is being watched for saves.

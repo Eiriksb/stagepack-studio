@@ -7166,6 +7166,7 @@ dependencies = [
  "slides-pptx",
  "tempfile",
  "toml 0.8.23",
+ "toolkit",
  "unicode-segmentation",
  "wat",
  "zip",

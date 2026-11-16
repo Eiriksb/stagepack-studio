@@ -217,7 +217,7 @@ impl<T: PartialEq> SharedOf<T> for Shared<T> {
 }
 
 /// `color` as the colour picker holds it, if it's one written as `#rgb` or `#rrggbb`.
-fn picker_color(color: &str) -> Option<Hsla> {
+pub(crate) fn picker_color(color: &str) -> Option<Hsla> {
     let hex = color.strip_prefix('#')?;
     let hex = match hex.len() {
         3 => hex.chars().flat_map(|c| [c, c]).collect(),
@@ -229,7 +229,7 @@ fn picker_color(color: &str) -> Option<Hsla> {
 }
 
 /// `color` as the talk writes it: `#rrggbb`.
-fn written_color(color: Hsla) -> String {
+pub(crate) fn written_color(color: Hsla) -> String {
     let Rgba { r, g, b, .. } = color.into();
     let byte = |channel: f32| (channel.clamp(0.0, 1.0) * 255.0).round() as u8;
     format!("#{:02x}{:02x}{:02x}", byte(r), byte(g), byte(b))

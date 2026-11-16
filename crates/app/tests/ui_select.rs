@@ -199,6 +199,8 @@ fn a_second_click_on_a_boxes_text_types_in_it(cx: &mut TestAppContext) {
     typing.click(cx, at);
     assert_eq!(selected(&typing, cx), Some((BOX, the_box.source.clone())), "the first click selects the box");
     assert!(typing.editing(cx).is_none());
+    // The inspector came, and the slide made room for it.
+    let at = typing.point_of(cx, flow, pos(0, 4));
     typing.click(cx, at);
     let editing = typing.editing(cx).expect("the second types in it");
     assert_eq!(editing.edit.selection, caret_at(pos(0, 4)));
@@ -355,9 +357,10 @@ fn the_outline_is_where_the_thing_is_drawn(cx: &mut TestAppContext) {
         cx.simulate_window_resize(typing.handle, size(px(width), px(height)));
         typing.settle(cx);
         for start in ["<Box", "<Shape"] {
+            // Let go of first: the inspector goes, and the slide takes its room back.
+            typing.press(cx, "escape");
             let element = thing(&typing, cx, start);
             let at = middle(&typing, cx, &element);
-            typing.press(cx, "escape");
             typing.click(cx, at);
             assert_eq!(selected(&typing, cx).map(|(_, range)| range), Some(element.source.clone()));
             let drawn = outline(&typing, cx).expect("the outline shows");
@@ -374,6 +377,8 @@ fn delete_while_typing_deletes_a_letter_not_the_box(cx: &mut TestAppContext) {
     let flow = flow_in(&typing, cx, "<Box");
     let at = typing.point_of(cx, flow, pos(0, 4));
     typing.click(cx, at);
+    // The inspector came, and the slide made room for it.
+    let at = typing.point_of(cx, flow, pos(0, 4));
     typing.click(cx, at);
     typing.press(cx, "delete");
     assert_eq!(typing.source(cx), SHOWCASE.replacen("Just a", "Justa", 1));

@@ -21,6 +21,7 @@ slides-engine = { path = "../engine" }
 slides-format = { path = "../format" }
 slides-pdf = { path = "../pdf" }
 slides-pptx = { path = "../pptx" }
+toolkit = { path = "../toolkit" }
 unicode-segmentation = "=1.13.3"
 
 [target.'cfg(unix)'.dependencies]

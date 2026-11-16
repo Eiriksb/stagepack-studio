@@ -4,6 +4,8 @@
 use super::*;
 use crate::clipboard::{self, SlidePaste, TooLarge};
 use crate::clipboard_tools::{read_clipboard, write_clipboard};
+use crate::document::Selected;
+use crate::inspector::INSPECTOR_WIDTH;
 
 impl WorkspaceView {
     /// Moves to another slide, unless the notes field has the keyboard: its keys move the caret.
@@ -85,6 +87,47 @@ impl WorkspaceView {
         if let Some(message) = message {
             self.say(message, cx);
         }
+    }
+
+    /// Sets attribute `name` of the thing the inspector shows to `value`, or takes it away, as
+    /// one edit, and says whether that was done. The inspector shows the thing picked `pick`,
+    /// now at `target`: while it's still the one selected, the selection's is the one changed;
+    /// once another is picked, as by the click that took the keyboard from a field, the change
+    /// goes to the thing it was typed for, if that's still where it was.
+    pub(crate) fn set_attr_from_inspector(
+        &mut self,
+        pick: u64,
+        target: &Selected,
+        name: &str,
+        value: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(document) = self.document.clone() else {
+            return false;
+        };
+        let picked = document.read(cx).selection_pick() == pick;
+        let mut made = false;
+        self.edit(
+            |document| {
+                let result = if picked {
+                    document.set_selected_attr(name, value)
+                } else {
+                    document.set_attr_of(target, name, value)
+                };
+                made = result.is_ok();
+                result
+            },
+            cx,
+        );
+        made
+    }
+
+    /// Whether the inspector shows: while a thing on the slide shown is selected.
+    pub(super) fn shows_inspector(&self, cx: &App) -> bool {
+        self.document.as_ref().is_some_and(|document| {
+            let document = document.read(cx);
+            document.selected().is_some_and(|selected| selected.slide == document.current())
+        })
     }
 
     /// Leaves the talk tidy of what typing on the slide left empty, before it's saved, shown
@@ -351,11 +394,14 @@ impl WorkspaceView {
                     .visible(has_talk && self.show_notes)
                     .child(self.notes_panel.clone()),
             );
-        div()
+        let inspector = self.shows_inspector(cx).then(|| self.inspector.clone());
+        h_flex()
             .flex_1()
             .min_h_0()
             .w_full()
+            .items_start()
             .child(
+                div().flex_1().min_w_0().h_full().child(
                 h_resizable("editor-columns")
                     .child(
                         resizable_panel()
@@ -380,7 +426,12 @@ impl WorkspaceView {
                                     .child(self.markdown_panel.clone()),
                             ),
                     ),
+                ),
             )
+            // The slide makes room for it.
+            .when_some(inspector, |this, inspector| {
+                this.child(div().flex_none().w(INSPECTOR_WIDTH).h_full().child(inspector))
+            })
             .bg(cx.theme().background)
     }
 }

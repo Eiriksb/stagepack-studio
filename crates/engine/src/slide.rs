@@ -233,7 +233,7 @@ impl TagPlace {
 }
 
 /// Whether a tag asks for a place on the slide, which gives it a layer of its own.
-pub(crate) fn is_positioned(tag: &Tag) -> bool {
+pub fn is_positioned(tag: &Tag) -> bool {
     let place = TagPlace::of(tag);
     place.x.is_some() || place.y.is_some() || place.w.is_some() || place.h.is_some()
 }

@@ -15,8 +15,9 @@ use slides_engine::{
 };
 use slides_format::{
     Change, FlowPlace, MAX_SLIDE_BYTES, Para, Pos, Selection, SourceEdit, Talk, TextEdit, parse_talk, reparse, set_align,
-    Tag, delete_block, find_tag, split_slides, storable, text_flows, write_flow, write_into_region,
+    Tag, delete_block, find_tag, set_tag_attr, split_slides, storable, text_flows, write_flow, write_into_region,
 };
+use toolkit::ComponentSchema;
 
 use crate::added_files::{self, FileKind, NotAdded, Placed, talk_uses};
 use crate::export::ExportInput;
@@ -150,6 +151,7 @@ const EDIT_NOTES: &str = "Edit notes";
 const RECOVER_CHANGES: &str = "Recover changes";
 const LOAD_CHANGED_FILE: &str = "Load the changed file";
 const DELETE: &str = "Delete";
+const CHANGE_SETTING: &str = "Change setting";
 
 /// What the window says when the current slide couldn't be laid out for the editor.
 pub const LAYOUT_FAILED: &str =
@@ -292,6 +294,8 @@ pub struct Document {
     held_color: Option<HeldColor>,
     /// The thing picked on a slide, if any: the editor's view of the talk, not part of it.
     selected: Option<Selected>,
+    /// Counts the times a thing was picked or let go of, rather than followed through an edit.
+    picks: u64,
     /// The number the next time of typing on a slide gets.
     next_session: u64,
     /// What the window should say about something that went wrong where nothing was refused
@@ -389,6 +393,7 @@ impl Document {
             editing: None,
             held_color: None,
             selected: None,
+            picks: 0,
             next_session: 0,
             message: None,
             files_to_save: Cell::new(None),
@@ -1205,6 +1210,7 @@ impl Document {
         }
         // Ending the typing can move the thing, and the selection moves with it.
         self.selected = Some(Selected { slide, source });
+        self.picks += 1;
         if let Err(refused) = self.end_text() {
             self.say(refused);
         }
@@ -1217,7 +1223,55 @@ impl Document {
 
     /// Lets go of the thing selected, if any.
     pub fn deselect(&mut self) {
-        self.selected = None;
+        if self.selected.take().is_some() {
+            self.picks += 1;
+        }
+    }
+
+    /// Changes each time a thing is selected or let go of, but not as the thing selected is
+    /// followed through an edit: what's shown for one thing is never taken for another's.
+    pub fn selection_pick(&self) -> u64 {
+        self.picks
+    }
+
+    /// What the tag selected takes, from its component: `None` when nothing's selected, the
+    /// thing isn't a tag, the talk has no such component, or it has no working build.
+    pub fn schema_of_selected(&mut self) -> Option<ComponentSchema> {
+        let name = self.selected_tag()?.name.clone();
+        let deck = &mut self.deck;
+        guarded(|| deck.component_schema(&name)).ok().flatten()
+    }
+
+    /// Sets attribute `name` of the tag selected to `value`, or takes it away with `None`, as
+    /// one step named "Change setting", and returns the slides to show again. Only that
+    /// attribute's bytes change. A value the same as the one there writes nothing and makes no
+    /// step. It's refused when the value can't be written, as one holding both kinds of quote
+    /// mark or a new line, or when the slide wouldn't read the same but for it.
+    pub fn set_selected_attr(&mut self, name: &str, value: Option<&str>) -> Result<Vec<usize>, EditRefused> {
+        // Typing is finished first, which can move the thing.
+        self.finish_before_edit()?;
+        let Some(selected) = self.selected.clone() else {
+            return Ok(Vec::new());
+        };
+        self.set_attr_of(&selected, name, value)
+    }
+
+    /// Sets attribute `name` of `thing`, a tag on a slide, whether or not it's the one selected,
+    /// as [`Self::set_selected_attr`] does. It's refused if there's no tag at exactly `thing`'s
+    /// place, as once typing that ends first has moved it.
+    pub fn set_attr_of(&mut self, thing: &Selected, name: &str, value: Option<&str>) -> Result<Vec<usize>, EditRefused> {
+        self.finish_before_edit()?;
+        let Selected { slide, source } = thing.clone();
+        let change = built(self.talk(), |talk| set_tag_attr(talk, slide, &source, name, value))?
+            .ok_or(EditRefused::CouldNotBeMade)?;
+        let selected = self.selected.as_ref() == Some(thing);
+        let depth = self.history.depth();
+        let changed = self.make(CHANGE_SETTING, change, Holds::Slide(slide), slide, slide, None)?;
+        if selected && self.history.depth() > depth {
+            let after = self.selected.as_ref().map(|selected| selected.source.clone());
+            self.history.select_mark_last(SelectMark { before: Some(source), after });
+        }
+        Ok(changed)
     }
 
     /// The tag selected, if what's selected is one.
@@ -1290,10 +1344,14 @@ impl Document {
             return;
         };
         let talk = self.talk();
-        self.selected = source.and_then(|source| {
+        let selected = source.and_then(|source| {
             let slide = selection::slide_of(talk, &source)?;
             selection::has_block(talk, slide, &source).then_some(Selected { slide, source })
         });
+        if selected != self.selected {
+            self.selected = selected;
+            self.picks += 1;
+        }
     }
 
     /// The number for a new time of typing.
