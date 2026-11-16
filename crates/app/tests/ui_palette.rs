@@ -16,7 +16,7 @@ use gpui_kit::test::TestWindowExt;
 use gpui_kit::{App, AppContext as _, Bounds, ElementId, Entity, Point, TestAppContext, WindowBounds, WindowOptions, px, size};
 use slides_components::source_hash;
 use slides_engine::{ComponentState, Fonts};
-use slides_format::{find_tag, parse_talk};
+use slides_format::{FlowPlace, TextEdit, find_tag, parse_talk};
 use stagepack_studio::builds::Compile;
 use stagepack_studio::document::{Document, PaletteEntry};
 use stagepack_studio::insert::hex;
@@ -728,5 +728,266 @@ fn a_click_on_a_component_that_does_not_draw_its_words_selects_it(cx: &mut TestA
         typing.type_text(cx, "x");
         assert_eq!(typing.source(cx), slides, "{name}: nothing is typed into the slide");
         typing.press(cx, "escape");
+    }
+}
+
+// A box of text is remembered by where its tag is, never by counting the slide's boxes, which
+// changes as the talk's components load.
+
+/// A Callout that takes content if `content`, and draws it under its title.
+fn callout_module(content: bool) -> Vec<u8> {
+    let schema = format!(r#"{{"name":"Callout","props":[{{"name":"title","kind":"Text","optional":false}}],"children":{content}}}"#);
+    let element = format!(r#"{{"Stack":{{"horizontal":false,"gap":16.0,"children":[{},"Children"]}}}}"#, words("Callout"));
+    module(&schema, &[], &element)
+}
+
+/// A component called `tag` whose render spins for as long as it's let.
+fn slow_module(tag: &str) -> Vec<u8> {
+    let schema = format!(r#"{{"name":"{tag}","props":[],"children":false}}"#);
+    let text = format!(
+        r#"(module
+  (memory (export "memory") 8)
+  (global $heap (mut i32) (i32.const 262144))
+  {}
+  (func (export "abi_version") (result i32) (i32.const 1))
+  (func (export "alloc") (param $len i32) (result i32)
+    (local $at i32)
+    (local.set $at (global.get $heap))
+    (global.set $heap (i32.add (global.get $heap) (local.get $len)))
+    (local.get $at))
+  (func (export "schema") (result i64) (i64.const {}))
+  (func (export "render") (param $ptr i32) (param $len i32) (result i64) (loop br 0) (i64.const 0)))"#,
+        data(1024, &schema),
+        packed(1024, &schema)
+    );
+    wat::parse_str(&text).unwrap()
+}
+
+/// A slide of `slows` components that spin as they draw, a Callout holding "Note" and a text
+/// box holding "Hello", in a folder with a build of each.
+fn two_boxes(slows: usize) -> (tempfile::TempDir, String) {
+    let slow_tags: String = (0..slows).map(|n| format!("<Slow{} x=\"0\" y=\"{}\" w=\"10\" h=\"10\" />\n\n", (b'a' + n as u8) as char, n * 20)).collect();
+    let slides = format!(
+        "# T\n\n{slow_tags}<Callout title=\"\" x=\"100\" y=\"100\" w=\"600\" h=\"300\">\n\nNote\n\n</Callout>\n\n<Text x=\"100\" y=\"500\" w=\"600\" h=\"200\">\n\nHello\n\n</Text>\n"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("components")).unwrap();
+    std::fs::create_dir(dir.path().join("build")).unwrap();
+    std::fs::write(dir.path().join("slides.md"), &slides).unwrap();
+    let mut builds = vec![("Callout".to_string(), callout_module(true))];
+    builds.extend((0..slows).map(|n| format!("Slow{}", (b'a' + n as u8) as char)).map(|tag| { let wasm = slow_module(&tag); (tag, wasm) }));
+    let mut entries = Vec::new();
+    for (tag, wasm) in builds {
+        let file = tag.to_lowercase();
+        let source = format!("use toolkit::prelude::*;\n\n#[component]\nfn {tag}() -> Element {{\n    text(\"{tag}\")\n}}\n");
+        std::fs::write(dir.path().join(format!("components/{file}.rs")), &source).unwrap();
+        std::fs::write(dir.path().join(format!("build/{file}.wasm")), wasm).unwrap();
+        entries.push(format!(r#"{{"tag":"{tag}","file":"{file}","source_hash":"{}"}}"#, source_hash(source.as_bytes())));
+    }
+    std::fs::write(dir.path().join("build/index.json"), format!(r#"{{"format":1,"components":[{}]}}"#, entries.join(","))).unwrap();
+    (dir, slides)
+}
+
+/// Which of the slide's flows is the box whose tag starts with `start`.
+fn box_flow(document: &Document, start: &str) -> Option<usize> {
+    let source = document.source();
+    document
+        .text_flows(document.talk(), 0)
+        .iter()
+        .position(|flow| matches!(&flow.place, FlowPlace::Tag(range) if source[range.clone()].starts_with(start)))
+}
+
+/// Starts typing at the end of the box whose tag starts with `start`.
+fn type_at_end(document: &mut Document, start: &str, text: &str) {
+    let flow = box_flow(document, start).unwrap_or_else(|| panic!("{start} is a box of text"));
+    let paras = document.text_flows(document.talk(), 0)[flow].paras.clone();
+    let end = TextEdit::new(paras).select_all().selection.end();
+    assert!(document.begin_text(0, flow, end));
+    document.apply_text(|edit| edit.insert(text)).unwrap();
+}
+
+/// Loads every build the palette lists that isn't loaded.
+fn load_all(document: &mut Document) {
+    document.begin_palette();
+    while document.palette_step() {}
+}
+
+/// Makes the Callout's build take content or not, as a rebuild would, and loads it.
+fn rebuild_callout(document: &mut Document, folder: &Path, content: bool) {
+    std::fs::write(folder.join("build/callout.wasm"), callout_module(content)).unwrap();
+    document.reload_components();
+    load_all(document);
+    assert_eq!(box_flow(document, "<Callout").is_some(), content);
+}
+
+#[test]
+fn undo_after_a_component_loads_resumes_in_the_same_box() {
+    // With nothing drawn, and with the Callout run out of time on a slide too slow to draw.
+    for (slows, draw) in [(0, false), (5, true)] {
+        let (dir, slides) = two_boxes(slows);
+        let mut document = Document::open(dir.path(), Fonts::bundled_only()).unwrap();
+        if draw {
+            let _ = document.layers_of(0, 0.25);
+            let _ = document.text_layout(0);
+        }
+        assert_eq!(box_flow(&document, "<Callout"), None, "the Callout isn't loaded");
+        type_at_end(&mut document, "<Text", "X");
+        document.end_text().unwrap();
+        assert!(document.source().contains("HelloX"));
+        load_all(&mut document);
+        assert!(box_flow(&document, "<Callout").is_some(), "the Callout is loaded now");
+        document.undo().unwrap();
+        assert_eq!(document.source(), slides, "the X is taken away");
+        assert_eq!(document.text_flow(), box_flow(&document, "<Text"), "typing goes on in the same box");
+        let caret = document.text_layout(0).caret(document.text_flow().unwrap(), slides_format::Pos::default());
+        assert!(caret.is_some(), "where it's drawn");
+        document.apply_text(|edit| edit.insert("Y")).unwrap();
+        assert!(document.source().contains("HelloY") || document.source().contains("YHello"), "{}", document.source());
+        assert!(document.source().contains("\n\nNote\n\n"), "the Callout is as it was");
+    }
+}
+
+#[test]
+fn undo_after_a_component_stops_taking_content_types_nothing() {
+    let (dir, slides) = two_boxes(0);
+    let mut document = Document::open(dir.path(), Fonts::bundled_only()).unwrap();
+    load_all(&mut document);
+    type_at_end(&mut document, "<Callout", "X");
+    document.end_text().unwrap();
+    let typed = document.source().to_string();
+    assert!(typed.contains("NoteX"));
+    rebuild_callout(&mut document, dir.path(), false);
+    document.undo().unwrap();
+    assert_eq!(document.source(), slides, "undone exactly");
+    assert_eq!(document.text_flow(), None, "nothing is being typed");
+    assert!(document.apply_text(|edit| edit.insert("Y")).is_err() || document.source() == slides);
+    assert_eq!(document.source(), slides);
+    document.redo().unwrap();
+    assert_eq!(document.source(), typed, "made again exactly");
+    assert_eq!(document.text_flow(), None);
+}
+
+/// What a test of the property does.
+#[derive(Clone, Debug)]
+enum Act {
+    /// Types the character at the end of the Callout's text if `callout`, or else the text box's.
+    Type { callout: bool, letter: char },
+    EndTyping,
+    /// Makes the Callout take content, or stop taking it.
+    Toggle,
+    Undo,
+    Redo,
+}
+
+fn act() -> impl proptest::strategy::Strategy<Value = Act> {
+    use proptest::prelude::*;
+    prop_oneof![
+        4 => (any::<bool>(), proptest::char::range('a', 'e')).prop_map(|(callout, letter)| Act::Type { callout, letter }),
+        1 => Just(Act::EndTyping),
+        2 => Just(Act::Toggle),
+        2 => Just(Act::Undo),
+        1 => Just(Act::Redo),
+    ]
+}
+
+/// The two boxes' words, as a model of the talk that never looks at what's loaded.
+#[derive(Clone, Debug, PartialEq)]
+struct Words {
+    note: String,
+    hello: String,
+}
+
+impl Words {
+    fn source(&self, slides: &str) -> String {
+        slides.replacen("\n\nNote\n\n", &format!("\n\n{}\n\n", self.note), 1).replacen("\n\nHello\n\n", &format!("\n\n{}\n\n", self.hello), 1)
+    }
+}
+
+/// Where the box whose tag starts with `start` starts in `source`.
+fn tag_start_of(source: &str, start: &str) -> usize {
+    source.find(start).unwrap()
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig { cases: 24, ..Default::default() })]
+
+    #[test]
+    fn typing_follows_its_box_whatever_loads(acts in proptest::collection::vec(act(), 1..16)) {
+        let (dir, slides) = two_boxes(0);
+        let mut document = Document::open(dir.path(), Fonts::bundled_only()).unwrap();
+        let mut content = false;
+        // The model: the words now, the steps to undo and redo, each with the box it was typed
+        // in, and the box of the run of typing open, if any.
+        let mut now = Words { note: "Note".to_string(), hello: "Hello".to_string() };
+        let mut undo: Vec<(Words, bool)> = Vec::new();
+        let mut redo: Vec<(Words, bool)> = Vec::new();
+        let mut open: Option<bool> = None;
+        for act in acts {
+            let mut resumed_in: Option<bool> = None;
+            match act {
+                Act::Type { callout, letter } => {
+                    if callout && !content {
+                        continue;
+                    }
+                    if open != Some(callout) {
+                        document.end_text().unwrap();
+                        let start = if callout { "<Callout" } else { "<Text" };
+                        let flow = box_flow(&document, start).unwrap();
+                        let paras = document.text_flows(document.talk(), 0)[flow].paras.clone();
+                        let end = TextEdit::new(paras).select_all().selection.end();
+                        proptest::prop_assert!(document.begin_text(0, flow, end));
+                        undo.push((now.clone(), callout));
+                        redo.clear();
+                        open = Some(callout);
+                    }
+                    document.apply_text(|edit| edit.insert(&letter.to_string())).unwrap();
+                    if callout { now.note.push(letter) } else { now.hello.push(letter) }
+                }
+                Act::EndTyping => {
+                    document.end_text().unwrap();
+                    open = None;
+                }
+                Act::Toggle => {
+                    document.end_text().unwrap();
+                    open = None;
+                    content = !content;
+                    rebuild_callout(&mut document, dir.path(), content);
+                }
+                Act::Undo => {
+                    open = None;
+                    document.undo().unwrap();
+                    if let Some((before, callout)) = undo.pop() {
+                        redo.push((now.clone(), callout));
+                        now = before;
+                        resumed_in = Some(callout);
+                    }
+                }
+                Act::Redo => {
+                    open = None;
+                    document.redo().unwrap();
+                    if let Some((after, callout)) = redo.pop() {
+                        undo.push((now.clone(), callout));
+                        now = after;
+                        resumed_in = Some(callout);
+                    }
+                }
+            }
+            let source = document.source().to_string();
+            proptest::prop_assert_eq!(&source, &now.source(&slides));
+            // Typing brought back is in the box the step was typed in, at its tag's start.
+            if let Some(flow) = document.text_flow() {
+                let flows = document.text_flows(document.talk(), 0);
+                let FlowPlace::Tag(range) = &flows[flow].place else {
+                    return Err(proptest::test_runner::TestCaseError::fail(format!("typing in {:?}", flows[flow].place)));
+                };
+                if let Some(callout) = resumed_in {
+                    let wanted = tag_start_of(&source, if callout { "<Callout" } else { "<Text" });
+                    proptest::prop_assert_eq!(range.start, wanted);
+                }
+            }
+            if resumed_in == Some(true) && !content {
+                proptest::prop_assert_eq!(document.text_flow(), None);
+            }
+        }
     }
 }

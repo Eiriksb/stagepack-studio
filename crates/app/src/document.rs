@@ -2134,6 +2134,14 @@ impl Document {
     /// Moves the selection along with `change`, just made to the talk's text: to where its
     /// thing's text went, or away if that went.
     fn follow(&mut self, change: &Change) {
+        // The box being typed in moves as the thing selected does; if it can't be followed,
+        // typing there ends.
+        if let Some(editing) = &mut self.editing {
+            match editing.flow.moved(change) {
+                Some(flow) => editing.flow = flow,
+                None => self.editing = None,
+            }
+        }
         let Some(selected) = self.selected.take() else {
             return;
         };
@@ -3283,7 +3291,7 @@ fn joined(mut a: Vec<usize>, b: Vec<usize>) -> Vec<usize> {
 fn typed_place(talk: &Talk, editing: &EditingText, content: &[String]) -> Option<FlowPlace> {
     match &editing.flow {
         FlowKey::Region { name, .. } => Some(FlowPlace::Region(name.clone())),
-        FlowKey::Box { .. } | FlowKey::Cell { .. } => {
+        FlowKey::Cell { .. } => {
             let flows = flows_in(talk, editing.slide, content);
             editing.flow.find(&flows).map(|index| flows[index].place.clone())
         }

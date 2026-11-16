@@ -28,11 +28,11 @@ pub const COULD_NOT_TYPE: &str = "That couldn't be typed here, so nothing was ch
 pub enum FlowKey {
     /// The `nth` run of text in the layout's region `name`.
     Region { name: String, nth: usize },
-    /// The `nth` box of text on the slide.
-    Box { nth: usize },
-    /// The box whose tag starts at byte `start` of the talk, which may have no text yet: a
-    /// shape typed on, or a text box just put on the slide. Typing in it changes only what's
-    /// inside the tag, so its start stays where it is.
+    /// The box of text whose tag starts at byte `start` of the talk, which may have no text yet:
+    /// a shape typed on, or a text box just put on the slide. Typing in it changes only what's
+    /// inside the tag, so its start stays where it is; any other change to the talk moves it as
+    /// it moves the thing selected. A box is never named by counting the slide's boxes, as which
+    /// tags are boxes of text changes as the talk's components load.
     Tag { start: usize },
     /// A text box that isn't in the talk yet, its top-left corner at (`x`, `y`) of the slide,
     /// in slide units. The first thing typed in it writes it; till then nothing of it is written.
@@ -75,12 +75,7 @@ impl FlowKey {
                     .filter(|other| other.place == flow.place)
                     .count(),
             },
-            FlowPlace::Tag(_) => FlowKey::Box {
-                nth: before
-                    .iter()
-                    .filter(|other| matches!(other.place, FlowPlace::Tag(_)))
-                    .count(),
-            },
+            FlowPlace::Tag(range) => FlowKey::Tag { start: range.start },
             FlowPlace::Cell { row, column, .. } => {
                 FlowKey::Cell { table: tables_of(flows).nth(index).flatten()?, row: *row, column: *column }
             }
@@ -98,7 +93,6 @@ impl FlowKey {
         for (index, flow) in flows.iter().enumerate() {
             let same_kind = match (self, &flow.place) {
                 (FlowKey::Region { name, .. }, FlowPlace::Region(region)) => name == region,
-                (FlowKey::Box { .. }, FlowPlace::Tag(_)) => true,
                 (FlowKey::Tag { start }, FlowPlace::Tag(range)) => {
                     if range.start == *start {
                         return Some(index);
@@ -111,7 +105,7 @@ impl FlowKey {
                 continue;
             }
             let nth = match self {
-                FlowKey::Region { nth, .. } | FlowKey::Box { nth } => *nth,
+                FlowKey::Region { nth, .. } => *nth,
                 FlowKey::Tag { .. } | FlowKey::NewBox { .. } | FlowKey::Cell { .. } => continue,
             };
             if seen == nth {
@@ -126,7 +120,7 @@ impl FlowKey {
     pub fn region(&self) -> Option<&str> {
         match self {
             FlowKey::Region { name, .. } => Some(name),
-            FlowKey::Box { .. } | FlowKey::Tag { .. } | FlowKey::NewBox { .. } | FlowKey::Cell { .. } => None,
+            FlowKey::Tag { .. } | FlowKey::NewBox { .. } | FlowKey::Cell { .. } => None,
         }
     }
 
@@ -135,6 +129,17 @@ impl FlowKey {
         match self {
             FlowKey::Tag { start } => Some(*start),
             _ => None,
+        }
+    }
+
+    /// This key once `change` is made to the talk: a box's tag moved as the thing selected is,
+    /// or `None` if the change took its start away. Other keys name what doesn't move.
+    pub fn moved(&self, change: &slides_format::Change) -> Option<FlowKey> {
+        match self {
+            FlowKey::Tag { start } => {
+                crate::selection::moved(&(*start..*start + 1), change).map(|range| FlowKey::Tag { start: range.start })
+            }
+            other => Some(other.clone()),
         }
     }
 
