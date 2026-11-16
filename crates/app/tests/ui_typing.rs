@@ -2510,6 +2510,23 @@ mod tools {
     }
 
     #[gpui_kit::test]
+    fn the_arrow_scrolls_with_the_text_tools_greyed_under_it(cx: &mut TestAppContext) {
+        // Seen in the real window: with nothing being typed, a click on the right arrow, over
+        // the greyed size field, did nothing, and the field's tooltip showed through it.
+        let typing = open(cx, TWO);
+        typing.resize(cx, 800., 500.);
+        assert!(typing.editing(cx).is_none());
+        // Wide enough for the arrow to lie over the size field.
+        let size = typing.bounds_of(cx, SIZE_ID).unwrap();
+        typing.resize(cx, f32::from(size.center().x) + 14., 500.);
+        let arrow = typing.bounds_of(cx, MORE_RIGHT_ID).expect("an arrow says there's more");
+        assert!(typing.bounds_of(cx, SIZE_ID).unwrap().contains(&arrow.center()), "the size field is under the arrow");
+        let before = typing.bounds_of(cx, PASTE_ID).unwrap();
+        typing.click_on(cx, MORE_RIGHT_ID);
+        assert!(typing.bounds_of(cx, PASTE_ID).unwrap().left() < before.left(), "the row scrolled");
+    }
+
+    #[gpui_kit::test]
     fn in_a_wide_window_nothing_scrolls(cx: &mut TestAppContext) {
         let typing = open(cx, TWO);
         typing.resize(cx, 1400., 800.);

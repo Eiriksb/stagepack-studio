@@ -413,6 +413,8 @@ impl Ribbon {
             .bg(linear_gradient(90., linear_color_stop(from, 0.), linear_color_stop(to, 0.6)))
             .text_color(cx.theme().muted_foreground)
             .child(Icon::new(icon).small())
+            // Over the tools it covers: a click or a hover is the arrow's alone.
+            .occlude()
             .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
             .on_click(cx.listener(move |this, _, _, cx| {
                 // Most of the row's width at a time.
