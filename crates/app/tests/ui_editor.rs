@@ -451,7 +451,14 @@ fn undo_and_redo_are_disabled_until_there_is_something(cx: &mut TestAppContext) 
     click(cx, handle, UNDO_ID);
     assert_eq!(count(cx, &view), 2);
     assert_eq!(state(cx), (true, false));
-    click(cx, handle, REDO_ID);
+    // At its left end: in this window the row of tools runs past the right edge, and the
+    // arrow there, which takes the clicks over what it covers, lies over Redo's right half.
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click_at(REDO_ID, gpui_kit::point(gpui_kit::px(4.), gpui_kit::px(8.)), cx);
+    })
+    .unwrap();
+    settle(cx, handle);
     assert_eq!(count(cx, &view), 3);
     assert_eq!(state(cx), (false, true));
 }
