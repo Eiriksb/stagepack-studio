@@ -822,3 +822,104 @@ fn a_picture_inserted_and_not_saved_survives_a_crash(cx: &mut TestAppContext) {
     });
     assert!(drawn, "the picture draws");
 }
+
+// ---------------------------------------------------------------------------------------
+// What writes a new text box
+
+#[gpui_kit::test]
+fn blank_input_leaves_a_text_box_pending(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    insert_text_box(&typing, cx);
+    let still_pending = |typing: &Typing, cx: &mut TestAppContext, what: &str| {
+        assert_eq!(typing.source(cx), TALK, "{what}");
+        assert!(!can_undo(typing, cx), "{what}");
+        assert_eq!(new_box(typing, cx), Some(NEW_BOX), "{what}");
+        assert!(typing.caret(cx).is_some(), "{what}: the caret shows");
+    };
+    for key in ["enter", "shift-enter", "tab", "backspace", "delete"] {
+        typing.press(cx, key);
+        still_pending(&typing, cx, key);
+    }
+    typing.type_text(cx, " ");
+    still_pending(&typing, cx, "a space");
+    typing.type_text(cx, "\u{a0}");
+    still_pending(&typing, cx, "a no-break space");
+    put_on_clipboard(cx, vec![ClipboardEntry::String("\n\n".to_string().into())]);
+    typing.press(cx, "ctrl-v");
+    still_pending(&typing, cx, "a paste of blank lines");
+}
+
+#[gpui_kit::test]
+fn the_first_visible_character_after_blanks_writes_only_it(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    insert_text_box(&typing, cx);
+    typing.press(cx, "enter");
+    typing.type_text(cx, " ");
+    typing.type_text(cx, "H");
+    assert_eq!(typing.source(cx), written_box("H"));
+    assert_eq!(typing.selection(cx), caret_at(pos(0, 1)));
+    assert_eq!(undo_label(&typing, cx), Some("Insert text box"));
+}
+
+#[gpui_kit::test]
+fn a_paste_starting_with_blank_lines_writes_from_its_first_words(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    insert_text_box(&typing, cx);
+    put_on_clipboard(cx, vec![ClipboardEntry::String("\n\n  Hello\nWorld".to_string().into())]);
+    typing.press(cx, "ctrl-v");
+    assert_eq!(typing.source(cx), written_box("Hello\n\nWorld"));
+    assert_eq!(typing.selection(cx), caret_at(pos(1, "World".len())));
+    assert_eq!(undo_label(&typing, cx), Some("Insert text box"));
+}
+
+/// A step of typing into a new text box, for the property below.
+#[derive(Clone, Debug)]
+enum Input {
+    Text(String),
+    Enter,
+    LineBreak,
+    Backspace,
+}
+
+fn input() -> impl proptest::strategy::Strategy<Value = Input> {
+    use proptest::prelude::*;
+    prop_oneof![
+        proptest::collection::vec(prop::sample::select(vec![" ", "\u{a0}", "\t", "\n", "\u{2028}", "a", "é", "\u{200b}"]), 1..4)
+            .prop_map(|parts| Input::Text(parts.concat())),
+        Just(Input::Enter),
+        Just(Input::LineBreak),
+        Just(Input::Backspace),
+    ]
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig { cases: 48, ..Default::default() })]
+
+    #[test]
+    fn typing_into_a_new_box_never_writes_a_box_with_no_visible_character(inputs in proptest::collection::vec(input(), 1..6)) {
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(folder.path().join("slides.md"), TALK).unwrap();
+        let mut document = stagepack_studio::document::Document::open(folder.path(), Fonts::bundled_only()).unwrap();
+        document.insert_text_box().unwrap();
+        for input in inputs {
+            let _ = document.apply_text(|edit| match &input {
+                Input::Text(text) => edit.insert(text),
+                Input::Enter => edit.enter(),
+                Input::LineBreak => edit.soft_break(),
+                Input::Backspace => edit.backspace(),
+            });
+            let talk = document.talk();
+            let source = talk.source.clone();
+            match source.find("<Box") {
+                None => proptest::prop_assert_eq!(&source, TALK),
+                Some(_) => {
+                    let flows = slides_format::text_flows(talk, 0);
+                    let visible = flows.iter().filter(|flow| matches!(flow.place, slides_format::FlowPlace::Tag(_))).any(|flow| {
+                        flow.paras.iter().flat_map(|para| &para.spans).any(|span| span.text.chars().any(|c| !c.is_whitespace()))
+                    });
+                    proptest::prop_assert!(visible || document.undo_label() == Some("Typing"), "an empty box was written: {:?}", source);
+                }
+            }
+        }
+    }
+}

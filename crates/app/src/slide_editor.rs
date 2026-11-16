@@ -19,8 +19,8 @@ use gpui_kit::*;
 use slides_engine::{Align, CaretRect, ElementBox, Hit, LineMove, Rect, SelectionRects, TextLayout};
 use slides_format::{Motion, Para, ParaKind, Pos, Selection, Span, StyleBit, TextEdit};
 
-use crate::clipboard::{self, ClipboardOp, TextPaste};
-use crate::clipboard_tools::{read_clipboard, write_clipboard};
+use crate::clipboard::{self, TextPaste};
+use crate::clipboard_tools::write_clipboard;
 use crate::document::{Document, EditRefused};
 use crate::selection::{self, Selected};
 use crate::slide_canvas::{SLIDE_WIDTH, SlideCanvas, letterbox};
@@ -540,17 +540,13 @@ impl SlideEditor {
             .then(|| first.round().max(0.0) as u32)
     }
 
-    /// Copies, cuts or pastes in the text being typed.
-    pub fn clipboard(&mut self, op: ClipboardOp, cx: &mut Context<Self>) {
-        match op {
-            ClipboardOp::Copy => {
-                self.copy_text(cx);
-            }
-            ClipboardOp::Cut => self.cut_text(cx),
-            ClipboardOp::Paste => {
-                let (plain, metadata) = read_clipboard(cx);
-                self.paste_text(plain.as_deref(), metadata.as_deref(), cx)
-            }
+    /// Copies the selection of the text being typed, or with `cut` cuts it. Pasting is the
+    /// window's, which reads the clipboard once and hands text here, to [`Self::paste_text`].
+    pub fn copy_or_cut(&mut self, cut: bool, cx: &mut Context<Self>) {
+        if cut {
+            self.cut_text(cx);
+        } else {
+            self.copy_text(cx);
         }
     }
 
@@ -1601,10 +1597,10 @@ impl Render for SlideEditor {
             }))
             .on_action(cx.listener(|this, _: &LetGoOfSelected, _, cx| this.let_go(cx)))
             .on_action(cx.listener(|this, _: &CopyToClipboard, _, cx| {
-                this.clipboard(ClipboardOp::Copy, cx)
+                this.copy_or_cut(false, cx)
             }))
             .on_action(cx.listener(|this, _: &CutToClipboard, _, cx| {
-                this.clipboard(ClipboardOp::Cut, cx)
+                this.copy_or_cut(true, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleBold, _, cx| {
                 this.format(|edit| edit.toggle(StyleBit::Bold), cx)

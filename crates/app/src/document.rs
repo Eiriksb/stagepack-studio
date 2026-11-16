@@ -1437,13 +1437,17 @@ impl Document {
     }
 
     /// Writes the new text box `editing` is typing in, at (`x`, `y`), holding `after`'s
-    /// paragraphs, as one step of its own named "Insert text box", and goes on typing in it. With
-    /// nothing in them yet, nothing is written.
+    /// paragraphs from their first visible character on, as one step of its own named "Insert
+    /// text box", and goes on typing in it, at the end of what's written. Input with no visible
+    /// character in it, as Enter, a space or a paste of blank lines, writes nothing, and the box
+    /// stays as it was, waiting.
     fn write_new_box(&mut self, editing: &EditingText, (x, y): (u32, u32), after: TextEdit) -> Result<Vec<usize>, EditRefused> {
-        if !holds_something(&after.paras) {
-            self.keep_typed(after, None);
+        let Some(paras) = from_first_visible(&after.paras) else {
+            self.keep_typed(editing.edit.clone(), None);
             return Ok(Vec::new());
-        }
+        };
+        let end = TextEdit::new(paras.clone()).select_all().selection.end();
+        let after = TextEdit::new(paras).move_to(end, false);
         let slide = editing.slide;
         let (change, start) = guarded(|| new_box_change(self.talk(), slide, (x, y), &after.paras))?
             .ok_or(EditRefused::CouldNotBeTyped)?;
@@ -2436,6 +2440,25 @@ fn tag_starting_at(talk: &Talk, slide: usize, start: usize) -> Option<&Tag> {
     }
     let slide = talk.slides.get(slide).filter(|slide| slide.error.is_none())?;
     within(&slide.blocks, start)
+}
+
+/// `paras` from their first visible character on: the paragraphs before it, and the white space
+/// before it in its own, left out. `None` if there's none.
+fn from_first_visible(paras: &[Para]) -> Option<Vec<Para>> {
+    let visible = |para: &Para| para.spans.iter().any(|span| span.text.chars().any(|c| !c.is_whitespace()));
+    let first = paras.iter().position(visible)?;
+    let mut out = paras[first..].to_vec();
+    let spans = &mut out[0].spans;
+    while let Some(span) = spans.first_mut() {
+        let rest = span.text.trim_start();
+        if rest.is_empty() {
+            spans.remove(0);
+        } else {
+            span.text = rest.to_string();
+            break;
+        }
+    }
+    Some(out)
 }
 
 /// The change that writes a new text box, at (`x`, `y`) and [`TEXT_BOX_SIZE`], holding `paras`,

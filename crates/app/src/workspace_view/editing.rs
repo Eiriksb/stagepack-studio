@@ -251,20 +251,19 @@ impl WorkspaceView {
         if op == ClipboardOp::Paste {
             return self.paste(window, cx);
         }
+        let cut = op == ClipboardOp::Cut;
         if document.read(cx).text().is_some() {
             // From a text tool that has the keyboard: it goes back to the text, as after any tool.
             self.slide_editor.update(cx, |editor, cx| {
                 editor.focus_text(window, cx);
-                editor.clipboard(op, cx);
+                editor.copy_or_cut(cut, cx);
             });
             return;
         }
-        match op {
-            ClipboardOp::Copy => {
-                self.copy_slide(cx);
-            }
-            ClipboardOp::Cut => self.cut_slide(cx),
-            ClipboardOp::Paste => {}
+        if cut {
+            self.cut_slide(cx);
+        } else {
+            self.copy_slide(cx);
         }
     }
 

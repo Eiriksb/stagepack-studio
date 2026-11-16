@@ -31,14 +31,6 @@ pub(crate) fn write_clipboard(entry: Entry, cx: &mut App) {
     cx.write_to_clipboard(item);
 }
 
-/// What the system clipboard holds: its text, and its metadata, if it's one piece of text
-/// that has some.
-pub(crate) fn read_clipboard(cx: &App) -> (Option<String>, Option<String>) {
-    cx.read_from_clipboard()
-        .map(|item| (item.text(), item.metadata().cloned()))
-        .unwrap_or_default()
-}
-
 /// What on the clipboard can be put on the slide, besides text.
 pub(crate) enum ClipboardThing {
     Picture(Image),
