@@ -410,10 +410,10 @@ fn a_paste_more_than_the_slide_holds_is_refused_at_once(cx: &mut TestAppContext)
     let styled = text_entry(&paras);
     assert!(styled.metadata.is_some());
     let talk = open(cx, TWO);
-    for (text, metadata) in [(plain.as_str(), None), (styled.text.as_str(), styled.metadata.as_deref())] {
+    // Ctrl+V alone, with the window drawn before it and not after.
+    let paste = |cx: &mut TestAppContext, text: &str, metadata: Option<&str>| {
         talk.click_text(cx, 1, pos(0, 15));
         put(cx, text, metadata);
-        // The key alone, with the window drawn before it and not after.
         let took = cx
             .update_window(talk.handle, |_, window, cx| {
                 window.render_frame(cx);
@@ -423,11 +423,17 @@ fn a_paste_more_than_the_slide_holds_is_refused_at_once(cx: &mut TestAppContext)
             })
             .unwrap();
         talk.settle(cx);
-        assert!(took < Duration::from_millis(50), "said at once, not after trying: {took:?}");
         assert_eq!(talk.status(cx).as_deref(), Some(TOO_LARGE));
         assert_eq!(talk.source(cx), TWO);
         assert!(!talk.can_undo(cx));
         assert!(talk.editing(cx).is_some(), "typing goes on");
+        took
+    };
+    for (text, metadata) in [(plain.as_str(), None), (styled.text.as_str(), styled.metadata.as_deref())] {
+        let took = paste(cx, text, metadata);
+        // Against more than any paste takes, which is refused before the clipboard is read.
+        let at_once = paste(cx, &"x".repeat(MAX_BYTES + 1), None);
+        assert!(took < at_once + Duration::from_millis(50), "said at once, not after trying: {took:?} against {at_once:?}");
     }
 }
 
