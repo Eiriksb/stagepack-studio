@@ -63,7 +63,7 @@ impl FileKind {
         }
     }
 
-    fn is_component(self) -> bool {
+    pub(crate) fn is_component(self) -> bool {
         matches!(self, FileKind::ComponentSource | FileKind::ComponentBuild)
     }
 }
@@ -162,7 +162,7 @@ pub fn picture_bytes(bytes: Vec<u8>, hint_ext: Option<&str>) -> Result<(Vec<u8>,
 /// with its build, `build/<stem>.wasm`, by that stem, so making it "safe" would part them. `None`
 /// if it isn't a stem the engine takes (letters, digits, `_` and `-`, at most 64), or is a name
 /// Windows keeps for a device.
-fn component_stem(suggested: &str) -> Option<&str> {
+pub(crate) fn component_stem(suggested: &str) -> Option<&str> {
     let (stem, _) = split_extension(suggested);
     let device = DEVICE_NAMES.iter().any(|device| device.eq_ignore_ascii_case(stem));
     (slides_components::safe_stem(stem) && !device).then_some(stem)
@@ -286,12 +286,17 @@ fn component_tag_of(files: &dyn TalkFiles, stem: &str) -> Option<String> {
     slides_components::component_tag(std::str::from_utf8(&source).ok()?)
 }
 
+/// The talk's build index in `files`, if it has one that can be read.
+pub(crate) fn build_index(files: &dyn TalkFiles) -> Option<BuildIndex> {
+    if files.len(INDEX_FILE).is_some_and(|len| len > MAX_INDEX_BYTES) {
+        return None;
+    }
+    files.read(INDEX_FILE).and_then(|bytes| serde_json::from_slice::<BuildIndex>(&bytes).ok())
+}
+
 /// The tags the talk's build index in `files` gives the build `build/<file>.wasm`.
 fn indexed_tags(files: &dyn TalkFiles, file: &str) -> Vec<String> {
-    if files.len(INDEX_FILE).is_some_and(|len| len > MAX_INDEX_BYTES) {
-        return Vec::new();
-    }
-    let Some(index) = files.read(INDEX_FILE).and_then(|bytes| serde_json::from_slice::<BuildIndex>(&bytes).ok()) else {
+    let Some(index) = build_index(files) else {
         return Vec::new();
     };
     index.components.into_iter().filter(|entry| entry.file == file).map(|entry| entry.tag).collect()

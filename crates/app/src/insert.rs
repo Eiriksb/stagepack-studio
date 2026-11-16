@@ -38,7 +38,14 @@ pub const SHAPE_KINDS: [&str; 6] = ["rect", "rounded", "ellipse", "line", "arrow
 /// the slide goes at its corner. Whole numbers, as they're written.
 pub fn place_for(size: (f32, f32), taken: &[(f32, f32)]) -> (f32, f32) {
     let (w, h) = size;
-    let mut at = (((SLIDE.0 - w) / 2.0).round(), ((SLIDE.1 - h) / 2.0).round());
+    let at = step_aside((((SLIDE.0 - w) / 2.0).round(), ((SLIDE.1 - h) / 2.0).round()), taken);
+    let held = |at: f32, length: f32, room: f32| at.min((room - length).round()).max(0.0);
+    (held(at.0, w, SLIDE.0), held(at.1, h, SLIDE.1))
+}
+
+/// `at`, a top-left corner in slide units, moved 40 down and right for each time that exact
+/// place is in `taken`, the top-left corners of the things on the slide, at most ten times.
+pub fn step_aside(mut at: (f32, f32), taken: &[(f32, f32)]) -> (f32, f32) {
     let is_taken = |(x, y): (f32, f32)| taken.iter().any(|&(tx, ty)| (tx - x).abs() < 0.5 && (ty - y).abs() < 0.5);
     for _ in 0..MOST_STEPS {
         if !is_taken(at) {
@@ -46,8 +53,7 @@ pub fn place_for(size: (f32, f32), taken: &[(f32, f32)]) -> (f32, f32) {
         }
         at = (at.0 + STEP, at.1 + STEP);
     }
-    let held = |at: f32, length: f32, room: f32| at.min((room - length).round()).max(0.0);
-    (held(at.0, w, SLIDE.0), held(at.1, h, SLIDE.1))
+    at
 }
 
 /// Whether a shape of kind `kind` is a line, with no inside to fill.

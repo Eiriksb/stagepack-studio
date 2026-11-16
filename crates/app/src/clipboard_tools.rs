@@ -1,6 +1,6 @@
 //! The Clipboard group on the Home tab, Paste, Cut and Copy, and the window's side of the
-//! system clipboard. The tools act on what has the keyboard: the text being typed, or else
-//! the current slide. Using one leaves the keyboard where it was. What goes on the clipboard,
+//! system clipboard. The tools act on what has the keyboard: the text being typed, the thing
+//! selected on the slide, or else the current slide. Using one leaves the keyboard where it was. What goes on the clipboard,
 //! and what's taken from it, is [`crate::clipboard`]'s.
 
 use std::path::PathBuf;
@@ -13,7 +13,7 @@ use gpui_kit::*;
 use crate::clipboard::Entry;
 use crate::document::Document;
 use crate::ribbon::group;
-use crate::slide_editor::{EDITOR_CONTEXT, SlideEditor};
+use crate::slide_editor::{EDITOR_CONTEXT, SELECTION_CONTEXT, SlideEditor};
 use crate::slide_strip::STRIP_CONTEXT;
 use crate::workspace_view::{CopyToClipboard, CutToClipboard, PasteFromClipboard};
 
@@ -149,11 +149,18 @@ impl Render for ClipboardTools {
         // With text being typed, they're for its selection; Cut and Copy need some selected.
         // Otherwise they're for the current slide, which can't be cut if it's the only one.
         // In the notes field, they do what its own keys do, to its selection.
+        // With a thing selected on the slide shown, they're for it.
         let in_notes = self.notes.as_ref().is_some_and(|notes| notes.contains_focused(window, cx));
+        let thing_here = self.document.as_ref().is_some_and(|document| {
+            let document = document.read(cx);
+            document.selected().is_some_and(|selected| selected.slide == document.current())
+        });
         let (copy, cut, context) = if in_notes {
             (has_talk, has_talk, STRIP_CONTEXT)
         } else if seen.typing {
             (seen.selected, seen.selected, EDITOR_CONTEXT)
+        } else if thing_here {
+            (true, true, SELECTION_CONTEXT)
         } else {
             (has_talk, slides.is_some_and(|count| count > 1), STRIP_CONTEXT)
         };

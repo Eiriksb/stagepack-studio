@@ -1026,3 +1026,63 @@ fn a_component_that_draws_its_words_takes_typing_there() {
     assert_eq!(hit, Hit::Text { flow: boxed, pos: slides_format::Pos { para: 0, offset: 0 } });
     assert!(!deck.takes_content("Nope"));
 }
+
+/// A talk in a folder holding `Hello`'s source and build, and `index` as its build index if
+/// it's given, whose files are read with those added to it in `added`.
+fn hello_with_added(index: Option<Vec<u8>>) -> (tempfile::TempDir, std::sync::Arc<AddedSet>, Deck) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("components")).unwrap();
+    std::fs::create_dir_all(dir.path().join("build")).unwrap();
+    std::fs::write(dir.path().join("components/hello.rs"), source("Hello")).unwrap();
+    std::fs::write(dir.path().join("build/hello.wasm"), answering("Hello", &text_answer("Entered"))).unwrap();
+    if let Some(index) = index {
+        std::fs::write(dir.path().join(INDEX_FILE), index).unwrap();
+    }
+    let added = std::sync::Arc::new(AddedSet::new());
+    let under: std::sync::Arc<dyn TalkFiles + Send + Sync> = std::sync::Arc::new(FolderFiles::new(dir.path().to_path_buf()));
+    let files: std::sync::Arc<dyn TalkFiles + Send + Sync> = std::sync::Arc::new(WithAdded::new(under, added.clone()));
+    let deck = Deck::open(Box::new(files), Fonts::bundled_only(), "<Hello />\n".into());
+    (dir, added, deck)
+}
+
+fn entry(tag: &str, file: &str, built_from: &str) -> BuildEntry {
+    BuildEntry { tag: tag.to_string(), file: file.to_string(), source_hash: source_hash(built_from.as_bytes()) }
+}
+
+#[test]
+fn a_build_entered_with_the_added_files_pairs_as_the_index_would() {
+    let (_dir, added, mut deck) = hello_with_added(None);
+    assert_eq!(info(&deck, "Hello").state, ComponentState::NeedsBuilding);
+    added.enter_build(entry("Hello", "hello", &source("Hello")));
+    deck.files_added();
+    assert_eq!(info(&deck, "Hello").state, ComponentState::UpToDate);
+    assert!(shows(&mut deck, 0, "Entered"), "{:?}", texts(&mut deck, 0));
+    // Entered again from another source, it's out of date, though the index is as long.
+    added.enter_build(entry("Hello", "hello", &source("Other")));
+    deck.files_added();
+    assert_eq!(info(&deck, "Hello").state, ComponentState::OutOfDate);
+    assert_eq!(added.builds_entered().len(), 1, "one entry for a component");
+    // Forgotten, the talk's own index is read as it is.
+    added.forget_builds(&added.builds_entered());
+    deck.files_added();
+    assert_eq!(info(&deck, "Hello").state, ComponentState::NeedsBuilding);
+}
+
+#[test]
+fn a_build_entered_keeps_the_talks_own_index_and_an_unreadable_one_is_left_as_it_is() {
+    let (_dir, added, mut deck) = hello_with_added(Some(index(&[("Other", "other", "x"), ("Hello", "hello", "older")])));
+    assert_eq!(info(&deck, "Hello").state, ComponentState::OutOfDate);
+    added.enter_build(entry("Hello", "hello", &source("Hello")));
+    deck.files_added();
+    assert_eq!(info(&deck, "Hello").state, ComponentState::UpToDate);
+    let files = WithAdded::new(std::sync::Arc::new(FolderFiles::new(_dir.path().to_path_buf())), added.clone());
+    let read: BuildIndex = serde_json::from_slice(&files.read(INDEX_FILE).unwrap()).unwrap();
+    assert_eq!(read.components, [entry("Other", "other", "x"), entry("Hello", "hello", &source("Hello"))]);
+    assert_eq!(files.len(INDEX_FILE), Some(files.read(INDEX_FILE).unwrap().len() as u64));
+
+    let (_dir, added, mut deck) = hello_with_added(Some(b"this isn't JSON".to_vec()));
+    added.enter_build(entry("Hello", "hello", &source("Hello")));
+    deck.files_added();
+    assert_eq!(info(&deck, "Hello").state, ComponentState::NeedsBuilding, "nothing counts as built");
+    assert!(has_problem(&deck, INDEX_FILE));
+}

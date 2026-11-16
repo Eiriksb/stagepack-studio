@@ -1,6 +1,9 @@
 //! Picking a thing on the slide with a click, the outline that shows it, and taking it away.
 
 use std::ops::Range;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 #[path = "support/typing.rs"]
 mod typing;
@@ -9,9 +12,16 @@ use typing::*;
 
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{Bounds, Modifiers, Pixels, Point, TestAppContext, px, size};
-use slides_engine::{ElementBox, Hit};
+use slides_engine::{ComponentState, ElementBox, Fonts, Hit, Pixmap};
 use slides_format::FlowPlace;
+use stagepack_studio::builds::Compile;
+use stagepack_studio::clipboard::MISSING_PICTURES;
+use stagepack_studio::clipboard_tools::{COPY_ID, CUT_ID};
+use stagepack_studio::document::Document;
+use stagepack_studio::insert_tools::InsertTextBox;
+use stagepack_studio::permissions::BuildPermissions;
 use stagepack_studio::slide_editor::SELECTION_OUTLINE_ID;
+use stagepack_studio::slide_strip::strip_row_id;
 
 const SHOWCASE: &str = include_str!("../../../fixtures/showcase/slides.md");
 /// The showcase's slide of shapes, an icon, a picture and a table.
@@ -473,4 +483,357 @@ fn typing_given_back_by_undo_or_redo_drops_the_selection(cx: &mut TestAppContext
         typing.press(cx, "delete");
         assert!(typing.source(cx).contains("<Picture"), "redo {redo}: delete is the text's");
     }
+}
+
+// Copying things, and what a paste brings with it.
+
+const SCORE_SOURCE: &str = include_str!("../../components/tests/fixtures/v1/score.rs");
+const SCORE_BUILD: &[u8] = include_bytes!("../../components/tests/fixtures/v1/score.wasm");
+const PICTURE: &str = "<Picture src=\"assets/photo.png\" x=\"300\" y=\"300\" w=\"400\" h=\"300\" />";
+const SCORE: &str = "<Score team=\"Reds\" points=\"3\" x=\"300\" y=\"300\" w=\"600\" h=\"300\" />";
+
+fn on_clipboard(cx: &mut TestAppContext) -> (Option<String>, Option<String>) {
+    cx.read_from_clipboard().map(|item| (item.text(), item.metadata().cloned())).unwrap_or_default()
+}
+
+fn undo_label(typing: &Typing, cx: &TestAppContext) -> Option<&'static str> {
+    typing.document(cx).read_with(cx, |document, _| document.undo_label())
+}
+
+/// Clicks row `row` of the list of slides, which takes the keyboard.
+fn click_row(typing: &Typing, cx: &mut TestAppContext, row: usize) {
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        window.click(strip_row_id(row), cx);
+    });
+    typing.settle(cx);
+}
+
+/// Selects the thing on the current slide whose source starts with `start`.
+fn pick(typing: &Typing, cx: &mut TestAppContext, start: &str) -> ElementBox {
+    let element = thing(typing, cx, start);
+    let at = if start.starts_with('|') { border(typing, cx, &element) } else { middle(typing, cx, &element) };
+    typing.click(cx, at);
+    assert_eq!(selected(typing, cx).map(|(_, range)| range), Some(element.source.clone()), "{start} is selected");
+    element
+}
+
+/// The text of the thing selected.
+fn selected_text(typing: &Typing, cx: &TestAppContext) -> Option<String> {
+    let (_, range) = selected(typing, cx)?;
+    Some(typing.source(cx)[range].to_string())
+}
+
+/// Saves the talk and waits for it to be written.
+fn save(typing: &Typing, cx: &mut TestAppContext) {
+    typing.press(cx, "ctrl-s");
+    cx.run_until_parked();
+    typing.settle(cx);
+}
+
+/// A folder holding a talk of one slide holding `thing`, and the picture its fixture has.
+fn talk_with(thing: &str) -> tempfile::TempDir {
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::write(folder.path().join("slides.md"), format!("# From\n\n{thing}\n")).unwrap();
+    std::fs::create_dir(folder.path().join("assets")).unwrap();
+    std::fs::write(folder.path().join("assets/photo.png"), photo()).unwrap();
+    folder
+}
+
+fn photo() -> Vec<u8> {
+    std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/showcase/assets/photo.png")).unwrap()
+}
+
+/// A folder holding a talk whose slide shows Score, with its source, and its build as the index
+/// says it was built from `built_from`.
+fn score_talk(built_from: &str) -> tempfile::TempDir {
+    let folder = talk_with(SCORE);
+    for sub in ["components", "build"] {
+        std::fs::create_dir(folder.path().join(sub)).unwrap();
+    }
+    std::fs::write(folder.path().join("components/score.rs"), SCORE_SOURCE).unwrap();
+    std::fs::write(folder.path().join("build/score.wasm"), SCORE_BUILD).unwrap();
+    let index = format!(r#"{{"format":1,"components":[{{"tag":"Score","file":"score","source_hash":"{built_from}"}}]}}"#);
+    std::fs::write(folder.path().join("build/index.json"), index).unwrap();
+    folder
+}
+
+/// Opens the talk in `folder` with a compiler that counts its calls, and build permissions kept
+/// in `permissions`.
+fn open_counting(cx: &mut TestAppContext, folder: tempfile::TempDir, permissions: &std::path::Path) -> (Typing, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let compile: Compile = Arc::new(move |_: &str, _: &str| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        Err(Vec::new())
+    });
+    let typing = open_folder(cx, folder, None);
+    let file = permissions.to_path_buf();
+    cx.update(|cx| {
+        typing.view.update(cx, |view, _| {
+            view.set_compile_for_test(compile);
+            view.set_permissions_for_test(BuildPermissions::load(file));
+        })
+    });
+    (typing, calls)
+}
+
+fn state_of(typing: &Typing, cx: &TestAppContext, tag: &str) -> Option<ComponentState> {
+    typing.document(cx).read_with(cx, |document, _| document.components().iter().find(|info| info.tag == tag).map(|info| info.state))
+}
+
+#[gpui_kit::test]
+fn copy_and_paste_a_shape_gives_a_second_one_offset_and_selected(cx: &mut TestAppContext) {
+    let typing = open(cx, SHOWCASE);
+    go_to(&typing, cx, THINGS);
+    let shape = "<Shape kind=\"ellipse\" x=\"700\" y=\"560\" w=\"240\" h=\"200\" fill=\"orange\" outline=\"black\" outline-width=\"4\" />";
+    pick(&typing, cx, "<Shape kind=\"ellipse\"");
+    typing.press(cx, "ctrl-c");
+    assert_eq!(typing.source(cx), SHOWCASE, "copying changes nothing");
+    let (plain, metadata) = on_clipboard(cx);
+    assert_eq!(plain.as_deref(), Some(shape), "other programs get its Markdown");
+    assert!(metadata.is_some_and(|metadata| metadata.contains("\"element\"")));
+    typing.press(cx, "ctrl-v");
+    let moved = shape.replace("x=\"700\" y=\"560\"", "x=\"740\" y=\"600\"");
+    assert_eq!(typing.source(cx).matches("<Shape kind=\"ellipse\"").count(), 2);
+    assert_eq!(selected_text(&typing, cx).as_deref(), Some(moved.as_str()), "the copy is selected, 40 down and right");
+    assert_eq!(undo_label(&typing, cx), Some("Paste"));
+    assert_eq!(typing.current(cx), THINGS);
+    // Again, and it steps aside from both.
+    typing.press(cx, "ctrl-v");
+    let again = shape.replace("x=\"700\" y=\"560\"", "x=\"780\" y=\"640\"");
+    assert_eq!(selected_text(&typing, cx).as_deref(), Some(again.as_str()));
+    typing.press(cx, "ctrl-z");
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), SHOWCASE, "each paste is one step");
+}
+
+#[gpui_kit::test]
+fn cut_then_undo_brings_it_back(cx: &mut TestAppContext) {
+    let typing = open(cx, SHOWCASE);
+    go_to(&typing, cx, THINGS);
+    pick(&typing, cx, "<Icon");
+    typing.press(cx, "ctrl-x");
+    assert_eq!(typing.source(cx), SHOWCASE.replacen(&format!("{ICON}\n\n"), "", 1));
+    assert_eq!(undo_label(&typing, cx), Some("Cut"));
+    assert_eq!(typing.slide_count(cx), 7, "the thing, not the slide");
+    assert_eq!(on_clipboard(cx).0.as_deref(), Some(ICON));
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), SHOWCASE);
+    assert_eq!(selected_text(&typing, cx).as_deref(), Some(ICON), "selected again");
+    // And it can be pasted back.
+    typing.press(cx, "ctrl-v");
+    assert_eq!(selected_text(&typing, cx).as_deref(), Some(ICON.replace("x=\"100\" y=\"840\"", "x=\"140\" y=\"880\"").as_str()));
+}
+
+#[gpui_kit::test]
+fn duplicate_leaves_the_clipboard_alone(cx: &mut TestAppContext) {
+    let typing = open(cx, SHOWCASE);
+    go_to(&typing, cx, THINGS);
+    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("keep me".to_string()));
+    pick(&typing, cx, "<Icon");
+    typing.press(cx, "ctrl-d");
+    assert_eq!(typing.slide_count(cx), 7, "the thing is duplicated, not the slide");
+    assert_eq!(typing.source(cx).matches("<Icon").count(), SHOWCASE.matches("<Icon").count() + 1);
+    assert_eq!(selected_text(&typing, cx).as_deref(), Some(ICON.replace("x=\"100\" y=\"840\"", "x=\"140\" y=\"880\"").as_str()));
+    assert_eq!(on_clipboard(cx), (Some("keep me".to_string()), None));
+    assert_eq!(undo_label(&typing, cx), Some("Duplicate"));
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), SHOWCASE, "one step");
+}
+
+#[gpui_kit::test]
+fn a_picture_pasted_into_another_talk_brings_its_file(cx: &mut TestAppContext) {
+    let from = open_folder(cx, talk_with(PICTURE), None);
+    let into = open(cx, "# Into\n");
+    pick(&from, cx, "<Picture");
+    from.press(cx, "ctrl-c");
+    click_row(&into, cx, 0);
+    into.press(cx, "ctrl-v");
+    assert_eq!(into.source(cx), format!("# Into\n\n{PICTURE}\n"));
+    assert_eq!(selected_text(&into, cx).as_deref(), Some(PICTURE));
+    let notices = into.document(cx).update(cx, |document, _| document.notices());
+    assert!(notices.is_empty(), "the second talk draws it: {notices:?}");
+    assert_ne!(into.status(cx).as_deref(), Some(MISSING_PICTURES));
+    assert!(into.document(cx).read_with(cx, |document, _| document.has_unsaved_changes()));
+    save(&into, cx);
+    let folder = into.file.parent().unwrap().to_path_buf();
+    assert_eq!(std::fs::read(folder.join("assets/photo.png")).unwrap(), photo(), "saved, its folder holds the file");
+}
+
+#[gpui_kit::test]
+fn a_picture_whose_name_is_taken_is_renamed_in_the_pasted_tag(cx: &mut TestAppContext) {
+    let from = open_folder(cx, talk_with(PICTURE), None);
+    let taken = tempfile::tempdir().unwrap();
+    std::fs::write(taken.path().join("slides.md"), "# Into\n").unwrap();
+    std::fs::create_dir(taken.path().join("assets")).unwrap();
+    let theirs = Pixmap::new(2, 2).unwrap().encode_png().unwrap();
+    std::fs::write(taken.path().join("assets/photo.png"), &theirs).unwrap();
+    let into = open_folder(cx, taken, None);
+    pick(&from, cx, "<Picture");
+    from.press(cx, "ctrl-c");
+    click_row(&into, cx, 0);
+    into.press(cx, "ctrl-v");
+    assert_eq!(into.source(cx), format!("# Into\n\n{}\n", PICTURE.replace("assets/photo.png", "assets/photo-2.png")));
+    save(&into, cx);
+    let folder = into.file.parent().unwrap().to_path_buf();
+    assert_eq!(std::fs::read(folder.join("assets/photo.png")).unwrap(), theirs, "the talk's own is left as it was");
+    assert_eq!(std::fs::read(folder.join("assets/photo-2.png")).unwrap(), photo());
+}
+
+#[gpui_kit::test]
+fn a_slide_pasted_into_another_talk_brings_its_pictures(cx: &mut TestAppContext) {
+    let from = open_folder(cx, talk_with(PICTURE), None);
+    let into = open(cx, "# Into\n");
+    click_row(&from, cx, 0);
+    from.press(cx, "ctrl-c");
+    click_row(&into, cx, 0);
+    into.press(cx, "ctrl-v");
+    assert_eq!(into.slide_count(cx), 2);
+    assert!(into.source(cx).contains(PICTURE));
+    assert!(into.document(cx).update(cx, |document, _| document.notices()).is_empty());
+    assert_eq!(into.status(cx), None, "nothing is missing");
+    save(&into, cx);
+    assert_eq!(std::fs::read(into.file.parent().unwrap().join("assets/photo.png")).unwrap(), photo());
+}
+
+#[gpui_kit::test]
+fn a_component_pasted_into_a_talk_without_it_brings_source_and_build_and_builds_nothing(cx: &mut TestAppContext) {
+    let hash = slides_components::source_hash(SCORE_SOURCE.as_bytes());
+    for (built_from, state) in [(hash.clone(), ComponentState::UpToDate), ("0".repeat(64), ComponentState::OutOfDate)] {
+        let from = open_folder(cx, score_talk(&built_from), None);
+        assert_eq!(state_of(&from, cx, "Score"), Some(state));
+        let app_data = tempfile::tempdir().unwrap();
+        let permissions = app_data.path().join("permissions.json");
+        let into_folder = tempfile::tempdir().unwrap();
+        std::fs::write(into_folder.path().join("slides.md"), "# Into\n").unwrap();
+        let (into, calls) = open_counting(cx, into_folder, &permissions);
+        pick(&from, cx, "<Score");
+        from.press(cx, "ctrl-c");
+        click_row(&into, cx, 0);
+        into.press(cx, "ctrl-v");
+        assert_eq!(into.source(cx), format!("# Into\n\n{SCORE}\n"));
+        assert_eq!(state_of(&into, cx, "Score"), Some(state), "paired as in the talk it came from");
+        let notices = into.document(cx).update(cx, |document, _| document.notices());
+        let drawn = if state == ComponentState::UpToDate { notices.is_empty() } else { notices.iter().all(|notice| notice.contains("last build")) };
+        assert!(drawn, "it draws: {notices:?}");
+        save(&into, cx);
+        cx.executor().advance_clock(Duration::from_secs(5));
+        cx.run_until_parked();
+        let folder = into.file.parent().unwrap().to_path_buf();
+        assert_eq!(std::fs::read_to_string(folder.join("components/score.rs")).unwrap(), SCORE_SOURCE);
+        assert_eq!(std::fs::read(folder.join("build/score.wasm")).unwrap(), SCORE_BUILD);
+        let index: serde_json::Value = serde_json::from_slice(&std::fs::read(folder.join("build/index.json")).unwrap()).unwrap();
+        assert_eq!(index["components"][0]["tag"], "Score");
+        assert_eq!(index["components"][0]["source_hash"].as_str(), Some(built_from.as_str()));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing is built");
+        assert!(!permissions.exists(), "the permissions are as they were");
+        assert!(!BuildPermissions::load(permissions).always(&folder));
+        // Opened again, it's as it was.
+        let reopened = Document::open(&folder, Fonts::bundled_only()).unwrap();
+        assert_eq!(reopened.components().iter().find(|info| info.tag == "Score").map(|info| info.state), Some(state));
+    }
+}
+
+#[gpui_kit::test]
+fn a_component_that_differs_is_not_replaced_and_says_so(cx: &mut TestAppContext) {
+    let from = open_folder(cx, score_talk(&slides_components::source_hash(SCORE_SOURCE.as_bytes())), None);
+    let theirs = format!("{SCORE_SOURCE}\n// This talk's own.\n");
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::write(folder.path().join("slides.md"), "# Into\n").unwrap();
+    std::fs::create_dir(folder.path().join("components")).unwrap();
+    std::fs::write(folder.path().join("components/score.rs"), &theirs).unwrap();
+    let into = open_folder(cx, folder, None);
+    pick(&from, cx, "<Score");
+    from.press(cx, "ctrl-c");
+    click_row(&into, cx, 0);
+    into.press(cx, "ctrl-v");
+    assert_eq!(into.source(cx), format!("# Into\n\n{SCORE}\n"), "the thing is pasted");
+    assert_eq!(
+        into.status(cx).as_deref(),
+        Some("This talk already has a different component called Score. The pasted one uses this talk's.")
+    );
+    assert!(into.document(cx).read_with(cx, |document, _| document.unsaved_files().is_empty()), "nothing is added");
+    save(&into, cx);
+    let saved = into.file.parent().unwrap().to_path_buf();
+    assert_eq!(std::fs::read_to_string(saved.join("components/score.rs")).unwrap(), theirs);
+    assert!(!saved.join("build").exists());
+    // The same source is used as it is, and nothing's said.
+    let same = tempfile::tempdir().unwrap();
+    std::fs::write(same.path().join("slides.md"), "# Into\n").unwrap();
+    std::fs::create_dir(same.path().join("components")).unwrap();
+    std::fs::write(same.path().join("components/score.rs"), SCORE_SOURCE).unwrap();
+    let into = open_folder(cx, same, None);
+    click_row(&into, cx, 0);
+    into.press(cx, "ctrl-v");
+    assert!(into.source(cx).contains(SCORE));
+    assert!(into.status(cx).is_none_or(|status| !status.contains("different component")));
+    assert!(into.document(cx).read_with(cx, |document, _| document.unsaved_files().is_empty()));
+}
+
+#[gpui_kit::test]
+fn an_element_pasted_while_typing_is_refused_in_words(cx: &mut TestAppContext) {
+    let typing = open(cx, SHOWCASE);
+    go_to(&typing, cx, THINGS);
+    pick(&typing, cx, "<Icon");
+    typing.press(cx, "ctrl-c");
+    typing.press(cx, "escape");
+    for _ in 0..THINGS {
+        typing.press(cx, "pageup");
+    }
+    assert_eq!(typing.current(cx), 0);
+    typing.click_text(cx, 0, pos(0, 1));
+    assert!(typing.editing(cx).is_some());
+    typing.press(cx, "ctrl-v");
+    assert_eq!(typing.source(cx), SHOWCASE, "nothing is pasted, nor typed in as Markdown");
+    assert_eq!(typing.status(cx).as_deref(), Some("That can't be pasted into text."));
+    assert!(typing.editing(cx).is_some(), "typing goes on");
+    // A new text box waiting for its first letter is dropped, and the thing pasted.
+    typing.press(cx, "escape");
+    typing.with_window(cx, |window, cx| window.dispatch_action(Box::new(InsertTextBox), cx));
+    typing.settle(cx);
+    assert!(typing.document(cx).read_with(cx, |document, _| document.new_box().is_some()));
+    typing.press(cx, "ctrl-v");
+    assert!(typing.document(cx).read_with(cx, |document, _| document.new_box().is_none()));
+    assert_eq!(selected_text(&typing, cx).as_deref(), Some(ICON));
+    assert_eq!(typing.source(cx).matches("<Icon").count(), SHOWCASE.matches("<Icon").count() + 1);
+}
+
+#[gpui_kit::test]
+fn a_table_can_be_copied_and_pasted(cx: &mut TestAppContext) {
+    let typing = open(cx, SHOWCASE);
+    go_to(&typing, cx, THINGS);
+    let table = pick(&typing, cx, "| Layout");
+    let text = typing.source(cx)[table.source.clone()].to_string();
+    typing.press(cx, "ctrl-c");
+    assert_eq!(on_clipboard(cx).0.as_deref(), Some(text.as_str()));
+    typing.press(cx, "ctrl-v");
+    assert_eq!(typing.source(cx).matches(text.as_str()).count(), 2);
+    let (slide, range) = selected(&typing, cx).expect("the copy is selected");
+    assert_eq!(slide, THINGS);
+    assert_ne!(range, table.source);
+    assert_eq!(&typing.source(cx)[range], text);
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), SHOWCASE);
+}
+
+#[gpui_kit::test]
+fn the_home_tabs_copy_and_cut_act_on_the_thing_selected(cx: &mut TestAppContext) {
+    let only = "# Only\n\n<Icon name=\"star\" x=\"100\" y=\"100\" size=\"96\" />\n";
+    let typing = open(cx, only);
+    pick(&typing, cx, "<Icon");
+    let disabled = |typing: &Typing, cx: &mut TestAppContext, id: &'static str| {
+        typing.with_window(cx, |window, cx| {
+            window.render_frame(cx);
+            window.find(id).disabled() == Some(true)
+        })
+    };
+    assert!(!disabled(&typing, cx, CUT_ID), "the only slide's thing can be cut");
+    typing.with_window(cx, |window, cx| window.click(COPY_ID, cx));
+    typing.settle(cx);
+    assert_eq!(on_clipboard(cx).0.as_deref(), Some("<Icon name=\"star\" x=\"100\" y=\"100\" size=\"96\" />"));
+    typing.with_window(cx, |window, cx| window.click(CUT_ID, cx));
+    typing.settle(cx);
+    assert_eq!(typing.source(cx), "# Only\n");
+    assert_eq!(undo_label(&typing, cx), Some("Cut"));
 }

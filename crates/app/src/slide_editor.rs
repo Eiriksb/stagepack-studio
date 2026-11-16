@@ -94,6 +94,7 @@ actions!(
         SelectNextThing,
         SelectPreviousThing,
         LetGoOfSelected,
+        DuplicateSelected,
     ]
 );
 
@@ -147,8 +148,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("tab", SelectNextThing, selecting),
         KeyBinding::new("shift-tab", SelectPreviousThing, selecting),
         KeyBinding::new("escape", LetGoOfSelected, selecting),
-        // The window's paste, as with nothing selected.
+        // The window's copy, cut and paste, which act on the thing selected.
+        KeyBinding::new("ctrl-c", CopyToClipboard, selecting),
+        KeyBinding::new("ctrl-x", CutToClipboard, selecting),
         KeyBinding::new("ctrl-v", PasteFromClipboard, selecting),
+        KeyBinding::new("ctrl-d", DuplicateSelected, selecting),
     ]);
     crate::text_tools::bind_keys(cx);
 }
@@ -426,6 +430,25 @@ impl SlideEditor {
         } else {
             cx.propagate();
         }
+    }
+
+    /// Copies or cuts the selection of the text being typed, as [`Self::copy_or_cut`] does; with
+    /// none being typed, the window copies or cuts the thing selected.
+    fn copy_or_cut_typed(&mut self, cut: bool, cx: &mut Context<Self>) {
+        if self.editing(cx).is_none() {
+            cx.propagate();
+            return;
+        }
+        self.copy_or_cut(cut, cx);
+    }
+
+    /// Puts a copy of the thing selected on the slide shown beside it, and selects the copy.
+    fn duplicate(&mut self, cx: &mut Context<Self>) {
+        if self.selection_here(cx).is_none() {
+            cx.propagate();
+            return;
+        }
+        self.run(Document::duplicate_selected, cx);
     }
 
     /// Takes the thing selected on the slide shown away.
@@ -1791,11 +1814,12 @@ impl Render for SlideEditor {
             }))
             .on_action(cx.listener(|this, _: &LetGoOfSelected, _, cx| this.let_go(cx)))
             .on_action(cx.listener(|this, _: &CopyToClipboard, _, cx| {
-                this.copy_or_cut(false, cx)
+                this.copy_or_cut_typed(false, cx)
             }))
             .on_action(cx.listener(|this, _: &CutToClipboard, _, cx| {
-                this.copy_or_cut(true, cx)
+                this.copy_or_cut_typed(true, cx)
             }))
+            .on_action(cx.listener(|this, _: &DuplicateSelected, _, cx| this.duplicate(cx)))
             .on_action(cx.listener(|this, _: &ToggleBold, _, cx| {
                 this.format(|edit| edit.toggle(StyleBit::Bold), cx)
             }))

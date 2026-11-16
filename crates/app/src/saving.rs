@@ -11,6 +11,8 @@ use slides_engine::{
     write_atomically, write_new_atomically,
 };
 
+use slides_components::{BuildEntry, INDEX_FILE};
+
 use crate::added_files::{NotAdded, is_added_path};
 use crate::builds;
 use crate::document::{SLIDES_FILE, TalkPlace};
@@ -35,6 +37,9 @@ pub struct SaveJob {
     to: Option<SaveTarget>,
     /// The files added to the talk that the text uses and aren't saved yet, by their path in it.
     added: Vec<(String, Arc<[u8]>)>,
+    /// The builds entered in the talk's index, of builds the text uses, that no save has
+    /// written into the index on disk.
+    builds: Vec<BuildEntry>,
 }
 
 /// Why a save didn't write anything.
@@ -77,6 +82,8 @@ pub struct Saved {
     pub(crate) moved_to: Option<(TalkPlace, SharedFiles)>,
     /// The files added to the talk that were written, by their path in it.
     pub(crate) files_written: Vec<String>,
+    /// The builds entered in the index on disk.
+    pub(crate) builds_written: Vec<BuildEntry>,
     notices: Vec<String>,
 }
 
@@ -99,6 +106,7 @@ impl SaveJob {
         from: TalkPlace,
         to: Option<SaveTarget>,
         added: Vec<(String, Arc<[u8]>)>,
+        builds: Vec<BuildEntry>,
     ) -> SaveJob {
         SaveJob {
             text,
@@ -106,10 +114,13 @@ impl SaveJob {
             from,
             to,
             added,
+            builds,
         }
     }
 
-    /// Writes the talk out, with the files added to it that its text uses. A failure says why,
+    /// Writes the talk out, with the files added to it that its text uses, and, to a folder, the
+    /// builds entered in its index, which a pack doesn't take: there, a pasted component needs
+    /// building once the pack is opened again. A failure says why,
     /// in words for the person saving, and leaves what was there as it was: a folder may have
     /// some of those files in it, which nothing uses until a save writes its text.
     pub fn run(self) -> Result<Saved, SaveError> {
@@ -119,7 +130,9 @@ impl SaveJob {
             from,
             to,
             added,
+            builds,
         } = self;
+        let mut builds_written = Vec::new();
         let files_written: Vec<String> = added.iter().map(|(path, _)| path.clone()).collect();
         let extra = || -> Vec<NewFile> { added.iter().map(|(path, bytes)| (path.clone(), bytes.to_vec())).collect() };
         if let (TalkPlace::Folder(folder), Some(SaveTarget::Folder(to) | SaveTarget::Packed(to))) =
@@ -144,6 +157,8 @@ impl SaveJob {
                 for (path, bytes) in &added {
                     write_added(folder, path, bytes)?;
                 }
+                builds::enter_builds(folder, &builds).map_err(|e| failed(&folder.join(INDEX_FILE), e))?;
+                builds_written = builds;
                 write_slides(folder, &text)?;
                 (None, Vec::new())
             }
@@ -157,6 +172,8 @@ impl SaveJob {
             }
             (TalkPlace::Folder(folder), Some(SaveTarget::Folder(to))) => {
                 let report = copy_talk_folder(folder, &to, &text, &extra()).map_err(|e| failed(&to, e))?;
+                builds::enter_builds(&to, &builds).map_err(|e| failed(&to.join(INDEX_FILE), e))?;
+                builds_written = builds;
                 let left_out = report.skipped.into_iter().map(|name| format!("{name} was left out"));
                 let outside = report
                     .outside_pictures
@@ -184,6 +201,8 @@ impl SaveJob {
             }
             (TalkPlace::Packed(file), Some(SaveTarget::Folder(to))) => {
                 unpack_with_slides(file, &to, &text, &extra()).map_err(|e| failed(&to, e))?;
+                builds::enter_builds(&to, &builds).map_err(|e| failed(&to.join(INDEX_FILE), e))?;
+                builds_written = builds;
                 (Some(in_folder(to)), Vec::new())
             }
         };
@@ -191,6 +210,7 @@ impl SaveJob {
             written: text,
             moved_to,
             files_written,
+            builds_written,
             notices,
         })
     }

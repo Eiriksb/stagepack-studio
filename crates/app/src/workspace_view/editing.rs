@@ -3,9 +3,9 @@
 
 use super::*;
 use crate::clipboard_tools;
-use crate::clipboard::{self, SlidePaste, TooLarge};
+use crate::clipboard::{self, AppData, Carried, PastedFiles, SlidePaste, TooLarge};
 use crate::clipboard_tools::write_clipboard;
-use crate::document::Selected;
+use crate::document::{Brought, Selected};
 use crate::inspector::INSPECTOR_WIDTH;
 
 impl WorkspaceView {
@@ -260,6 +260,15 @@ impl WorkspaceView {
             });
             return;
         }
+        // The thing selected on the slide shown, unless the list of slides has the keyboard.
+        let in_list = self.slide_strip.read(cx).focus_handle().contains_focused(window, cx);
+        let thing_here = document.read(cx).selected().is_some_and(|selected| selected.slide == document.read(cx).current());
+        if thing_here && !in_list {
+            if self.copy_thing(cx) && cut {
+                self.edit(Document::cut_selected, cx);
+            }
+            return;
+        }
         if cut {
             self.cut_slide(cx);
         } else {
@@ -267,9 +276,11 @@ impl WorkspaceView {
         }
     }
 
-    /// Pastes what's on the clipboard, read once. With text being typed: text, the app's or
-    /// plain, into it; or else a picture, or files, once the typing ends, onto the slide. With
-    /// none: the app's own slide or text, as a slide; then a picture; then files, as a drop; then
+    /// Pastes what's on the clipboard, read once. With text being typed: a thing from a slide is
+    /// refused, and said so; text, the app's or plain, goes into it; or else a picture, or files,
+    /// once the typing ends, onto the slide. A new text box waiting for its first letter isn't
+    /// typed in yet: a thing pasted drops it. With none: a thing from a slide, on the slide shown;
+    /// then the app's own slide or text, as a slide; then a picture; then files, as a drop; then
     /// plain text, as a slide.
     fn paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(document) = self.document.clone() else {
@@ -278,10 +289,17 @@ impl WorkspaceView {
         let item = cx.read_from_clipboard();
         let (plain, metadata) = item.as_ref().map(|item| (item.text(), item.metadata().cloned())).unwrap_or_default();
         let typing = document.read(cx).text().is_some();
+        let data = clipboard::read_app_data(metadata.as_deref());
+        if let AppData::Element(carried) = data {
+            if typing && document.read(cx).new_box().is_none() {
+                return self.say(clipboard::NOT_INTO_TEXT, cx);
+            }
+            return self.paste_element(carried, cx);
+        }
         let thing_first = if typing {
             !item.as_ref().is_some_and(clipboard_tools::holds_text)
         } else {
-            !metadata.as_deref().is_some_and(clipboard::is_app_data)
+            matches!(data, AppData::Not)
         };
         if thing_first && let Some(thing) = item.and_then(clipboard_tools::picture_or_files) {
             if typing {
@@ -297,7 +315,7 @@ impl WorkspaceView {
             });
             return;
         }
-        self.paste_slide(plain, metadata, cx);
+        self.paste_slide(plain, data, cx);
     }
 
     /// Puts the current slide's own text on the clipboard, and says whether it did.
@@ -309,7 +327,8 @@ impl WorkspaceView {
             self.say(EditRefused::CouldNotBeMade.to_string(), cx);
             return false;
         };
-        let Some(entry) = clipboard::slide_entry(&text) else {
+        let files = document.read(cx).files_for_copy(&text);
+        let Some(entry) = clipboard::slide_entry_with(&text, &files) else {
             self.say(clipboard::SLIDE_TOO_BIG, cx);
             return false;
         };
@@ -329,26 +348,94 @@ impl WorkspaceView {
         }
     }
 
-    /// Pastes the slide on the clipboard after the current one. If it shows a picture or a
-    /// component this talk lacks, that's said, once.
-    fn paste_slide(&mut self, plain: Option<String>, metadata: Option<String>, cx: &mut Context<Self>) {
+    /// Puts the selected thing on the clipboard, with the files it uses, and says whether it did.
+    fn copy_thing(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(document) = self.document.clone() else {
+            return false;
+        };
+        let Some((text, files)) = document.read(cx).copy_selected() else {
+            self.say(EditRefused::CouldNotBeMade.to_string(), cx);
+            return false;
+        };
+        let Some(entry) = clipboard::element_entry(&text, &files) else {
+            self.say(clipboard::THING_TOO_BIG, cx);
+            return false;
+        };
+        write_clipboard(entry, cx);
+        true
+    }
+
+    /// Puts the thing on the clipboard on the slide shown, with the files it brings, and says
+    /// what there is to say of them.
+    fn paste_element(&mut self, carried: Carried, cx: &mut Context<Self>) {
         let Some(document) = self.document.clone() else {
             return;
         };
-        let markdown = match clipboard::slide_to_paste(plain.as_deref(), metadata.as_deref()) {
+        let mut brought = None;
+        // The edit's notice is what has the working copy keep the files added.
+        self.edit(
+            |document| {
+                let (changed, said) = document.paste_element(&carried.markdown, carried.files)?;
+                brought = Some(said);
+                Ok(changed)
+            },
+            cx,
+        );
+        // A new text box that was waiting is gone, which the editor hears of.
+        document.update(cx, |_, cx| cx.notify());
+        if let Some(brought) = brought {
+            self.say_brought(brought, cx);
+        }
+    }
+
+    /// Says what there is to say of the files a paste brought, or that something it shows is
+    /// missing, once the status line has heard what's selected, so that this is what it says.
+    fn say_brought(&mut self, brought: Brought, cx: &mut Context<Self>) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        let notices = document.update(cx, |document, _| document.notices());
+        let missing = {
+            let document = document.read(cx);
+            clipboard::shows_something_missing(&notices, |path| document.has_file(path))
+        };
+        let said = brought.said().or_else(|| missing.then(|| clipboard::MISSING_PICTURES.to_string()));
+        if let Some(said) = said {
+            cx.spawn(async move |this, cx| {
+                this.update(cx, |this, cx| this.say(said, cx)).ok();
+            })
+            .detach();
+        }
+    }
+
+    /// Pastes the slide on the clipboard after the current one, with the files it brings. If it
+    /// shows a picture or a component this talk lacks, that's said, once.
+    fn paste_slide(&mut self, plain: Option<String>, data: AppData, cx: &mut Context<Self>) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        let (paste, files) = match data {
+            AppData::Slide(carried) => (Ok(clipboard::carried_slide(&carried.markdown)), carried.files),
+            _ => (clipboard::slide_to_paste(plain.as_deref(), None), PastedFiles::default()),
+        };
+        let markdown = match paste {
             Ok(SlidePaste::Slide(markdown)) => markdown,
             Ok(SlidePaste::NoSlide) => return self.say(clipboard::NO_SLIDE, cx),
             Ok(SlidePaste::NotOneSlide) => return self.say(EditRefused::WouldChangeTheSlides.to_string(), cx),
             Err(TooLarge) => return self.say(clipboard::TOO_LARGE, cx),
         };
         let before = document.read(cx).slide_count();
-        self.edit(|document| document.paste_slide(&markdown), cx);
-        if document.read(cx).slide_count() == before + 1 {
-            let notices = document.update(cx, |document, _| document.notices());
-            let document = document.read(cx);
-            if clipboard::shows_something_missing(&notices, |path| document.has_file(path)) {
-                self.say(clipboard::MISSING_PICTURES, cx);
-            }
+        let mut brought = None;
+        self.edit(
+            |document| {
+                let (changed, said) = document.paste_slide_with_files(&markdown, files)?;
+                brought = Some(said);
+                Ok(changed)
+            },
+            cx,
+        );
+        if let Some(brought) = brought.filter(|_| document.read(cx).slide_count() == before + 1) {
+            self.say_brought(brought, cx);
         }
     }
 

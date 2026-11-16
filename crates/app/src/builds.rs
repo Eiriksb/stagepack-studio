@@ -162,15 +162,32 @@ fn write_build(folder: &Path, entry: &BuildEntry, module: &[u8]) -> io::Result<(
     refuse_a_link(&index_file)?;
 
     let mut index = read_index(&index_file);
-    index
-        .components
-        .retain(|kept| kept.tag != entry.tag && kept.file != entry.file);
-    index.components.push(entry.clone());
+    index.enter(entry.clone());
     index.format = INDEX_FORMAT;
     let json = serde_json::to_vec_pretty(&index).map_err(io::Error::other)?;
 
     build_folder_is_the_talks(folder)?;
     write_atomically(&wasm, |out| out.write_all(module))?;
+    build_folder_is_the_talks(folder)?;
+    write_atomically(&index_file, |out| out.write_all(&json))
+}
+
+/// Enters `entries` in the index of the talk in `folder`, each in place of any entry for the same
+/// component or the same file, keeping its others: what a save does with the builds entered with
+/// the files added to a talk. Nothing is written for none, nor through a link.
+pub(crate) fn enter_builds(folder: &Path, entries: &[BuildEntry]) -> io::Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let index_file = folder.join(INDEX_FILE);
+    build_folder_is_the_talks(folder)?;
+    refuse_a_link(&index_file)?;
+    let mut index = read_index(&index_file);
+    for entry in entries {
+        index.enter(entry.clone());
+    }
+    index.format = INDEX_FORMAT;
+    let json = serde_json::to_vec_pretty(&index).map_err(io::Error::other)?;
     build_folder_is_the_talks(folder)?;
     write_atomically(&index_file, |out| out.write_all(&json))
 }

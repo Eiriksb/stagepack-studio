@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use slides_components::Diagnostic;
+use slides_components::{BuildEntry, Diagnostic, source_hash};
 use slides_engine::{
     AddedSet, Align, ComponentInfo, ComponentState, Deck, SchemaLoad, ElementBox, FolderFiles, Fonts, Layer, LayerTiming, Moment, PackError, Pixmap,
     SlideTimeline, TalkFiles, TextLayout, Transition, WithAdded, layout_by_name, open_packed, text_align,
@@ -16,12 +16,13 @@ use slides_engine::{
 };
 use slides_format::{
     Change, FlowPlace, TextFlow, MAX_SLIDE_BYTES, Para, Pos, Selection, SourceEdit, Talk, TextEdit, is_visible_char, parse_talk, reparse, set_align,
-    Block, NewTag, Tag, delete_block, find_tag, insert_block, set_tag_attr, set_tag_body, split_slides, storable,
+    Block, NewTag, Tag, block_text, delete_block, find_tag, insert_block, set_tag_attr, set_tag_body, split_slides, storable,
     tag_text, text_flows_with, write_flow_with, write_into_region, MAX_TABLE_COLUMNS, MAX_TABLE_ROWS, new_table, table_size,
 };
 use toolkit::{ComponentSchema, Theme};
 
-use crate::added_files::{self, FileKind, NotAdded, Placed, talk_uses};
+use crate::added_files::{self, FileKind, MAX_ADDED_BYTES, NotAdded, Placed, talk_uses};
+use crate::clipboard::{self, CopiedFile, MAX_CLIPBOARD_FILES, MAX_CLIPBOARD_FILES_BYTES, PastedFile, PastedFiles};
 use crate::export::ExportInput;
 use crate::history::{History, RunId, one_edit};
 use crate::insert::{self, INSERT_COMPONENT, INSERT_PICTURE, INSERT_SHAPE, INSERT_TABLE, INSERT_TEXT_BOX, TEXT_BOX_SIZE};
@@ -100,6 +101,8 @@ pub enum EditRefused {
     NeedsACell,
     /// A component's build couldn't be loaded, so it couldn't be put on the slide.
     ComponentNotLoaded,
+    /// What was pasted isn't one thing a slide can hold.
+    NotOneThing,
 }
 
 impl std::fmt::Display for EditRefused {
@@ -129,6 +132,7 @@ impl std::fmt::Display for EditRefused {
             EditRefused::RowTooLong => LONG_ROW,
             EditRefused::NeedsACell => CLICK_IN_A_CELL,
             EditRefused::ComponentNotLoaded => "That component couldn't be loaded, so it wasn't added.",
+            EditRefused::NotOneThing => clipboard::NOT_ONE_THING,
         })
     }
 }
@@ -154,6 +158,27 @@ impl std::fmt::Display for InsertFailed {
 }
 
 impl std::error::Error for InsertFailed {}
+
+/// What a paste that brought files with it has to say of them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Brought {
+    /// Some of them couldn't be added, or the text couldn't be made to name them.
+    pub left_out: bool,
+    /// They were too big to come with it.
+    pub too_large: bool,
+    /// What to say of a component the talk has a different one of, by the same name.
+    pub different: Option<String>,
+}
+
+impl Brought {
+    /// The one thing to say of it, if any: a different component first, then files too big,
+    /// then files left out.
+    pub fn said(&self) -> Option<String> {
+        self.different.clone().or_else(|| self.too_large.then(|| clipboard::FILES_TOO_LARGE.to_string())).or_else(|| {
+            self.left_out.then(|| clipboard::MISSING_PICTURES.to_string())
+        })
+    }
+}
 
 /// Whether an edit to one slide joins the run of edits open in the history, so that one undo
 /// takes the run back.
@@ -201,6 +226,7 @@ const EDIT_NOTES: &str = "Edit notes";
 const RECOVER_CHANGES: &str = "Recover changes";
 const LOAD_CHANGED_FILE: &str = "Load the changed file";
 const DELETE: &str = "Delete";
+const DUPLICATE: &str = "Duplicate";
 const CHANGE_SETTING: &str = "Change setting";
 const ADD_ROW: &str = "Add row";
 const ADD_COLUMN: &str = "Add column";
@@ -1215,6 +1241,211 @@ impl Document {
         self.make(PASTE_SLIDE, change, Holds::Inserted(at + 1), at, at + 1, None)
     }
 
+    /// Pastes the slide `text` as [`Self::paste_slide`] does, with `files`, the files it uses
+    /// from the talk it was copied from: they're added first, as [`Self::bring_files`] says, and
+    /// each path in its text that had to change is made to name the file as added. A slide that
+    /// isn't one is refused before anything is added.
+    pub fn paste_slide_with_files(&mut self, text: &str, files: PastedFiles) -> Result<(Vec<usize>, Brought), EditRefused> {
+        if guarded(|| crate::clipboard::one_slide(text))?.is_none() {
+            return Err(EditRefused::WouldChangeTheSlides);
+        }
+        let (text, brought) = self.bring_files_for(text, files);
+        self.paste_slide(&text).map(|changed| (changed, brought))
+    }
+
+    /// Adds `files` for `text`, as [`Self::bring_files`] does, and gives `text` naming them as
+    /// added. If it can't be made to name them exactly, it's given as it is, and that's left out.
+    fn bring_files_for(&mut self, text: &str, files: PastedFiles) -> (String, Brought) {
+        let (renames, mut brought) = self.bring_files(files);
+        if renames.is_empty() {
+            return (text.to_string(), brought);
+        }
+        match guarded(|| added_files::rename_uses(text, &renames)).ok().flatten() {
+            Some(renamed) => (renamed, brought),
+            None => {
+                brought.left_out = true;
+                (text.to_string(), brought)
+            }
+        }
+    }
+
+    /// Adds `files`, pasted from another talk, as [`Self::add_file`] adds a dropped one, and gives
+    /// each path that had to change, `(as it was, as added)`, with what there is to say of them.
+    /// One that can't be added is left out.
+    ///
+    /// A component's source and build are added only if the talk has no component of that name.
+    /// If it has one with the same source, that one is used as it is; with different source,
+    /// nothing of the pasted one is added, and that's said. A build is entered in the talk's
+    /// build index, kept with the files added until a save, only with its source, named for the
+    /// component the app finds in that source, and recorded as built from it only if the copy
+    /// says it was built from exactly those bytes, by their hash as the app works it out; if it
+    /// says another, that's recorded, and the engine shows it out of date. Nothing is built, and
+    /// no component's source or build is ever replaced.
+    fn bring_files(&mut self, files: PastedFiles) -> (Vec<(String, String)>, Brought) {
+        let mut brought = Brought { left_out: files.left_out, too_large: files.too_large, different: None };
+        let mut renames = Vec::new();
+        let (components, others): (Vec<PastedFile>, Vec<PastedFile>) = files.files.into_iter().partition(|file| file.kind.is_component());
+        for file in others {
+            let name = file.path.split_once('/').map_or(file.path.as_str(), |(_, name)| name).to_string();
+            match self.add_file(file.kind, &name, file.bytes) {
+                Ok(path) if path != file.path => renames.push((file.path, path)),
+                Ok(_) => {}
+                Err(_) => brought.left_out = true,
+            }
+        }
+        let stem_of = |file: &PastedFile| file.path.split_once('/').and_then(|(_, name)| name.rsplit_once('.')).map(|(stem, _)| stem.to_string());
+        let (sources, mut builds): (Vec<PastedFile>, Vec<PastedFile>) =
+            components.into_iter().partition(|file| file.kind == FileKind::ComponentSource);
+        for source in sources {
+            let Some(stem) = stem_of(&source) else { continue };
+            let build = builds.iter().position(|build| stem_of(build).as_deref() == Some(stem.as_str())).map(|at| builds.swap_remove(at));
+            let Some(tag) = std::str::from_utf8(&source.bytes).ok().and_then(slides_components::component_tag) else {
+                brought.left_out = true;
+                continue;
+            };
+            if let Some(info) = self.components().iter().find(|info| info.tag == tag) {
+                if !self.files.read(&info.file).is_some_and(|held| held == source.bytes) {
+                    brought.different = Some(clipboard::different_component(&palette::label(&tag)));
+                }
+                continue;
+            }
+            let hash = source_hash(&source.bytes);
+            if self.add_file(FileKind::ComponentSource, &format!("{stem}.rs"), source.bytes).is_err() {
+                brought.left_out = true;
+                continue;
+            }
+            // Without its build, it needs building, as any source does.
+            let Some(build) = build else { continue };
+            let built_from = build.built_from.clone();
+            if self.add_file(FileKind::ComponentBuild, &format!("{stem}.wasm"), build.bytes).is_err() {
+                brought.left_out = true;
+                continue;
+            }
+            let source_hash = match built_from {
+                Some(said) if said == hash => hash,
+                Some(other) => other,
+                // Built from what, nobody said: it needs building.
+                None => continue,
+            };
+            self.added.enter_build(BuildEntry { tag, file: stem, source_hash });
+            self.deck.files_added();
+            self.components_looked_at();
+        }
+        // A build with no source of its own pasted beside it would be paired with nothing.
+        if !builds.is_empty() {
+            brought.left_out = true;
+        }
+        (renames, brought)
+    }
+
+    /// The files of the talk's that `text`, a slide's own text or a thing's, uses, as
+    /// [`talk_uses`] finds them, for a copy to carry: a picture or data file in `assets` a tag
+    /// or picture names, and for a component of the talk's own, its source and build. A build
+    /// says which source it was built from, as the talk's index records. Files are read only
+    /// while there's room for them in a copy; past that, the last one read is more than a copy
+    /// carries, and it carries none.
+    pub fn files_for_copy(&self, text: &str) -> Vec<CopiedFile> {
+        let Ok(talk) = worked_out(|| parse_talk(text)) else {
+            return Vec::new();
+        };
+        let files = &*self.files;
+        let index = added_files::build_index(files);
+        let mut copied: Vec<CopiedFile> = Vec::new();
+        let mut total = 0usize;
+        for folder in ["assets", "components", "build"] {
+            for path in files.names_in(folder) {
+                if copied.len() > MAX_CLIPBOARD_FILES || total > MAX_CLIPBOARD_FILES_BYTES {
+                    return copied;
+                }
+                let copyable = crate::clipboard::pasted_kind(&path).is_some()
+                    && files.len(&path).is_some_and(|len| len <= MAX_ADDED_BYTES as u64)
+                    && guarded(|| talk_uses(&talk, files, &path)).unwrap_or(false);
+                let Some(bytes) = copyable.then(|| files.read(&path)).flatten() else {
+                    continue;
+                };
+                let stem = path.strip_prefix("build/").and_then(|name| name.strip_suffix(".wasm"));
+                let built_from = stem.and_then(|stem| {
+                    let entry = index.as_ref()?.components.iter().find(|entry| entry.file == stem)?;
+                    Some(entry.source_hash.clone())
+                });
+                total = total.saturating_add(bytes.len());
+                copied.push(CopiedFile { path, bytes: bytes.into(), built_from });
+            }
+        }
+        copied
+    }
+
+    /// The text of the thing selected, as a copy of it gives it, and the files it uses, as
+    /// [`Self::files_for_copy`] gives them. `None` with nothing selected.
+    pub fn copy_selected(&self) -> Option<(String, Vec<CopiedFile>)> {
+        let selected = self.selected.as_ref()?;
+        let text = worked_out(|| block_text(self.talk(), selected.slide, &selected.source)).ok().flatten()?;
+        let files = self.files_for_copy(&text);
+        Some((text, files))
+    }
+
+    /// Puts the thing `markdown` holds, perhaps from another talk, on the current slide, with
+    /// `files`, the files it uses: see [`Self::put_thing`].
+    pub fn paste_element(&mut self, markdown: &str, files: PastedFiles) -> Result<(Vec<usize>, Brought), EditRefused> {
+        self.put_thing(PASTE, markdown, files)
+    }
+
+    /// Puts a copy of the thing selected on the slide it's on, as a paste of it would, as one
+    /// step named "Duplicate", and selects the copy. The clipboard isn't touched.
+    pub fn duplicate_selected(&mut self) -> Result<Vec<usize>, EditRefused> {
+        self.finish_before_edit()?;
+        let Some(Selected { slide, source }) = self.selected.clone() else {
+            return Ok(Vec::new());
+        };
+        let text = built(self.talk(), |talk| block_text(talk, slide, &source))?.ok_or(EditRefused::CouldNotBeMade)?;
+        self.go_to(slide);
+        self.put_thing(DUPLICATE, &text, PastedFiles::default()).map(|(changed, _)| changed)
+    }
+
+    /// Puts the thing `markdown` holds on the current slide, as one step named `label`, and
+    /// selects it. It must be one thing, as [`clipboard::one_element`] says, or it's refused,
+    /// with nothing added. Typing ends first, and a new text box waiting for its first letter
+    /// is dropped. `files` are added first, as [`Self::bring_files`] says, and each path in the
+    /// thing that had to change is made to name the file as added. Where a thing already has
+    /// its corner at exactly the thing's `x` and `y`, it's moved 40 down and right, as often as
+    /// it takes. It's written with [`insert_block`], after the slide's content.
+    fn put_thing(&mut self, label: &'static str, markdown: &str, files: PastedFiles) -> Result<(Vec<usize>, Brought), EditRefused> {
+        let text = guarded(|| clipboard::one_element(markdown))?.ok_or(EditRefused::NotOneThing)?;
+        let tidied = self.finish_before_edit()?;
+        self.editing = None;
+        let (text, brought) = self.bring_files_for(&text, files);
+        let text = self.stepped_aside(&text);
+        let changed = self.insert_text(label, &text, tidied)?;
+        Ok((changed, brought))
+    }
+
+    /// `text`, one tag, with its `x` and `y` moved aside from the corners of the things on the
+    /// current slide, as [`insert::step_aside`] moves them. As it is if it has no place written
+    /// as numbers, or nothing is there.
+    fn stepped_aside(&mut self, text: &str) -> String {
+        let layout = self.text_layout(self.current);
+        let taken: Vec<(f32, f32)> = layout.elements().iter().map(|element| (element.rect.x, element.rect.y)).collect();
+        let first_tag = |talk: &Talk| match talk.slides.first()?.blocks.first()? {
+            Block::Tag(tag) => Some(tag.clone()),
+            _ => None,
+        };
+        let moved = guarded(|| {
+            let talk = parse_talk(text);
+            let tag = first_tag(&talk)?;
+            let place = |name: &str| tag.attrs.iter().find(|attr| attr.name == name)?.value.trim().parse::<f32>().ok().filter(|at| at.is_finite());
+            let at = (place("x")?, place("y")?);
+            let to = insert::step_aside(at, &taken);
+            if to == at {
+                return None;
+            }
+            let text = set_tag_attr(&talk, 0, &tag.range, "x", Some(&insert::whole(to.0)))?.apply(text);
+            let talk = parse_talk(&text);
+            let tag = first_tag(&talk)?;
+            Some(set_tag_attr(&talk, 0, &tag.range, "y", Some(&insert::whole(to.1)))?.apply(&text))
+        });
+        moved.ok().flatten().unwrap_or_else(|| text.to_string())
+    }
+
     /// Moves slide `from` so that `to` is its place afterwards, and makes it current.
     pub fn move_slide(&mut self, from: usize, to: usize) -> Result<Vec<usize>, EditRefused> {
         let change = self.build(|talk| slides_format::move_slide(talk, from, to))?;
@@ -1362,6 +1593,15 @@ impl Document {
     /// named "Delete", and returns the slides to show again. Undone, it's selected again. It's
     /// refused when what's around it would read differently without it.
     pub fn delete_selected(&mut self) -> Result<Vec<usize>, EditRefused> {
+        self.remove_selected(DELETE)
+    }
+
+    /// Takes the thing selected away, as [`Self::delete_selected`] does, as one step named "Cut".
+    pub fn cut_selected(&mut self) -> Result<Vec<usize>, EditRefused> {
+        self.remove_selected(CUT)
+    }
+
+    fn remove_selected(&mut self, label: &'static str) -> Result<Vec<usize>, EditRefused> {
         // Typing is finished first, which can move the thing.
         self.finish_before_edit()?;
         let Some(Selected { slide, source }) = self.selected.clone() else {
@@ -1370,7 +1610,7 @@ impl Document {
         let change = built(self.talk(), |talk| delete_block(talk, slide, &source))?
             .ok_or(EditRefused::CouldNotBeRemoved)?;
         let depth = self.history.depth();
-        let changed = self.make(DELETE, change, Holds::Slide(slide), slide, slide, None)?;
+        let changed = self.make(label, change, Holds::Slide(slide), slide, slide, None)?;
         if self.history.depth() > depth {
             self.history.select_mark_last(SelectMark { before: Some(source), after: None });
         }
@@ -1415,6 +1655,15 @@ impl Document {
         let mut all: Vec<(&str, &str)> = attrs.to_vec();
         all.extend(["x", "y", "w", "h"].into_iter().zip(place.iter().map(String::as_str)));
         let text = tag_text(&NewTag { name, attrs: &all, body }).ok_or(EditRefused::CouldNotBeMade)?;
+        self.insert_text(label, &text, tidied)
+    }
+
+    /// Writes `text`, one block, at the end of the current slide's content, as one step named
+    /// `label`, and selects it. `tidied` says whether finishing the typing first changed the
+    /// talk. Undone, it goes and nothing is selected; made again, it's selected again.
+    fn insert_text(&mut self, label: &'static str, text: &str, tidied: bool) -> Result<Vec<usize>, EditRefused> {
+        let slide = self.current;
+        let text = text.to_string();
         let change = built(self.talk(), |talk| insert_block(talk, slide, &text))?.ok_or(EditRefused::CouldNotBeMade)?;
         // Where the tag is once it's written, in the talk's line endings.
         let source = change.edits.first().and_then(|edit| {
@@ -2720,6 +2969,7 @@ impl Document {
             self.place.clone(),
             None,
             self.added_files(),
+            self.builds_to_enter(),
         )
     }
 
@@ -2731,7 +2981,19 @@ impl Document {
             self.place.clone(),
             Some(target),
             self.added_files(),
+            self.builds_to_enter(),
         )
+    }
+
+    /// The builds entered in the talk's index with the files added to it, of builds its text
+    /// uses, for a save to enter in the index it writes.
+    fn builds_to_enter(&self) -> Vec<BuildEntry> {
+        let talk = self.talk();
+        self.added
+            .builds_entered()
+            .into_iter()
+            .filter(|entry| talk_uses(talk, &*self.files, &format!("build/{}.wasm", entry.file)))
+            .collect()
     }
 
     /// Takes in a save that worked. The talk is saved if its text is still what was written,
@@ -2742,6 +3004,8 @@ impl Document {
         for path in &saved.files_written {
             self.pending.remove(path);
         }
+        // In the index on disk now, which is read as it is from here on.
+        self.added.forget_builds(&saved.builds_written);
         if let Some((place, files)) = saved.moved_to {
             self.place_name = place.name();
             self.place = place;

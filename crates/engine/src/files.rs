@@ -8,6 +8,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use slides_components::{BuildEntry, BuildIndex, INDEX_FILE};
+
+use crate::MAX_INDEX_BYTES;
+
 /// The biggest file a talk can use. Pictures and fonts are read whole, into memory.
 pub const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -164,12 +168,19 @@ impl TalkFiles for std::sync::Arc<dyn TalkFiles + Send + Sync> {
 /// Files added to a talk while it's open, by their path in it, kept in memory until they're
 /// saved. Shared between the talk and whatever saves it, and only ever added to: a file once
 /// added keeps its bytes for as long as the set lasts.
+///
+/// It also holds builds entered in the talk's build index that no save has written yet, as
+/// for a component pasted with its build: the index the talk's files give is the talk's own
+/// with these entered in it, each in place of any entry for the same component or file.
 #[derive(Default)]
 pub struct AddedSet {
     files: Mutex<BTreeMap<String, Arc<[u8]>>>,
     /// How many files have been added, so that something holding on to what it read can
     /// tell when there's more.
     added: AtomicU64,
+    builds: Mutex<Vec<BuildEntry>>,
+    /// Changes each time the builds entered change, so the index they give is read again.
+    builds_changed: AtomicU64,
 }
 
 impl AddedSet {
@@ -219,6 +230,59 @@ impl AddedSet {
     pub fn stamp(&self) -> u64 {
         self.added.load(Ordering::SeqCst)
     }
+
+    fn builds(&self) -> std::sync::MutexGuard<'_, Vec<BuildEntry>> {
+        self.builds.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Enters `entry` in the talk's build index, in place of any entered for the same component
+    /// or file.
+    pub fn enter_build(&self, entry: BuildEntry) {
+        let mut builds = self.builds();
+        builds.retain(|kept| kept.tag != entry.tag && kept.file != entry.file);
+        builds.push(entry);
+        self.builds_changed.fetch_add(1, Ordering::SeqCst);
+        self.added.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The builds entered that no save has written, in the order they were entered.
+    pub fn builds_entered(&self) -> Vec<BuildEntry> {
+        self.builds().clone()
+    }
+
+    /// Takes `written` out of the builds entered, once a save has entered them in the talk's own
+    /// index.
+    pub fn forget_builds(&self, written: &[BuildEntry]) {
+        let mut builds = self.builds();
+        let before = builds.len();
+        builds.retain(|kept| !written.contains(kept));
+        if builds.len() != before {
+            self.builds_changed.fetch_add(1, Ordering::SeqCst);
+            self.added.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// The index `under`'s own gives with the builds entered in it, or `None` if none are, or
+    /// if its own can't be read as an index, which is then read as it is.
+    fn index_over(&self, under: &dyn TalkFiles) -> Option<Vec<u8>> {
+        let builds = self.builds_entered();
+        if builds.is_empty() {
+            return None;
+        }
+        let mut index = match under.len(INDEX_FILE) {
+            Some(len) if len > MAX_INDEX_BYTES => return None,
+            _ => match under.read(INDEX_FILE) {
+                None => BuildIndex { format: 1, components: Vec::new() },
+                Some(bytes) if bytes.len() as u64 > MAX_INDEX_BYTES => return None,
+                Some(bytes) => serde_json::from_slice::<BuildIndex>(&bytes).ok()?,
+            },
+        };
+        for entry in builds {
+            index.enter(entry);
+        }
+        index.format = index.format.max(1);
+        serde_json::to_vec_pretty(&index).ok()
+    }
 }
 
 /// A talk's files with those added to it since it opened, which are read first.
@@ -233,8 +297,18 @@ impl WithAdded {
     }
 }
 
+impl WithAdded {
+    /// The build index the talk's files give with the builds entered in it, if any are.
+    fn entered_index(&self, path: &str) -> Option<Vec<u8>> {
+        (crate::packed::normalise(path).as_deref() == Some(INDEX_FILE)).then(|| self.added.index_over(&*self.under)).flatten()
+    }
+}
+
 impl TalkFiles for WithAdded {
     fn read(&self, path: &str) -> Option<Vec<u8>> {
+        if let Some(index) = self.entered_index(path) {
+            return Some(index);
+        }
         match self.added.get(path) {
             Some(bytes) => Some(bytes.to_vec()),
             None => self.under.read(path),
@@ -242,8 +316,15 @@ impl TalkFiles for WithAdded {
     }
 
     /// An added file never changes, so its length is its stamp; so is a file of a talk that
-    /// never changes, such as a pack, as nothing under this can say that any more.
+    /// never changes, such as a pack, as nothing under this can say that any more. The build
+    /// index, with builds entered in it, changes with them as with its own file.
     fn stamp(&self, path: &str) -> Option<(u64, SystemTime)> {
+        if let Some(index) = self.entered_index(path) {
+            let own = if self.under.never_changes() { None } else { self.under.stamp(path) };
+            let changed = std::time::Duration::from_nanos(self.added.builds_changed.load(Ordering::SeqCst));
+            let at = own.map_or(SystemTime::UNIX_EPOCH, |(_, at)| at) + changed;
+            return Some((index.len() as u64, at));
+        }
         if let Some(bytes) = self.added.get(path) {
             return Some((bytes.len() as u64, SystemTime::UNIX_EPOCH));
         }
@@ -254,6 +335,9 @@ impl TalkFiles for WithAdded {
     }
 
     fn len(&self, path: &str) -> Option<u64> {
+        if let Some(index) = self.entered_index(path) {
+            return Some(index.len() as u64);
+        }
         match self.added.get(path) {
             Some(bytes) => Some(bytes.len() as u64),
             None => self.under.len(path),
@@ -263,6 +347,9 @@ impl TalkFiles for WithAdded {
     fn names_in(&self, folder: &str) -> Vec<String> {
         let mut names = self.under.names_in(folder);
         names.extend(self.added.names_in(folder));
+        if crate::packed::normalise(folder).as_deref() == Some("build") && !self.added.builds_entered().is_empty() {
+            names.push(INDEX_FILE.to_string());
+        }
         names.sort();
         names.dedup();
         names

@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use slides_engine::{Fonts, Pixmap};
 use slides_format::{MAX_LEVEL, MAX_SLIDE_BYTES, Para, ParaKind, Pos, Span, Style, TextFlow, is_hidden, parse_talk, storable, text_flows};
 use stagepack_studio::clipboard::{
-    self, APP_KEY, MAX_BYTES, MAX_PARAS, MAX_SPANS, MISSING_PICTURES, NO_SLIDE, TOO_LARGE,
-    SlidePaste, TextPaste, decode_paras, encode_paras, text_entry, text_to_paste,
+    self, APP_KEY, AppData, Carried, CopiedFile, MAX_BYTES, MAX_CLIPBOARD_FILES_BYTES, MAX_PARAS, MAX_SPANS, MISSING_PICTURES,
+    NO_SLIDE, TOO_LARGE, SlidePaste, TextPaste, decode_paras, encode_paras, read_app_data, text_entry, text_to_paste,
 };
 use stagepack_studio::clipboard_tools::{COPY_ID, CUT_ID, PASTE_ID};
 use stagepack_studio::document::{Document, talk_settings};
@@ -28,7 +28,8 @@ const TWO: &str = "---\ntitle: T\n---\n\n# Hello\n\nSome words here\n\n---\n\n# 
 const THREE: &str = "# One\n\nfirst words\n\n---\n\n# Two\n\n---\n\n# Three\n";
 
 struct Talk {
-    folder: tempfile::TempDir,
+    /// Kept for as long as the talk is open.
+    _folder: tempfile::TempDir,
     handle: AnyWindowHandle,
     view: Entity<WorkspaceView>,
 }
@@ -56,7 +57,7 @@ fn open_in(cx: &mut TestAppContext, folder: tempfile::TempDir, source: &str) -> 
         })
         .expect("open test window")
     });
-    let talk = Talk { folder, handle, view };
+    let talk = Talk { _folder: folder, handle, view };
     talk.settle(cx);
     talk
 }
@@ -695,25 +696,30 @@ fn a_cut_slide_is_gone_and_one_undo_brings_it_back(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn a_pasted_slide_missing_its_picture_says_so(cx: &mut TestAppContext) {
+fn a_pasted_slide_brings_its_picture_and_says_what_it_cannot(cx: &mut TestAppContext) {
     let folder = tempfile::tempdir().unwrap();
     std::fs::create_dir(folder.path().join("assets")).unwrap();
     let png = Pixmap::new(4, 4).unwrap().encode_png().unwrap();
-    std::fs::write(folder.path().join("assets/chart.png"), png).unwrap();
-    let from = open_in(cx, folder, "# One\n\n![A chart](assets/chart.png)\n\n---\n\n# Two\n\n<Gauge />\n\n---\n\n# Three\n");
+    std::fs::write(folder.path().join("assets/chart.png"), &png).unwrap();
+    let from = open_in(
+        cx,
+        folder,
+        "# One\n\n![A chart](assets/chart.png)\n\n---\n\n# Two\n\n<Gauge />\n\n---\n\n# Three\n\n---\n\n# Four\n\n![Gone](assets/gone.png)\n",
+    );
     let into = open(cx, "# A\n");
     from.click(cx, strip_row_id(0));
-    assert_ne!(from.status(cx).as_deref(), Some(MISSING_PICTURES));
     from.press(cx, "ctrl-c");
     into.click(cx, strip_row_id(0));
     into.press(cx, "ctrl-v");
     assert_eq!(into.count(cx), 2);
-    assert_eq!(into.status(cx).as_deref(), Some(MISSING_PICTURES));
-    assert!(!into.folder.path().join("assets/chart.png").exists(), "nothing is carried across");
+    assert_eq!(into.status(cx), None, "the picture came with it");
+    assert!(into.document(cx).read_with(cx, |document, _| document.has_file("assets/chart.png")));
+    assert!(into.document(cx).update(cx, |document, _| document.notices()).is_empty());
 
-    // A component the talk lacks says the same, and a slide that has all it uses says nothing,
-    // each pasted into a talk of its own, whose status line says nothing yet.
-    for (row, says) in [(1, true), (2, false)] {
+    // A component the talk lacks, or a picture the talk it came from lacks, says so, and a slide
+    // that has all it uses says nothing, each pasted into a talk of its own, whose status line
+    // says nothing yet.
+    for (row, says) in [(1, true), (2, false), (3, true)] {
         let into = open(cx, "# A\n");
         from.click(cx, strip_row_id(row));
         from.press(cx, "ctrl-c");
@@ -722,7 +728,8 @@ fn a_pasted_slide_missing_its_picture_says_so(cx: &mut TestAppContext) {
         assert_eq!(into.count(cx), 2);
         assert_eq!(into.status(cx).as_deref() == Some(MISSING_PICTURES), says, "row {row}");
     }
-    // A picture that's there, but can't be read as one, isn't missing.
+    // Where the talk has a different file by the picture's name, it comes under another, which
+    // the pasted slide names.
     let corrupt = tempfile::tempdir().unwrap();
     std::fs::create_dir(corrupt.path().join("assets")).unwrap();
     std::fs::write(corrupt.path().join("assets/chart.png"), "not a picture").unwrap();
@@ -732,15 +739,17 @@ fn a_pasted_slide_missing_its_picture_says_so(cx: &mut TestAppContext) {
     into.click(cx, strip_row_id(0));
     into.press(cx, "ctrl-v");
     assert_eq!(into.count(cx), 2);
-    let notices = into.document(cx).update(cx, |document, _| document.notices());
-    assert!(notices.iter().any(|notice| notice.starts_with("Can't show the picture")), "{notices:?}");
+    assert!(into.source(cx).contains("![A chart](assets/chart-2.png)"), "{}", into.source(cx));
+    assert!(into.document(cx).update(cx, |document, _| document.notices()).is_empty());
     assert_eq!(into.status(cx), None);
-    // Pasting into the talk it came from, where the picture is, says nothing either.
+    // Pasting into the talk it came from, where the picture is, says nothing either, and adds
+    // nothing.
     from.click(cx, strip_row_id(0));
     from.press(cx, "ctrl-c");
     from.press(cx, "ctrl-v");
-    assert_eq!(from.count(cx), 4);
+    assert_eq!(from.count(cx), 5);
     assert_eq!(from.status(cx), None);
+    assert!(from.document(cx).read_with(cx, |document, _| document.unsaved_files().is_empty()));
 }
 
 #[gpui_kit::test]
@@ -1279,3 +1288,195 @@ fn plain_text_pastes_as_one_slide_or_none_and_leaves_the_others_alone() {
 /// How far past the caret, in slide units, a click aimed at it lands: far less than a letter,
 /// but more than rounding to the window's pixels can take away.
 const CARET_NUDGE: f32 = 0.05;
+
+// Things on a slide, and the files they bring.
+
+/// A picture's bytes, as a talk holds them.
+fn png() -> Vec<u8> {
+    Pixmap::new(4, 4).unwrap().encode_png().unwrap()
+}
+
+const SCORE_SOURCE: &str = include_str!("../../components/tests/fixtures/v1/score.rs");
+const SCORE_BUILD: &[u8] = include_bytes!("../../components/tests/fixtures/v1/score.wasm");
+const PICTURE_TAG: &str = "<Picture src=\"assets/photo.png\" x=\"100\" y=\"100\" w=\"400\" h=\"300\" />";
+
+fn base64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Element data holding `markdown` and `files`, as JSON that's well formed whatever they hold.
+fn element_json(markdown: &str, files: serde_json::Value) -> String {
+    let json = serde_json::json!({ APP_KEY: { "kind": "element", "version": 1, "markdown": markdown, "files": files } }).to_string();
+    assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok(), "well formed");
+    json
+}
+
+fn element_of(metadata: &str) -> Carried {
+    match read_app_data(Some(metadata)) {
+        AppData::Element(carried) => carried,
+        _ => panic!("element data"),
+    }
+}
+
+/// Whether `path` is one plain name in one of the folders a pasted file can go in.
+fn in_the_three_folders(path: &str) -> bool {
+    let Some((folder, name)) = path.split_once('/') else { return false };
+    ["assets", "components", "build"].contains(&folder)
+        && !name.is_empty()
+        && !name.contains(['/', '\\'])
+        && !name.starts_with('.')
+        && slides_engine::normalise(path).as_deref() == Some(path)
+}
+
+#[test]
+fn element_data_round_trips() {
+    let files = vec![
+        CopiedFile { path: "assets/photo.png".into(), bytes: png().into(), built_from: None },
+        CopiedFile { path: "components/score.rs".into(), bytes: SCORE_SOURCE.as_bytes().into(), built_from: None },
+        CopiedFile {
+            path: "build/score.wasm".into(),
+            bytes: SCORE_BUILD.into(),
+            built_from: Some(slides_components::source_hash(SCORE_SOURCE.as_bytes())),
+        },
+    ];
+    let entry = clipboard::element_entry(PICTURE_TAG, &files).expect("it fits");
+    assert_eq!(entry.text, PICTURE_TAG, "other programs get its Markdown");
+    let carried = element_of(entry.metadata.as_deref().unwrap());
+    assert_eq!(carried.markdown, PICTURE_TAG);
+    assert!(!carried.files.left_out && !carried.files.too_large);
+    let back: Vec<(String, Vec<u8>, Option<String>)> =
+        carried.files.files.iter().map(|file| (file.path.clone(), file.bytes.clone(), file.built_from.clone())).collect();
+    let sent: Vec<(String, Vec<u8>, Option<String>)> =
+        files.iter().map(|file| (file.path.clone(), file.bytes.to_vec(), file.built_from.clone())).collect();
+    assert_eq!(back, sent);
+    assert_eq!(clipboard::one_element(&carried.markdown).as_deref(), Some(PICTURE_TAG));
+    // A slide carries them the same way.
+    let entry = clipboard::slide_entry_with("# One\n\n![](assets/photo.png)\n", &files[..1]).unwrap();
+    let AppData::Slide(slide) = read_app_data(entry.metadata.as_deref()) else { panic!("slide data") };
+    assert_eq!(slide.files.files.len(), 1);
+    assert_eq!(clipboard::carried_slide(&slide.markdown), SlidePaste::Slide("# One\n\n![](assets/photo.png)\n".into()));
+    // Files over the limit aren't carried, and the paste can say so.
+    let big = vec![CopiedFile { path: "assets/a.png".into(), bytes: vec![0u8; MAX_CLIPBOARD_FILES_BYTES + 1].into(), built_from: None }];
+    let entry = clipboard::element_entry(PICTURE_TAG, &big).unwrap();
+    assert!(entry.metadata.as_ref().unwrap().len() < MAX_BYTES, "no files in it");
+    let carried = element_of(entry.metadata.as_deref().unwrap());
+    assert!(carried.files.files.is_empty() && carried.files.too_large);
+}
+
+#[test]
+fn hostile_element_data_is_refused_or_made_safe() {
+    let file = |path: &str, bytes: &[u8]| serde_json::json!({ "path": path, "bytes": base64(bytes) });
+    let png = png();
+    let sneaky_source = format!("{SCORE_SOURCE}\nconst SECRET: &str = include_str!(\"/etc/passwd\");\n");
+    // Paths and contents a file can't have: each is left out, and the thing still pastes.
+    for (what, bad) in [
+        ("up a folder", file("../x.png", &png)),
+        ("up two folders", file("assets/../../x", &png)),
+        ("from the root", file("/etc/x", &png)),
+        ("a folder in assets", file("assets/a/b.png", &png)),
+        ("a program", file("build/x.exe", b"MZ")),
+        ("not a picture", file("assets/x.png", b"not a picture")),
+        ("not a build", file("build/x.wasm", b"not wasm")),
+        ("a source reading files", file("components/x.rs", sneaky_source.as_bytes())),
+        ("the build index", file("build/index.json", b"{}")),
+        ("not base64", serde_json::json!({ "path": "assets/y.png", "bytes": "%%% not base64 %%%" })),
+        ("no bytes", serde_json::json!({ "path": "assets/y.png" })),
+    ] {
+        let metadata = element_json(PICTURE_TAG, serde_json::json!([file("assets/photo.png", &png), bad]));
+        let carried = element_of(&metadata);
+        let paths: Vec<&str> = carried.files.files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(paths, ["assets/photo.png"], "{what}");
+        assert!(carried.files.left_out, "{what}: said");
+        assert_eq!(clipboard::one_element(&carried.markdown).as_deref(), Some(PICTURE_TAG), "{what}: the thing pastes");
+    }
+    // Too many files, or too many bytes by their stated length: none are taken.
+    let many: Vec<serde_json::Value> = (0..2000).map(|at| file(&format!("assets/a{at}.png"), &png)).collect();
+    let carried_many = element_of(&element_json(PICTURE_TAG, serde_json::Value::Array(many)));
+    assert!(carried_many.files.files.is_empty() && carried_many.files.too_large, "2,000 files");
+    let stated = "A".repeat(65 * 1024 * 1024 / 3 * 4 + 4);
+    let metadata = element_json(PICTURE_TAG, serde_json::json!([{ "path": "assets/big.png", "bytes": stated }]));
+    let started = Instant::now();
+    let carried_big = element_of(&metadata);
+    assert!(carried_big.files.files.is_empty() && carried_big.files.too_large, "65 MiB");
+    assert!(started.elapsed() < Duration::from_secs(10), "refused before it's decoded");
+    // Markdown that isn't one thing on a slide.
+    for markdown in [
+        "<Shape kind=\"rect\" />\n\n<Shape kind=\"ellipse\" />\n",
+        "<Shape kind=\"rect\" />\n\n---\n\n# Next\n",
+        "---\ntitle: Evil\n---\n<Shape kind=\"rect\" />\n",
+        "title: Evil\n---\n<Shape kind=\"rect\" />\n",
+        "<Notes>\nsay this\n</Notes>\n",
+        "<Shape kind=\"rect\" />\n\n<Notes>\nsay this\n</Notes>\n",
+        "# A heading\n",
+        "some words\n",
+        "",
+    ] {
+        let carried = element_of(&element_json(markdown, serde_json::json!([])));
+        assert_eq!(clipboard::one_element(&carried.markdown), None, "{markdown:?}");
+    }
+    assert!(clipboard::one_element(&"x".repeat(MAX_SLIDE_BYTES + 1)).is_none());
+    // Kinds and versions that aren't the app's are nothing of it.
+    for (kind, version) in [("element", 2), ("elements", 1)] {
+        let json = serde_json::json!({ APP_KEY: { "kind": kind, "version": version, "markdown": PICTURE_TAG } }).to_string();
+        assert!(matches!(read_app_data(Some(&json)), AppData::Not), "{kind} {version}");
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+
+    #[test]
+    fn no_pasted_path_leaves_the_three_folders(
+        pieces in prop::collection::vec(
+            prop_oneof![
+                Just("assets"), Just("components"), Just("build"), Just("/"), Just("\\"), Just(".."), Just("."), Just("a"),
+                Just("photo"), Just(".png"), Just(".rs"), Just(".wasm"), Just(".csv"), Just(".svg"), Just("C:"), Just("%2e"),
+                Just(" "), Just("\u{0}"), Just("\u{202e}"), Just("~"), Just("index.json"), Just("con"), Just(".PNG"),
+            ],
+            0..8,
+        )
+    ) {
+        let path = pieces.concat();
+        let bytes: Vec<u8> = if path.ends_with(".rs") {
+            SCORE_SOURCE.as_bytes().to_vec()
+        } else if path.ends_with(".wasm") {
+            SCORE_BUILD.to_vec()
+        } else if path.ends_with(".csv") {
+            b"a,1".to_vec()
+        } else {
+            png()
+        };
+        let metadata = element_json(PICTURE_TAG, serde_json::json!([{ "path": path, "bytes": base64(&bytes) }]));
+        for file in element_of(&metadata).files.files {
+            prop_assert!(in_the_three_folders(&file.path), "{:?}", file.path);
+            prop_assert_eq!(clipboard::pasted_kind(&file.path), Some(file.kind));
+        }
+        if let Some(kind) = clipboard::pasted_kind(&path) {
+            prop_assert!(in_the_three_folders(&path), "{:?} as {:?}", path, kind);
+        }
+    }
+}
+
+#[test]
+fn a_paste_never_sets_a_talk_wide_setting_with_files_either() {
+    for (what, text) in sets_talk_settings() {
+        for into in INTO {
+            let (_folder, mut document) = document_of(into);
+            let before = talk_settings(document.talk());
+            let source = document.source().to_string();
+            let metadata = serde_json::json!({ APP_KEY: {
+                "kind": "slide", "version": 1, "markdown": text,
+                "files": [{ "path": "assets/photo.png", "bytes": base64(&png()) }],
+            } })
+            .to_string();
+            let AppData::Slide(slide) = read_app_data(Some(&metadata)) else { panic!("slide data") };
+            if let SlidePaste::Slide(markdown) = clipboard::carried_slide(&slide.markdown)
+                && document.paste_slide_with_files(&markdown, slide.files).is_err()
+            {
+                assert_eq!(document.source(), source, "{what}");
+            }
+            assert_eq!(talk_settings(document.talk()), before, "{what} into {into:?}: {:?}", document.source());
+        }
+    }
+}
