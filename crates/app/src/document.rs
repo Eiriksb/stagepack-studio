@@ -634,13 +634,20 @@ impl Document {
     }
 
     /// Finishes the text being typed on a slide, before another edit, and says whether tidying
-    /// what typing left empty changed the talk.
+    /// what typing left empty changed the talk. Emptied text that can't be taken away is left
+    /// where it is, said, and doesn't stop the edit.
     fn finish_before_edit(&mut self) -> Result<bool, EditRefused> {
         if self.editing.is_none() {
             return Ok(false);
         }
-        let (_, removed) = self.finish_text()?;
-        Ok(removed.is_some())
+        match self.finish_text() {
+            Ok((_, removed)) => Ok(removed.is_some()),
+            Err(EditRefused::CouldNotTidy) => {
+                self.message = Some(EditRefused::CouldNotTidy.to_string());
+                Ok(false)
+            }
+            Err(refused) => Err(refused),
+        }
     }
 
     /// [`Self::make`], but for ending the typing, into the step `join` says. With `check`, the

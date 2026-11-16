@@ -994,3 +994,19 @@ fn a_tidy_up_that_is_refused_is_said() {
     doc.begin_text_in_region(0, "title");
     assert!(doc.take_message().is_some(), "the refusal is said");
 }
+
+#[test]
+fn a_command_goes_on_when_emptied_text_cannot_be_taken_away() {
+    // Seen in the real window: with a title emptied above a smaller heading, which taking the
+    // title away would make the title, the first press of New slide did nothing but say so.
+    let source = "# Title\n\n## Sub heading\n\nWords\n\n---\n\n# Two\n";
+    let (_d, mut doc) = talk(source);
+    assert!(doc.begin_text(0, 0, slides_format::Pos { para: 0, offset: 0 }));
+    doc.apply_text(|edit| edit.select_all()).unwrap();
+    doc.apply_text(|edit| edit.backspace()).unwrap();
+    doc.add_slide("content").unwrap();
+    assert_eq!((doc.slide_count(), doc.current()), (3, 1), "the slide was added");
+    assert!(doc.text().is_none());
+    assert!(doc.take_message().is_some(), "what was left is said");
+    assert_eq!(doc.take_message(), None, "once");
+}
