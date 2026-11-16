@@ -12,7 +12,7 @@ use slides_engine::{
     read_talk_text,
 };
 use slides_format::{
-    Change, FlowPlace, Para, Pos, Selection, SourceEdit, Talk, TextEdit, parse_talk, reparse, set_align,
+    Change, FlowPlace, MAX_SLIDE_BYTES, Para, Pos, Selection, SourceEdit, Talk, TextEdit, parse_talk, reparse, set_align,
     split_slides, storable, text_flows, write_flow, write_into_region,
 };
 
@@ -966,6 +966,13 @@ impl Document {
         let changed = self.edit_slide(EDIT_NOTES, index, change, run)?;
         self.typing_notes = self.open_run().map(|run| (index, run));
         Ok(changed)
+    }
+
+    /// Whether `bytes` more can go on the slide whose text is being typed: a slide that holds
+    /// more than [`MAX_SLIDE_BYTES`] can't be read. With no text being typed, there's room.
+    pub fn has_room_for(&self, bytes: usize) -> bool {
+        let slide = self.editing.as_ref().and_then(|editing| self.talk().slides.get(editing.slide));
+        slide.is_none_or(|slide| slide.range.len().saturating_add(bytes) <= MAX_SLIDE_BYTES)
     }
 
     /// The text being typed on a slide, if any.

@@ -429,6 +429,17 @@ impl SlideEditor {
                 return;
             }
         };
+        let bytes = match &paste {
+            TextPaste::Nothing => 0,
+            TextPaste::Styled(paras) => paras.iter().flat_map(|para| &para.spans).map(|span| span.text.len()).sum(),
+            TextPaste::Plain(text) => text.len(),
+        };
+        // More than the slide can hold is refused before anything is written, which would take
+        // seconds to find it can't be.
+        if !self.document.as_ref().is_some_and(|document| document.read(cx).has_room_for(bytes)) {
+            cx.emit(EditorEvent::Said(clipboard::TOO_LARGE.into()));
+            return;
+        }
         self.wanted_x = None;
         match paste {
             TextPaste::Nothing => return,

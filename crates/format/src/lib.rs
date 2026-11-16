@@ -15,7 +15,7 @@ mod split;
 
 pub use edit::{Change, SourceEdit, set_attr, set_setting};
 pub use model::{Attr, Block, Notes, Slide, SlideError, Span, Style, Tag, Talk};
-pub use parse::{parse_talk, slides_parsed_on_this_thread};
+pub use parse::{MAX_BODY as MAX_SLIDE_BYTES, parse_talk, slides_parsed_on_this_thread};
 pub use reparse::reparse;
 pub use rich::{FlowPlace, Para, ParaKind, ParaSource, TextFlow, text_flows, uneditable_reason};
 pub use rich_edit::{Motion, Pos, Selection, Shared, StyleBit, StyleState, TextEdit, is_bidi_control};

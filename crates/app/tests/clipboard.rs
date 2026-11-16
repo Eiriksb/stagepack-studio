@@ -4,12 +4,13 @@
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
     AnyWindowHandle, App, AppContext, Bounds, ClipboardItem, Entity, EntityInputHandler as _,
-    InputEvent as _, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Modifiers, Point,
+    InputEvent as _, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Modifiers, Point,
     TestAppContext, WindowBounds, WindowOptions, point, px, size,
 };
 use proptest::prelude::*;
+use std::time::{Duration, Instant};
 use slides_engine::{Fonts, Pixmap};
-use slides_format::{Para, ParaKind, Pos, Span, Style, TextFlow, is_hidden, parse_talk, storable, text_flows};
+use slides_format::{MAX_SLIDE_BYTES, Para, ParaKind, Pos, Span, Style, TextFlow, is_hidden, parse_talk, storable, text_flows};
 use stagepack_studio::clipboard::{
     self, APP_KEY, MAX_BYTES, MAX_PARAS, MAX_SPANS, MISSING_PICTURES, NO_SLIDE, TOO_LARGE,
     SlidePaste, TextPaste, decode_paras, encode_paras, text_entry, text_to_paste,
@@ -398,6 +399,36 @@ fn a_paste_too_large_is_refused(cx: &mut TestAppContext) {
     talk.press(cx, "ctrl-v");
     assert_eq!(talk.source(cx), TWO);
     assert!(talk.editing(cx).is_some(), "typing goes on");
+}
+
+#[gpui_kit::test]
+fn a_paste_more_than_the_slide_holds_is_refused_at_once(cx: &mut TestAppContext) {
+    let lines: Vec<String> = (0..700).map(|n| format!("Line {n} with some words to make it about seventy characters long, yes.")).collect();
+    let plain = lines.join("\n");
+    assert!(MAX_SLIDE_BYTES < plain.len() && plain.len() < MAX_BYTES, "more than a slide holds, less than a paste takes");
+    let paras: Vec<Para> = lines.iter().map(|line| Para { kind: ParaKind::Body, spans: vec![Span { text: line.clone(), style: bold() }] }).collect();
+    let styled = text_entry(&paras);
+    assert!(styled.metadata.is_some());
+    let talk = open(cx, TWO);
+    for (text, metadata) in [(plain.as_str(), None), (styled.text.as_str(), styled.metadata.as_deref())] {
+        talk.click_text(cx, 1, pos(0, 15));
+        put(cx, text, metadata);
+        // The key alone, with the window drawn before it and not after.
+        let took = cx
+            .update_window(talk.handle, |_, window, cx| {
+                window.render_frame(cx);
+                let started = Instant::now();
+                window.dispatch_keystroke(Keystroke::parse("ctrl-v").unwrap(), cx);
+                started.elapsed()
+            })
+            .unwrap();
+        talk.settle(cx);
+        assert!(took < Duration::from_millis(50), "said at once, not after trying: {took:?}");
+        assert_eq!(talk.status(cx).as_deref(), Some(TOO_LARGE));
+        assert_eq!(talk.source(cx), TWO);
+        assert!(!talk.can_undo(cx));
+        assert!(talk.editing(cx).is_some(), "typing goes on");
+    }
 }
 
 #[gpui_kit::test]

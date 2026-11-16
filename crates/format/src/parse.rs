@@ -17,7 +17,7 @@ const TOO_DEEP: &str = "This slide is nested too deeply to read";
 /// The most a slide's body can hold and still be read, far more than any slide needs. The
 /// `markdown` crate's time grows with the square of some slides' length, and the worst
 /// found at this size takes about 4 seconds in a release build: a long run of `*`.
-const MAX_BODY: usize = 32 * 1024;
+pub const MAX_BODY: usize = 32 * 1024;
 const TOO_LARGE: &str = "This slide is too large to read";
 const UNREADABLE: &str = "This slide could not be read";
 /// The `markdown` crate goes further down the stack for every level of a slide, however
