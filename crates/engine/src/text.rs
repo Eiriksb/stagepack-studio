@@ -4,9 +4,10 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use cosmic_text::{
-    fontdb, Align as TextAlign, Attrs, AttrsList, Buffer, BufferLine, Color as TextColor, Command, Family, FontSystem,
-    LineEnding, Metrics, Shaping, Style, SwashCache, SwashContent, Weight,
+    fontdb, Align as TextAlign, Attrs, AttrsList, Buffer, BufferLine, Color as TextColor, Command, Fallback, Family, FontSystem,
+    LineEnding, Metrics, PlatformFallback, Shaping, Style, SwashCache, SwashContent, Weight,
 };
+use unicode_script::Script;
 use tiny_skia::{
     Color, ColorU8, FillRule, FilterQuality, Paint, Path, PathBuilder, Pixmap, PixmapMut,
     PixmapPaint, Rect, Shader, Transform,
@@ -54,6 +55,41 @@ pub struct EmbeddableFace {
     pub data: Arc<Vec<u8>>,
 }
 
+/// The bundled colour emoji's family.
+const EMOJI_FAMILY: &str = "Noto Color Emoji";
+
+/// The platform's fallback fonts, with the colour emoji first: a computer's own fonts may
+/// have some emoji in one colour, and a slide would look different from one computer to
+/// the next. The bundled fonts have nothing else the emoji font has, so with them alone the
+/// order changes nothing.
+struct EmojiFirst {
+    platform: PlatformFallback,
+    common: Vec<&'static str>,
+}
+
+impl EmojiFirst {
+    fn new() -> EmojiFirst {
+        let platform = PlatformFallback;
+        let rest = platform.common_fallback().iter().copied().filter(|family| *family != EMOJI_FAMILY);
+        let common = std::iter::once(EMOJI_FAMILY).chain(rest).collect();
+        EmojiFirst { platform, common }
+    }
+}
+
+impl Fallback for EmojiFirst {
+    fn common_fallback(&self) -> &[&'static str] {
+        &self.common
+    }
+
+    fn forbidden_fallback(&self) -> &[&'static str] {
+        self.platform.forbidden_fallback()
+    }
+
+    fn script_fallback(&self, script: Script, locale: &str) -> &[&'static str] {
+        self.platform.script_fallback(script, locale)
+    }
+}
+
 pub struct Fonts {
     pub system: FontSystem,
     pub cache: SwashCache,
@@ -74,7 +110,7 @@ impl Fonts {
             db.load_system_fonts();
         }
         Fonts {
-            system: FontSystem::new_with_locale_and_db("en-US".to_string(), db),
+            system: FontSystem::new_with_locale_and_db_and_fallback("en-US".to_string(), db, EmojiFirst::new()),
             cache: SwashCache::new(),
             known,
         }

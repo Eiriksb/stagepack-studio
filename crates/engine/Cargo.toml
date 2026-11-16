@@ -18,6 +18,8 @@ svgtypes = "=0.16.2"
 serde_json = { workspace = true }
 zip = { version = "=9.5.0", default-features = false, features = ["deflate"] }
 unicode-segmentation = "=1.13.3"
+# The script type of cosmic-text's fallback lists, at the version it uses.
+unicode-script = "=0.5.9"
 
 [dev-dependencies]
 tempfile = "3"
