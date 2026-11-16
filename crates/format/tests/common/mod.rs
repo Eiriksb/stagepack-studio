@@ -133,6 +133,13 @@ pub fn block() -> impl Strategy<Value = String> {
         "A paragraph\nover two lines.".to_string(),
         "- one\n- two".to_string(),
         "1. first\n2. second".to_string(),
+        // Lists as people indent them by hand: four spaces or a tab in, one space in, and
+        // straight under a paragraph's line.
+        "- a\n    - deep\n- b".to_string(),
+        "- a\n\t- deep\n- b".to_string(),
+        "1. a\n    - nested\n    1. one\n2. b".to_string(),
+        " - a\n - b".to_string(),
+        "Intro:\n- a\n- b".to_string(),
         "```\n---\ncode\n```".to_string(),
         "~~~md\n---\n~~~".to_string(),
         "> A quote".to_string(),

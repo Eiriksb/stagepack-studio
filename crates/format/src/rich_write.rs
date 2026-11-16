@@ -733,8 +733,12 @@ fn block_text(para: &Para, shape: Option<&Shape>, src: &Source, keep: Option<&st
 /// How old paragraph `index` of `flow`, a list item, is written now.
 fn old_shape(src: &Source, flow: &TextFlow, index: usize) -> Option<Shape> {
     let source = &flow.source[index];
-    let indent = src.prefix(source.block.start)?.to_string();
     let rest = src.text.get(source.block.start..)?;
+    // An item indented past the text of the item it's in starts before its marker: the
+    // spaces and tabs up to the marker are part of its indentation.
+    let lead = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+    let indent = format!("{}{}", src.prefix(source.block.start)?, &rest[..lead]);
+    let rest = &rest[lead..];
     let (marker, length) = marker_at(rest)?;
     // The spaces after the marker, up to the text on its line. With none, or more than an
     // item's text can be indented by, the text is one space after it.

@@ -307,6 +307,7 @@ fn mixed_source() -> impl Strategy<Value = String> {
             "<Box x=\"1\">\n\n- a\n\n  b\n\n</Box>",
             "\\*a", "- \\*a\n  - c\n- b", "# \\#tag", "\\[x]", "\\_y_", "\\- z", "\\\\w", "&amp; co", "1\\. not a list",
             "- \\[x] \\[y]", "## \\* starred", "\\\\\n===",
+            "- a\n    - deep\n- b", "- a\n\t- deep", "1. a\n    - nested", " - a\n - b", "Intro:\n- a\n- b",
         ]),
         0..12,
     )

@@ -1,3 +1,6 @@
+mod common;
+
+use common::*;
 use proptest::prelude::*;
 use slides_format::*;
 
@@ -581,6 +584,12 @@ fn talk() -> impl Strategy<Value = (String, usize, usize)> {
         ("# A\n\nFirst slide.\n\n---\n\n#   Odd   heading\n\n10. ten\n11. eleven\n\n```\n---\n```\n", 1, 1),
         ("Plain words first.\n\n- a\n- b\n", 0, 0),
         ("# T\n\n- \\*a\n  - \\#c\n-   \\[b]\n\n\\_d and \\\\e\n\n&amp; f\n", 0, 1),
+        // Lists indented by hand, and one straight under a paragraph's line.
+        ("# T\n\n- a\n    - deep\n- b\n\nafter\n", 0, 1),
+        ("# T\n\n- a\n\t- deep\n- b\n\nafter\n", 0, 1),
+        ("# T\n\n1. a\n    - nested\n2. b\n", 0, 1),
+        ("# T\n\n - a\n - b\n", 0, 1),
+        ("# T\n\nIntro:\n- a\n    - deep\n- b\n", 0, 1),
     ];
     (prop::sample::select(slides), any::<[bool; 3]>()).prop_map(|((source, slide, flow), [crlf, more, bom])| {
         let mut source = source.to_string();
@@ -670,5 +679,42 @@ proptest! {
         prop_assert_eq!(&after[..block.start], &source[..block.start]);
         prop_assert!(after.ends_with(&source[block.end..]), "{:?}", after);
         prop_assert_eq!(&text_flows(&parse_talk(&after), 0)[at].paras, &paras);
+    }
+
+    /// Typing a letter at the start or end of any paragraph of a hand-written talk changes
+    /// no byte outside that paragraph's lines.
+    #[test]
+    fn typing_a_letter_changes_only_its_paragraphs_lines(
+        generated in gen_talk(),
+        slide in any::<prop::sample::Index>(),
+        flow in any::<prop::sample::Index>(),
+        para in any::<prop::sample::Index>(),
+        at_end in any::<bool>(),
+    ) {
+        let source = generated.text();
+        let talk = parse_talk(&source);
+        let slide = slide.index(talk.slides.len());
+        let flows = text_flows(&talk, slide);
+        prop_assume!(!flows.is_empty());
+        let flow = &flows[flow.index(flows.len())];
+        let which = para.index(flow.paras.len());
+        let mut paras = flow.paras.clone();
+        let spans = &mut paras[which].spans;
+        if spans.is_empty() {
+            spans.push(plain("x"));
+        } else if at_end {
+            spans.last_mut().unwrap().text.push('x');
+        } else {
+            spans[0].text.insert(0, 'x');
+        }
+        let change = write_flow(&talk, slide, flow, &paras);
+        prop_assert!(change.is_some(), "refused typing in {:?}", &source[flow.source[which].block.clone()]);
+        let after = change.unwrap().apply(&source);
+        prop_assert_eq!(&text_flows(&parse_talk(&after), slide)[flows.iter().position(|f| f == flow).unwrap()].paras, &storable(&paras));
+        let block = &flow.source[which].block;
+        let start = source[..block.start].rfind('\n').map_or(0, |i| i + 1);
+        let end = source[block.end..].find('\n').map_or(source.len(), |i| block.end + i + 1);
+        prop_assert_eq!(&after[..start], &source[..start], "{:?}", after);
+        prop_assert!(after.ends_with(&source[end..]), "{:?} became {:?}", source, after);
     }
 }
