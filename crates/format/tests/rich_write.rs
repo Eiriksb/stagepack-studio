@@ -559,6 +559,22 @@ fn emptying_a_deep_item_leaves_the_hand_indented_items_around_it() {
 }
 
 #[test]
+fn an_item_made_before_a_hand_indented_one_takes_its_indentation() {
+    for (source, expected) in [
+        ("# T\n\n- a\n    - b\n    - x\n- d\n", "# T\n\n- a\n\n    -\n    - b\n    - x\n- d\n"),
+        ("# T\n\n- a\n\t- b\n\t- x\n- d\n", "# T\n\n- a\n\n\t-\n\t- b\n\t- x\n- d\n"),
+        ("# T\n\n- a\n    - b\n        - c\n- d\n", "# T\n\n- a\n\n    -\n    - b\n        - c\n- d\n"),
+    ] {
+        let talk = parse_talk(source);
+        let flow = &text_flows(&talk, 0)[1];
+        let paras = TextEdit::new(flow.paras.clone()).move_to(Pos { para: 1, offset: 0 }, false).enter().paras;
+        let after = write_flow(&talk, 0, flow, &paras).expect("written").apply(source);
+        assert_eq!(after, expected);
+        assert_eq!(text_flows(&parse_talk(&after), 0)[1].paras, paras);
+    }
+}
+
+#[test]
 fn a_list_written_again_keeps_its_untouched_items_as_they_were() {
     // Each made body at item `which`, and what the rest of the list keeps.
     for (source, which, expected) in [

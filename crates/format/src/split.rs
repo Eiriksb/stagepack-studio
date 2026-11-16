@@ -40,38 +40,43 @@ fn is_break(text: &str) -> bool {
     text.trim_end_matches(' ') == "---"
 }
 
-/// A code fence: the mark it's made of, and how many of them open it.
+/// A code fence: the mark it's made of, how many of them open it, and the column they
+/// start at.
 #[derive(Clone, Copy)]
 struct Fence {
     mark: u8,
     length: usize,
+    column: usize,
 }
 
-/// The run of fence marks starting `text` after up to three spaces, as CommonMark has it:
-/// four spaces in is code by indentation, not a fence.
-fn fence_marks(text: &str) -> Option<(Fence, &str)> {
-    let indent = text.bytes().take_while(|byte| *byte == b' ').count();
-    if indent > 3 {
+/// The run of fence marks starting `text` after its blank space, if they start no further in
+/// than column `most`, a tab going on to the next multiple of four.
+fn fence_marks(text: &str, most: usize) -> Option<(Fence, &str)> {
+    let blank = text.len() - text.trim_start_matches([' ', '\t']).len();
+    let column = text[..blank].bytes().fold(0, |at, byte| if byte == b'\t' { at + 4 - at % 4 } else { at + 1 });
+    if column > most {
         return None;
     }
-    let rest = &text[indent..];
+    let rest = &text[blank..];
     let mark = *rest.as_bytes().first().filter(|mark| matches!(mark, b'`' | b'~'))?;
     let length = rest.bytes().take_while(|byte| *byte == mark).count();
-    (length >= 3).then(|| (Fence { mark, length }, &rest[length..]))
+    (length >= 3).then(|| (Fence { mark, length, column }, &rest[length..]))
 }
 
 /// The fence `text` opens, if it opens one: three or more tildes, or three or more
 /// backticks with no backtick after them on the line, as a line with more is code in a
-/// paragraph.
+/// paragraph. Four columns in is code by indentation, as CommonMark has it.
 fn opens(text: &str) -> Option<Fence> {
-    let (fence, info) = fence_marks(text)?;
+    let (fence, info) = fence_marks(text, 3)?;
     (fence.mark == b'~' || !info.contains('`')).then_some(fence)
 }
 
 /// Whether `text` closes `open`: at least as many of its marks, and nothing after them but
-/// spaces and tabs.
+/// spaces and tabs. A closing line can be up to three columns further in than the opening
+/// one, as far as a fence in a list item can be closed past its item's text, which the
+/// opening line is never left of.
 fn closes(text: &str, open: Fence) -> bool {
-    fence_marks(text).is_some_and(|(fence, rest)| {
+    fence_marks(text, open.column + 3).is_some_and(|(fence, rest)| {
         fence.mark == open.mark && fence.length >= open.length && rest.trim_matches([' ', '\t']).is_empty()
     })
 }

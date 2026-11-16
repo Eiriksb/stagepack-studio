@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc a1c6fb9d7d04b2963826624c8af094e92030dddcd1bb7a1bca9717783dfd030e # shrinks to lines = ["```a```b", "---"]
+cc 34411d9a3eddb8230c4d2c15bdc30fd0d3b06dbb1e65830e139c83140c08906f # shrinks to pieces = ["- a\n\n  ```\n  x\n    ```", "---"]
+cc 59abb3c699f32b0b3edc95e3833ff6463939104a79aecd0c8be5bf2206894969 # shrinks to lines = ["words", "---", "---", "```a```b", "---"]

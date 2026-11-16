@@ -147,6 +147,8 @@ pub fn block() -> impl Strategy<Value = String> {
             " - a\n - b".to_string(),
             "Intro:\n- a\n- b".to_string(),
             "- a\n    - b\n        - c\n- d".to_string(),
+            "- a\n    - b\n    - x\n- d".to_string(),
+            "- a\n\t- b\n\t- x\n- d".to_string(),
             "- &nbsp;\n  - under\n- c".to_string(),
             "```\n---\ncode\n```".to_string(),
             "~~~md\n---\n~~~".to_string(),

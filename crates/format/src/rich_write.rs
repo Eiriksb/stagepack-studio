@@ -1011,12 +1011,26 @@ fn whole_change(src: &Source, flow: &TextFlow, new: &[Para], origin: &[Origin], 
         })
         .collect();
     let untouched = |j: usize| own && matches!(origin[j], Origin::Kept(i) if !loses_its_space(src, flow, i, new, j));
-    // An item at the level it was at keeps its indentation where it can.
-    let own_indent = |j: usize| match origin[j] {
-        Origin::Kept(i) | Origin::Paired(i) if own && level_of(new[j].kind).is_some() && level_of(flow.paras[i].kind) == level_of(new[j].kind) => {
-            old_shape(src, flow, i).map(|shape| (shape.indent, untouched(j)))
+    // The indentation item `j` had, if it was an item at the level it's at.
+    let had = |j: usize| match origin[j] {
+        Origin::Kept(i) | Origin::Paired(i) if level_of(new[j].kind).is_some() && level_of(flow.paras[i].kind) == level_of(new[j].kind) => {
+            old_shape(src, flow, i).map(|shape| shape.indent)
         }
         _ => None,
+    };
+    // An item at the level it was at keeps its indentation where it can, and a new one takes
+    // that of the item it's made beside, the next at its level in the same item, so as not
+    // to push that one in or out.
+    let own_indent = |j: usize| {
+        if !own {
+            return None;
+        }
+        if origin[j] != Origin::New {
+            return had(j).map(|indent| (indent, untouched(j)));
+        }
+        let level = level_of(new[j].kind)?;
+        let beside = (j + 1..new.len()).find(|&k| level_of(new[k].kind).is_none_or(|at| at <= level))?;
+        (level_of(new[beside].kind) == Some(level)).then(|| had(beside)).flatten().map(|indent| (indent, false))
     };
     let shapes = shapes(new, &src.base, &look, |_| None, keeps_marker, |j| old_number(src, flow, origin[j]), |j| blank[j], own_indent)?;
     let mut text = String::new();

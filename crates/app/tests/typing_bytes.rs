@@ -43,6 +43,8 @@ const TALKS: &[(&str, &str)] = &[
     ("code span", "# T\n\nuse `x * y` here\n\nother\n"),
     ("emphasis star", "# T\n\nsome *it* and **bold** and ***both***\n\nother\n"),
     ("deep 4-space", "# T\n\n- a\n    - b\n        - c\n- d\n"),
+    ("two 4-space children", "# T\n\n- a\n    - b\n    - x\n- d\n"),
+    ("two tab children", "# T\n\n- a\n\t- b\n\t- x\n- d\n"),
     ("no-break space over items", "# T\n\n- &nbsp;\n  - b\n- c\n"),
 ];
 
