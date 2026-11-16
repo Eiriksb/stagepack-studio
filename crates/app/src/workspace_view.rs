@@ -904,7 +904,8 @@ impl WorkspaceView {
     }
 
     /// Asks where to put what `job` will write, then runs it on a background task and says how
-    /// it went. `job` is made once the place is chosen, so it has the talk as it is by then.
+    /// it went. `job` is made once the place is chosen, so it has the talk as it is by then,
+    /// with typing done since settled too.
     fn write_out<Job>(
         &mut self,
         extension: Option<&str>,
@@ -937,6 +938,8 @@ impl WorkspaceView {
                 |name| name.to_string_lossy().into_owned(),
             );
             let job = this.update(cx, |this, cx| {
+                // Typing may have gone on while the dialog was up.
+                this.settle_typing(cx);
                 this.say(format!("{} {name}…", wording.doing), cx);
                 this.document
                     .as_ref()

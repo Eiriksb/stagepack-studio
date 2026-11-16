@@ -21,7 +21,7 @@ use stagepack_studio::ribbon::{DELETE_ID, DUPLICATE_ID, HIDE_ID, NEW_SLIDE_ID};
 use stagepack_studio::recovery::Recovery;
 use stagepack_studio::slide_editor::{CARET_ID, COMPOSITION_ID, SLIDE_EDITOR_ID, SlideEditor};
 use stagepack_studio::text_editing::{COULD_NOT_TYPE, EditingText};
-use stagepack_studio::workspace_view::{self, CLOSE_SAVE_ID, ExportPdf, STATUS_ID, WorkspaceView};
+use stagepack_studio::workspace_view::{self, CLOSE_SAVE_ID, ExportPdf, SAVE_AS_FOLDER_ID, STATUS_ID, WorkspaceView};
 
 /// Two slides, the first with a title and a line of words.
 const TWO: &str = "---\ntitle: T\n---\n\n# Hello\n\nSome words here\n\n---\n\n# Second\n";
@@ -1166,6 +1166,46 @@ fn an_export_while_typing_tidies_up_first(cx: &mut TestAppContext) {
     assert_eq!(typing.source(cx), EMPTY_BODY);
     cx.simulate_new_path_selection(|_| None);
     cx.run_until_parked();
+}
+
+/// Types two empty lines into `EMPTY_BODY`'s first body while a Save dialog is showing.
+fn type_empty_lines_while_the_dialog_is_up(cx: &mut TestAppContext, typing: &Typing) {
+    cx.run_until_parked();
+    assert!(cx.did_prompt_for_new_path(), "a Save dialog is showing");
+    let at = typing.placeholder_point(cx, "body");
+    typing.click(cx, at);
+    typing.press(cx, "enter");
+    typing.press(cx, "enter");
+    assert!(typing.source(cx).contains("&nbsp;"), "{}", typing.source(cx));
+}
+
+#[gpui_kit::test]
+fn typing_while_the_export_dialog_is_up_is_tidied_before_the_export(cx: &mut TestAppContext) {
+    let typing = open(cx, EMPTY_BODY);
+    cx.dispatch_action(typing.handle, ExportPdf);
+    type_empty_lines_while_the_dialog_is_up(cx, &typing);
+    let elsewhere = tempfile::tempdir().unwrap();
+    let out = elsewhere.path().join("exported.pdf");
+    let chosen = out.clone();
+    cx.simulate_new_path_selection(move |_| Some(chosen));
+    cx.run_until_parked();
+    assert_eq!(typing.source(cx), EMPTY_BODY);
+    assert!(out.exists());
+}
+
+#[gpui_kit::test]
+fn typing_while_the_save_as_dialog_is_up_is_tidied_before_saving(cx: &mut TestAppContext) {
+    let typing = open(cx, EMPTY_BODY);
+    typing.press(cx, "ctrl-shift-s");
+    typing.click_id(cx, SAVE_AS_FOLDER_ID);
+    type_empty_lines_while_the_dialog_is_up(cx, &typing);
+    let elsewhere = tempfile::tempdir().unwrap();
+    let out = elsewhere.path().join("copy");
+    let chosen = out.clone();
+    cx.simulate_new_path_selection(move |_| Some(chosen));
+    cx.run_until_parked();
+    assert_eq!(typing.source(cx), EMPTY_BODY);
+    assert_eq!(std::fs::read_to_string(out.join("slides.md")).unwrap(), EMPTY_BODY);
 }
 
 #[gpui_kit::test]

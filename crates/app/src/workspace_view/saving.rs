@@ -193,6 +193,8 @@ impl WorkspaceView {
                 _ => return,
             };
             this.update(cx, |this, cx| {
+                // Typing may have gone on while the dialog was up.
+                this.settle_typing(cx);
                 let Some(document) = this.document.clone() else {
                     return;
                 };
