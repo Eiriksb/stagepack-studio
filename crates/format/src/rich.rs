@@ -56,6 +56,7 @@ const TABLE: &str = "Tables can't be edited on the slide yet.";
 const CODE: &str = "Code can't be edited on the slide yet.";
 const QUOTE: &str = "Quotes can't be edited on the slide yet.";
 const PICTURE: &str = "Pictures can't be edited on the slide yet.";
+const ICON: &str = "Icons can't be edited on the slide yet.";
 const MIXED: &str = "Text with a component or picture in it can't be edited on the slide yet.";
 const IN_A_COMPONENT: &str = "Text inside a component can't be edited on the slide yet.";
 const STYLED_BLOCK: &str = "Text styled as a whole block can't be edited on the slide yet.";
@@ -294,6 +295,8 @@ fn reason_in(block: &Block, at: usize) -> Option<&'static str> {
             let positioned = is_positioned(tag);
             let fallback = match tag.name.as_str() {
                 "Text" if !positioned => STYLED_BLOCK,
+                "Picture" => PICTURE,
+                "Icon" => ICON,
                 name if positioned && TEXT_BOXES.contains(&name) => BOX_WITH_MORE,
                 _ => IN_A_COMPONENT,
             };

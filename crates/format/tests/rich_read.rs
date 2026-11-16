@@ -246,6 +246,16 @@ fn a_list_with_a_component_in_an_item_is_in_no_flow() {
 }
 
 #[test]
+fn a_picture_or_an_icon_placed_on_the_slide_is_named_as_one() {
+    // Seen in the real window: clicking a placed picture said "Text inside a component".
+    let source = "# T\n\n<Picture src=\"a.png\" x=\"10\" y=\"10\" w=\"100\" h=\"100\" />\n\n<Icon name=\"arrow-right\" x=\"200\" y=\"10\" size=\"96\" />\n";
+    let talk = parse_talk(source);
+    let at = |word: &str| source.find(word).unwrap();
+    assert_eq!(uneditable_reason(&talk, 0, at("Picture")), Some("Pictures can't be edited on the slide yet."));
+    assert_eq!(uneditable_reason(&talk, 0, at("Icon")), Some("Icons can't be edited on the slide yet."));
+}
+
+#[test]
 fn uneditable_reason_names_tables_code_and_quotes() {
     let source = "# T\n\n| a | b |\n| - | - |\n| 1 | 2 |\n\n```\nlet x = 1;\n```\n\n> A quote\n\nWords.\n";
     let talk = parse_talk(source);
