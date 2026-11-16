@@ -18,6 +18,7 @@ use stagepack_studio::insert_tools::{INSERT_ICON_ID, INSERT_SHAPES_ID, shape_id}
 use stagepack_studio::inspector::field_id;
 use stagepack_studio::ribbon::TAB_INSERT_ID;
 use stagepack_studio::slide_editor::NEW_BOX_ID;
+use stagepack_studio::slide_strip::strip_row_id;
 
 const TALK: &str = "---\ntitle: T\n---\n\n# One\n\nSome words\n\n---\n\n# Two\n";
 /// Where the first slide's content ends, and where what's inserted on it goes.
@@ -229,6 +230,20 @@ fn a_click_inserts_that_icon_selected(cx: &mut TestAppContext) {
     open_picker(&typing, cx);
     assert_eq!(picker.read_with(cx, |picker, cx| picker.query(cx)), "");
     assert_eq!(picker.read_with(cx, |picker, _| picker.matches().len()), 2776);
+}
+
+#[gpui_kit::test]
+fn an_icon_put_on_the_slide_from_the_list_of_slides_is_taken_away_by_delete(cx: &mut TestAppContext) {
+    // Seen in the window: with the keyboard in the list of slides, a thing put on the slide
+    // didn't have it, so Delete did nothing.
+    let typing = open(cx, TALK);
+    click_on(&typing, cx, strip_row_id(0));
+    open_picker(&typing, cx);
+    typing.type_text(cx, "star");
+    click_on(&typing, cx, icon_id("star"));
+    assert_eq!(typing.source(cx), with_inserted(&icon_line("star")));
+    typing.press(cx, "delete");
+    assert_eq!(typing.source(cx), TALK, "Delete takes it away");
 }
 
 #[gpui_kit::test]

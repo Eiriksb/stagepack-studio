@@ -28,6 +28,7 @@ use stagepack_studio::palette::{
 };
 use stagepack_studio::permissions::BuildPermissions;
 use stagepack_studio::ribbon::{MORE_RIGHT_ID, TAB_INSERT_ID};
+use stagepack_studio::slide_strip::strip_row_id;
 use stagepack_studio::workspace_view::{self, WorkspaceView};
 use toolkit::{ComponentSchema, PropField, PropKind, Theme};
 
@@ -345,6 +346,18 @@ fn inserting_a_chart_draws_bars_at_once(cx: &mut TestAppContext) {
     assert_eq!(undo, Some("Insert component"));
     typing.press(cx, "ctrl-z");
     assert_eq!(typing.source(cx), SHOW, "one step");
+}
+
+#[gpui_kit::test]
+fn a_chart_put_on_the_slide_from_the_list_of_slides_is_taken_away_by_delete(cx: &mut TestAppContext) {
+    // Seen in the window: with the keyboard in the list of slides, a thing put on the slide
+    // didn't have it, and Delete took the whole slide away.
+    let typing = open_folder(cx, show_talk(), None);
+    click_on(&typing, cx, strip_row_id(0));
+    insert(&typing, cx, "Chart");
+    assert_ne!(typing.source(cx), SHOW, "the chart is on the slide");
+    typing.press(cx, "delete");
+    assert_eq!(typing.source(cx), SHOW, "Delete takes the chart away, and only it");
 }
 
 #[gpui_kit::test]

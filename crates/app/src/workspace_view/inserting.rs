@@ -20,7 +20,7 @@ const PASTED_PICTURE: &str = "pasted-picture.png";
 
 impl WorkspaceView {
     /// Asks for pictures in the system's dialog, and puts each on the slide.
-    pub(super) fn ask_for_pictures(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn ask_for_pictures(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.document.is_none() {
             return;
         }
@@ -30,10 +30,14 @@ impl WorkspaceView {
             multiple: true,
             prompt: Some("Insert".into()),
         });
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             match chosen.await {
                 Ok(Ok(Some(paths))) => {
-                    this.update(cx, |this, cx| this.chosen_pictures(paths, cx)).ok();
+                    this.update_in(cx, |this, window, cx| {
+                        this.chosen_pictures(paths, cx);
+                        this.keyboard_to_the_slide(window, cx);
+                    })
+                    .ok();
                 }
                 Ok(Err(_)) => {
                     this.update(cx, |this, cx| this.say(DIALOG_FAILED, cx)).ok();
@@ -113,6 +117,20 @@ impl WorkspaceView {
         );
         if let Some(why) = not_a_file {
             self.say(not_added(why, dropped), cx);
+        }
+    }
+
+    /// Gives the slide the keyboard once a thing just put on it is selected there, from
+    /// wherever it was, so that the next keys type in it or take it away. Left in the list of
+    /// slides, Delete would take the whole slide away.
+    pub(super) fn keyboard_to_the_slide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let selected_here = self.document.as_ref().is_some_and(|document| {
+            let document = document.read(cx);
+            document.selected().is_some_and(|selected| selected.slide == document.current())
+        });
+        if selected_here {
+            let slide = self.slide_editor.read(cx).focus_handle().clone();
+            slide.focus(window, cx);
         }
     }
 

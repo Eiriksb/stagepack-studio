@@ -294,7 +294,8 @@ impl WorkspaceView {
             if typing && document.read(cx).new_box().is_none() {
                 return self.say(clipboard::NOT_INTO_TEXT, cx);
             }
-            return self.paste_element(carried, cx);
+            self.paste_element(carried, cx);
+            return self.keyboard_to_the_slide(window, cx);
         }
         let thing_first = if typing {
             !item.as_ref().is_some_and(clipboard_tools::holds_text)
@@ -305,7 +306,8 @@ impl WorkspaceView {
             if typing {
                 self.edit(Document::end_text, cx);
             }
-            return self.paste_thing(thing, cx);
+            self.paste_thing(thing, cx);
+            return self.keyboard_to_the_slide(window, cx);
         }
         if typing {
             // From a text tool that has the keyboard: it goes back to the text, as after any tool.

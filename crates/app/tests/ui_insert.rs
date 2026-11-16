@@ -25,7 +25,7 @@ use stagepack_studio::ribbon::{MORE_RIGHT_ID, RIBBON_ID, TAB_HOME_ID, TAB_INSERT
 use stagepack_studio::text_tools::{ALIGN_CENTER_ID, BOLD_ID, BULLETS_ID, NUMBERING_ID};
 use stagepack_studio::inspector::{INSPECTOR_HEADING_ID, INSPECTOR_MESSAGE_ID};
 use stagepack_studio::slide_editor::{NEW_BOX_ID, SlideEditor};
-use stagepack_studio::slide_strip::STRIP_ID;
+use stagepack_studio::slide_strip::{STRIP_ID, strip_row_id};
 use stagepack_studio::workspace_view::{DIALOG_FAILED, ExportPdf, ONLY_THE_FIRST, RECOVER_ID};
 use toolkit::ShapeKind;
 
@@ -444,6 +444,52 @@ fn typing_on_a_selected_shape_puts_words_in_it(cx: &mut TestAppContext) {
     assert_eq!(typing.source(cx), with_inserted(&shape.replace(">\n\nHi\n\n</Shape>", " />")));
     typing.press(cx, "ctrl-z");
     assert_eq!(typing.source(cx), TALK);
+}
+
+/// Gives the list of slides the keyboard, as a click on a slide in it does.
+fn keyboard_to_the_slide_list(typing: &Typing, cx: &mut TestAppContext) {
+    click_on(typing, cx, strip_row_id(0));
+    let list_has_it = typing.with_window(cx, |window, cx| {
+        let view = typing.view.clone();
+        view.read(cx).slide_strip().read(cx).focus_handle().contains_focused(window, cx)
+    });
+    assert!(list_has_it, "the list of slides has the keyboard");
+}
+
+#[gpui_kit::test]
+fn a_shape_put_on_the_slide_from_the_list_of_slides_takes_the_typing(cx: &mut TestAppContext) {
+    // Seen in the window: with the keyboard in the list of slides, a shape put on the slide
+    // took none of the letters typed next, and Delete didn't take it away.
+    let typing = open(cx, TALK);
+    keyboard_to_the_slide_list(&typing, cx);
+    insert_shape(&typing, cx, "rect");
+    typing.type_text(cx, "Hi");
+    let shape = "<Shape kind=\"rect\" fill=\"#2563eb\" x=\"720\" y=\"380\" w=\"480\" h=\"320\">\n\nHi\n\n</Shape>";
+    assert_eq!(typing.source(cx), with_inserted(shape));
+}
+
+#[gpui_kit::test]
+fn a_picture_dropped_while_the_list_of_slides_has_the_keyboard_is_taken_away_by_delete(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    keyboard_to_the_slide_list(&typing, cx);
+    let dir = tempfile::tempdir().unwrap();
+    let red = outside_file(&dir, "red.png", &png(100, 100, [255, 0, 0, 255]));
+    let middle = typing.at(cx, 960., 540.);
+    drop_at(&typing, cx, &[red], middle);
+    assert_ne!(typing.source(cx), TALK, "the picture is on the slide");
+    typing.press(cx, "delete");
+    assert_eq!(typing.source(cx), TALK, "Delete takes it away");
+}
+
+#[gpui_kit::test]
+fn a_picture_pasted_from_the_list_of_slides_is_taken_away_by_delete(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    keyboard_to_the_slide_list(&typing, cx);
+    put_on_clipboard(cx, vec![picture_entry(png(100, 100, [255, 0, 0, 255]))]);
+    click_on(&typing, cx, PASTE_ID);
+    assert_ne!(typing.source(cx), TALK, "the picture is on the slide");
+    typing.press(cx, "delete");
+    assert_eq!(typing.source(cx), TALK, "Delete takes it away");
 }
 
 #[gpui_kit::test]

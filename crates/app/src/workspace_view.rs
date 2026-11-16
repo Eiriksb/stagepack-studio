@@ -449,18 +449,23 @@ impl WorkspaceView {
         // Typing in the picker's search leaves a text box waiting for its first character as it is.
         let search_focus = icon_picker.read(cx).search_focus(cx);
         slide_editor.update(cx, |editor, cx| editor.keep_typing_with(search_focus, window, cx));
-        let icon_picked = cx.subscribe(&icon_picker, |this, _, picked: &IconPicked, cx| this.insert_icon(picked.0, cx));
+        let icon_picked = cx.subscribe_in(&icon_picker, window, |this, _, picked: &IconPicked, window, cx| {
+            this.insert_icon(picked.0, cx);
+            this.keyboard_to_the_slide(window, cx);
+        });
         let ribbon = cx.new(|cx| {
             Ribbon::new(document.clone(), clipboard_tools.clone(), text_tools, icon_picker, panels, cx)
         });
         let table_grid = ribbon.read(cx).table_grid().clone();
-        let table_picked = cx.subscribe(&table_grid, |this, _, picked: &InsertTable, cx| {
+        let table_picked = cx.subscribe_in(&table_grid, window, |this, _, picked: &InsertTable, window, cx| {
             let InsertTable { columns, rows } = *picked;
             this.edit(|document| document.insert_table(columns, rows), cx);
+            this.keyboard_to_the_slide(window, cx);
         });
         let component_list = ribbon.read(cx).component_list().clone();
-        let component_picked = cx.subscribe(&component_list, |this, _, picked: &InsertComponent, cx| {
+        let component_picked = cx.subscribe_in(&component_list, window, |this, _, picked: &InsertComponent, window, cx| {
             this.edit(|document| document.insert_component(&picked.0), cx);
+            this.keyboard_to_the_slide(window, cx);
         });
         let slide_strip = cx.new(|cx| SlideStrip::new(document.clone(), cx));
         let notes_panel = cx.new(|cx| NotesPanel::new(document.clone(), window, cx));
@@ -1290,8 +1295,9 @@ impl Render for WorkspaceView {
                 focus_handle.focus(window, cx)
             })
             // Pictures dropped on it from outside the app go on the slide.
-            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
-                this.dropped(paths.paths().to_vec(), cx)
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.dropped(paths.paths().to_vec(), cx);
+                this.keyboard_to_the_slide(window, cx);
             }));
         v_flex()
             .key_context(KEY_CONTEXT)
@@ -1338,9 +1344,10 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &PasteFromClipboard, window, cx| {
                 this.clipboard(ClipboardOp::Paste, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &InsertPicture, _, cx| this.ask_for_pictures(cx)))
-            .on_action(cx.listener(|this, action: &InsertShape, _, cx| {
-                this.insert_shape(action.kind, cx)
+            .on_action(cx.listener(|this, _: &InsertPicture, window, cx| this.ask_for_pictures(window, cx)))
+            .on_action(cx.listener(|this, action: &InsertShape, window, cx| {
+                this.insert_shape(action.kind, cx);
+                this.keyboard_to_the_slide(window, cx);
             }))
             .on_action(cx.listener(|this, _: &InsertTextBox, _, cx| this.insert_text_box(cx)))
             .on_action(cx.listener(|this, _: &TableRowAbove, _, cx| this.edit(|document| document.add_row(false), cx)))
