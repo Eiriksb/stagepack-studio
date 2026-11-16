@@ -322,6 +322,49 @@ fn a_paste_into_an_empty_region_fills_it(cx: &mut TestAppContext) {
     assert_eq!(talk.source(cx), "# Only a title\n");
 }
 
+/// Clicks the middle of region `region`'s placeholder on the first slide.
+fn click_placeholder(talk: &Talk, cx: &mut TestAppContext, region: &str) {
+    let document = talk.document(cx);
+    let (rect, _) = cx
+        .update(|cx| document.update(cx, |document, _| document.text_layout(0)))
+        .placeholder(region)
+        .expect("the region is empty");
+    let at = talk.slide_point(cx, rect.x + rect.w / 2., rect.y + rect.h / 2.);
+    talk.click_at(cx, at);
+}
+
+#[gpui_kit::test]
+fn a_heading_pasted_outside_a_title_takes_the_kind_of_where_it_goes(cx: &mut TestAppContext) {
+    let copied = |text: &str| Para { kind: ParaKind::Heading(1), spans: vec![Span { text: text.into(), style: Style::default() }] };
+    let body = |text: &str| Para { kind: ParaKind::Body, spans: vec![Span { text: text.into(), style: Style::default() }] };
+    let paste = |cx: &mut TestAppContext, talk: &Talk, paras: &[Para]| {
+        let entry = text_entry(paras);
+        put(cx, &entry.text, entry.metadata.as_deref());
+        talk.press(cx, "ctrl-v");
+        assert_eq!(talk.status(cx), None, "nothing is refused");
+    };
+    // Into the empty body of a slide with a title, and of one without, alone or with more.
+    for source in ["# Only a title\n", "---\nlayout: content\n---\n"] {
+        let talk = open(cx, source);
+        click_placeholder(&talk, cx, "body");
+        paste(cx, &talk, &[copied("Copied title")]);
+        let flows = talk.flows(cx, 0);
+        assert_eq!(flows.last().unwrap().paras, [body("Copied title")], "{:?}", talk.source(cx));
+        assert_eq!(flows.len(), if source.starts_with('#') { 2 } else { 1 }, "no title is made: {:?}", talk.source(cx));
+        talk.press(cx, "ctrl-z");
+        assert_eq!(talk.source(cx), source);
+        click_placeholder(&talk, cx, "body");
+        paste(cx, &talk, &[copied("Copied title"), body("and words")]);
+        assert_eq!(talk.flows(cx, 0).last().unwrap().paras, [body("Copied title"), body("and words")]);
+    }
+    // Into an empty list item, as an item.
+    let talk = open(cx, "# T\n\n- a\n-\n");
+    talk.click_text(cx, 1, pos(1, 0));
+    paste(cx, &talk, &[copied("Copied title")]);
+    let item = |text: &str| Para { kind: ParaKind::Bullet { level: 0 }, spans: vec![Span { text: text.into(), style: Style::default() }] };
+    assert_eq!(talk.flows(cx, 0)[1].paras, [item("a"), item("Copied title")]);
+}
+
 #[gpui_kit::test]
 fn cut_removes_and_copies(cx: &mut TestAppContext) {
     let talk = open(cx, TWO);

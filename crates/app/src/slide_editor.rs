@@ -412,7 +412,8 @@ impl SlideEditor {
 
     /// Puts what's on the clipboard in place of the selection, as one step to undo: the styled
     /// text the app copied, or else plain text, a paragraph to a line, in the style at the
-    /// caret. In a title, which is one paragraph, the paragraphs are joined by line breaks.
+    /// caret. In a title, which is one paragraph, the paragraphs are joined by line breaks;
+    /// anywhere else, a heading takes the kind of the paragraph it's pasted into.
     fn paste_text(&mut self, cx: &mut Context<Self>) {
         self.drop_composing(cx);
         let Some(editing) = self.editing(cx) else {
@@ -446,7 +447,15 @@ impl SlideEditor {
             TextPaste::Styled(paras) => {
                 let paras = match kind {
                     Some(kind) if title => vec![one_paragraph(paras, kind)],
-                    _ => paras,
+                    // Outside a title, a heading would be a second title, or a heading where
+                    // there was none: it takes the kind of the paragraph it goes into.
+                    _ => paras
+                        .into_iter()
+                        .map(|para| match para.kind {
+                            ParaKind::Heading(_) => Para { kind: kind.unwrap_or(ParaKind::Body), ..para },
+                            _ => para,
+                        })
+                        .collect(),
                 };
                 self.run(|document| document.paste_text(|edit| edit.paste(&paras)), cx);
             }
