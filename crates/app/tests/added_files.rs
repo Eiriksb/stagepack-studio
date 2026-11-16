@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use proptest::prelude::*;
 use slides_engine::{FolderFiles, Fonts, TalkFiles};
 use slides_format::{Change, SourceEdit, parse_talk};
-use stagepack_studio::added_files::{FileKind, KEPT_FILE_RENAMED, MAX_ADDED_BYTES, NotAdded, picture_bytes, safe_name, talk_uses};
+use stagepack_studio::added_files::{FileKind, KEPT_FILE_CLASH, MAX_ADDED_BYTES, NotAdded, picture_bytes, safe_name, talk_uses};
 use stagepack_studio::document::Document;
 
 const ONE: &str = "---\ntitle: T\n---\n\n# One\n";
@@ -509,24 +509,92 @@ fn an_added_file_the_text_uses_is_an_unsaved_change() {
     assert!(!doc.has_unsaved_changes());
 }
 
-#[test]
-fn a_kept_file_whose_name_is_taken_comes_back_under_another() {
-    let (_dir, folder, mut doc) = talk();
+/// Whether the current slide shows something of the colour `rgb`.
+fn shows(doc: &mut Document, rgb: [u8; 3]) -> bool {
+    let index = doc.current();
+    let thumbnail = doc.thumbnail(index, 480).expect("the slide draws");
+    let near = |a: u8, b: u8| a.abs_diff(b) < 40;
+    thumbnail.data().chunks(4).any(|pixel| near(pixel[0], rgb[0]) && near(pixel[1], rgb[1]) && near(pixel[2], rgb[2]))
+}
+
+const BLUE: [u8; 4] = [0, 0, 255, 255];
+
+/// What the window brought back last time: the picture red, in every way a slide names a file,
+/// and once in words.
+fn recovered_text() -> String {
+    format!(
+        "{ONE}\n![](assets/photo.png)\n\n<Picture src=\"./assets/photo.png\" w=\"100\" />\n\nSays assets/photo.png in words.\n"
+    )
+}
+
+/// A talk whose folder holds a blue `assets/photo.png`, and `others` beside it.
+fn talk_with_their_photo(others: &[(&str, Vec<u8>)]) -> (tempfile::TempDir, PathBuf, Document) {
+    let (dir, folder, doc) = talk();
     std::fs::create_dir(folder.join("assets")).unwrap();
-    let theirs = png([0, 0, 255, 255]);
-    std::fs::write(folder.join("assets/photo.png"), &theirs).unwrap();
+    std::fs::write(folder.join("assets/photo.png"), png(BLUE)).unwrap();
+    for (name, bytes) in others {
+        std::fs::write(folder.join(name), bytes).unwrap();
+    }
+    (dir, folder, doc)
+}
 
-    // The same bytes are the file the talk has: nothing to say.
-    doc.bring_back_files(vec![("assets/photo.png".to_string(), theirs.into())]);
+#[test]
+fn a_recovered_picture_whose_name_was_taken_is_still_the_one_shown() {
+    let (_dir, folder, mut doc) = talk_with_their_photo(&[]);
+    doc.recover_with_files(recovered_text(), vec![("assets/photo.png".to_string(), red_png().into())]).unwrap();
+
+    let expected = format!(
+        "{ONE}\n![](assets/photo-2.png)\n\n<Picture src=\"assets/photo-2.png\" w=\"100\" />\n\nSays assets/photo.png in words.\n"
+    );
+    assert_eq!(doc.source(), expected);
+    assert_eq!(doc.take_message(), None, "nothing went wrong");
+    assert!(draws_red(&mut doc));
+    assert!(!shows(&mut doc, [0, 0, 255]), "not theirs");
+    // One step, as any recovery.
+    assert_eq!(doc.undo_label(), Some("Recover changes"));
+
+    save(&mut doc);
+    assert_eq!(std::fs::read(folder.join("assets/photo-2.png")).unwrap(), red_png());
+    assert_eq!(std::fs::read(folder.join("assets/photo.png")).unwrap(), png(BLUE), "theirs is as it was");
+    assert_eq!(std::fs::read_to_string(folder.join("slides.md")).unwrap(), expected);
+    let mut fresh = Document::open(&folder, Fonts::bundled_only()).unwrap();
+    assert!(draws_red(&mut fresh));
+}
+
+#[test]
+fn a_recovered_picture_the_talk_has_under_another_name_is_named_so() {
+    let (_dir, folder, mut doc) = talk_with_their_photo(&[("assets/red.png", red_png())]);
+    doc.recover_with_files(recovered_text(), vec![("assets/photo.png".to_string(), red_png().into())]).unwrap();
+
+    let expected =
+        format!("{ONE}\n![](assets/red.png)\n\n<Picture src=\"assets/red.png\" w=\"100\" />\n\nSays assets/photo.png in words.\n");
+    assert_eq!(doc.source(), expected);
     assert_eq!(doc.take_message(), None);
-    assert!(doc.added_files().is_empty());
+    assert!(draws_red(&mut doc));
+    assert!(!shows(&mut doc, [0, 0, 255]));
     assert!(!doc.has_file("assets/photo-2.png"));
+    save(&mut doc);
+    assert_eq!(std::fs::read_to_string(folder.join("slides.md")).unwrap(), expected);
+    assert_eq!(std::fs::read(folder.join("assets/photo.png")).unwrap(), png(BLUE));
+    assert_eq!(names_under(&folder), ["assets/photo.png", "assets/red.png", "slides.md"]);
+}
 
-    doc.bring_back_files(vec![("assets/photo.png".to_string(), red_png().into())]);
-    assert_eq!(doc.take_message().as_deref(), Some(KEPT_FILE_RENAMED));
-    assert!(doc.has_file("assets/photo-2.png"));
-    assert_eq!(files_of(&doc).read("assets/photo-2.png"), Some(red_png()));
-    assert_eq!(files_of(&doc).read("assets/photo.png"), Some(png([0, 0, 255, 255])), "theirs is as it was");
+#[test]
+fn a_recovered_use_that_cannot_be_rewritten_leaves_the_text_and_says_so() {
+    let (_dir, _folder, mut doc) = talk_with_their_photo(&[("assets/sky.png", png([0, 200, 0, 255]))]);
+    // Written with an escape, which can't be replaced byte for byte as it reads.
+    let text = format!("{ONE}\n![](assets\\/photo.png)\n\n![](assets/sky.png)\n");
+    let files = vec![
+        ("assets/photo.png".to_string(), red_png().into()),
+        ("assets/sky.png".to_string(), png([0, 0, 200, 255]).into()),
+    ];
+    doc.recover_with_files(text.clone(), files).unwrap();
+
+    assert_eq!(doc.source(), text, "left as it was");
+    assert_eq!(doc.take_message().as_deref(), Some(KEPT_FILE_CLASH), "one sentence for both");
+    assert_eq!(doc.take_message(), None);
+    assert!(doc.has_file("assets/photo-2.png"), "kept, under its numbered name");
+    assert!(doc.has_file("assets/sky-2.png"));
 }
 
 #[cfg(unix)]
@@ -552,4 +620,34 @@ fn only_the_files_the_text_uses_are_saved() {
     save(&mut doc);
     assert_eq!(names_under(&folder), ["assets/used.png", "slides.md"]);
     assert!(doc.added_files().is_empty(), "saved, so no longer pending");
+}
+
+#[test]
+fn whether_there_are_files_to_save_is_worked_out_once_per_change() {
+    let named = format!("{ONE}\n![](assets/a.png)\n\n![](assets/b.png)\n\n![](assets/c.png)\n");
+    let (_dir, _folder, mut doc) = talk_with(&named);
+    for (name, shade) in [("a", 1), ("b", 2), ("c", 3)] {
+        doc.add_file(FileKind::Picture, name, png([shade, 0, 0, 255])).unwrap();
+    }
+    assert!(doc.has_unsaved_changes());
+    let walked = doc.files_to_save_walks();
+    for _ in 0..100 {
+        assert!(doc.has_unsaved_changes());
+    }
+    assert_eq!(doc.files_to_save_walks(), walked, "asking again walks nothing");
+
+    // An edit and its undo: the text is as it's saved, so only the files are left to ask about.
+    show(&mut doc, "assets/a.png");
+    doc.undo().unwrap();
+    assert!(doc.has_unsaved_changes());
+    assert_eq!(doc.files_to_save_walks(), walked + 1, "once after the edit");
+    for _ in 0..100 {
+        assert!(doc.has_unsaved_changes());
+    }
+    assert_eq!(doc.files_to_save_walks(), walked + 1);
+    doc.add_file(FileKind::Picture, "d", png([4, 0, 0, 255])).unwrap();
+    assert!(doc.has_unsaved_changes());
+    assert_eq!(doc.files_to_save_walks(), walked + 2, "and once after a file is added");
+    save(&mut doc);
+    assert!(!doc.has_unsaved_changes());
 }

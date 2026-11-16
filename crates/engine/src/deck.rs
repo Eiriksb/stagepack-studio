@@ -378,6 +378,13 @@ impl Deck {
         self.slides_holding_pictures.clear();
     }
 
+    /// Changes whenever any slide's text does, or how it's drawn: a slide's text changing always
+    /// gives it a new version. For telling cheaply whether anything worked out from the text is
+    /// still right.
+    pub fn text_version(&self) -> u64 {
+        self.versions_made
+    }
+
     /// Takes in that files have been added to the talk's files, and returns the slides to show
     /// again: all of them, as any could name one, and a picture that wasn't there leaves no trace
     /// to find it by. Its components are looked at again too. Pictures read already are kept.

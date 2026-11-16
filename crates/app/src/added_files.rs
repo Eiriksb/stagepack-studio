@@ -10,7 +10,7 @@ use std::path::Path;
 
 use slides_components::{BuildIndex, INDEX_FILE};
 use slides_engine::{MAX_INDEX_BYTES, MAX_SOURCE_BYTES, PictureFormat, TalkFiles, normalise, picture_as_png, picture_format};
-use slides_format::{Block, Talk};
+use slides_format::{Block, Change, SourceEdit, Talk, parse_talk, set_tag_attr};
 
 /// The largest file that can be added to a talk.
 pub const MAX_ADDED_BYTES: usize = 32 * 1024 * 1024;
@@ -24,12 +24,10 @@ const DEVICE_NAMES: [&str; 22] = [
     "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3",
     "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
 ];
-/// What the window says when a file kept from last time is brought back under another name.
-pub const KEPT_FILE_RENAMED: &str =
-    "A file kept from last time has the same name as a different one in the talk, so it was brought back under another name.";
-/// What the window says when a file kept from last time couldn't be brought back.
-pub const KEPT_FILE_LEFT_OUT: &str =
-    "A file kept from last time has the same name as a different one in the talk, so it couldn't be brought back.";
+/// What the window says when a file kept from last time has the name of a different one the talk
+/// has now, and the text brought back couldn't be made to name the kept one instead.
+pub const KEPT_FILE_CLASH: &str =
+    "A file kept from last time has the same name as a different one in the talk, so a slide may show the talk's own instead.";
 /// What a WebAssembly module starts with.
 const WASM_MAGIC: &[u8] = b"\0asm";
 
@@ -377,4 +375,88 @@ pub(crate) fn read_outside(path: &Path) -> Result<Vec<u8>, NotAdded> {
         return Err(NotAdded::TooLarge);
     }
     Ok(bytes)
+}
+
+/// Every file name the talk's slides write where a file is named, as written, in order: the
+/// source of each picture and the value of each attribute of each tag, at any depth.
+fn written_names(talk: &Talk) -> Vec<&str> {
+    let mut names = Vec::new();
+    for slide in &talk.slides {
+        let mut blocks: Vec<&Block> = slide.blocks.iter().rev().collect();
+        while let Some(block) = blocks.pop() {
+            match block {
+                Block::Picture { src, .. } => names.push(src.as_str()),
+                Block::List { items, .. } => blocks.extend(items.iter().flatten().rev()),
+                Block::Tag(tag) => {
+                    names.extend(tag.attrs.iter().map(|attr| attr.value.as_str()));
+                    blocks.extend(tag.children.iter().rev());
+                }
+                _ => {}
+            }
+        }
+    }
+    names
+}
+
+/// The edit that makes the first use of a renamed file in `talk` name its new path, as
+/// `renamed_to` gives it for what's written: `Some(None)` if there's none left, and `None` if
+/// that use can't be rewritten exactly.
+fn rename_first_use(talk: &Talk, renamed_to: &dyn Fn(&str) -> Option<String>) -> Option<Option<Change>> {
+    for (index, slide) in talk.slides.iter().enumerate() {
+        let mut blocks: Vec<&Block> = slide.blocks.iter().rev().collect();
+        while let Some(block) = blocks.pop() {
+            match block {
+                Block::Picture { src, range, .. } => {
+                    let Some(to) = renamed_to(src) else { continue };
+                    // The source's own bytes, as written: just after `(` or `(<`.
+                    let written = talk.source.get(range.clone())?;
+                    let mut at = written.match_indices(src.as_str()).map(|(at, _)| at).filter(|&at| {
+                        let before = &written[..at];
+                        before.ends_with("](") || before.ends_with("](<")
+                    });
+                    let (Some(at), None) = (at.next(), at.next()) else {
+                        return None;
+                    };
+                    let start = range.start + at;
+                    return Some(Some(Change::single(SourceEdit { range: start..start + src.len(), text: to })));
+                }
+                Block::List { items, .. } => blocks.extend(items.iter().flatten().rev()),
+                Block::Tag(tag) => {
+                    if let Some((attr, to)) = tag.attrs.iter().find_map(|attr| Some((attr, renamed_to(&attr.value)?))) {
+                        return Some(Some(set_tag_attr(talk, index, &tag.range, &attr.name, Some(&to))?));
+                    }
+                    blocks.extend(tag.children.iter().rev());
+                }
+                _ => {}
+            }
+        }
+    }
+    Some(None)
+}
+
+/// `text` with every use of a file that `renames` gives a new path, `(from, to)`, naming `to`
+/// instead: each picture's source and attribute of a tag that names `from`, however it's
+/// written, rewritten in place and nothing else. Words that only mention it are left. `None`
+/// if any use can't be rewritten exactly, so that the text stays whole as it was.
+pub(crate) fn rename_uses(text: &str, renames: &[(String, String)]) -> Option<String> {
+    let renamed_to = |written: &str| {
+        let path = normalise(written)?;
+        renames.iter().find(|(from, _)| *from == path).map(|(_, to)| to.clone())
+    };
+    let before = parse_talk(text);
+    let expected: Vec<String> = written_names(&before).into_iter().map(|name| renamed_to(name).unwrap_or_else(|| name.to_string())).collect();
+    let mut text = text.to_string();
+    // Each edit takes one use away, so there are at most as many as there are names written.
+    for _ in 0..=expected.len() {
+        let talk = parse_talk(&text);
+        match rename_first_use(&talk, &renamed_to)? {
+            Some(change) => text = change.apply(&text),
+            None => {
+                let after: Vec<&str> = written_names(&talk);
+                let same_slides = talk.slides.len() == before.slides.len();
+                return (same_slides && after == expected).then_some(text);
+            }
+        }
+    }
+    None
 }

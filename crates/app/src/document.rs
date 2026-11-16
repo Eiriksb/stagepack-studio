@@ -31,6 +31,8 @@ use crate::text_editing::{
 };
 
 pub(crate) const SLIDES_FILE: &str = "slides.md";
+/// What tells one state of the talk's text and its added files from another.
+type FilesKey = (u64, usize, u64, usize);
 const FONTS_FOLDER: &str = "assets/fonts";
 
 /// The most bytes of fonts a talk can bring. A small packed file can unpack to far more than
@@ -295,6 +297,10 @@ pub struct Document {
     /// What the window should say about something that went wrong where nothing was refused
     /// to whoever asked, such as a tidy-up before a slide change, until it's taken.
     message: Option<String>,
+    /// Whether a save would write a file added to the talk, for the text, files added and files
+    /// still to save it was worked out for.
+    files_to_save: Cell<Option<(FilesKey, bool)>>,
+    files_to_save_walks: Cell<u64>,
 }
 
 impl Document {
@@ -385,6 +391,8 @@ impl Document {
             selected: None,
             next_session: 0,
             message: None,
+            files_to_save: Cell::new(None),
+            files_to_save_walks: Cell::new(0),
         })
     }
 
@@ -839,10 +847,29 @@ impl Document {
         !self.history.is_saved() || self.has_files_to_save()
     }
 
-    /// Whether a save would write a file added to the talk.
+    /// Whether a save would write a file added to the talk. Worked out once for each version of
+    /// the text and of the files added, as it's asked on every frame and keystroke.
     fn has_files_to_save(&self) -> bool {
+        if self.pending.is_empty() {
+            return false;
+        }
+        let key = (self.deck.text_version(), self.source().len(), self.added.stamp(), self.pending.len());
+        if let Some((known, answer)) = self.files_to_save.get()
+            && known == key
+        {
+            return answer;
+        }
+        self.files_to_save_walks.set(self.files_to_save_walks.get() + 1);
         let talk = self.talk();
-        self.pending.iter().any(|path| talk_uses(talk, &*self.files, path))
+        let answer = self.pending.iter().any(|path| talk_uses(talk, &*self.files, path));
+        self.files_to_save.set(Some((key, answer)));
+        answer
+    }
+
+    /// How many times whether there are files to save has been worked out, for its tests.
+    #[doc(hidden)]
+    pub fn files_to_save_walks(&self) -> u64 {
+        self.files_to_save_walks.get()
     }
 
     /// Takes `text`, the working copy of edits that weren't saved, as the talk's text, and
@@ -981,12 +1008,39 @@ impl Document {
         self.added.stamp()
     }
 
-    /// Takes back `files`, added to the talk before the app stopped and kept with its unsaved
-    /// changes, as added again, before the changes are brought back. One the talk has already is
-    /// left as it is. One whose name the talk now gives a different file comes back under
-    /// another name, and the window says so, as the text still names the talk's own; nothing in
-    /// the text is changed. One that isn't a name the app gives is left out.
-    pub fn bring_back_files(&mut self, files: Vec<(String, Arc<[u8]>)>) {
+    /// Takes `text`, the working copy of edits that weren't saved, as [`Self::recover`] does,
+    /// with `files`, the files added to the talk that were kept with it, as added again. One the
+    /// talk has already is left as it is, and one that isn't a name the app gives is left out.
+    ///
+    /// One whose name the talk now gives a different file comes back under another name, or is
+    /// the file the talk has with the same bytes, and every use of it in `text`, a picture's
+    /// source or a tag's attribute, is made to name that instead before it's taken: the slides
+    /// show what they showed. If one of those uses can't be rewritten exactly, or the file can't
+    /// be brought back at all, `text` is taken as it is, and the window says so, once.
+    pub fn recover_with_files(&mut self, text: String, files: Vec<(String, Arc<[u8]>)>) -> Result<Vec<usize>, EditRefused> {
+        let (renames, mut clashed) = self.bring_back_files(files);
+        let text = if renames.is_empty() {
+            text
+        } else {
+            match guarded(|| added_files::rename_uses(&text, &renames)).ok().flatten() {
+                Some(renamed) => renamed,
+                None => {
+                    clashed = true;
+                    text
+                }
+            }
+        };
+        if clashed {
+            self.message = Some(added_files::KEPT_FILE_CLASH.to_string());
+        }
+        self.recover(text)
+    }
+
+    /// Adds `files` back as [`Self::recover_with_files`] says, and gives the new path of each
+    /// that couldn't keep its own, `(old, new)`, and whether any couldn't be brought back.
+    fn bring_back_files(&mut self, files: Vec<(String, Arc<[u8]>)>) -> (Vec<(String, String)>, bool) {
+        let mut renames = Vec::new();
+        let mut left_out = false;
         let mut any = false;
         for (path, bytes) in files {
             let Some(kind) = added_files::kind_of_path(&path) else {
@@ -997,31 +1051,35 @@ impl Document {
                 continue;
             }
             let free = self.files.len(&path).is_none() && !self.on_disk(&path);
-            let path = if free {
+            let new = if free {
                 path
             } else {
                 let (_, name) = path.split_once('/').expect("a path from kind_of_path");
                 match added_files::place(&*self.files, kind, name, bytes.to_vec(), |path| self.on_disk(path)) {
-                    Ok(Placed::New(path, _)) => {
-                        self.message = Some(added_files::KEPT_FILE_RENAMED.to_string());
-                        path
+                    Ok(Placed::New(new, _)) => {
+                        renames.push((path, new.clone()));
+                        new
                     }
                     // The same bytes under another name already.
-                    Ok(Placed::There(_)) => continue,
+                    Ok(Placed::There(there)) => {
+                        renames.push((path, there));
+                        continue;
+                    }
                     Err(_) => {
-                        self.message = Some(added_files::KEPT_FILE_LEFT_OUT.to_string());
+                        left_out = true;
                         continue;
                     }
                 }
             };
-            if self.added.add(&path, bytes) {
-                self.pending.insert(path);
+            if self.added.add(&new, bytes) {
+                self.pending.insert(new);
                 any = true;
             }
         }
         if any {
             self.deck.files_added();
         }
+        (renames, left_out)
     }
 
     /// Whether anything is at `path` in a folder talk's folder, a link or a folder included,
