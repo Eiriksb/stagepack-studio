@@ -188,7 +188,8 @@ fn number_in(text: &str, whole: bool) -> Result<f64, &'static str> {
 /// isn't a number, or a fraction in a `whole` one, is refused, and nothing is stepped.
 pub fn stepped(text: &str, talk: &str, up: bool, whole: bool, range: Option<(f64, f64)>) -> Result<String, &'static str> {
     let from = if text.trim().is_empty() { talk } else { text };
-    let value = if from.trim().is_empty() { 0.0 } else { number_in(from, whole)? };
+    // In the rounded terms it's written in, so 1.1 steps down to 0.1.
+    let value = if from.trim().is_empty() { 0.0 } else { rounded(number_in(from, whole)?) };
     Ok(number_text(held(if up { value + 1.0 } else { value - 1.0 }, range)))
 }
 
@@ -199,9 +200,21 @@ fn held(value: f64, range: Option<(f64, f64)>) -> f64 {
     value.clamp(low, high)
 }
 
-/// `value` as it's written: as few digits as say it, and never `-0`.
+/// The most decimal places a number is written with.
+pub const DECIMALS: i32 = 4;
+
+/// `value` rounded to [`DECIMALS`] places, as it's written.
+pub fn rounded(value: f64) -> f64 {
+    let scale = 10f64.powi(DECIMALS);
+    let rounded = (value * scale).round() / scale;
+    // Never -0.
+    if rounded == 0.0 { 0.0 } else { rounded }
+}
+
+/// `value` as it's written: rounded to [`DECIMALS`] places, in as few digits as say that, with
+/// a dot, and never `-0`.
 pub fn number_text(value: f64) -> String {
-    if value == 0.0 { "0".to_string() } else { value.to_string() }
+    rounded(value).to_string()
 }
 
 /// The name of the file at `path` in the talk, without the folder it's kept in.
@@ -264,6 +277,30 @@ mod tests {
         assert_eq!(stepped("1,5", "", true, false, None), Ok("2.5".into()));
         assert_eq!(stepped("abc", "4", true, false, None), Err(NOT_A_NUMBER), "never from 0");
         assert_eq!(stepped("1,5", "", true, true, None), Err(NOT_WHOLE));
+    }
+
+    #[test]
+    fn a_number_is_written_with_at_most_four_places() {
+        assert_eq!(stepped("1.1", "", false, false, None), Ok("0.1".into()));
+        assert_eq!(stepped("0,3", "", true, false, None), Ok("1.3".into()));
+        assert_eq!(number_typed("0.123456", false, None, false), Typed::Write(Some("0.1235".into())));
+        assert_eq!(number_typed("2.50000", false, None, false), Typed::Write(Some("2.5".into())));
+        assert_eq!(number_typed("-0.00001", false, None, false), Typed::Write(Some("0".into())));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn what_is_written_reads_back_rounded_and_writes_the_same_again(value in -NUMBER_LIMIT..NUMBER_LIMIT, comma: bool) {
+            let typed = if comma { value.to_string().replace('.', ",") } else { value.to_string() };
+            let Typed::Write(Some(written)) = number_typed(&typed, false, None, false) else {
+                panic!("{typed} is a number");
+            };
+            proptest::prop_assert_eq!(written.parse::<f64>().unwrap(), rounded(value), "{} gave {}", typed, written);
+            proptest::prop_assert!(!written.contains(['e', ',']));
+            let decimals = written.split_once('.').map_or(0, |(_, places)| places.len());
+            proptest::prop_assert!(decimals <= 4, "{}", written);
+            proptest::prop_assert_eq!(number_typed(&written, false, None, false), Typed::Write(Some(written.clone())));
+        }
     }
 
     #[test]

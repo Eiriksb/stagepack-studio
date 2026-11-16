@@ -1250,6 +1250,11 @@ impl Document {
         }
     }
 
+    /// Changes whenever the talk's text does, however it changes.
+    pub fn text_version(&self) -> u64 {
+        self.deck.text_version()
+    }
+
     /// Changes each time a thing is selected or let go of, but not as the thing selected is
     /// followed through an edit: what's shown for one thing is never taken for another's.
     pub fn selection_pick(&self) -> u64 {

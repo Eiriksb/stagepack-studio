@@ -126,7 +126,9 @@ impl Talk {
         let document = self.document(cx);
         let layout = cx.update(|cx| document.update(cx, |document, _| document.text_layout(document.current())));
         let caret = layout.caret(flow, pos).expect("the place has a caret");
-        let (x, y) = caret.on_slide(caret.x, caret.top + caret.height / 2.);
+        // A hair inside the text, so that rounding at the slide's scale never puts the point
+        // just before where the text starts.
+        let (x, y) = caret.on_slide(caret.x + CARET_NUDGE, caret.top + caret.height / 2.);
         self.slide_point(cx, x, y)
     }
 
@@ -1273,3 +1275,7 @@ fn plain_text_pastes_as_one_slide_or_none_and_leaves_the_others_alone() {
             .unwrap();
     }
 }
+
+/// How far past the caret, in slide units, a click aimed at it lands: far less than a letter,
+/// but more than rounding to the window's pixels can take away.
+const CARET_NUDGE: f32 = 0.05;

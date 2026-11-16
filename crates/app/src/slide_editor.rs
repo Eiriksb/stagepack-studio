@@ -11,7 +11,7 @@
 
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -199,8 +199,6 @@ pub struct SlideEditor {
     dragging: bool,
     /// What the status line was told of the thing selected on the slide shown, if anything is.
     told: Option<SharedString>,
-    /// Where the last first press of a click was, and where the slide was then.
-    gesture: Option<Gesture>,
 
     /// Where the caret and any composition were last drawn, so that the system's input method
     /// is told when they move, and only then.
@@ -287,7 +285,6 @@ impl SlideEditor {
             wanted_x: None,
             dragging: false,
             told: None,
-            gesture: None,
             ime_place: None,
             _subscriptions: subscriptions,
         }
@@ -913,76 +910,29 @@ impl SlideEditor {
     /// Where `position`, in the window, is on the slide, in slide units, if it's on it.
     fn slide_point(&self, position: Point<Pixels>, cx: &App) -> Option<(f32, f32)> {
         let slide = self.canvas.read(cx).slide_bounds()?;
-        point_on(slide, position)
+        slide
+            .contains(&position)
+            .then(|| self.nearest_slide_point(position, cx))
+            .flatten()
     }
 
     /// The point of the slide nearest `position`, in the window, in slide units: `position`
     /// itself if it's on the slide, or else the nearest point of its edge.
     fn nearest_slide_point(&self, position: Point<Pixels>, cx: &App) -> Option<(f32, f32)> {
         let slide = self.canvas.read(cx).slide_bounds()?;
-        nearest_point_on(slide, position)
-    }
-
-    /// Where the press `event` is on the slide, in slide units, if it's on it. The second press
-    /// of a double click is where the first was on the slide as it was then: the first can
-    /// select a thing, which brings the inspector and moves the slide, but it's one gesture.
-    fn pressed_point(&mut self, event: &MouseDownEvent, cx: &App) -> Option<(f32, f32)> {
-        let now = self.canvas.read(cx).slide_bounds()?;
-        // The app's clock, which a test's runs as the test says.
-        let time = cx.background_executor().now();
-        let slide = match self.gesture.take() {
-            Some(Gesture { at, slide, when })
-                if event.click_count > 1 && (at - event.position).magnitude() <= GESTURE_SLACK && time.saturating_duration_since(when) <= GESTURE_TIME =>
-            {
-                slide
-            }
-            _ => now,
-        };
-        if event.click_count <= 1 {
-            self.gesture = Some(Gesture { at: event.position, slide: now, when: time });
+        let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
+        if unit <= 0.0 {
+            return None;
         }
-        point_on(slide, event.position)
+        let along = |at: Pixels, start: Pixels, length: Pixels| {
+            f32::from(at - start).clamp(0.0, f32::from(length)) / unit
+        };
+        Some((
+            along(position.x, slide.origin.x, slide.size.width),
+            along(position.y, slide.origin.y, slide.size.height),
+        ))
     }
-}
 
-/// How far, in pixels, the presses of a double click can be apart and still be taken for the
-/// same place on the slide.
-const GESTURE_SLACK: f64 = 8.0;
-
-/// How long after the first press of a double click the slide's place then still counts. No
-/// system's double click is slower.
-const GESTURE_TIME: Duration = Duration::from_secs(1);
-
-/// The first press of what may be a double click on the slide: where it was, where the slide
-/// was then, and when. A press anywhere else ends it.
-#[derive(Clone, Copy)]
-struct Gesture {
-    at: Point<Pixels>,
-    slide: Bounds<Pixels>,
-    when: Instant,
-}
-
-/// Where `position`, in the window, is on `slide`, drawn there, in slide units, if it's on it.
-fn point_on(slide: Bounds<Pixels>, position: Point<Pixels>) -> Option<(f32, f32)> {
-    slide.contains(&position).then(|| nearest_point_on(slide, position)).flatten()
-}
-
-/// The point of `slide`, drawn there, nearest `position`, in slide units.
-fn nearest_point_on(slide: Bounds<Pixels>, position: Point<Pixels>) -> Option<(f32, f32)> {
-    let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
-    if unit <= 0.0 {
-        return None;
-    }
-    let along = |at: Pixels, start: Pixels, length: Pixels| {
-        f32::from(at - start).clamp(0.0, f32::from(length)) / unit
-    };
-    Some((
-        along(position.x, slide.origin.x, slide.size.width),
-        along(position.y, slide.origin.y, slide.size.height),
-    ))
-}
-
-impl SlideEditor {
     /// What's at (`x`, `y`) of the current slide.
     fn hit(&self, (x, y): (f32, f32), cx: &mut Context<Self>) -> Option<(usize, Hit)> {
         let slide = self.document.as_ref()?.read(cx).current();
@@ -1005,7 +955,7 @@ impl SlideEditor {
         // A colour held for the selection goes to it before the click moves it.
         self.give_held_color(cx);
         self.dragging = false;
-        let Some(point) = self.pressed_point(event, cx) else {
+        let Some(point) = self.slide_point(event.position, cx) else {
             // The desk around the slide.
             self.stop_typing(window, cx);
             return;
@@ -1560,8 +1510,6 @@ impl Render for SlideEditor {
             .absolute()
             .size_full()
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
-            // A press anywhere else ends any double click begun on the slide.
-            .on_mouse_down_out(cx.listener(|this, _, _, _| this.gesture = None))
             .on_action(
                 cx.listener(|this, _: &MoveLeft, _, cx| this.go(Go::By(Motion::Left), false, cx)),
             )

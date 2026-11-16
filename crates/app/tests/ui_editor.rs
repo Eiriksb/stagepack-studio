@@ -689,13 +689,14 @@ fn the_view_tab_hides_and_shows_each_panel(cx: &mut TestAppContext) {
         click(cx, handle, toggle);
         assert_eq!(shown(cx, panel), at_first, "{panel}");
     }
-    // With both away, the slide has the room.
+    // With both away, the slide has the room, but for the inspector's, which is always there.
     click(cx, handle, NOTES_TOGGLE_ID);
     click(cx, handle, SLIDE_LIST_TOGGLE_ID);
     with_window(cx, handle, |window, _| {
         let canvas = window.find(CANVAS_ID).bounds();
+        let inspector = window.find(stagepack_studio::inspector::INSPECTOR_ID).bounds();
         assert!(canvas.left() < px(40.), "{canvas:?}");
-        assert!(canvas.right() > px(1240.), "{canvas:?}");
+        assert!(canvas.right() > inspector.left() - px(40.), "{canvas:?} {inspector:?}");
     });
 }
 

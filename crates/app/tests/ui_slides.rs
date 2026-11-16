@@ -585,7 +585,10 @@ fn the_markdown_is_to_the_right_of_the_slide(cx: &mut TestAppContext) {
             panel.bounds().bottom() >= canvas.bounds().bottom(),
             "beside the notes too"
         );
-        assert_eq!(panel.bounds().right(), px(1280.));
+        // The inspector is at the window's right, after it.
+        let inspector = window.find(stagepack_studio::inspector::INSPECTOR_ID).bounds();
+        assert_eq!(panel.bounds().right(), inspector.left());
+        assert_eq!(inspector.right(), px(1280.));
     })
     .unwrap();
 }

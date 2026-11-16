@@ -10,13 +10,14 @@ use typing::*;
 
 use gpui_kit::component::color_picker::ColorPickerState;
 use gpui_kit::test::TestWindowExt;
-use gpui_kit::{AppContext as _, Entity, Hsla, TestAppContext, rgb};
+use gpui_kit::{Action as _, AppContext as _, Entity, Hsla, TestAppContext, rgb};
 use slides_engine::ElementBox;
 use slides_format::{find_tag, parse_talk};
 use stagepack_studio::inspector::{
-    INSPECTOR_CHOOSE_FILE_ID, INSPECTOR_HEADING_ID, INSPECTOR_ID, INSPECTOR_MESSAGE_ID, Inspector, field_id, none_id,
-    problem_id,
+    INSPECTOR_CHOOSE_FILE_ID, INSPECTOR_HEADING_ID, INSPECTOR_ID, INSPECTOR_MESSAGE_ID, Inspector, NOTHING_SELECTED,
+    field_id, none_id, problem_id,
 };
+use stagepack_studio::insert_tools::InsertTextBox;
 use stagepack_studio::recovery::Recovery;
 use stagepack_studio::workspace_view::RECOVER_ID;
 
@@ -228,24 +229,43 @@ fn score_module() -> Vec<u8> {
 const SCORE: &str = "# Scores\n\n<Score team=\"Oslo\" points=\"3\" ready=\"true\" colour=\"#16a34a\" bar-kind=\"bar\" x=\"100\" y=\"300\" w=\"600\" h=\"300\" />\n";
 
 #[gpui_kit::test]
-fn the_panel_shows_only_with_a_selection(cx: &mut TestAppContext) {
+fn the_panel_shows_a_hint_with_nothing_selected(cx: &mut TestAppContext) {
     let typing = open(cx, SHOWCASE);
     go_to(&typing, cx, THINGS);
-    assert!(!panel_shows(&typing, cx), "nothing is selected");
-    let wide = typing.slide_bounds(cx);
+    assert!(panel_shows(&typing, cx), "always there while a talk is open");
+    assert_eq!(label_of(&typing, cx, INSPECTOR_MESSAGE_ID).as_deref(), Some(NOTHING_SELECTED));
+    assert_eq!(label_of(&typing, cx, INSPECTOR_HEADING_ID), None);
+    let slide = typing.slide_bounds(cx);
     select(&typing, cx, ELLIPSE);
-    assert!(panel_shows(&typing, cx));
     assert_eq!(label_of(&typing, cx, INSPECTOR_HEADING_ID).as_deref(), Some("Shape"));
-    let narrow = typing.slide_bounds(cx);
-    assert!(narrow.size.width < wide.size.width, "the slide makes room: {wide:?} then {narrow:?}");
+    assert_eq!(typing.slide_bounds(cx), slide, "the slide never moves for a selection");
     typing.press(cx, "escape");
-    assert!(!panel_shows(&typing, cx), "let go of");
-    assert_eq!(typing.slide_bounds(cx), wide, "and the slide has its room back");
+    assert_eq!(label_of(&typing, cx, INSPECTOR_MESSAGE_ID).as_deref(), Some(NOTHING_SELECTED), "let go of");
+    assert_eq!(typing.slide_bounds(cx), slide);
     select(&typing, cx, ICON);
     assert_eq!(label_of(&typing, cx, INSPECTOR_HEADING_ID).as_deref(), Some("Icon"));
     typing.press(cx, "pagedown");
-    assert!(!panel_shows(&typing, cx), "the thing selected isn't on the slide shown");
+    assert_eq!(label_of(&typing, cx, INSPECTOR_MESSAGE_ID).as_deref(), Some(NOTHING_SELECTED), "the thing selected isn't on the slide shown");
     assert_eq!(typing.source(cx), SHOWCASE);
+
+    // A new text box waiting for its first character is nothing selected yet.
+    typing.with_window(cx, |window, cx| window.dispatch_action(InsertTextBox.boxed_clone(), cx));
+    typing.settle(cx);
+    assert!(typing.editing(cx).is_some(), "a box to type in");
+    assert_eq!(label_of(&typing, cx, INSPECTOR_MESSAGE_ID).as_deref(), Some(NOTHING_SELECTED));
+
+    // No talk, no panel.
+    let empty = cx.update(|cx| {
+        gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| stagepack_studio::workspace_view::WorkspaceView::for_test(window, cx))
+        })
+        .unwrap()
+    });
+    cx.update_window(empty.0, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find(INSPECTOR_ID).is_none());
+    })
+    .unwrap();
 }
 
 #[gpui_kit::test]
@@ -639,7 +659,7 @@ fn a_click_elsewhere_commits_a_field_to_its_own_thing(cx: &mut TestAppContext) {
     let desk = typing.slide_bounds(cx).origin - gpui_kit::point(gpui_kit::px(4.), gpui_kit::px(4.));
     typing.click(cx, desk);
     assert_eq!(typing.source(cx), sized.replace("outline-width=\"4\"", "outline-width=\"6\""));
-    assert!(!panel_shows(&typing, cx));
+    assert_eq!(label_of(&typing, cx, INSPECTOR_MESSAGE_ID).as_deref(), Some(NOTHING_SELECTED));
 }
 
 /// A CSV file outside any talk.
@@ -721,17 +741,28 @@ fn a_file_chosen_in_the_inspector_survives_a_crash(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn a_double_click_still_types_in_a_box_with_the_panel_appearing(cx: &mut TestAppContext) {
+fn a_double_click_types_in_a_box_with_nothing_selected_before(cx: &mut TestAppContext) {
     let typing = open(cx, SHOWCASE);
     go_to(&typing, cx, BOX);
-    let flow = 0;
     let at = pos(0, 5);
-    let before = typing.slide_bounds(cx);
-    typing.double_click_text(cx, flow, at);
-    assert_ne!(typing.slide_bounds(cx), before, "the panel came, and the slide made room");
+    let slide = typing.slide_bounds(cx);
+    typing.double_click_text(cx, 0, at);
+    assert_eq!(typing.slide_bounds(cx), slide, "the slide stayed put");
     let editing = typing.editing(cx).expect("the second click types in the box");
     assert_eq!(editing.edit.selection, caret_at(at), "where it was clicked");
-    assert!(panel_shows(&typing, cx), "the box stays selected while it's typed in");
+    assert_eq!(label_of(&typing, cx, INSPECTOR_HEADING_ID).as_deref(), Some("Text box"), "the box stays selected while it's typed in");
+}
+
+#[gpui_kit::test]
+fn a_triple_click_in_a_box_selects_its_paragraph_with_nothing_selected_before(cx: &mut TestAppContext) {
+    let typing = open(cx, SHOWCASE);
+    go_to(&typing, cx, BOX);
+    let at = typing.point_of(cx, 0, pos(0, 5));
+    typing.clicks(cx, at, 3, gpui_kit::Modifiers::default());
+    let editing = typing.editing(cx).expect("the box is typed in");
+    let paragraph = "Just a few words, with nothing around them.".len();
+    assert_eq!(editing.edit.selection.anchor, pos(0, 0));
+    assert_eq!(editing.edit.selection.head, pos(0, paragraph), "the whole paragraph");
 }
 
 #[gpui_kit::test]
@@ -867,7 +898,7 @@ fn the_panel_is_never_in_a_show_or_a_thumbnail(cx: &mut TestAppContext) {
     let document = typing.document(cx);
     let before = document.update(cx, |document, _| document.thumbnail(THINGS, 320)).expect("a thumbnail");
     select(&typing, cx, ELLIPSE);
-    assert!(panel_shows(&typing, cx));
+    assert_eq!(label_of(&typing, cx, INSPECTOR_HEADING_ID).as_deref(), Some("Shape"));
     document.update(cx, |document, _| document.set_memory_budget(64 << 20));
     let after = document.update(cx, |document, _| document.thumbnail(THINGS, 320)).expect("a thumbnail");
     assert_eq!(before.data(), after.data(), "a thumbnail is the same with a thing selected");
@@ -888,37 +919,73 @@ fn the_panel_is_never_in_a_show_or_a_thumbnail(cx: &mut TestAppContext) {
     assert!(panel_shows(&typing, cx), "the editor still shows it");
 }
 
+
 #[gpui_kit::test]
-fn a_press_elsewhere_ends_the_double_click(cx: &mut TestAppContext) {
-    let typing = open(cx, SHOWCASE);
-    go_to(&typing, cx, BOX);
-    let at_pos = pos(0, 5);
-    let at = typing.point_of(cx, 0, at_pos);
-    typing.click(cx, at);
-    assert!(panel_shows(&typing, cx), "the box is selected, and the slide moved");
-    // A press on the panel, then a second press where the first was: it's no double click on
-    // the slide as it was, but a press on the slide as it is now.
+fn a_write_the_talk_refuses_stays_with_its_sentence(cx: &mut TestAppContext) {
+    let typing = open(cx, CHART);
+    select(&typing, cx, "<Chart");
+    type_over(&typing, cx, "title", "Revenue");
+    stagepack_studio::document::panic_in_next_change();
+    typing.press(cx, "enter");
+    assert_eq!(typing.source(cx), CHART);
+    let refused = "That change couldn't be made, so nothing was changed.";
+    assert_eq!(label_of(&typing, cx, &problem_id("title")).as_deref(), Some(refused));
+    typing.press(cx, "tab");
+    assert_eq!(shown(&typing, cx, "title").as_deref(), Some("Revenue"), "what was typed stays");
+    assert_eq!(label_of(&typing, cx, &problem_id("title")).as_deref(), Some(refused), "and why");
+    click_field(&typing, cx, "title");
+    typing.press(cx, "enter");
+    assert_eq!(attr(&typing, cx, "title").as_deref(), Some("Revenue"), "committed again, it's written");
+    assert_eq!(label_of(&typing, cx, &problem_id("title")), None);
+}
+
+/// Opens the outline picker of the thing selected and drags its sliders to blue.
+fn drag_outline_blue(typing: &Typing, cx: &mut TestAppContext) -> Entity<ColorPickerState> {
+    let picker = picker(typing, cx, "outline");
     typing.with_window(cx, |window, cx| {
-        window.render_frame(cx);
-        window.click(INSPECTOR_HEADING_ID, cx);
+        picker.update(cx, |picker, cx| {
+            picker.set_open(true, cx);
+            picker.update_color(rgb(0x0000ff).into(), window, cx);
+        })
     });
     typing.settle(cx);
-    typing.mouse_down(cx, at, 2, gpui_kit::Modifiers::default());
-    typing.mouse_up(cx, at, 2, gpui_kit::Modifiers::default());
-    let typed_at = typing.editing(cx).map(|editing| editing.edit.selection);
-    assert_ne!(typed_at, Some(caret_at(at_pos)), "not mapped through the slide's old place");
+    picker
 }
 
 #[gpui_kit::test]
-fn a_second_press_long_after_the_first_is_no_double_click(cx: &mut TestAppContext) {
+fn a_dragged_colour_is_let_go_of_after_an_undo(cx: &mut TestAppContext) {
     let typing = open(cx, SHOWCASE);
-    go_to(&typing, cx, BOX);
-    let at_pos = pos(0, 5);
-    let at = typing.point_of(cx, 0, at_pos);
-    typing.click(cx, at);
-    cx.executor().advance_clock(std::time::Duration::from_secs(2));
-    typing.mouse_down(cx, at, 2, gpui_kit::Modifiers::default());
-    typing.mouse_up(cx, at, 2, gpui_kit::Modifiers::default());
-    let typed_at = typing.editing(cx).map(|editing| editing.edit.selection);
-    assert_ne!(typed_at, Some(caret_at(at_pos)), "not mapped through the slide's old place");
+    go_to(&typing, cx, THINGS);
+    select(&typing, cx, ELLIPSE);
+    pick(&typing, cx, "fill", rgb(0xff0000).into());
+    let picker = drag_outline_blue(&typing, cx);
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), SHOWCASE, "the fill is undone");
+    typing.with_window(cx, |_, cx| picker.update(cx, |picker, cx| picker.set_open(false, cx)));
+    typing.settle(cx);
+    assert_eq!(typing.source(cx), SHOWCASE, "and the colour dragged before it isn't written late");
+    assert!(typing.document(cx).read_with(cx, |document, _| document.can_redo()), "the redo is still there");
 }
+
+#[gpui_kit::test]
+fn a_dragged_colour_is_let_go_of_when_its_thing_is_deleted(cx: &mut TestAppContext) {
+    let typing = open(cx, SHOWCASE);
+    go_to(&typing, cx, THINGS);
+    let ellipse = select(&typing, cx, ELLIPSE);
+    drag_outline_blue(&typing, cx);
+    // Taken away while the picker's open, as Delete on the slide does.
+    let document = typing.document(cx);
+    document.update(cx, |document, cx| {
+        document.delete_selected().unwrap();
+        cx.notify();
+    });
+    typing.settle(cx);
+    let deleted = typing.source(cx);
+    assert!(!deleted.contains("kind=\"ellipse\""), "the ellipse went");
+    typing.settle(cx);
+    cx.run_until_parked();
+    assert_eq!(typing.source(cx), deleted, "nothing written after");
+    assert_eq!(typing.status(cx).as_deref().filter(|said| said.contains("couldn't")), None, "and nothing refused to say");
+    let _ = ellipse;
+}
+

@@ -1,5 +1,6 @@
 //! The inspector: a form at the window's right for the thing selected on the slide, made from
-//! its component's arguments, so that someone who doesn't write code can set it up. Each field
+//! its component's arguments, so that someone who doesn't write code can set it up. It's always
+//! there while a talk is open, so the slide never moves as things are selected. Each field
 //! shows what the talk says, and writes one attribute when it's changed.
 //!
 //! The form is worked out as the panel is drawn, from the talk and the thing selected; nothing
@@ -27,7 +28,7 @@ use slides_format::{Block, Span, Tag, find_tag};
 use toolkit::ComponentSchema;
 
 use crate::added_files::{FileKind, NotAdded};
-use crate::document::{Document, Selected};
+use crate::document::{Document, EditRefused, Selected};
 use crate::selection;
 use crate::text_tools::written_color;
 use crate::workspace_view::WorkspaceView;
@@ -48,6 +49,9 @@ pub const INSPECTOR_WIDTH: Pixels = px(300.);
 
 /// The key context of the panel.
 pub const INSPECTOR_CONTEXT: &str = "Inspector";
+
+/// What the panel says with nothing selected.
+pub const NOTHING_SELECTED: &str = "Select something on the slide to set it up.";
 
 /// What the panel says of a talk's own component that has no working build.
 pub const NEEDS_BUILD: &str = "Build this talk's components to set this up.";
@@ -97,13 +101,20 @@ enum Widget {
     Color {
         picker: Entity<ColorPickerState>,
         /// A colour dragged on the sliders, given once the picker closes.
-        held: Option<String>,
+        held: Option<Held>,
     },
     Choice {
         select: Entity<SelectState<Vec<Choice>>>,
         choices: Vec<Choice>,
     },
     File,
+}
+
+/// A colour dragged on a picker's sliders, and the version of the talk's text it was dragged
+/// on: once the text has changed since, by an undo, a redo or a delete, it's let go of unwritten.
+struct Held {
+    color: String,
+    version: u64,
 }
 
 struct Field {
@@ -201,7 +212,7 @@ impl Inspector {
             .field(name)
             .is_some_and(|field| matches!(&field.spec.kind, Kind::Choice(options) if options.iter().any(|option| option == value)));
         if known {
-            self.write(name, Some(value), cx);
+            self.write(name, Some(value), cx).ok();
             cx.notify();
         }
     }
@@ -231,10 +242,7 @@ impl Inspector {
                 })
             });
         let problem = match added {
-            Ok(added) => {
-                self.write(name, Some(&added), cx);
-                None
-            }
+            Ok(added) => self.write(name, Some(&added), cx).err().map(|refused| SharedString::from(refused.to_string())),
             Err(why) => Some(SharedString::from(why.to_string())),
         };
         if let Some(field) = self.field_mut(name) {
@@ -258,17 +266,17 @@ impl Inspector {
         find_tag(document.talk(), target.slide, &target.source)?.attr(name).map(str::to_string)
     }
 
-    /// Sets attribute `name` of the thing the form is for to `value`, or takes it away, and
-    /// says whether that was done.
-    fn write(&mut self, name: &str, value: Option<&str>, cx: &mut Context<Self>) -> bool {
+    /// Sets attribute `name` of the thing the form is for to `value`, or takes it away, or says
+    /// why it wasn't.
+    fn write(&mut self, name: &str, value: Option<&str>, cx: &mut Context<Self>) -> Result<(), EditRefused> {
         let Some(form) = &self.form else {
-            return false;
+            return Err(EditRefused::CouldNotBeMade);
         };
         let (pick, target) = (form.shape.pick, form.target.clone());
         let made = self
             .workspace
             .update(cx, |workspace, cx| workspace.set_attr_from_inspector(pick, &target, name, value, cx))
-            .unwrap_or(false);
+            .unwrap_or(Err(EditRefused::CouldNotBeMade));
         // The thing's text has grown or shrunk: the form follows it there at once.
         let moved = self.document.as_ref().and_then(|document| {
             let document = document.read(cx);
@@ -280,11 +288,16 @@ impl Inspector {
         made
     }
 
-    /// Writes what text or number field `index` holds, if something's been typed in it.
-    fn commit(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    /// Writes what text or number field `index` holds, if something's been typed in it. What was
+    /// refused and not typed in since is tried again only by Enter, `again`: leaving the field
+    /// leaves it as it is, with why.
+    fn commit(&mut self, index: usize, again: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(field) = self.form.as_ref().and_then(|form| form.fields.get(index)) else {
             return;
         };
+        if field.problem.is_some() && !again {
+            return;
+        }
         let Widget::Input(input) = &field.widget else {
             return;
         };
@@ -302,8 +315,8 @@ impl Inspector {
         };
         let attr = field.spec.attr.clone();
         match typed {
-            Typed::Write(value) => {
-                if self.write(&attr, value.as_deref(), cx) {
+            Typed::Write(value) => match self.write(&attr, value.as_deref(), cx) {
+                Ok(()) => {
                     let shown = value.unwrap_or_default();
                     if text != shown {
                         input.update(cx, |input, cx| input.set_value(SharedString::from(shown.clone()), window, cx));
@@ -313,7 +326,13 @@ impl Inspector {
                         field.problem = None;
                     }
                 }
-            }
+                // Refused as a value that can't be written is: it stays, with why.
+                Err(refused) => {
+                    if let Some(field) = self.field_mut(&attr) {
+                        field.problem = Some(refused.to_string().into());
+                    }
+                }
+            },
             Typed::Refused(why) => {
                 if let Some(field) = self.field_mut(&attr) {
                     field.problem = Some(why.into());
@@ -331,7 +350,7 @@ impl Inspector {
             _ => None,
         });
         if let Some(index) = typed_in {
-            self.commit(index, window, cx);
+            self.commit(index, false, window, cx);
         }
     }
 
@@ -368,7 +387,7 @@ impl Inspector {
         match stepped(&input.read(cx).value(), &talk, up, whole, range) {
             Ok(next) => {
                 input.update(cx, |input, cx| input.set_value(SharedString::from(next), window, cx));
-                self.commit(index, window, cx);
+                self.commit(index, true, window, cx);
             }
             // What's in the field stays, and nothing is written.
             Err(why) => {
@@ -399,7 +418,7 @@ impl Inspector {
             .fields
             .into_iter()
             .filter_map(|field| match field.widget {
-                Widget::Color { held: Some(color), .. } => Some((field.spec.attr, color)),
+                Widget::Color { held: Some(held), .. } if self.is_current(held.version, cx) => Some((field.spec.attr, held.color)),
                 _ => None,
             })
             .collect();
@@ -543,7 +562,8 @@ impl Inspector {
                     let input = cx.new(|cx| InputState::new(window, cx).mask_pattern(MaskPattern::None));
                     subscriptions.push(cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, window, cx| {
                         match event {
-                            InputEvent::PressEnter { .. } | InputEvent::Blur => this.commit(index, window, cx),
+                            InputEvent::PressEnter { .. } => this.commit(index, true, window, cx),
+                            InputEvent::Blur => this.commit(index, false, window, cx),
                             // Typing in it again takes back what was said of it.
                             InputEvent::Change => this.clear_problem(index, cx),
                             _ => {}
@@ -566,13 +586,13 @@ impl Inspector {
                         let ColorPickerEvent::Change(color) = event;
                         match color {
                             // A drag of the sliders is one change, given once the picker closes.
-                            Some(color) if picker.read(cx).is_open() => this.hold_color(&attr, written_color(*color)),
+                            Some(color) if picker.read(cx).is_open() => this.hold_color(&attr, Some(written_color(*color)), cx),
                             Some(color) => {
-                                this.hold_color(&attr, String::new());
+                                this.hold_color(&attr, None, cx);
                                 this.write_color(&attr, &written_color(*color), cx);
                             }
                             None if optional => {
-                                this.write(&attr, None, cx);
+                                this.write(&attr, None, cx).ok();
                             }
                             None => {}
                         }
@@ -609,24 +629,38 @@ impl Inspector {
         Form { shape, target, fields, _subscriptions: subscriptions }
     }
 
-    /// Keeps `color`, dragged in colour field `name`'s picker, for when the picker closes. An
-    /// empty one is nothing held.
-    fn hold_color(&mut self, name: &str, color: String) {
+    /// Keeps `color`, dragged in colour field `name`'s picker, for when the picker closes, or
+    /// with `None` lets go of what's held. A drag is of the talk as it was when it began.
+    fn hold_color(&mut self, name: &str, color: Option<String>, cx: &App) {
+        let version = self.text_version(cx);
         if let Some(Field { widget: Widget::Color { held, .. }, .. }) = self.field_mut(name) {
-            *held = (!color.is_empty()).then_some(color);
+            *held = color.map(|color| Held { version: held.as_ref().map_or(version, |held| held.version), color });
         }
     }
 
-    /// Writes the colour held for colour field `name`, if there is one.
+    /// Writes the colour held for colour field `name`, if there is one and nothing has changed
+    /// the talk's text since the drag began.
     fn give_held_color(&mut self, name: &str, cx: &mut Context<Self>) {
         let held = match self.field_mut(name) {
             Some(Field { widget: Widget::Color { held, .. }, .. }) => held.take(),
             _ => None,
         };
-        if let Some(color) = held {
-            self.write_color(name, &color, cx);
+        if let Some(held) = held {
+            if self.is_current(held.version, cx) {
+                self.write_color(name, &held.color, cx);
+            }
             cx.notify();
         }
+    }
+
+    /// The version of the talk's text now.
+    fn text_version(&self, cx: &App) -> u64 {
+        self.document.as_ref().map_or(0, |document| document.read(cx).text_version())
+    }
+
+    /// Whether the talk's text is still at `version`.
+    fn is_current(&self, version: u64, cx: &App) -> bool {
+        self.text_version(cx) == version
     }
 
     /// Writes `color`, as `#rrggbb`, to colour field `name`, unless it's the colour the talk
@@ -634,7 +668,7 @@ impl Inspector {
     fn write_color(&mut self, name: &str, color: &str, cx: &mut Context<Self>) {
         let now = self.talk_attr(name, cx).as_deref().and_then(color_of).map(written_color);
         if now.as_deref() != Some(color) {
-            self.write(name, Some(color), cx);
+            self.write(name, Some(color), cx).ok();
         }
     }
 
@@ -742,7 +776,7 @@ impl Inspector {
                     .accessibility_label(label.clone())
                     .on_click(cx.listener(move |this, checked: &bool, _, cx| {
                         let value = if *checked { "true" } else { "false" };
-                        this.write(&attr, Some(value), cx);
+                        this.write(&attr, Some(value), cx).ok();
                         cx.notify();
                     }))
                     .into_any_element()
@@ -755,7 +789,7 @@ impl Inspector {
                         .xsmall()
                         .label("None")
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.write(&attr, None, cx);
+                            this.write(&attr, None, cx).ok();
                             cx.notify();
                         }))
                 });
@@ -887,7 +921,15 @@ impl Render for Inspector {
                 }
             }));
         let Some(form) = &self.form else {
-            return panel;
+            return panel.child(
+                div()
+                    .id(INSPECTOR_MESSAGE_ID)
+                    .test_support()
+                    .aria_label(NOTHING_SELECTED)
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(NOTHING_SELECTED),
+            );
         };
         let heading = SharedString::from(form.shape.heading.clone());
         let message = form.shape.message.clone().map(SharedString::from);

@@ -22,7 +22,7 @@ use stagepack_studio::insert::place_for;
 use stagepack_studio::insert_tools::{INSERT_PICTURE_ID, INSERT_SHAPES_ID, INSERT_TEXT_BOX_ID, shape_id};
 use stagepack_studio::recovery::Recovery;
 use stagepack_studio::ribbon::{MORE_RIGHT_ID, RIBBON_ID, TAB_INSERT_ID};
-use stagepack_studio::inspector::INSPECTOR_ID;
+use stagepack_studio::inspector::{INSPECTOR_HEADING_ID, INSPECTOR_MESSAGE_ID};
 use stagepack_studio::slide_editor::{NEW_BOX_ID, SlideEditor};
 use stagepack_studio::slide_strip::STRIP_ID;
 use stagepack_studio::workspace_view::{DIALOG_FAILED, ExportPdf, ONLY_THE_FIRST, RECOVER_ID};
@@ -639,13 +639,14 @@ fn save_present_and_export_with_a_pending_box_write_nothing(cx: &mut TestAppCont
 }
 
 #[gpui_kit::test]
-fn the_inspector_does_not_show_for_a_pending_box(cx: &mut TestAppContext) {
+fn the_inspector_has_no_form_for_a_pending_box(cx: &mut TestAppContext) {
     let typing = open(cx, TALK);
     insert_shape(&typing, cx, "rect");
-    assert!(bounds_of(&typing, cx, INSPECTOR_ID).is_some(), "the shape's");
+    assert!(bounds_of(&typing, cx, INSPECTOR_HEADING_ID).is_some(), "the shape's");
     insert_text_box(&typing, cx);
     assert_eq!(selected(&typing, cx), None);
-    assert!(bounds_of(&typing, cx, INSPECTOR_ID).is_none());
+    assert!(bounds_of(&typing, cx, INSPECTOR_HEADING_ID).is_none(), "nothing selected, so no form");
+    assert!(bounds_of(&typing, cx, INSPECTOR_MESSAGE_ID).is_some(), "but the hint");
     // A setting changed meanwhile, as from a field, changes nothing and loses nothing.
     let with_shape = typing.source(cx);
     let document = typing.document(cx);

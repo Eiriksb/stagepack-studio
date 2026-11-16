@@ -671,8 +671,6 @@ fn typing_in_a_turned_box_works(cx: &mut TestAppContext) {
     // The first click selects the box, the second types in it.
     typing.click(cx, at);
     assert!(typing.editing(cx).is_none());
-    // The inspector came, and the slide made room for it.
-    let at = typing.point_of(cx, 1, pos(0, 5));
     typing.click(cx, at);
     let editing = typing.editing(cx).expect("the box's text is typed into");
     assert_eq!(editing.edit.selection, caret_at(pos(0, 5)));

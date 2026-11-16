@@ -91,7 +91,7 @@ impl WorkspaceView {
     }
 
     /// Sets attribute `name` of the thing the inspector shows to `value`, or takes it away, as
-    /// one edit, and says whether that was done. The inspector shows the thing picked `pick`,
+    /// one edit, or says why it wasn't made. The inspector shows the thing picked `pick`,
     /// now at `target`: while it's still the one selected, the selection's is the one changed;
     /// once another is picked, as by the click that took the keyboard from a field, the change
     /// goes to the thing it was typed for, if that's still where it was.
@@ -102,12 +102,12 @@ impl WorkspaceView {
         name: &str,
         value: Option<&str>,
         cx: &mut Context<Self>,
-    ) -> bool {
+    ) -> Result<(), EditRefused> {
         let Some(document) = self.document.clone() else {
-            return false;
+            return Err(EditRefused::CouldNotBeMade);
         };
         let picked = document.read(cx).selection_pick() == pick;
-        let mut made = false;
+        let mut made = Err(EditRefused::CouldNotBeMade);
         self.edit(
             |document| {
                 let result = if picked {
@@ -115,7 +115,7 @@ impl WorkspaceView {
                 } else {
                     document.set_attr_of(target, name, value)
                 };
-                made = result.is_ok();
+                made = result.as_ref().map(|_| ()).map_err(|refused| *refused);
                 result
             },
             cx,
@@ -123,12 +123,10 @@ impl WorkspaceView {
         made
     }
 
-    /// Whether the inspector shows: while a thing on the slide shown is selected.
-    pub(super) fn shows_inspector(&self, cx: &App) -> bool {
-        self.document.as_ref().is_some_and(|document| {
-            let document = document.read(cx);
-            document.selected().is_some_and(|selected| selected.slide == document.current())
-        })
+    /// Whether the inspector shows: whenever a talk is open, so the slide's place never
+    /// changes as things are selected and let go of.
+    pub(super) fn shows_inspector(&self) -> bool {
+        self.document.is_some()
     }
 
     /// Leaves the talk tidy of what typing on the slide left empty, before it's saved, shown
@@ -435,7 +433,7 @@ impl WorkspaceView {
                     .visible(has_talk && self.show_notes)
                     .child(self.notes_panel.clone()),
             );
-        let inspector = self.shows_inspector(cx).then(|| self.inspector.clone());
+        let inspector = self.shows_inspector().then(|| self.inspector.clone());
         h_flex()
             .flex_1()
             .min_h_0()
