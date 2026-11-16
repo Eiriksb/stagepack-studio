@@ -858,3 +858,36 @@ proptest! {
         prop_assert_eq!(change.inverse(&source).apply(&new), source);
     }
 }
+
+#[test]
+fn a_body_given_anywhere_is_exact_or_refused() {
+    // Hand-written tags across lines, in a list item's continuation, inside a box, with a body
+    // already, and with `/>` in a value.
+    let cases = [
+        ("# T\n\n<Shape\n  kind=\"rect\"\n  x=\"1\"\n/>\n\nAfter\n", true),
+        ("# T\r\n\r\n<Shape\r\n  kind=\"rect\"\r\n/>\r\n\r\nAfter\r\n", true),
+        ("# T\n\n- item\n\n  <Shape kind=\"rect\" />\n- two\n", false),
+        ("# T\n\n- <Shape kind=\"rect\" />\n", false),
+        ("# T\n\n<Box>\n\n  <Shape kind=\"rect\" />\n\n</Box>\n", false),
+        ("# T\n\n<Box>\n<Shape kind=\"rect\" />\n</Box>\n", false),
+        ("# T\n\n<Shape kind=\"rect\">\n\nOld\n\n</Shape>\n", true),
+        ("# T\n\n<Shape kind=\"rect\" label=\"a /> b\" />\n", true),
+    ];
+    for (source, must) in cases {
+        let talk = parse_talk(source);
+        let shapes: Vec<Tag> = all_tags(&talk).into_iter().map(|(_, tag)| tag).filter(|tag| tag.name == "Shape").collect();
+        assert!(!shapes.is_empty(), "{source:?}");
+        for tag in shapes {
+            match set_tag_body(&talk, 0, &tag.range, "&nbsp;") {
+                Some(change) => {
+                    let new = change.apply(source);
+                    assert_eq!(change.inverse(source).apply(&new), source, "{source:?}");
+                    assert_eq!(&new[..tag.range.start], &source[..tag.range.start]);
+                    let after = parse_talk(&new);
+                    assert!(after.slides[0].error.is_none(), "{new:?}");
+                }
+                None => assert!(!must, "{source:?} was refused"),
+            }
+        }
+    }
+}

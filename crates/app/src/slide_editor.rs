@@ -20,10 +20,11 @@ use slides_engine::{Align, CaretRect, ElementBox, Hit, LineMove, Rect, Selection
 use slides_format::{Motion, Para, ParaKind, Pos, Selection, Span, StyleBit, TextEdit};
 
 use crate::clipboard::{self, ClipboardOp, TextPaste};
-use crate::clipboard_tools::{holds_text, picture_or_files, read_clipboard, write_clipboard};
+use crate::clipboard_tools::{read_clipboard, write_clipboard};
 use crate::document::{Document, EditRefused};
 use crate::selection::{self, Selected};
 use crate::slide_canvas::{SLIDE_WIDTH, SlideCanvas, letterbox};
+use crate::insert::TEXT_BOX_SIZE;
 use crate::text_editing::{Composing, EditingText, clean_typed, utf16_slice};
 use crate::text_tools::{
     SetTextSize, ToggleBold, ToggleBullets, ToggleItalic, ToggleNumbering, ToggleUnderline,
@@ -36,6 +37,8 @@ pub const SLIDE_EDITOR_ID: &str = "slide-editor";
 pub const CARET_ID: &str = "caret";
 /// What the system's input method is composing, shown at the caret.
 pub const COMPOSITION_ID: &str = "composition";
+/// The dashed line around a new text box that isn't written yet.
+pub const NEW_BOX_ID: &str = "new-text-box";
 /// The outline around the thing selected on the slide.
 pub const SELECTION_OUTLINE_ID: &str = "selection-outline";
 
@@ -134,6 +137,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-d", NoAction, context),
         KeyBinding::new("ctrl-c", CopyToClipboard, context),
         KeyBinding::new("ctrl-x", CutToClipboard, context),
+        // The window's: it reads the clipboard, and pastes text here or puts a picture on the slide.
         KeyBinding::new("ctrl-v", PasteFromClipboard, context),
     ]);
     let selecting = Some(SELECTION_CONTEXT);
@@ -546,7 +550,10 @@ impl SlideEditor {
                 self.copy_text(cx);
             }
             ClipboardOp::Cut => self.cut_text(cx),
-            ClipboardOp::Paste => self.paste_text(cx),
+            ClipboardOp::Paste => {
+                let (plain, metadata) = read_clipboard(cx);
+                self.paste_text(plain.as_deref(), metadata.as_deref(), cx)
+            }
         }
     }
 
@@ -579,7 +586,7 @@ impl SlideEditor {
     /// text the app copied, or else plain text, a paragraph to a line, in the style at the
     /// caret. In a title, which is one paragraph, the paragraphs are joined by line breaks;
     /// anywhere else, a heading takes the kind of the paragraph it's pasted into.
-    fn paste_text(&mut self, cx: &mut Context<Self>) {
+    pub fn paste_text(&mut self, plain: Option<&str>, metadata: Option<&str>, cx: &mut Context<Self>) {
         self.drop_composing(cx);
         let Some(editing) = self.editing(cx) else {
             return;
@@ -587,8 +594,7 @@ impl SlideEditor {
         let title = editing.is_title();
         let edit = &editing.edit;
         let kind = edit.paras.get(edit.selection.start().para).map(|para| para.kind);
-        let (plain, metadata) = read_clipboard(cx);
-        let paste = match clipboard::text_to_paste(plain.as_deref(), metadata.as_deref()) {
+        let paste = match clipboard::text_to_paste(plain, metadata) {
             Ok(paste) => paste,
             Err(clipboard::TooLarge) => {
                 cx.emit(EditorEvent::Said(clipboard::TOO_LARGE.into()));
@@ -1004,6 +1010,13 @@ impl SlideEditor {
             self.stop_typing(window, cx);
             return;
         };
+        if self.new_box_here(cx).is_some_and(|(x, y, w, h)| x <= point.0 && point.0 <= x + w && y <= point.1 && point.1 <= y + h) {
+            // In the new box being typed in: typing goes on there.
+            cx.stop_propagation();
+            self.focus_handle.focus(window, cx);
+            self.typed(cx);
+            return;
+        }
         let Some((slide, mut hit)) = self.hit(point, cx) else {
             self.stop_typing(window, cx);
             return;
@@ -1126,6 +1139,12 @@ impl SlideEditor {
         }
         // An empty region, before anything is typed: the caret is where its text would start.
         let key = &self.editing(cx)?.flow;
+        if let Some((x, y)) = key.new_box() {
+            // A new box, not written yet: at its corner.
+            let (w, h) = TEXT_BOX_SIZE;
+            let element = ElementBox { source: 0..0, rect: Rect { x: x as f32, y: y as f32, w, h }, rotate: 0.0, holds_text: true };
+            return Some(empty_box_caret(&element, false));
+        }
         if let Some(start) = key.tag_start() {
             // An empty box: at its corner, or a shape's middle.
             let element = layout.elements().iter().rev().find(|element| element.source.start == start)?.clone();
@@ -1133,6 +1152,13 @@ impl SlideEditor {
             return Some(empty_box_caret(&element, shape));
         }
         layout.placeholder_caret(key.region()?)
+    }
+
+    /// The new text box typed in that isn't written yet, if it's on the slide shown: where it is,
+    /// `(x, y, w, h)`, in slide units.
+    fn new_box_here(&self, cx: &App) -> Option<(f32, f32, f32, f32)> {
+        let document = self.document.as_ref()?.read(cx);
+        document.new_box().filter(|(slide, _)| *slide == document.current()).map(|(_, rect)| rect)
     }
 
     /// Whether the thing selected on the slide shown takes typing, with nothing being typed: a
@@ -1336,6 +1362,32 @@ fn corners_box(corners: &[(f32, f32); 4], slide: Bounds<Pixels>, unit: f32) -> B
     }
 }
 
+/// How long each dash of a new box's line is, and the gap after it, in the window's pixels.
+const DASH: f32 = 6.0;
+
+/// Draws a dashed line around `(x, y, w, h)`, in slide units, on a slide drawn at `slide`.
+fn paint_dashed((x, y, w, h): (f32, f32, f32, f32), slide: Bounds<Pixels>, unit: f32, color: Hsla, window: &mut Window) {
+    let (dash, thick) = (DASH / unit, OUTLINE_WIDTH / 2. / unit);
+    let edges = [((x, y), (x + w, y)), ((x + w, y), (x + w, y + h)), ((x + w, y + h), (x, y + h)), ((x, y + h), (x, y))];
+    for ((x0, y0), (x1, y1)) in edges {
+        let length = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
+        if length <= 0. {
+            continue;
+        }
+        let (dx, dy) = ((x1 - x0) / length, (y1 - y0) / length);
+        let mut at = 0.;
+        while at < length {
+            let end = (at + dash).min(length);
+            let (ax, ay, bx, by) = (x0 + dx * at, y0 + dy * at, x0 + dx * end, y0 + dy * end);
+            // Across the line, half its width each side.
+            let (nx, ny) = (-dy * thick, dx * thick);
+            let points = [(ax + nx, ay + ny), (bx + nx, by + ny), (bx - nx, by - ny), (ax - nx, ay - ny)];
+            paint_polygon(&points, slide, unit, color, window);
+            at += dash * 2.;
+        }
+    }
+}
+
 fn paint_polygon(
     points: &[(f32, f32)],
     slide: Bounds<Pixels>,
@@ -1391,6 +1443,9 @@ impl Render for SlideEditor {
             document.update(cx, |document, _| document.selected_box())
         });
         let outline = outline.as_ref().map(outline_corners);
+        // A new box waiting for its first character: a dashed line around where it'll be.
+        let new_box = self.new_box_here(cx);
+        let new_box_color = cx.theme().muted_foreground;
         let selecting = outline.is_some() && !self.is_editing(cx);
         let placed = {
             let canvas = self.canvas.read(cx);
@@ -1409,6 +1464,12 @@ impl Render for SlideEditor {
         // Where the outline is in the editor, for whoever looks for it.
         let outline_box = outline.zip(placed).and_then(|(corners, (slide, area))| {
             let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
+            (unit > 0.0).then(|| in_editor(corners_box(&corners, slide, unit), area))
+        });
+        // Where the new box is in the editor, for whoever looks for it.
+        let new_box_bounds = new_box.zip(placed).and_then(|((x, y, w, h), (slide, area))| {
+            let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
+            let corners = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)];
             (unit > 0.0).then(|| in_editor(corners_box(&corners, slide, unit), area))
         });
         // What the system is composing, at the caret, where the selection it stands for starts.
@@ -1463,6 +1524,9 @@ impl Render for SlideEditor {
                 window.with_content_mask(Some(ContentMask { bounds: slide }), |window| {
                     if let Some(corners) = &outline {
                         paint_outline(corners, slide, unit, outline_color, window);
+                    }
+                    if let Some(rect) = new_box {
+                        paint_dashed(rect, slide, unit, new_box_color, window);
                     }
                     let Some(marks) = marks else { return };
                     let SelectionRects {
@@ -1594,18 +1658,6 @@ impl Render for SlideEditor {
             .on_action(cx.listener(|this, _: &CutToClipboard, _, cx| {
                 this.clipboard(ClipboardOp::Cut, cx)
             }))
-            .on_action(cx.listener(|this, _: &PasteFromClipboard, _, cx| {
-                // With nothing typed, or a picture or files and no text, the window's: it ends the
-                // typing and puts what's there on the slide.
-                let item = cx.read_from_clipboard();
-                let elsewhere = !this.is_editing(cx)
-                    || item.as_ref().is_some_and(|item| !holds_text(item) && picture_or_files(item).is_some());
-                if elsewhere {
-                    cx.propagate();
-                    return;
-                }
-                this.clipboard(ClipboardOp::Paste, cx)
-            }))
             .on_action(cx.listener(|this, _: &ToggleBold, _, cx| {
                 this.format(|edit| edit.toggle(StyleBit::Bold), cx)
             }))
@@ -1622,6 +1674,18 @@ impl Render for SlideEditor {
             }))
             .child(self.canvas.clone())
             .child(overlay)
+            .when_some(new_box_bounds, |this, bounds| {
+                this.child(
+                    div()
+                        .id(NEW_BOX_ID)
+                        .test_support()
+                        .absolute()
+                        .left(bounds.origin.x)
+                        .top(bounds.origin.y)
+                        .w(bounds.size.width)
+                        .h(bounds.size.height),
+                )
+            })
             .when_some(outline_box, |this, outline| {
                 this.child(
                     div()

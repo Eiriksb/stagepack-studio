@@ -4,7 +4,7 @@
 use super::*;
 use crate::clipboard_tools;
 use crate::clipboard::{self, SlidePaste, TooLarge};
-use crate::clipboard_tools::{read_clipboard, write_clipboard};
+use crate::clipboard_tools::write_clipboard;
 use crate::document::Selected;
 use crate::inspector::INSPECTOR_WIDTH;
 
@@ -142,6 +142,11 @@ impl WorkspaceView {
         });
         if let Some(composing) = typing {
             self.edit(Document::settle_text, cx);
+            // A new text box with nothing in it is dropped, which changes nothing of the talk:
+            // the editor hears of it all the same.
+            if let Some(document) = &self.document {
+                document.update(cx, |_, cx| cx.notify());
+            }
             // What the system was composing went with it, and isn't shown any more.
             if composing {
                 self.slide_editor.update(cx, |_, cx| cx.notify());
@@ -245,19 +250,10 @@ impl WorkspaceView {
             window.dispatch_action(action, cx);
             return;
         }
+        if op == ClipboardOp::Paste {
+            return self.paste(window, cx);
+        }
         if document.read(cx).text().is_some() {
-            // A picture, or files, with no text on the clipboard: the typing ends, and it goes on
-            // the slide.
-            let item = cx.read_from_clipboard();
-            let thing = item
-                .as_ref()
-                .filter(|item| op == ClipboardOp::Paste && !clipboard_tools::holds_text(item))
-                .and_then(clipboard_tools::picture_or_files);
-            if let Some(thing) = thing {
-                self.edit(Document::end_text, cx);
-                self.paste_thing(thing, cx);
-                return;
-            }
             // From a text tool that has the keyboard: it goes back to the text, as after any tool.
             self.slide_editor.update(cx, |editor, cx| {
                 editor.focus_text(window, cx);
@@ -270,8 +266,41 @@ impl WorkspaceView {
                 self.copy_slide(cx);
             }
             ClipboardOp::Cut => self.cut_slide(cx),
-            ClipboardOp::Paste => self.paste_slide(cx),
+            ClipboardOp::Paste => {}
         }
+    }
+
+    /// Pastes what's on the clipboard, read once. With text being typed: text, the app's or
+    /// plain, into it; or else a picture, or files, once the typing ends, onto the slide. With
+    /// none: the app's own slide or text, as a slide; then a picture; then files, as a drop; then
+    /// plain text, as a slide.
+    fn paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        let item = cx.read_from_clipboard();
+        let (plain, metadata) = item.as_ref().map(|item| (item.text(), item.metadata().cloned())).unwrap_or_default();
+        let typing = document.read(cx).text().is_some();
+        let thing_first = if typing {
+            !item.as_ref().is_some_and(clipboard_tools::holds_text)
+        } else {
+            !metadata.as_deref().is_some_and(clipboard::is_app_data)
+        };
+        if thing_first && let Some(thing) = item.and_then(clipboard_tools::picture_or_files) {
+            if typing {
+                self.edit(Document::end_text, cx);
+            }
+            return self.paste_thing(thing, cx);
+        }
+        if typing {
+            // From a text tool that has the keyboard: it goes back to the text, as after any tool.
+            self.slide_editor.update(cx, |editor, cx| {
+                editor.focus_text(window, cx);
+                editor.paste_text(plain.as_deref(), metadata.as_deref(), cx);
+            });
+            return;
+        }
+        self.paste_slide(plain, metadata, cx);
     }
 
     /// Puts the current slide's own text on the clipboard, and says whether it did.
@@ -305,19 +334,10 @@ impl WorkspaceView {
 
     /// Pastes the slide on the clipboard after the current one. If it shows a picture or a
     /// component this talk lacks, that's said, once.
-    fn paste_slide(&mut self, cx: &mut Context<Self>) {
+    fn paste_slide(&mut self, plain: Option<String>, metadata: Option<String>, cx: &mut Context<Self>) {
         let Some(document) = self.document.clone() else {
             return;
         };
-        let (plain, metadata) = read_clipboard(cx);
-        // The app's own slide or text, as before; then a picture, then files, as a drop; then
-        // plain text, as a slide.
-        let app_data = metadata.as_deref().is_some_and(clipboard::is_app_data);
-        if !app_data
-            && let Some(thing) = cx.read_from_clipboard().as_ref().and_then(clipboard_tools::picture_or_files)
-        {
-            return self.paste_thing(thing, cx);
-        }
         let markdown = match clipboard::slide_to_paste(plain.as_deref(), metadata.as_deref()) {
             Ok(SlidePaste::Slide(markdown)) => markdown,
             Ok(SlidePaste::NoSlide) => return self.say(clipboard::NO_SLIDE, cx),

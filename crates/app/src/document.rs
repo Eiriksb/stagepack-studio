@@ -316,10 +316,6 @@ pub struct Document {
     held_color: Option<HeldColor>,
     /// The thing picked on a slide, if any: the editor's view of the talk, not part of it.
     selected: Option<Selected>,
-    /// The text box just put on a slide with nothing in it, while it's typed in: the time of
-    /// typing in it, and how many steps from the start the history was once it was put there.
-    /// Left with no words when that typing ends, it's taken away again.
-    fresh_box: Option<(u64, usize)>,
     /// Counts the times a thing was picked or let go of, rather than followed through an edit.
     picks: u64,
     /// The number the next time of typing on a slide gets.
@@ -419,7 +415,6 @@ impl Document {
             editing: None,
             held_color: None,
             selected: None,
-            fresh_box: None,
             picks: 0,
             next_session: 0,
             message: None,
@@ -1401,19 +1396,77 @@ impl Document {
         self.insert_sized(INSERT_SHAPE, "Shape", &attrs, insert::shape_size(kind), None)
     }
 
-    /// Puts an empty box of text on the current slide, as [`Self::insert_sized`] does, and starts
-    /// typing in it. If that typing ends with no words in it, it's taken away again, into the same
-    /// step, so that there's nothing to undo.
+    /// Starts typing in a new text box on the current slide, which isn't written until something
+    /// is typed in it: the first character typed writes it, with that character, as one step
+    /// named "Insert text box". Till then it's nothing of the talk's: no change, no step, nothing
+    /// to save. Anything that ends the typing drops it, writing nothing. It goes in the middle of
+    /// the slide, stepped aside from the things on it, and from a new box already waiting there,
+    /// which it takes the place of. Typing elsewhere ends first, and nothing stays selected.
     pub fn insert_text_box(&mut self) -> Result<Vec<usize>, EditRefused> {
-        let depth = self.history.depth();
-        let changed = self.insert_sized(INSERT_TEXT_BOX, "Box", &[], TEXT_BOX_SIZE, Some(""))?;
-        if self.history.depth() > depth
-            && let Some(Selected { slide, source }) = self.selected.clone()
-            && self.begin_text_in_tag(slide, source.start)
-            && let Some(editing) = &self.editing
-        {
-            self.fresh_box = Some((editing.session, self.history.depth()));
+        let waiting = self
+            .new_box()
+            .filter(|(slide, _)| *slide == self.current)
+            .map(|(_, (x, y, _, _))| (x, y));
+        let tidied = self.finish_before_edit()?;
+        // Ending typing in a new box drops it; ending any other may tidy the talk.
+        self.editing = None;
+        self.deselect();
+        let slide = self.current;
+        let layout = self.text_layout(slide);
+        let mut taken: Vec<(f32, f32)> = layout.elements().iter().map(|element| (element.rect.x, element.rect.y)).collect();
+        taken.extend(waiting);
+        let (x, y) = insert::place_for(TEXT_BOX_SIZE, &taken);
+        self.editing = Some(EditingText {
+            session: self.new_session(),
+            ..EditingText::in_new_box(slide, x.max(0.0) as u32, y.max(0.0) as u32)
+        });
+        Ok(if tidied { vec![slide] } else { Vec::new() })
+    }
+
+    /// The new text box typing has begun in that isn't written yet, if there's one: its slide,
+    /// and where it is, `(x, y, w, h)`, in slide units.
+    pub fn new_box(&self) -> Option<(usize, (f32, f32, f32, f32))> {
+        let editing = self.editing.as_ref()?;
+        let (x, y) = editing.flow.new_box()?;
+        Some((editing.slide, (x as f32, y as f32, TEXT_BOX_SIZE.0, TEXT_BOX_SIZE.1)))
+    }
+
+    /// Writes the new text box `editing` is typing in, at (`x`, `y`), holding `after`'s
+    /// paragraphs, as one step of its own named "Insert text box", and goes on typing in it. With
+    /// nothing in them yet, nothing is written.
+    fn write_new_box(&mut self, editing: &EditingText, (x, y): (u32, u32), after: TextEdit) -> Result<Vec<usize>, EditRefused> {
+        if !holds_something(&after.paras) {
+            self.keep_typed(after, None);
+            return Ok(Vec::new());
         }
+        let slide = editing.slide;
+        let (change, start) = guarded(|| new_box_change(self.talk(), slide, (x, y), &after.paras))?
+            .ok_or(EditRefused::CouldNotBeTyped)?;
+        let count = guarded(|| text_flows(self.talk(), slide).len())? + 1;
+        let expected = storable(&after.paras);
+        let key = FlowKey::Tag { start };
+        let reads_back = |candidate: &Talk| {
+            let flows = text_flows(candidate, slide);
+            flows.len() == count && key.find(&flows).is_some_and(|index| flows[index].paras == expected)
+        };
+        let depth = self.history.depth();
+        let changed = self
+            .try_make(INSERT_TEXT_BOX, change, Holds::Slide(slide), slide, slide, Join::Alone, Some(&reads_back))
+            .map_err(|_| EditRefused::CouldNotBeTyped)?;
+        if self.history.depth() > depth {
+            // Undone, nothing's left to type in; made again, typing goes on after what was typed.
+            self.history.mark_last(TextMark {
+                slide,
+                flow: key.clone(),
+                before: Selection::caret(Pos::default()),
+                after: Some(after.selection),
+                session: editing.session,
+            });
+        }
+        if let Some(editing) = &mut self.editing {
+            editing.flow = key;
+        }
+        self.keep_typed(after, None);
         Ok(changed)
     }
 
@@ -1773,6 +1826,10 @@ impl Document {
             }
             Kind::Typed | Kind::Formatted => {}
         }
+        if let Some(place) = editing.flow.new_box() {
+            // Typed or pasted, what first goes in a new box writes it, as "Insert text box".
+            return self.write_new_box(&editing, place, after);
+        }
         let found = editing.flow.find(&flows);
         let change = match (found, editing.flow.region()) {
             (Some(index), _) => write_flow(self.talk(), slide, &flows[index], &after.paras),
@@ -1843,7 +1900,7 @@ impl Document {
             return Ok(given);
         };
         let slide = editing.slide;
-        if slide >= self.slide_count() {
+        if slide >= self.slide_count() || editing.flow.new_box().is_some() {
             return Ok(given);
         }
         let written = match align {
@@ -1926,7 +1983,13 @@ impl Document {
         let Some(editing) = self.editing.clone() else {
             return Ok(given);
         };
-        let (changed, removed) = self.tidy(&editing, false)?;
+        if editing.flow.new_box().is_some() {
+            // A new box nothing is typed in yet is dropped, so that nothing of it is saved,
+            // shown or exported.
+            self.editing = None;
+            return Ok(given);
+        }
+        let (changed, removed) = self.tidy(&editing)?;
         let changed = joined(given, changed);
         if removed.is_some() {
             let region = editing.flow.region().unwrap_or_default();
@@ -1947,7 +2010,7 @@ impl Document {
         let Some(editing) = self.editing.take() else {
             return Ok((given, None));
         };
-        let (changed, removed) = self.tidy(&editing, true)?;
+        let (changed, removed) = self.tidy(&editing)?;
         Ok((joined(given, changed), removed))
     }
 
@@ -1955,17 +2018,9 @@ impl Document {
     /// the slides to show again, and the slide and flow taken away. That's no step of its own:
     /// it joins the step before it typed in the same time of typing, where the history can
     /// take it, and if that leaves the step doing nothing, the step goes. A box of text is
-    /// never taken away, as an empty box would be no text at all, but for a text box just put
-    /// on the slide, when the typing in it is `ending`: see [`Self::take_back_fresh_box`].
-    fn tidy(&mut self, editing: &EditingText, ending: bool) -> Result<EndedText, EditRefused> {
+    /// never taken away, as an empty box would be no text at all.
+    fn tidy(&mut self, editing: &EditingText) -> Result<EndedText, EditRefused> {
         let slide = editing.slide;
-        if ending
-            && let Some((session, depth)) = self.fresh_box
-            && session == editing.session
-        {
-            self.fresh_box = None;
-            return self.take_back_fresh_box(editing, depth);
-        }
         if editing.flow.region().is_none() || slide >= self.slide_count() {
             return Ok((Vec::new(), None));
         }
@@ -2022,69 +2077,6 @@ impl Document {
             last.after = None;
         }
         Ok((changed, Some((slide, index))))
-    }
-
-    /// Takes the text box `editing` was typed in away, if it has no words in it, with each step
-    /// typed in it since it was put there, and the step that put it there, `depth` steps from
-    /// the start: each is folded into the one before it, so they go, and there's nothing to undo.
-    /// Where a step can't be folded, as one the talk was saved at, what's taken away is a step of
-    /// its own.
-    fn take_back_fresh_box(&mut self, editing: &EditingText, depth: usize) -> Result<EndedText, EditRefused> {
-        let slide = editing.slide;
-        let Some(start) = editing.flow.tag_start() else {
-            return Ok((Vec::new(), None));
-        };
-        if slide >= self.slide_count() {
-            return Ok((Vec::new(), None));
-        }
-        let (empty, flow) = {
-            let talk = self.talk();
-            let flows = guarded(|| text_flows(talk, slide))?;
-            match editing.flow.find(&flows) {
-                Some(index) => (holds_no_words(&flows[index].paras), Some(index)),
-                None => (tag_starting_at(talk, slide, start).is_some_and(waits_for_text), None),
-            }
-        };
-        if !empty {
-            return Ok((Vec::new(), None));
-        }
-        let mut changed = Vec::new();
-        let mut gone = false;
-        loop {
-            let now = self.history.depth();
-            let typed_in_it = self.history.last_mark().is_some_and(|mark| mark.session == editing.session);
-            if now < depth || (now > depth && !typed_in_it) {
-                break;
-            }
-            let Some(back) = self.history.next_undo().cloned() else {
-                break;
-            };
-            let made = self
-                .try_make(INSERT_TEXT_BOX, back, Holds::Slide(slide), slide, slide, Join::Last, None)
-                .map_err(|_| EditRefused::CouldNotTidy)?;
-            changed = joined(changed, made);
-            if now == depth {
-                // The step that put it there is taken back: it's gone.
-                gone = true;
-                break;
-            }
-            if self.history.depth() >= now {
-                break;
-            }
-        }
-        if !gone {
-            let range = tag_starting_at(self.talk(), slide, start).filter(|tag| takes_text(tag)).map(|tag| tag.range.clone());
-            let Some(range) = range else {
-                return Ok((changed, None));
-            };
-            let change = built(self.talk(), |talk| delete_block(talk, slide, &range))?.ok_or(EditRefused::CouldNotTidy)?;
-            let made = self
-                .try_make(DELETE, change, Holds::Slide(slide), slide, slide, Join::Alone, None)
-                .map_err(|_| EditRefused::CouldNotTidy)?;
-            changed = joined(changed, made);
-        }
-        // Whatever flows came after it on the slide come one sooner.
-        Ok((changed, Some((slide, flow.unwrap_or(NO_FLOW)))))
     }
 
     /// The change back to the talk from before the newest step, if that step is what put
@@ -2408,6 +2400,7 @@ fn reads_as_typed(talk: &Talk, flows: &[slides_format::TextFlow], editing: &Edit
         (None, Some(region)) => {
             !region_has_text(flows, region) && !holds_something(&editing.edit.paras)
         }
+        (None, None) if editing.flow.new_box().is_some() => !holds_something(&editing.edit.paras),
         (None, None) => {
             let start = editing.flow.tag_start();
             start.is_some_and(|start| tag_starting_at(talk, editing.slide, start).is_some_and(waits_for_text))
@@ -2415,9 +2408,6 @@ fn reads_as_typed(talk: &Talk, flows: &[slides_format::TextFlow], editing: &Edit
         }
     }
 }
-
-/// What [`EndedText`] gives for a box taken away that had no text to be one of the slide's flows.
-const NO_FLOW: usize = usize::MAX;
 
 /// Whether `tag` is one typing on it puts words in: a shape or a box.
 fn takes_text(tag: &Tag) -> bool {
@@ -2441,6 +2431,25 @@ fn tag_starting_at(talk: &Talk, slide: usize, start: usize) -> Option<&Tag> {
     }
     let slide = talk.slides.get(slide).filter(|slide| slide.error.is_none())?;
     within(&slide.blocks, start)
+}
+
+/// The change that writes a new text box, at (`x`, `y`) and [`TEXT_BOX_SIZE`], holding `paras`,
+/// at the end of slide `slide`'s content, as one edit, and where its tag starts once it's made:
+/// the box is written holding one empty paragraph, and that then written as `paras`. `None` if
+/// it can't be.
+fn new_box_change(talk: &Talk, slide: usize, (x, y): (u32, u32), paras: &[Para]) -> Option<(Change, usize)> {
+    let place = [x.to_string(), y.to_string(), insert::whole(TEXT_BOX_SIZE.0), insert::whole(TEXT_BOX_SIZE.1)];
+    let attrs: Vec<(&str, &str)> = ["x", "y", "w", "h"].into_iter().zip(place.iter().map(String::as_str)).collect();
+    let text = tag_text(&NewTag { name: "Box", attrs: &attrs, body: Some("&nbsp;") })?;
+    let opened = insert_block(talk, slide, &text)?;
+    let edit = opened.edits.first()?;
+    let written = if edit.text.contains("\r\n") { text.replace('\n', "\r\n") } else { text.clone() };
+    let start = edit.range.start + edit.text.find(&written)?;
+    let held = reparse(talk, opened.apply(&talk.source));
+    let flows = text_flows(&held, slide);
+    let index = FlowKey::Tag { start }.find(&flows)?;
+    let filled = write_flow(&held, slide, &flows[index], paras)?;
+    Some((one_edit(&talk.source, &filled.apply(&held.source)), start))
 }
 
 /// The change that puts `paras` in the shape or box with nothing in it whose tag starts at byte
@@ -2488,6 +2497,7 @@ fn typed_place(talk: &Talk, editing: &EditingText) -> Option<FlowPlace> {
         FlowKey::Tag { start } => {
             tag_starting_at(talk, editing.slide, *start).map(|tag| FlowPlace::Tag(tag.range.clone()))
         }
+        FlowKey::NewBox { .. } => None,
     }
 }
 

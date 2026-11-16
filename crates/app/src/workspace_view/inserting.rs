@@ -8,6 +8,12 @@ use crate::document::InsertFailed;
 
 /// What the window says when a file that isn't a picture is dropped on the slide.
 pub const ONLY_PICTURES: &str = "Only pictures can be dropped on a slide.";
+/// What the window says when the dialog to choose pictures couldn't be shown.
+pub const DIALOG_FAILED: &str = "The picture couldn't be opened.";
+/// The most files a drop, or a paste of files, puts on the slide.
+pub const MOST_DROPPED: usize = 20;
+/// What the window says when more files than that were dropped.
+pub const ONLY_THE_FIRST: &str = "Only the first 20 pictures were added.";
 /// What a picture pasted from the clipboard is named, as like as is safe.
 const PASTED_PICTURE: &str = "pasted-picture.png";
 
@@ -28,9 +34,8 @@ impl WorkspaceView {
                 Ok(Ok(Some(paths))) => {
                     this.update(cx, |this, cx| this.chosen_pictures(paths, cx)).ok();
                 }
-                Ok(Err(error)) => {
-                    let problem = format!("Could not show the dialog to choose pictures: {error}");
-                    this.update(cx, |this, cx| this.say(problem, cx)).ok();
+                Ok(Err(_)) => {
+                    this.update(cx, |this, cx| this.say(DIALOG_FAILED, cx)).ok();
                 }
                 _ => {}
             }
@@ -49,8 +54,16 @@ impl WorkspaceView {
     /// Puts the pictures in the files at `paths`, dropped on the slide from outside the app, on
     /// it, each in turn, one step each. A file that isn't a picture is said, and left out.
     pub(super) fn dropped(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        for path in paths {
-            self.insert_file(&path, true, cx);
+        let more = paths.len() > MOST_DROPPED;
+        for path in paths.iter().take(MOST_DROPPED) {
+            self.insert_file(path, true, cx);
+        }
+        if more {
+            // After the status line has heard what's selected, so that this is what it says.
+            cx.spawn(async move |this, cx| {
+                this.update(cx, |this, cx| this.say(ONLY_THE_FIRST, cx)).ok();
+            })
+            .detach();
         }
     }
 
@@ -107,9 +120,13 @@ impl WorkspaceView {
         self.edit(|document| document.insert_shape(kind), cx);
     }
 
-    /// Puts a box to type in on the slide, and starts typing in it.
+    /// Starts typing in a new text box on the slide, which isn't written until something is
+    /// typed in it. The editor hears of it as it hears of any change to the document.
     pub(super) fn insert_text_box(&mut self, cx: &mut Context<Self>) {
         self.edit(Document::insert_text_box, cx);
+        if let Some(document) = &self.document {
+            document.update(cx, |_, cx| cx.notify());
+        }
     }
 }
 

@@ -50,7 +50,7 @@ mod editing;
 mod inserting;
 mod saving;
 
-pub use inserting::ONLY_PICTURES;
+pub use inserting::{DIALOG_FAILED, ONLY_PICTURES, ONLY_THE_FIRST};
 
 pub const CANVAS_ID: &str = "canvas";
 pub const TITLE_ID: &str = "title";

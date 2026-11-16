@@ -34,6 +34,9 @@ pub enum FlowKey {
     /// shape typed on, or a text box just put on the slide. Typing in it changes only what's
     /// inside the tag, so its start stays where it is.
     Tag { start: usize },
+    /// A text box that isn't in the talk yet, its top-left corner at (`x`, `y`) of the slide,
+    /// in slide units. The first thing typed in it writes it; till then nothing of it is written.
+    NewBox { x: u32, y: u32 },
 }
 
 impl FlowKey {
@@ -78,7 +81,7 @@ impl FlowKey {
             }
             let nth = match self {
                 FlowKey::Region { nth, .. } | FlowKey::Box { nth } => *nth,
-                FlowKey::Tag { .. } => continue,
+                FlowKey::Tag { .. } | FlowKey::NewBox { .. } => continue,
             };
             if seen == nth {
                 return Some(index);
@@ -92,7 +95,7 @@ impl FlowKey {
     pub fn region(&self) -> Option<&str> {
         match self {
             FlowKey::Region { name, .. } => Some(name),
-            FlowKey::Box { .. } | FlowKey::Tag { .. } => None,
+            FlowKey::Box { .. } | FlowKey::Tag { .. } | FlowKey::NewBox { .. } => None,
         }
     }
 
@@ -100,6 +103,14 @@ impl FlowKey {
     pub fn tag_start(&self) -> Option<usize> {
         match self {
             FlowKey::Tag { start } => Some(*start),
+            _ => None,
+        }
+    }
+
+    /// Where the text box not yet written is, if this is one: its top-left corner.
+    pub fn new_box(&self) -> Option<(u32, u32)> {
+        match self {
+            FlowKey::NewBox { x, y } => Some((*x, *y)),
             _ => None,
         }
     }
@@ -408,6 +419,12 @@ impl EditingText {
             session: 0,
             composing: None,
         }
+    }
+
+    /// Text started in a text box on slide `slide`, its top-left corner at (`x`, `y`), that isn't
+    /// written yet: one empty paragraph.
+    pub fn in_new_box(slide: usize, x: u32, y: u32) -> EditingText {
+        EditingText { flow: FlowKey::NewBox { x, y }, ..EditingText::in_empty_tag(slide, 0) }
     }
 
     /// Whether this is the slide's title, where a paragraph can't be ended.

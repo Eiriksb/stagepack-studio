@@ -22,9 +22,10 @@ use stagepack_studio::insert::place_for;
 use stagepack_studio::insert_tools::{INSERT_PICTURE_ID, INSERT_SHAPES_ID, INSERT_TEXT_BOX_ID, shape_id};
 use stagepack_studio::recovery::Recovery;
 use stagepack_studio::ribbon::{MORE_RIGHT_ID, RIBBON_ID, TAB_INSERT_ID};
-use stagepack_studio::slide_editor::SlideEditor;
+use stagepack_studio::inspector::INSPECTOR_ID;
+use stagepack_studio::slide_editor::{NEW_BOX_ID, SlideEditor};
 use stagepack_studio::slide_strip::STRIP_ID;
-use stagepack_studio::workspace_view::RECOVER_ID;
+use stagepack_studio::workspace_view::{DIALOG_FAILED, ExportPdf, ONLY_THE_FIRST, RECOVER_ID};
 use toolkit::ShapeKind;
 
 const TALK: &str = "---\ntitle: T\n---\n\n# One\n\nSome words\n\n---\n\n# Two\n";
@@ -473,44 +474,266 @@ fn typing_on_a_selected_picture_does_nothing(cx: &mut TestAppContext) {
 // ---------------------------------------------------------------------------------------
 // Text boxes
 
-#[gpui_kit::test]
-fn a_text_box_takes_the_caret_and_typing_goes_in_it(cx: &mut TestAppContext) {
-    let typing = open(cx, TALK);
-    insert_text_box(&typing, cx);
-    assert_eq!(typing.source(cx), with_inserted("<Box x=\"640\" y=\"440\" w=\"640\" h=\"200\">\n\n</Box>"));
-    assert!(typing.editing(cx).is_some(), "typing has begun in it");
-    let caret = typing.caret(cx).expect("the caret shows");
-    let corner = typing.at(cx, 640., 440.);
-    let far = typing.at(cx, 1280., 640.);
-    // At the box's corner, give or take the caret's width.
-    let middle = caret.center();
-    assert!((middle.x - corner.x).abs() <= px(2.) && (caret.origin.y - corner.y).abs() <= px(2.), "{caret:?} {corner:?}");
-    assert!(caret.bottom() <= far.y, "inside the box: {caret:?} {far:?}");
+/// The new text box waiting for its first character, if there's one: its slide and where it is.
+fn new_box(typing: &Typing, cx: &TestAppContext) -> Option<(usize, (f32, f32, f32, f32))> {
+    typing.document(cx).read_with(cx, |document, _| document.new_box())
+}
 
-    typing.type_text(cx, "Hello");
-    assert_eq!(typing.source(cx), with_inserted("<Box x=\"640\" y=\"440\" w=\"640\" h=\"200\">\n\nHello\n\n</Box>"));
-    typing.press(cx, "escape");
-    assert_eq!(typing.source(cx), with_inserted("<Box x=\"640\" y=\"440\" w=\"640\" h=\"200\">\n\nHello\n\n</Box>"), "kept");
-    assert_eq!(typing.document(cx).read_with(cx, |document, _| document.undo_label()), Some("Typing"));
+fn unsaved(typing: &Typing, cx: &TestAppContext) -> bool {
+    typing.document(cx).read_with(cx, |document, _| document.has_unsaved_changes())
+}
+
+fn undo_label(typing: &Typing, cx: &TestAppContext) -> Option<&'static str> {
+    typing.document(cx).read_with(cx, |document, _| document.undo_label())
+}
+
+const NEW_BOX: (usize, (f32, f32, f32, f32)) = (0, (640., 440., 640., 200.));
+
+fn written_box(words: &str) -> String {
+    with_inserted(&format!("<Box x=\"640\" y=\"440\" w=\"640\" h=\"200\">\n\n{words}\n\n</Box>"))
 }
 
 #[gpui_kit::test]
-fn an_empty_text_box_leaves_nothing_behind_and_nothing_to_undo(cx: &mut TestAppContext) {
+fn a_text_box_writes_nothing_until_a_character_is_typed(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    insert_text_box(&typing, cx);
+    assert_eq!(typing.source(cx), TALK);
+    assert!(!unsaved(&typing, cx), "nothing to save");
+    assert!(!can_undo(&typing, cx), "nothing to undo");
+    assert_eq!(new_box(&typing, cx), Some(NEW_BOX));
+    assert!(typing.editing(cx).is_some(), "typing has begun in it");
+    assert_eq!(selected(&typing, cx), None);
+    // Drawn where it'll be, with the caret at its corner.
+    let drawn = bounds_of(&typing, cx, NEW_BOX_ID).expect("its outline is drawn");
+    let (corner, far) = (typing.at(cx, 640., 440.), typing.at(cx, 1280., 640.));
+    assert!((drawn.origin.x - corner.x).abs() <= px(1.) && (drawn.bottom() - far.y).abs() <= px(1.), "{drawn:?}");
+    let caret = typing.caret(cx).expect("the caret shows");
+    assert!((caret.center().x - corner.x).abs() <= px(2.) && (caret.origin.y - corner.y).abs() <= px(2.), "{caret:?} {corner:?}");
+    assert!(caret.bottom() <= far.y);
+}
+
+#[gpui_kit::test]
+fn the_first_character_writes_the_box_in_one_step(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    insert_text_box(&typing, cx);
+    typing.type_text(cx, "H");
+    assert_eq!(typing.source(cx), written_box("H"));
+    assert_eq!(undo_label(&typing, cx), Some("Insert text box"));
+    assert_eq!(new_box(&typing, cx), None);
+    assert!(bounds_of(&typing, cx, NEW_BOX_ID).is_none());
+    typing.type_text(cx, "i");
+    assert_eq!(typing.source(cx), written_box("Hi"));
+    assert_eq!(undo_label(&typing, cx), Some("Typing"), "later typing is a step of its own");
+
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), written_box("H"));
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), TALK, "the box goes whole");
+    assert_eq!(new_box(&typing, cx), None, "and nothing is left waiting");
+    assert!(!can_undo(&typing, cx));
+    typing.press(cx, "ctrl-shift-z");
+    assert_eq!(typing.source(cx), written_box("H"));
+    assert_eq!(typing.selection(cx), caret_at(pos(0, 1)), "the caret after what was typed");
+    typing.type_text(cx, "o");
+    assert_eq!(typing.source(cx), written_box("Ho"));
+}
+
+#[gpui_kit::test]
+fn undoing_the_first_character_leaves_nothing(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    insert_text_box(&typing, cx);
+    typing.type_text(cx, "a");
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), TALK);
+    typing.press(cx, "escape");
+    assert_eq!(typing.source(cx), TALK);
+    assert!(!can_undo(&typing, cx));
+    assert_eq!(typing.document(cx).read_with(cx, |document, _| document.redo_label()), Some("Insert text box"));
+}
+
+#[gpui_kit::test]
+fn escape_or_a_click_elsewhere_drops_a_pending_box(cx: &mut TestAppContext) {
     let typing = open(cx, TALK);
     insert_text_box(&typing, cx);
     typing.press(cx, "escape");
-    assert_eq!(typing.source(cx), TALK);
-    assert!(!can_undo(&typing, cx), "nothing to undo");
+    assert_eq!(new_box(&typing, cx), None);
+    assert!(typing.editing(cx).is_none());
 
-    // Typed in, and emptied again.
+    insert_text_box(&typing, cx);
+    // A click in it keeps it.
+    let inside = typing.at(cx, 900., 540.);
+    typing.click(cx, inside);
+    assert_eq!(new_box(&typing, cx), Some(NEW_BOX));
+    let away = typing.at(cx, 100., 1000.);
+    typing.click(cx, away);
+    assert_eq!(new_box(&typing, cx), None);
+
+    insert_text_box(&typing, cx);
+    let document = typing.document(cx);
+    cx.update(|cx| document.update(cx, |document, cx| {
+        document.go_to(1);
+        cx.notify();
+    }));
+    typing.settle(cx);
+    assert_eq!(typing.current(cx), 1);
+    assert_eq!(new_box(&typing, cx), None, "leaving the slide drops it");
+
+    cx.update(|cx| document.update(cx, |document, cx| {
+        document.go_to(0);
+        cx.notify();
+    }));
+    typing.settle(cx);
+    insert_text_box(&typing, cx);
+    insert_shape(&typing, cx, "rect");
+    assert_eq!(new_box(&typing, cx), None, "another insert drops it");
+    assert_eq!(undo_label(&typing, cx), Some("Insert shape"));
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), TALK);
+    assert!(!can_undo(&typing, cx), "nothing of the boxes was ever a step");
+}
+
+#[gpui_kit::test]
+fn a_second_text_box_replaces_the_pending_one_and_takes_the_caret(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    insert_text_box(&typing, cx);
+    click_on(&typing, cx, INSERT_TEXT_BOX_ID);
+    assert_eq!(new_box(&typing, cx), Some((0, (680., 480., 640., 200.))), "a step aside from the first");
+    assert!(typing.editing(cx).is_some());
+    assert_eq!(typing.source(cx), TALK);
+    assert!(!can_undo(&typing, cx));
+    typing.type_text(cx, "x");
+    assert_eq!(typing.source(cx), with_inserted("<Box x=\"680\" y=\"480\" w=\"640\" h=\"200\">\n\nx\n\n</Box>"));
+    typing.press(cx, "escape");
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), TALK);
+    assert!(!can_undo(&typing, cx));
+}
+
+#[gpui_kit::test]
+fn save_present_and_export_with_a_pending_box_write_nothing(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    insert_shape(&typing, cx, "rect");
+    let with_shape = typing.source(cx);
+    insert_text_box(&typing, cx);
+    typing.press(cx, "ctrl-s");
+    cx.run_until_parked();
+    typing.settle(cx);
+    assert_eq!(std::fs::read_to_string(&typing.file).unwrap(), with_shape, "only the shape is saved");
+    assert_eq!(typing.source(cx), with_shape);
+    assert!(!unsaved(&typing, cx));
+    assert_eq!(new_box(&typing, cx), None);
+    assert_eq!(undo_label(&typing, cx), Some("Insert shape"));
+
+    insert_text_box(&typing, cx);
+    typing.press(cx, "f5");
+    assert_eq!(new_box(&typing, cx), None, "a show drops it");
+    assert_eq!(typing.source(cx), with_shape);
+
+    insert_text_box(&typing, cx);
+    typing.with_window(cx, |window, cx| window.dispatch_action(Box::new(ExportPdf), cx));
+    typing.settle(cx);
+    assert_eq!(new_box(&typing, cx), None, "an export drops it");
+    assert_eq!(typing.source(cx), with_shape);
+    assert!(!unsaved(&typing, cx));
+    assert_eq!(undo_label(&typing, cx), Some("Insert shape"));
+}
+
+#[gpui_kit::test]
+fn the_inspector_does_not_show_for_a_pending_box(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    insert_shape(&typing, cx, "rect");
+    assert!(bounds_of(&typing, cx, INSPECTOR_ID).is_some(), "the shape's");
+    insert_text_box(&typing, cx);
+    assert_eq!(selected(&typing, cx), None);
+    assert!(bounds_of(&typing, cx, INSPECTOR_ID).is_none());
+    // A setting changed meanwhile, as from a field, changes nothing and loses nothing.
+    let with_shape = typing.source(cx);
+    let document = typing.document(cx);
+    let changed = cx.update(|cx| document.update(cx, |document, _| document.set_selected_attr("w", Some("700"))));
+    assert_eq!(changed, Ok(Vec::new()));
+    assert_eq!(typing.source(cx), with_shape);
+    assert_eq!(undo_label(&typing, cx), Some("Insert shape"));
+}
+
+#[gpui_kit::test]
+fn a_dead_key_into_a_pending_box_writes_the_composed_character(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    insert_text_box(&typing, cx);
+    compose(&typing, cx, "´");
+    assert_eq!(typing.source(cx), TALK, "what's composed isn't written");
+    assert!(new_box(&typing, cx).is_some());
+    commit(&typing, cx, "é");
+    assert_eq!(typing.source(cx), written_box("é"));
+    assert_eq!(undo_label(&typing, cx), Some("Insert text box"));
+}
+
+#[gpui_kit::test]
+fn pasting_text_into_a_pending_box_writes_it(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    insert_text_box(&typing, cx);
+    put_on_clipboard(cx, vec![ClipboardEntry::String("Pasted words".to_string().into())]);
+    typing.press(cx, "ctrl-v");
+    assert_eq!(typing.source(cx), written_box("Pasted words"));
+    assert_eq!(undo_label(&typing, cx), Some("Insert text box"));
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), TALK);
+    assert!(!can_undo(&typing, cx));
+
+    // A picture drops the box, and goes on the slide.
+    insert_text_box(&typing, cx);
+    put_on_clipboard(cx, vec![picture_entry(png(100, 100, [255, 0, 0, 255]))]);
+    typing.press(cx, "ctrl-v");
+    assert_eq!(new_box(&typing, cx), None);
+    let line = "<Picture src=\"assets/pasted-picture.png\" x=\"910\" y=\"490\" w=\"100\" h=\"100\" />";
+    assert_eq!(typing.source(cx), with_inserted(line));
+}
+
+#[gpui_kit::test]
+fn an_emptied_text_box_stays_as_an_empty_box(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
     insert_text_box(&typing, cx);
     typing.type_text(cx, "ab");
     typing.press(cx, "backspace");
     typing.press(cx, "backspace");
-    let middle = typing.at(cx, 100., 1000.);
-    typing.click(cx, middle);
+    typing.press(cx, "escape");
+    let source = typing.source(cx);
+    assert!(source.contains("<Box x=\"640\" y=\"440\" w=\"640\" h=\"200\">"), "{source}");
+    // An ordinary box: it can be picked and taken away.
+    let start = source.find("<Box").unwrap();
+    let end = source.find("</Box>").unwrap() + "</Box>".len();
+    let document = typing.document(cx);
+    assert!(cx.update(|cx| document.update(cx, |document, _| document.select(0, start..end))));
+    let taken = cx.update(|cx| document.update(cx, |document, _| document.delete_selected()));
+    assert!(taken.is_ok());
     assert_eq!(typing.source(cx), TALK);
-    assert!(!can_undo(&typing, cx), "nothing to undo");
+}
+
+#[gpui_kit::test]
+fn a_pending_box_schedules_only_the_caret_blink(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    insert_text_box(&typing, cx);
+    let editor = editor(&typing, cx);
+    // Past the time the caret blinks for, nothing more is drawn.
+    wait(cx, 11_000);
+    let (count, _watching) = redraws(cx, &editor);
+    let (doc_count, _watching_doc) = redraws(cx, &typing.document(cx));
+    wait(cx, 3_000);
+    assert_eq!(count.get(), 0, "the editor is idle");
+    assert_eq!(doc_count.get(), 0, "the talk is idle");
+    assert!(new_box(&typing, cx).is_some(), "still waiting");
+}
+
+#[gpui_kit::test]
+fn more_than_twenty_dropped_files_take_the_first_twenty(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    let dir = tempfile::tempdir().unwrap();
+    let paths: Vec<PathBuf> = (0..21).map(|at| outside_file(&dir, &format!("p{at}.png"), &png(10, 10, [at as u8, 0, 0, 255]))).collect();
+    let middle = typing.at(cx, 960., 540.);
+    drop_at(&typing, cx, &paths, middle);
+    assert_eq!(typing.source(cx).matches("<Picture").count(), 20);
+    assert_eq!(typing.status(cx).as_deref(), Some(ONLY_THE_FIRST));
+    assert_eq!(ONLY_THE_FIRST, "Only the first 20 pictures were added.");
+    assert_eq!(DIALOG_FAILED, "The picture couldn't be opened.");
 }
 
 // ---------------------------------------------------------------------------------------
@@ -557,7 +780,7 @@ fn the_insert_tab_fits_at_800_pixels_or_scrolls(cx: &mut TestAppContext) {
     }
     // The tools work from there.
     click_on(&typing, cx, INSERT_TEXT_BOX_ID);
-    assert!(typing.source(cx).contains("<Box"));
+    assert!(new_box(&typing, cx).is_some());
 }
 
 // ---------------------------------------------------------------------------------------

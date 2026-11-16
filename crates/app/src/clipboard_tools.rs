@@ -45,21 +45,20 @@ pub(crate) enum ClipboardThing {
     Paths(Vec<PathBuf>),
 }
 
-/// The picture on the clipboard `item`, or else the files it names, if it holds either.
-pub(crate) fn picture_or_files(item: &ClipboardItem) -> Option<ClipboardThing> {
-    let entries = item.entries();
-    let picture = entries.iter().find_map(|entry| match entry {
-        ClipboardEntry::Image(image) => Some(ClipboardThing::Picture(image.clone())),
-        _ => None,
-    });
-    picture.or_else(|| {
-        entries.iter().find_map(|entry| match entry {
-            ClipboardEntry::ExternalPaths(paths) if !paths.paths().is_empty() => {
-                Some(ClipboardThing::Paths(paths.paths().to_vec()))
+/// The picture on the clipboard `item`, or else the files it names, if it holds either. The
+/// picture's bytes are moved out, not copied.
+pub(crate) fn picture_or_files(item: ClipboardItem) -> Option<ClipboardThing> {
+    let mut paths = None;
+    for entry in item.into_entries() {
+        match entry {
+            ClipboardEntry::Image(image) => return Some(ClipboardThing::Picture(image)),
+            ClipboardEntry::ExternalPaths(found) if paths.is_none() && !found.paths().is_empty() => {
+                paths = Some(ClipboardThing::Paths(found.paths().to_vec()));
             }
-            _ => None,
-        })
-    })
+            _ => {}
+        }
+    }
+    paths
 }
 
 /// Whether the clipboard `item` holds text.
