@@ -9,7 +9,7 @@ use typing::*;
 
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
-    ClipboardItem, Context, ElementId, Entity, EntityInputHandler as _, InputEvent as _, Modifiers, MouseMoveEvent,
+    ClipboardEntry, ClipboardItem, Image, ImageFormat, Context, ElementId, Entity, EntityInputHandler as _, InputEvent as _, Modifiers, MouseMoveEvent,
     TestAppContext, Window,
 };
 use slides_engine::Hit;
@@ -17,9 +17,9 @@ use slides_format::{FlowPlace, Pos, new_table};
 use stagepack_studio::insert_tools::INSERT_TABLE_ID;
 use stagepack_studio::inspector::{INSPECTOR_HEADING_ID, INSPECTOR_ID, INSPECTOR_MESSAGE_ID};
 use stagepack_studio::ribbon::{MORE_RIGHT_ID, RIBBON_ID, TAB_INSERT_ID};
-use stagepack_studio::slide_editor::SlideEditor;
+use stagepack_studio::slide_editor::{EditorEvent, SlideEditor};
 use stagepack_studio::table_tools::{
-    HEADING_ROW_STAYS, LONG_ROW, MOST_COLUMNS, MOST_ROWS, ONE_COLUMN_STAYS, TABLE_COLUMN_LEFT_ID,
+    CLICK_IN_A_CELL, HEADING_ROW_STAYS, LONG_ROW, MOST_COLUMNS, MOST_ROWS, ONE_COLUMN_STAYS, TABLE_COLUMN_LEFT_ID,
     TABLE_COLUMN_RIGHT_ID, TABLE_DELETE_COLUMN_ID, TABLE_DELETE_ROW_ID, TABLE_GRID_SIZE_ID, TABLE_ROW_ABOVE_ID,
     TABLE_ROW_BELOW_ID, TABLE_TOOLS_ID, grid_id,
 };
@@ -34,6 +34,8 @@ const TALK: &str = "---\ntitle: T\n---\n\n# One\n\nSome words\n\n---\n\n# Two\n"
 const SHOWCASE: &str = include_str!("../../../fixtures/showcase/slides.md");
 /// The showcase's slide of shapes, an icon, a picture and a table.
 const THINGS: usize = 5;
+const NOT_MADE: &str = "That change couldn't be made, so nothing was changed.";
+const BROKE_A_SLIDE: &str = "That change would have broken a slide, so it wasn't made.";
 const CELL_WITH_MORE: &str = "This cell holds more than text, so it can't be typed in yet.";
 
 /// The talk `source` in a window that's the active one, as a window being used is.
@@ -264,8 +266,51 @@ fn a_table_that_does_not_fit_on_the_slide_is_refused(cx: &mut TestAppContext) {
     click_on(&typing, cx, grid_id(8, 6));
     assert_eq!(typing.source(cx), source);
     assert!(!can_undo(&typing, cx));
-    let said = typing.status(cx).unwrap_or_default();
-    assert!(said.ends_with("so it wasn't made.") || said.ends_with("nothing was changed."), "{said}");
+    assert_eq!(typing.status(cx).as_deref(), Some(NOT_MADE));
+}
+
+#[gpui_kit::test]
+fn a_row_or_a_column_that_does_not_fit_on_the_slide_is_refused(cx: &mut TestAppContext) {
+    // A slide a few bytes short of the most a slide can hold.
+    // The words are in the notes, so the table is on the slide where it can be clicked.
+    let table = "| a | b |\n| --- | --- |\n| 1 | 2 |\n";
+    let frame = "# T\n\n\n<Notes>\n\n</Notes>\n";
+    let short = slides_format::MAX_SLIDE_BYTES - frame.len() - table.len() - 3;
+    let words = "word ".repeat(short / 5 + 1);
+    let source = format!("# T\n\n{table}\n<Notes>\n{}\n</Notes>\n", &words[..short]);
+    assert_eq!(source.len(), slides_format::MAX_SLIDE_BYTES - 3);
+    let typing = open(cx, &source);
+    for tool in [TABLE_ROW_BELOW_ID, TABLE_COLUMN_RIGHT_ID] {
+        click_cell(&typing, cx, 1, 0);
+        click_in(&typing, cx, RIBBON_ID, tool);
+        assert_eq!(typing.source(cx), source, "{tool}");
+        assert!(!can_undo(&typing, cx), "{tool}");
+        assert_eq!(typing.status(cx).as_deref(), Some(NOT_MADE), "{tool}");
+    }
+}
+
+#[gpui_kit::test]
+fn the_new_table_takes_the_caret_wherever_it_goes(cx: &mut TestAppContext) {
+    let only_settings = "---\ntitle: T\n---\n\n# One\n\n---\nlayout: content\n---\n";
+    let with_notes = "# One\n\nWords\n\n<Notes>\nSay this.\n</Notes>\n";
+    let two_columns = "---\nlayout: two-columns\n---\n\n# T\n\nLeft\n\n<Region name=\"right\" />\n\nRight\n";
+    for (source, slide) in [(only_settings, 1), (with_notes, 0), (two_columns, 0)] {
+        let typing = open(cx, source);
+        for _ in 0..slide {
+            typing.press(cx, "pagedown");
+        }
+        open_grid(&typing, cx);
+        hover(&typing, cx, grid_id(2, 1));
+        click_on(&typing, cx, grid_id(2, 1));
+        assert!(typing.source(cx).contains(&new_table(2, 1).unwrap()), "{source}: {}", typing.source(cx));
+        assert_eq!(at_cell(&typing, cx), Some((0, 0)), "{source}: in the first heading cell");
+        assert_eq!(typing.selection(cx), caret_at(pos(0, 0)));
+        typing.type_text(cx, "H");
+        assert!(typing.source(cx).contains("| H |  |\n| --- | --- |"), "{source}: {}", typing.source(cx));
+        if source == with_notes {
+            assert!(typing.source(cx).ends_with("<Notes>\nSay this.\n</Notes>\n"), "the notes stay last");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -506,19 +551,16 @@ fn the_table_tools_show_only_for_a_table(cx: &mut TestAppContext) {
     assert!(shown_in(&typing, cx, RIBBON_ID, TABLE_TOOLS_ID));
     assert!(shown_in(&typing, cx, INSPECTOR_ID, TABLE_TOOLS_ID));
     assert_eq!(label_of(&typing, cx, INSPECTOR_HEADING_ID).as_deref(), Some("Table"));
-    assert_eq!(label_of(&typing, cx, INSPECTOR_MESSAGE_ID).as_deref(), Some("2 columns, 2 rows"));
+    assert_eq!(label_of(&typing, cx, INSPECTOR_MESSAGE_ID).as_deref(), Some("2 columns, 1 row"), "as the grid counts");
     // The tools follow the table as it grows.
     click_in(&typing, cx, INSPECTOR_ID, TABLE_ROW_BELOW_ID);
-    assert_eq!(label_of(&typing, cx, INSPECTOR_MESSAGE_ID).as_deref(), Some("2 columns, 3 rows"));
-    // Selected, the table has them too, and they act on its last row and column.
+    assert_eq!(label_of(&typing, cx, INSPECTOR_MESSAGE_ID).as_deref(), Some("2 columns, 2 rows"));
+    // Selected, the table has them too.
     typing.press(cx, "escape");
     assert!(selected(&typing, cx).is_some(), "Escape in a cell selects its table");
     assert!(typing.editing(cx).is_none());
     assert!(shown_in(&typing, cx, RIBBON_ID, TABLE_TOOLS_ID));
-    click_in(&typing, cx, RIBBON_ID, TABLE_DELETE_ROW_ID);
-    assert_eq!(typing.source(cx), "# T\n\nWords\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n");
-    let source = typing.source(cx);
-    assert_eq!(selected(&typing, cx).map(|range| source[range].to_string()).as_deref(), Some("| a | b |\n| --- | --- |\n| 1 | 2 |"), "it stays selected");
+    assert!(shown_in(&typing, cx, INSPECTOR_ID, TABLE_TOOLS_ID));
     typing.press(cx, "escape");
     assert!(selected(&typing, cx).is_none(), "Escape again lets it go");
     assert!(!shown_in(&typing, cx, RIBBON_ID, TABLE_TOOLS_ID));
@@ -581,10 +623,14 @@ fn the_tools_are_off_when_they_cannot_be_done(cx: &mut TestAppContext) {
     }));
     typing.settle(cx);
     assert_eq!(at_cell(&typing, cx), Some((50, 1)));
+    let said = said_count(&typing, cx, MOST_ROWS);
     typing.press(cx, "tab");
+    assert_eq!(said.0.get(), 1, "said once");
     typing.press(cx, "enter");
+    assert_eq!(said.0.get(), 2, "and once again");
     assert_eq!(typing.source(cx), long, "nor does Tab or Enter add one");
     assert_eq!(typing.status(cx).as_deref(), Some(MOST_ROWS));
+    assert!(!can_undo(&typing, cx), "and no step is made");
 
     // A row longer than the heading leaves the columns as they are.
     let ragged = "# T\n\n| a | b |\n| --- | --- |\n| 1 | 2 | 3 |\n";
@@ -727,4 +773,132 @@ fn a_dead_key_in_a_cell_composes(cx: &mut TestAppContext) {
     assert_eq!(typing.selection(cx), caret_at(Pos { para: 0, offset: 1 + "é".len() }));
     assert!(typing.editing(cx).is_some_and(|editing| editing.composing.is_none()));
     assert_eq!(at_cell(&typing, cx), Some((1, 0)));
+}
+
+// ---------------------------------------------------------------------------------------
+// Fix round 1
+
+/// Counts how often the editor says `sentence` from now on.
+fn said_count(typing: &Typing, cx: &mut TestAppContext, sentence: &'static str) -> (std::rc::Rc<std::cell::Cell<usize>>, gpui_kit::Subscription) {
+    let count = std::rc::Rc::new(std::cell::Cell::new(0));
+    let counter = count.clone();
+    let editor = editor(typing, cx);
+    let watching = cx.update(|cx| {
+        cx.subscribe(&editor, move |_, event: &EditorEvent, _| {
+            if matches!(event, EditorEvent::Said(said) if said.as_ref() == sentence) {
+                counter.set(counter.get() + 1);
+            }
+        })
+    });
+    (count, watching)
+}
+
+/// How many columns the current slide's first table has, and how many rows under its heading.
+fn size(typing: &Typing, cx: &TestAppContext) -> (usize, usize) {
+    let slide = typing.current(cx);
+    let cells: Vec<(usize, usize)> = typing
+        .flows(cx, slide)
+        .iter()
+        .filter_map(|flow| match flow.place {
+            FlowPlace::Cell { row, column, .. } => Some((row, column)),
+            _ => None,
+        })
+        .collect();
+    let columns = cells.iter().filter(|(row, _)| *row == 0).count();
+    let rows = cells.iter().map(|(row, _)| *row).max().unwrap_or(0);
+    (columns, rows)
+}
+
+#[gpui_kit::test]
+fn a_colour_held_for_a_cell_is_written_before_a_tool_acts(cx: &mut TestAppContext) {
+    // The tool or the key, the cell typed in, what the table then is, and where the caret goes.
+    type Cell = (usize, usize);
+    type Case = (Option<&'static str>, Option<&'static str>, Cell, Cell, Cell);
+    let cases: [Case; 8] = [
+        (Some(TABLE_ROW_BELOW_ID), None, (1, 0), (2, 2), (2, 0)),
+        (Some(TABLE_ROW_ABOVE_ID), None, (1, 0), (2, 2), (1, 0)),
+        (Some(TABLE_COLUMN_LEFT_ID), None, (1, 0), (3, 1), (1, 0)),
+        (Some(TABLE_COLUMN_RIGHT_ID), None, (1, 0), (3, 1), (1, 1)),
+        (Some(TABLE_DELETE_ROW_ID), None, (1, 0), (2, 0), (0, 0)),
+        (Some(TABLE_DELETE_COLUMN_ID), None, (1, 0), (1, 1), (1, 0)),
+        (None, Some("tab"), (1, 1), (2, 2), (2, 0)),
+        (None, Some("enter"), (1, 1), (2, 2), (2, 1)),
+    ];
+    for (tool, key, cell, after, caret) in cases {
+        let what = tool.or(key).unwrap();
+        let typing = open(cx, TABLE);
+        click_cell(&typing, cx, cell.0, cell.1);
+        typing.press(cx, "shift-home");
+        system(&typing, cx, |editor, _, cx| editor.hold_color("#ff0000".into(), cx));
+        match (tool, key) {
+            (Some(tool), _) => click_in(&typing, cx, RIBBON_ID, tool),
+            (_, Some(key)) => typing.press(cx, key),
+            _ => unreachable!(),
+        }
+        assert_ne!(typing.status(cx).as_deref(), Some(BROKE_A_SLIDE), "{what}");
+        assert_eq!(size(&typing, cx), after, "{what}: the tool acted");
+        assert_eq!(at_cell(&typing, cx), Some(caret), "{what}: where the caret goes");
+        undo(&typing, cx);
+        assert!(typing.source(cx).contains("#ff0000"), "{what}: the colour was written first: {}", typing.source(cx));
+        assert_eq!(size(&typing, cx), (2, 1), "{what}: undone, the table is as it was");
+        assert_eq!(at_cell(&typing, cx), Some(cell), "{what}: and the caret is back");
+        undo(&typing, cx);
+        assert_eq!(typing.source(cx), TABLE, "{what}: the colour was a step of its own");
+    }
+}
+
+#[gpui_kit::test]
+fn a_selected_table_is_added_to_at_its_end(cx: &mut TestAppContext) {
+    let source = "# T\n\nWords\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n";
+    for scope in [RIBBON_ID, INSPECTOR_ID] {
+        let typing = open(cx, source);
+        let at = border_point(&typing, cx);
+        typing.click(cx, at);
+        assert!(selected(&typing, cx).is_some());
+        for tool in [TABLE_ROW_ABOVE_ID, TABLE_COLUMN_LEFT_ID, TABLE_DELETE_ROW_ID, TABLE_DELETE_COLUMN_ID] {
+            assert!(disabled(&typing, cx, scope, tool), "{tool} in {scope}");
+            assert_eq!(tip(&typing, cx, scope, tool).as_deref(), Some(CLICK_IN_A_CELL), "{tool} in {scope}");
+        }
+        assert_eq!(tip(&typing, cx, scope, TABLE_ROW_BELOW_ID).as_deref(), Some("Add a row at the end"));
+        assert_eq!(tip(&typing, cx, scope, TABLE_COLUMN_RIGHT_ID).as_deref(), Some("Add a column at the end"));
+        click_in(&typing, cx, scope, TABLE_DELETE_ROW_ID);
+        assert_eq!(typing.source(cx), source, "{scope}: an off tool does nothing");
+        click_in(&typing, cx, scope, TABLE_ROW_BELOW_ID);
+        let grown = "# T\n\nWords\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n|  |  |\n";
+        assert_eq!(typing.source(cx), grown, "{scope}");
+        let now = typing.source(cx);
+        assert_eq!(
+            selected(&typing, cx).map(|range| now[range].to_string()).as_deref(),
+            Some("| a | b |\n| --- | --- |\n| 1 | 2 |\n|  |  |"),
+            "{scope}: it stays selected"
+        );
+        assert!(typing.editing(cx).is_none(), "{scope}: and nothing is typed in");
+        click_in(&typing, cx, scope, TABLE_COLUMN_RIGHT_ID);
+        assert_eq!(typing.source(cx), "# T\n\nWords\n\n| a | b |  |\n| --- | --- | --- |\n| 1 | 2 |  |\n|  |  |  |\n", "{scope}");
+        assert!(selected(&typing, cx).is_some(), "{scope}");
+        undo(&typing, cx);
+        undo(&typing, cx);
+        assert_eq!(typing.source(cx), source, "{scope}: a step each");
+        assert!(selected(&typing, cx).is_some(), "{scope}: undone, it's still selected");
+    }
+}
+
+#[gpui_kit::test]
+fn a_picture_pasted_while_typing_in_a_cell_is_its_own_step(cx: &mut TestAppContext) {
+    let typing = open(cx, TABLE);
+    click_cell(&typing, cx, 1, 0);
+    typing.type_text(cx, "x");
+    let picture = image::RgbaImage::from_pixel(8, 8, image::Rgba([200, 0, 0, 255]));
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(picture).write_to(&mut png, image::ImageFormat::Png).unwrap();
+    cx.write_to_clipboard(ClipboardItem {
+        entries: vec![ClipboardEntry::Image(Image::from_bytes(ImageFormat::Png, png.into_inner()))],
+    });
+    typing.press(cx, "ctrl-v");
+    assert!(typing.editing(cx).is_none(), "typing ends");
+    assert_eq!(cell_text(&typing, cx, 1, 0), "1x", "the cell keeps its text");
+    assert!(typing.source(cx).contains("<Picture"), "{}", typing.source(cx));
+    assert_eq!(undo_label(&typing, cx), Some("Insert picture"));
+    undo(&typing, cx);
+    assert_eq!(typing.source(cx), TABLE.replacen("| 1 |", "| 1x |", 1), "the picture was its own step");
 }

@@ -579,7 +579,7 @@ fn a_table_and_a_written_picture_say_what_they_are(cx: &mut TestAppContext) {
     go_to(&typing, cx, THINGS);
     select(&typing, cx, "| Layout");
     assert_eq!(label_of(&typing, cx, INSPECTOR_HEADING_ID).as_deref(), Some("Table"));
-    assert_eq!(label_of(&typing, cx, INSPECTOR_MESSAGE_ID).as_deref(), Some("2 columns, 3 rows"));
+    assert_eq!(label_of(&typing, cx, INSPECTOR_MESSAGE_ID).as_deref(), Some("2 columns, 2 rows"));
 
     let source = "# T\n\n![](assets/photo.png)\n";
     let typing = open(cx, source);

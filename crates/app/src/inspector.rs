@@ -950,11 +950,17 @@ fn color_of(value: &str) -> Option<Hsla> {
     Some(rgb(u32::from(color.r) << 16 | u32::from(color.g) << 8 | u32::from(color.b)).into())
 }
 
-/// How big a table with `rows` is, such as "3 columns, 4 rows".
+/// How big a table with `rows` is, as the Insert tab's grid counts: the heading row's columns,
+/// and the rows under it, such as "3 columns, 4 rows", or "3 columns, no rows" for a heading
+/// row alone.
 fn table_size(rows: &[Vec<Vec<Span>>]) -> String {
-    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
-    let counted = |count: usize, one: &str, many: &str| format!("{count} {}", if count == 1 { one } else { many });
-    format!("{}, {}", counted(columns, "column", "columns"), counted(rows.len(), "row", "rows"))
+    let columns = rows.first().map_or(0, Vec::len);
+    let counted = |count: usize, one: &str, many: &str| match count {
+        0 => format!("no {many}"),
+        1 => format!("1 {one}"),
+        count => format!("{count} {many}"),
+    };
+    format!("{}, {}", counted(columns, "column", "columns"), counted(rows.len().saturating_sub(1), "row", "rows"))
 }
 
 impl Render for Inspector {

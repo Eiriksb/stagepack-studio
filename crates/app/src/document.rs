@@ -28,7 +28,7 @@ use crate::palette::{self, COMPONENT_SIZE, LISTED_BUILT_INS};
 pub use crate::palette::PaletteEntry;
 use crate::present::TalkShape;
 use crate::saving::{SaveJob, SaveTarget, Saved};
-use crate::table_tools::{HEADING_ROW_STAYS, LONG_ROW, MOST_COLUMNS, MOST_ROWS, ONE_COLUMN_STAYS};
+use crate::table_tools::{CLICK_IN_A_CELL, HEADING_ROW_STAYS, LONG_ROW, MOST_COLUMNS, MOST_ROWS, ONE_COLUMN_STAYS};
 use crate::selection::{self, SelectMark};
 pub use crate::selection::Selected;
 use crate::text_editing::{
@@ -95,6 +95,8 @@ pub enum EditRefused {
     TooManyRows,
     /// A table with a row of more cells than its heading row can't have its columns changed.
     RowTooLong,
+    /// A table selected with no caret in it has no row or column of its own to act on.
+    NeedsACell,
 }
 
 impl std::fmt::Display for EditRefused {
@@ -122,6 +124,7 @@ impl std::fmt::Display for EditRefused {
             EditRefused::TooManyColumns => MOST_COLUMNS,
             EditRefused::TooManyRows => MOST_ROWS,
             EditRefused::RowTooLong => LONG_ROW,
+            EditRefused::NeedsACell => CLICK_IN_A_CELL,
         })
     }
 }
@@ -1536,31 +1539,28 @@ impl Document {
         let tidied = self.finish_before_edit()?;
         let slide = self.current;
         let change = built(self.talk(), |talk| insert_block(talk, slide, &text))?.ok_or(EditRefused::CouldNotBeMade)?;
-        // Where the table starts once it's written: at its heading row, which is the same in
-        // either line ending.
-        let start = change.edits.first().and_then(|edit| {
-            let heading = text.lines().next()?;
-            Some(edit.range.start + edit.text.find(heading)?)
-        });
+        let before = tables_on(self.talk(), slide);
+        let moved = change.clone();
         self.deselect();
         let depth = self.history.depth();
         let mut changed = self.make(INSERT_TABLE, change, Holds::Slide(slide), slide, slide, None)?;
         if tidied && !changed.contains(&slide) {
             changed.push(slide);
         }
+        // The new table is the one on the slide that isn't one of those it had, moved along.
+        let kept: Vec<Range<usize>> = before.iter().filter_map(|table| selection::moved(table, &moved)).collect();
+        let new = tables_on(self.talk(), slide).into_iter().find(|table| !kept.contains(table));
         if self.history.depth() > depth
-            && let Some(start) = start
+            && let Some(table) = new
         {
-            if let Some(table) = table_starting_at(self.talk(), slide, start) {
-                self.history.select_mark_last(SelectMark { before: None, after: Some(table) });
-            }
-            self.land_in_cell(slide, start, (0, 0), false);
+            self.history.select_mark_last(SelectMark { before: None, after: Some(table.clone()) });
+            self.land_in_cell(slide, table.start, (0, 0), false);
         }
         Ok(changed)
     }
 
     /// The table the table tools are about, if any: the one whose cell the caret is in, or, with
-    /// nothing typed, the table selected, whose last cell they act on. It's worked out once for
+    /// nothing typed, the table selected, which they only add to at its end. It's worked out once for
     /// each state of the text, the text being typed and the thing selected.
     pub fn table_here(&self) -> Option<TableHere> {
         let key = (
@@ -1688,7 +1688,11 @@ impl Document {
             .as_ref()
             .filter(|_| here.caret)
             .map(|editing| (editing.flow.clone(), editing.edit.selection, editing.session));
-        let change = built(self.talk(), |talk| change(talk, slide, &here.table))?.ok_or(EditRefused::CouldNotBeMade)?;
+        // Typing is finished before the change is worked out: that can write a colour held for
+        // the cell, which moves what's after it. The table is found again where it starts.
+        self.finish_before_edit()?;
+        let table = table_starting_at(self.talk(), slide, here.table.start).ok_or(EditRefused::CouldNotBeMade)?;
+        let change = built(self.talk(), |talk| change(talk, slide, &table))?.ok_or(EditRefused::CouldNotBeMade)?;
         let depth = self.history.depth();
         let changed = self.make(label, change, Holds::Slide(slide), slide, slide, None)?;
         let made = self.history.depth() > depth;
@@ -1711,10 +1715,10 @@ impl Document {
                 }
             }
             None => {
-                if let Some(table) = table_starting_at(self.talk(), slide, start) {
-                    self.selected = Some(Selected { slide, source: table.clone() });
+                if let Some(after) = table_starting_at(self.talk(), slide, start) {
+                    self.selected = Some(Selected { slide, source: after.clone() });
                     if made {
-                        self.history.select_mark_last(SelectMark { before: Some(here.table.clone()), after: Some(table) });
+                        self.history.select_mark_last(SelectMark { before: Some(table), after: Some(after) });
                     }
                 }
             }
@@ -2953,7 +2957,8 @@ pub struct TableHere {
     /// The table's whole source.
     pub table: Range<usize>,
     /// The cell's row, the heading row being row 0, and its column: the caret's, or, for a table
-    /// selected with nothing typed, its last row and column.
+    /// selected with nothing typed, its last row and column, where Row below and Column right
+    /// add at its end.
     pub row: usize,
     pub column: usize,
     /// Whether the caret is in that cell.
@@ -2982,6 +2987,8 @@ impl TableHere {
     pub fn why_not(&self, tool: TableTool) -> Option<EditRefused> {
         use TableTool::*;
         match tool {
+            // A table selected, with no caret, is only added to at its end.
+            RowAbove | ColumnLeft | DeleteRow | DeleteColumn if !self.caret => Some(EditRefused::NeedsACell),
             RowAbove | DeleteRow if self.row == 0 => Some(EditRefused::KeepsHeadingRow),
             RowAbove | RowBelow if self.rows >= MAX_TABLE_ROWS => Some(EditRefused::TooManyRows),
             ColumnLeft | ColumnRight | DeleteColumn if self.long_row => Some(EditRefused::RowTooLong),
@@ -3024,6 +3031,25 @@ fn table_starting_at(talk: &Talk, slide: usize, start: usize) -> Option<Range<us
     }
     let slide = talk.slides.get(slide).filter(|slide| slide.error.is_none())?;
     within(&slide.blocks, start)
+}
+
+/// The whole source of each table on slide `slide` of `talk`, at any depth.
+fn tables_on(talk: &Talk, slide: usize) -> Vec<Range<usize>> {
+    fn within(blocks: &[Block], found: &mut Vec<Range<usize>>) {
+        for block in blocks {
+            match block {
+                Block::Table { range, .. } => found.push(range.clone()),
+                Block::Tag(tag) => within(&tag.children, found),
+                Block::List { items, .. } => items.iter().for_each(|item| within(item, found)),
+                _ => {}
+            }
+        }
+    }
+    let mut found = Vec::new();
+    if let Some(slide) = talk.slides.get(slide).filter(|slide| slide.error.is_none()) {
+        within(&slide.blocks, &mut found);
+    }
+    found
 }
 
 /// Where the end of `paras` is.

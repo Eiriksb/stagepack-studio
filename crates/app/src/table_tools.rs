@@ -36,6 +36,7 @@ pub const HEADING_ROW_STAYS: &str = "A table keeps its heading row.";
 pub const ONE_COLUMN_STAYS: &str = "A table keeps at least one column.";
 pub const MOST_COLUMNS: &str = "A table can have 20 columns at most.";
 pub const MOST_ROWS: &str = "A table can have 50 rows at most.";
+pub const CLICK_IN_A_CELL: &str = "Click in a cell first.";
 pub const LONG_ROW: &str = "This table has a row with more cells than its heading, so columns can't be changed here.";
 
 /// What the grid says before a square is pointed at.
@@ -83,6 +84,12 @@ fn buttons(here: &TableHere) -> Vec<AnyElement> {
         .into_iter()
         .map(|(tool, id, icon, label, tip, action)| {
             let why = here.why_not(tool);
+            // A table selected, with no caret in it, is added to at its end.
+            let tip = match tool {
+                TableTool::RowBelow if !here.caret => "Add a row at the end",
+                TableTool::ColumnRight if !here.caret => "Add a column at the end",
+                _ => tip,
+            };
             let tip: SharedString = why.map_or_else(|| tip.into(), |why| why.to_string().into());
             Button::new(id)
                 .ghost()
