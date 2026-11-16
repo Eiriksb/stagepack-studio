@@ -510,9 +510,10 @@ impl Document {
     }
 
     /// Slide `index` drawn `width` device pixels wide, to stand for it in a list, or `None` if
-    /// the talk has no such slide.
+    /// the talk has no such slide, or drawing it goes wrong.
     pub fn thumbnail(&mut self, index: usize, width: u32) -> Option<Arc<Pixmap>> {
-        self.deck.thumbnail(index, width)
+        let deck = &mut self.deck;
+        laid_out(|| deck.thumbnail(index, width)).flatten()
     }
 
     /// What slide `index` is at the moment: a number that changes whenever anything that
@@ -531,10 +532,15 @@ impl Document {
         self.deck.drawn_thumbnail(index, width)
     }
 
-    /// What the user should hear about the current slide.
+    /// What the user should hear about the current slide. If laying it out goes wrong, there
+    /// are none, and [`Self::take_message`] says so, as for [`Self::editor_layers`].
     pub fn notices(&mut self) -> Vec<String> {
+        let (deck, current) = (&mut self.deck, self.current);
         // The window shows the slide in its whole state, so these are its notices.
-        self.deck.notices_whole(self.current)
+        laid_out(|| deck.notices_whole(current)).unwrap_or_else(|| {
+            self.layout_failed();
+            Vec::new()
+        })
     }
 
     pub fn source(&self) -> &str {
