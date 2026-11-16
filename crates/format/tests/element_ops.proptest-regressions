@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 430ddd4030e6a1a626ccfe5fd993fa76f4275d7abacb61c37e77e7720eb90b7a # shrinks to generated = GenTalk { slides: [GenSlide { settings: [], blocks: ["<Icon name=\"star\" />"], notes: None, blank_after: false, notes_layout: NotesLayout { after_blocks: 0, indented: false, tight_before: false, tight_after: false }, key_values: false }], crlf: false, bom: false, final_newline: false, opening_rule: false, tail: None }, which = 0, name = "name", value = "&a"

@@ -1179,7 +1179,7 @@ fn region_change(talk: &Talk, index: usize, region: &str, paras: &[Para]) -> Opt
         return None;
     }
     let new = storable(paras);
-    let (regions, main) = layout_of(slide);
+    let (regions, _) = layout_of(slide);
     if !regions.contains(&region) || has_content(slide, region) {
         return None;
     }
@@ -1206,10 +1206,34 @@ fn region_change(talk: &Talk, index: usize, region: &str, paras: &[Para]) -> Opt
         text.push_str(&block_text(para, shapes[j].as_ref(), &src, None)?);
     }
     let source = &talk.source;
+    let edit = empty_region_edit(source, slide, region, &text, eol)?;
+    let change = Change::single(edit);
+    let mut expected: Vec<(FlowPlace, Vec<Para>)> =
+        text_flows(talk, index).into_iter().map(|flow| (flow.place, flow.paras)).collect();
+    // The new flow sits wherever it reads: find it, and check the rest are as they were.
+    let new_text = {
+        let local = SourceEdit {
+            range: change.edits[0].range.start - slide.range.start..change.edits[0].range.end - slide.range.start,
+            text: change.edits[0].text.clone(),
+        };
+        local.apply(source.get(slide.range.clone())?)
+    };
+    let read = parse_talk(&new_text);
+    let place = FlowPlace::Region(region.to_string());
+    let at = text_flows(&read, 0).iter().position(|flow| flow.place == place && flow.paras == new)?;
+    expected.insert(at.min(expected.len()), (place, new));
+    reads_as(talk, slide, &change, &expected).then_some(change)
+}
+
+/// The edit that puts `text`, blocks with the talk's line ending `eol`, into region `region`
+/// of `slide`, a region of its layout with nothing in it: as [`write_into_region`] places a
+/// region's first text.
+pub(crate) fn empty_region_edit(source: &str, slide: &Slide, region: &str, text: &str, eol: &str) -> Option<SourceEdit> {
+    let (_, main) = layout_of(slide);
     let body = body_start(source, slide)?;
     let after_blocks = slide.blocks.last().map(|block| block.range().end);
     // At the end of a line that may have no line ending, and before what follows.
-    let at_end = |at: usize, what: String| {
+    let at_end = |at: usize, what: &str| {
         let lead = if at == 0 || source[..at].ends_with('\n') { "" } else { eol };
         SourceEdit { range: at..at, text: format!("{lead}{what}{eol}") }
     };
@@ -1220,7 +1244,7 @@ fn region_change(talk: &Talk, index: usize, region: &str, paras: &[Para]) -> Opt
         })
     };
     let has_markers = slide.blocks.iter().any(|block| matches!(block, Block::Region { .. }));
-    let edit = if region == "title" {
+    Some(if region == "title" {
         let rest = source.get(body..slide.range.end)?;
         // A blank line under the slide's opening lines stays above the title, as a person
         // would write it.
@@ -1263,29 +1287,13 @@ fn region_change(talk: &Talk, index: usize, region: &str, paras: &[Para]) -> Opt
         let marker = format!("<Region name=\"{region}\" />{eol}{eol}{text}");
         match after_blocks {
             Some(end) => SourceEdit { range: end..end, text: format!("{eol}{eol}{marker}") },
-            None => at_end(body, marker),
+            None => at_end(body, &marker),
         }
-    };
-    let change = Change::single(edit);
-    let mut expected: Vec<(FlowPlace, Vec<Para>)> =
-        text_flows(talk, index).into_iter().map(|flow| (flow.place, flow.paras)).collect();
-    // The new flow sits wherever it reads: find it, and check the rest are as they were.
-    let new_text = {
-        let local = SourceEdit {
-            range: change.edits[0].range.start - slide.range.start..change.edits[0].range.end - slide.range.start,
-            text: change.edits[0].text.clone(),
-        };
-        local.apply(source.get(slide.range.clone())?)
-    };
-    let read = parse_talk(&new_text);
-    let place = FlowPlace::Region(region.to_string());
-    let at = text_flows(&read, 0).iter().position(|flow| flow.place == place && flow.paras == new)?;
-    expected.insert(at.min(expected.len()), (place, new));
-    reads_as(talk, slide, &change, &expected).then_some(change)
+    })
 }
 
 /// Where a slide's body starts: after its settings, or its break line, if it has either.
-fn body_start(source: &str, slide: &Slide) -> Option<usize> {
+pub(crate) fn body_start(source: &str, slide: &Slide) -> Option<usize> {
     if let Some(settings) = &slide.settings {
         return Some(settings.range.end);
     }
@@ -1299,23 +1307,27 @@ fn body_start(source: &str, slide: &Slide) -> Option<usize> {
 
 /// Whether anything on `slide` is drawn in `region`, as the engine sends blocks to regions.
 fn has_content(slide: &Slide, region: &str) -> bool {
+    block_regions(slide).contains(&Some(region))
+}
+
+/// The region each of the slide's blocks is drawn in, as the engine sends blocks to regions:
+/// none for a `<Region>` line or a tag with a place of its own.
+pub(crate) fn block_regions(slide: &Slide) -> Vec<Option<&'static str>> {
     let (regions, main) = layout_of(slide);
     let mut title = regions.contains(&"title").then_some("title");
     let mut current = main;
-    for block in &slide.blocks {
-        let place = match block {
+    slide
+        .blocks
+        .iter()
+        .map(|block| match block {
             Block::Region { name, .. } => {
                 title = None;
                 current = regions.iter().find(|known| *known == name).copied().unwrap_or(main);
-                continue;
+                None
             }
-            Block::Tag(tag) if is_positioned(tag) => continue,
-            Block::Heading { .. } => title.take().unwrap_or(current),
-            _ => current,
-        };
-        if place == region {
-            return true;
-        }
-    }
-    false
+            Block::Tag(tag) if is_positioned(tag) => None,
+            Block::Heading { .. } => Some(title.take().unwrap_or(current)),
+            _ => Some(current),
+        })
+        .collect()
 }

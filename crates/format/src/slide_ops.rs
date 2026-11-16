@@ -309,7 +309,7 @@ fn without_notes(source: &str, raw: &RawSlide, mut removal: SourceEdit, eol: &st
 }
 
 /// Whether two lists of blocks say the same, wherever they are in the file.
-fn blocks_alike(a: &[Block], b: &[Block]) -> bool {
+pub(crate) fn blocks_alike(a: &[Block], b: &[Block]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(a, b)| block_alike(a, b))
 }
 

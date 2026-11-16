@@ -132,26 +132,47 @@ pub fn cases(default: u32) -> u32 {
 }
 
 pub fn block() -> impl Strategy<Value = String> {
-    prop::sample::select(vec![
-        "## A heading".to_string(),
-        "Some *text* with trailing spaces  ".to_string(),
-        "A paragraph\nover two lines.".to_string(),
-        "- one\n- two".to_string(),
-        "1. first\n2. second".to_string(),
-        // Lists as people indent them by hand: four spaces or a tab in, one space in, and
-        // straight under a paragraph's line.
-        "- a\n    - deep\n- b".to_string(),
-        "- a\n\t- deep\n- b".to_string(),
-        "1. a\n    - nested\n    1. one\n2. b".to_string(),
-        " - a\n - b".to_string(),
-        "Intro:\n- a\n- b".to_string(),
-        "- a\n    - b\n        - c\n- d".to_string(),
-        "- &nbsp;\n  - under\n- c".to_string(),
-        "```\n---\ncode\n```".to_string(),
-        "~~~md\n---\n~~~".to_string(),
-        "> A quote".to_string(),
-    ])
+    prop::sample::select(
+        vec![
+            "## A heading".to_string(),
+            "Some *text* with trailing spaces  ".to_string(),
+            "A paragraph\nover two lines.".to_string(),
+            "- one\n- two".to_string(),
+            "1. first\n2. second".to_string(),
+            // Lists as people indent them by hand: four spaces or a tab in, one space in, and
+            // straight under a paragraph's line.
+            "- a\n    - deep\n- b".to_string(),
+            "- a\n\t- deep\n- b".to_string(),
+            "1. a\n    - nested\n    1. one\n2. b".to_string(),
+            " - a\n - b".to_string(),
+            "Intro:\n- a\n- b".to_string(),
+            "- a\n    - b\n        - c\n- d".to_string(),
+            "- &nbsp;\n  - under\n- c".to_string(),
+            "```\n---\ncode\n```".to_string(),
+            "~~~md\n---\n~~~".to_string(),
+            "> A quote".to_string(),
+        ]
+        .into_iter()
+        .chain(TAG_BLOCKS.iter().map(|block| block.to_string()))
+        .collect::<Vec<_>>(),
+    )
 }
+
+/// Tags and other blocks that aren't text, as people write them by hand.
+pub const TAG_BLOCKS: [&str; 12] = [
+    "<Icon name=\"star\" />",
+    "<Box x=\"10\" y=\"20\" w=\"30\">\n\nIn a *box*\n\n</Box>",
+    "<Shape\n  kind=\"circle\"\n  color=\"red\"\n/>",
+    "<Icon name='a \"quoted\" star' size=\"2\" />",
+    "<Icon name=\"first\" flag name=\"second\" />",
+    "<Icon name=\"one\" />\n<Icon name=\"two\" />",
+    "- an item\n\n  <Icon name=\"in-a-list\" />",
+    "<Box>\n\n<Icon name=\"in-a-box\" />\n\n</Box>",
+    "![A cat](cat.png)",
+    "| a | b |\n| --- | --- |\n| 1 | 2 |",
+    "<Chart\tdata=\"x.csv\"   tall >\n\nSome words\n\n</Chart>",
+    "<Region name=\"right\" />",
+];
 
 pub fn slide_settings() -> impl Strategy<Value = Vec<(String, String)>> {
     prop::sample::subsequence(vec![("layout", "section  "), ("hidden", "true"), ("transition", "fade")], 0..=3)

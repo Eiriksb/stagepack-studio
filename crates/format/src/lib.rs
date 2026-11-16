@@ -2,6 +2,7 @@
 
 mod attrs;
 mod edit;
+mod element_ops;
 mod model;
 mod notes;
 mod parse;
@@ -14,6 +15,7 @@ mod slide_ops;
 mod split;
 
 pub use edit::{Change, SourceEdit, set_attr, set_setting};
+pub use element_ops::{NewTag, block_text, delete_block, find_tag, insert_block, insert_block_in_region, set_tag_attr, tag_text};
 pub use model::{Attr, Block, Notes, Slide, SlideError, Span, Style, Tag, Talk};
 pub use parse::{MAX_BODY as MAX_SLIDE_BYTES, parse_talk, slides_parsed_on_this_thread};
 pub use reparse::reparse;
