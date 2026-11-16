@@ -180,7 +180,7 @@ fn text_goes_into_an_empty_title_as_a_heading() {
     let talk = parse_talk(source);
     let title = [para(ParaKind::Heading(1), "Hello")];
     let after = write_into_region(&talk, 0, "title", &title).unwrap().apply(source);
-    assert_eq!(after, "---\nlayout: content\n---\n# Hello\n\nBody text.\n");
+    assert_eq!(after, "---\nlayout: content\n---\n\n# Hello\n\nBody text.\n", "the blank line stays above it");
     let flows = text_flows(&parse_talk(&after), 0);
     assert_eq!(flows[flow_in(&flows, "title")].paras, title);
 
@@ -188,6 +188,16 @@ fn text_goes_into_an_empty_title_as_a_heading() {
     let talk = parse_talk(empty);
     let after = write_into_region(&talk, 1, "title", &title).unwrap().apply(empty);
     assert_eq!(after, "# A\n\n---\n# Hello\n");
+
+    // A new slide, as the app adds it, between two others.
+    let new = "# A\n\n---\nlayout: title\n---\n\n---\n\n# B\n";
+    let talk = parse_talk(new);
+    let after = write_into_region(&talk, 1, "title", &title).unwrap().apply(new);
+    assert_eq!(after, "# A\n\n---\nlayout: title\n---\n\n# Hello\n\n---\n\n# B\n");
+    let new = "# A\n\n---\n\n";
+    let talk = parse_talk(new);
+    let after = write_into_region(&talk, 1, "title", &title).unwrap().apply(new);
+    assert_eq!(after, "# A\n\n---\n\n# Hello\n");
 
     // Not a heading, or a title that's there already.
     assert!(write_into_region(&talk, 1, "title", &[para(BODY, "x")]).is_none());

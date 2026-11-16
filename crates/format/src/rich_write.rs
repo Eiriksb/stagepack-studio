@@ -1122,8 +1122,21 @@ fn region_change(talk: &Talk, index: usize, region: &str, paras: &[Para]) -> Opt
     let has_markers = slide.blocks.iter().any(|block| matches!(block, Block::Region { .. }));
     let edit = if region == "title" {
         let rest = source.get(body..slide.range.end)?;
-        let gap = if rest.trim().is_empty() || rest.starts_with(['\n', '\r']) { "" } else { eol };
-        SourceEdit { range: body..body, text: format!("{text}{eol}{gap}") }
+        // A blank line under the slide's opening lines stays above the title, as a person
+        // would write it.
+        let skip = if source[..body].ends_with('\n') && rest.starts_with(eol) { eol.len() } else { 0 };
+        let rest = &rest[skip..];
+        let gap = if rest.starts_with(['\n', '\r']) {
+            ""
+        } else if rest.is_empty() {
+            // A blank line before the next slide's, if there is one.
+            if slide.range.end < source.len() { eol } else { "" }
+        } else if rest.trim().is_empty() {
+            ""
+        } else {
+            eol
+        };
+        SourceEdit { range: body + skip..body + skip, text: format!("{text}{eol}{gap}") }
     } else if let Some(marker) = marker_for(region) {
         let after = if source.get(marker..slide.range.end)?.trim().is_empty() { "" } else { eol };
         SourceEdit { range: marker..marker, text: format!("{eol}{eol}{text}{after}") }
