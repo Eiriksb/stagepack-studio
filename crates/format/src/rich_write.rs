@@ -1293,7 +1293,10 @@ pub(crate) fn empty_region_edit(source: &str, slide: &Slide, region: &str, text:
                     }
                     edit
                 } else {
-                    SourceEdit { range: body..body, text: format!("{text}{eol}{eol}") }
+                    // Under a blank line after the slide's opening lines, as for a title, so
+                    // that it isn't left as a second one before what follows.
+                    let skip = if source[..body].ends_with('\n') && rest.starts_with(eol) { eol.len() } else { 0 };
+                    SourceEdit { range: body + skip..body + skip, text: format!("{text}{eol}{eol}") }
                 }
             }
         }
@@ -1301,7 +1304,15 @@ pub(crate) fn empty_region_edit(source: &str, slide: &Slide, region: &str, text:
         let marker = format!("<Region name=\"{region}\" />{eol}{eol}{text}");
         match after_blocks {
             Some(end) => SourceEdit { range: end..end, text: format!("{eol}{eol}{marker}") },
-            None => at_end(body, &marker),
+            None => {
+                let mut edit = at_end(body, &marker);
+                // A blank line before notes or anything else that follows.
+                let rest = source.get(body..slide.range.end)?;
+                if !rest.lines().next().is_none_or(|line| line.trim().is_empty()) {
+                    edit.text.push_str(eol);
+                }
+                edit
+            }
         }
     })
 }

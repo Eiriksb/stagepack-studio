@@ -43,7 +43,7 @@ pub fn tag_text(tag: &NewTag) -> Option<String> {
         Some(match tag.body {
             None => format!("{open} />"),
             Some(body) => {
-                let body = body.replace("\r\n", "\n");
+                let body = one_line_ending(body);
                 let body = body.trim_matches('\n');
                 if body.is_empty() { format!("{open}>\n\n</{}>", tag.name) } else { format!("{open}>\n\n{body}\n\n</{}>", tag.name) }
             }
@@ -77,6 +77,10 @@ pub fn delete_block(talk: &Talk, slide: usize, range: &Range<usize>) -> Option<C
 
 /// The tag at exactly `range` on slide `slide`, at any depth.
 pub fn find_tag<'a>(talk: &'a Talk, slide: usize, range: &Range<usize>) -> Option<&'a Tag> {
+    guarded(|| tag_at(talk, slide, range))
+}
+
+fn tag_at<'a>(talk: &'a Talk, slide: usize, range: &Range<usize>) -> Option<&'a Tag> {
     match find_block(&talk.slides.get(slide)?.blocks, range)? {
         Block::Tag(tag) => Some(tag),
         _ => None,
@@ -100,6 +104,11 @@ pub fn block_text(talk: &Talk, slide: usize, range: &Range<usize>) -> Option<Str
         find_block(&talk.slides.get(slide)?.blocks, range)?;
         Some(talk.source.get(range.clone())?.replace("\r\n", "\n"))
     })
+}
+
+/// `text` with every line ending, a lone carriage return too, made `\n`.
+fn one_line_ending(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 /// What `make` gives, or `None` if it panics.
@@ -192,7 +201,7 @@ fn insert_change(talk: &Talk, index: usize, region: Option<&str>, text: &str) ->
     let slide = readable(talk, index)?;
     let source = talk.source.as_str();
     let eol = eol_in(source);
-    let text = text.replace("\r\n", "\n");
+    let text = one_line_ending(text);
     let text = text.trim_matches('\n');
     if text.trim().is_empty() {
         return None;
@@ -272,6 +281,7 @@ fn insert_change(talk: &Talk, index: usize, region: Option<&str>, text: &str) ->
 /// The edit that puts `text` on lines of its own after the block ending at `end`, with a
 /// blank line before it and, where something follows on the slide, one after it.
 fn after_block(source: &str, slide: &Slide, end: usize, text: &str, eol: &str) -> Option<SourceEdit> {
+    let end = content_end(source, end);
     let stop = line_end(source, end);
     let rest_of_line = source[end..stop].trim_end_matches(['\n', '\r']);
     if !rest_of_line.trim().is_empty() {
@@ -286,6 +296,12 @@ fn after_block(source: &str, slide: &Slide, end: usize, text: &str, eol: &str) -
     Some(SourceEdit { range: at..at, text: out })
 }
 
+/// `end`, the end of a block's range, moved back over the line endings and spaces it ends
+/// with: the `markdown` crate takes the blank lines after a list into the list.
+fn content_end(source: &str, end: usize) -> usize {
+    source[..end].trim_end_matches([' ', '\t', '\r', '\n']).len()
+}
+
 // ---------------------------------------------------------------------------------------
 // Deleting
 
@@ -298,13 +314,15 @@ fn delete_change(talk: &Talk, index: usize, range: &Range<usize>) -> Option<Chan
         return None;
     }
 
-    let first = line_start(source, range.start).max(content);
-    let whole_lines = source[first..range.start].chars().all(|c| matches!(c, ' ' | '\t' | '>'))
-        && is_blank(&source[range.end..line_end(source, range.end).min(slide.range.end)]);
-    let (mut start, mut end) = (range.start, range.end);
+    // The blank lines a list's range runs over aren't its own.
+    let own = range.start..content_end(source, range.end).max(range.start);
+    let first = line_start(source, own.start).max(content);
+    let whole_lines = source[first..own.start].chars().all(|c| matches!(c, ' ' | '\t' | '>'))
+        && is_blank(&source[own.end..line_end(source, own.end).min(slide.range.end)]);
+    let (mut start, mut end) = (own.start, own.end);
     if whole_lines {
         start = first;
-        end = line_end(source, range.end).min(slide.range.end);
+        end = line_end(source, own.end).min(slide.range.end);
         let next = line_end(source, end).min(slide.range.end);
         if end < slide.range.end && is_blank(&source[end..next]) {
             end = next;

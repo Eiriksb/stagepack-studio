@@ -187,16 +187,22 @@ pub(crate) fn set_attr_as_typed(source: &str, tag: &Tag, name: &str, value: &str
     })
 }
 
-/// The edits that take every attribute named `name` out of `tag`, each with the space
-/// before it.
+/// The edits that take every attribute named `name` out of `tag`, each with the space or tab
+/// before it, or, for one on a line of its own, with that line's indentation and the line
+/// ending before it.
 pub(crate) fn remove_attr(source: &str, tag: &Tag, name: &str) -> Vec<SourceEdit> {
-    let bytes = source.as_bytes();
     tag.attrs
         .iter()
         .filter(|attr| attr.name == name)
         .map(|attr| {
             let start = attr.name_range.start;
-            let start = if start > 0 && bytes[start - 1].is_ascii_whitespace() { start - 1 } else { start };
+            let before = &source[tag.range.start..start];
+            let indent = before.len() - before.trim_end_matches([' ', '\t']).len();
+            let line_ending = ["\r\n", "\n"].into_iter().find(|ending| before[..before.len() - indent].ends_with(ending));
+            let start = match line_ending {
+                Some(ending) => start - indent - ending.len(),
+                None => start - indent.min(1),
+            };
             let end = match value_form(source, attr) {
                 ValueForm::Bare => attr.name_range.end,
                 ValueForm::Quoted(_) => attr.value_range.end + 1,
