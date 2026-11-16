@@ -77,6 +77,32 @@ fn an_empty_line_reads_as_an_empty_paragraph_in_either_spelling() {
 }
 
 #[test]
+fn a_no_break_space_item_with_items_under_it_can_be_typed_in() {
+    let source = "# T\n\n- &nbsp;\n  - b\n- c\n";
+    let talk = parse_talk(source);
+    let flows = text_flows(&talk, 0);
+    let bullet = |level| ParaKind::Bullet { level };
+    assert_eq!(flows[1].paras, [para(bullet(0), "\u{a0}"), para(bullet(1), "b"), para(bullet(0), "c")]);
+    let mut paras = flows[1].paras.clone();
+    paras[1].spans[0].text.push('x');
+    let after = write_flow(&talk, 0, &flows[1], &paras).expect("typing is written").apply(source);
+    assert_eq!(after, "# T\n\n- &nbsp;\n  - bx\n- c\n");
+    // Alone, with nothing under it, it's an empty item.
+    assert_eq!(text_flows(&parse_talk("# T\n\n- &nbsp;\n- c\n"), 0)[1].paras[0], Para { kind: bullet(0), spans: vec![] });
+}
+
+#[test]
+fn a_no_break_space_item_left_with_nothing_under_it_keeps_its_space() {
+    let source = "# T\n\n- &nbsp;\n  - b\n- c\n";
+    let talk = parse_talk(source);
+    let flow = &text_flows(&talk, 0)[1];
+    let paras = [flow.paras[0].clone(), flow.paras[2].clone()];
+    let after = write_flow(&talk, 0, flow, &paras).expect("the item under it can go").apply(source);
+    assert_eq!(text_flows(&parse_talk(&after), 0)[1].paras, paras, "{after:?}");
+    assert!(after.ends_with("\n- c\n"), "{after:?}");
+}
+
+#[test]
 fn an_item_whose_content_the_parser_drops_is_in_no_flow() {
     for source in ["- ***\n- a\n", "- [r]: http://x\n- a\n"] {
         assert!(flows(source).is_empty(), "{source:?}");
@@ -347,17 +373,27 @@ fn assert_flows_are_sound(talk: &Talk) -> Result<(), TestCaseError> {
                 // give the same spans, where they read as one paragraph at all: a lone
                 // `- *` is a list in a list, though it's text after another line.
                 let content = &talk.source[at.inline.clone()];
+                // A heading's content is tried both ways it's written: underlined, `>` starts
+                // a quote, and after `# `, a `#` can be read as part of the marker.
                 let alone = match para.kind {
-                    ParaKind::Heading(_) => format!("{content}\n==="),
-                    ParaKind::Bullet { .. } | ParaKind::Numbered { .. } => format!("- {content}"),
-                    ParaKind::Body => content.to_string(),
+                    ParaKind::Heading(_) => vec![format!("{content}\n==="), format!("# {content}")],
+                    ParaKind::Bullet { .. } | ParaKind::Numbered { .. } => vec![format!("- {content}")],
+                    ParaKind::Body => vec![content.to_string()],
                 };
+                let read_alone: Vec<Vec<Span>> = alone
+                    .iter()
+                    .filter_map(|alone| match text_flows(&parse_talk(alone), 0).as_slice() {
+                        [flow] if flow.paras.len() == 1 => Some(flow.paras[0].spans.clone()),
+                        _ => None,
+                    })
+                    .collect();
                 if content.is_empty() {
                     prop_assert!(para.spans.is_empty());
-                } else if let [flow] = text_flows(&parse_talk(&alone), 0).as_slice()
-                    && let [read_alone] = flow.paras.as_slice()
-                {
-                    prop_assert_eq!(&read_alone.spans, &para.spans, "content {:?} of {:?}", content, &talk.source);
+                } else if content == "&nbsp;" {
+                    // Empty, or, in an item with items under it, the character.
+                    prop_assert!(para.spans.is_empty() || para.spans == [plain("\u{a0}")], "{:?}", &para.spans);
+                } else if !read_alone.is_empty() {
+                    prop_assert!(read_alone.contains(&para.spans), "content {:?} of {:?} reads alone as {:?}", content, &talk.source, read_alone);
                 }
                 blocks.push(at.block.clone());
             }
@@ -387,7 +423,7 @@ fn assert_flows_are_sound(talk: &Talk) -> Result<(), TestCaseError> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(512))]
+    #![proptest_config(ProptestConfig::with_cases(cases(512)))]
 
     #[test]
     fn flows_never_overlap_and_stay_inside_their_slide(generated in gen_talk()) {

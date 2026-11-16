@@ -126,6 +126,11 @@ impl GenTalk {
     }
 }
 
+/// How many cases a property tries: `PROPTEST_CASES` if it's set, or `default`.
+pub fn cases(default: u32) -> u32 {
+    std::env::var("PROPTEST_CASES").ok().and_then(|cases| cases.parse().ok()).unwrap_or(default)
+}
+
 pub fn block() -> impl Strategy<Value = String> {
     prop::sample::select(vec![
         "## A heading".to_string(),
@@ -140,6 +145,8 @@ pub fn block() -> impl Strategy<Value = String> {
         "1. a\n    - nested\n    1. one\n2. b".to_string(),
         " - a\n - b".to_string(),
         "Intro:\n- a\n- b".to_string(),
+        "- a\n    - b\n        - c\n- d".to_string(),
+        "- &nbsp;\n  - under\n- c".to_string(),
         "```\n---\ncode\n```".to_string(),
         "~~~md\n---\n~~~".to_string(),
         "> A quote".to_string(),

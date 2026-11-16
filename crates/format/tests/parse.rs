@@ -363,3 +363,13 @@ fn a_real_fenced_block_full_of_tags_is_not_refused() {
         assert_eq!(parse_talk(&source).slides[0].error, None, "{}", &source[..20]);
     }
 }
+
+#[test]
+fn a_line_of_backticks_with_more_backticks_is_not_a_fence() {
+    // Markdown reads `` ```a```b `` as code in a paragraph, so the `---` after it starts a slide.
+    assert_eq!(parse_talk("```a```b\n- \n---\na").slides.len(), 2);
+    assert_eq!(parse_talk("``` a ` b\n---\na").slides.len(), 2);
+    // Tildes open a fence whatever follows them, and backticks with none after them do.
+    assert_eq!(parse_talk("~~~a`b\n---\n~~~\n").slides.len(), 1);
+    assert_eq!(parse_talk("```rust\n---\n```\n").slides.len(), 1);
+}

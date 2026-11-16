@@ -515,14 +515,14 @@ impl Source<'_> {
 
 /// How a list item is written: what's before its marker, the marker, and the column of
 /// its text.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct Shape {
     indent: String,
     marker: Marker,
     content: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum Marker {
     Bullet(char),
     Number(u64, char),
@@ -617,7 +617,11 @@ struct Look {
 /// it. Others take the indentation and marker of the item before them at their level, or
 /// the text column of the item they're in, and run on the numbering, but keep the marker
 /// of the shape `old_shape` gives them, if any, and its spacing too where they're at its
-/// column. `blank_before` says which have a blank line before them. `start` gives the number a numbered item starts a list with.
+/// column. An item that `own` gives the indentation it had at its level keeps that wherever
+/// it still reads as the item it is, and, if `own` says the edit left it untouched, all of
+/// its old shape, its number aside. `blank_before` says which have a blank line before them.
+/// `start` gives the number a numbered item starts a list with.
+#[allow(clippy::too_many_arguments)]
 fn shapes(
     new: &[Para],
     base: &str,
@@ -626,6 +630,7 @@ fn shapes(
     old_shape: impl Fn(usize) -> Option<Shape>,
     start: impl Fn(usize) -> Option<u64>,
     blank_before: impl Fn(usize) -> bool,
+    own: impl Fn(usize) -> Option<(String, bool)>,
 ) -> Option<Vec<Option<Shape>>> {
     let mut shapes: Vec<Option<Shape>> = Vec::with_capacity(new.len());
     for (index, para) in new.iter().enumerate() {
@@ -667,11 +672,16 @@ fn shapes(
             });
             break;
         }
-        let (indent, mut marker) = match found {
+        let (mut indent, mut marker) = match found {
             Some(found) => found,
             None if level == 0 => fresh(base.to_string()),
             None => return None,
         };
+        let (own_indent, untouched) = own(index).unzip();
+        if let Some(own_indent) = own_indent.filter(|own_indent| *own_indent != indent && fits(new, &shapes, index, base, own_indent)) {
+            indent = own_indent;
+        }
+        let untouched = untouched.unwrap_or(false);
         let old = old_shape(index);
         let mut kept = false;
         match old.as_ref().map(|old| &old.marker) {
@@ -686,14 +696,61 @@ fn shapes(
             }
             _ => {}
         }
-        if let Some(old) = old.filter(|old| kept && old.indent == indent) {
-            shapes.push(Some(old));
+        if let Some(old) = old.filter(|old| old.indent == indent && (kept || untouched)) {
+            if kept {
+                shapes.push(Some(old));
+            } else {
+                // Only its number changes.
+                let spaces = old.content.len().saturating_sub(old.indent.len() + old.marker.text().len());
+                let content = format!("{}{}", old.indent, " ".repeat(marker.text().len() + spaces));
+                shapes.push(Some(Shape { indent: old.indent, marker, content }));
+            }
             continue;
         }
         let content = format!("{indent}{}", " ".repeat(marker.text().len() + 1));
         shapes.push(Some(Shape { indent, marker, content }));
     }
     Some(shapes)
+}
+
+/// The column `text`, blank space from a line's start, ends at, a tab going on to the next
+/// multiple of four.
+fn columns(text: &str) -> usize {
+    text.chars().fold(0, |at, c| if c == '\t' { at + 4 - at % 4 } else { at + 1 })
+}
+
+/// Whether `new[index]`, a list item, written `indent` in, reads as the item it is after the
+/// items before it, written in `shapes`: no more than three columns past the text of the
+/// item it's in, or the flow's `base`, and not as far in as the text of the item before it
+/// at its own level.
+fn fits(new: &[Para], shapes: &[Option<Shape>], index: usize, base: &str, indent: &str) -> bool {
+    let Some(level) = level_of(new[index].kind) else { return false };
+    let at = columns(indent);
+    let mut least = (level == 0).then(|| columns(base));
+    let mut sibling = None;
+    for back in (0..index).rev() {
+        let (Some(above), Some(shape)) = (level_of(new[back].kind), shapes[back].as_ref()) else { break };
+        if above == level && sibling.is_none() {
+            sibling = Some(columns(&shape.content));
+        }
+        if above + 1 == level {
+            least = Some(columns(&shape.content));
+            break;
+        }
+        if above < level || (level == 0 && sibling.is_some()) {
+            break;
+        }
+    }
+    least.is_some_and(|least| least <= at && at <= least + 3) && sibling.is_none_or(|sibling| at < sibling)
+}
+
+/// Whether old paragraph `i` of `flow`, an item written `&nbsp;` that holds a no-break space
+/// because items are under it, has none under it as `new[j]`, and so would read as empty if
+/// its bytes were kept.
+fn loses_its_space(src: &Source, flow: &TextFlow, i: usize, new: &[Para], j: usize) -> bool {
+    let Some(level) = level_of(new[j].kind) else { return false };
+    let under = new.get(j + 1).and_then(|next| level_of(next.kind)).is_some_and(|next| next > level);
+    !under && !new[j].spans.is_empty() && src.text.get(flow.source[i].inline.clone()) == Some(EMPTY_LINE)
 }
 
 /// What goes between two paragraphs written one after the other.
@@ -821,12 +878,13 @@ fn least_change(
         _ => None,
     };
     let blank = |j: usize| j > 0 && separator(&new[j - 1], &new[j], src.eol).len() > src.eol.len();
-    let shapes = shapes(new, &src.base, &look, keeps_shape, |_| None, |j| old_number(src, flow, origin[j]), blank)?;
+    let shapes = shapes(new, &src.base, &look, keeps_shape, |_| None, |j| old_number(src, flow, origin[j]), blank, |_| None)?;
     let mut edits = Vec::new();
     let mut j = 0;
     while j < new.len() {
         let para = &new[j];
         match origin[j] {
+            Origin::Kept(i) if loses_its_space(src, flow, i, new, j) => edits.push(paired_edit(src, flow, i, para, shapes[j].as_ref())?),
             Origin::Kept(_) => {}
             Origin::Paired(i) => edits.push(paired_edit(src, flow, i, para, shapes[j].as_ref())?),
             Origin::New => {
@@ -922,8 +980,9 @@ fn paired_edit(src: &Source, flow: &TextFlow, i: usize, para: &Para, shape: Opti
 
 /// The change that writes the whole flow's markers, indentation and spacing again.
 /// Paragraphs whose words didn't change keep their content's bytes, and items whose kind
-/// didn't change keep their markers.
-fn whole_change(src: &Source, flow: &TextFlow, new: &[Para], origin: &[Origin]) -> Option<Vec<SourceEdit>> {
+/// didn't change keep their markers. With `own`, a paragraph the change leaves as it was
+/// keeps all its bytes, its indentation and marker too, wherever they still read as it.
+fn whole_change(src: &Source, flow: &TextFlow, new: &[Para], origin: &[Origin], own: bool) -> Option<Vec<SourceEdit>> {
     let blank_line = format!("{}{}", src.eol, src.eol);
     let first = flow.source.first()?.block.start;
     src.prefix(first)?;
@@ -951,14 +1010,36 @@ fn whole_change(src: &Source, flow: &TextFlow, new: &[Para], origin: &[Origin]) 
             kept_gap || separator(&new[j - 1], &new[j], src.eol).len() > src.eol.len()
         })
         .collect();
-    let shapes = shapes(new, &src.base, &look, |_| None, keeps_marker, |j| old_number(src, flow, origin[j]), |j| blank[j])?;
+    let untouched = |j: usize| own && matches!(origin[j], Origin::Kept(i) if !loses_its_space(src, flow, i, new, j));
+    // An item at the level it was at keeps its indentation where it can.
+    let own_indent = |j: usize| match origin[j] {
+        Origin::Kept(i) | Origin::Paired(i) if own && level_of(new[j].kind).is_some() && level_of(flow.paras[i].kind) == level_of(new[j].kind) => {
+            old_shape(src, flow, i).map(|shape| (shape.indent, untouched(j)))
+        }
+        _ => None,
+    };
+    let shapes = shapes(new, &src.base, &look, |_| None, keeps_marker, |j| old_number(src, flow, origin[j]), |j| blank[j], own_indent)?;
     let mut text = String::new();
     for (j, para) in new.iter().enumerate() {
         if j > 0 {
             text.push_str(if blank[j] { &blank_line } else { src.eol });
         }
+        // An untouched paragraph written where and as it was is its old bytes.
+        let as_it_was = match origin[j] {
+            Origin::Kept(i) if untouched(j) && (level_of(para.kind).is_none() || shapes[j] == old_shape(src, flow, i)) => {
+                let block = &flow.source[i].block;
+                src.prefix(block.start).and_then(|_| src.text.get(src.line_start(block.start)..block.end))
+            }
+            _ => None,
+        };
+        if let Some(bytes) = as_it_was {
+            text.push_str(bytes);
+            continue;
+        }
         let keep = match origin[j] {
-            Origin::Kept(i) | Origin::Paired(i) if !para.spans.is_empty() && flow.paras[i].spans == para.spans => {
+            Origin::Kept(i) | Origin::Paired(i)
+                if !para.spans.is_empty() && flow.paras[i].spans == para.spans && !loses_its_space(src, flow, i, new, j) =>
+            {
                 src.text.get(flow.source[i].inline.clone())
             }
             _ => None,
@@ -993,10 +1074,11 @@ fn flow_change(talk: &Talk, index: usize, flow: &TextFlow, paras: &[Para]) -> Op
     // else on the slide, in tags and with every escape.
     for ways in [PLAIN, GUARDED] {
         let src = Source { text: &talk.source, eol: eol_in(&talk.source), base: base.clone(), ways };
-        let tries: [&dyn Fn() -> Option<Vec<SourceEdit>>; 3] = [
+        let tries: [&dyn Fn() -> Option<Vec<SourceEdit>>; 4] = [
             &|| least_change(&src, flow, &new, &origin, &gone, slide.range.end, false),
             &|| least_change(&src, flow, &new, &origin, &gone, slide.range.end, true).filter(|_| new.is_empty()),
-            &|| whole_change(&src, flow, &new, &origin),
+            &|| whole_change(&src, flow, &new, &origin, true),
+            &|| whole_change(&src, flow, &new, &origin, false),
         ];
         let found = tries.iter().filter_map(|attempt| attempt()).map(|edits| Change { edits }).find(|change| reads_as(talk, slide, change, &expected));
         if found.is_some() {
@@ -1114,7 +1196,7 @@ fn region_change(talk: &Talk, index: usize, region: &str, paras: &[Para]) -> Opt
     let src = Source { text: &talk.source, eol, base: String::new(), ways: PLAIN };
     let look = Look { bullets: ['-'; MAX_LEVEL as usize + 1], delim: '.' };
     let blank = |j: usize| j > 0 && separator(&new[j - 1], &new[j], eol).len() > eol.len();
-    let shapes = shapes(&new, "", &look, |_| None, |_| None, |_| None, blank)?;
+    let shapes = shapes(&new, "", &look, |_| None, |_| None, |_| None, blank, |_| None)?;
     let mut text = String::new();
     for (j, para) in new.iter().enumerate() {
         if j > 0 {

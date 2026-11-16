@@ -40,23 +40,58 @@ fn is_break(text: &str) -> bool {
     text.trim_end_matches(' ') == "---"
 }
 
+/// A code fence: the mark it's made of, and how many of them open it.
+#[derive(Clone, Copy)]
+struct Fence {
+    mark: u8,
+    length: usize,
+}
+
+/// The run of fence marks starting `text` after up to three spaces, as CommonMark has it:
+/// four spaces in is code by indentation, not a fence.
+fn fence_marks(text: &str) -> Option<(Fence, &str)> {
+    let indent = text.bytes().take_while(|byte| *byte == b' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &text[indent..];
+    let mark = *rest.as_bytes().first().filter(|mark| matches!(mark, b'`' | b'~'))?;
+    let length = rest.bytes().take_while(|byte| *byte == mark).count();
+    (length >= 3).then(|| (Fence { mark, length }, &rest[length..]))
+}
+
+/// The fence `text` opens, if it opens one: three or more tildes, or three or more
+/// backticks with no backtick after them on the line, as a line with more is code in a
+/// paragraph.
+fn opens(text: &str) -> Option<Fence> {
+    let (fence, info) = fence_marks(text)?;
+    (fence.mark == b'~' || !info.contains('`')).then_some(fence)
+}
+
+/// Whether `text` closes `open`: at least as many of its marks, and nothing after them but
+/// spaces and tabs.
+fn closes(text: &str, open: Fence) -> bool {
+    fence_marks(text).is_some_and(|(fence, rest)| {
+        fence.mark == open.mark && fence.length >= open.length && rest.trim_matches([' ', '\t']).is_empty()
+    })
+}
+
 /// Splits a file into slides. Every byte belongs to exactly one slide.
 pub fn split_slides(source: &str) -> Vec<RawSlide> {
     let bom = if source.starts_with('\u{feff}') { 3 } else { 0 };
     let all = lines(source);
     let mut breaks = Vec::new(); // (line index, closing line index if settings)
-    let mut fence: Option<char> = None;
+    let mut fence: Option<Fence> = None;
     let mut i = 0;
     while i < all.len() {
         let text = all[i].text;
         let text = if i == 0 { &text[bom.min(text.len())..] } else { text };
-        let trimmed = text.trim_start();
         if let Some(open) = fence {
-            if trimmed.starts_with(&open.to_string().repeat(3)) {
+            if closes(text, open) {
                 fence = None;
             }
-        } else if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            fence = trimmed.chars().next();
+        } else if let Some(open) = opens(text) {
+            fence = Some(open);
         } else if is_break(text) {
             let close = settings_close(&all, i);
             breaks.push((i, close));

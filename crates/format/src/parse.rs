@@ -243,9 +243,19 @@ impl Ctx<'_> {
                     .children
                     .iter()
                     .map(|item| {
+                        let children = item.children().map_or(&[][..], |children| children);
                         let mut blocks = Vec::new();
-                        for child in item.children().into_iter().flatten() {
+                        for child in children {
                             self.block(child, &mut blocks, &mut None);
+                        }
+                        // An item can't be empty and hold others, so one that's `&nbsp;` with
+                        // items under it holds the no-break space it reads as anywhere else.
+                        let has_items = children.iter().skip(1).any(|child| matches!(child, Node::List(_)));
+                        if let (true, Some(Block::Paragraph { spans, inline, .. })) = (has_items, blocks.first_mut())
+                            && spans.is_empty()
+                            && self.source.get(inline.clone()) == Some(EMPTY_PARAGRAPH)
+                        {
+                            spans.push(Span { text: "\u{a0}".to_string(), style: Style::default() });
                         }
                         blocks
                     })
