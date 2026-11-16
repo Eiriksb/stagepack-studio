@@ -26,6 +26,7 @@ use crate::clipboard_tools::ClipboardTools;
 use crate::document::{Document, EditRefused, OpenProblem, Reload, SLIDES_FILE, TalkPlace, UNREADABLE_FILE};
 use crate::export::{self, ExportKind, run_export, stagepack_executable};
 use crate::icon_picker::{self, IconPicked, IconPicker};
+use crate::palette::InsertComponent;
 use crate::insert_tools::{InsertPicture, InsertShape, InsertTextBox};
 use crate::inspector::{self, Inspector};
 use crate::markdown_panel::MarkdownPanel;
@@ -345,6 +346,7 @@ pub struct WorkspaceView {
     _icon_picked: Subscription,
     /// A size chosen from the Insert tab's grid of tables.
     _table_picked: Subscription,
+    _component_picked: Subscription,
 }
 
 impl WorkspaceView {
@@ -456,6 +458,10 @@ impl WorkspaceView {
             let InsertTable { columns, rows } = *picked;
             this.edit(|document| document.insert_table(columns, rows), cx);
         });
+        let component_list = ribbon.read(cx).component_list().clone();
+        let component_picked = cx.subscribe(&component_list, |this, _, picked: &InsertComponent, cx| {
+            this.edit(|document| document.insert_component(&picked.0), cx);
+        });
         let slide_strip = cx.new(|cx| SlideStrip::new(document.clone(), cx));
         let notes_panel = cx.new(|cx| NotesPanel::new(document.clone(), window, cx));
         let workspace = cx.weak_entity();
@@ -551,6 +557,7 @@ impl WorkspaceView {
             _keep_failed: keep_failed,
             _icon_picked: icon_picked,
             _table_picked: table_picked,
+            _component_picked: component_picked,
         };
         view.always_build = view.is_always_built();
         view

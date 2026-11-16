@@ -193,9 +193,19 @@ pub(crate) fn typed_tables(slide: &Slide) -> Vec<&Block> {
     out
 }
 
+/// The built-in tags that draw nothing written between them.
+const HOLD_NO_TEXT: [&str; 3] = ["Picture", "Icon", "Chart"];
+
+/// Whether a positioned tag named `name` is a box of the text written between its tags: a text
+/// box, a box or a shape, or a talk's own component, which draws that text where it puts what
+/// it's given.
+fn holds_text(name: &str) -> bool {
+    TEXT_BOXES.contains(&name) || !HOLD_NO_TEXT.contains(&name)
+}
+
 /// The flow of a positioned tag's text, if it's a box holding only editable text.
 fn box_flow(source: &str, slide: &Slide, tag: &Tag) -> Option<TextFlow> {
-    if !TEXT_BOXES.contains(&tag.name.as_str()) || is_quoted(slide, &tag.range) || tag.children.is_empty() {
+    if !holds_text(&tag.name) || is_quoted(slide, &tag.range) || tag.children.is_empty() {
         return None;
     }
     let mut read = Vec::new();

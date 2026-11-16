@@ -1289,7 +1289,8 @@ impl SlideEditor {
     }
 
     /// Whether the thing selected on the slide shown takes typing, with nothing being typed: a
-    /// shape or a box, which typing puts words in.
+    /// shape, a box, or one of the talk's own components that takes content, which typing puts
+    /// words in.
     fn takes_typing(&self, cx: &App) -> bool {
         !self.is_editing(cx)
             && self.selection_here(cx).is_some()

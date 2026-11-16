@@ -15,6 +15,7 @@ pub mod insert_tools;
 pub mod inspector;
 pub mod markdown_panel;
 pub mod notes_panel;
+pub mod palette;
 pub mod permissions;
 pub mod present;
 pub mod present_view;

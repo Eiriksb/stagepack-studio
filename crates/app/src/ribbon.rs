@@ -14,6 +14,7 @@ use gpui_kit::*;
 use crate::clipboard_tools::ClipboardTools;
 use crate::document::Document;
 use crate::icon_picker::IconPicker;
+use crate::palette::ComponentList;
 use crate::table_tools::{self, TableGrid};
 use crate::text_tools::TextTools;
 use crate::workspace_view::{
@@ -130,6 +131,8 @@ pub struct Ribbon {
     icon_picker: Entity<IconPicker>,
     /// What the Insert tab's Table tool opens.
     table_grid: Entity<TableGrid>,
+    /// What the Insert tab's Component tool opens.
+    component_list: Entity<ComponentList>,
     tab: RibbonTab,
     panels: Panels,
     /// How far the row of tools is scrolled.
@@ -139,6 +142,7 @@ pub struct Ribbon {
     _document_changed: Option<Subscription>,
     _picker_changed: Subscription,
     _grid_changed: Subscription,
+    _list_changed: Subscription,
 }
 
 impl Ribbon {
@@ -157,12 +161,15 @@ impl Ribbon {
         let picker_changed = cx.observe(&icon_picker, |_, _, cx| cx.notify());
         let table_grid = cx.new(|_| TableGrid::new());
         let grid_changed = cx.observe(&table_grid, |_, _, cx| cx.notify());
+        let component_list = cx.new(|cx| ComponentList::new(document.clone(), cx));
+        let list_changed = cx.observe(&component_list, |_, _, cx| cx.notify());
         Ribbon {
             document,
             clipboard_tools,
             text_tools,
             icon_picker,
             table_grid,
+            component_list,
             tab: RibbonTab::default(),
             panels,
             scroll: ScrollHandle::new(),
@@ -170,6 +177,7 @@ impl Ribbon {
             _document_changed: document_changed,
             _picker_changed: picker_changed,
             _grid_changed: grid_changed,
+            _list_changed: list_changed,
         }
     }
 
@@ -185,6 +193,11 @@ impl Ribbon {
     /// The grid of sizes the Insert tab's Table tool opens.
     pub fn table_grid(&self) -> &Entity<TableGrid> {
         &self.table_grid
+    }
+
+    /// The list of components the Insert tab's Component tool opens.
+    pub fn component_list(&self) -> &Entity<ComponentList> {
+        &self.component_list
     }
 
     pub fn tab(&self) -> RibbonTab {
@@ -514,13 +527,14 @@ impl Render for Ribbon {
         if self.tab != RibbonTab::Insert {
             self.icon_picker.update(cx, |picker, cx| picker.close(cx));
             self.table_grid.update(cx, |grid, cx| grid.set_open(false, cx));
+            self.component_list.update(cx, |list, cx| list.set_open(false, cx));
         }
         let groups = match self.tab {
             RibbonTab::Home => self.home(cx),
             RibbonTab::SlideShow => self.slide_show(cx),
             RibbonTab::View => self.view(cx),
             RibbonTab::Insert => {
-                crate::insert_tools::insert_tab(self.document.is_some(), &self.icon_picker, &self.table_grid, cx)
+                crate::insert_tools::insert_tab(self.document.is_some(), &self.icon_picker, &self.table_grid, &self.component_list, cx)
             }
             RibbonTab::Animate => Self::on_the_way(cx),
         };

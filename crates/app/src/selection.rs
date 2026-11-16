@@ -121,7 +121,7 @@ pub fn name_of(talk: &Talk, slide: usize, range: &Range<usize>) -> Option<String
 }
 
 /// `name` with a space before each capital letter but the first: "StatCard" is "Stat Card".
-fn spaced(name: &str) -> String {
+pub(crate) fn spaced(name: &str) -> String {
     let mut spaced = String::with_capacity(name.len() + 4);
     for (index, letter) in name.chars().enumerate() {
         if index > 0 && letter.is_uppercase() {

@@ -263,6 +263,26 @@ fn text_in_a_box_is_a_flow_of_its_own() {
 }
 
 #[test]
+fn a_placed_component_holding_only_text_is_a_box_of_its_own() {
+    let source = "# T\n\n<Callout title=\"Hi\" x=\"10\" y=\"10\" w=\"600\" h=\"300\">\n\nWords\n\n</Callout>\n";
+    let talk = parse_talk(source);
+    let all = text_flows(&talk, 0);
+    let tag = source.find("<Callout").unwrap()..source.trim_end().len();
+    let boxed: Vec<&TextFlow> = all.iter().filter(|flow| flow.place == FlowPlace::Tag(tag.clone())).collect();
+    assert_eq!(boxed.len(), 1, "{all:?}");
+    assert_eq!(boxed[0].paras, vec![para(ParaKind::Body, "Words")]);
+    assert_eq!(uneditable_reason(&talk, 0, source.find("Words").unwrap()), None);
+    // Not placed, it's part of the slide's own content, which it isn't text of.
+    let unplaced = "# T\n\n<Callout title=\"Hi\">\n\nWords\n\n</Callout>\n";
+    assert_eq!(flows(unplaced).len(), 1, "the title alone");
+    // A built-in that draws nothing written inside it is no box.
+    for name in ["Chart", "Picture", "Icon"] {
+        let placed = format!("# T\n\n<{name} x=\"10\" y=\"10\" w=\"600\" h=\"300\">\n\nWords\n\n</{name}>\n");
+        assert_eq!(flows(&placed).len(), 1, "{name}");
+    }
+}
+
+#[test]
 fn a_box_with_a_component_in_it_is_in_no_flow() {
     let source = "<Box x=\"1\" y=\"2\">\n\nWords\n\n<Chart />\n\n</Box>\n";
     assert!(flows(source).is_empty());

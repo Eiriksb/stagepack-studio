@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use slides_components::Diagnostic;
 use slides_engine::{
-    AddedSet, Align, ComponentInfo, Deck, ElementBox, FolderFiles, Fonts, Layer, LayerTiming, Moment, PackError, Pixmap,
+    AddedSet, Align, ComponentInfo, ComponentState, Deck, ElementBox, FolderFiles, Fonts, Layer, LayerTiming, Moment, PackError, Pixmap,
     SlideTimeline, TalkFiles, TextLayout, Transition, WithAdded, layout_by_name, open_packed, text_align,
     read_talk_text,
 };
@@ -18,12 +18,14 @@ use slides_format::{
     Block, NewTag, Tag, delete_block, find_tag, insert_block, set_tag_attr, set_tag_body, split_slides, storable,
     tag_text, text_flows, write_flow, write_into_region, MAX_TABLE_COLUMNS, MAX_TABLE_ROWS, new_table, table_size,
 };
-use toolkit::ComponentSchema;
+use toolkit::{ComponentSchema, Theme};
 
 use crate::added_files::{self, FileKind, NotAdded, Placed, talk_uses};
 use crate::export::ExportInput;
 use crate::history::{History, RunId, one_edit};
-use crate::insert::{self, INSERT_PICTURE, INSERT_SHAPE, INSERT_TABLE, INSERT_TEXT_BOX, TEXT_BOX_SIZE};
+use crate::insert::{self, INSERT_COMPONENT, INSERT_PICTURE, INSERT_SHAPE, INSERT_TABLE, INSERT_TEXT_BOX, TEXT_BOX_SIZE};
+use crate::palette::{self, COMPONENT_SIZE, LISTED_BUILT_INS};
+pub use crate::palette::PaletteEntry;
 use crate::present::TalkShape;
 use crate::saving::{SaveJob, SaveTarget, Saved};
 use crate::table_tools::{HEADING_ROW_STAYS, LONG_ROW, MOST_COLUMNS, MOST_ROWS, ONE_COLUMN_STAYS};
@@ -353,6 +355,11 @@ pub struct Document {
     /// The table the table tools are about, for the state of the text, the text being typed and
     /// the thing selected it was worked out for.
     table_here: RefCell<Option<(TableKey, Option<TableHere>)>>,
+    /// What the component palette offers, worked out again whenever the talk's components change.
+    palette: Vec<PaletteEntry>,
+    /// The tags of the talk's own components that draw what's written between their tags, which
+    /// typing with one selected puts words in.
+    content_tags: Vec<String>,
 }
 
 impl Document {
@@ -425,7 +432,7 @@ impl Document {
         }
         let added = Arc::new(AddedSet::new());
         let files: Arc<dyn TalkFiles + Send + Sync> = Arc::new(WithAdded::new(files, added.clone()));
-        Ok(Document {
+        let mut document = Document {
             on_disk: source,
             outside: None,
             deck: Deck::open_parsed(Box::new(files.clone()), fonts, talk),
@@ -447,7 +454,11 @@ impl Document {
             files_to_save: Cell::new(None),
             files_to_save_walks: Cell::new(0),
             table_here: RefCell::new(None),
-        })
+            palette: Vec::new(),
+            content_tags: Vec::new(),
+        };
+        document.components_looked_at();
+        Ok(document)
     }
 
     pub fn current(&self) -> usize {
@@ -1032,6 +1043,7 @@ impl Document {
         // A slide may name it already, and a component is found by its files.
         if kind == FileKind::ComponentSource || kind == FileKind::ComponentBuild || talk_uses(self.talk(), &*self.files, &path) {
             self.deck.files_added();
+            self.components_looked_at();
         }
         Ok(path)
     }
@@ -1132,6 +1144,7 @@ impl Document {
         }
         if any {
             self.deck.files_added();
+            self.components_looked_at();
         }
         (renames, left_out)
     }
@@ -1791,8 +1804,8 @@ impl Document {
         found.map(|cell| cell.0)
     }
 
-    /// Whether the thing selected takes typing: a shape or a box with nothing in it, or with only
-    /// text in it.
+    /// Whether the thing selected takes typing: a shape, a box, or one of the talk's own
+    /// components that takes content, with nothing in it, or with only text in it.
     pub fn selected_takes_text(&self) -> bool {
         let Some(selected) = &self.selected else {
             return false;
@@ -1800,7 +1813,7 @@ impl Document {
         let Some(tag) = self.selected_tag() else {
             return false;
         };
-        takes_text(tag)
+        takes_text(tag, &self.content_tags)
             && (tag.children.is_empty()
                 || guarded(|| text_flows(self.talk(), selected.slide))
                     .is_ok_and(|flows| flows.iter().any(|flow| flow.place == FlowPlace::Tag(tag.range.clone()))))
@@ -1821,8 +1834,9 @@ impl Document {
         self.begin_text_in_tag(slide, source.start)
     }
 
-    /// Starts typing in the shape or box whose tag starts at byte `start` of slide `slide`: at the
-    /// end of its text, or, with none, in it empty. Says whether it did.
+    /// Starts typing in the shape, box or component taking content whose tag starts at byte
+    /// `start` of slide `slide`: at the end of its text, or, with none, in it empty. Says whether
+    /// it did.
     fn begin_text_in_tag(&mut self, slide: usize, start: usize) -> bool {
         if slide >= self.slide_count() {
             return false;
@@ -1835,7 +1849,7 @@ impl Document {
             let end = TextEdit::new(flows[index].paras.clone()).select_all().selection.end();
             return self.begin_text(slide, index, end);
         }
-        if !tag_starting_at(self.talk(), slide, start).is_some_and(waits_for_text) {
+        if !tag_starting_at(self.talk(), slide, start).is_some_and(|tag| waits_for_text(tag, &self.content_tags)) {
             return false;
         }
         if let Err(refused) = self.end_text() {
@@ -2122,7 +2136,7 @@ impl Document {
         let flows = (slide < self.slide_count())
             .then(|| guarded(|| text_flows(self.talk(), slide)).ok())
             .flatten();
-        let Some(flows) = flows.filter(|flows| reads_as_typed(self.talk(), flows, &editing)) else {
+        let Some(flows) = flows.filter(|flows| reads_as_typed(self.talk(), &self.content_tags, flows, &editing)) else {
             // The talk and what's typed have parted: nothing can be written safely.
             self.editing = None;
             self.held_color = None;
@@ -2157,7 +2171,7 @@ impl Document {
                 return Ok(Vec::new());
             }
             (None, None) => match editing.flow.tag_start() {
-                Some(start) => guarded(|| write_into_tag(self.talk(), slide, start, &after.paras))?,
+                Some(start) => guarded(|| write_into_tag(self.talk(), &self.content_tags, slide, start, &after.paras))?,
                 None => None,
             },
         };
@@ -2516,7 +2530,7 @@ impl Document {
             (None, None) => mark
                 .flow
                 .tag_start()
-                .filter(|&start| tag_starting_at(self.talk(), slide, start).is_some_and(waits_for_text))
+                .filter(|&start| tag_starting_at(self.talk(), slide, start).is_some_and(|tag| waits_for_text(tag, &self.content_tags)))
                 .map(|start| EditingText {
                     session: mark.session,
                     ..EditingText::in_empty_tag(slide, start)
@@ -2541,8 +2555,66 @@ impl Document {
         if changed.is_empty() {
             Reload::Unchanged
         } else {
+            self.components_looked_at();
             Reload::Changed(changed)
         }
+    }
+
+    /// What the component palette offers: a chart first, then the talk's own components in name
+    /// order, each with how built it is. The tags with tools of their own aren't in it. It's
+    /// worked out as the talk's components change, not each time it's asked for.
+    pub fn palette(&mut self) -> Vec<PaletteEntry> {
+        self.palette.clone()
+    }
+
+    /// Works out the palette again, and which of the talk's components take content, from the
+    /// talk's components as they are now.
+    fn components_looked_at(&mut self) {
+        let deck = &mut self.deck;
+        let palette = guarded(|| {
+            let own: Vec<(String, ComponentState)> = deck.components().iter().map(|info| (info.tag.clone(), info.state)).collect();
+            let state_of = |tag: &str| own.iter().find(|(own, _)| own == tag).map(|(_, state)| *state);
+            let listed: Vec<String> = deck
+                .available_components()
+                .into_iter()
+                .filter(|tag| state_of(tag).is_some() && !LISTED_BUILT_INS.contains(&tag.as_str()))
+                .collect();
+            let built_ins = LISTED_BUILT_INS.iter().map(|tag| tag.to_string());
+            built_ins
+                .chain(listed)
+                .map(|tag| {
+                    let state = state_of(&tag);
+                    let takes_content = deck.component_schema(&tag).is_some_and(|schema| schema.children);
+                    PaletteEntry { label: palette::label(&tag), ours: state.is_some(), state, takes_content, tag }
+                })
+                .collect::<Vec<_>>()
+        });
+        self.palette = palette.unwrap_or_default();
+        self.content_tags = self.palette.iter().filter(|entry| entry.ours && entry.takes_content).map(|entry| entry.tag.clone()).collect();
+    }
+
+    /// Puts the component `tag` from the palette on the current slide, [`COMPONENT_SIZE`] big,
+    /// as one step named "Insert component", and selects it: written with what
+    /// [`palette::default_attrs`] gives, and, if it takes content, an empty body. One the
+    /// palette doesn't offer, or one with no build, puts nothing there. Nothing is built.
+    pub fn insert_component(&mut self, tag: &str) -> Result<Vec<usize>, EditRefused> {
+        let Some(entry) = self.palette.iter().find(|entry| entry.tag == tag).filter(|entry| entry.can_insert()) else {
+            return Ok(Vec::new());
+        };
+        let takes_content = entry.takes_content;
+        let deck = &mut self.deck;
+        let Some(schema) = guarded(|| deck.component_schema(tag))? else {
+            return Ok(Vec::new());
+        };
+        let attrs = palette::default_attrs(&schema, &self.deck.theme());
+        let attrs: Vec<(&str, &str)> = attrs.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
+        let body = takes_content.then_some("");
+        self.insert_sized(INSERT_COMPONENT, tag, &attrs, COMPONENT_SIZE, body)
+    }
+
+    /// The talk's theme, as the engine reads it.
+    pub fn theme(&self) -> Theme {
+        self.deck.theme()
     }
 
     /// Whether this talk came from a packed file, rather than a folder.
@@ -2590,6 +2662,7 @@ impl Document {
             self.place = place;
             self.files = Arc::new(WithAdded::new(files, self.added.clone()));
             self.deck.set_files(Box::new(self.files.clone()));
+            self.components_looked_at();
         }
         if self.source() == saved.written {
             self.history.mark_saved();
@@ -2732,7 +2805,7 @@ type EndedText = (Vec<usize>, Option<(usize, usize)>);
 /// Whether `editing` reads as the talk holds it in `flows`, its slide's text: the flow its key
 /// finds holds exactly its paragraphs, or, in an empty region before anything is written, the
 /// region has no text and it holds one empty paragraph.
-fn reads_as_typed(talk: &Talk, flows: &[slides_format::TextFlow], editing: &EditingText) -> bool {
+fn reads_as_typed(talk: &Talk, content: &[String], flows: &[slides_format::TextFlow], editing: &EditingText) -> bool {
     match (editing.flow.find(flows), editing.flow.region()) {
         (Some(index), _) => flows[index].paras == storable(&editing.edit.paras),
         (None, Some(region)) => {
@@ -2741,20 +2814,21 @@ fn reads_as_typed(talk: &Talk, flows: &[slides_format::TextFlow], editing: &Edit
         (None, None) if editing.flow.new_box().is_some() => !holds_something(&editing.edit.paras),
         (None, None) => {
             let start = editing.flow.tag_start();
-            start.is_some_and(|start| tag_starting_at(talk, editing.slide, start).is_some_and(waits_for_text))
+            start.is_some_and(|start| tag_starting_at(talk, editing.slide, start).is_some_and(|tag| waits_for_text(tag, content)))
                 && !holds_something(&editing.edit.paras)
         }
     }
 }
 
-/// Whether `tag` is one typing on it puts words in: a shape or a box.
-fn takes_text(tag: &Tag) -> bool {
-    matches!(tag.name.as_str(), "Shape" | "Box")
+/// Whether `tag` is one typing on it puts words in: a shape, a box, or one of the talk's own
+/// components that draws what's written between its tags, whose tags are `content`.
+fn takes_text(tag: &Tag, content: &[String]) -> bool {
+    matches!(tag.name.as_str(), "Shape" | "Box") || content.contains(&tag.name)
 }
 
 /// Whether `tag` takes typing and has nothing in it yet.
-fn waits_for_text(tag: &Tag) -> bool {
-    takes_text(tag) && tag.children.is_empty()
+fn waits_for_text(tag: &Tag, content: &[String]) -> bool {
+    takes_text(tag, content) && tag.children.is_empty()
 }
 
 /// The tag on slide `slide` of `talk`, at any depth, that starts at byte `start`.
@@ -2810,11 +2884,12 @@ fn new_box_change(talk: &Talk, slide: usize, (x, y): (u32, u32), align: Option<&
     Some((one_edit(&talk.source, &filled.apply(&held.source)), start))
 }
 
-/// The change that puts `paras` in the shape or box with nothing in it whose tag starts at byte
-/// `start` of slide `slide`: the tag given a body of one empty paragraph, and that written as
-/// `paras`, as one edit inside the tag. `None` if it can't be.
-fn write_into_tag(talk: &Talk, slide: usize, start: usize, paras: &[Para]) -> Option<Change> {
-    let tag = tag_starting_at(talk, slide, start).filter(|tag| waits_for_text(tag))?;
+/// The change that puts `paras` in the shape, box or component taking content, one of `content`,
+/// with nothing in it whose tag starts at byte `start` of slide `slide`: the tag given a body of
+/// one empty paragraph, and that written as `paras`, as one edit inside the tag. `None` if it
+/// can't be.
+fn write_into_tag(talk: &Talk, content: &[String], slide: usize, start: usize, paras: &[Para]) -> Option<Change> {
+    let tag = tag_starting_at(talk, slide, start).filter(|tag| waits_for_text(tag, content))?;
     let opened = set_tag_body(talk, slide, &tag.range, "&nbsp;")?;
     let held = reparse(talk, opened.apply(&talk.source));
     let flows = text_flows(&held, slide);
