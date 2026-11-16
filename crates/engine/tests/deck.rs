@@ -74,6 +74,45 @@ fn changing_the_talks_settings_redraws_everything() {
     assert_eq!(d.update("---\ncolor.text: blue\n---\n\n# One\n\n---\n\n# Two\n".to_string()), vec![0, 1]);
 }
 
+/// The talk's look and title with `settings` in its first slide's settings block.
+fn talk_wide(settings: &[(&str, &str)]) -> (toolkit::Theme, Option<String>) {
+    let lines: String = settings.iter().map(|(key, value)| format!("{key}: {value}\n")).collect();
+    let deck = deck(&format!("---\n{lines}---\n\n# One\n\n---\n\n# Two\n"));
+    (talk_theme(deck.talk()), deck.title())
+}
+
+#[test]
+fn the_talk_wide_settings_are_the_ones_the_engine_reads_as_talk_wide() {
+    let none = talk_wide(&[]);
+    // Each key the engine reads from the first slide for the whole talk is one the format
+    // crate keeps with whichever slide is first, and the other way round.
+    let read = [
+        ("title", "A talk"),
+        ("color.background", "#123456"),
+        ("color.text", "#654321"),
+        ("color.accent", "#abcdef"),
+        ("font", "Some Font"),
+        ("font.mono", "Some Mono"),
+    ];
+    for (key, value) in read {
+        assert!(slides_format::TALK_SETTINGS.contains(&key), "{key} isn't kept as the talk's");
+        assert_ne!(talk_wide(&[(key, value)]), none, "{key} isn't read");
+    }
+    assert_eq!(read.len(), slides_format::TALK_SETTINGS.len(), "a talk-wide key the engine doesn't read");
+    // Any other key changes neither the look nor the title.
+    let others = [
+        "layout", "hidden", "transition", "region.body", "region.title", "click", "background", "color", "color.link", "color.heading",
+        "color.title", "color.code", "font.heading", "font.title", "font.body", "font.size", "size", "theme", "accent", "text", "author",
+        "date", "logo", "subtitle", "aspect", "footer",
+    ];
+    for key in others {
+        assert!(!slides_format::TALK_SETTINGS.contains(&key), "{key}");
+        for value in ["#ff0000", "Inter", "true", "A talk"] {
+            assert_eq!(talk_wide(&[(key, value)]), none, "{key}: {value} changed the talk's look or title");
+        }
+    }
+}
+
 #[test]
 fn title_comes_from_the_talks_settings() {
     assert_eq!(deck("---\ntitle: Review\n---\n\n# One\n").title().as_deref(), Some("Review"));
