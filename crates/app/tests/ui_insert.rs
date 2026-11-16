@@ -19,7 +19,7 @@ use slides_engine::{Deck, FolderFiles, Fonts, NativeContent};
 use stagepack_studio::clipboard_tools::PASTE_ID;
 use stagepack_studio::export::{ExportKind, run_export};
 use stagepack_studio::insert::place_for;
-use stagepack_studio::insert_tools::{INSERT_PICTURE_ID, INSERT_SHAPES_ID, INSERT_TEXT_BOX_ID, shape_id};
+use stagepack_studio::insert_tools::{INSERT_ICON_ID, INSERT_PICTURE_ID, INSERT_SHAPES_ID, INSERT_TEXT_BOX_ID, shape_id};
 use stagepack_studio::recovery::Recovery;
 use stagepack_studio::ribbon::{MORE_RIGHT_ID, RIBBON_ID, TAB_HOME_ID, TAB_INSERT_ID};
 use stagepack_studio::text_tools::{ALIGN_CENTER_ID, BOLD_ID, BULLETS_ID, NUMBERING_ID};
@@ -776,7 +776,7 @@ fn the_insert_tab_fits_at_1024_pixels_or_scrolls(cx: &mut TestAppContext) {
     insert_tab(&typing, cx);
     let ribbon = bounds_of(&typing, cx, RIBBON_ID).unwrap();
     let scrolls = bounds_of(&typing, cx, MORE_RIGHT_ID).is_some();
-    for tool in [INSERT_PICTURE_ID, INSERT_SHAPES_ID, INSERT_TEXT_BOX_ID] {
+    for tool in [INSERT_PICTURE_ID, INSERT_SHAPES_ID, INSERT_TEXT_BOX_ID, INSERT_ICON_ID] {
         let bounds = bounds_of(&typing, cx, tool).unwrap_or_else(|| panic!("{tool} is there"));
         assert!(scrolls || bounds.right() <= ribbon.right(), "{tool} is cut off");
     }

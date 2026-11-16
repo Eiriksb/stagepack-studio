@@ -25,6 +25,7 @@ use crate::clipboard::ClipboardOp;
 use crate::clipboard_tools::ClipboardTools;
 use crate::document::{Document, EditRefused, OpenProblem, Reload, SLIDES_FILE, TalkPlace, UNREADABLE_FILE};
 use crate::export::{self, ExportKind, run_export, stagepack_executable};
+use crate::icon_picker::{self, IconPicked, IconPicker};
 use crate::insert_tools::{InsertPicture, InsertShape, InsertTextBox};
 use crate::inspector::{self, Inspector};
 use crate::markdown_panel::MarkdownPanel;
@@ -226,6 +227,7 @@ pub fn bind_keys(cx: &mut App) {
     slide_strip::bind_keys(cx);
     slide_editor::bind_keys(cx);
     inspector::bind_keys(cx);
+    icon_picker::bind_keys(cx);
     present_view::bind_keys(cx);
 }
 
@@ -337,6 +339,7 @@ pub struct WorkspaceView {
     _editor_events: Subscription,
     _working_copies_changed: Subscription,
     _keep_failed: Subscription,
+    _icon_picked: Subscription,
 }
 
 impl WorkspaceView {
@@ -435,7 +438,14 @@ impl WorkspaceView {
             markdown: false,
         };
         let clipboard_tools = cx.new(|cx| ClipboardTools::new(document.clone(), &slide_editor, cx));
-        let ribbon = cx.new(|cx| Ribbon::new(document.clone(), clipboard_tools.clone(), text_tools, panels, cx));
+        let icon_picker = cx.new(|cx| IconPicker::new(window, cx));
+        // Typing in the picker's search leaves a text box waiting for its first character as it is.
+        let search_focus = icon_picker.read(cx).search_focus(cx);
+        slide_editor.update(cx, |editor, cx| editor.keep_typing_with(search_focus, window, cx));
+        let icon_picked = cx.subscribe(&icon_picker, |this, _, picked: &IconPicked, cx| this.insert_icon(picked.0, cx));
+        let ribbon = cx.new(|cx| {
+            Ribbon::new(document.clone(), clipboard_tools.clone(), text_tools, icon_picker, panels, cx)
+        });
         let slide_strip = cx.new(|cx| SlideStrip::new(document.clone(), cx));
         let notes_panel = cx.new(|cx| NotesPanel::new(document.clone(), window, cx));
         let workspace = cx.weak_entity();
@@ -529,6 +539,7 @@ impl WorkspaceView {
             _editor_events: editor_events,
             _working_copies_changed: working_copies_changed,
             _keep_failed: keep_failed,
+            _icon_picked: icon_picked,
         };
         view.always_build = view.is_always_built();
         view

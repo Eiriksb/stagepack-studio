@@ -10,7 +10,7 @@ icon_assets!(
         Save, SquarePlus, CopyPlus, Trash, Presentation, Timer, CodeXml, ClipboardPaste, Scissors, Bold, Italic,
         Underline, DropletOff, List, ListOrdered, ListIndentDecrease, ListIndentIncrease, TextAlignStart,
         TextAlignCenter, TextAlignEnd, ImagePlus, Shapes, RectangleHorizontal, SquareRoundCorner, Circle, Minus,
-        MoveRight, MessageSquare, TextCursorInput,
+        MoveRight, MessageSquare, TextCursorInput, Star,
     ]
 );
 

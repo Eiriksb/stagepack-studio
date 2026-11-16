@@ -184,6 +184,8 @@ pub struct SlideEditor {
     away: FocusHandle,
     /// What holds the text tools: the keyboard can go there and typing goes on.
     tools: FocusHandle,
+    /// What else the keyboard can go to while typing goes on, as the icon picker's search.
+    more_tools: Vec<FocusHandle>,
     /// Whether the caret shows, as it blinks.
     caret_on: bool,
     /// How many more times it blinks before it holds still.
@@ -233,14 +235,14 @@ impl SlideEditor {
             cx.on_focus_out(&focus_handle, window, |this, _, window, cx| {
                 // The keyboard went elsewhere: what was typed is in the talk, and typing ends,
                 // unless it went to the text tools.
-                if !this.tools.contains_focused(window, cx) {
+                if !this.tools_have_keyboard(window, cx) {
                     this.end_editing(false, window, cx)
                 }
             }),
             cx.on_focus_out(&tools, window, |this, _, window, cx| {
                 // From the text tools the keyboard went on elsewhere than the text.
                 if !this.focus_handle.contains_focused(window, cx)
-                    && !this.tools.contains_focused(window, cx)
+                    && !this.tools_have_keyboard(window, cx)
                 {
                     this.end_editing(false, window, cx)
                 }
@@ -277,6 +279,7 @@ impl SlideEditor {
             focus_handle,
             away,
             tools,
+            more_tools: Vec::new(),
             caret_on: true,
             blinks_left: 0,
             blinking: false,
@@ -294,6 +297,24 @@ impl SlideEditor {
         &self.focus_handle
     }
 
+    /// Lets what holds `tools` have the keyboard while typing goes on, as the text tools can:
+    /// typing ends once the keyboard goes on from there to anywhere but the slide.
+    pub fn keep_typing_with(&mut self, tools: FocusHandle, window: &mut Window, cx: &mut Context<Self>) {
+        let subscription = cx.on_focus_out(&tools, window, |this, _, window, cx| {
+            if !this.focus_handle.contains_focused(window, cx) && !this.tools_have_keyboard(window, cx) {
+                this.end_editing(false, window, cx)
+            }
+        });
+        self._subscriptions.push(subscription);
+        self.more_tools.push(tools);
+    }
+
+    /// Whether the text tools, or something else that can have the keyboard while typing goes
+    /// on, has it.
+    fn tools_have_keyboard(&self, window: &Window, cx: &App) -> bool {
+        self.tools.contains_focused(window, cx) || self.more_tools.iter().any(|tools| tools.contains_focused(window, cx))
+    }
+
     fn is_editing(&self, cx: &App) -> bool {
         self.document
             .as_ref()
@@ -308,7 +329,7 @@ impl SlideEditor {
         let focused = self.focus_handle.is_focused(window);
         if self.is_editing(cx) {
             // A text tool keeps the keyboard until it's done with it.
-            if !focused && !self.tools.contains_focused(window, cx) {
+            if !focused && !self.tools_have_keyboard(window, cx) {
                 self.focus_handle.focus(window, cx);
                 self.wake(cx);
             }

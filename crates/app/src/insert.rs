@@ -22,6 +22,10 @@ const LINE_WIDTH: &str = "6";
 pub const INSERT_PICTURE: &str = "Insert picture";
 pub const INSERT_SHAPE: &str = "Insert shape";
 pub const INSERT_TEXT_BOX: &str = "Insert text box";
+pub const INSERT_ICON: &str = "Insert icon";
+
+/// How big a new icon is, as its `size` is written: its width and its height.
+pub const ICON_SIZE: &str = "128";
 
 /// The kinds of shape the Shapes list offers, by the talk's names for them.
 pub const SHAPE_KINDS: [&str; 6] = ["rect", "rounded", "ellipse", "line", "arrow", "callout"];

@@ -13,6 +13,7 @@ use gpui_kit::*;
 
 use crate::clipboard_tools::ClipboardTools;
 use crate::document::Document;
+use crate::icon_picker::IconPicker;
 use crate::text_tools::TextTools;
 use crate::workspace_view::{
     AddSlide, DeleteSlide, DuplicateSlide, KEY_CONTEXT, NewSlide, Present, Redo, Rehearse, Save,
@@ -124,6 +125,8 @@ pub struct Ribbon {
     clipboard_tools: Entity<ClipboardTools>,
     /// The tools for text being typed, on the Home tab.
     text_tools: Entity<TextTools>,
+    /// What the Insert tab's Icon tool opens.
+    icon_picker: Entity<IconPicker>,
     tab: RibbonTab,
     panels: Panels,
     /// How far the row of tools is scrolled.
@@ -131,6 +134,7 @@ pub struct Ribbon {
     /// Whether the row goes on past its left end, and past its right, as last drawn.
     more: (bool, bool),
     _document_changed: Option<Subscription>,
+    _picker_changed: Subscription,
 }
 
 impl Ribbon {
@@ -138,26 +142,36 @@ impl Ribbon {
         document: Option<Entity<Document>>,
         clipboard_tools: Entity<ClipboardTools>,
         text_tools: Entity<TextTools>,
+        icon_picker: Entity<IconPicker>,
         panels: Panels,
         cx: &mut Context<Self>,
     ) -> Self {
         let document_changed = document
             .as_ref()
             .map(|document| cx.observe(document, |_, _, cx| cx.notify()));
+        // The picker opens and closes in the tab's drawing.
+        let picker_changed = cx.observe(&icon_picker, |_, _, cx| cx.notify());
         Ribbon {
             document,
             clipboard_tools,
             text_tools,
+            icon_picker,
             tab: RibbonTab::default(),
             panels,
             scroll: ScrollHandle::new(),
             more: (false, false),
             _document_changed: document_changed,
+            _picker_changed: picker_changed,
         }
     }
 
     pub fn text_tools(&self) -> &Entity<TextTools> {
         &self.text_tools
+    }
+
+    /// The picker the Insert tab's Icon tool opens.
+    pub fn icon_picker(&self) -> &Entity<IconPicker> {
+        &self.icon_picker
     }
 
     pub fn tab(&self) -> RibbonTab {
@@ -476,12 +490,17 @@ pub(crate) fn divider(cx: &App) -> AnyElement {
 }
 
 impl Render for Ribbon {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // What the picker no longer shows, once it's closed, goes from the window.
+        self.icon_picker.update(cx, |picker, _| picker.release(window));
+        if self.tab != RibbonTab::Insert {
+            self.icon_picker.update(cx, |picker, cx| picker.close(cx));
+        }
         let groups = match self.tab {
             RibbonTab::Home => self.home(cx),
             RibbonTab::SlideShow => self.slide_show(cx),
             RibbonTab::View => self.view(cx),
-            RibbonTab::Insert => crate::insert_tools::insert_tab(self.document.is_some(), cx),
+            RibbonTab::Insert => crate::insert_tools::insert_tab(self.document.is_some(), &self.icon_picker, cx),
             RibbonTab::Animate => Self::on_the_way(cx),
         };
         let mut tools = Vec::with_capacity(groups.len() * 2);

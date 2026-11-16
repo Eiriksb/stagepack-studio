@@ -291,12 +291,9 @@ fn a_shape_shows_its_fields_with_its_values(cx: &mut TestAppContext) {
         assert_eq!(shown(&typing, cx, name).as_deref(), Some(value), "{name}");
     }
     select(&typing, cx, ICON);
-    let id = gpui_kit::SharedString::from(field_id("name"));
-    let in_field = typing.with_window(cx, |window, cx| {
-        window.render_frame(cx);
-        window.find(id).value().map(str::to_string)
-    });
-    assert_eq!(in_field.as_deref(), Some("arrow-right"), "the field itself shows it");
+    assert_eq!(shown(&typing, cx, "name").as_deref(), Some("arrow-right"));
+    // The icon's is a button that opens the icon picker, showing the icon and its name.
+    assert_eq!(label_of(&typing, cx, &field_id("name")).as_deref(), Some("arrow-right"), "the field itself shows it");
 
     // A kind the shape doesn't have draws a rectangle, and shows as one.
     let odd = SHOWCASE.replace("kind=\"ellipse\"", "kind=\"star\"");
@@ -370,11 +367,10 @@ fn emptying_an_optional_field_removes_it(cx: &mut TestAppContext) {
     assert_eq!(typing.source(cx), no_size.replace(" fill=\"orange\"", ""));
 
     // A required text field emptied is written empty.
-    let typing = open(cx, SHOWCASE);
-    go_to(&typing, cx, THINGS);
-    select(&typing, cx, ICON);
-    enter(&typing, cx, "name", "");
-    assert_eq!(typing.source(cx), SHOWCASE.replace("name=\"arrow-right\"", "name=\"\""));
+    let typing = open_folder(cx, talk_with_score(SCORE), None);
+    select(&typing, cx, "<Score");
+    enter(&typing, cx, "team", "");
+    assert_eq!(typing.source(cx), SCORE.replace("team=\"Oslo\"", "team=\"\""));
 }
 
 #[gpui_kit::test]
@@ -450,16 +446,15 @@ fn a_checkbox_writes_at_once_and_undoes_in_one_step(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn escape_puts_the_old_value_back(cx: &mut TestAppContext) {
-    let typing = open(cx, SHOWCASE);
-    go_to(&typing, cx, THINGS);
-    select(&typing, cx, ICON);
-    type_over(&typing, cx, "name", "star");
-    assert_eq!(shown(&typing, cx, "name").as_deref(), Some("star"));
+    let typing = open(cx, CHART);
+    select(&typing, cx, "<Chart");
+    type_over(&typing, cx, "title", "Costs");
+    assert_eq!(shown(&typing, cx, "title").as_deref(), Some("Costs"));
     typing.press(cx, "escape");
-    assert_eq!(shown(&typing, cx, "name").as_deref(), Some("arrow-right"));
+    assert_eq!(shown(&typing, cx, "title").as_deref(), Some("Sales"));
     assert!(selected(&typing, cx).is_some(), "Escape in a field lets go of nothing");
     typing.press(cx, "tab");
-    assert_eq!(typing.source(cx), SHOWCASE, "and leaving the field writes nothing");
+    assert_eq!(typing.source(cx), CHART, "and leaving the field writes nothing");
 }
 
 #[gpui_kit::test]
@@ -520,39 +515,38 @@ fn undo_updates_the_field(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn a_field_with_the_keyboard_is_not_overwritten_by_an_outside_change(cx: &mut TestAppContext) {
-    let typing = open(cx, SHOWCASE);
-    go_to(&typing, cx, THINGS);
-    select(&typing, cx, ICON);
-    type_over(&typing, cx, "name", "sta");
-    let outside = SHOWCASE.replace("size=\"96\"", "size=\"80\"");
+    let typing = open(cx, CHART);
+    select(&typing, cx, "<Chart");
+    type_over(&typing, cx, "title", "Cos");
+    let outside = CHART.replace("values=\"1, 2\"", "values=\"3, 4\"");
     typing.view.update(cx, |view, cx| view.reload_for_test(Some(outside.clone()), cx));
     typing.settle(cx);
     assert_eq!(typing.source(cx), outside);
-    assert_eq!(shown(&typing, cx, "name").as_deref(), Some("sta"), "what's being typed stays");
-    assert_eq!(shown(&typing, cx, "size").as_deref(), Some("80"), "the other fields follow");
-    assert!(has_keyboard(&typing, cx, "name"));
+    assert_eq!(shown(&typing, cx, "title").as_deref(), Some("Cos"), "what's being typed stays");
+    assert_eq!(shown(&typing, cx, "values").as_deref(), Some("3, 4"), "the other fields follow");
+    assert!(has_keyboard(&typing, cx, "title"));
     typing.press(cx, "enter");
-    assert_eq!(typing.source(cx), outside.replace("name=\"arrow-right\"", "name=\"sta\""));
+    assert_eq!(typing.source(cx), outside.replace("title=\"Sales\"", "title=\"Cos\""));
 }
 
 #[gpui_kit::test]
 fn keys_in_a_field_stay_in_the_field(cx: &mut TestAppContext) {
-    let typing = open(cx, SHOWCASE);
-    go_to(&typing, cx, THINGS);
-    let icon = select(&typing, cx, ICON);
-    click_field(&typing, cx, "name");
+    let source = format!("{CHART}\n---\n\n# After\n\nWords\n");
+    let typing = open(cx, &source);
+    let chart = select(&typing, cx, "<Chart");
+    click_field(&typing, cx, "title");
     for key in ["backspace", "delete", "left", "right", "pagedown", "ctrl-m", "ctrl-d"] {
         typing.press(cx, key);
     }
     typing.type_text(cx, "x");
-    assert_eq!(typing.source(cx), SHOWCASE, "nothing is typed on the slide or taken away");
-    assert_eq!(selected(&typing, cx), Some(icon), "and the selection stays");
-    assert_eq!(typing.current(cx), THINGS);
+    assert_eq!(typing.source(cx), source, "nothing is typed on the slide or taken away");
+    assert_eq!(selected(&typing, cx), Some(chart), "and the selection stays");
+    assert_eq!(typing.current(cx), 0);
     assert!(typing.editing(cx).is_none());
     typing.press(cx, "tab");
-    assert!(has_keyboard(&typing, cx, "size"), "Tab goes on to the next field");
+    assert!(has_keyboard(&typing, cx, "labels"), "Tab goes on to the next field");
     typing.press(cx, "shift-tab");
-    assert!(has_keyboard(&typing, cx, "name"), "and Shift+Tab back");
+    assert!(has_keyboard(&typing, cx, "title"), "and Shift+Tab back");
 }
 
 #[gpui_kit::test]

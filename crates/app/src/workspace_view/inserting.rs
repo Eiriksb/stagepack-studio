@@ -5,6 +5,7 @@ use super::*;
 use crate::added_files::{MAX_ADDED_BYTES, NotAdded};
 use crate::clipboard_tools::ClipboardThing;
 use crate::document::InsertFailed;
+use crate::insert::{ICON_SIZE, INSERT_ICON};
 
 /// What the window says when a file that isn't a picture is dropped on the slide.
 pub const ONLY_PICTURES: &str = "Only pictures can be dropped on a slide.";
@@ -118,6 +119,11 @@ impl WorkspaceView {
     /// Puts a shape of kind `kind` on the slide.
     pub(super) fn insert_shape(&mut self, kind: &str, cx: &mut Context<Self>) {
         self.edit(|document| document.insert_shape(kind), cx);
+    }
+
+    /// Puts icon `name` on the slide, as big as a new icon is.
+    pub(super) fn insert_icon(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.edit(|document| document.insert_tag(INSERT_ICON, "Icon", &[("name", name), ("size", ICON_SIZE)], None), cx);
     }
 
     /// Starts typing in a new text box on the slide, which isn't written until something is

@@ -12,6 +12,7 @@ mod fields;
 mod labels;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
@@ -19,6 +20,7 @@ use gpui_kit::component::color_picker::{ColorPicker, ColorPickerEvent, ColorPick
 use gpui_kit::component::input::{
     self, Input, InputEvent, InputState, MaskPattern, NumberInput, NumberInputEvent, StepAction,
 };
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::{ActiveTheme as _, IndexPath, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -29,6 +31,7 @@ use toolkit::ComponentSchema;
 
 use crate::added_files::{FileKind, NotAdded};
 use crate::document::{Document, EditRefused, Selected};
+use crate::icon_picker::{IconPicked, IconPicker};
 use crate::selection;
 use crate::text_tools::written_color;
 use crate::workspace_view::WorkspaceView;
@@ -108,6 +111,8 @@ enum Widget {
         choices: Vec<Choice>,
     },
     File,
+    /// The icon picker that chooses which icon it is.
+    Icon(Entity<IconPicker>),
 }
 
 /// A colour dragged on a picker's sliders, and the talk's text it was dragged on, by its hash:
@@ -148,6 +153,8 @@ pub struct Inspector {
     workspace: WeakEntity<WorkspaceView>,
     form: Option<Form>,
     looked_up: Option<LookedUp>,
+    /// Pictures of a form let go of, which the window lets go of as the panel is drawn.
+    retired: Vec<Arc<RenderImage>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -158,7 +165,7 @@ impl Inspector {
             .iter()
             .map(|document| cx.observe(document, |_, _, cx| cx.notify()))
             .collect();
-        Inspector { document, workspace, form: None, looked_up: None, _subscriptions: subscriptions }
+        Inspector { document, workspace, form: None, looked_up: None, retired: Vec::new(), _subscriptions: subscriptions }
     }
 
     /// The labels of the fields shown, in order.
@@ -186,7 +193,16 @@ impl Inspector {
                     .unwrap_or_default()
             }
             Widget::File => self.talk_attr(name, cx).map(|path| file_name(&path).to_string()).unwrap_or_default(),
+            Widget::Icon(_) => self.talk_attr(name, cx).unwrap_or_default(),
         })
+    }
+
+    /// The icon picker of the icon field for attribute `name`.
+    pub fn icon_picker(&self, name: &str) -> Option<Entity<IconPicker>> {
+        match &self.field(name)?.widget {
+            Widget::Icon(picker) => Some(picker.clone()),
+            _ => None,
+        }
     }
 
     /// The colour picker of the colour field for attribute `name`.
@@ -414,6 +430,12 @@ impl Inspector {
         let Some(form) = self.form.take() else {
             return;
         };
+        for field in &form.fields {
+            if let Widget::Icon(picker) = &field.widget {
+                let images = picker.update(cx, |picker, _| picker.take_images());
+                self.retired.extend(images);
+            }
+        }
         let held: Vec<(String, String)> = form
             .fields
             .into_iter()
@@ -514,7 +536,7 @@ impl Inspector {
                     match self.schema(&document, pick, &tag.name, cx) {
                         Some(schema) => {
                             let ordered = labels::ordered(&tag.name, &schema.props);
-                            shape.specs.extend(ordered.iter().map(|(prop, label)| Spec::of(prop, label.clone())));
+                            shape.specs.extend(ordered.iter().map(|(prop, label)| Spec::of(&tag.name, prop, label.clone())));
                         }
                         None => {
                             let own = document.read(cx).components().iter().any(|info| info.tag == tag.name);
@@ -623,6 +645,17 @@ impl Inspector {
                     Widget::Choice { select, choices }
                 }
                 Kind::File(_) => Widget::File,
+                Kind::Icon => {
+                    let picker = cx.new(|cx| IconPicker::new(window, cx));
+                    let attr = spec.attr.clone();
+                    subscriptions.push(cx.subscribe(&picker, move |this, _, picked: &IconPicked, cx| {
+                        this.write(&attr, Some(picked.0), cx).ok();
+                        cx.notify();
+                    }));
+                    // It opens and closes in the panel's drawing.
+                    subscriptions.push(cx.observe(&picker, |_, _, cx| cx.notify()));
+                    Widget::Icon(picker)
+                }
             };
             fields.push(Field { spec: spec.clone(), widget, shown: String::new(), problem: None });
         }
@@ -723,7 +756,7 @@ impl Inspector {
                         select.update(cx, |select, cx| select.set_selected_index(at, window, cx));
                     }
                 }
-                Widget::Flag | Widget::File => {}
+                Widget::Flag | Widget::File | Widget::Icon(_) => {}
             }
         }
     }
@@ -740,7 +773,7 @@ impl Inspector {
     }
 
     /// Field `index` as it's drawn: its label, what shows its value, and any problem under it.
-    fn field_element(&self, index: usize, field: &Field, tag: Option<&Tag>, cx: &mut Context<Self>) -> AnyElement {
+    fn field_element(&self, index: usize, field: &Field, tag: Option<&Tag>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let attr = field.spec.attr.clone();
         let id = SharedString::from(field_id(&attr));
         let value = tag.and_then(|tag| tag.attr(&attr)).map(str::to_string);
@@ -833,6 +866,7 @@ impl Inspector {
                     .child(div().min_w_0().text_sm().truncate().child(name))
                     .into_any_element()
             }
+            Widget::Icon(picker) => icon_field(id.clone(), label.clone(), value.unwrap_or_default(), picker, window, cx),
         };
         v_flex()
             .w_full()
@@ -852,6 +886,45 @@ impl Inspector {
             })
             .into_any_element()
     }
+}
+
+/// An icon field, `id`, labelled `label`: a button showing icon `name` and its name, which opens
+/// `picker` to choose another.
+fn icon_field(
+    id: SharedString,
+    label: SharedString,
+    name: String,
+    picker: &Entity<IconPicker>,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let image = picker.update(cx, |picker, cx| {
+        picker.release(window);
+        picker.image_of(&name, window, cx)
+    });
+    let focus = picker.read(cx).search_focus(cx);
+    let (opened, shown) = (picker.clone(), picker.clone());
+    let button = Button::new(id)
+        .small()
+        .w_full()
+        .accessibility_label(SharedString::from(name.clone()))
+        .tooltip(label)
+        .child(
+            h_flex()
+                .w_full()
+                .gap_2()
+                .items_center()
+                .when_some(image, |this, image| this.child(img(image).flex_none().size(px(20.))))
+                .child(div().min_w_0().truncate().child(SharedString::from(name.clone()))),
+        );
+    Popover::new("inspector-icon-picker")
+        .open(picker.read(cx).is_open())
+        .on_open_change(move |open, window, cx| opened.update(cx, |picker, cx| picker.set_open(*open, window, cx)))
+        .track_focus(&focus)
+        .trigger_style(StyleRefinement::default().w_full())
+        .trigger(button)
+        .content(move |_, _, _| shown.clone())
+        .into_any_element()
 }
 
 /// The kind of file `path` is, for a field that takes `extensions`, if it's one it takes and one
@@ -899,6 +972,9 @@ impl Render for Inspector {
             }
         };
         self.follow_talk(tag.as_ref(), window, cx);
+        for image in self.retired.drain(..) {
+            window.drop_image(image).ok();
+        }
         let panel = v_flex()
             .id(INSPECTOR_ID)
             .test_support()
@@ -941,7 +1017,7 @@ impl Render for Inspector {
         let mut settings = Vec::new();
         let mut place = Vec::new();
         for (index, field) in form.fields.iter().enumerate() {
-            let element = self.field_element(index, field, tag.as_ref(), cx);
+            let element = self.field_element(index, field, tag.as_ref(), window, cx);
             if field.spec.place { place.push(element) } else { settings.push(element) }
         }
         let muted = cx.theme().muted_foreground;

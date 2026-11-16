@@ -9,6 +9,7 @@ pub mod clipboard_tools;
 pub mod document;
 pub mod export;
 pub mod history;
+pub mod icon_picker;
 pub mod insert;
 pub mod insert_tools;
 pub mod inspector;

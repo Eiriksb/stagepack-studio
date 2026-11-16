@@ -1,18 +1,23 @@
-//! The Insert tab's tools: Picture, the Shapes list and Text box. What they put on the slide is
-//! [`crate::insert`]'s and [`crate::document::Document`]'s; the window does what they ask.
+//! The Insert tab's tools: Picture, the Shapes list, Text box and Icon. What they put on the
+//! slide is [`crate::insert`]'s and [`crate::document::Document`]'s; the window does what they
+//! ask. Icon opens the [`IconPicker`], whose pick the window hears of.
 
 use gpui_kit::assets::IconName as Icons;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::DropdownMenu as _;
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::{Disableable as _, Sizable as _};
 use gpui_kit::*;
 
+use crate::icon_picker::IconPicker;
 use crate::ribbon::group;
 
 pub const INSERT_PICTURE_ID: &str = "insert-picture";
 /// The Shapes button, which lists the shapes.
 pub const INSERT_SHAPES_ID: &str = "insert-shapes";
 pub const INSERT_TEXT_BOX_ID: &str = "insert-text-box";
+/// The Icon tool, which opens the icon picker.
+pub const INSERT_ICON_ID: &str = "insert-icon";
 
 actions!(insert_tools, [InsertPicture, InsertTextBox]);
 
@@ -40,8 +45,9 @@ pub fn shape_id(kind: &str) -> &'static str {
     SHAPES.iter().find(|shape| shape.0 == kind).unwrap_or(&SHAPES[0]).3
 }
 
-/// The Insert tab's groups, for a window with a talk if `has_talk`.
-pub fn insert_tab(has_talk: bool, cx: &App) -> Vec<AnyElement> {
+/// The Insert tab's groups, for a window with a talk if `has_talk`, whose Icon tool opens
+/// `icon_picker`.
+pub fn insert_tab(has_talk: bool, icon_picker: &Entity<IconPicker>, cx: &App) -> Vec<AnyElement> {
     let shapes = Button::new(INSERT_SHAPES_ID)
         .ghost()
         .small()
@@ -80,7 +86,25 @@ pub fn insert_tab(has_talk: bool, cx: &App) -> Vec<AnyElement> {
             ],
             cx,
         ),
+        group("Icons", vec![icon_tool(has_talk, icon_picker, cx)], cx),
     ]
+}
+
+/// The Icon tool, which opens `picker` under it.
+fn icon_tool(has_talk: bool, picker: &Entity<IconPicker>, cx: &App) -> AnyElement {
+    let button = tool(INSERT_ICON_ID, Icons::Star, "Icon").tooltip("Put an icon on the slide");
+    if !has_talk {
+        return button.disabled(true).into_any_element();
+    }
+    let focus = picker.read(cx).search_focus(cx);
+    let (opened, shown) = (picker.clone(), picker.clone());
+    Popover::new("insert-icon-picker")
+        .open(picker.read(cx).is_open())
+        .on_open_change(move |open, window, cx| opened.update(cx, |picker, cx| picker.set_open(*open, window, cx)))
+        .track_focus(&focus)
+        .trigger(button)
+        .content(move |_, _, _| shown.clone())
+        .into_any_element()
 }
 
 /// A tool: its icon, then its name.

@@ -45,6 +45,8 @@ pub enum Kind {
     Color,
     Choice(Vec<String>),
     File(Vec<String>),
+    /// Which of the bundled icons, chosen from the icon picker.
+    Icon,
 }
 
 /// A setting as the form shows it: the attribute it writes, its label, its kind, whether it can
@@ -60,9 +62,10 @@ pub struct Spec {
 
 impl Spec {
     /// The field for `prop` of `tag`'s component, labelled `label`. A kind this app doesn't
-    /// know of yet is typed as text.
-    pub fn of(prop: &PropField, label: String) -> Spec {
+    /// know of yet is typed as text. The built-in icon's name is chosen from the icon picker.
+    pub fn of(tag: &str, prop: &PropField, label: String) -> Spec {
         let kind = match &prop.kind {
+            PropKind::Text if tag == "Icon" && prop.name == "name" => Kind::Icon,
             PropKind::Whole => Kind::Number { whole: true, range: None },
             PropKind::Number => Kind::Number { whole: false, range: None },
             PropKind::Flag => Kind::Flag,
@@ -301,6 +304,15 @@ mod tests {
             proptest::prop_assert!(decimals <= 4, "{}", written);
             proptest::prop_assert_eq!(number_typed(&written, false, None, false), Typed::Write(Some(written.clone())));
         }
+    }
+
+    #[test]
+    fn the_built_in_icons_name_is_chosen_from_the_picker() {
+        let name = PropField::new("name", PropKind::Text, false);
+        assert_eq!(Spec::of("Icon", &name, "Icon".into()).kind, Kind::Icon);
+        assert_eq!(Spec::of("Score", &name, "Name".into()).kind, Kind::Text, "a talk's own is typed");
+        let size = PropField::new("size", PropKind::Number, true);
+        assert_eq!(Spec::of("Icon", &size, "Size".into()).kind, Kind::Number { whole: false, range: None });
     }
 
     #[test]
