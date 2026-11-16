@@ -7,10 +7,11 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use cosmic_text::{Align as TextAlign, BidiParagraphs, Buffer};
-use slides_format::{FlowPlace, Pos, Talk, text_flows, uneditable_reason};
+use slides_format::{Block, FlowPlace, Pos, Talk, text_flows, uneditable_reason};
 use tiny_skia::{Point, Transform};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::flow::TEXT_TAG;
 use crate::slide::EmptyRegion;
 use crate::text::LINE_HEIGHT;
 use crate::{Align, LayerSpec, Rect};
@@ -43,11 +44,27 @@ impl CaretRect {
     }
 }
 
+/// Something on the slide that can be picked as a whole: a positioned tag, a picture, an icon,
+/// a shape, a component or a table.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ElementBox {
+    /// Its tag's or its block's whole source.
+    pub source: Range<usize>,
+    /// Where it's drawn, in slide units before it's turned.
+    pub rect: Rect,
+    /// The degrees it's turned by, about the centre of `rect`.
+    pub rotate: f32,
+    /// Whether there's text in it that can be edited.
+    pub holds_text: bool,
+}
+
 /// What's under a point of the slide.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Hit {
     /// Editable text: the caret goes at `pos` of flow `flow`.
     Text { flow: usize, pos: Pos },
+    /// A thing of its own whose text, if it has any, can't be edited where the point is.
+    Element(ElementBox),
     /// Something whose text can't be edited, and the sentence saying why.
     Uneditable(&'static str),
     /// An empty region of the slide's layout, by name, where text can be started.
@@ -201,8 +218,11 @@ pub struct TextLayout {
     paras: Vec<PlacedPara>,
     lines: Vec<ParaLines>,
     frames: Vec<Frame>,
-    /// What can't be edited, by layer, and why: innermost first among those that overlap.
-    uneditable: Vec<(usize, Rect, &'static str)>,
+    /// What can't be edited, by layer, and why, with the element it is if it's one: innermost
+    /// first among those that overlap.
+    uneditable: Vec<(usize, Rect, &'static str, Option<usize>)>,
+    /// Every element, in the order it's drawn.
+    elements: Vec<ElementBox>,
     /// The empty regions, their place and turn, and the size and alignment of their text.
     placeholders: Vec<Placeholder>,
 }
@@ -229,6 +249,30 @@ fn turned(x: f32, y: f32, centre: (f32, f32), degrees: f32) -> (f32, f32) {
 
 fn contains(rect: &Rect, (x, y): (f32, f32)) -> bool {
     x >= rect.x && x <= rect.x + rect.w && y >= rect.y && y <= rect.y + rect.h
+}
+
+/// The block of `blocks`, at any depth, whose source is `range`.
+fn block_at<'a>(blocks: &'a [Block], range: &Range<usize>) -> Option<&'a Block> {
+    blocks.iter().find_map(|block| {
+        if block.range() == range {
+            return Some(block);
+        }
+        match block {
+            Block::List { items, .. } => items.iter().find_map(|item| block_at(item, range)),
+            Block::Tag(tag) => block_at(&tag.children, range),
+            _ => None,
+        }
+    })
+}
+
+/// Whether `block`, drawn among others, is a thing of its own. A `<Text>` tag only styles
+/// the text in it.
+fn is_element(block: &Block) -> bool {
+    match block {
+        Block::Picture { .. } | Block::Table { .. } => true,
+        Block::Tag(tag) => tag.name != TEXT_TAG,
+        _ => false,
+    }
 }
 
 fn frame_of(rect: Rect, rotate: f32, whole: bool, region: Option<(&'static str, Rect)>) -> Frame {
@@ -314,6 +358,8 @@ impl TextLayout {
                 .collect(),
             ..TextLayout::default()
         };
+        // The block of each paragraph placed, for what holds editable text.
+        let mut placed_text: Vec<Range<usize>> = Vec::new();
         // Each drawn text by the end of its block and its content, which tell paragraphs apart.
         let mut found: HashMap<(usize, usize, usize), (usize, &DrawnText)> = HashMap::new();
         for (layer, text) in drawn.iter().enumerate() {
@@ -336,23 +382,39 @@ impl TextLayout {
                 let rect = Rect { x: origin.x + text.rect.x, y: origin.y + text.rect.y, ..text.rect };
                 layout.paras.push(PlacedPara { flow: f, para: p, layer, rect });
                 layout.lines.push(para_lines(text, rect));
+                placed_text.push(source.block.clone());
             }
         }
+        let blocks = talk.slides.get(index).filter(|slide| slide.error.is_none()).map_or(&[][..], |slide| &slide.blocks[..]);
+        let holds_text = |source: &Range<usize>| placed_text.iter().any(|block| source.start <= block.start && block.end <= source.end);
         for (layer, text) in drawn.iter().enumerate() {
             let origin = specs[layer].rect;
-            let mut found: Vec<(Rect, &'static str)> = Vec::new();
+            let frame = layout.frames[layer];
+            // An element of the layer, `rect` relative to the slide before the layer's turn.
+            let mut element = |source: &Range<usize>, rect: Rect| {
+                let (x, y) = turned(rect.x + rect.w / 2.0, rect.y + rect.h / 2.0, frame.centre, frame.rotate);
+                let rect = Rect { x: x - rect.w / 2.0, y: y - rect.h / 2.0, ..rect };
+                layout.elements.push(ElementBox { source: source.clone(), rect, rotate: frame.rotate, holds_text: holds_text(source) });
+                layout.elements.len() - 1
+            };
+            // A positioned tag is drawn first in its layer, then what's in it.
+            let whole = specs[layer].source.as_ref().filter(|source| text.whole && matches!(block_at(blocks, source), Some(Block::Tag(_))));
+            let whole = whole.map(|source| element(source, origin));
+            let mut found: Vec<(Rect, &'static str, Option<usize>)> = Vec::new();
             for block in &text.blocks {
+                let rect = Rect { x: origin.x + block.rect.x, y: origin.y + block.rect.y, ..block.rect };
+                let at = block_at(blocks, &block.range).filter(|block| is_element(block)).map(|_| element(&block.range, rect));
                 if let Some(reason) = uneditable_reason(talk, index, block.range.start) {
-                    found.push((Rect { x: origin.x + block.rect.x, y: origin.y + block.rect.y, ..block.rect }, reason));
+                    found.push((rect, reason, at));
                 }
             }
             if text.whole
                 && let Some(reason) = specs[layer].source.as_ref().and_then(|source| uneditable_reason(talk, index, source.start))
             {
-                found.push((origin, reason));
+                found.push((origin, reason, whole));
             }
             found.sort_by(|a, b| (a.0.w * a.0.h).total_cmp(&(b.0.w * b.0.h)));
-            layout.uneditable.extend(found.into_iter().map(|(rect, reason)| (layer, rect, reason)));
+            layout.uneditable.extend(found.into_iter().map(|(rect, reason, element)| (layer, rect, reason, element)));
         }
         layout
     }
@@ -460,9 +522,12 @@ impl TextLayout {
                 let placed = &self.paras[at];
                 return Some(Hit::Text { flow: placed.flow, pos: Pos { para: placed.para, offset: self.offset_at(at, point) } });
             }
-            let why = self.uneditable.iter().find(|(on, rect, _)| *on == layer && contains(rect, point));
-            if let Some((_, _, reason)) = why {
-                return Some(Hit::Uneditable(reason));
+            let why = self.uneditable.iter().find(|(on, rect, ..)| *on == layer && contains(rect, point));
+            if let Some((_, _, reason, element)) = why {
+                return Some(match element {
+                    Some(at) => Hit::Element(self.elements[*at].clone()),
+                    None => Hit::Uneditable(reason),
+                });
             }
             // In a box of text away from its text, the caret goes to the nearest paragraph.
             if frame.whole
@@ -488,6 +553,24 @@ impl TextLayout {
             }
         }
         Some(Hit::Nothing)
+    }
+
+    /// The topmost element under the point (`x`, `y`) of the slide, whether or not the point
+    /// is on its text: the one drawn last, each in its turned shape.
+    pub fn element_at(&self, x: f32, y: f32) -> Option<ElementBox> {
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        let under = |element: &&ElementBox| {
+            let Rect { x: left, y: top, w, h } = element.rect;
+            contains(&element.rect, turned(x, y, (left + w / 2.0, top + h / 2.0), -element.rotate))
+        };
+        self.elements.iter().rev().find(under).cloned()
+    }
+
+    /// The element whose source is `source`, as `element_at` would give it.
+    pub fn element(&self, source: &Range<usize>) -> Option<ElementBox> {
+        self.elements.iter().rev().find(|element| element.source == *source).cloned()
     }
 
     /// The place in the paragraphs `among` takes nearest the point (`x`, `y`) of the slide:

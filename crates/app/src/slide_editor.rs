@@ -17,7 +17,9 @@ use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use slides_engine::{Align, CaretRect, Hit, LineMove, SelectionRects, TextLayout};
-use slides_format::{Motion, Para, ParaKind, Pos, Selection, Span, StyleBit, TextEdit};
+use slides_format::{
+    Motion, Para, ParaKind, Pos, Selection, Span, StyleBit, TextEdit, uneditable_reason,
+};
 
 use crate::clipboard::{self, ClipboardOp, TextPaste};
 use crate::clipboard_tools::{read_clipboard, write_clipboard};
@@ -47,6 +49,8 @@ const TYPING_PAUSE: Duration = Duration::from_secs(2);
 const CARET_WIDTH: f32 = 2.0;
 /// How big the text being composed is drawn, to the height of the caret.
 const COMPOSITION_TEXT: f32 = 0.7;
+/// What's said of a click on a thing on the slide that has no sentence of its own.
+const CANNOT_EDIT_HERE: &str = "This can't be edited on the slide yet.";
 
 actions!(
     slide_editor,
@@ -862,6 +866,14 @@ impl SlideEditor {
             Hit::Uneditable(reason) => {
                 self.end_editing(true, window, cx);
                 cx.emit(EditorEvent::Said(reason.into()));
+            }
+            // Picking a thing on the slide comes later: for now it says why it can't be typed in.
+            Hit::Element(element) => {
+                self.end_editing(true, window, cx);
+                let reason = self.document.as_ref().and_then(|document| {
+                    uneditable_reason(document.read(cx).talk(), slide, element.source.start)
+                });
+                cx.emit(EditorEvent::Said(reason.unwrap_or(CANNOT_EDIT_HERE).into()));
             }
             Hit::Nothing => self.end_editing(true, window, cx),
         }

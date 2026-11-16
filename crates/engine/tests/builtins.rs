@@ -1035,3 +1035,77 @@ fn the_names_kept_for_the_slide_hold_every_placement_attribute() {
         assert!(toolkit::RESERVED_NAMES.contains(&name), "{name}");
     }
 }
+
+#[test]
+fn a_shapes_kind_is_a_choice() {
+    let schema = (builtin_registry().get("Shape").unwrap().schema)();
+    let kind = schema.props.iter().find(|prop| prop.name == "kind").expect("a shape has a kind");
+    let choices = ["rect", "rounded", "ellipse", "line", "arrow", "callout"].map(String::from).to_vec();
+    assert_eq!(kind.kind, toolkit::PropKind::Choice(choices));
+}
+
+/// Everything a layer draws and is, written out, to compare with what it was.
+fn described(layer: &LayerSpec) -> String {
+    let mut out = format!("{:?} turned {}\n", layer.rect, layer.rotate);
+    for item in &layer.items {
+        out += &match item {
+            DisplayItem::Fill { path, color } => format!("fill {color:?} {:?}\n", path.segments().collect::<Vec<_>>()),
+            DisplayItem::Stroke { path, color, width } => format!("stroke {color:?} {width} {:?}\n", path.segments().collect::<Vec<_>>()),
+            DisplayItem::Text { x, y, .. } => format!("text at {x} {y}\n"),
+            DisplayItem::Picture { rect, .. } => format!("picture {rect:?}\n"),
+        };
+    }
+    for native in &layer.native {
+        out += &match &native.content {
+            NativeContent::Shape { kind, fill, outline, outline_width, radius, paragraphs, inset, centered } => format!(
+                "shape {:?} {kind:?} {fill:?} {outline:?} {outline_width} {radius} {} {inset} {centered}\n",
+                native.rect,
+                paragraphs.len()
+            ),
+            _ => format!("other {:?}\n", native.rect),
+        };
+    }
+    out
+}
+
+/// What `<Shape kind="circle" …>` drew before a shape's kind was a choice.
+const UNKNOWN_KIND_DRAWN: &str = "Rect { x: 10.0, y: 20.0, w: 300.0, h: 200.0 } turned 0
+fill Color { r: 255, g: 0, b: 0, a: 255 } [MoveTo(Point { x: 0.0, y: 0.0 }), LineTo(Point { x: 300.0, y: 0.0 }), LineTo(Point { x: 300.0, y: 200.0 }), LineTo(Point { x: 0.0, y: 200.0 }), Close]
+stroke Color { r: 0, g: 0, b: 0, a: 255 } 1 [MoveTo(Point { x: 0.0, y: 0.0 }), LineTo(Point { x: 300.0, y: 0.0 }), LineTo(Point { x: 300.0, y: 200.0 }), LineTo(Point { x: 0.0, y: 200.0 }), Close]
+shape Rect { x: 0.0, y: 0.0, w: 300.0, h: 200.0 } Rect Some(Color { r: 255, g: 0, b: 0, a: 255 }) Some(Color { r: 0, g: 0, b: 0, a: 255 }) 1 0 0 0 true
+";
+
+#[test]
+fn an_unknown_kind_still_draws_a_rectangle() {
+    let shape = |kind: &str| format!("<Shape {kind}x=\"10\" y=\"20\" w=\"300\" h=\"200\" fill=\"#ff0000\" outline=\"#000000\" />\n");
+    let (slide, _) = lay_out(&shape("kind=\"circle\" "), &[]);
+    assert!(slide.notices.is_empty(), "{:?}", slide.notices);
+    let drawn = described(slide.layers.last().unwrap());
+    assert_eq!(drawn, UNKNOWN_KIND_DRAWN, "as it was drawn before");
+    for other in ["kind=\"rect\" ", "kind=\"Ellipse\" ", "kind=\"\" ", ""] {
+        let (slide, _) = lay_out(&shape(other), &[]);
+        assert!(slide.notices.is_empty(), "{other}: {:?}", slide.notices);
+        assert_eq!(described(slide.layers.last().unwrap()), drawn, "{other}");
+    }
+}
+
+#[test]
+fn icon_names_are_sorted_and_2776() {
+    let names = icon_names();
+    assert_eq!(names.len(), 2776);
+    assert!(names.windows(2).all(|pair| pair[0] < pair[1]), "in order, each once");
+    assert!(names.contains(&"arrow-right"));
+}
+
+#[test]
+fn every_listed_icon_draws() {
+    for name in icon_names() {
+        let icon = icon_preview(name, 24, [0x11, 0x22, 0x33, 0xff]).unwrap_or_else(|| panic!("{name} draws"));
+        assert_eq!((icon.width(), icon.height()), (24, 24), "{name}");
+        assert!(painted(&icon), "{name} has some ink");
+    }
+    assert!(icon_preview("no-such-icon", 24, [0, 0, 0, 255]).is_none());
+    assert!(icon_preview("arrow-right", 0, [0, 0, 0, 255]).is_none(), "nothing to draw at no size");
+    let big = icon_preview("arrow-right", u32::MAX, [0, 0, 0, 255]).expect("held to a size that can be drawn");
+    assert!(big.width() <= 4096);
+}

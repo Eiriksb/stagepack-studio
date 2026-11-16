@@ -11,7 +11,9 @@ use slides_components::Diagnostic;
 use slides_format::{Settings, Talk, is_hidden, parse_talk};
 use toolkit::{ComponentSchema, Registry};
 
-use crate::slide::{EmptyRegion, SLIDE_WIDTH, empty_region_layer};
+use crate::builtins::DEFAULT_ICON_SIZE;
+use crate::pictures::picture_size;
+use crate::slide::{EmptyRegion, MAX_SIZE, SLIDE_WIDTH, empty_region_layer};
 use crate::text_geometry::{LayerText, TextLayout};
 use crate::timeline::MAX_CLICK;
 use crate::{
@@ -413,6 +415,35 @@ impl Deck {
         match self.registry.get(tag) {
             Some(component) => Some((component.schema)()),
             None => self.components.schema(tag),
+        }
+    }
+
+    /// The size, in slide units, a new `tag` with `attrs` is given: a picture its own size,
+    /// made smaller to fit in half the slide, an icon the size it asks for, and anything
+    /// else a box of a third of the slide's width.
+    pub fn default_size(&mut self, tag: &str, attrs: &[(&str, &str)]) -> (f32, f32) {
+        const ROOM: (f64, f64) = (960.0, 540.0);
+        const OTHERWISE: (f32, f32) = (640.0, 360.0);
+        let attr = |name: &str| attrs.iter().find(|(key, _)| *key == name).map(|(_, value)| *value);
+        match tag {
+            "Picture" => {
+                let size = attr("src").and_then(|src| picture_size(src, &self.files.read(src)?));
+                let Some((w, h)) = size.map(|(w, h)| (f64::from(w), f64::from(h))) else { return OTHERWISE };
+                let (w, h) = if w <= ROOM.0 && h <= ROOM.1 {
+                    (w, h)
+                } else if w * ROOM.1 >= h * ROOM.0 {
+                    (ROOM.0, h * ROOM.0 / w)
+                } else {
+                    (w * ROOM.1 / h, ROOM.1)
+                };
+                (w as f32, h as f32)
+            }
+            "Icon" => {
+                let size = attr("size").and_then(|size| size.trim().parse::<f32>().ok()).filter(|size| size.is_finite() && *size > 0.0);
+                let size = size.unwrap_or(DEFAULT_ICON_SIZE).min(MAX_SIZE);
+                (size, size)
+            }
+            _ => OTHERWISE,
         }
     }
 

@@ -631,3 +631,36 @@ fn an_edit_made_in_the_app_reads_no_files() {
     d.update_text(slides_format::parse_talk(&PICTURE_TALK.replace("Two", "Changed")));
     assert_eq!(files.asked(), asked);
 }
+
+struct SomeFiles(Vec<(&'static str, Vec<u8>)>);
+impl TalkFiles for SomeFiles {
+    fn read(&self, path: &str) -> Option<Vec<u8>> { self.0.iter().find(|(name, _)| *name == path).map(|(_, bytes)| bytes.clone()) }
+}
+
+fn blank_png(width: u32, height: u32) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    image::RgbaImage::new(width, height).write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png).unwrap();
+    bytes
+}
+
+#[test]
+fn a_new_pictures_size_fits_and_keeps_its_shape() {
+    let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"200\" height=\"100\"></svg>".to_vec();
+    let files = vec![("wide.png", blank_png(4000, 1000)), ("small.png", blank_png(100, 50)), ("tall.png", blank_png(300, 1080)), ("bad.png", b"not a picture".to_vec()), ("drawn.svg", svg)];
+    let mut d = Deck::open(Box::new(SomeFiles(files)), Fonts::bundled_only(), "# One\n".to_string());
+    let picture = |d: &mut Deck, src: &str| d.default_size("Picture", &[("src", src)]);
+    assert_eq!(picture(&mut d, "wide.png"), (960.0, 240.0));
+    assert_eq!(picture(&mut d, "small.png"), (100.0, 50.0), "a small picture isn't made bigger");
+    assert_eq!(picture(&mut d, "tall.png"), (150.0, 540.0));
+    assert_eq!(picture(&mut d, "drawn.svg"), (200.0, 100.0));
+    assert_eq!(picture(&mut d, "bad.png"), (640.0, 360.0), "unreadable");
+    assert_eq!(picture(&mut d, "missing.png"), (640.0, 360.0));
+    assert_eq!(picture(&mut d, "../outside.png"), (640.0, 360.0));
+    assert_eq!(d.default_size("Picture", &[]), (640.0, 360.0));
+    assert_eq!(d.default_size("Icon", &[("name", "star"), ("size", "96")]), (96.0, 96.0));
+    assert_eq!(d.default_size("Icon", &[("name", "star")]), (64.0, 64.0), "an icon's own size");
+    assert_eq!(d.default_size("Icon", &[("size", "nonsense")]), (64.0, 64.0));
+    assert_eq!(d.default_size("Icon", &[("size", "1e30")]), (3840.0, 3840.0), "held to the most a box can be");
+    assert_eq!(d.default_size("Box", &[]), (640.0, 360.0));
+    assert_eq!(d.default_size("Chart", &[("kind", "bar")]), (640.0, 360.0));
+}

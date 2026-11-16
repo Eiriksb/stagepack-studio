@@ -760,7 +760,7 @@ fn clicking_a_table_says_it_cannot_be_edited_yet(cx: &mut TestAppContext) {
     let layout = typing.layout(cx);
     let (x, y) = (0..40)
         .flat_map(|row| (0..40).map(move |column| (column as f32 * 48., row as f32 * 27.)))
-        .find(|&(x, y)| matches!(layout.hit(x, y), Some(Hit::Uneditable(_))))
+        .find(|&(x, y)| matches!(layout.hit(x, y), Some(Hit::Element(_))))
         .expect("the table is somewhere");
     let at = typing.at(cx, x, y);
     typing.click(cx, at);

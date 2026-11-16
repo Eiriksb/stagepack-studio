@@ -7005,6 +7005,7 @@ version = "0.1.0"
 dependencies = [
  "cosmic-text",
  "image",
+ "proptest",
  "resvg 0.46.0",
  "serde_json",
  "slides-components",

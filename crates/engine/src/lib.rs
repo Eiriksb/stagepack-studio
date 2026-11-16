@@ -33,12 +33,12 @@ pub use highlight::*;
 pub use layouts::*;
 pub use native::*;
 pub use packed::*;
-pub use pictures::PictureCache;
+pub use pictures::{PictureCache, icon_names, icon_preview};
 pub use render::*;
 pub use slide::*;
 pub use talk_components::{
     COMPONENTS_FOLDER, ComponentInfo, ComponentState, MAX_ASSETS_REMEMBERED, MAX_COMPONENTS, MAX_INDEX_BYTES, MAX_SOURCE_BYTES, SLIDE_RENDER_BUDGET, TalkComponents,
 };
 pub use text::*;
-pub use text_geometry::{CaretRect, Hit, LineMove, PlacedPara, SelectionRects, TextLayout};
+pub use text_geometry::{CaretRect, ElementBox, Hit, LineMove, PlacedPara, SelectionRects, TextLayout};
 pub use timeline::*;

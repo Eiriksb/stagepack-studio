@@ -220,9 +220,8 @@ fn decode_svg(bytes: &[u8]) -> Option<Pixmap> {
     draw_svg(std::str::from_utf8(bytes).ok()?, |size| (MAX_EDGE as f32 / size.width().max(size.height())).min(1.0))
 }
 
-/// Draws SVG markup at the scale `scale_for` picks from the size the markup declares.
-fn draw_svg(markup: &str, scale_for: impl FnOnce(usvg::Size) -> f32) -> Option<Pixmap> {
-    let options = usvg::Options {
+fn svg_options() -> usvg::Options<'static> {
+    usvg::Options {
         // A linked picture could be any file on the computer, which a talk must never reach,
         // and an embedded one would be decoded without the limits above.
         image_href_resolver: usvg::ImageHrefResolver {
@@ -230,8 +229,12 @@ fn draw_svg(markup: &str, scale_for: impl FnOnce(usvg::Size) -> f32) -> Option<P
             resolve_string: Box::new(|_, _| None),
         },
         ..usvg::Options::default()
-    };
-    let tree = usvg::Tree::from_str(markup, &options).ok()?;
+    }
+}
+
+/// Draws SVG markup at the scale `scale_for` picks from the size the markup declares.
+fn draw_svg(markup: &str, scale_for: impl FnOnce(usvg::Size) -> f32) -> Option<Pixmap> {
+    let tree = usvg::Tree::from_str(markup, &svg_options()).ok()?;
     let scale = scale_for(tree.size());
     let side = |length: f32| ((length * scale).round() as u32).clamp(1, MAX_EDGE);
     let canvas = (side(tree.size().width()), side(tree.size().height()));
@@ -392,6 +395,53 @@ fn icons() -> &'static HashMap<String, String> {
             .map(|(name, icon)| (name.clone(), icon["body"].as_str().expect("every icon has a body").to_string()))
             .collect()
     })
+}
+
+/// The name of every icon, in order.
+pub fn icon_names() -> &'static [&'static str] {
+    static NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        let mut names: Vec<&'static str> = icons().keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
+    })
+}
+
+/// Icon `name` drawn `size` pixels square in `color`, as red, green, blue and alpha, for
+/// showing it to pick it. `None` if there's no such icon or the size is 0. A size bigger
+/// than a picture is kept at is held to that.
+pub fn icon_preview(name: &str, size: u32, color: [u8; 4]) -> Option<Pixmap> {
+    if size == 0 {
+        return None;
+    }
+    let [r, g, b, a] = color;
+    let icon = icon_pixmap(name, size.min(MAX_EDGE) as f32, Color { r, g, b, a })?;
+    Some(Arc::unwrap_or_clone(icon))
+}
+
+/// The size in pixels the picture at `path`, whose file is `bytes`, would be drawn at,
+/// found without drawing it. `None` if it can't be read, or is bigger than can be.
+pub(crate) fn picture_size(path: &str, bytes: &[u8]) -> Option<(u32, u32)> {
+    std::panic::catch_unwind(|| if is_svg(path) { svg_size(bytes) } else { raster_size(bytes) }).ok().flatten()
+}
+
+fn raster_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    let (width, height) = ImageReader::new(Cursor::new(bytes)).with_guessed_format().ok()?.into_dimensions().ok()?;
+    if width == 0 || height == 0 || width > MAX_DECODED_SIDE || height > MAX_DECODED_SIDE {
+        return None;
+    }
+    // As `decode_raster` shrinks it.
+    let scale = (MAX_EDGE as f64 / f64::from(width.max(height))).min(1.0);
+    let side = |length: u32| ((f64::from(length) * scale).round() as u32).max(1);
+    Some((side(width), side(height)))
+}
+
+fn svg_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    let size = usvg::Tree::from_str(std::str::from_utf8(bytes).ok()?, &svg_options()).ok()?.size();
+    // As `decode_svg` scales it.
+    let scale = (MAX_EDGE as f32 / size.width().max(size.height())).min(1.0);
+    let side = |length: f32| ((length * scale).round() as u32).clamp(1, MAX_EDGE);
+    Some((side(size.width()), side(size.height())))
 }
 
 /// Draws icon `name`, `size` units square, or `None` if there's no such icon.
