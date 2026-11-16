@@ -581,6 +581,11 @@ impl TextLayout {
         self.elements.iter().rev().find(under).cloned()
     }
 
+    /// Every element on the slide, in the order they're drawn.
+    pub fn elements(&self) -> &[ElementBox] {
+        &self.elements
+    }
+
     /// The element whose source is `source`, as `element_at` would give it.
     pub fn element(&self, source: &Range<usize>) -> Option<ElementBox> {
         self.elements.iter().rev().find(|element| element.source == *source).cloned()

@@ -939,10 +939,11 @@ impl SlideState {
                     *source = source.start - from + to..source.end - from + to;
                 }
             }
-            // The text layout holds no ranges: it's the same wherever the slide's text sits.
             for text in &mut laid.texts {
                 text.moved(from, to);
             }
+            // The text layout's elements say where each is written: it's made again from these.
+            laid.text_layout = None;
         }
     }
 

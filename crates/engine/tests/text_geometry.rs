@@ -398,10 +398,15 @@ fn the_layout_is_kept_until_the_slide_changes() {
     let mut d = deck("# One\n\n---\n\n# Two\n");
     let before = d.text_layout(1);
     assert!(Arc::ptr_eq(&before, &d.text_layout(1)));
+    d.update_text(slides_format::parse_talk("# One\n\n---\n\n# Two\n"));
+    assert!(Arc::ptr_eq(&before, &d.text_layout(1)), "the same text keeps it");
     d.update_text(slides_format::parse_talk("# One changed\n\n---\n\n# Two\n"));
-    assert!(Arc::ptr_eq(&before, &d.text_layout(1)), "another slide's edit keeps it");
+    // Its elements say where each is written, which moved: it's made again, the same but for that.
+    let moved = d.text_layout(1);
+    assert_eq!(before.paras(), moved.paras(), "another slide's edit leaves its text where it was");
+    assert!(Arc::ptr_eq(&moved, &d.text_layout(1)), "and it's kept from then on");
     d.update_text(slides_format::parse_talk("# One changed\n\n---\n\n# Two changed\n"));
-    assert!(!Arc::ptr_eq(&before, &d.text_layout(1)));
+    assert!(!Arc::ptr_eq(&moved, &d.text_layout(1)));
     assert_eq!(d.text_layout(5).paras().len(), 0, "a slide that isn't there has no text");
 }
 
@@ -838,4 +843,20 @@ fn a_thin_line_is_picked_near_it() {
     assert!(source_at(&d, &layout, (293.0, 400.0)).starts_with("<Shape"));
     assert_eq!(source_at(&d, &layout, (291.0, 400.0)), "");
     assert_eq!(source_at(&d, &layout, (200.0, 500.0)), "", "where it would be unturned");
+}
+
+#[test]
+fn an_element_moves_with_its_slide_when_text_before_it_changes() {
+    let before = "# One\n\n---\n\n# Two\n\n<Icon name=\"arrow-right\" x=\"100\" y=\"300\" size=\"96\" />\n";
+    let mut d = deck(before);
+    let icon = |source: &str| {
+        let start = source.find("<Icon").unwrap();
+        start..start + source[start..].find("/>").unwrap() + 2
+    };
+    assert!(d.text_layout(1).element(&icon(before)).is_some());
+    let after = before.replacen("# One", "# One more", 1);
+    assert_eq!(d.update_text(slides_format::parse_talk(&after)), vec![0], "the second slide is only moved");
+    let moved = d.text_layout(1).element(&icon(&after)).expect("the icon is found where it's written now");
+    assert_eq!(moved.source, icon(&after));
+    assert!(d.text_layout(1).element(&icon(before)).is_none());
 }

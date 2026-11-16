@@ -51,7 +51,7 @@ fn a_keystroke_typed_on_a_slide_of_a_long_talk_is_quick() {
     std::fs::write(dir.path().join("slides.md"), long_talk()).unwrap();
     let mut doc = Document::open(dir.path(), Fonts::bundled_only()).unwrap();
     let slide = SLIDES / 2;
-    doc.select(slide);
+    doc.go_to(slide);
     let flows = text_flows(doc.talk(), slide);
     let body = flows
         .iter()

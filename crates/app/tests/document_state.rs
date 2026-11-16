@@ -626,16 +626,16 @@ fn undo_goes_back_through_every_kind_of_change() {
 #[test]
 fn the_current_slide_follows_what_changed() {
     let (_d, mut doc) = talk(FOUR_SLIDES);
-    doc.select(2);
+    doc.go_to(2);
     doc.delete_current().unwrap();
-    doc.select(0);
+    doc.go_to(0);
     doc.undo().unwrap();
     assert_eq!(doc.current(), 2);
     assert!(doc.notes_of(2).is_none());
 
     doc.move_slide(3, 1).unwrap();
     assert_eq!(doc.current(), 1, "where the slide went");
-    doc.select(0);
+    doc.go_to(0);
     doc.undo().unwrap();
     assert_eq!(doc.current(), 3, "where the slide came back to");
     doc.redo().unwrap();
@@ -645,7 +645,7 @@ fn the_current_slide_follows_what_changed() {
 #[test]
 fn adding_a_slide_makes_it_the_current_one() {
     let (_d, mut doc) = talk(FOUR_SLIDES);
-    doc.select(1);
+    doc.go_to(1);
     let shown = doc.add_slide("section").unwrap();
     assert_eq!(doc.current(), 2);
     assert_eq!(doc.slide_count(), 5);
@@ -668,7 +668,7 @@ fn a_content_slide_needs_no_settings() {
 #[test]
 fn deleting_the_last_slide_moves_to_the_one_before() {
     let (_d, mut doc) = talk(FOUR_SLIDES);
-    doc.select(3);
+    doc.go_to(3);
     doc.delete_current().unwrap();
     assert_eq!(doc.current(), 2);
     assert_eq!(doc.slide_count(), 3);
@@ -725,7 +725,7 @@ fn notes_typed_after_something_else_are_a_step_of_their_own() {
 #[test]
 fn notes_typed_then_taken_back_then_typed_again_are_a_step_of_their_own() {
     let (_d, mut doc) = talk(FOUR_SLIDES);
-    doc.select(1);
+    doc.go_to(1);
     doc.delete_current().unwrap();
     assert_eq!(doc.slide_count(), 3);
     doc.set_notes(1, "a").unwrap();
@@ -743,7 +743,7 @@ fn notes_typed_then_taken_back_then_typed_again_are_a_step_of_their_own() {
 #[test]
 fn hiding_and_showing_say_so() {
     let (_d, mut doc) = talk(FOUR_SLIDES);
-    doc.select(1);
+    doc.go_to(1);
     doc.set_current_hidden(true).unwrap();
     assert_eq!(doc.undo_label(), Some("Hide slide"));
     assert_eq!(doc.shown_count(), 3);
@@ -994,7 +994,7 @@ fn a_tidy_up_that_is_refused_is_said() {
     let (_d, mut doc) = talk(source);
     assert_eq!(doc.take_message(), None);
     empty_the_body(&mut doc);
-    doc.select(1);
+    doc.go_to(1);
     assert_eq!(doc.current(), 1);
     assert!(doc.text().is_none());
     assert!(doc.take_message().is_some(), "the refusal is said");

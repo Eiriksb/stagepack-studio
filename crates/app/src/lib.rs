@@ -18,6 +18,7 @@ pub mod recovery;
 pub mod ribbon;
 pub mod save_flow;
 pub mod saving;
+pub mod selection;
 pub mod slide_canvas;
 pub mod slide_editor;
 pub mod slide_strip;

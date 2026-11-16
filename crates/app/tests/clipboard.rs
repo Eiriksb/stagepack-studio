@@ -1252,7 +1252,7 @@ fn plain_text_pastes_as_one_slide_or_none_and_leaves_the_others_alone() {
                 let mut document = document.borrow_mut();
                 let before = document.source().to_string();
                 let count = document.slide_count();
-                document.select(at.min(count - 1));
+                document.go_to(at.min(count - 1));
                 let at = document.current();
                 let Ok(SlidePaste::Slide(markdown)) = clipboard::slide_to_paste(Some(&plain), None) else { return Ok(()) };
                 match document.paste_slide(&markdown) {

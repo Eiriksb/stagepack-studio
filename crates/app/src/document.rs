@@ -3,25 +3,28 @@
 use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use slides_components::Diagnostic;
 use slides_engine::{
-    AddedSet, Align, ComponentInfo, Deck, FolderFiles, Fonts, Layer, LayerTiming, Moment, PackError, Pixmap,
+    AddedSet, Align, ComponentInfo, Deck, ElementBox, FolderFiles, Fonts, Layer, LayerTiming, Moment, PackError, Pixmap,
     SlideTimeline, TalkFiles, TextLayout, Transition, WithAdded, layout_by_name, open_packed, text_align,
     read_talk_text,
 };
 use slides_format::{
     Change, FlowPlace, MAX_SLIDE_BYTES, Para, Pos, Selection, SourceEdit, Talk, TextEdit, parse_talk, reparse, set_align,
-    split_slides, storable, text_flows, write_flow, write_into_region,
+    Tag, delete_block, find_tag, split_slides, storable, text_flows, write_flow, write_into_region,
 };
 
 use crate::added_files::{self, FileKind, NotAdded, Placed, talk_uses};
 use crate::export::ExportInput;
-use crate::history::{History, RunId};
+use crate::history::{History, RunId, one_edit};
 use crate::present::TalkShape;
 use crate::saving::{SaveJob, SaveTarget, Saved};
+use crate::selection::{self, SelectMark};
+pub use crate::selection::Selected;
 use crate::text_editing::{
     ALIGN_TEXT, COULD_NOT_TYPE, CUT, Composing, EditingText, FORMAT_TEXT, FlowKey, Kind, PASTE, TYPING, TextMark,
     holds_no_words, holds_something, region_has_text,
@@ -69,6 +72,8 @@ pub enum EditRefused {
     CouldNotBeTyped,
     /// Text that typing left with no words couldn't be taken away.
     CouldNotTidy,
+    /// The thing selected couldn't be taken away without changing what's around it.
+    CouldNotBeRemoved,
 }
 
 impl std::fmt::Display for EditRefused {
@@ -87,6 +92,9 @@ impl std::fmt::Display for EditRefused {
             EditRefused::CouldNotBeTyped => COULD_NOT_TYPE,
             EditRefused::CouldNotTidy => {
                 "The emptied text couldn't be taken away, so it's left on the slide."
+            }
+            EditRefused::CouldNotBeRemoved => {
+                "That couldn't be taken away without changing what's around it."
             }
         })
     }
@@ -139,6 +147,7 @@ const SHOW_SLIDE: &str = "Show slide";
 const EDIT_NOTES: &str = "Edit notes";
 const RECOVER_CHANGES: &str = "Recover changes";
 const LOAD_CHANGED_FILE: &str = "Load the changed file";
+const DELETE: &str = "Delete";
 
 /// What the window says when the current slide couldn't be laid out for the editor.
 pub const LAYOUT_FAILED: &str =
@@ -279,6 +288,8 @@ pub struct Document {
     editing: Option<EditingText>,
     /// A colour chosen for the selection of the text being typed, not yet given to it.
     held_color: Option<HeldColor>,
+    /// The thing picked on a slide, if any: the editor's view of the talk, not part of it.
+    selected: Option<Selected>,
     /// The number the next time of typing on a slide gets.
     next_session: u64,
     /// What the window should say about something that went wrong where nothing was refused
@@ -371,6 +382,7 @@ impl Document {
             typing_notes: None,
             editing: None,
             held_color: None,
+            selected: None,
             next_session: 0,
             message: None,
         })
@@ -398,16 +410,16 @@ impl Document {
 
     pub fn next(&mut self) {
         if self.current + 1 < self.slide_count() {
-            self.select(self.current + 1);
+            self.go_to(self.current + 1);
         }
     }
 
     pub fn previous(&mut self) {
-        self.select(self.current.saturating_sub(1));
+        self.go_to(self.current.saturating_sub(1));
     }
 
     /// Makes slide `index` the current one, or the last if there's no such slide.
-    pub fn select(&mut self, index: usize) {
+    pub fn go_to(&mut self, index: usize) {
         let index = index.min(self.slide_count() - 1);
         if index != self.current {
             // What's typed is in the talk already; only what typing left empty is tidied.
@@ -720,6 +732,7 @@ impl Document {
         }
         let old = old.to_string();
         let mut changed = self.deck.update_text(candidate);
+        self.follow(&change);
         let joined = match join {
             Join::Run(EditRun::Continue(run)) => {
                 self.history.extend(run, &old, self.deck.source())
@@ -761,8 +774,9 @@ impl Document {
             .history
             .undo(self.deck.source())
             .expect("there's a step to undo");
-        let changed = self.take_step(step.current, talk);
+        let changed = self.take_step(step.current, &step.change, talk);
         self.resume_text(step.mark, true);
+        self.select_marked(step.selects.map(|selects| selects.before));
         Ok(Some(changed))
     }
 
@@ -777,8 +791,9 @@ impl Document {
             .history
             .redo(self.deck.source())
             .expect("there's a step to redo");
-        let changed = self.take_step(step.current, talk);
+        let changed = self.take_step(step.current, &step.change, talk);
         self.resume_text(step.mark, false);
+        self.select_marked(step.selects.map(|selects| selects.after));
         Ok(Some(changed))
     }
 
@@ -788,8 +803,9 @@ impl Document {
         read_after(self.talk(), text)
     }
 
-    fn take_step(&mut self, current: usize, talk: Talk) -> Vec<usize> {
+    fn take_step(&mut self, current: usize, change: &Change, talk: Talk) -> Vec<usize> {
         let mut changed = self.deck.update_text(talk);
+        self.follow(change);
         self.typing_notes = None;
         self.editing = None;
         self.held_color = None;
@@ -848,6 +864,7 @@ impl Document {
         let undo = change.inverse(&old);
         // Taken from outside the app, so its pictures are looked at again too.
         let mut changed = self.deck.update_parsed(talk);
+        self.follow(&one_edit(&old, self.deck.source()));
         let at = self.current;
         self.history.record(label, undo, at, at, false);
         self.typing_notes = None;
@@ -1067,6 +1084,93 @@ impl Document {
         editing.flow.find(&flows)
     }
 
+    /// The thing selected on a slide, if any. It's the editor's view of the talk, not part of
+    /// it: nothing of it is written, and it's no change to save or undo.
+    pub fn selected(&self) -> Option<&Selected> {
+        self.selected.as_ref()
+    }
+
+    /// Selects the thing on slide `slide` whose whole source is `source`, which must be one the
+    /// slide's layout can pick, and makes `slide` the current one. Any typing ends first. Says
+    /// whether there's such a thing.
+    pub fn select(&mut self, slide: usize, source: Range<usize>) -> bool {
+        if slide >= self.slide_count() || self.text_layout(slide).element(&source).is_none() {
+            return false;
+        }
+        // Ending the typing can move the thing, and the selection moves with it.
+        self.selected = Some(Selected { slide, source });
+        if let Err(refused) = self.end_text() {
+            self.say(refused);
+        }
+        let Some(slide) = self.selected.as_ref().map(|selected| selected.slide) else {
+            return false;
+        };
+        self.go_to(slide);
+        true
+    }
+
+    /// Lets go of the thing selected, if any.
+    pub fn deselect(&mut self) {
+        self.selected = None;
+    }
+
+    /// The tag selected, if what's selected is one.
+    pub fn selected_tag(&self) -> Option<&Tag> {
+        let selected = self.selected.as_ref()?;
+        guarded(|| find_tag(self.talk(), selected.slide, &selected.source)).ok().flatten()
+    }
+
+    /// Where the thing selected is drawn, if anything is.
+    pub fn selected_box(&mut self) -> Option<ElementBox> {
+        let selected = self.selected.clone()?;
+        self.text_layout(selected.slide).element(&selected.source)
+    }
+
+    /// Takes the thing selected away, its own lines and one blank line beside them, as one step
+    /// named "Delete", and returns the slides to show again. Undone, it's selected again. It's
+    /// refused when what's around it would read differently without it.
+    pub fn delete_selected(&mut self) -> Result<Vec<usize>, EditRefused> {
+        // Typing is finished first, which can move the thing.
+        self.finish_before_edit()?;
+        let Some(Selected { slide, source }) = self.selected.clone() else {
+            return Ok(Vec::new());
+        };
+        let change = built(self.talk(), |talk| delete_block(talk, slide, &source))?
+            .ok_or(EditRefused::CouldNotBeRemoved)?;
+        let depth = self.history.depth();
+        let changed = self.make(DELETE, change, Holds::Slide(slide), slide, slide, None)?;
+        if self.history.depth() > depth {
+            self.history.select_mark_last(SelectMark { before: Some(source), after: None });
+        }
+        Ok(changed)
+    }
+
+    /// Moves the selection along with `change`, just made to the talk's text: to where its
+    /// thing's text went, or away if that went.
+    fn follow(&mut self, change: &Change) {
+        let Some(selected) = self.selected.take() else {
+            return;
+        };
+        let talk = self.talk();
+        self.selected = selection::moved(&selected.source, change).and_then(|source| {
+            let slide = selection::slide_of(talk, &source)?;
+            selection::has_block(talk, slide, &source).then_some(Selected { slide, source })
+        });
+    }
+
+    /// Selects what a step of the history marked, once it's undone or made again: the thing at
+    /// `source`, or nothing.
+    fn select_marked(&mut self, source: Option<Option<Range<usize>>>) {
+        let Some(source) = source else {
+            return;
+        };
+        let talk = self.talk();
+        self.selected = source.and_then(|source| {
+            let slide = selection::slide_of(talk, &source)?;
+            selection::has_block(talk, slide, &source).then_some(Selected { slide, source })
+        });
+    }
+
     /// The number for a new time of typing.
     fn new_session(&mut self) -> u64 {
         self.next_session += 1;
@@ -1107,7 +1211,7 @@ impl Document {
             Some((on, removed)) if on == slide && removed < flow => flow - 1,
             _ => flow,
         };
-        self.select(slide);
+        self.go_to(slide);
         let Ok(flows) = guarded(|| text_flows(self.talk(), slide)) else {
             return false;
         };
@@ -1123,6 +1227,13 @@ impl Document {
             session: self.new_session(),
             composing: None,
         });
+        // Typing in the thing selected keeps it selected; typing elsewhere on its slide doesn't.
+        let inside = self.selected.as_ref().is_some_and(|selected| {
+            selected.slide != slide || selection::holds_para(self.talk(), slide, flow, pos.para, &selected.source)
+        });
+        if !inside {
+            self.selected = None;
+        }
         true
     }
 
@@ -1137,7 +1248,7 @@ impl Document {
         if let Err(refused) = self.end_text() {
             self.say(refused);
         }
-        self.select(slide);
+        self.go_to(slide);
         let Ok(flows) = guarded(|| text_flows(self.talk(), slide)) else {
             return false;
         };
@@ -1154,6 +1265,9 @@ impl Document {
             session: self.new_session(),
             ..EditingText::in_empty_region(slide, region)
         });
+        if self.selected.as_ref().is_some_and(|selected| selected.slide == slide) {
+            self.selected = None;
+        }
         true
     }
 
@@ -1807,8 +1921,12 @@ impl Document {
     fn take(&mut self, source: String, talk: Talk) -> Reload {
         self.on_disk = source.clone();
         let same_text = source == self.source();
+        let old = (!same_text).then(|| self.source().to_string());
         // Even the same text goes through: a picture it shows may have been replaced.
         let mut changed = self.deck.update_parsed(talk);
+        if let Some(old) = old {
+            self.follow(&one_edit(&old, self.deck.source()));
+        }
         if !same_text {
             // Its steps are ranges of the text it had, which no longer fit.
             self.history = History::new();

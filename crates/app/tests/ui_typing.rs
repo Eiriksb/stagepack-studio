@@ -1,327 +1,30 @@
 //! Typing on the slide: clicking its text, typing, selecting, undoing, and what the talk's
 //! file holds while it's done.
 
-use std::cell::Cell;
-use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+
+#[path = "support/typing.rs"]
+mod typing;
+
+use typing::*;
 
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext, Bounds, Context, Entity, EntityInputHandler as _,
-    InputEvent as _, KeyDownEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, TestAppContext, VisualTestContext, Window,
-    WindowBounds, WindowOptions, point, px, size,
+    Bounds, Context, Entity, EntityInputHandler as _, InputEvent as _, KeyDownEvent, Keystroke, Modifiers,
+    MouseButton, MouseMoveEvent, Pixels, TestAppContext, VisualTestContext, Window, point, px, size,
 };
-use slides_engine::{Fonts, Hit, TextLayout, layout_by_name};
-use slides_format::{FlowPlace, ParaKind, Pos, Selection, TextFlow, text_flows};
-use stagepack_studio::document::{Document, LAYOUT_FAILED, TalkPlace, panic_in_next_layout};
+use slides_engine::{Hit, layout_by_name};
+use slides_format::{FlowPlace, ParaKind, Selection};
+use stagepack_studio::document::{LAYOUT_FAILED, TalkPlace, panic_in_next_layout};
 use stagepack_studio::ribbon::{DELETE_ID, DUPLICATE_ID, HIDE_ID, NEW_SLIDE_ID};
 use stagepack_studio::recovery::Recovery;
-use stagepack_studio::slide_editor::{CARET_ID, COMPOSITION_ID, SLIDE_EDITOR_ID, SlideEditor};
-use stagepack_studio::text_editing::{COULD_NOT_TYPE, EditingText};
-use stagepack_studio::workspace_view::{self, CLOSE_SAVE_ID, ExportPdf, SAVE_AS_FOLDER_ID, STATUS_ID, WorkspaceView};
+use stagepack_studio::slide_editor::{COMPOSITION_ID, SLIDE_EDITOR_ID, SlideEditor};
+use stagepack_studio::text_editing::COULD_NOT_TYPE;
+use stagepack_studio::workspace_view::{CLOSE_SAVE_ID, ExportPdf, SAVE_AS_FOLDER_ID};
 
 /// Two slides, the first with a title and a line of words.
 const TWO: &str = "---\ntitle: T\n---\n\n# Hello\n\nSome words here\n\n---\n\n# Second\n";
 const WORDS: &str = "Some words here";
-
-struct Typing {
-    _folder: tempfile::TempDir,
-    file: PathBuf,
-    handle: AnyWindowHandle,
-    view: Entity<WorkspaceView>,
-}
-
-fn open(cx: &mut TestAppContext, source: &str) -> Typing {
-    open_with(cx, source, None)
-}
-
-fn open_with(cx: &mut TestAppContext, source: &str, recovery: Option<Recovery>) -> Typing {
-    let folder = tempfile::tempdir().unwrap();
-    let file = folder.path().join("slides.md");
-    std::fs::write(&file, source).unwrap();
-    let talk = Document::open(folder.path(), Fonts::bundled_only()).unwrap();
-    let (handle, view) = cx.update(|cx: &mut App| {
-        gpui_kit::init(cx);
-        workspace_view::init(cx);
-        let bounds = Bounds {
-            origin: Point::default(),
-            size: size(px(1280.), px(800.)),
-        };
-        gpui_kit::open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            cx,
-            |window, cx| {
-                cx.new(|cx| {
-                    let mut view = WorkspaceView::open_with(talk, window, cx);
-                    if let Some(recovery) = recovery {
-                        view.set_recovery_for_test(recovery, cx);
-                    }
-                    view
-                })
-            },
-        )
-        .expect("open test window")
-    });
-    let typing = Typing {
-        _folder: folder,
-        file,
-        handle,
-        view,
-    };
-    typing.settle(cx);
-    typing
-}
-
-/// Lets `millis` of the test clock pass, a quarter of a second at a time.
-fn wait(cx: &mut TestAppContext, millis: u64) {
-    for _ in 0..millis / 250 {
-        cx.executor().advance_clock(Duration::from_millis(250));
-        cx.run_until_parked();
-    }
-    cx.executor()
-        .advance_clock(Duration::from_millis(millis % 250));
-    cx.run_until_parked();
-}
-
-impl Typing {
-    /// Draws until what one frame asked for has reached the screen.
-    fn settle(&self, cx: &mut TestAppContext) {
-        for _ in 0..3 {
-            cx.update_window(self.handle, |_, window, cx| window.render_frame(cx))
-                .unwrap();
-            cx.run_until_parked();
-        }
-    }
-
-    fn with_window<T>(
-        &self,
-        cx: &mut TestAppContext,
-        f: impl FnOnce(&mut Window, &mut App) -> T,
-    ) -> T {
-        cx.update_window(self.handle, |_, window, cx| f(window, cx))
-            .unwrap()
-    }
-
-    fn document(&self, cx: &TestAppContext) -> Entity<Document> {
-        cx.read(|cx| self.view.read(cx).document().unwrap().clone())
-    }
-
-    fn source(&self, cx: &TestAppContext) -> String {
-        self.document(cx)
-            .read_with(cx, |document, _| document.source().to_string())
-    }
-
-    fn current(&self, cx: &TestAppContext) -> usize {
-        self.document(cx)
-            .read_with(cx, |document, _| document.current())
-    }
-
-    fn slide_count(&self, cx: &TestAppContext) -> usize {
-        self.document(cx)
-            .read_with(cx, |document, _| document.slide_count())
-    }
-
-    fn editing(&self, cx: &TestAppContext) -> Option<EditingText> {
-        self.document(cx)
-            .read_with(cx, |document, _| document.text().cloned())
-    }
-
-    fn selection(&self, cx: &TestAppContext) -> Selection {
-        self.editing(cx)
-            .expect("text is being typed")
-            .edit
-            .selection
-    }
-
-    fn flows(&self, cx: &TestAppContext, slide: usize) -> Vec<TextFlow> {
-        self.document(cx)
-            .read_with(cx, |document, _| text_flows(document.talk(), slide))
-    }
-
-    fn layout(&self, cx: &mut TestAppContext) -> Arc<TextLayout> {
-        let document = self.document(cx);
-        cx.update(|cx| document.update(cx, |document, _| document.text_layout(document.current())))
-    }
-
-    /// Where the slide is in the window.
-    fn slide_bounds(&self, cx: &TestAppContext) -> Bounds<Pixels> {
-        cx.read(|cx| {
-            let canvas = self.view.read(cx).slide_canvas().clone();
-            canvas
-                .read(cx)
-                .slide_bounds()
-                .expect("the slide has been drawn")
-        })
-    }
-
-    /// The point of the window at (`x`, `y`) of the slide, in slide units.
-    fn at(&self, cx: &TestAppContext, x: f32, y: f32) -> Point<Pixels> {
-        let slide = self.slide_bounds(cx);
-        let unit = f32::from(slide.size.width) / 1920.;
-        slide.origin + point(px(x * unit), px(y * unit))
-    }
-
-    /// The middle of where the caret goes at `pos` of flow `flow` of the current slide.
-    fn point_of(&self, cx: &mut TestAppContext, flow: usize, pos: Pos) -> Point<Pixels> {
-        let caret = self
-            .layout(cx)
-            .caret(flow, pos)
-            .expect("the place has a caret");
-        let (x, y) = caret.on_slide(caret.x, caret.top + caret.height / 2.);
-        self.at(cx, x, y)
-    }
-
-    /// The middle of the empty region `region` of the current slide.
-    fn placeholder_point(&self, cx: &mut TestAppContext, region: &str) -> Point<Pixels> {
-        let (rect, _) = self
-            .layout(cx)
-            .placeholder(region)
-            .expect("the region is empty");
-        self.at(cx, rect.x + rect.w / 2., rect.y + rect.h / 2.)
-    }
-
-    fn mouse_down(
-        &self,
-        cx: &mut TestAppContext,
-        at: Point<Pixels>,
-        click_count: usize,
-        modifiers: Modifiers,
-    ) {
-        self.with_window(cx, |window, cx| {
-            window.render_frame(cx);
-            window.dispatch_event(
-                MouseMoveEvent {
-                    position: at,
-                    pressed_button: None,
-                    modifiers,
-                }
-                .to_platform_input(),
-                cx,
-            );
-            window.dispatch_event(
-                MouseDownEvent {
-                    button: MouseButton::Left,
-                    position: at,
-                    modifiers,
-                    click_count,
-                    first_mouse: false,
-                }
-                .to_platform_input(),
-                cx,
-            );
-            window.render_frame(cx);
-        });
-    }
-
-    fn mouse_up(
-        &self,
-        cx: &mut TestAppContext,
-        at: Point<Pixels>,
-        click_count: usize,
-        modifiers: Modifiers,
-    ) {
-        self.with_window(cx, |window, cx| {
-            window.dispatch_event(
-                MouseUpEvent {
-                    button: MouseButton::Left,
-                    position: at,
-                    modifiers,
-                    click_count,
-                }
-                .to_platform_input(),
-                cx,
-            );
-            window.render_frame(cx);
-        });
-        self.settle(cx);
-    }
-
-    /// Clicks `count` times in a row at `at`, as a double or triple click does.
-    fn clicks(
-        &self,
-        cx: &mut TestAppContext,
-        at: Point<Pixels>,
-        count: usize,
-        modifiers: Modifiers,
-    ) {
-        for click_count in 1..=count {
-            self.mouse_down(cx, at, click_count, modifiers);
-            self.mouse_up(cx, at, click_count, modifiers);
-        }
-    }
-
-    fn click(&self, cx: &mut TestAppContext, at: Point<Pixels>) {
-        self.clicks(cx, at, 1, Modifiers::default());
-    }
-
-    fn click_text(&self, cx: &mut TestAppContext, flow: usize, pos: Pos) {
-        let at = self.point_of(cx, flow, pos);
-        self.click(cx, at);
-    }
-
-    fn drag(&self, cx: &mut TestAppContext, from: Point<Pixels>, to: Point<Pixels>) {
-        self.with_window(cx, |window, cx| window.drag(from, to, cx));
-        self.settle(cx);
-    }
-
-    fn type_text(&self, cx: &mut TestAppContext, text: &str) {
-        self.with_window(cx, |window, cx| window.input(text, cx));
-        self.settle(cx);
-    }
-
-    fn press(&self, cx: &mut TestAppContext, key: &str) {
-        self.with_window(cx, |window, cx| window.press(key, cx));
-        self.settle(cx);
-    }
-
-    /// Where the caret is in the window, if one is showing.
-    fn caret(&self, cx: &mut TestAppContext) -> Option<Bounds<Pixels>> {
-        self.with_window(cx, |window, cx| {
-            window.render_frame(cx);
-            window.try_find(CARET_ID).map(|caret| caret.bounds())
-        })
-    }
-
-    fn status(&self, cx: &mut TestAppContext) -> Option<String> {
-        self.with_window(cx, |window, cx| {
-            window.render_frame(cx);
-            window
-                .try_find(STATUS_ID)
-                .and_then(|status| status.label().map(str::to_string))
-        })
-    }
-
-    /// The text of flow `flow` of slide `slide`, a paragraph to a line.
-    fn text_of(&self, cx: &TestAppContext, slide: usize, flow: usize) -> Vec<String> {
-        self.flows(cx, slide)[flow]
-            .paras
-            .iter()
-            .map(|para| para.spans.iter().map(|span| span.text.as_str()).collect())
-            .collect()
-    }
-}
-
-fn pos(para: usize, offset: usize) -> Pos {
-    Pos { para, offset }
-}
-
-fn caret_at(at: Pos) -> Selection {
-    Selection::caret(at)
-}
-
-/// Whether the caret drawn in `caret` is where `at` is, give or take a pixel.
-fn caret_is_at(caret: Bounds<Pixels>, at: Point<Pixels>) -> bool {
-    let middle_x = f32::from(caret.origin.x) + f32::from(caret.size.width) / 2.;
-    (middle_x - f32::from(at.x)).abs() <= 2.
-        && caret.origin.y - px(1.) <= at.y
-        && at.y <= caret.origin.y + caret.size.height + px(1.)
-}
 
 #[gpui_kit::test]
 fn clicking_on_text_shows_a_caret_there(cx: &mut TestAppContext) {
@@ -754,20 +457,24 @@ fn a_new_slide_of_each_layout_offers_each_of_its_places(cx: &mut TestAppContext)
 }
 
 #[gpui_kit::test]
-fn clicking_a_table_says_it_cannot_be_edited_yet(cx: &mut TestAppContext) {
+fn clicking_a_table_selects_it(cx: &mut TestAppContext) {
     let source = "# T\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
     let typing = open(cx, source);
     let layout = typing.layout(cx);
-    let (x, y) = (0..40)
+    let (x, y, table) = (0..40)
         .flat_map(|row| (0..40).map(move |column| (column as f32 * 48., row as f32 * 27.)))
-        .find(|&(x, y)| matches!(layout.hit(x, y), Some(Hit::Element(_))))
+        .find_map(|(x, y)| match layout.hit(x, y) {
+            Some(Hit::Element(element)) => Some((x, y, element.source)),
+            _ => None,
+        })
         .expect("the table is somewhere");
     let at = typing.at(cx, x, y);
     typing.click(cx, at);
-    assert_eq!(
-        typing.status(cx).as_deref(),
-        Some("Tables can't be edited on the slide yet.")
-    );
+    assert_eq!(typing.status(cx).as_deref(), Some("Table selected"));
+    let selected = typing
+        .document(cx)
+        .read_with(cx, |document, _| document.selected().map(|selected| selected.source.clone()));
+    assert_eq!(selected, Some(table));
     assert!(typing.editing(cx).is_none());
     assert!(typing.caret(cx).is_none());
     assert_eq!(typing.source(cx), source);
@@ -907,16 +614,6 @@ fn the_working_copy_follows_typing(cx: &mut TestAppContext) {
     assert!(kept.contains("Someabcd words"), "{kept}");
 }
 
-/// Counts how often `entity` asks to be drawn again.
-fn redraws<T: 'static>(
-    cx: &mut TestAppContext,
-    entity: &Entity<T>,
-) -> (Rc<Cell<usize>>, gpui_kit::Subscription) {
-    let count = Rc::new(Cell::new(0));
-    let counter = count.clone();
-    let watching = cx.update(|cx| cx.observe(entity, move |_, _| counter.set(counter.get() + 1)));
-    (count, watching)
-}
 
 #[gpui_kit::test]
 fn the_caret_stops_blinking_when_left_alone(cx: &mut TestAppContext) {
@@ -971,6 +668,9 @@ fn typing_in_a_turned_box_works(cx: &mut TestAppContext) {
         "# T\n\n<Text x=\"600\" y=\"300\" w=\"600\" h=\"200\" rotate=\"30\">\n\nHello\n\n</Text>\n";
     let typing = open(cx, source);
     let at = typing.point_of(cx, 1, pos(0, 5));
+    // The first click selects the box, the second types in it.
+    typing.click(cx, at);
+    assert!(typing.editing(cx).is_none());
     typing.click(cx, at);
     let editing = typing.editing(cx).expect("the box's text is typed into");
     assert_eq!(editing.edit.selection, caret_at(pos(0, 5)));
@@ -2365,7 +2065,7 @@ mod tools {
     fn a_box_is_aligned_by_its_own_attribute(cx: &mut TestAppContext) {
         let source = "# T\n\n<Text x=\"100\" y=\"400\" w=\"800\" h=\"200\">\n\nHi\n\n</Text>\n";
         let typing = open(cx, source);
-        typing.click_text(cx, 1, pos(0, 1));
+        typing.double_click_text(cx, 1, pos(0, 1));
         // What the system was composing is dropped first, as before any other change.
         typing.compose(cx, "´");
         typing.click_on(cx, ALIGN_RIGHT_ID);
@@ -2608,7 +2308,7 @@ mod tools {
         // A box, left as boxes are.
         let boxed = "# T\n\n<Text x=\"100\" y=\"400\" w=\"800\" h=\"200\">\n\nHi\n\n</Text>\n";
         let typing = open(cx, boxed);
-        typing.click_text(cx, 1, pos(0, 1));
+        typing.double_click_text(cx, 1, pos(0, 1));
         assert_eq!(typing.shows(cx, ALIGN_LEFT_ID), Shows::On);
         typing.click_on(cx, ALIGN_LEFT_ID);
         assert_eq!(typing.source(cx), boxed);

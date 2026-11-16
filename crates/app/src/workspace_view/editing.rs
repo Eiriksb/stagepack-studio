@@ -47,6 +47,8 @@ impl WorkspaceView {
         }
         self.notes_panel
             .update(cx, |panel, cx| panel.follow_slide(window, cx));
+        self.slide_editor
+            .update(cx, |editor, cx| editor.follow_slide(window, cx));
         self.slide_strip.update(cx, |_, cx| cx.notify());
         self.ribbon.update(cx, |_, cx| cx.notify());
         self.show_slide(cx);

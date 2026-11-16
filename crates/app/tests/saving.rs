@@ -551,7 +551,7 @@ fn show(doc: &mut Document, path: &str) {
 /// Whether the last slide draws with nothing to say and something red on it.
 fn last_draws_red(doc: &mut Document) -> bool {
     let last = doc.slide_count() - 1;
-    doc.select(last);
+    doc.go_to(last);
     let notices = doc.notices();
     assert!(notices.is_empty(), "{notices:?}");
     let thumbnail = doc.thumbnail(last, 480).expect("the slide draws");

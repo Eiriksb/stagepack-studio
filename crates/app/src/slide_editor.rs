@@ -16,14 +16,13 @@ use std::time::Duration;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use slides_engine::{Align, CaretRect, Hit, LineMove, SelectionRects, TextLayout};
-use slides_format::{
-    Motion, Para, ParaKind, Pos, Selection, Span, StyleBit, TextEdit, uneditable_reason,
-};
+use slides_engine::{Align, CaretRect, ElementBox, Hit, LineMove, Rect, SelectionRects, TextLayout};
+use slides_format::{Motion, Para, ParaKind, Pos, Selection, Span, StyleBit, TextEdit};
 
 use crate::clipboard::{self, ClipboardOp, TextPaste};
 use crate::clipboard_tools::{read_clipboard, write_clipboard};
 use crate::document::{Document, EditRefused};
+use crate::selection::{self, Selected};
 use crate::slide_canvas::{SLIDE_WIDTH, SlideCanvas, letterbox};
 use crate::text_editing::{Composing, EditingText, clean_typed, utf16_slice};
 use crate::text_tools::{
@@ -37,9 +36,14 @@ pub const SLIDE_EDITOR_ID: &str = "slide-editor";
 pub const CARET_ID: &str = "caret";
 /// What the system's input method is composing, shown at the caret.
 pub const COMPOSITION_ID: &str = "composition";
+/// The outline around the thing selected on the slide.
+pub const SELECTION_OUTLINE_ID: &str = "selection-outline";
 
 /// The key context the editor's keys apply in, while text is being typed.
 pub const EDITOR_CONTEXT: &str = "SlideEditor";
+/// The key context the editor's keys apply in while a thing on the slide is selected and no
+/// text is being typed.
+pub const SELECTION_CONTEXT: &str = "SlideSelection";
 
 /// How long the caret shows, and then doesn't, as it blinks.
 const BLINK: Duration = Duration::from_millis(500);
@@ -47,10 +51,10 @@ const BLINK: Duration = Duration::from_millis(500);
 const TYPING_PAUSE: Duration = Duration::from_secs(2);
 /// How wide the caret is drawn, in the window's pixels.
 const CARET_WIDTH: f32 = 2.0;
+/// How wide the outline around the thing selected is drawn, in the window's pixels.
+const OUTLINE_WIDTH: f32 = 2.0;
 /// How big the text being composed is drawn, to the height of the caret.
 const COMPOSITION_TEXT: f32 = 0.7;
-/// What's said of a click on a thing on the slide that has no sentence of its own.
-const CANNOT_EDIT_HERE: &str = "This can't be edited on the slide yet.";
 
 actions!(
     slide_editor,
@@ -83,6 +87,10 @@ actions!(
         Indent,
         Outdent,
         StopEditing,
+        TakeAwaySelected,
+        SelectNextThing,
+        SelectPreviousThing,
+        LetGoOfSelected,
     ]
 );
 
@@ -128,6 +136,14 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-x", CutToClipboard, context),
         KeyBinding::new("ctrl-v", PasteFromClipboard, context),
     ]);
+    let selecting = Some(SELECTION_CONTEXT);
+    cx.bind_keys([
+        KeyBinding::new("delete", TakeAwaySelected, selecting),
+        KeyBinding::new("backspace", TakeAwaySelected, selecting),
+        KeyBinding::new("tab", SelectNextThing, selecting),
+        KeyBinding::new("shift-tab", SelectPreviousThing, selecting),
+        KeyBinding::new("escape", LetGoOfSelected, selecting),
+    ]);
     crate::text_tools::bind_keys(cx);
 }
 
@@ -137,6 +153,8 @@ pub enum EditorEvent {
     Edited,
     /// Something to put on the status line.
     Said(SharedString),
+    /// What was put on the status line no longer holds, and goes if it's still there.
+    Unsaid(SharedString),
 }
 
 /// Where the caret goes.
@@ -173,6 +191,8 @@ pub struct SlideEditor {
     wanted_x: Option<f32>,
     /// Whether a press on the text is being dragged, selecting.
     dragging: bool,
+    /// What the status line was told of the thing selected on the slide shown, if anything is.
+    told: Option<SharedString>,
 
     /// Where the caret and any composition were last drawn, so that the system's input method
     /// is told when they move, and only then.
@@ -258,6 +278,7 @@ impl SlideEditor {
             pause: None,
             wanted_x: None,
             dragging: false,
+            told: None,
             ime_place: None,
             _subscriptions: subscriptions,
         }
@@ -274,7 +295,9 @@ impl SlideEditor {
     }
 
     /// Follows the talk: once text is being typed, as after an undo of typing, the editor has
-    /// the keyboard, and once it isn't, it gives the keyboard back and stops its timers.
+    /// the keyboard, and once it isn't, it gives the keyboard back and stops its timers. A thing
+    /// selected on the slide shown keeps the keyboard, and takes it from the window, though not
+    /// from a panel that has it.
     fn document_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let focused = self.focus_handle.is_focused(window);
         if self.is_editing(cx) {
@@ -285,11 +308,144 @@ impl SlideEditor {
             }
         } else {
             self.stop(cx);
-            if focused {
+            if self.selection_here(cx).is_some() {
+                if !focused && self.away.is_focused(window) {
+                    self.focus_handle.focus(window, cx);
+                }
+            } else if focused {
                 self.away.focus(window, cx);
             }
         }
+        self.tell_selection(cx);
         cx.notify();
+    }
+
+    /// Follows another slide being shown: a thing selected on the one left isn't shown, and
+    /// one selected on the one come to is.
+    pub fn follow_slide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.document_changed(window, cx);
+    }
+
+    /// The thing selected, if it's on the slide shown.
+    fn selection_here(&self, cx: &App) -> Option<Selected> {
+        let document = self.document.as_ref()?.read(cx);
+        document
+            .selected()
+            .filter(|selected| selected.slide == document.current())
+            .cloned()
+    }
+
+    /// What the status line says of the thing selected on the slide shown.
+    fn said_of_selection(&self, cx: &App) -> Option<SharedString> {
+        let selected = self.selection_here(cx)?;
+        let talk = self.document.as_ref()?.read(cx).talk();
+        selection::said_of(talk, selected.slide, &selected.source).map(SharedString::from)
+    }
+
+    /// Tells the status line what's selected, once that's changed, or that it's let go of.
+    fn tell_selection(&mut self, cx: &mut Context<Self>) {
+        let said = self.said_of_selection(cx);
+        if said == self.told {
+            return;
+        }
+        match (&said, self.told.take()) {
+            (Some(said), _) => cx.emit(EditorEvent::Said(said.clone())),
+            (None, Some(told)) => cx.emit(EditorEvent::Unsaid(told)),
+            (None, None) => {}
+        }
+        self.told = said;
+    }
+
+    /// Selects the thing on slide `slide` whose source is `source`, ending any typing, and
+    /// takes the keyboard for it.
+    fn select_thing(&mut self, slide: usize, source: Range<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        self.stop(cx);
+        let message = document.update(cx, |document, cx| {
+            document.select(slide, source);
+            cx.notify();
+            document.take_message()
+        });
+        if let Some(message) = message {
+            cx.emit(EditorEvent::Said(message.into()));
+        }
+        self.focus_handle.focus(window, cx);
+        // Said even if it's said already, as the status line may say something else by now.
+        self.told = self.said_of_selection(cx);
+        if let Some(said) = &self.told {
+            cx.emit(EditorEvent::Said(said.clone()));
+        }
+        cx.notify();
+    }
+
+    /// Lets go of the thing selected, if anything is.
+    fn deselect(&mut self, cx: &mut Context<Self>) {
+        if let Some(document) = &self.document {
+            document.update(cx, |document, cx| {
+                if document.selected().is_some() {
+                    document.deselect();
+                    cx.notify();
+                }
+            });
+        }
+    }
+
+    /// Lets go of the thing selected on the slide shown, as Escape does once nothing is typed.
+    fn let_go(&mut self, cx: &mut Context<Self>) {
+        if self.selection_here(cx).is_some() {
+            self.deselect(cx);
+        } else {
+            cx.propagate();
+        }
+    }
+
+    /// Takes the thing selected on the slide shown away.
+    fn take_away(&mut self, cx: &mut Context<Self>) {
+        if self.selection_here(cx).is_none() {
+            cx.propagate();
+            return;
+        }
+        self.run(Document::delete_selected, cx);
+    }
+
+    /// Selects the next thing on the slide after the one selected, in the order they're
+    /// written, or with `back` the one before; past the last comes the first again.
+    fn select_along(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(selected) = self.selection_here(cx) else {
+            cx.propagate();
+            return;
+        };
+        let Some(layout) = self.layout(selected.slide, cx) else {
+            return;
+        };
+        let mut things: Vec<Range<usize>> = layout.elements().iter().map(|element| element.source.clone()).collect();
+        things.sort_by_key(|source| (source.start, std::cmp::Reverse(source.end)));
+        things.dedup();
+        let Some(at) = things.iter().position(|source| *source == selected.source) else {
+            return;
+        };
+        let next = if back { (at + things.len() - 1) % things.len() } else { (at + 1) % things.len() };
+        self.select_thing(selected.slide, things[next].clone(), window, cx);
+    }
+
+    /// The thing a click on paragraph `para` of flow `flow` of slide `slide`, at `point`, would
+    /// select before typing in it: the box the text is written in, if it's one.
+    fn box_of_text(&self, slide: usize, flow: usize, para: usize, (x, y): (f32, f32), cx: &mut Context<Self>) -> Option<Range<usize>> {
+        let element = self.layout(slide, cx)?.element_at(x, y)?;
+        let talk = self.document.as_ref()?.read(cx).talk();
+        (element.holds_text && selection::holds_para(talk, slide, flow, para, &element.source)).then_some(element.source)
+    }
+
+    /// Whether the thing on slide `slide` at `source` is the one selected.
+    fn is_selected(&self, slide: usize, source: &Range<usize>, cx: &App) -> bool {
+        self.document.as_ref().is_some_and(|document| {
+            document
+                .read(cx)
+                .selected()
+                .is_some_and(|selected| selected.slide == slide && selected.source == *source)
+        })
     }
 
     /// Does `work` to the talk, and tells the window what came of it: the slides it changed,
@@ -636,20 +792,21 @@ impl SlideEditor {
         self.wanted_x = None;
     }
 
-    /// Ends typing on the slide, as a click on the desk around it does, and gives the keyboard
-    /// back to the window.
+    /// Ends typing on the slide and lets go of anything selected, as a click on the desk
+    /// around it does, and gives the keyboard back to the window.
     pub fn stop_typing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.deselect(cx);
         self.end_editing(true, window, cx);
     }
 
     /// Ends typing on the slide. With `give_back`, the keyboard goes back to the window, if
-    /// the editor has it.
+    /// the editor has it, unless a thing on the slide is still selected.
     fn end_editing(&mut self, give_back: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.stop(cx);
         if self.is_editing(cx) {
             self.run(Document::end_text, cx);
         }
-        if give_back && self.focus_handle.is_focused(window) {
+        if give_back && self.focus_handle.is_focused(window) && self.selection_here(cx).is_none() {
             self.away.focus(window, cx);
         }
         cx.notify();
@@ -792,11 +949,11 @@ impl SlideEditor {
         self.dragging = false;
         let Some(point) = self.slide_point(event.position, cx) else {
             // The desk around the slide.
-            self.end_editing(true, window, cx);
+            self.stop_typing(window, cx);
             return;
         };
         let Some((slide, mut hit)) = self.hit(point, cx) else {
-            self.end_editing(true, window, cx);
+            self.stop_typing(window, cx);
             return;
         };
         let elsewhere = match &hit {
@@ -817,8 +974,17 @@ impl SlideEditor {
         match hit {
             Hit::Text { flow, pos } => {
                 cx.stop_propagation();
+                let starts = !self.editing_flow(slide, flow, cx);
+                // The first click on a box's text picks the box; the next types in it.
+                let pick = self
+                    .box_of_text(slide, flow, pos.para, point, cx)
+                    .filter(|source| starts && event.click_count == 1 && !self.is_selected(slide, source, cx));
+                if let Some(source) = pick {
+                    self.select_thing(slide, source, window, cx);
+                    return;
+                }
                 self.wanted_x = None;
-                if !self.editing_flow(slide, flow, cx) {
+                if starts {
                     self.run(
                         |document| {
                             document.begin_text(slide, flow, pos);
@@ -828,7 +994,9 @@ impl SlideEditor {
                     );
                 }
                 let extend = event.modifiers.shift && !elsewhere;
-                match event.click_count {
+                // A double click that starts the typing puts the caret where it was clicked.
+                let count = if starts { 1 } else { event.click_count };
+                match count {
                     2 => self.apply(|edit| edit.select_word_at(pos), cx),
                     count if count >= 3 => self.apply(
                         |edit| {
@@ -850,9 +1018,14 @@ impl SlideEditor {
                 }
                 self.focus_handle.focus(window, cx);
             }
+            Hit::Element(element) => {
+                cx.stop_propagation();
+                self.select_thing(slide, element.source, window, cx);
+            }
             Hit::Placeholder(region) => {
                 cx.stop_propagation();
                 self.wanted_x = None;
+                self.deselect(cx);
                 self.run(
                     |document| {
                         document.begin_text_in_region(slide, &region);
@@ -864,19 +1037,12 @@ impl SlideEditor {
                 self.typed(cx);
             }
             Hit::Uneditable(reason) => {
-                self.end_editing(true, window, cx);
+                self.stop_typing(window, cx);
                 cx.emit(EditorEvent::Said(reason.into()));
             }
-            // Picking a thing on the slide comes later: for now it says why it can't be typed in.
-            Hit::Element(element) => {
-                self.end_editing(true, window, cx);
-                let reason = self.document.as_ref().and_then(|document| {
-                    uneditable_reason(document.read(cx).talk(), slide, element.source.start)
-                });
-                cx.emit(EditorEvent::Said(reason.unwrap_or(CANNOT_EDIT_HERE).into()));
-            }
-            Hit::Nothing => self.end_editing(true, window, cx),
+            Hit::Nothing => self.stop_typing(window, cx),
         }
+        self.tell_selection(cx);
     }
 
     fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -1038,7 +1204,18 @@ fn caret_box(caret: &CaretRect, slide: Bounds<Pixels>) -> Bounds<Pixels> {
             size: Size::default(),
         };
     }
-    let corners = caret_corners(caret, unit);
+    corners_box(&caret_corners(caret, unit), slide, unit)
+}
+
+/// The corners of the thing selected, `element`, turned with it, in slide units.
+fn outline_corners(element: &ElementBox) -> [(f32, f32); 4] {
+    let Rect { x, y, w, h } = element.rect;
+    corners(x, y, w, h, (x + w / 2., y + h / 2.), element.rotate)
+}
+
+/// The box `corners`, in slide units, fit in, in the window, on a slide drawn at `slide`
+/// there, `unit` window pixels to a slide unit.
+fn corners_box(corners: &[(f32, f32); 4], slide: Bounds<Pixels>, unit: f32) -> Bounds<Pixels> {
     let (xs, ys): (Vec<f32>, Vec<f32>) = corners.iter().copied().unzip();
     let fold = |values: &[f32], pick: fn(f32, f32) -> f32| {
         values.iter().copied().reduce(pick).unwrap_or(0.)
@@ -1058,11 +1235,32 @@ fn paint_polygon(
     color: Hsla,
     window: &mut Window,
 ) {
+    paint_path(PathBuilder::fill(), points, slide, unit, color, window);
+}
+
+/// Draws the line around `points`, in slide units, on a slide drawn at `slide`.
+fn paint_outline(
+    points: &[(f32, f32)],
+    slide: Bounds<Pixels>,
+    unit: f32,
+    color: Hsla,
+    window: &mut Window,
+) {
+    paint_path(PathBuilder::stroke(px(OUTLINE_WIDTH)), points, slide, unit, color, window);
+}
+
+fn paint_path(
+    mut path: PathBuilder,
+    points: &[(f32, f32)],
+    slide: Bounds<Pixels>,
+    unit: f32,
+    color: Hsla,
+    window: &mut Window,
+) {
     let points: Vec<Point<Pixels>> = points
         .iter()
         .map(|&(x, y)| slide.origin + point(px(x * unit), px(y * unit)))
         .collect();
-    let mut path = PathBuilder::fill();
     path.add_polygon(&points, true);
     if let Ok(path) = path.build() {
         window.paint_path(path, color);
@@ -1078,6 +1276,14 @@ impl Render for SlideEditor {
         let (composition_color, composition_background) =
             (cx.theme().foreground, cx.theme().background);
         let caret_on = self.caret_on;
+        let outline_color = cx.theme().ring;
+        // The thing selected on the slide shown, drawn around.
+        let outline = self.selection_here(cx).and_then(|_| {
+            let document = self.document.clone()?;
+            document.update(cx, |document, _| document.selected_box())
+        });
+        let outline = outline.as_ref().map(outline_corners);
+        let selecting = outline.is_some() && !self.is_editing(cx);
         let placed = {
             let canvas = self.canvas.read(cx);
             canvas.slide_bounds().zip(canvas.area())
@@ -1092,6 +1298,11 @@ impl Render for SlideEditor {
             .and_then(|marks| marks.caret)
             .zip(placed)
             .map(|(caret, (slide, area))| in_editor(caret_box(&caret, slide), area));
+        // Where the outline is in the editor, for whoever looks for it.
+        let outline_box = outline.zip(placed).and_then(|(corners, (slide, area))| {
+            let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
+            (unit > 0.0).then(|| in_editor(corners_box(&corners, slide, unit), area))
+        });
         // What the system is composing, at the caret, where the selection it stands for starts.
         let composing = self.editing(cx).and_then(|editing| {
             let composing = editing.composing.as_ref()?;
@@ -1136,13 +1347,16 @@ impl Render for SlideEditor {
                         editor.update(cx, |editor, _| editor.dragging = false).ok();
                     }
                 });
-                let Some(marks) = marks else { return };
                 let slide = letterbox(area, window.scale_factor());
                 let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
                 if unit <= 0.0 {
                     return;
                 }
                 window.with_content_mask(Some(ContentMask { bounds: slide }), |window| {
+                    if let Some(corners) = &outline {
+                        paint_outline(corners, slide, unit, outline_color, window);
+                    }
+                    let Some(marks) = marks else { return };
                     let SelectionRects {
                         rects,
                         rotate,
@@ -1169,7 +1383,7 @@ impl Render for SlideEditor {
         div()
             .id(SLIDE_EDITOR_ID)
             .test_support()
-            .key_context(EDITOR_CONTEXT)
+            .key_context(if selecting { SELECTION_CONTEXT } else { EDITOR_CONTEXT })
             .track_focus(&self.focus_handle)
             .absolute()
             .size_full()
@@ -1256,6 +1470,14 @@ impl Render for SlideEditor {
             .on_action(
                 cx.listener(|this, _: &StopEditing, window, cx| this.end_editing(true, window, cx)),
             )
+            .on_action(cx.listener(|this, _: &TakeAwaySelected, _, cx| this.take_away(cx)))
+            .on_action(cx.listener(|this, _: &SelectNextThing, window, cx| {
+                this.select_along(false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectPreviousThing, window, cx| {
+                this.select_along(true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &LetGoOfSelected, _, cx| this.let_go(cx)))
             .on_action(cx.listener(|this, _: &CopyToClipboard, _, cx| {
                 this.clipboard(ClipboardOp::Copy, cx)
             }))
@@ -1281,6 +1503,18 @@ impl Render for SlideEditor {
             }))
             .child(self.canvas.clone())
             .child(overlay)
+            .when_some(outline_box, |this, outline| {
+                this.child(
+                    div()
+                        .id(SELECTION_OUTLINE_ID)
+                        .test_support()
+                        .absolute()
+                        .left(outline.origin.x)
+                        .top(outline.origin.y)
+                        .w(outline.size.width)
+                        .h(outline.size.height),
+                )
+            })
             .when_some(caret_box, |this, caret| {
                 this.child(
                     div()

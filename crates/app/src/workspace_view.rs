@@ -408,6 +408,7 @@ impl WorkspaceView {
             cx.subscribe(&slide_editor, |this, _, event: &EditorEvent, cx| match event {
                 EditorEvent::Edited => this.edited(cx),
                 EditorEvent::Said(said) => this.say(said.clone(), cx),
+                EditorEvent::Unsaid(said) => this.unsay(said, cx),
             });
         let panels = Panels {
             notes: true,
@@ -861,6 +862,15 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    /// Takes `status` off the status line, if it's still what the line says.
+    fn unsay(&mut self, status: &SharedString, cx: &mut Context<Self>) {
+        if self.status.as_ref() == Some(status) {
+            self.status = None;
+            self.status_fading = None;
+            cx.notify();
+        }
+    }
+
     /// Puts `status` on the status line until [`STATUS_FADE`] has passed, or the next edit.
     fn say_for_a_while(&mut self, status: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.say(status, cx);
@@ -1032,6 +1042,11 @@ fn export_menu(has_talk: bool) -> impl IntoElement {
 }
 
 /// One line of small print under the slide.
+/// A footer line with nothing on it, as tall as one with something.
+fn blank_footer_line() -> impl IntoElement {
+    div().w_full().px_2().py_1().text_xs().child("\u{a0}")
+}
+
 fn footer_line(id: &'static str, line: SharedString, color: Hsla) -> impl IntoElement {
     div()
         .id(id)
@@ -1229,7 +1244,7 @@ impl Render for WorkspaceView {
             }))
             .on_action(cx.listener(|this, action: &SelectSlide, window, cx| {
                 let index = action.index;
-                this.select(|document| document.select(index), window, cx)
+                this.select(|document| document.go_to(index), window, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleMarkdown, window, cx| {
                 this.toggle_panel(|this| &mut this.show_markdown, window, cx)
@@ -1310,8 +1325,12 @@ impl Render for WorkspaceView {
                     muted_text,
                 ))
             })
-            .when_some(self.status.clone(), |this, status| {
-                this.child(footer_line(STATUS_ID, status, muted_text))
+            .map(|this| match self.status.clone() {
+                Some(status) => this.child(footer_line(STATUS_ID, status, muted_text)),
+                // The line keeps its room with nothing on it, so the slide stays put as what's
+                // said comes and goes, as it does with each click that selects a thing.
+                None if self.document.is_some() => this.child(blank_footer_line()),
+                None => this,
             })
     }
 }
