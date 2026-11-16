@@ -963,6 +963,17 @@ fn a_change_worked_out_before_typing_was_tidied_is_refused() {
 }
 
 #[test]
+fn tab_on_the_first_bullet_of_an_empty_region_leaves_typing_working() {
+    let (_d, mut doc) = talk("# First\n");
+    assert!(doc.begin_text_in_region(0, "body"));
+    doc.apply_text(|edit| edit.toggle_list(false)).unwrap();
+    doc.apply_text(|edit| edit.indent()).unwrap();
+    doc.apply_text(|edit| edit.insert("a")).unwrap();
+    doc.apply_text(|edit| edit.insert("b")).unwrap();
+    assert_eq!(doc.source(), "# First\n\n- ab\n");
+}
+
+#[test]
 fn text_is_not_begun_in_a_region_the_layout_has_not_got() {
     let (_d, mut doc) = talk("# T\n\nwords\n");
     assert!(!doc.begin_text_in_region(0, "right"));

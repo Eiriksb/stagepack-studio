@@ -393,35 +393,83 @@ fn style_at_says_mixed_when_it_is() {
     assert_eq!(state.kind, Shared::All(BODY));
 }
 
+/// Panics unless every list item `op` gave a level to, by making or changing it, is no more
+/// than a level deeper than the item before it, and at the top level after anything else.
+fn assert_levels_fit(before: &TextEdit, op: &Op, after: &TextEdit) {
+    let given = match op {
+        Op::SetKind(_) | Op::Indent | Op::Outdent => {
+            let (start, end) = (before.selection.start().para, before.selection.end().para);
+            start..(end + 1).min(after.paras.len())
+        }
+        Op::Paste(_) => {
+            let (start, end) = (before.selection.start().para, before.selection.end().para);
+            let replaced = if before.paras.is_empty() { 0 } else { end - start + 1 };
+            start..start + after.paras.len() + replaced - before.paras.len()
+        }
+        _ => return,
+    };
+    let level = |kind: ParaKind| match kind {
+        ParaKind::Bullet { level } | ParaKind::Numbered { level } => Some(level),
+        _ => None,
+    };
+    for index in given {
+        let Some(at) = level(after.paras[index].kind) else { continue };
+        let most = index.checked_sub(1).and_then(|before| level(after.paras[before].kind)).map_or(0, |above| above + 1);
+        assert!(at <= most, "{op:?} made item {index} too deep in {:?}", after.paras);
+    }
+}
+
 // Kinds and levels.
 
 #[test]
 fn set_kind_changes_every_paragraph_the_selection_touches() {
     let edit = at(vec![body("a"), body("b"), body("c")], range(pos(1, 0), pos(0, 1))).set_kind(NUMBERED);
     assert_eq!(kinds(&edit), [NUMBERED, NUMBERED, BODY]);
-    let edit = at(vec![body("a")], caret(0, 0)).set_kind(ParaKind::Bullet { level: 20 });
-    assert_eq!(kinds(&edit), [ParaKind::Bullet { level: 8 }]);
+    let deep: Vec<Para> = (0..=8).map(|level| para(ParaKind::Bullet { level }, "a")).chain([body("b")]).collect();
+    let edit = at(deep, caret(9, 0)).set_kind(ParaKind::Bullet { level: 20 });
+    assert_eq!(kinds(&edit)[9], ParaKind::Bullet { level: 8 });
+}
+
+#[test]
+fn a_list_item_is_never_made_deeper_than_the_one_before_it_allows() {
+    let level = |level| ParaKind::Bullet { level };
+    // A first item, empty or not, and one after a body paragraph, stay at the top level.
+    assert_eq!(kinds(&at(vec![para(BULLET, "")], caret(0, 0)).indent()), [BULLET]);
+    assert_eq!(kinds(&TextEdit::new(vec![body("")]).toggle_list(false).indent()), [BULLET]);
+    assert_eq!(kinds(&at(vec![body("a"), para(BULLET, "b")], caret(1, 0)).indent()), [BODY, BULLET]);
+    // One under another goes a level deeper than it, and no further.
+    let two = at(vec![para(BULLET, "a"), para(BULLET, "b")], caret(1, 0));
+    assert_eq!(kinds(&two.indent().indent()), [BULLET, level(1)]);
+    // Made items at once, each one goes no deeper than the one before allows.
+    let three = at(vec![body("a"), body("b"), body("c")], range(pos(0, 0), pos(2, 1)));
+    assert_eq!(kinds(&three.set_kind(level(3))), [BULLET, level(1), level(2)]);
+    // Pasted items too, wherever they go.
+    let pasted = [para(level(2), "x"), para(level(5), "y")];
+    assert_eq!(kinds(&at(vec![body("")], caret(0, 0)).paste(&pasted)), [BULLET, level(1)]);
+    assert_eq!(kinds(&at(vec![para(BULLET, "a"), body("")], caret(1, 0)).paste(&pasted)), [BULLET, level(1), level(2)]);
 }
 
 #[test]
 fn indent_and_outdent_change_list_levels_from_0_to_8() {
-    let edit = at(vec![para(BULLET, "a"), body("b"), para(NUMBERED, "c")], range(pos(0, 0), pos(2, 0))).indent();
-    assert_eq!(kinds(&edit), [ParaKind::Bullet { level: 1 }, BODY, ParaKind::Numbered { level: 1 }]);
+    let list = vec![para(BULLET, "top"), para(BULLET, "a"), body("b"), para(NUMBERED, "c"), para(NUMBERED, "d")];
+    let edit = at(list, range(pos(1, 0), pos(4, 0))).indent();
+    assert_eq!(kinds(&edit), [BULLET, ParaKind::Bullet { level: 1 }, BODY, NUMBERED, ParaKind::Numbered { level: 1 }]);
     let edit = edit.outdent().outdent();
-    assert_eq!(kinds(&edit), [BULLET, BODY, NUMBERED]);
-    let mut edit = at(vec![para(BULLET, "a")], caret(0, 0));
+    assert_eq!(kinds(&edit), [BULLET, BULLET, BODY, NUMBERED, NUMBERED]);
+    let mut edit = at((0..10).map(|_| para(BULLET, "a")).collect(), range(pos(0, 0), pos(9, 1)));
     for _ in 0..12 {
         edit = edit.indent();
     }
-    assert_eq!(kinds(&edit), [ParaKind::Bullet { level: 8 }]);
+    let levels: Vec<u8> = (0..=8).chain([8]).collect();
+    assert_eq!(kinds(&edit), levels.into_iter().map(|level| ParaKind::Bullet { level }).collect::<Vec<_>>());
 }
 
 #[test]
 fn toggle_list_makes_the_paragraphs_a_list_keeping_levels_and_back() {
-    let two = ParaKind::Numbered { level: 2 };
+    let two = ParaKind::Numbered { level: 1 };
     let edit = at(vec![body("a"), para(two, "b"), para(HEADING, "c"), body("d")], range(pos(0, 0), pos(2, 1)));
     let bullets = edit.toggle_list(false);
-    assert_eq!(kinds(&bullets), [BULLET, ParaKind::Bullet { level: 2 }, BULLET, BODY]);
+    assert_eq!(kinds(&bullets), [BULLET, ParaKind::Bullet { level: 1 }, BULLET, BODY]);
     assert_eq!(texts(&bullets), ["a", "b", "c", "d"]);
     assert_eq!(bullets.selection, edit.selection, "the selection stays");
     // All of them bullets already: they go back to body paragraphs.
@@ -949,6 +997,21 @@ impl Plain {
         }
     }
 
+    /// No list item of `range` deeper than the paragraph before it allows.
+    fn fit_levels(&mut self, range: std::ops::Range<usize>) {
+        for index in range {
+            let most = match index.checked_sub(1).map(|before| self.paras[before].0) {
+                Some(ParaKind::Bullet { level } | ParaKind::Numbered { level }) => level + 1,
+                _ => 0,
+            };
+            self.paras[index].0 = match self.paras[index].0 {
+                ParaKind::Bullet { level } => ParaKind::Bullet { level: level.min(most) },
+                ParaKind::Numbered { level } => ParaKind::Numbered { level: level.min(most) },
+                kind => kind,
+            };
+        }
+    }
+
     /// Applies `op`, or returns false if the model doesn't follow it.
     fn apply(&mut self, op: &Op) -> bool {
         let clamp = |level: u8| level.min(8);
@@ -1008,6 +1071,7 @@ impl Plain {
                     for para in &mut self.paras[start.para..=end.para] {
                         para.0 = *kind;
                     }
+                    self.fit_levels(start.para..end.para + 1);
                 }
             }
             Op::Indent | Op::Outdent => {
@@ -1022,6 +1086,7 @@ impl Plain {
                             kind => kind,
                         };
                     }
+                    self.fit_levels(start.para..end.para + 1);
                 }
             }
             Op::SelectAll => {
@@ -1065,7 +1130,12 @@ impl Plain {
                     .iter()
                     .map(|para| (para.kind, para.spans.iter().map(|span| span.text.as_str()).collect()))
                     .collect();
+                self.ensure();
+                let (start, end) = self.ends();
+                let before = self.paras.len();
                 self.replace(&pasted, true);
+                let made = self.paras.len() + (end.para - start.para + 1) - before;
+                self.fit_levels(start.para..start.para + made);
             }
             Op::SelectWord(..) | Op::WordMove(..) | Op::Wild(..) => return false,
         }
@@ -1082,8 +1152,10 @@ proptest! {
     fn the_model_stays_well_formed(edit in start(), ops in prop::collection::vec(op(), 0..40)) {
         let mut edit = edit;
         for op in &ops {
+            let before = edit.clone();
             edit = apply(&edit, op);
             assert_well_formed(&edit);
+            assert_levels_fit(&before, op, &edit);
             let _ = edit.style_at();
             let copied = edit.copied();
             assert_well_formed(&at(copied, caret(0, 0)));

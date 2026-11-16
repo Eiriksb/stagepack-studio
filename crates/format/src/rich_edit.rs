@@ -253,7 +253,8 @@ impl TextEdit {
         self.clamped().restyle(|style| style.color = color.clone())
     }
 
-    /// Makes every paragraph the selection touches `kind`.
+    /// Makes every paragraph the selection touches `kind`. A list item is no more than a
+    /// level deeper than the item before it, and at the top level after anything else.
     pub fn set_kind(&self, kind: ParaKind) -> Self {
         let kind = clamp_kind(kind);
         self.clamped().rekind(|_| kind)
@@ -261,7 +262,8 @@ impl TextEdit {
 
     /// Makes every paragraph the selection touches a bulleted list item, or a numbered one
     /// with `numbered`, keeping the level of one that's a list item already. If all of them
-    /// are that kind of item already, they become body paragraphs instead.
+    /// are that kind of item already, they become body paragraphs instead. Levels are kept
+    /// as [`Self::set_kind`] allows.
     pub fn toggle_list(&self, numbered: bool) -> Self {
         let edit = self.clamped();
         let is_one = |kind: ParaKind| match kind {
@@ -284,7 +286,8 @@ impl TextEdit {
         })
     }
 
-    /// Takes every list item the selection touches a level deeper.
+    /// Takes every list item the selection touches a level deeper, but never more than a
+    /// level deeper than the item before it: the first item of a list stays where it is.
     pub fn indent(&self) -> Self {
         self.clamped().rekind(|kind| match kind {
             ParaKind::Bullet { level } | ParaKind::Numbered { level } => with_level(kind, (level + 1).min(MAX_LEVEL)),
@@ -366,12 +369,17 @@ impl TextEdit {
     /// starts in, and gives it its kind if that's left empty. More start in it, taking its
     /// kind unless nothing's before them in it, and the last is followed by what came after
     /// the selection. Line endings become line breaks, a paragraph separator ends a
-    /// paragraph, and other control characters are dropped.
+    /// paragraph, and other control characters are dropped. The list items it makes take
+    /// levels as [`Self::set_kind`] allows.
     pub fn paste(&self, paras: &[Para]) -> Self {
         let mut edit = self.clamped();
         edit.ensure_para();
         let fragment = paras.iter().flat_map(clean_para).collect();
+        let (start, end) = (edit.selection.start().para, edit.selection.end().para);
+        let before = edit.paras.len();
         edit.replace(fragment, true);
+        let made = edit.paras.len() + (end - start + 1) - before;
+        edit.fit_levels(start..start + made);
         edit
     }
 
@@ -580,7 +588,24 @@ impl TextEdit {
         for para in &mut self.paras[start.para..=end.para] {
             para.kind = clamp_kind(change(para.kind));
         }
+        self.fit_levels(start.para..end.para + 1);
         self
+    }
+
+    /// Brings each list item of `range`, in order, to no more than a level deeper than the
+    /// paragraph before it, if that's a list item, or to the top level if it isn't: an item
+    /// can't be written deeper than the item it sits in.
+    fn fit_levels(&mut self, range: std::ops::Range<usize>) {
+        for index in range {
+            let most = match index.checked_sub(1).map(|before| self.paras[before].kind) {
+                Some(ParaKind::Bullet { level } | ParaKind::Numbered { level }) => level + 1,
+                _ => 0,
+            };
+            let kind = self.paras[index].kind;
+            if let ParaKind::Bullet { level } | ParaKind::Numbered { level } = kind {
+                self.paras[index].kind = with_level(kind, level.min(most));
+            }
+        }
     }
 
     /// Puts `fragment` in place of the selection, which must be in range, and puts the caret

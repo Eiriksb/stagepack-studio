@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e2e4cccff895b3ea9afa73491ffcb2b0bcced0e0e016f426ca9082d08115f73c # shrinks to edit = TextEdit { paras: [], selection: Selection { anchor: Pos { para: 0, offset: 0 }, head: Pos { para: 0, offset: 0 } }, typing_style: None }, ops = [Paste([Para { kind: Bullet { level: 0 }, spans: [] }]), Indent, Insert("")]
