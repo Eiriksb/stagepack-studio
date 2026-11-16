@@ -274,7 +274,7 @@ fn loading_theirs_is_a_step_that_undo_takes_back() {
     let theirs = format!("{TWO_SLIDES}\n---\n\n# Three\n");
     doc.reload(Some(theirs.clone()));
 
-    doc.take_theirs(theirs.clone());
+    doc.take_theirs(theirs.clone()).unwrap();
 
     assert_eq!(doc.source(), theirs);
     assert!(doc.outside_change().is_none());
@@ -309,9 +309,9 @@ fn keeping_mine_then_saving_writes_mine() {
     // The same change again isn't asked about twice.
     assert!(!matches!(doc.reload(Some(theirs.clone())), Reload::Conflict));
     // Undoing back to what was saved before isn't what the file holds now.
-    doc.undo();
+    doc.undo().unwrap();
     assert!(doc.has_unsaved_changes());
-    doc.redo();
+    doc.redo().unwrap();
     // A new change is.
     let again = format!("{theirs}\n---\n\n# Four\n");
     std::fs::write(dir.path().join("slides.md"), &again).unwrap();
@@ -527,5 +527,6 @@ fn a_slides_file_that_is_there_but_cannot_be_read_is_not_written_over() {
 fn a_missing_slides_file_is_written_without_asking() {
     let (problem, dir) = save_over(|file| std::fs::remove_file(file).unwrap());
     assert_eq!(problem, None);
-    assert!(read(&dir.path().join("slides.md")).contains("# \n"), "the edit was saved");
+    let saved = read(&dir.path().join("slides.md"));
+    assert_eq!(saved.lines().filter(|line| *line == "---").count(), 4, "the edit was saved: {saved}");
 }

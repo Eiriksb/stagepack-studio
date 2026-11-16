@@ -132,7 +132,7 @@ impl PropField {
 ///     text(left.to_string())
 /// }
 /// ```
-pub const RESERVED_NAMES: [&str; 16] = include!("../../toolkit-macros/src/reserved_names.rs");
+pub const RESERVED_NAMES: [&str; 17] = include!("../../toolkit-macros/src/reserved_names.rs");
 
 /// Whether `path` stays inside the talk's `assets` folder.
 pub fn asset_path_allowed(path: &str) -> bool {

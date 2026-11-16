@@ -510,9 +510,10 @@ fn the_working_copy_follows_edits_after_a_moment(cx: &mut TestAppContext) {
     add_slide(cx, &view);
     wait(cx, 600);
     let kept = recovery.find(&setup.place()).unwrap().text;
+    // The talk's settings, and one new slide's line.
     assert_eq!(
-        kept.matches("# ").count(),
-        2,
+        kept.lines().filter(|line| *line == "---").count(),
+        3,
         "each edit starts the wait again: {kept:?}"
     );
     wait(cx, 400);

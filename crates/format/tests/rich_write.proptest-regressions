@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 629ad89e895aec8122199ce56e8570200a224798d12e932e630df845d48fdd3e # shrinks to (source, slide, flow) = ("# Title\n\nPara one.\n\n- a\n- b\n  - c\n\n1. x\n2. y\n", 0, 1), mut paras = [Para { kind: Body, spans: [Span { text: "!", style: Style { bold: false, italic: false, underline: false, code: false, color: None, size: None, link: None } }, Span { text: "a", style: Style { bold: false, italic: false, underline: false, code: false, color: None, size: None, link: Some("https://example.com/a_b") } }] }]
+cc f97aba9a0719d22fb3defe3a4700b53ad1256363ada2245b05285b40bf26c796 # shrinks to generated = GenTalk { slides: [GenSlide { settings: [], blocks: ["1. a\n    - nested\n    1. one\n2. b"], notes: None, blank_after: false, notes_layout: NotesLayout { after_blocks: 0, indented: false, tight_before: false, tight_after: false }, key_values: false }], crlf: false, bom: false, final_newline: false, opening_rule: false, tail: None }, slide = Index(0), flow = Index(9223372036854775808), para = Index(0), at_end = false
+cc 6513e2bc69767444e09a6cf967080bb00afd145bd50ad311f11f340cd4336e98 # shrinks to (source, slide, flow) = ("# Title\n\nPara one.\n\n- a\n- b\n  - c\n\n1. x\n2. y\n", 0, 1), mut paras = [Para { kind: Body, spans: [Span { text: "]:", style: Style { bold: false, italic: false, underline: false, code: true, color: None, size: None, link: Some("(x)") } }] }]

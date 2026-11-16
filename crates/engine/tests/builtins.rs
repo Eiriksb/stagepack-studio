@@ -312,7 +312,7 @@ fn text_of(layer: &LayerSpec) -> String {
 
 #[test]
 fn placement_attributes_do_not_reach_the_component() {
-    assert_eq!(PLACEMENT_ATTRS, ["x", "y", "w", "h", "rotate", "click", "enter"]);
+    assert_eq!(PLACEMENT_ATTRS, ["x", "y", "w", "h", "rotate", "click", "enter", "align"]);
     let src = "<Probe x=\"1\" rotate=\"2\" click=\"3\" note=\"kept\" />\n";
     let (slide, _) = lay_out_with(src, &[], &probe_registry());
     assert_eq!(text_of(slide.layers.last().unwrap()), "[][][][kept]");

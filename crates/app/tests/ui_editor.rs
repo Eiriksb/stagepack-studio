@@ -451,7 +451,14 @@ fn undo_and_redo_are_disabled_until_there_is_something(cx: &mut TestAppContext) 
     click(cx, handle, UNDO_ID);
     assert_eq!(count(cx, &view), 2);
     assert_eq!(state(cx), (true, false));
-    click(cx, handle, REDO_ID);
+    // At its left end: in this window the row of tools runs past the right edge, and the
+    // arrow there, which takes the clicks over what it covers, lies over Redo's right half.
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click_at(REDO_ID, gpui_kit::point(gpui_kit::px(4.), gpui_kit::px(8.)), cx);
+    })
+    .unwrap();
+    settle(cx, handle);
     assert_eq!(count(cx, &view), 3);
     assert_eq!(state(cx), (false, true));
 }
@@ -625,8 +632,14 @@ fn arrow_keys_in_the_notes_field_do_not_change_slide(cx: &mut TestAppContext) {
         keys(cx, handle, key);
         assert_eq!(current(cx, &view), 1, "{key}");
     }
-    // The canvas has them again once it's clicked.
-    click(cx, handle, CANVAS_ID);
+    // The slide has them again once the desk around it is clicked: a click on the slide itself
+    // types there.
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click_at(CANVAS_ID, point(px(1.), px(1.)), cx);
+    })
+    .unwrap();
+    settle(cx, handle);
     keys(cx, handle, "right");
     assert_eq!(current(cx, &view), 2);
 }
@@ -1224,13 +1237,18 @@ fn pick_from_rows_menu(cx: &mut TestAppContext, handle: AnyWindowHandle, row: us
     settle(cx, handle);
 }
 
-const MENU: [&str; 6] = [
+/// The menu's items, a line between the last two groups.
+const MENU: [&str; 10] = [
     "New slide",
     "Duplicate",
     "Delete",
     "Hide slide",
     "Move up",
     "Move down",
+    "",
+    "Cut",
+    "Copy",
+    "Paste",
 ];
 
 #[gpui_kit::test]

@@ -88,6 +88,12 @@ fn text_is_selectable() {
 }
 
 #[test]
+fn an_empty_line_exports_the_same_in_either_spelling() {
+    let pdf = |line: &str| slides_pdf::write_pdf(&mut open_source(&format!("# T\n\nFirst\n\n{line}\n\nThird\n"))).expect("the export succeeds");
+    assert_eq!(pdf("&nbsp;"), pdf("**<Text></Text>**"));
+}
+
+#[test]
 fn fonts_are_embedded_and_subset() {
     let (_dir, pdf) = showcase_pdf();
     let Some(fonts) = run("pdffonts", &[&pdf]) else { return };

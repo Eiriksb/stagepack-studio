@@ -11,13 +11,13 @@ use taffy::prelude::{
 use tiny_skia::{Path, PathBuilder};
 use toolkit::{Color, Ctx, CtxData, Element, Placed, Props, RenderInput, ShapeKind, TextAlign, Theme};
 
-use crate::flow::{Content, Flow, MAX_NOTICE_CHARS, TEXT_TAG, column, rounded_rect, rounded_rect_with};
+use crate::flow::{Content, Drawing, Flow, MAX_NOTICE_CHARS, TEXT_TAG, column, rounded_rect, rounded_rect_with};
 use slides_components::shortened;
 use crate::pictures::icon_pixmap;
-use crate::slide::{MAX_SIZE, SLIDE_HEIGHT, SLIDE_WIDTH, is_positioned};
+use crate::slide::{ALIGN_UNPLACED, MAX_SIZE, SLIDE_HEIGHT, SLIDE_WIDTH, is_positioned};
 use crate::native::Semantic;
 use crate::talk_components::{Rendered, read_asset};
-use crate::{Align, DisplayItem, LayoutEnv, NativeContent, NativeElement, Notice, PLACEMENT_ATTRS, PathStep, RegionDef, layout_by_name};
+use crate::{Align, DisplayItem, LayoutEnv, NativeContent, Notice, PLACEMENT_ATTRS, PathStep, RegionDef, layout_by_name};
 
 const DEFAULT_WIDTH: f32 = 400.0;
 const DEFAULT_HEIGHT: f32 = 200.0;
@@ -126,22 +126,25 @@ fn positioned_tag_region() -> &'static RegionDef {
     &layout_by_name("blank").expect("the blank layout exists").regions[0]
 }
 
-/// Lays out a tag with a layer of its own, and returns the size of its box, its drawing
-/// and what it is. `wanted` is the width and height the tag gives.
+/// Lays out a tag with a layer of its own, and returns the size of its box, its drawing,
+/// what it is and where its text is. `wanted` is the width and height the tag gives, and
+/// `align` the alignment it asks for.
 pub(crate) fn lay_out_positioned_tag(
     tag: &Tag,
     wanted: (Option<f32>, Option<f32>),
+    align: Option<Align>,
     theme: &Theme,
     env: &mut LayoutEnv,
     notices: &mut Vec<Notice>,
-) -> ((f32, f32), Vec<DisplayItem>, Vec<NativeElement>) {
+) -> ((f32, f32), Drawing) {
     let room = (wanted.0.unwrap_or(POSITIONED_ROOM), wanted.1.unwrap_or(0.0));
     let mut flow = Flow::new(positioned_tag_region(), room.0, theme, env, notices);
+    flow.box_align = align;
     let element = flow.render_tag(tag, room);
     let natural = element.as_ref().and_then(|element| flow.natural_size(element));
     let (w, h) = box_size(wanted, natural);
     let content = match element {
-        Some(element) => flow.tag_element(tag, &element, Align::Left, true),
+        Some(element) => flow.tag_element(tag, &element, align.unwrap_or(Align::Left), true),
         None => Some(flow.placeholder(tag.name.clone(), size_of(0.0, 0.0, true))),
     };
     let content = if flow.over_budget() { Some(flow.too_much()) } else { content };
@@ -151,8 +154,7 @@ pub(crate) fn lay_out_positioned_tag(
         ..Style::default()
     };
     let root = flow.node(style, content.as_slice());
-    let (items, native) = flow.finish(root, w);
-    ((w, h), items, native)
+    ((w, h), flow.finish(root, w))
 }
 
 impl Flow<'_, '_> {
@@ -217,6 +219,9 @@ impl Flow<'_, '_> {
         if is_positioned(tag) {
             self.notice(format!("{} is inside another tag, so the place it asks for is ignored", tag.name));
         }
+        if tag.attr("align").is_some() {
+            self.notice(ALIGN_UNPLACED.to_string());
+        }
         match self.render_tag(tag, (self.width, 0.0)) {
             Some(element) => self.tag_element(tag, &element, align, false),
             None => Some(self.block_placeholder(tag.name.clone())),
@@ -256,9 +261,15 @@ impl Flow<'_, '_> {
             Element::Stack { horizontal, gap, children } => self.stack(*horizontal, *gap, children, blocks, align),
             Element::Shape { kind, width, height, fill, outline, outline_width, radius, padding, child } => {
                 let child = child.as_deref();
-                // Whatever is in a stack starts at the corner. Anything else is centred.
+                // Whatever is in a stack starts at the corner. Anything else is centred, unless
+                // the positioned tag asks for an alignment.
                 let centered = !matches!(child, Some(Element::Stack { .. }));
-                let inner_align = if centered { Align::Center } else { align };
+                let inner_align = if centered { self.box_align.unwrap_or(Align::Center) } else { align };
+                let across = match inner_align {
+                    Align::Left if centered => AlignItems::FLEX_START,
+                    Align::Right if centered => AlignItems::FLEX_END,
+                    _ => AlignItems::CENTER,
+                };
                 let content = child.and_then(|child| self.element(child, blocks, inner_align, boxed));
                 let size = match content {
                     Some(_) => size_of(*width, *height, boxed),
@@ -270,7 +281,7 @@ impl Flow<'_, '_> {
                     size,
                     flex_direction: FlexDirection::Column,
                     justify_content: JustifyContent::CENTER,
-                    align_items: AlignItems::CENTER,
+                    align_items: across,
                     padding: taffy::Rect { left: pad, right: pad, top: pad, bottom: length(limited(*padding, MAX_SIZE) + tail) },
                     ..Style::default()
                 };

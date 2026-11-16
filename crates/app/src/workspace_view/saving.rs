@@ -16,140 +16,45 @@ enum SaveKind {
     Packed,
 }
 
-/// The working copy last written for the talk, so the same one isn't written again.
-#[derive(PartialEq)]
-pub(super) struct Kept {
-    place: PathBuf,
-    text: String,
-    on_disk: String,
-}
-
-/// The copy from last time that was brought back, until this window's own copy or a save
-/// holds what it did. The jobs take it when they run, not when they're asked for.
-pub(super) type Adopted = Arc<Mutex<Option<Found>>>;
-
-fn take_adopted(adopted: &Adopted) -> Option<Found> {
-    adopted
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take()
-}
-
-/// A change to the working copies, made on a background task, one after another.
-enum WorkingCopyJob {
-    /// Keeps this window's copy, then lets go of the adopted copy, which it now holds. Made
-    /// only if no clear has been asked for since it was, as one has then let it all go.
-    Keep {
-        recovery: Recovery,
-        place: TalkPlace,
-        on_disk: String,
-        text: String,
-        adopted: Adopted,
-    },
-    /// Removes this window's copy, and the adopted one too if `adopted` is given.
-    Clear {
-        recovery: Recovery,
-        place: TalkPlace,
-        adopted: Option<Adopted>,
-    },
-    /// Removes a copy from last time.
-    Discard(Recovery, Found),
-}
-
-impl WorkingCopyJob {
-    /// Makes the change. `at` is how many clears had been asked for when it was asked for,
-    /// and `clears` how many have been by now. A keep that fails leaves the adopted copy
-    /// where it is, for the next keep or clear.
-    fn run(self, clears: &AtomicU64, at: u64) -> Result<(), ()> {
-        match self {
-            WorkingCopyJob::Keep {
-                recovery,
-                place,
-                on_disk,
-                text,
-                adopted,
-            } => {
-                if clears.load(Ordering::SeqCst) == at {
-                    recovery
-                        .keep(&place, &hash_text(&on_disk), &text)
-                        .map_err(|_| ())?;
-                }
-                // Kept, or overtaken by a clear: either way it's no longer needed.
-                if let Some(adopted) = take_adopted(&adopted) {
-                    recovery.discard(&adopted);
-                }
-            }
-            WorkingCopyJob::Clear {
-                recovery,
-                place,
-                adopted,
-            } => {
-                recovery.clear(&place);
-                if let Some(adopted) = adopted.as_ref().and_then(take_adopted) {
-                    recovery.discard(&adopted);
-                }
-            }
-            WorkingCopyJob::Discard(recovery, found) => recovery.discard(&found),
-        }
-        Ok(())
-    }
-}
-
 impl WorkspaceView {
     /// Keeps working copies of unsaved changes in `recovery`, in a slot of this window's own,
     /// and offers back the newest one left there for this talk, if any.
     pub(super) fn use_recovery(&mut self, recovery: Recovery, cx: &mut Context<Self>) {
-        let recovery = recovery.for_another_window();
-        self.recovery = Some(recovery.clone());
-        let Some(document) = &self.document else {
-            return;
-        };
-        let place = document.read(cx).place().clone();
-        cx.spawn(async move |this, cx| {
-            let found = cx
-                .background_spawn(async move { recovery.find(&place) })
-                .await;
-            this.update(cx, |this, cx| this.offer(found, cx)).ok();
-        })
-        .detach();
-    }
-
-    fn offer(&mut self, found: Option<Found>, cx: &mut Context<Self>) {
-        let (Some(found), Some(document), Some(recovery)) =
-            (found, &self.document, self.recovery.clone())
-        else {
-            return;
-        };
-        if found.text == document.read(cx).source() {
-            // Nothing in it that isn't here.
-            self.enqueue_working_copy_job(WorkingCopyJob::Discard(recovery, found), cx);
-            return;
-        }
-        self.offered = Some(found);
-        cx.notify();
+        self.working_copies
+            .update(cx, |copies, cx| copies.use_recovery(recovery, cx));
     }
 
     /// Takes back the unsaved changes from last time, as one edit to undo. They're kept as
     /// this window's own straight away, and last time's copy goes once they are.
     fn bring_back(&mut self, cx: &mut Context<Self>) {
-        let (Some(mut found), Some(document)) = (self.offered.take(), self.document.clone()) else {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        let Some(mut found) = self
+            .working_copies
+            .update(cx, |copies, _| copies.take_offered())
+        else {
             return;
         };
         let text = std::mem::take(&mut found.text);
-        document.update(cx, |document, cx| {
-            document.recover(text);
-            // A show of the talk has to know.
-            cx.notify();
+        let recovered = document.update(cx, |document, cx| {
+            let recovered = document.recover(text.clone());
+            if recovered.is_ok() {
+                // A show of the talk has to know.
+                cx.notify();
+            }
+            recovered
         });
-        *self
-            .adopted
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(found);
-        self.pending_working_copy = None;
-        self.unkept_since = None;
-        if let Some(job) = self.working_copy_job(cx) {
-            self.enqueue_working_copy_job(job, cx);
+        if let Err(refused) = recovered {
+            // Nothing was taken, so they're still there to bring back.
+            found.text = text;
+            self.working_copies
+                .update(cx, |copies, cx| copies.offer_again(found, cx));
+            self.say(refused.to_string(), cx);
+            return;
         }
+        self.working_copies
+            .update(cx, |copies, cx| copies.brought_back(found, cx));
         let source = document.read(cx).source().to_string();
         self.markdown_panel
             .update(cx, |panel, cx| panel.set_source(&source, cx));
@@ -159,157 +64,62 @@ impl WorkspaceView {
     /// Lets the unsaved changes from last time go. Edits made here since are in a copy of
     /// their own, which stays.
     fn discard_recovered(&mut self, cx: &mut Context<Self>) {
-        let (Some(found), Some(recovery)) = (self.offered.take(), self.recovery.clone()) else {
-            return;
-        };
-        self.enqueue_working_copy_job(WorkingCopyJob::Discard(recovery, found), cx);
-        cx.notify();
-    }
-
-    /// Brings the working copy up to date once the edits have stopped for a moment, or
-    /// [`WORKING_COPY_MOST_WAIT`] after the first edit it doesn't hold, if that's sooner.
-    pub(super) fn keep_working_copy_soon(&mut self, cx: &mut Context<Self>) {
-        let now = cx.background_executor().now();
-        let since = *self.unkept_since.get_or_insert(now);
-        let left = WORKING_COPY_MOST_WAIT.saturating_sub(now.saturating_duration_since(since));
-        self.keep_working_copy_after(WORKING_COPY_DELAY.min(left), cx);
-    }
-
-    fn keep_working_copy_after(&mut self, delay: Duration, cx: &mut Context<Self>) {
-        if self.recovery.is_none() || self.close_anyway {
-            return;
-        }
-        // Replacing the task cancels the one waiting, so the wait starts again from now.
-        self.pending_working_copy = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(delay).await;
-            this.update(cx, |this, cx| {
-                this.unkept_since = None;
-                if let Some(job) = this.working_copy_job(cx) {
-                    this.enqueue_working_copy_job(job, cx);
-                }
-            })
-            .ok();
-        }));
-    }
-
-    /// Runs `job` on a background task once the changes asked for before it are made, so
-    /// they're made in the order asked.
-    fn enqueue_working_copy_job(&mut self, job: WorkingCopyJob, cx: &mut Context<Self>) {
-        if matches!(job, WorkingCopyJob::Clear { .. }) {
-            // A keep still waiting is older than this.
-            self.clears.fetch_add(1, Ordering::SeqCst);
-        }
-        let clears = self.clears.clone();
-        let at = clears.load(Ordering::SeqCst);
-        let previous = self.working_copy_chain.take();
-        self.working_copy_chain = Some(cx.spawn(async move |this, cx| {
-            if let Some(previous) = previous {
-                previous.await;
-            }
-            let outcome = cx
-                .background_spawn(async move { job.run(&clears, at) })
-                .await;
-            if outcome.is_err() {
-                this.update(cx, |this, cx| this.keep_failed(cx)).ok();
-            }
-        }));
-    }
-
-    /// Says that the working copy couldn't be written, and tries again in a while.
-    fn keep_failed(&mut self, cx: &mut Context<Self>) {
-        self.kept = None;
-        self.say(KEEP_FAILED, cx);
-        let unsaved = self
-            .document
-            .as_ref()
-            .is_some_and(|document| document.read(cx).has_unsaved_changes());
-        if unsaved {
-            self.keep_working_copy_after(KEEP_RETRY_DELAY, cx);
-        }
-    }
-
-    /// What brings the working copy in line with the talk: one while it has unsaved changes,
-    /// and none once it hasn't.
-    fn working_copy_job(&mut self, cx: &App) -> Option<WorkingCopyJob> {
-        let recovery = self.recovery.clone()?;
-        let document = self.document.as_ref()?.read(cx);
-        let place = document.place().clone();
-        if !document.has_unsaved_changes() {
-            self.kept.take()?;
-            return Some(WorkingCopyJob::Clear {
-                recovery,
-                place,
-                adopted: None,
-            });
-        }
-        let (TalkPlace::Folder(path) | TalkPlace::Packed(path)) = &place;
-        let kept = Kept {
-            place: path.clone(),
-            text: document.source().to_string(),
-            on_disk: document.stamp_on_disk().to_string(),
-        };
-        if self.kept.as_ref() == Some(&kept) {
-            return None;
-        }
-        let job = WorkingCopyJob::Keep {
-            recovery,
-            place,
-            on_disk: kept.on_disk.clone(),
-            text: kept.text.clone(),
-            adopted: self.adopted.clone(),
-        };
-        self.kept = Some(kept);
-        Some(job)
-    }
-
-    /// Removes this window's working copy of the talk at `place`, and the one it brought
-    /// back, as their changes are saved or let go.
-    fn clear_working_copies(&mut self, place: TalkPlace, cx: &mut Context<Self>) {
-        self.kept = None;
-        self.pending_working_copy = None;
-        self.unkept_since = None;
-        let Some(recovery) = self.recovery.clone() else {
-            return;
-        };
-        self.enqueue_working_copy_job(
-            WorkingCopyJob::Clear {
-                recovery,
-                place,
-                adopted: Some(self.adopted.clone()),
-            },
-            cx,
-        );
+        self.working_copies
+            .update(cx, |copies, cx| copies.discard_offered(cx));
     }
 
     /// Closes the window once the changes to the working copies asked for are made: they'd
     /// be lost with it.
     fn close_after_working_copies(&mut self, cx: &mut Context<Self>) {
-        self.close_anyway = true;
-        self.pending_working_copy = None;
-        self.unkept_since = None;
-        // Taken, so the close waits for it. A job asked for after this has nothing before it
-        // to wait for, but none that matters can be: with `close_anyway` set no keep is
-        // started, and a clear or discard that comes anyway removes copies of changes the
-        // window is letting go, in whatever order.
-        let chain = self.working_copy_chain.take();
+        let settled = self.working_copies.update(cx, |copies, _| copies.settled());
         cx.spawn(async move |this, cx| {
-            if let Some(chain) = chain {
-                chain.await;
-            }
+            settled.await;
             this.update(cx, |this, cx| this.close_window(cx)).ok();
         })
         .detach();
     }
 
+    /// Does what the saving said to, once an event of its own has been taken in.
+    fn follow(&mut self, effect: Effect, cx: &mut Context<Self>) {
+        match effect {
+            Effect::StartSave => self.start_save(cx),
+            Effect::Reload => {
+                if let Some(folder) = &self.talk_folder {
+                    let file = folder.join(SLIDES_FILE);
+                    self.reload_soon(file, cx);
+                }
+            }
+            Effect::Close => self.close_after_working_copies(cx),
+            Effect::LetGo => {
+                if let Some(document) = &self.document {
+                    let place = document.read(cx).place().clone();
+                    self.working_copies
+                        .update(cx, |copies, cx| copies.let_go(place, cx));
+                }
+            }
+            Effect::Say(said) => self.say(said, cx),
+            // Only events that come with a read or a window give these, and what took them
+            // in follows them itself.
+            Effect::TakeRead | Effect::AskAboutOutsideChange | Effect::AskBeforeClosing => {}
+        }
+    }
+
     /// Saves the talk where it's kept, on a background task.
     pub(super) fn save(&mut self, cx: &mut Context<Self>) {
+        if self.document.is_none() {
+            return;
+        }
+        for effect in self.save_flow.ask_save() {
+            self.follow(effect, cx);
+        }
+    }
+
+    /// Runs the save the saving has started, of the talk as it is now where it's kept.
+    fn start_save(&mut self, cx: &mut Context<Self>) {
+        self.settle_typing(cx);
         let Some(document) = &self.document else {
             return;
         };
-        if self.saving {
-            self.save_again = true;
-            return;
-        }
         let document = document.read(cx);
         let job = document.save_job();
         let name = place_label(document.place());
@@ -361,6 +171,7 @@ impl WorkspaceView {
     /// Asks where to save the talk as `kind`, then saves it there on a background task. From
     /// then on the talk is kept there.
     fn save_as(&mut self, kind: SaveKind, cx: &mut Context<Self>) {
+        self.settle_typing(cx);
         let Some(document) = &self.document else {
             return;
         };
@@ -382,20 +193,24 @@ impl WorkspaceView {
                 _ => return,
             };
             this.update(cx, |this, cx| {
-                let Some(document) = &this.document else {
+                // Typing may have gone on while the dialog was up.
+                this.settle_typing(cx);
+                let Some(document) = this.document.clone() else {
                     return;
                 };
-                if this.saving {
-                    this.say("The talk is still being saved. Try Save As again in a moment.", cx);
-                    return;
+                for effect in this.save_flow.ask_save_as() {
+                    let Effect::StartSave = effect else {
+                        this.follow(effect, cx);
+                        continue;
+                    };
+                    let name = file_label(&out);
+                    let target = match kind {
+                        SaveKind::Folder => SaveTarget::Folder(out.clone()),
+                        SaveKind::Packed => SaveTarget::Packed(out.clone()),
+                    };
+                    let job = document.read(cx).save_as_job(target);
+                    this.run_save(job, name, cx);
                 }
-                let name = file_label(&out);
-                let target = match kind {
-                    SaveKind::Folder => SaveTarget::Folder(out),
-                    SaveKind::Packed => SaveTarget::Packed(out),
-                };
-                let job = document.read(cx).save_as_job(target);
-                this.run_save(job, name, cx);
             })
             .ok();
         })
@@ -404,7 +219,6 @@ impl WorkspaceView {
 
     /// Runs `job`, which saves to the place called `name`, on a background task.
     fn run_save(&mut self, job: SaveJob, name: String, cx: &mut Context<Self>) {
-        self.saving = true;
         self.say(format!("{} {name}…", SAVING.doing), cx);
         cx.spawn(async move |this, cx| {
             let outcome = cx.background_spawn(async move { job.run() }).await;
@@ -420,11 +234,11 @@ impl WorkspaceView {
         name: String,
         cx: &mut Context<Self>,
     ) {
-        self.saving = false;
         let Some(document) = self.document.clone() else {
+            self.save_flow = SaveFlow::Idle;
             return;
         };
-        match outcome {
+        let (outcome, mut theirs) = match outcome {
             Ok(saved) => {
                 let said = if saved.notices().is_empty() {
                     format!("{} {name}.", SAVING.done)
@@ -438,41 +252,27 @@ impl WorkspaceView {
                     cx.notify();
                 });
                 // What it kept is in the file now. Anything edited since is kept again.
-                self.clear_working_copies(saved_from, cx);
+                self.working_copies
+                    .update(cx, |copies, cx| copies.saved(saved_from, cx));
                 if moved {
                     self.moved(cx);
                 }
                 self.say_for_a_while(said, cx);
-                if self.close_after_save {
-                    if !document.read(cx).has_unsaved_changes() {
-                        self.close_after_save = false;
-                        self.close_after_working_copies(cx);
-                        return;
+                (SaveOutcome::Saved, None)
+            }
+            Err(SaveError::ChangedOutside(theirs)) => (SaveOutcome::ChangedOutside, Some(theirs)),
+            Err(problem) => (SaveOutcome::Failed(problem.to_string()), None),
+        };
+        let still_unsaved = document.read(cx).has_unsaved_changes();
+        for effect in self.save_flow.finished(outcome, still_unsaved) {
+            match effect {
+                Effect::AskAboutOutsideChange => {
+                    if let Some(theirs) = theirs.take() {
+                        self.reload(Some(theirs), cx);
                     }
-                    // Edited while it saved: those are saved too before the window goes.
-                    self.save_again = true;
                 }
+                effect => self.follow(effect, cx),
             }
-            Err(SaveError::ChangedOutside(theirs)) => {
-                self.close_after_save = false;
-                self.save_again = false;
-                self.say(SaveError::ChangedOutside(String::new()).to_string(), cx);
-                // Asked about as any change from outside is: nothing has been written.
-                self.reload(Some(theirs), cx);
-            }
-            Err(problem) => {
-                self.close_after_save = false;
-                self.say(problem.to_string(), cx);
-            }
-        }
-        if std::mem::take(&mut self.reload_after_save)
-            && let Some(folder) = &self.talk_folder
-        {
-            let file = folder.join(SLIDES_FILE);
-            self.reload_soon(file, cx);
-        }
-        if std::mem::take(&mut self.save_again) && document.read(cx).has_unsaved_changes() {
-            self.save(cx);
         }
     }
 
@@ -503,7 +303,8 @@ impl WorkspaceView {
         if let Some(document) = &self.document {
             document.update(cx, |document, _| document.keep_mine());
             // The edits now start from what the file holds.
-            self.keep_working_copy_soon(cx);
+            self.working_copies
+                .update(cx, |copies, cx| copies.talk_changed(cx));
             cx.notify();
         }
     }
@@ -516,11 +317,18 @@ impl WorkspaceView {
         let Some(theirs) = document.read(cx).outside_change().map(str::to_string) else {
             return;
         };
-        document.update(cx, |document, cx| {
-            document.take_theirs(theirs);
-            // A show of the talk has to know.
-            cx.notify();
+        let taken = document.update(cx, |document, cx| {
+            let taken = document.take_theirs(theirs);
+            if taken.is_ok() {
+                // A show of the talk has to know.
+                cx.notify();
+            }
+            taken
         });
+        if let Err(refused) = taken {
+            self.say(refused.to_string(), cx);
+            return;
+        }
         let source = document.read(cx).source().to_string();
         self.markdown_panel
             .update(cx, |panel, cx| panel.set_source(&source, cx));
@@ -534,39 +342,59 @@ impl WorkspaceView {
             .document
             .as_ref()
             .is_some_and(|document| document.read(cx).has_unsaved_changes());
-        if self.close_anyway {
+        if self.working_copies.read(cx).is_closing() {
             return true;
         }
-        if !unsaved {
-            // Back to what's saved within the wait: the copy still there goes first.
-            if self.kept.is_some()
-                && let Some(document) = &self.document
-            {
-                let place = document.read(cx).place().clone();
-                self.clear_working_copies(place, cx);
+        for effect in self.save_flow.ask_close(unsaved) {
+            match effect {
+                Effect::Close => return self.close_now_or_once_settled(cx),
+                Effect::AskBeforeClosing => {
+                    if !window.has_active_dialog(cx) {
+                        self.ask_before_closing(window, cx);
+                    }
+                }
+                effect => self.follow(effect, cx),
             }
-            // A change to the working copies still to be made, such as the clear after a
-            // save, would be lost with the window.
-            if self.working_copy_chain.is_some() {
-                self.close_after_working_copies(cx);
-                return false;
-            }
-            return true;
-        }
-        if !window.has_active_dialog(cx) {
-            self.ask_before_closing(window, cx);
         }
         false
+    }
+
+    /// Whether the window, with nothing unsaved, can close now. If changes to the working
+    /// copies are still to be made, it closes itself once they are.
+    fn close_now_or_once_settled(&mut self, cx: &mut Context<Self>) -> bool {
+        // Back to what's saved within the wait: the copy still there goes first.
+        if self.working_copies.read(cx).holds_a_copy()
+            && let Some(document) = &self.document
+        {
+            let place = document.read(cx).place().clone();
+            self.working_copies
+                .update(cx, |copies, cx| copies.let_go(place, cx));
+        }
+        // A change to the working copies still to be made, such as the clear after a save,
+        // would be lost with the window.
+        if self.working_copies.read(cx).has_jobs() {
+            self.close_after_working_copies(cx);
+            return false;
+        }
+        true
+    }
+
+    /// Takes in the answer to the dialog asking before the window closes.
+    fn answer_close(&mut self, answer: CloseAnswer, cx: &mut Context<Self>) {
+        for effect in self.save_flow.answer_close(answer) {
+            self.follow(effect, cx);
+        }
     }
 
     fn ask_before_closing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.weak_entity();
         window.open_dialog(cx, move |dialog, _, _| {
-            let answer = |answer: fn(&mut WorkspaceView, &mut Context<WorkspaceView>)| {
+            let answer = |answer: CloseAnswer| {
                 let view = view.clone();
                 move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
                     window.close_dialog(cx);
-                    view.update(cx, answer).ok();
+                    view.update(cx, |view, cx| view.answer_close(answer, cx))
+                        .ok();
                 }
             };
             dialog
@@ -580,27 +408,18 @@ impl WorkspaceView {
                             Button::new(CLOSE_CANCEL_ID)
                                 .ghost()
                                 .label("Cancel")
-                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                                .on_click(answer(CloseAnswer::Cancel)),
                         )
                         .child(
                             Button::new(CLOSE_DONT_SAVE_ID)
                                 .label("Don't save")
-                                .on_click(answer(|view, cx| {
-                                    if let Some(document) = &view.document {
-                                        let place = document.read(cx).place().clone();
-                                        view.clear_working_copies(place, cx);
-                                    }
-                                    view.close_after_working_copies(cx);
-                                })),
+                                .on_click(answer(CloseAnswer::DontSave)),
                         )
                         .child(
                             Button::new(CLOSE_SAVE_ID)
                                 .primary()
                                 .label("Save")
-                                .on_click(answer(|view, cx| {
-                                    view.close_after_save = true;
-                                    view.save(cx);
-                                })),
+                                .on_click(answer(CloseAnswer::Save)),
                         ),
                 )
         });
@@ -651,7 +470,7 @@ impl WorkspaceView {
 
     /// The bar that offers back the unsaved changes from last time.
     pub(super) fn recovery_bar(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
-        let found = self.offered.as_ref()?;
+        let found = self.working_copies.read(cx).offered()?;
         let said: SharedString = if found.base_matches {
             RECOVERY_OFFER.into()
         } else {

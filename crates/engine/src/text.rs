@@ -4,9 +4,10 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use cosmic_text::{
-    fontdb, Align as TextAlign, Attrs, Buffer, Color as TextColor, Command, Family, FontSystem,
-    Metrics, Shaping, Style, SwashCache, SwashContent, Weight,
+    fontdb, Align as TextAlign, Attrs, AttrsList, Buffer, BufferLine, Color as TextColor, Command, Fallback, Family, FontSystem,
+    LineEnding, Metrics, PlatformFallback, Shaping, Style, SwashCache, SwashContent, Weight,
 };
+use unicode_script::Script;
 use tiny_skia::{
     Color, ColorU8, FillRule, FilterQuality, Paint, Path, PathBuilder, Pixmap, PixmapMut,
     PixmapPaint, Rect, Shader, Transform,
@@ -54,6 +55,41 @@ pub struct EmbeddableFace {
     pub data: Arc<Vec<u8>>,
 }
 
+/// The bundled colour emoji's family.
+const EMOJI_FAMILY: &str = "Noto Color Emoji";
+
+/// The platform's fallback fonts, with the colour emoji first: a computer's own fonts may
+/// have some emoji in one colour, and a slide would look different from one computer to
+/// the next. The bundled fonts have nothing else the emoji font has, so with them alone the
+/// order changes nothing.
+struct EmojiFirst {
+    platform: PlatformFallback,
+    common: Vec<&'static str>,
+}
+
+impl EmojiFirst {
+    fn new() -> EmojiFirst {
+        let platform = PlatformFallback;
+        let rest = platform.common_fallback().iter().copied().filter(|family| *family != EMOJI_FAMILY);
+        let common = std::iter::once(EMOJI_FAMILY).chain(rest).collect();
+        EmojiFirst { platform, common }
+    }
+}
+
+impl Fallback for EmojiFirst {
+    fn common_fallback(&self) -> &[&'static str] {
+        &self.common
+    }
+
+    fn forbidden_fallback(&self) -> &[&'static str] {
+        self.platform.forbidden_fallback()
+    }
+
+    fn script_fallback(&self, script: Script, locale: &str) -> &[&'static str] {
+        self.platform.script_fallback(script, locale)
+    }
+}
+
 pub struct Fonts {
     pub system: FontSystem,
     pub cache: SwashCache,
@@ -74,7 +110,7 @@ impl Fonts {
             db.load_system_fonts();
         }
         Fonts {
-            system: FontSystem::new_with_locale_and_db("en-US".to_string(), db),
+            system: FontSystem::new_with_locale_and_db_and_fallback("en-US".to_string(), db, EmojiFirst::new()),
             cache: SwashCache::new(),
             known,
         }
@@ -169,6 +205,17 @@ fn run_attrs(run: &TextRun, index: usize) -> Attrs<'_> {
 
 /// Shapes `runs` in slide units. With a width the text wraps at it.
 pub fn shape_text(fonts: &mut Fonts, runs: &[TextRun], width: Option<f32>, align: Align) -> ShapedText {
+    shape_text_with(fonts, runs, width, align, false)
+}
+
+/// Whether `c` ends a line, as the shaper splits text into lines.
+fn ends_a_line(c: char) -> bool {
+    matches!(c, '\n' | '\r' | '\u{1c}'..='\u{1e}' | '\u{85}' | '\u{2029}')
+}
+
+/// As [`shape_text`]. With `end_line`, text that ends with a line break has an empty line
+/// after it, as a paragraph ending in a break is drawn, where the shaper would leave none.
+pub(crate) fn shape_text_with(fonts: &mut Fonts, runs: &[TextRun], width: Option<f32>, align: Align, end_line: bool) -> ShapedText {
     let biggest = runs.iter().map(|r| limited_size(r.size)).fold(MIN_TEXT_SIZE, f32::max);
     let mut buffer = Buffer::new(&mut fonts.system, Metrics::new(biggest, biggest * LINE_HEIGHT));
     buffer.set_size(width, None);
@@ -183,6 +230,12 @@ pub fn shape_text(fonts: &mut Fonts, runs: &[TextRun], width: Option<f32>, align
         Shaping::Advanced,
         Some(alignment),
     );
+    let last = runs.iter().rev().find(|run| !run.text.is_empty());
+    if end_line && let Some(last) = last.filter(|run| run.text.ends_with(ends_a_line)) {
+        let mut line = BufferLine::new("", LineEnding::None, AttrsList::new(&run_attrs(last, runs.len())), Shaping::Advanced);
+        line.set_align(Some(alignment));
+        buffer.lines.push(line);
+    }
     buffer.shape_until_scroll(&mut fonts.system, false);
 
     let mut shaped_width = 0.0_f32;

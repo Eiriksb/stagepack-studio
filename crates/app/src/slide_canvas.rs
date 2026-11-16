@@ -10,7 +10,7 @@ use slides_engine::{Layer, to_bgra_frame};
 use crate::present::{LayerLook, SlideLook};
 
 /// The width of a 16:9 slide, in slide units.
-const SLIDE_WIDTH: f32 = 1920.0;
+pub const SLIDE_WIDTH: f32 = 1920.0;
 
 /// How far the slide can grow or shrink before its layers are drawn again. Below this they
 /// are stretched to fit, so a resize doesn't draw the slide again for every pixel.
@@ -45,6 +45,8 @@ pub struct SlideCanvas {
     framed: bool,
     /// Where that line was last drawn.
     edge: Option<Bounds<Pixels>>,
+    /// Where the slide was last drawn, and the area it was drawn in.
+    placed: Option<(Bounds<Pixels>, Bounds<Pixels>)>,
 }
 
 impl EventEmitter<ScaleChanged> for SlideCanvas {}
@@ -61,6 +63,16 @@ impl SlideCanvas {
     /// Where the line around the slide was last drawn, just outside it, if it has one.
     pub fn edge(&self) -> Option<Bounds<Pixels>> {
         self.edge
+    }
+
+    /// Where the slide was last drawn in the window.
+    pub fn slide_bounds(&self) -> Option<Bounds<Pixels>> {
+        self.placed.map(|(slide, _)| slide)
+    }
+
+    /// Where the area the slide sits in, its bars beside it included, was last drawn.
+    pub fn area(&self) -> Option<Bounds<Pixels>> {
+        self.placed.map(|(_, area)| area)
     }
 
     /// The layers to show, first to last, drawn at [`Self::scale`]. A layer that was
@@ -131,7 +143,14 @@ impl SlideCanvas {
             .collect()
     }
 
-    fn measured(&mut self, slide: Bounds<Pixels>, scale: f32, cx: &mut Context<Self>) {
+    fn measured(
+        &mut self,
+        area: Bounds<Pixels>,
+        slide: Bounds<Pixels>,
+        scale: f32,
+        cx: &mut Context<Self>,
+    ) {
+        self.placed = Some((slide, area));
         if self.framed {
             self.edge = Some(slide.dilate(px(1.)));
         }
@@ -240,7 +259,7 @@ impl Render for SlideCanvas {
                     if let Some(color) = edge_color {
                         window.paint_quad(outline(slide.dilate(px(1.)), color, BorderStyle::Solid));
                     }
-                    this.update(cx, |this, cx| this.measured(slide, scale, cx))
+                    this.update(cx, |this, cx| this.measured(area, slide, scale, cx))
                         .ok();
                 }
             },

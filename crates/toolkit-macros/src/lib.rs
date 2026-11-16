@@ -6,7 +6,7 @@ use quote::{format_ident, quote};
 use syn::{Data, DeriveInput, Fields, FnArg, ItemFn, Pat, Path, Type, parse_macro_input};
 
 /// The names kept for the slide, which `toolkit::RESERVED_NAMES` also holds.
-const RESERVED_NAMES: [&str; 16] = include!("reserved_names.rs");
+const RESERVED_NAMES: [&str; 17] = include!("reserved_names.rs");
 
 enum Kind {
     Ctx,

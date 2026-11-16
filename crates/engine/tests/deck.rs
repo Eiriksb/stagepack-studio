@@ -35,6 +35,25 @@ fn only_changed_blocks_get_new_layers() {
 }
 
 #[test]
+fn text_aligned_anew_is_drawn_anew() {
+    // Seen in the real window: centring a region kept its words drawn at the left, as the
+    // layers were kept by where the text was and its size, which aligning doesn't change.
+    let left = "# One\n\n---\n\n# Title\n\nBody\n";
+    let centred = "# One\n\n---\nregion.body: align=center\n---\n\n# Title\n\nBody\n";
+    let mut d = deck(left);
+    let before = d.layers(1, 0.5);
+    d.update_text(slides_format::parse_talk(centred));
+    let after = d.layers(1, 0.5);
+    let fresh = deck(centred).layers(1, 0.5);
+    assert_eq!(after.len(), fresh.len());
+    assert_ne!(before[2].pixmap.data(), fresh[2].pixmap.data(), "centring moves the body");
+    for (after, fresh) in after.iter().zip(&fresh) {
+        assert_eq!((after.x, after.y), (fresh.x, fresh.y));
+        assert!(after.pixmap.data() == fresh.pixmap.data(), "drawn as the centred talk is drawn");
+    }
+}
+
+#[test]
 fn a_new_scale_redraws() {
     let mut d = deck(TALK);
     let small = d.layers(0, 0.5);
@@ -53,6 +72,45 @@ fn adding_a_slide_reports_the_slides_whose_text_changed() {
 fn changing_the_talks_settings_redraws_everything() {
     let mut d = deck("---\ncolor.text: red\n---\n\n# One\n\n---\n\n# Two\n");
     assert_eq!(d.update("---\ncolor.text: blue\n---\n\n# One\n\n---\n\n# Two\n".to_string()), vec![0, 1]);
+}
+
+/// The talk's look and title with `settings` in its first slide's settings block.
+fn talk_wide(settings: &[(&str, &str)]) -> (toolkit::Theme, Option<String>) {
+    let lines: String = settings.iter().map(|(key, value)| format!("{key}: {value}\n")).collect();
+    let deck = deck(&format!("---\n{lines}---\n\n# One\n\n---\n\n# Two\n"));
+    (talk_theme(deck.talk()), deck.title())
+}
+
+#[test]
+fn the_talk_wide_settings_are_the_ones_the_engine_reads_as_talk_wide() {
+    let none = talk_wide(&[]);
+    // Each key the engine reads from the first slide for the whole talk is one the format
+    // crate keeps with whichever slide is first, and the other way round.
+    let read = [
+        ("title", "A talk"),
+        ("color.background", "#123456"),
+        ("color.text", "#654321"),
+        ("color.accent", "#abcdef"),
+        ("font", "Some Font"),
+        ("font.mono", "Some Mono"),
+    ];
+    for (key, value) in read {
+        assert!(slides_format::TALK_SETTINGS.contains(&key), "{key} isn't kept as the talk's");
+        assert_ne!(talk_wide(&[(key, value)]), none, "{key} isn't read");
+    }
+    assert_eq!(read.len(), slides_format::TALK_SETTINGS.len(), "a talk-wide key the engine doesn't read");
+    // Any other key changes neither the look nor the title.
+    let others = [
+        "layout", "hidden", "transition", "region.body", "region.title", "click", "background", "color", "color.link", "color.heading",
+        "color.title", "color.code", "font.heading", "font.title", "font.body", "font.size", "size", "theme", "accent", "text", "author",
+        "date", "logo", "subtitle", "aspect", "footer",
+    ];
+    for key in others {
+        assert!(!slides_format::TALK_SETTINGS.contains(&key), "{key}");
+        for value in ["#ff0000", "Inter", "true", "A talk"] {
+            assert_eq!(talk_wide(&[(key, value)]), none, "{key}: {value} changed the talk's look or title");
+        }
+    }
 }
 
 #[test]
@@ -534,4 +592,42 @@ fn a_slide_keeps_its_version_until_it_changes() {
     d.update("# One\n\n---\n\n# Three\n".to_string());
     assert_eq!(d.slide_version(0), Some(before[0]));
     assert_ne!(d.slide_version(1), Some(before[2]));
+}
+
+#[test]
+fn a_slide_added_in_the_middle_keeps_the_others_drawn() {
+    let mut d = deck(TALK);
+    let before = d.layers(2, SCALE);
+    let version = d.slide_version(2);
+    let changed = d.update_text(slides_format::parse_talk(&TALK.replace("---\n\n# Two", "---\n\n# New\n\n---\n\n# Two")));
+    assert_eq!(changed, vec![1, 2, 3], "the slides whose place now holds other text");
+    assert_eq!(d.slide_version(3), version);
+    assert!(Arc::ptr_eq(&before[1], &d.layers(3, SCALE)[1]));
+}
+
+/// Files that count how often they're asked anything.
+#[derive(Clone, Default)]
+struct CountingFiles(Arc<std::sync::atomic::AtomicUsize>);
+
+impl CountingFiles {
+    fn asked(&self) -> usize { self.0.load(std::sync::atomic::Ordering::SeqCst) }
+    fn ask(&self) { self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+}
+
+impl TalkFiles for CountingFiles {
+    fn read(&self, _: &str) -> Option<Vec<u8>> { self.ask(); Some(one_colour_png(tiny_skia::Color::BLACK)) }
+    fn stamp(&self, _: &str) -> Option<(u64, std::time::SystemTime)> { self.ask(); None }
+    fn len(&self, _: &str) -> Option<u64> { self.ask(); None }
+    fn names_in(&self, _: &str) -> Vec<String> { self.ask(); Vec::new() }
+}
+
+#[test]
+fn an_edit_made_in_the_app_reads_no_files() {
+    let files = CountingFiles::default();
+    let mut d = Deck::open(Box::new(files.clone()), Fonts::bundled_only(), PICTURE_TALK.to_string());
+    d.layers(0, SCALE);
+    let asked = files.asked();
+    assert!(asked > 0, "opening and drawing the talk read its picture");
+    d.update_text(slides_format::parse_talk(&PICTURE_TALK.replace("Two", "Changed")));
+    assert_eq!(files.asked(), asked);
 }

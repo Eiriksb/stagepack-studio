@@ -1,6 +1,6 @@
 //! Puts a parsed slide's content into the regions of its layout.
 
-use slides_format::{Block, Slide, Tag, Talk};
+use slides_format::{Block, FlowPlace, Slide, Tag, Talk};
 use tiny_skia::PathBuilder;
 use toolkit::{Color, Registry, Theme};
 
@@ -10,8 +10,10 @@ use slides_components::shortened;
 use crate::timeline::{MAX_CLICK, RegionClick, read_region_timing, read_tag_timing, read_transition};
 use crate::native::placeholder_element;
 use crate::placeholder::placeholder_items;
+use crate::text_geometry::LayerText;
 use crate::{
-    ComponentAsks, DisplayItem, Enter, Fonts, LayerSpec, LayoutDef, Moment, Notice, PictureCache, Rect, RegionDef, TalkComponents, TalkFiles, Transition, layout_by_name,
+    Align, ComponentAsks, DisplayItem, Enter, Fonts, LayerSpec, LayoutDef, Moment, Notice, PictureCache, Rect, RegionDef, TalkComponents, TalkFiles, TextRun,
+    Transition, layout_by_name, shape_text,
 };
 
 pub(crate) const SLIDE_WIDTH: f32 = 1920.0;
@@ -19,7 +21,7 @@ pub(crate) const SLIDE_HEIGHT: f32 = 1080.0;
 const DEFAULT_LAYOUT: &str = "content";
 
 /// The attributes that place a component, which it doesn't see as props.
-pub const PLACEMENT_ATTRS: [&str; 7] = ["x", "y", "w", "h", "rotate", "click", "enter"];
+pub const PLACEMENT_ATTRS: [&str; 8] = ["x", "y", "w", "h", "rotate", "click", "enter", "align"];
 
 // The most a talk can ask for in a place on the slide, so one line of a settings block
 // can't make a layer that needs gigabytes.
@@ -27,6 +29,9 @@ pub(crate) const MIN_POSITION: f32 = -3840.0;
 pub(crate) const MAX_POSITION: f32 = 7680.0;
 pub(crate) const MAX_SIZE: f32 = 3840.0;
 pub(crate) const MAX_ROTATION: f32 = 360.0;
+
+/// What's said of an `align` that's given where it does nothing.
+pub(crate) const ALIGN_UNPLACED: &str = "Only a box placed on the slide can be aligned, so align is ignored here";
 
 pub struct LayoutEnv<'a> {
     pub fonts: &'a mut Fonts,
@@ -47,6 +52,21 @@ pub struct LaidOutSlide {
     pub transition: Transition,
     /// What the slide's components looked at.
     pub asks: ComponentAsks,
+    /// Where each layer's text is, beside `layers`.
+    pub(crate) texts: Vec<LayerText>,
+    /// The regions of the slide's layout that have nothing in them.
+    pub(crate) empty_regions: Vec<EmptyRegion>,
+}
+
+/// A region of the slide's layout with nothing in it, where the editor offers to start text.
+#[derive(Clone)]
+pub(crate) struct EmptyRegion {
+    pub name: &'static str,
+    pub rect: Rect,
+    pub rotate: f32,
+    pub align: Align,
+    pub size: f32,
+    pub bold: bool,
 }
 
 /// Runs `lay_out` with what components look at noted apart, then adds that to the rest,
@@ -91,20 +111,30 @@ pub fn layout_slide(talk: &Talk, index: usize, env: &mut LayoutEnv) -> LaidOutSl
         .map(|name| Notice(format!("{name} is in the middle of a line. A component goes on a line of its own")))
         .collect();
     let mut layers = vec![background(&theme)];
+    let mut texts = vec![LayerText::default()];
     if let Some(error) = &slide.error {
         notices.push(Notice(error.message.clone()));
         layers.push(error_layer(slide, &error.message, &theme, env.fonts));
-        return LaidOutSlide { layers, notices, transition: Transition::None, asks: std::mem::take(&mut env.asks) };
+        texts.push(LayerText { whole: true, ..LayerText::default() });
+        let asks = std::mem::take(&mut env.asks);
+        return LaidOutSlide { layers, notices, transition: Transition::None, asks, texts, empty_regions: Vec::new() };
+    }
+    let mut empty_regions = Vec::new();
+    if aligns_inline(&talk.source, &slide.blocks) {
+        notices.push(Notice(ALIGN_UNPLACED.to_string()));
     }
     let transition = read_transition(slide.settings.as_ref().and_then(|settings| settings.get("transition")), &mut notices);
     let layout = slide_layout(slide, &mut notices);
     let contents = assign_blocks(slide, layout, &mut notices);
 
     for (region, blocks) in layout.regions.iter().zip(&contents) {
+        let (rect, rotate) = placement(slide, region);
+        let region = &RegionDef { align: region_align(slide, region, &mut notices), ..*region };
         let (Some(first), Some(last)) = (blocks.first(), blocks.last()) else {
+            let RegionDef { name, size, bold, align, .. } = *region;
+            empty_regions.push(EmptyRegion { name, rect, rotate, align, size, bold });
             continue;
         };
-        let (rect, rotate) = placement(slide, region);
         let line = region_line(slide, region);
         let timing = read_region_timing(line, &mut notices);
         let source = first.range().start..last.range().end;
@@ -138,26 +168,30 @@ pub fn layout_slide(talk: &Talk, index: usize, env: &mut LayoutEnv) -> LaidOutSl
                             is_title: is_title && step == 0,
                             varies,
                         });
+                        texts.push(LayerText { region: Some((region.name, rect)), ..piece.text });
                     }
                     continue;
                 }
                 click = Some(1);
             }
         }
-        let ((items, native), varies) = noting_asks(env, |env| flow_region(blocks, region, rect.w, &theme, env, &mut notices));
+        let (drawing, varies) = noting_asks(env, |env| flow_region(blocks, region, rect.w, &theme, env, &mut notices));
+        let (items, native) = (drawing.items, drawing.native);
         layers.push(LayerSpec { source: Some(source), rect, rotate, items, click, enter: timing.enter, native, is_title, varies });
+        texts.push(LayerText { region: Some((region.name, rect)), ..drawing.text });
     }
     for block in &slide.blocks {
         if let Block::Tag(tag) = block
             && is_positioned(tag)
         {
-            let (mut layer, varies) = noting_asks(env, |env| positioned_layer(tag, &theme, env, &mut notices));
+            let ((mut layer, text), varies) = noting_asks(env, |env| positioned_layer(tag, &theme, env, &mut notices));
             layer.varies = varies;
             layers.push(layer);
+            texts.push(LayerText { whole: true, ..text });
         }
     }
     let notices = notices.into_iter().map(|notice| Notice(shortened(&notice.0, MAX_NOTICE_CHARS))).collect();
-    LaidOutSlide { layers, notices, transition, asks: std::mem::take(&mut env.asks) }
+    LaidOutSlide { layers, notices, transition, asks: std::mem::take(&mut env.asks), texts, empty_regions }
 }
 
 /// The placement numbers a tag gives. One that can't be read counts as absent, and the
@@ -168,9 +202,11 @@ struct TagPlace {
     w: Option<f32>,
     h: Option<f32>,
     rotate: Option<f32>,
+    /// The alignment its text asks for.
+    align: Option<Align>,
     click: Option<u32>,
     enter: Enter,
-    /// What was wrong with the `click` and `enter` it gave.
+    /// What was wrong with the `click`, `enter` and `align` it gave.
     notices: Vec<Notice>,
 }
 
@@ -188,6 +224,7 @@ impl TagPlace {
             w: number("w", 0.0, MAX_SIZE),
             h: number("h", 0.0, MAX_SIZE),
             rotate: number("rotate", -MAX_ROTATION, MAX_ROTATION),
+            align: tag.attr("align").and_then(|value| read_align(value, &format!("The {} box", tag.name), &mut notices)),
             click,
             enter,
             notices,
@@ -201,22 +238,136 @@ pub(crate) fn is_positioned(tag: &Tag) -> bool {
     place.x.is_some() || place.y.is_some() || place.w.is_some() || place.h.is_some()
 }
 
-fn positioned_layer(tag: &Tag, theme: &Theme, env: &mut LayoutEnv, notices: &mut Vec<Notice>) -> LayerSpec {
+fn positioned_layer(tag: &Tag, theme: &Theme, env: &mut LayoutEnv, notices: &mut Vec<Notice>) -> (LayerSpec, LayerText) {
     let place = TagPlace::of(tag);
     for notice in place.notices {
         if !notices.contains(&notice) {
             notices.push(notice);
         }
     }
-    let ((w, h), items, native) = lay_out_positioned_tag(tag, (place.w, place.h), theme, env, notices);
-    LayerSpec {
+    let ((w, h), drawing) = lay_out_positioned_tag(tag, (place.w, place.h), place.align, theme, env, notices);
+    let layer = LayerSpec {
         source: Some(tag.range.clone()),
         rect: Rect { x: place.x.unwrap_or(0.0), y: place.y.unwrap_or(0.0), w, h },
         rotate: place.rotate.unwrap_or(0.0),
-        items,
+        items: drawing.items,
         click: place.click,
         enter: place.enter,
-        native,
+        native: drawing.native,
+        is_title: false,
+        varies: false,
+    };
+    (layer, drawing.text)
+}
+
+/// Whether the text of any of `blocks`, at any depth, has an inline `<Text>` tag that asks for
+/// an alignment, which only a placed box can have.
+fn aligns_inline(source: &str, blocks: &[Block]) -> bool {
+    let asks = |inline: &std::ops::Range<usize>| {
+        let text = source.get(inline.clone()).unwrap_or_default();
+        text.match_indices("<Text").any(|(at, _)| {
+            let tag = &text[at..];
+            let tag = &tag[..tag.find('>').unwrap_or(tag.len())];
+            tag.split(|c: char| c.is_whitespace()).any(|part| part.starts_with("align="))
+        })
+    };
+    blocks.iter().any(|block| match block {
+        Block::Heading { inline, .. } | Block::Paragraph { inline, .. } => asks(inline),
+        Block::List { items, .. } => items.iter().any(|item| aligns_inline(source, item)),
+        Block::Tag(tag) => aligns_inline(source, &tag.children),
+        _ => false,
+    })
+}
+
+/// The alignment `value` names, or `None`, with a notice about `what`, if it names none.
+fn read_align(value: &str, what: &str, notices: &mut Vec<Notice>) -> Option<Align> {
+    match value.trim() {
+        "left" => Some(Align::Left),
+        "center" => Some(Align::Center),
+        "right" => Some(Align::Right),
+        _ => {
+            let notice = Notice(shortened(&format!("{what} can be aligned left, center or right, not {value}"), MAX_NOTICE_CHARS));
+            if !notices.contains(&notice) {
+                notices.push(notice);
+            }
+            None
+        }
+    }
+}
+
+/// How a region's text is aligned on this slide: as its `region.<name>` settings line's
+/// `align` says, or as the layout has it.
+fn region_align(slide: &Slide, region: &RegionDef, notices: &mut Vec<Notice>) -> Align {
+    let line = region_line(slide, region);
+    // The first, as a tag's first attribute of a name is the one it has.
+    let asked = line.split_whitespace().find_map(|pair| pair.strip_prefix("align="));
+    let what = format!("The {} region", region.name);
+    asked.and_then(|value| read_align(value, &what, notices)).unwrap_or(region.align)
+}
+
+/// How the text in `place` on slide `index` is set to be aligned: a region's as its
+/// `region.<name>` line says or its layout has it, a positioned box's as its `align` says, or
+/// at the left. It's what's asked for, whatever a list in it is drawn at. `None` if the slide
+/// has no such region or box.
+pub fn text_align(talk: &Talk, index: usize, place: &FlowPlace) -> Option<Align> {
+    let slide = talk.slides.get(index)?;
+    let mut notices = Vec::new();
+    match place {
+        FlowPlace::Region(name) => {
+            let layout = slide_layout(slide, &mut notices);
+            let region = layout.regions.iter().find(|region| region.name == name.as_str())?;
+            Some(region_align(slide, region, &mut notices))
+        }
+        FlowPlace::Tag(range) => slide.blocks.iter().find_map(|block| match block {
+            Block::Tag(tag) if tag.range == *range && is_positioned(tag) => Some(TagPlace::of(tag).align.unwrap_or(Align::Left)),
+            _ => None,
+        }),
+    }
+}
+
+/// What the editor shows in an empty region: a dashed outline, and an offer in a muted tint
+/// of the text colour to start the title or the text there.
+pub(crate) fn empty_region_layer(region: &EmptyRegion, theme: &Theme, fonts: &mut Fonts) -> LayerSpec {
+    const DASH: f32 = 16.0;
+    const DASH_GAP: f32 = 10.0;
+    const OUTLINE: f32 = 2.0;
+    const OUTSIDE: f32 = 8.0;
+    let mix = |text: u8, background: u8| ((u16::from(text) * 2 + u16::from(background) * 3) / 5) as u8;
+    let (text, back) = (theme.text, theme.background);
+    let muted = Color { r: mix(text.r, back.r), g: mix(text.g, back.g), b: mix(text.b, back.b), a: text.a };
+    let Rect { w, h, .. } = region.rect;
+    let mut items = Vec::new();
+    let mut outline = PathBuilder::new();
+    let (left, top, right, bottom) = (-OUTSIDE, -OUTSIDE, w + OUTSIDE, h + OUTSIDE);
+    for (from, to) in [((left, top), (right, top)), ((right, top), (right, bottom)), ((right, bottom), (left, bottom)), ((left, bottom), (left, top))] {
+        let length = (to.0 - from.0).hypot(to.1 - from.1);
+        let mut along = 0.0;
+        while along < length {
+            let end = (along + DASH).min(length);
+            let at = |d: f32| (from.0 + (to.0 - from.0) * d / length, from.1 + (to.1 - from.1) * d / length);
+            let (a, b) = (at(along), at(end));
+            outline.move_to(a.0, a.1);
+            outline.line_to(b.0, b.1);
+            along += DASH + DASH_GAP;
+        }
+    }
+    if let Some(path) = outline.finish() {
+        items.push(DisplayItem::Stroke { path, color: muted, width: OUTLINE });
+    }
+    let label = if region.name == "title" { "Click to add title" } else { "Click to add text" };
+    let run = TextRun { text: label.to_string(), size: region.size, bold: region.bold, italic: false, underline: false, color: muted, family: theme.font.clone() };
+    let text = shape_text(fonts, &[run], Some(w), region.align);
+    // A title's offer sits in the middle of its region; the rest start where text would.
+    let y = if region.name == "title" { ((h - text.height) / 2.0).max(0.0) } else { 0.0 };
+    items.push(DisplayItem::Text { text, x: 0.0, y });
+    LayerSpec {
+        source: None,
+        rect: region.rect,
+        rotate: region.rotate,
+        items,
+        click: None,
+        enter: Enter::Appear,
+        native: Vec::new(),
         is_title: false,
         varies: false,
     }

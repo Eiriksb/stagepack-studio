@@ -139,7 +139,7 @@ fn a_talk_is_drawn_at_the_device_width_of_its_slide(cx: &mut TestAppContext) {
     let slide = letterbox(area, 2.0);
     assert_eq!(scale(cx, &canvas), f32::from(slide.size.width) * 2.0 / 1920.);
     let drawn = images(cx, &canvas);
-    assert_eq!(drawn.len(), 2, "background and title");
+    assert_eq!(drawn.len(), 3, "background, title and the offer to add text");
     cx.update_window(handle, |_, window, _| {
         assert!(
             drawn
@@ -159,7 +159,7 @@ fn the_next_slide_replaces_the_images_and_releases_the_old_ones(cx: &mut TestApp
     cx.simulate_keystrokes(handle, "right");
     settle(cx, handle);
     let new = images(cx, &canvas);
-    assert_eq!(new.len(), 2);
+    assert_eq!(new.len(), 3, "background, title and the offer to add text");
     assert!(
         Arc::ptr_eq(&old[0], &new[0]),
         "the slides share one background, which keeps its image"
@@ -673,7 +673,7 @@ fn a_save_shows_once_the_file_has_been_quiet(cx: &mut TestAppContext) {
     let talk = open_saved_talk(cx, "---\ntitle: T\n---\n\n# One\n");
     let canvas = slide_canvas(cx, &talk.view);
     let before = images(cx, &canvas);
-    assert_eq!(before.len(), 2, "background and title");
+    assert_eq!(before.len(), 3, "background, title and the offer to add text");
 
     save(cx, &talk, "---\ntitle: T\n---\n\n# Changed\n");
     wait(cx, &talk, 99);
@@ -1931,7 +1931,8 @@ fn closing_with_save_while_a_save_runs_writes_the_last_edits(cx: &mut TestAppCon
     cx.run_until_parked();
 
     assert_eq!(std::fs::read_to_string(&talk.file).unwrap(), source_of(cx, &talk.view));
-    assert!(source_of(cx, &talk.view).matches("# ").count() >= 3, "both slides were added");
+    let rules = source_of(cx, &talk.view).lines().filter(|line| *line == "---").count();
+    assert_eq!(rules, 4, "both slides were added");
     assert!(!is_open(cx, talk.handle));
 }
 

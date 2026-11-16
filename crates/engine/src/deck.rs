@@ -11,7 +11,8 @@ use slides_components::Diagnostic;
 use slides_format::{Settings, Talk, is_hidden, parse_talk};
 use toolkit::{ComponentSchema, Registry};
 
-use crate::slide::SLIDE_WIDTH;
+use crate::slide::{EmptyRegion, SLIDE_WIDTH, empty_region_layer};
+use crate::text_geometry::{LayerText, TextLayout};
 use crate::timeline::MAX_CLICK;
 use crate::{
     ComponentAsks, ComponentInfo, DisplayItem, Fonts, Layer, LayerSpec, LayerTiming, LayoutEnv, Moment, PictureCache, SlideTimeline,
@@ -53,6 +54,12 @@ struct Laid {
     /// Whether it shows a picture from a file of the talk, and so holds that picture in memory.
     holds_pictures: bool,
     asks: ComponentAsks,
+    /// Where each layer's text is, beside `specs`.
+    texts: Vec<LayerText>,
+    /// The regions of the layout with nothing in them.
+    empty_regions: Vec<EmptyRegion>,
+    /// Where the slide's editable text is, once it's been asked for.
+    text_layout: Option<Arc<TextLayout>>,
 }
 
 impl Laid {
@@ -77,7 +84,13 @@ fn drawing_fingerprint(items: &[DisplayItem]) -> u64 {
                 let b = path.bounds();
                 (0u8, [b.left(), b.top(), b.right(), b.bottom()].map(f32::to_bits)).hash(&mut hasher);
             }
-            DisplayItem::Text { text, x, y } => (1u8, [*x, *y, text.width, text.height].map(f32::to_bits)).hash(&mut hasher),
+            DisplayItem::Text { text, x, y } => {
+                (1u8, [*x, *y, text.width, text.height].map(f32::to_bits)).hash(&mut hasher);
+                // Where each line starts, which aligning the text moves and nothing above sees.
+                for line in text.buffer.layout_runs() {
+                    line.glyphs.first().map(|glyph| glyph.x.to_bits()).hash(&mut hasher);
+                }
+            }
             DisplayItem::Picture { rect, .. } => (2u8, [rect.x, rect.y, rect.w, rect.h].map(f32::to_bits)).hash(&mut hasher),
         }
     }
@@ -90,6 +103,16 @@ struct Drawn {
     by_key: HashMap<LayerKey, Arc<Layer>>,
     /// The layers in order at a moment, as long as nothing in the slide has changed.
     ordered: Option<(Moment, Vec<Arc<Layer>>)>,
+    /// What the editor shows in the slide's empty regions, as long as nothing in it has changed.
+    empty_regions: Option<Vec<Arc<Layer>>>,
+}
+
+impl Drawn {
+    /// Forgets what's kept for the slide as it was, keeping the layers by key.
+    fn slide_changed(&mut self) {
+        self.ordered = None;
+        self.empty_regions = None;
+    }
 }
 
 struct SlideState {
@@ -161,16 +184,32 @@ fn shown_slides_of(talk: &Talk) -> Vec<usize> {
     if shown.is_empty() { (0..talk.slides.len()).collect() } else { shown }
 }
 
+/// How the slides of a talk just taken are matched to the ones it had, to keep what's known of each.
+enum Matching {
+    /// Each to the one that was at its place.
+    ByPlace,
+    /// From the start, and then from the end: slides after one added or taken out are still found.
+    FromBothEnds,
+}
+
 impl Deck {
     pub fn open(files: Box<dyn TalkFiles>, fonts: Fonts, source: String) -> Deck {
         Deck::with_registry(files, fonts, source, builtin_registry())
     }
 
+    /// As [`Self::open`], with the talk's text already read.
+    pub fn open_parsed(files: Box<dyn TalkFiles>, fonts: Fonts, talk: Talk) -> Deck {
+        Deck::of_talk(files, fonts, talk, builtin_registry())
+    }
+
     /// A deck whose talk can use the components in `registry`, as well as its own.
     pub fn with_registry(files: Box<dyn TalkFiles>, fonts: Fonts, source: String, registry: Registry) -> Deck {
+        Deck::of_talk(files, fonts, parse_talk(&source), registry)
+    }
+
+    fn of_talk(files: Box<dyn TalkFiles>, fonts: Fonts, talk: Talk, registry: Registry) -> Deck {
         let files: Rc<dyn TalkFiles> = Rc::from(files);
         let components = TalkComponents::scan_for(files.clone(), &registry);
-        let talk = parse_talk(&source);
         let slides: Vec<SlideState> = slide_texts(&talk)
             .into_iter()
             .zip(1..)
@@ -223,33 +262,60 @@ impl Deck {
         if files_changed {
             self.files_generation += 1;
         }
+        self.take_talk(talk, files_changed, Matching::ByPlace)
+    }
+
+    /// Takes the talk as an edit made in the app left it, and returns the slides whose text
+    /// differs from what was at the same place, or all of them if the talk's settings did. The
+    /// talk's files are as they were, so none are looked at.
+    ///
+    /// Each slide is matched to the old ones by its text, from the start and then from the
+    /// end, so that a slide added or taken out in the middle leaves every other slide its
+    /// version, layout and drawn layers.
+    pub fn update_text(&mut self, talk: Talk) -> Vec<usize> {
+        self.take_talk(talk, false, Matching::FromBothEnds)
+    }
+
+    fn take_talk(&mut self, talk: Talk, files_changed: bool, matching: Matching) -> Vec<usize> {
         let same_look = !files_changed
             && settings_pairs(self.talk.slides.first().and_then(|s| s.settings.as_ref()))
                 == settings_pairs(talk.slides.first().and_then(|s| s.settings.as_ref()));
-        let mut old = std::mem::take(&mut self.slides);
-        let mut changed = Vec::new();
-        let mut slides = Vec::new();
-        for (index, text) in slide_texts(&talk).into_iter().enumerate() {
-            let previous = old.get_mut(index);
+        let texts = slide_texts(&talk);
+        let changed: Vec<usize> = (0..texts.len())
+            .filter(|&index| !same_look || self.slides.get(index).is_none_or(|old| old.text != texts[index]))
+            .collect();
+        let old_starts: Vec<usize> = self.talk.slides.iter().map(|slide| slide.range.start).collect();
+        let (old_count, new_count) = (self.slides.len(), texts.len());
+        // Matched from the end too, a slide comes from the old slide as far from the end as it is.
+        let from_end = match matching {
+            Matching::FromBothEnds if same_look => {
+                let most = old_count.min(new_count);
+                let from_start = (0..most).take_while(|&index| self.slides[index].text == texts[index]).count();
+                (0..most - from_start).take_while(|&back| self.slides[old_count - 1 - back].text == texts[new_count - 1 - back]).count()
+            }
+            _ => 0,
+        };
+        let mut old: Vec<Option<SlideState>> = std::mem::take(&mut self.slides).into_iter().map(Some).collect();
+        let mut slides = Vec::with_capacity(new_count);
+        for (index, text) in texts.into_iter().enumerate() {
+            let came_from = if index >= new_count - from_end {
+                Some(index + old_count - new_count)
+            } else {
+                Some(index).filter(|&index| index < old_count - from_end)
+            };
+            let previous = came_from.and_then(|from| Some((from, old[from].take()?)));
+            let start = talk.slides[index].range.start;
             match previous {
-                Some(previous) if same_look && previous.text == text => {
-                    slides.push(SlideState {
-                        text,
-                        laid: previous.laid.take(),
-                        at_moment: previous.at_moment.take(),
-                        drawn: std::mem::take(&mut previous.drawn),
-                        thumbnail: previous.thumbnail.take(),
-                        last_used: previous.last_used,
-                        thumbnail_used: previous.thumbnail_used,
-                        version: previous.version,
-                    });
+                Some((from, mut previous)) if same_look && previous.text == text => {
+                    previous.moved(old_starts[from], start);
+                    slides.push(previous);
                 }
                 previous => {
-                    changed.push(index);
+                    let previous = previous.map(|(_, previous)| previous);
                     let (last_used, thumbnail_used) = previous.as_ref().map_or((0, 0), |p| (p.last_used, p.thumbnail_used));
-                    let mut drawn = previous.map(|p| std::mem::take(&mut p.drawn)).unwrap_or_default();
+                    let mut drawn = previous.map(|p| p.drawn).unwrap_or_default();
                     for scale in drawn.values_mut() {
-                        scale.ordered = None;
+                        scale.slide_changed();
                     }
                     self.versions_made += 1;
                     let version = self.versions_made;
@@ -282,7 +348,7 @@ impl Deck {
             slide.at_moment = None;
             slide.thumbnail = None;
             for scale in slide.drawn.values_mut() {
-                scale.ordered = None;
+                scale.slide_changed();
             }
             self.versions_made += 1;
             slide.version = self.versions_made;
@@ -369,7 +435,9 @@ impl Deck {
 
     /// The pixel bytes the deck is holding in drawn layers. A layer the slides share counts once.
     pub fn drawn_bytes(&self) -> usize {
-        let slide_layers = self.slides.iter().flat_map(|slide| slide.drawn.values()).flat_map(|drawn| drawn.by_key.values());
+        let drawn = || self.slides.iter().flat_map(|slide| slide.drawn.values());
+        let empty_regions = drawn().flat_map(|drawn| drawn.empty_regions.iter().flatten());
+        let slide_layers = drawn().flat_map(|drawn| drawn.by_key.values()).chain(empty_regions);
         let layers: usize = slide_layers.chain(self.backgrounds.values()).map(|layer| layer.pixmap.data().len()).sum();
         let thumbnails: usize = self.slides.iter().filter_map(|slide| slide.thumbnail.as_ref()).map(|(_, pixmap)| pixmap.data().len()).sum();
         layers + thumbnails
@@ -515,6 +583,71 @@ impl Deck {
     pub fn layers(&mut self, index: usize, scale: f32) -> Vec<Arc<Layer>> {
         let whole = self.ensure_whole(index);
         self.layers_at(index, whole, scale)
+    }
+
+    /// The slide's layers in its whole state, as `layers` gives them, and then, for the editor
+    /// alone, what it shows in each region of the layout with nothing in it: an offer to add
+    /// a title or text there. A show, a thumbnail and an export never have those.
+    pub fn editor_layers(&mut self, index: usize, scale: f32) -> Vec<Arc<Layer>> {
+        if index >= self.slides.len() {
+            return Vec::new();
+        }
+        let mut layers = self.layers(index, scale);
+        let drawn = self.slides[index].drawn.entry(scale.to_bits()).or_default();
+        let empty = match &drawn.empty_regions {
+            Some(empty) => empty.clone(),
+            None => {
+                let moment = self.ensure_whole(index);
+                let theme = talk_theme(&self.talk);
+                let regions = &self.slides[index].laid_at(moment).empty_regions;
+                let empty: Vec<Arc<Layer>> = regions
+                    .iter()
+                    .map(|region| Arc::new(render_layer(&empty_region_layer(region, &theme, &mut self.fonts), scale, &mut self.fonts)))
+                    .collect();
+                self.slides[index].drawn.entry(scale.to_bits()).or_default().empty_regions = Some(empty.clone());
+                self.keep_within_budget(index);
+                empty
+            }
+        };
+        layers.extend(empty);
+        layers
+    }
+
+    /// What `editor_layers` adds to the slide's own layers, before it's drawn.
+    #[doc(hidden)]
+    pub fn placeholder_specs(&mut self, index: usize) -> Vec<LayerSpec> {
+        if index >= self.slides.len() {
+            return Vec::new();
+        }
+        let moment = self.ensure_whole(index);
+        let theme = talk_theme(&self.talk);
+        let regions = self.slides[index].laid_at(moment).empty_regions.clone();
+        regions.iter().map(|region| empty_region_layer(region, &theme, &mut self.fonts)).collect()
+    }
+
+    /// Where slide `index`'s editable text is drawn in its whole state, as `layers` draws it:
+    /// for a caret, a selection and a click. It's kept with the slide's layout, and made
+    /// again only once the slide has changed. A slide the talk doesn't have has no text.
+    pub fn text_layout(&mut self, index: usize) -> Arc<TextLayout> {
+        if index >= self.slides.len() {
+            return Arc::new(TextLayout::default());
+        }
+        let moment = self.ensure_whole(index);
+        let talk = &self.talk;
+        let laid = self.slides[index].laid_at_mut(moment);
+        laid.text_layout
+            .get_or_insert_with(|| Arc::new(TextLayout::build(talk, index, &laid.specs, &laid.texts, &laid.empty_regions)))
+            .clone()
+    }
+
+    /// Every source range slide `index`'s text geometry is read from, in order, for tests.
+    #[doc(hidden)]
+    pub fn drawn_text_sources(&mut self, index: usize) -> Vec<std::ops::Range<usize>> {
+        if index >= self.slides.len() {
+            return Vec::new();
+        }
+        let moment = self.ensure_whole(index);
+        self.slides[index].laid_at(moment).texts.iter().flat_map(LayerText::sources).collect()
     }
 
     /// The slide's layers at `moment`, first to last, drawn at `scale`.
@@ -738,11 +871,40 @@ impl Deck {
             .iter()
             .flat_map(|spec| &spec.items)
             .any(|item| matches!(item, DisplayItem::Picture { src: Some(_), .. }));
-        Laid { specs: laid.layers, keys, notices, transition: laid.transition, holds_pictures, asks: laid.asks }
+        Laid {
+            specs: laid.layers,
+            keys,
+            notices,
+            transition: laid.transition,
+            holds_pictures,
+            asks: laid.asks,
+            texts: laid.texts,
+            empty_regions: laid.empty_regions,
+            text_layout: None,
+        }
     }
 }
 
 impl SlideState {
+    /// Moves what the slide was laid out from to where its text now sits: from `from` to `to`.
+    fn moved(&mut self, from: usize, to: usize) {
+        if from == to {
+            return;
+        }
+        let at_moment = self.at_moment.as_mut().map(|(_, laid)| laid);
+        for laid in self.laid.iter_mut().chain(at_moment) {
+            for spec in &mut laid.specs {
+                if let Some(source) = &mut spec.source {
+                    *source = source.start - from + to..source.end - from + to;
+                }
+            }
+            // The text layout holds no ranges: it's the same wherever the slide's text sits.
+            for text in &mut laid.texts {
+                text.moved(from, to);
+            }
+        }
+    }
+
     /// Whether either of its layouts shows a picture from a file of the talk.
     fn holds_pictures(&self) -> bool {
         let at_moment = self.at_moment.as_ref().map(|(_, laid)| laid);
@@ -754,6 +916,13 @@ impl SlideState {
         match &self.at_moment {
             Some((at, laid)) if *at == moment => laid,
             _ => self.laid.as_ref().expect("the slide was just laid out"),
+        }
+    }
+
+    fn laid_at_mut(&mut self, moment: Moment) -> &mut Laid {
+        match &mut self.at_moment {
+            Some((at, laid)) if *at == moment => laid,
+            _ => self.laid.as_mut().expect("the slide was just laid out"),
         }
     }
 }

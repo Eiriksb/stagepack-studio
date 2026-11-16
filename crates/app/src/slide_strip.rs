@@ -22,8 +22,8 @@ use slides_engine::{Pixmap, to_bgra_frame};
 
 use crate::document::Document;
 use crate::workspace_view::{
-    DeleteSlide, DuplicateSlide, MoveSlideDown, MoveSlideTo, MoveSlideUp, NewSlide, SelectSlide,
-    ToggleHidden,
+    CopyToClipboard, CutToClipboard, DeleteSlide, DuplicateSlide, MoveSlideDown, MoveSlideTo,
+    MoveSlideUp, NewSlide, PasteFromClipboard, SelectSlide, ToggleHidden,
 };
 
 pub const STRIP_ID: &str = "slide-strip";
@@ -652,6 +652,10 @@ impl SlideStrip {
                             Box::new(MoveSlideDown),
                             index + 1 >= count,
                         )
+                        .separator()
+                        .menu_with_disabled("Cut", Box::new(CutToClipboard), count < 2)
+                        .menu("Copy", Box::new(CopyToClipboard))
+                        .menu("Paste", Box::new(PasteFromClipboard))
                 })
                 .into_any_element()
         })

@@ -55,6 +55,16 @@ fn latin_and_emoji_need_no_notice() {
 }
 
 #[test]
+fn emoji_are_drawn_in_the_bundled_colour_font_before_any_of_this_computers() {
+    // A computer's own fonts, such as DejaVu Sans, may have some emoji in one colour.
+    let mut fonts = Fonts::with_system_fallback();
+    for text in ["😀", "a 🎉 b", "👍🏽", "❤️", "🇳🇴"] {
+        let notices = shape_text(&mut fonts, &[run(text)], None, Align::Left).notices;
+        assert!(notices.is_empty(), "{text}: {notices:?}");
+    }
+}
+
+#[test]
 fn characters_nothing_covers_raise_a_notice() {
     let mut fonts = Fonts::bundled_only();
     assert!(shape_text(&mut fonts, &[run("日本語")], None, Align::Left).notices[0].0.contains("日"));

@@ -1,3 +1,6 @@
+mod common;
+
+use common::*;
 use proptest::prelude::*;
 use slides_format::*;
 
@@ -214,6 +217,102 @@ fn removing_a_setting_takes_its_whole_line() {
         let edit = remove_setting(&src, &talk.slides[0], "layout").unwrap();
         assert_eq!(edit.apply(&src), e("---\ntitle: T\n---\n# A\n"));
         assert_eq!(remove_setting(&src, &talk.slides[0], "font"), None);
+    });
+}
+
+/// `src` with region `region` of slide `slide` aligned `align`.
+fn region_aligned(src: &str, slide: usize, region: &str, align: &str) -> String {
+    let change = set_align(&parse_talk(src), slide, &FlowPlace::Region(region.to_string()), align).unwrap();
+    applied(src, &change)
+}
+
+fn region_line(src: &str, slide: usize, region: &str) -> Option<String> {
+    let talk = parse_talk(src);
+    let settings = talk.slides[slide].settings.as_ref()?;
+    settings.get(&format!("region.{region}")).map(str::to_string)
+}
+
+#[test]
+fn a_region_is_aligned_on_a_settings_line_added_to_a_slide_with_none() {
+    on_both(|e| {
+        let src = e("# A\n---\n# B\n\nText\n");
+        let aligned = region_aligned(&src, 1, "body", "center");
+        assert_eq!(aligned, e("# A\n---\nregion.body: align=center\n---\n# B\n\nText\n"));
+        assert_eq!(region_line(&aligned, 1, "body").as_deref(), Some("align=center"));
+        assert_eq!(parse_talk(&aligned).slides.len(), 2);
+
+        let src = e("# A\n\nText\n");
+        assert_eq!(region_aligned(&src, 0, "body", "right"), e("---\nregion.body: align=right\n---\n# A\n\nText\n"));
+    });
+}
+
+#[test]
+fn a_region_is_aligned_after_a_byte_order_mark() {
+    on_both(|e| {
+        let src = format!("\u{feff}{}", e("# A\n\nText\n"));
+        let aligned = region_aligned(&src, 0, "title", "center");
+        assert_eq!(aligned, format!("\u{feff}{}", e("---\nregion.title: align=center\n---\n# A\n\nText\n")));
+        assert_eq!(region_line(&aligned, 0, "title").as_deref(), Some("align=center"));
+    });
+}
+
+#[test]
+fn a_first_slides_alignment_goes_beside_the_talks_settings() {
+    on_both(|e| {
+        let src = e("---\ntitle: T\ncolor.text: #112233\n---\n# A\n");
+        let aligned = region_aligned(&src, 0, "title", "right");
+        assert_eq!(aligned, e("---\ntitle: T\ncolor.text: #112233\nregion.title: align=right\n---\n# A\n"));
+        let talk = parse_talk(&aligned);
+        let settings = talk.slides[0].settings.as_ref().unwrap();
+        assert_eq!((settings.get("title"), settings.get("color.text")), (Some("T"), Some("#112233")));
+    });
+}
+
+#[test]
+fn an_alignment_already_given_is_changed_and_the_lines_other_values_stay() {
+    on_both(|e| {
+        let src = e("# A\n---\nregion.body: x=100  align=left w=800\nhidden: true\n---\n# B\n");
+        assert_eq!(region_aligned(&src, 1, "body", "center"), e("# A\n---\nregion.body: x=100  align=center w=800\nhidden: true\n---\n# B\n"));
+        // Only the first, which is the one that counts.
+        let src = e("---\nregion.body: align=left align=right\n---\n# B\n");
+        assert_eq!(region_aligned(&src, 0, "body", "center"), e("---\nregion.body: align=center align=right\n---\n# B\n"));
+        // A line without one has it added at its end, after what else it says.
+        let src = e("---\nregion.body: x=100 click=1\n---\n# B\n");
+        assert_eq!(region_aligned(&src, 0, "body", "right"), e("---\nregion.body: x=100 click=1 align=right\n---\n# B\n"));
+        let src = e("---\nregion.body:\n---\n# B\n");
+        assert_eq!(region_aligned(&src, 0, "body", "right"), e("---\nregion.body: align=right\n---\n# B\n"));
+        // One given with no value takes one.
+        let src = e("---\nregion.body: align= x=3\n---\n# B\n");
+        assert_eq!(region_aligned(&src, 0, "body", "left"), e("---\nregion.body: align=left x=3\n---\n# B\n"));
+    });
+}
+
+#[test]
+fn aligning_as_it_is_already_changes_nothing() {
+    let src = "---\nregion.body: align=center\n---\n# B\n";
+    let change = set_align(&parse_talk(src), 0, &FlowPlace::Region("body".into()), "center").unwrap();
+    assert!(change.is_empty());
+    let src = "<Text x=\"1\" align=\"right\">\n\nHi\n\n</Text>\n";
+    let talk = parse_talk(src);
+    let place = text_flows(&talk, 0)[0].place.clone();
+    assert!(set_align(&talk, 0, &place, "right").unwrap().is_empty());
+}
+
+#[test]
+fn a_box_is_aligned_by_its_own_attribute() {
+    on_both(|e| {
+        let src = e("# A\n\n<Text x=\"10\" y=\"20\">\n\nHi\n\n</Text>\n");
+        let talk = parse_talk(&src);
+        let place = text_flows(&talk, 0).into_iter().find(|flow| matches!(flow.place, FlowPlace::Tag(_))).unwrap().place;
+        let aligned = applied(&src, &set_align(&talk, 0, &place, "center").unwrap());
+        assert_eq!(aligned, e("# A\n\n<Text x=\"10\" y=\"20\" align=\"center\">\n\nHi\n\n</Text>\n"));
+        let talk = parse_talk(&aligned);
+        let place = text_flows(&talk, 0).into_iter().find(|flow| matches!(flow.place, FlowPlace::Tag(_))).unwrap().place;
+        let again = applied(&aligned, &set_align(&talk, 0, &place, "right").unwrap());
+        assert_eq!(again, e("# A\n\n<Text x=\"10\" y=\"20\" align=\"right\">\n\nHi\n\n</Text>\n"));
+        // A box the slide doesn't have.
+        assert_eq!(set_align(&talk, 0, &FlowPlace::Tag(0..1), "left"), None);
+        assert_eq!(set_align(&talk, 5, &FlowPlace::Region("body".into()), "left"), None);
     });
 }
 
@@ -473,258 +572,6 @@ fn a_change_and_its_inverse_give_back_the_same_bytes() {
 
 // Property tests.
 
-#[derive(Clone, Debug)]
-struct GenSlide {
-    settings: Vec<(String, String)>,
-    blocks: Vec<String>,
-    notes: Option<String>,
-    blank_after: bool,
-    notes_layout: NotesLayout,
-    /// A slide of `key: value` lines only, which reads as a settings block if a break
-    /// comes straight after a `---` and it.
-    key_values: bool,
-}
-
-/// Where a slide's notes go, and how they are written.
-#[derive(Clone, Debug)]
-struct NotesLayout {
-    /// After the heading and this many of the slide's other blocks, as far as there are any.
-    after_blocks: usize,
-    /// Every line of the element two spaces in.
-    indented: bool,
-    /// No blank line between the heading and the element, when the element follows it.
-    tight_before: bool,
-    /// No blank line between the element and a block after it.
-    tight_after: bool,
-}
-
-#[derive(Clone, Debug)]
-struct GenTalk {
-    slides: Vec<GenSlide>,
-    crlf: bool,
-    bom: bool,
-    final_newline: bool,
-    /// Whether a first slide with no settings starts with a `---` all the same.
-    opening_rule: bool,
-    /// A last slide with no marker in it, after the others.
-    tail: Option<Tail>,
-}
-
-/// A last slide that holds nothing a marker could go in.
-#[derive(Clone, Debug)]
-enum Tail {
-    /// A bare `---` and nothing after it.
-    Empty,
-    /// Notes and nothing else, with a blank line before them or not, and its own settings.
-    NotesOnly { blank_before: bool, settings: Vec<(String, String)> },
-}
-
-/// Every slide holds the marker `mk<n>x`, `n` its place in the generated talk.
-fn marker(n: usize) -> String {
-    format!("mk{n}x")
-}
-
-impl GenTalk {
-    fn text(&self) -> String {
-        let mut out = String::new();
-        if self.bom {
-            out.push('\u{feff}');
-        }
-        for (n, slide) in self.slides.iter().enumerate() {
-            if !slide.settings.is_empty() {
-                out.push_str("---\n");
-                for (key, value) in &slide.settings {
-                    out.push_str(&format!("{key}: {value}\n"));
-                }
-                out.push_str("---\n");
-            } else if n > 0 || self.opening_rule {
-                out.push_str("---\n");
-            }
-            if slide.key_values {
-                let after_a_rule = slide.settings.is_empty() && (n > 0 || self.opening_rule);
-                if after_a_rule && n + 1 < self.slides.len() {
-                    out.push('\n');
-                }
-                out.push_str(&format!("Note: {}\nOther: thing", marker(n)));
-            } else {
-                let mut blocks = slide.blocks.clone();
-                blocks.insert(0, format!("# Slide {}", marker(n)));
-                let layout = &slide.notes_layout;
-                let at = 1 + layout.after_blocks.min(blocks.len() - 1);
-                if let Some(notes) = &slide.notes {
-                    let element = format!("<Notes>\n{notes}\n</Notes>");
-                    let indent = if layout.indented { "  " } else { "" };
-                    blocks.insert(at, element.lines().map(|line| format!("{indent}{line}")).collect::<Vec<_>>().join("\n"));
-                }
-                for (i, block) in blocks.iter().enumerate() {
-                    if i > 0 {
-                        let notes_here = slide.notes.is_some() && (i == at || i == at + 1);
-                        let tight = notes_here && if i == at { at == 1 && layout.tight_before } else { layout.tight_after };
-                        out.push_str(if tight { "\n" } else { "\n\n" });
-                    }
-                    out.push_str(block);
-                }
-            }
-            out.push('\n');
-            if slide.blank_after {
-                out.push('\n');
-            }
-        }
-        match &self.tail {
-            None => {}
-            Some(Tail::Empty) => out.push_str("---\n"),
-            Some(Tail::NotesOnly { blank_before, settings }) => {
-                out.push_str("---\n");
-                if !settings.is_empty() {
-                    for (key, value) in settings {
-                        out.push_str(&format!("{key}: {value}\n"));
-                    }
-                    out.push_str("---\n");
-                }
-                if *blank_before {
-                    out.push('\n');
-                }
-                out.push_str("<Notes>\nSay hi\n</Notes>\n");
-            }
-        }
-        if !self.final_newline {
-            out.truncate(out.trim_end_matches('\n').len());
-        }
-        if self.crlf { out.replace('\n', "\r\n") } else { out }
-    }
-}
-
-fn block() -> impl Strategy<Value = String> {
-    prop::sample::select(vec![
-        "## A heading".to_string(),
-        "Some *text* with trailing spaces  ".to_string(),
-        "A paragraph\nover two lines.".to_string(),
-        "- one\n- two".to_string(),
-        "1. first\n2. second".to_string(),
-        "```\n---\ncode\n```".to_string(),
-        "~~~md\n---\n~~~".to_string(),
-        "> A quote".to_string(),
-    ])
-}
-
-fn slide_settings() -> impl Strategy<Value = Vec<(String, String)>> {
-    prop::sample::subsequence(vec![("layout", "section  "), ("hidden", "true"), ("transition", "fade")], 0..=3)
-    .prop_map(|entries| entries.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect())
-}
-
-fn talk_settings() -> impl Strategy<Value = Vec<(String, String)>> {
-    prop::sample::subsequence(
-        vec![("title", "My talk"), ("color.background", "#000"), ("font", "Inter"), ("font.mono", "Mono  ")],
-        0..=4,
-    )
-    .prop_map(|entries| entries.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect())
-}
-
-fn gen_slide() -> impl Strategy<Value = GenSlide> {
-    (
-        slide_settings(),
-        prop::collection::vec(block(), 0..3),
-        prop::option::of(prop::sample::select(vec!["Say **this**".to_string(), "- a point\n- another".to_string()])),
-        any::<bool>(),
-        (0..3usize, any::<[bool; 3]>()).prop_map(|(after_blocks, [indented, tight_before, tight_after])| NotesLayout {
-            after_blocks,
-            indented,
-            tight_before,
-            tight_after,
-        }),
-        prop::bool::weighted(0.25),
-    )
-        .prop_map(|(settings, blocks, notes, blank_after, notes_layout, key_values)| GenSlide {
-            settings,
-            blocks,
-            notes,
-            blank_after,
-            notes_layout,
-            key_values,
-        })
-}
-
-fn tail() -> impl Strategy<Value = Option<Tail>> {
-    prop_oneof![
-        2 => Just(None),
-        1 => Just(Some(Tail::Empty)),
-        1 => (any::<bool>(), slide_settings()).prop_map(|(blank_before, settings)| Some(Tail::NotesOnly { blank_before, settings })),
-    ]
-}
-
-fn gen_talk() -> impl Strategy<Value = GenTalk> {
-    (prop::collection::vec(gen_slide(), 1..=8), talk_settings(), any::<[bool; 4]>(), tail()).prop_map(
-        |(mut slides, talk, [crlf, bom, final_newline, opening_rule], tail)| {
-            let own = std::mem::take(&mut slides[0].settings);
-            slides[0].settings = talk.into_iter().chain(own).collect();
-            GenTalk { slides, crlf, bom, final_newline, opening_rule, tail }
-        },
-    )
-}
-
-#[derive(Clone, Debug)]
-enum Op {
-    /// After which slide, and whether the new one is of `key: value` lines only.
-    Insert(Option<usize>, bool),
-    Delete(usize),
-    Duplicate(usize),
-    Move(usize, usize),
-    Hide(usize, bool),
-    Notes(usize, String),
-}
-
-fn op() -> impl Strategy<Value = Op> {
-    prop_oneof![
-        (prop::option::of(0..8usize), any::<bool>()).prop_map(|(after, key_values)| Op::Insert(after, key_values)),
-        (0..8usize).prop_map(Op::Delete),
-        (0..8usize).prop_map(Op::Duplicate),
-        (0..8usize, 0..8usize).prop_map(|(a, b)| Op::Move(a, b)),
-        (0..8usize, any::<bool>()).prop_map(|(a, b)| Op::Hide(a, b)),
-        (0..8usize, prop::sample::select(vec!["", "New words", "Watch </Notes> this", "**Bold**\n\n- list"]))
-            .prop_map(|(a, s)| Op::Notes(a, s.to_string())),
-    ]
-}
-
-/// The marker given to an inserted slide.
-const NEW: usize = 99;
-
-/// What `op` does to a talk of `n` slides: its change, the slides it should leave in order
-/// (by marker), and the markers of the slides it names.
-fn run(talk: &Talk, op: &Op) -> Option<(Change, Vec<usize>, Vec<usize>)> {
-    let n = talk.slides.len();
-    let order: Vec<usize> = (0..n).collect();
-    Some(match op {
-        Op::Insert(after, key_values) => {
-            let after = after.map(|a| a % n);
-            let mut expected = order;
-            expected.insert(after.map_or(0, |a| a + 1), NEW);
-            let text = if *key_values { format!("Note: {}\nOther: new\n", marker(NEW)) } else { format!("# Slide {}\n\nNew\n", marker(NEW)) };
-            (insert_slide(talk, after, &text), expected, vec![NEW])
-        }
-        Op::Delete(i) => {
-            let i = i % n;
-            let mut expected = order;
-            expected.remove(i);
-            (delete_slide(talk, i)?, expected, vec![i])
-        }
-        Op::Duplicate(i) => {
-            let i = i % n;
-            let mut expected = order;
-            expected.insert(i + 1, i);
-            (duplicate_slide(talk, i), expected, vec![])
-        }
-        Op::Move(from, to) => {
-            let (from, to) = (from % n, to % n);
-            let mut expected = order;
-            let moved = expected.remove(from);
-            expected.insert(to, moved);
-            (move_slide(talk, from, to), expected, vec![from])
-        }
-        Op::Hide(i, hidden) => (set_hidden(talk, i % n, *hidden), order, vec![i % n]),
-        Op::Notes(i, notes) => (set_notes(talk, i % n, notes), order, vec![i % n]),
-    })
-}
-
 fn markers_in(text: &str) -> Vec<usize> {
     text.match_indices("mk")
         .filter_map(|(at, _)| {
@@ -773,11 +620,14 @@ fn without_ranges(blocks: &[Block]) -> Vec<Block> {
     blocks
         .iter()
         .map(|block| match block.clone() {
-            Block::Heading { level, spans, .. } => Block::Heading { level, spans, range: 0..0 },
-            Block::Paragraph { spans, .. } => Block::Paragraph { spans, range: 0..0 },
-            Block::List { ordered, items, .. } => {
-                Block::List { ordered, items: items.iter().map(|item| without_ranges(item)).collect(), range: 0..0 }
-            }
+            Block::Heading { level, spans, only_text, .. } => Block::Heading { level, spans, range: 0..0, inline: 0..0, only_text },
+            Block::Paragraph { spans, only_text, .. } => Block::Paragraph { spans, range: 0..0, inline: 0..0, only_text },
+            Block::List { ordered, items, item_ranges, .. } => Block::List {
+                ordered,
+                items: items.iter().map(|item| without_ranges(item)).collect(),
+                range: 0..0,
+                item_ranges: vec![0..0; item_ranges.len()],
+            },
             Block::Table { rows, .. } => Block::Table { rows, range: 0..0 },
             Block::Code { language, code, .. } => Block::Code { language, code, range: 0..0 },
             Block::Picture { src, alt, .. } => Block::Picture { src, alt, range: 0..0 },
@@ -801,19 +651,6 @@ fn talk_eol(source: &str) -> &'static str {
     }
 }
 
-/// Text someone might type into the notes box, with everything the parser could take for
-/// something else.
-fn typed_notes() -> impl Strategy<Value = String> {
-    prop::collection::vec(
-        prop::sample::select(vec![
-            "a", "Z", "é", "🎉", " ", "  ", ".", "*", "_", "#", "-", "&", ":", "|", "[x](y)", "\n", "\n\n", "<", ">", "{", "}",
-            "\\", "`", "```", "~~~", "\n---\n", "\n---  \n", "\n  ```\n", "<b>", "</b>", "</Notes>", "<Notes>", "<Box x=\"1\">",
-            "\\<", "\\-", "\n> ", "\n- ", "\n1. ", "key: value", "a```b", "````",
-        ]),
-        0..24,
-    )
-    .prop_map(|parts| parts.concat())
-}
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
@@ -911,4 +748,71 @@ proptest! {
             _ => {}
         }
     }
+}
+
+/// Talks to copy slides from: the first slide carries the talk's settings and some of its
+/// own, one is hidden, one has notes, and one ends the file with no line ending.
+const COPY_FROM: [&str; 3] = [
+    "---\ntitle: Talk\ncolor.accent: #f00\nlayout: section\n---\n\n# One\n\nwords **bold**\n\n<Notes>\nsay one\n</Notes>\n\n---\nhidden: true\n---\n\n# Two\n\n- a\n- b\n\n---\n\n# Three\n",
+    "# Plain first\n\nwith words\n\n---\n\n![a picture](pic.png)\n\n<Notes>\nlook\n</Notes>\n",
+    "---\ntitle: Only talk settings\n---\n\n# Alone\n",
+];
+
+const COPY_INTO: [&str; 2] = ["# A\n\n---\n\n# B\n", "---\ntitle: Other\n---\n\n# A\n"];
+
+/// The settings of a slide, as key and value.
+fn settings_of(slide: &Slide) -> Vec<(String, String)> {
+    slide.settings.as_ref().map_or_else(Vec::new, |settings| {
+        settings.entries.iter().map(|entry| (entry.key.clone(), entry.value.clone())).collect()
+    })
+}
+
+#[test]
+fn a_slides_text_for_copy_pastes_back_as_the_same_slide() {
+    let endings: [fn(&str) -> String; 2] = [|text| text.to_string(), |text| text.replace('\n', "\r\n")];
+    for from_eol in endings {
+        for into_eol in endings {
+            for from in COPY_FROM {
+                let from = parse_talk(&from_eol(from));
+                for index in 0..from.slides.len() {
+                    let copied = slide_text_for_copy(&from, index);
+                    assert!(!copied.contains('\r'), "the copy has newlines only: {copied:?}");
+                    for into in COPY_INTO {
+                        let into_src = into_eol(into);
+                        let into = parse_talk(&into_src);
+                        for after in 0..into.slides.len() {
+                            let pasted = parse_talk(&applied(&into_src, &insert_slide(&into, Some(after), &copied)));
+                            assert_eq!(pasted.slides.len(), into.slides.len() + 1);
+                            let new = &pasted.slides[after + 1];
+                            let ctx = format!("slide {index} of {:?} after {after} of {into_src:?}", from.source);
+                            assert_eq!(slide_text_for_copy(&pasted, after + 1), copied, "{ctx}");
+                            assert_eq!(new.notes.as_ref().map(|n| &n.text), from.slides[index].notes.as_ref().map(|n| &n.text), "{ctx}");
+                            assert_eq!(is_hidden(new), is_hidden(&from.slides[index]), "{ctx}");
+                            assert_eq!(new.blocks.len(), from.slides[index].blocks.len(), "{ctx}");
+                            let own: Vec<_> = settings_of(&from.slides[index]).into_iter().filter(|(key, _)| index > 0 || !TALK_SETTINGS.contains(&key.as_str())).collect();
+                            assert_eq!(settings_of(new), own, "{ctx}");
+                            // The pasted slide takes the line endings of the talk it's pasted into.
+                            let text = &pasted.source[new.range.clone()];
+                            if into_src.contains('\r') {
+                                assert!(!text.replace("\r\n", "").contains('\n'), "{ctx}: {text:?}");
+                            } else {
+                                assert!(!text.contains('\r'), "{ctx}: {text:?}");
+                            }
+                            // The talk's own settings stay as they were.
+                            assert_eq!(settings_of(&pasted.slides[0]), settings_of(&into.slides[0]), "{ctx}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_copied_first_slide_leaves_the_talks_settings_out() {
+    let talk = parse_talk(COPY_FROM[0]);
+    assert_eq!(slide_text_for_copy(&talk, 0), "layout: section\n---\n\n# One\n\nwords **bold**\n\n<Notes>\nsay one\n</Notes>\n\n");
+    assert_eq!(slide_text_for_copy(&talk, 1), "hidden: true\n---\n\n# Two\n\n- a\n- b\n\n");
+    assert_eq!(slide_text_for_copy(&parse_talk(COPY_FROM[2]), 0), "\n# Alone\n");
+    assert_eq!(slide_text_for_copy(&talk, 9), "");
 }

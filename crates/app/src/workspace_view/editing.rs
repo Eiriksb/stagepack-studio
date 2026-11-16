@@ -2,6 +2,8 @@
 //! between slides, and the panels around the slide.
 
 use super::*;
+use crate::clipboard::{self, SlidePaste, TooLarge};
+use crate::clipboard_tools::{read_clipboard, write_clipboard};
 
 impl WorkspaceView {
     /// Moves to another slide, unless the notes field has the keyboard: its keys move the caret.
@@ -28,8 +30,18 @@ impl WorkspaceView {
         let Some(document) = self.document.clone() else {
             return;
         };
+        // What's typed on the slide is in the talk; only what typing left empty is tidied.
+        if document.read(cx).text().is_some() {
+            self.edit(Document::end_text, cx);
+        }
         let before = document.read(cx).current();
-        document.update(cx, |document, _| step(document));
+        let message = document.update(cx, |document, _| {
+            step(document);
+            document.take_message()
+        });
+        if let Some(message) = message {
+            self.say(message, cx);
+        }
         if document.read(cx).current() == before {
             return;
         }
@@ -51,7 +63,7 @@ impl WorkspaceView {
         let Some(document) = self.document.clone() else {
             return;
         };
-        let (made, changed) = document.update(cx, |document, cx| {
+        let (made, changed, message) = document.update(cx, |document, cx| {
             let before = talk_state(document);
             let made = change(document);
             // Whether the talk changed, as its text or its history did: what the edit says
@@ -60,7 +72,7 @@ impl WorkspaceView {
             if changed {
                 cx.notify();
             }
-            (made, changed)
+            (made, changed, document.take_message())
         });
         if changed {
             self.edited(cx);
@@ -68,20 +80,41 @@ impl WorkspaceView {
         if let Err(refused) = made {
             self.say(refused.to_string(), cx);
         }
+        if let Some(message) = message {
+            self.say(message, cx);
+        }
+    }
+
+    /// Leaves the talk tidy of what typing on the slide left empty, before it's saved, shown
+    /// or exported. Typing goes on where it can.
+    pub(super) fn settle_typing(&mut self, cx: &mut Context<Self>) {
+        let typing = self.document.as_ref().and_then(|document| {
+            document
+                .read(cx)
+                .text()
+                .map(|text| text.composing.is_some())
+        });
+        if let Some(composing) = typing {
+            self.edit(Document::settle_text, cx);
+            // What the system was composing went with it, and isn't shown any more.
+            if composing {
+                self.slide_editor.update(cx, |_, cx| cx.notify());
+            }
+        }
     }
 
     /// Takes back the last edit, or makes the last one undone again.
     pub(super) fn step_history(
         &mut self,
-        step: fn(&mut Document) -> Option<Vec<usize>>,
+        step: fn(&mut Document) -> Result<Option<Vec<usize>>, EditRefused>,
         cx: &mut Context<Self>,
     ) {
-        self.edit(|document| Ok(step(document).unwrap_or_default()), cx);
+        self.edit(|document| step(document).map(Option::unwrap_or_default), cx);
     }
 
     /// Brings what shows the talk up to date after an edit. A "Saved" on the status line no
     /// longer holds, so it goes.
-    fn edited(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn edited(&mut self, cx: &mut Context<Self>) {
         self.clear_fading_status(cx);
         let Some(document) = &self.document else {
             return;
@@ -150,6 +183,92 @@ impl WorkspaceView {
         );
     }
 
+    /// Copies, cuts or pastes what has the keyboard: the text being typed, or else the current
+    /// slide. The notes field has its own.
+    pub(super) fn clipboard(&mut self, op: ClipboardOp, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        if self.notes_panel.read(cx).is_focused(window, cx) {
+            // The notes field has the keyboard: the tool does what its own keys do there.
+            let action: Box<dyn Action> = match op {
+                ClipboardOp::Copy => Box::new(input::Copy),
+                ClipboardOp::Cut => Box::new(input::Cut),
+                ClipboardOp::Paste => Box::new(input::Paste),
+            };
+            window.dispatch_action(action, cx);
+            return;
+        }
+        if document.read(cx).text().is_some() {
+            // From a text tool that has the keyboard: it goes back to the text, as after any tool.
+            self.slide_editor.update(cx, |editor, cx| {
+                editor.focus_text(window, cx);
+                editor.clipboard(op, cx);
+            });
+            return;
+        }
+        match op {
+            ClipboardOp::Copy => {
+                self.copy_slide(cx);
+            }
+            ClipboardOp::Cut => self.cut_slide(cx),
+            ClipboardOp::Paste => self.paste_slide(cx),
+        }
+    }
+
+    /// Puts the current slide's own text on the clipboard, and says whether it did.
+    fn copy_slide(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(document) = self.document.clone() else {
+            return false;
+        };
+        let Some(text) = document.read(cx).current_for_copy() else {
+            self.say(EditRefused::CouldNotBeMade.to_string(), cx);
+            return false;
+        };
+        let Some(entry) = clipboard::slide_entry(&text) else {
+            self.say(clipboard::SLIDE_TOO_BIG, cx);
+            return false;
+        };
+        write_clipboard(entry, cx);
+        true
+    }
+
+    /// Copies the current slide and takes it out, unless it's the only one, or it couldn't be
+    /// copied.
+    fn cut_slide(&mut self, cx: &mut Context<Self>) {
+        let several = self
+            .document
+            .as_ref()
+            .is_some_and(|document| document.read(cx).slide_count() > 1);
+        if several && self.copy_slide(cx) {
+            self.edit(Document::cut_current, cx);
+        }
+    }
+
+    /// Pastes the slide on the clipboard after the current one. If it shows a picture or a
+    /// component this talk lacks, that's said, once.
+    fn paste_slide(&mut self, cx: &mut Context<Self>) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        let (plain, metadata) = read_clipboard(cx);
+        let markdown = match clipboard::slide_to_paste(plain.as_deref(), metadata.as_deref()) {
+            Ok(SlidePaste::Slide(markdown)) => markdown,
+            Ok(SlidePaste::NoSlide) => return self.say(clipboard::NO_SLIDE, cx),
+            Ok(SlidePaste::NotOneSlide) => return self.say(EditRefused::WouldChangeTheSlides.to_string(), cx),
+            Err(TooLarge) => return self.say(clipboard::TOO_LARGE, cx),
+        };
+        let before = document.read(cx).slide_count();
+        self.edit(|document| document.paste_slide(&markdown), cx);
+        if document.read(cx).slide_count() == before + 1 {
+            let notices = document.update(cx, |document, _| document.notices());
+            let document = document.read(cx);
+            if clipboard::shows_something_missing(&notices, |path| document.has_file(path)) {
+                self.say(clipboard::MISSING_PICTURES, cx);
+            }
+        }
+    }
+
     fn panels(&self) -> Panels {
         Panels {
             notes: self.show_notes,
@@ -203,6 +322,14 @@ impl WorkspaceView {
                         .size_full()
                         .p_4()
                         .bg(cx.theme().muted)
+                        // A click on the desk ends typing on the slide.
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.slide_editor
+                                    .update(cx, |editor, cx| editor.stop_typing(window, cx))
+                            }),
+                        )
                         .child(canvas)
                         .child(
                             v_flex()

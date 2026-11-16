@@ -5,6 +5,8 @@ use std::collections::VecDeque;
 
 use slides_format::{Change, SourceEdit};
 
+use crate::text_editing::TextMark;
+
 /// The most steps kept.
 const MAX_STEPS: usize = 1_000;
 /// The most bytes of edit text kept, over all the steps.
@@ -15,6 +17,8 @@ const MAX_BYTES: usize = 64 * 1024 * 1024;
 pub struct Step {
     pub change: Change,
     pub current: usize,
+    /// Where the step's text was typed, if it was typed on a slide.
+    pub mark: Option<TextMark>,
 }
 
 struct Entry {
@@ -25,6 +29,8 @@ struct Entry {
     before: usize,
     /// The slide to show once it's done again.
     after: usize,
+    /// Where its text was typed, if it was typed on a slide.
+    mark: Option<TextMark>,
 }
 
 impl Entry {
@@ -113,6 +119,7 @@ impl History {
             change: undo,
             before,
             after,
+            mark: None,
         };
         self.bytes += entry.bytes();
         self.undo.push_back(entry);
@@ -134,8 +141,29 @@ impl History {
         if self.run != Some(run) {
             return false;
         }
-        let Some(last) = self.undo.back_mut() else {
+        let joined = self.join_last(before, after);
+        if !joined {
             self.run = None;
+        }
+        joined
+    }
+
+    /// Takes an edit that turned the text `before` into `after` into the newest step, whether
+    /// or not its run is open, and says whether it did. It doesn't while there's something to
+    /// redo, or when the newest step leads to the saved text, which would no longer be one a
+    /// step leads to. An edit that brings the text back to where the step started takes the
+    /// step away. Any run that was open ends.
+    pub fn fold(&mut self, before: &str, after: &str) -> bool {
+        if !self.redo.is_empty() || self.saved == Some(self.position()) {
+            return false;
+        }
+        self.run = None;
+        self.join_last(before, after)
+    }
+
+    /// Takes an edit from `before` to `after` into the newest step, if there is one.
+    fn join_last(&mut self, before: &str, after: &str) -> bool {
+        let Some(last) = self.undo.back_mut() else {
             return false;
         };
         let start = last.change.apply(before);
@@ -152,9 +180,48 @@ impl History {
         true
     }
 
+    /// Notes where the newest step's text was typed, so that undoing or redoing it goes back
+    /// to typing there.
+    pub fn mark_last(&mut self, mark: TextMark) {
+        if let Some(last) = self.undo.back_mut() {
+            last.mark = Some(mark);
+        }
+    }
+
+    /// Where the newest step's text was typed, if it was typed on a slide.
+    pub fn last_mark(&self) -> Option<&TextMark> {
+        self.undo.back().and_then(|entry| entry.mark.as_ref())
+    }
+
+    /// How many steps from the start the text is now: one more after a step is recorded, one
+    /// fewer once a step is taken away.
+    pub fn depth(&self) -> usize {
+        self.position()
+    }
+
+    /// Where the newest step's text was typed, if it was typed on a slide.
+    pub fn last_mark_mut(&mut self) -> Option<&mut TextMark> {
+        self.undo.back_mut().and_then(|entry| entry.mark.as_mut())
+    }
+
     /// Whether `run` is open, so that edits can still join it.
     pub fn is_open(&self, run: RunId) -> bool {
         self.run == Some(run)
+    }
+
+    /// The run that's open, if any.
+    pub fn open_run(&self) -> Option<RunId> {
+        self.run
+    }
+
+    /// The change [`Self::undo`] would give, without taking the step back.
+    pub fn next_undo(&self) -> Option<&Change> {
+        self.undo.back().map(|entry| &entry.change)
+    }
+
+    /// The change [`Self::redo`] would give, without making the step again.
+    pub fn next_redo(&self) -> Option<&Change> {
+        self.redo.last().map(|entry| &entry.change)
     }
 
     /// Takes the last step back. `source` is the talk's text now, which the step's change
@@ -167,9 +234,10 @@ impl History {
         entry.change = change.inverse(source);
         self.bytes += entry.bytes();
         let current = entry.before;
+        let mark = entry.mark.clone();
         self.redo.push(entry);
         self.trim();
-        Some(Step { change, current })
+        Some(Step { change, current, mark })
     }
 
     /// Makes the last step undone again. `source` is the talk's text now.
@@ -181,9 +249,10 @@ impl History {
         entry.change = change.inverse(source);
         self.bytes += entry.bytes();
         let current = entry.after;
+        let mark = entry.mark.clone();
         self.undo.push_back(entry);
         self.trim();
-        Some(Step { change, current })
+        Some(Step { change, current, mark })
     }
 
     pub fn can_undo(&self) -> bool {

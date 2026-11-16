@@ -3,9 +3,7 @@
 //! talk's components, and saving the talk.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures::StreamExt as _;
 use futures::channel::mpsc;
@@ -23,7 +21,9 @@ use slides_engine::{ComponentState, Fonts};
 
 use crate::builds::{self, BuildOutcome, Compile};
 use crate::cargo_file::{self, write_cargo_file};
-use crate::document::{Document, EditRefused, OpenProblem, Reload, SLIDES_FILE, TalkPlace};
+use crate::clipboard::ClipboardOp;
+use crate::clipboard_tools::ClipboardTools;
+use crate::document::{Document, EditRefused, OpenProblem, Reload, SLIDES_FILE, TalkPlace, UNREADABLE_FILE};
 use crate::export::{self, ExportKind, run_export, stagepack_executable};
 use crate::markdown_panel::MarkdownPanel;
 use crate::notes_panel::{
@@ -31,19 +31,21 @@ use crate::notes_panel::{
 };
 use crate::permissions::BuildPermissions;
 use crate::present_view::{self, Presentation, start_show};
-use crate::recovery::{Found, Recovery, hash_text};
+use crate::recovery::Recovery;
 use crate::ribbon::{Panels, Ribbon};
+use crate::save_flow::{CloseAnswer, Effect, SaveFlow, SaveOutcome};
 use crate::saving::{SaveError, SaveJob, SaveTarget, Saved};
 use crate::slide_canvas::{ScaleChanged, SlideCanvas};
+use crate::slide_editor::{self, EditorEvent, SlideEditor};
+use crate::text_tools::TextTools;
 use crate::slide_strip::{
     self, STRIP_CONTEXT, STRIP_MAX_WIDTH, STRIP_MIN_WIDTH, STRIP_WIDTH, SlideStrip,
 };
 use crate::watcher::{self, Change};
+use crate::working_copies::{KEEP_FAILED, KeepFailed, WorkingCopies};
 
 mod editing;
 mod saving;
-
-use saving::Kept;
 
 pub const CANVAS_ID: &str = "canvas";
 pub const TITLE_ID: &str = "title";
@@ -83,15 +85,8 @@ pub(crate) const APP_ID: &str = "stagepack-studio";
 /// How long the file has to stay quiet before it's read, as one save can be several writes.
 const RELOAD_DELAY: Duration = Duration::from_millis(100);
 
-/// How long after the last edit the working copy of unsaved changes is brought up to date.
-const WORKING_COPY_DELAY: Duration = Duration::from_secs(1);
-/// The longest edits that never stop for [`WORKING_COPY_DELAY`] go without being kept, from
-/// the first of them.
-const WORKING_COPY_MOST_WAIT: Duration = Duration::from_secs(3);
 /// How long "Saved" stays on the status line.
 const STATUS_FADE: Duration = Duration::from_secs(5);
-/// How long after a working copy couldn't be written it's tried again.
-const KEEP_RETRY_DELAY: Duration = Duration::from_secs(10);
 
 const MARKDOWN_WIDTH: Pixels = px(380.);
 const MARKDOWN_MIN_WIDTH: Pixels = px(200.);
@@ -112,8 +107,6 @@ const UNSAVED_ON_CLOSE: &str = "This talk has changes that haven't been saved.";
 
 pub const RECOVERY_OFFER: &str = "Changes from last time weren't saved.";
 pub const RECOVERY_CHANGED_SINCE: &str = "The talk has also changed since then.";
-const KEEP_FAILED: &str =
-    "Unsaved changes couldn't be kept safe in case the app stops. The app will try again shortly.";
 
 /// What the title shows before the talk's name while it has unsaved changes.
 pub const UNSAVED_MARK: &str = "• ";
@@ -143,6 +136,9 @@ actions!(
         MoveSlideDown,
         ToggleNotes,
         ToggleSlideList,
+        CopyToClipboard,
+        CutToClipboard,
+        PasteFromClipboard,
     ]
 );
 
@@ -205,12 +201,16 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("delete", DeleteSlide, Some(STRIP_CONTEXT)),
         KeyBinding::new("ctrl-up", MoveSlideUp, Some(STRIP_CONTEXT)),
         KeyBinding::new("ctrl-down", MoveSlideDown, Some(STRIP_CONTEXT)),
+        KeyBinding::new("ctrl-c", CopyToClipboard, Some(STRIP_CONTEXT)),
+        KeyBinding::new("ctrl-x", CutToClipboard, Some(STRIP_CONTEXT)),
+        KeyBinding::new("ctrl-v", PasteFromClipboard, Some(STRIP_CONTEXT)),
         KeyBinding::new("ctrl-s", Save, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-shift-s", SaveAs, Some(KEY_CONTEXT)),
         KeyBinding::new("f5", Present, Some(KEY_CONTEXT)),
         KeyBinding::new("shift-f5", Rehearse, Some(KEY_CONTEXT)),
     ]);
     slide_strip::bind_keys(cx);
+    slide_editor::bind_keys(cx);
     present_view::bind_keys(cx);
 }
 
@@ -254,6 +254,8 @@ pub struct WorkspaceView {
     problem: Option<SharedString>,
     stagepack_offer: Option<StagepackOffer>,
     slide_canvas: Entity<SlideCanvas>,
+    /// The slide as it's typed on, over the canvas.
+    slide_editor: Entity<SlideEditor>,
     notices: Vec<String>,
     /// What came of the last thing asked of the File or Export menu.
     status: Option<SharedString>,
@@ -304,39 +306,18 @@ pub struct WorkspaceView {
     build_problems: Vec<Diagnostic>,
     /// The look at the components waiting for them to go quiet.
     pending_components: Option<Task<()>>,
-    /// Whether a save is running.
-    saving: bool,
-    /// Whether another save was asked for while one ran.
-    save_again: bool,
-    /// Whether a read of the file came in while a save ran. It's read again once the save
-    /// is done: what came in may be older than what the save wrote.
-    reload_after_save: bool,
-    /// Whether the window closes once the running save is done.
-    close_after_save: bool,
-    /// Whether the window may close with unsaved changes, as asked.
-    close_anyway: bool,
-    /// Where working copies of unsaved changes are kept, if anywhere.
-    recovery: Option<Recovery>,
-    /// The working copy this window last wrote, while it's there.
-    kept: Option<Kept>,
-    /// The update of the working copy waiting for the edits to stop for a moment.
-    pending_working_copy: Option<Task<()>>,
-    /// When the first edit the working copy doesn't hold yet was made, while an update waits.
-    unkept_since: Option<Instant>,
-    /// Unsaved changes from last time, while nobody has said whether to bring them back.
-    offered: Option<Found>,
-    /// The copy from last time that was brought back, until this window's own copy or a save
-    /// holds what it did.
-    adopted: saving::Adopted,
-    /// The last change to the working copies, which the next one waits for.
-    working_copy_chain: Option<Task<()>>,
-    /// How many clears of this window's copy have been asked for.
-    clears: Arc<AtomicU64>,
+    /// Whether a save is running, and what's to happen once it's done.
+    save_flow: SaveFlow,
+    /// The working copies of the talk's unsaved changes.
+    working_copies: Entity<WorkingCopies>,
     /// The window this is the content of.
     window_handle: AnyWindowHandle,
     _scale_changed: Subscription,
     _document_changed: Option<Subscription>,
     _notes_edited: Subscription,
+    _editor_events: Subscription,
+    _working_copies_changed: Subscription,
+    _keep_failed: Subscription,
 }
 
 impl WorkspaceView {
@@ -413,14 +394,32 @@ impl WorkspaceView {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
         let document = document.map(|document| cx.new(|_| document));
+        // What holds the text tools, which can have the keyboard while typing goes on.
+        let tools_focus = cx.focus_handle();
+        let slide_editor = cx.new(|cx| {
+            let canvas = slide_canvas.clone();
+            let (away, tools) = (focus_handle.clone(), tools_focus.clone());
+            SlideEditor::new(document.clone(), canvas, away, tools, window, cx)
+        });
+        let text_tools = cx.new(|cx| {
+            TextTools::new(document.clone(), slide_editor.clone(), tools_focus, window, cx)
+        });
+        let editor_events =
+            cx.subscribe(&slide_editor, |this, _, event: &EditorEvent, cx| match event {
+                EditorEvent::Edited => this.edited(cx),
+                EditorEvent::Said(said) => this.say(said.clone(), cx),
+            });
         let panels = Panels {
             notes: true,
             slide_list: true,
             markdown: false,
         };
-        let ribbon = cx.new(|cx| Ribbon::new(document.clone(), panels, cx));
+        let clipboard_tools = cx.new(|cx| ClipboardTools::new(document.clone(), &slide_editor, cx));
+        let ribbon = cx.new(|cx| Ribbon::new(document.clone(), clipboard_tools.clone(), text_tools, panels, cx));
         let slide_strip = cx.new(|cx| SlideStrip::new(document.clone(), cx));
         let notes_panel = cx.new(|cx| NotesPanel::new(document.clone(), window, cx));
+        let notes_focus = notes_panel.read(cx).field().focus_handle(cx);
+        clipboard_tools.update(cx, |tools, cx| tools.follow_notes(notes_focus, window, cx));
         let notes_edited = cx.subscribe_in(
             &notes_panel,
             window,
@@ -432,11 +431,18 @@ impl WorkspaceView {
                 notes_panel.update(cx, |panel, cx| panel.follow_slide(window, cx));
             },
         );
+        let working_copies = cx.new(|_| WorkingCopies::new(document.clone()));
+        // The bar offering back last time's changes comes and goes.
+        let working_copies_changed = cx.observe(&working_copies, |_, _, cx| cx.notify());
+        let keep_failed = cx.subscribe(&working_copies, |this, _, _: &KeepFailed, cx| {
+            this.say(KEEP_FAILED, cx)
+        });
         // The title says whether there are unsaved changes, whatever made them, and the
         // working copy follows them.
         let document_changed = document.as_ref().map(|document| {
             cx.observe(document, |this, _, cx| {
-                this.keep_working_copy_soon(cx);
+                this.working_copies
+                    .update(cx, |copies, cx| copies.talk_changed(cx));
                 cx.notify();
             })
         });
@@ -461,6 +467,7 @@ impl WorkspaceView {
             problem,
             stagepack_offer: None,
             slide_canvas,
+            slide_editor,
             notices,
             status: None,
             status_fading: None,
@@ -489,23 +496,15 @@ impl WorkspaceView {
             build_again: false,
             build_problems: Vec::new(),
             pending_components: None,
-            saving: false,
-            save_again: false,
-            reload_after_save: false,
-            close_after_save: false,
-            close_anyway: false,
-            recovery: None,
-            kept: None,
-            pending_working_copy: None,
-            unkept_since: None,
-            offered: None,
-            adopted: saving::Adopted::default(),
-            working_copy_chain: None,
-            clears: Arc::new(AtomicU64::new(0)),
+            save_flow: SaveFlow::default(),
+            working_copies,
             window_handle: window.window_handle(),
             _scale_changed: scale_changed,
             _document_changed: document_changed,
             _notes_edited: notes_edited,
+            _editor_events: editor_events,
+            _working_copies_changed: working_copies_changed,
+            _keep_failed: keep_failed,
         };
         view.always_build = view.is_always_built();
         view
@@ -557,6 +556,10 @@ impl WorkspaceView {
         &self.slide_canvas
     }
 
+    pub fn slide_editor(&self) -> &Entity<SlideEditor> {
+        &self.slide_editor
+    }
+
     pub fn ribbon(&self) -> &Entity<Ribbon> {
         &self.ribbon
     }
@@ -601,12 +604,13 @@ impl WorkspaceView {
             return;
         };
         let scale = self.slide_canvas.read(cx).scale();
-        let (notices, layers) = document.update(cx, |document, _| {
-            (
-                document.notices(),
-                scale.map(|scale| document.layers(scale)),
-            )
+        let (notices, layers, message) = document.update(cx, |document, _| {
+            let layers = scale.map(|scale| document.editor_layers(scale));
+            (document.notices(), layers, document.take_message())
         });
+        if let Some(message) = message {
+            self.say(message, cx);
+        }
         self.notices = notices;
         if let Some(layers) = layers {
             self.slide_canvas
@@ -684,8 +688,8 @@ impl WorkspaceView {
         let Some(document) = self.document.clone() else {
             return;
         };
-        if self.saving {
-            self.reload_after_save = true;
+        // A read that comes in while a save runs is held back, and the file read again after.
+        if !self.save_flow.read_arrived().contains(&Effect::TakeRead) {
             return;
         }
         let reload = document.update(cx, |document, cx| {
@@ -696,6 +700,10 @@ impl WorkspaceView {
             }
             reload
         });
+        if matches!(reload, Reload::Unreadable) {
+            self.say(UNREADABLE_FILE, cx);
+            return;
+        }
         let Reload::Changed(slides) = reload else {
             // The bar about a change from outside may have come or gone.
             cx.notify();
@@ -820,6 +828,7 @@ impl WorkspaceView {
 
     /// Starts a show of the talk, unless one is running already.
     fn present(&mut self, rehearsing: bool, cx: &mut Context<Self>) {
+        self.settle_typing(cx);
         let Some(document) = self.document.clone() else {
             return;
         };
@@ -878,7 +887,7 @@ impl WorkspaceView {
             multiple: false,
             prompt: Some("Open".into()),
         });
-        let recovery = self.recovery.clone();
+        let recovery = self.working_copies.read(cx).recovery().cloned();
         cx.spawn(async move |this, cx| {
             let opened = match chosen.await {
                 Ok(Ok(Some(mut paths))) if !paths.is_empty() => cx
@@ -895,7 +904,8 @@ impl WorkspaceView {
     }
 
     /// Asks where to put what `job` will write, then runs it on a background task and says how
-    /// it went. `job` is made once the place is chosen, so it has the talk as it is by then.
+    /// it went. `job` is made once the place is chosen, so it has the talk as it is by then,
+    /// with typing done since settled too.
     fn write_out<Job>(
         &mut self,
         extension: Option<&str>,
@@ -905,6 +915,7 @@ impl WorkspaceView {
     ) where
         Job: FnOnce(&Path) -> Result<Vec<String>, String> + Send + 'static,
     {
+        self.settle_typing(cx);
         let Some(document) = &self.document else {
             return;
         };
@@ -927,6 +938,8 @@ impl WorkspaceView {
                 |name| name.to_string_lossy().into_owned(),
             );
             let job = this.update(cx, |this, cx| {
+                // Typing may have gone on while the dialog was up.
+                this.settle_typing(cx);
                 this.say(format!("{} {name}…", wording.doing), cx);
                 this.document
                     .as_ref()
@@ -1175,7 +1188,7 @@ impl Render for WorkspaceView {
             .relative()
             .size_full()
             .bg(cx.theme().muted)
-            .child(self.slide_canvas.clone())
+            .child(self.slide_editor.clone())
             .when_some(self.problem.clone(), |this, problem| {
                 this.child(
                     v_flex()
@@ -1240,6 +1253,15 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &MoveSlideDown, _, cx| this.move_slide(true, cx)))
             .on_action(cx.listener(|this, action: &MoveSlideTo, _, cx| {
                 this.move_slide_to(action.from, action.to, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CopyToClipboard, window, cx| {
+                this.clipboard(ClipboardOp::Copy, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CutToClipboard, window, cx| {
+                this.clipboard(ClipboardOp::Cut, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &PasteFromClipboard, window, cx| {
+                this.clipboard(ClipboardOp::Paste, window, cx)
             }))
             .on_action(cx.listener(|this, _: &Undo, _, cx| this.step_history(Document::undo, cx)))
             .on_action(cx.listener(|this, _: &Redo, _, cx| this.step_history(Document::redo, cx)))

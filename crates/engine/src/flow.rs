@@ -15,13 +15,15 @@ use toolkit::{Color, Theme};
 use crate::elements::{PathLook, ShapeLook, path_items, shape_items};
 use crate::native::{MAX_TABLE_CELLS, Semantic, native_elements};
 use crate::placeholder::placeholder_items;
+use crate::text_geometry::{DrawnBlock, DrawnText, LayerText};
 use slides_components::shortened;
 use crate::{
     Align, Bullet, DisplayItem, Fonts, LayoutEnv, NativeElement, NativeParagraph, NativeRun, Notice, Rect, RegionDef, ShapedText, TextRun,
-    highlight, shape_text,
+    highlight,
 };
+use crate::text::shape_text_with;
 
-const GAP: f32 = 24.0;
+pub(crate) const GAP: f32 = 24.0;
 /// The least a list is indented, however narrow its markers.
 const LIST_INDENT: f32 = 48.0;
 /// The least space between a list's widest marker and its text.
@@ -93,12 +95,15 @@ pub(crate) struct Leaf {
     align: Align,
     /// A list marker stays on one line, however narrow the indent is.
     wraps: bool,
+    /// Whether a line break at the end of the text is drawn as an empty last line, as it is
+    /// at the end of a heading or a paragraph.
+    end_line: bool,
     frame: Frame,
 }
 
 impl Leaf {
     fn shape(&self, width: Option<f32>, fonts: &mut Fonts) -> ShapedText {
-        shape_text(fonts, &self.runs, width.filter(|_| self.wraps), self.align)
+        shape_text_with(fonts, &self.runs, width.filter(|_| self.wraps), self.align, self.end_line)
     }
 
     /// Takes the space Taffy offers, not its known size: only the space has had the
@@ -112,6 +117,14 @@ impl Leaf {
         let text = self.shape(width, fonts);
         Size { width: text.width, height: text.height }
     }
+}
+
+/// What a text leaf is of the slide's text: the block it draws and that block's content,
+/// with the size its text takes before its spans have their say.
+struct ParaKey {
+    range: Range<usize>,
+    inline: Range<usize>,
+    size: f32,
 }
 
 /// The size and weight text takes before its spans have their say.
@@ -140,6 +153,23 @@ pub(crate) struct Flow<'a, 'env> {
     stopped: bool,
     /// What the `<Text>` tags around the current block ask of the text in it.
     text_tag_style: TextStyle,
+    /// The alignment a positioned tag asks for, which wins over a shape's centring.
+    pub(crate) box_align: Option<Align>,
+    /// The text leaves that are a heading's or a paragraph's text.
+    paras: HashMap<NodeId, ParaKey>,
+    /// The content of each empty list item, by the item's bytes.
+    empty_items: HashMap<NodeId, Range<usize>>,
+    /// The node of each block, by its bytes.
+    blocks: HashMap<NodeId, Range<usize>>,
+    /// Where `draw` found those, for the editor.
+    drawn: LayerText,
+}
+
+/// A layer's drawing, what it is for export, and where its text is.
+pub(crate) struct Drawing {
+    pub items: Vec<DisplayItem>,
+    pub native: Vec<NativeElement>,
+    pub text: LayerText,
 }
 
 /// A column with the gap between blocks.
@@ -161,7 +191,7 @@ pub(crate) fn flow_region(
     theme: &Theme,
     env: &mut LayoutEnv,
     notices: &mut Vec<Notice>,
-) -> (Vec<DisplayItem>, Vec<NativeElement>) {
+) -> Drawing {
     let mut flow = Flow::new(region, width, theme, env, notices);
     let children: Vec<NodeId> = blocks.iter().filter_map(|block| flow.block(block, region.align)).collect();
     let root = flow.node(Style { size: Size { width: length(width), height: auto() }, ..column() }, &children);
@@ -175,6 +205,7 @@ pub(crate) struct Piece {
     pub source: Range<usize>,
     pub items: Vec<DisplayItem>,
     pub native: Vec<NativeElement>,
+    pub text: LayerText,
 }
 
 /// As `flow_region`, laid out the same way, but each top-level block and each item of a
@@ -223,7 +254,8 @@ impl<'a, 'env> Flow<'a, 'env> {
         let mut items = Vec::new();
         self.draw(node, inside, &mut items);
         let native = self.native(node, inside);
-        Piece { rect: Rect { x, y, w: layout.size.width, h: layout.size.height }, source, items, native }
+        let text = std::mem::take(&mut self.drawn);
+        Piece { rect: Rect { x, y, w: layout.size.width, h: layout.size.height }, source, items, native, text }
     }
 
     pub(crate) fn new(
@@ -248,16 +280,22 @@ impl<'a, 'env> Flow<'a, 'env> {
             children_placed: false,
             stopped: false,
             text_tag_style: TextStyle::default(),
+            box_align: None,
+            paras: HashMap::new(),
+            empty_items: HashMap::new(),
+            blocks: HashMap::new(),
+            drawn: LayerText::default(),
         }
     }
 
-    /// Lays out the tree under `root`, `width` wide, and returns its drawing and what it is.
-    pub(crate) fn finish(mut self, root: NodeId, width: f32) -> (Vec<DisplayItem>, Vec<NativeElement>) {
+    /// Lays out the tree under `root`, `width` wide, and returns its drawing, what it is and
+    /// where its text is.
+    pub(crate) fn finish(mut self, root: NodeId, width: f32) -> Drawing {
         self.compute(root, width);
         let mut items = Vec::new();
         self.draw(root, (0.0, 0.0), &mut items);
         let native = self.native(root, (0.0, 0.0));
-        (items, native)
+        Drawing { items, native, text: self.drawn }
     }
 
     /// What `node` and its children are, for export. Call it once, after laying out.
@@ -390,7 +428,8 @@ impl<'a, 'env> Flow<'a, 'env> {
             style.color.as_deref().or(tag.color.as_deref()).and_then(Color::parse).unwrap_or(self.theme.text)
         };
         TextRun {
-            text: span.text.clone(),
+            // Line endings as the text model has them, so that a caret's offset is the drawn text's.
+            text: if span.text.contains('\r') { span.text.replace("\r\n", "\n").replace('\r', "\n") } else { span.text.clone() },
             size: style.size.or(tag.size).map_or(look.size, |size| size as f32),
             bold: look.bold || style.bold || tag.bold,
             italic: style.italic || tag.italic,
@@ -412,9 +451,16 @@ impl<'a, 'env> Flow<'a, 'env> {
             .unzip()
     }
 
+    /// A heading's or a paragraph's text. One with nothing in it is still a line of its
+    /// look's height, and a break at its end is an empty last line.
     fn text(&mut self, spans: &[Span], look: TextLook, align: Align) -> NodeId {
-        let (runs, native) = self.runs(spans, look);
-        let node = self.leaf(Style::default(), Content::Text(Leaf { runs, align, wraps: true, frame: Frame::None }));
+        let (mut runs, mut native) = self.runs(spans, look);
+        if runs.iter().all(|run| run.text.is_empty()) {
+            let run = self.run(&Span { text: String::new(), style: Default::default() }, look);
+            native = vec![NativeRun::new(&run, None)];
+            runs = vec![run];
+        }
+        let node = self.leaf(Style::default(), Content::Text(Leaf { runs, align, wraps: true, end_line: true, frame: Frame::None }));
         self.note(node, Semantic::Paragraph(NativeParagraph::new(native, align)));
         node
     }
@@ -426,7 +472,7 @@ impl<'a, 'env> Flow<'a, 'env> {
         run.color = color.unwrap_or(run.color);
         run.size = size.unwrap_or(run.size);
         let paragraph = NativeParagraph::new(vec![NativeRun::new(&run, None)], align);
-        let node = self.leaf(Style::default(), Content::Text(Leaf { runs: vec![run], align, wraps: true, frame: Frame::None }));
+        let node = self.leaf(Style::default(), Content::Text(Leaf { runs: vec![run], align, wraps: true, end_line: false, frame: Frame::None }));
         self.note(node, Semantic::Paragraph(paragraph));
         node
     }
@@ -449,14 +495,17 @@ impl<'a, 'env> Flow<'a, 'env> {
         if top && self.over_budget() {
             return Some(self.too_much());
         }
+        if let Some(node) = node {
+            self.blocks.insert(node, block.range().clone());
+        }
         node
     }
 
     fn block_node(&mut self, block: &Block, align: Align) -> Option<NodeId> {
         match block {
-            Block::Heading { level, spans, .. } => Some(self.text(spans, self.heading_look(*level), align)),
-            Block::Paragraph { spans, .. } => Some(self.text(spans, self.region_look(), align)),
-            Block::List { ordered, items, .. } => Some(self.list(*ordered, items)),
+            Block::Heading { level, spans, range, inline, .. } => Some(self.para(spans, self.heading_look(*level), align, range, inline)),
+            Block::Paragraph { spans, range, inline, .. } => Some(self.para(spans, self.region_look(), align, range, inline)),
+            Block::List { ordered, items, item_ranges, .. } => Some(self.list(*ordered, items, item_ranges)),
             Block::Table { rows, .. } => Some(self.table(rows, align)),
             Block::Code { language, code, .. } => Some(self.code(language.as_deref(), code)),
             Block::Picture { src, alt, .. } => Some(self.picture(src, alt, 0.0, 0.0, align, false)),
@@ -465,9 +514,16 @@ impl<'a, 'env> Flow<'a, 'env> {
         }
     }
 
+    /// A heading's or a paragraph's text, noted as the text of the block at `range`.
+    fn para(&mut self, spans: &[Span], look: TextLook, align: Align, range: &Range<usize>, inline: &Range<usize>) -> NodeId {
+        let node = self.text(spans, look, align);
+        self.paras.insert(node, ParaKey { range: range.clone(), inline: inline.clone(), size: look.size });
+        node
+    }
+
     /// Each item is a row of its marker, in the indent, and a column of its blocks.
     /// A list always reads from the left, whatever the region's alignment.
-    fn list(&mut self, ordered: bool, items: &[Vec<Block>]) -> NodeId {
+    fn list(&mut self, ordered: bool, items: &[Vec<Block>], item_ranges: &[Range<usize>]) -> NodeId {
         let markers: Vec<Leaf> = (1..=items.len())
             .map(|number| self.marker(if ordered { format!("{number}.") } else { "•".to_string() }))
             .collect();
@@ -493,6 +549,9 @@ impl<'a, 'env> Flow<'a, 'env> {
                 ..column()
             };
             let content = self.node(content, &blocks);
+            if let Some(range) = item_ranges.get(index).filter(|_| item.is_empty()) {
+                self.empty_items.insert(content, range.clone());
+            }
             let row = self.node(Style::default(), &[marker, content]);
             self.note(row, Semantic::ListItem(if ordered { Bullet::Number(index as u32 + 1) } else { Bullet::Dot }, color));
             rows.push(row);
@@ -503,7 +562,7 @@ impl<'a, 'env> Flow<'a, 'env> {
     fn marker(&self, label: String) -> Leaf {
         let span = Span { text: label, style: Default::default() };
         let run = self.run(&span, self.region_look());
-        Leaf { runs: vec![run], align: Align::Left, wraps: false, frame: Frame::None }
+        Leaf { runs: vec![run], align: Align::Left, wraps: false, end_line: false, frame: Frame::None }
     }
 
     /// Columns share the width evenly. Cells are placed by number, so a row with too
@@ -526,7 +585,7 @@ impl<'a, 'env> Flow<'a, 'env> {
                     ..Style::default()
                 };
                 let (runs, native) = self.runs(spans, look);
-                let cell = self.leaf(style, Content::Text(Leaf { runs, align, wraps: true, frame: Frame::Outline }));
+                let cell = self.leaf(style, Content::Text(Leaf { runs, align, wraps: true, end_line: false, frame: Frame::Outline }));
                 native_row.push((cell, NativeParagraph::new(native, align)));
                 cells.push(cell);
             }
@@ -572,7 +631,7 @@ impl<'a, 'env> Flow<'a, 'env> {
             lines.push(NativeParagraph::new(without_line_ending(native), Align::Left));
         }
         let style = Style { padding: length(CODE_PADDING), ..Style::default() };
-        let node = self.leaf(style, Content::Text(Leaf { runs, align: Align::Left, wraps: true, frame: Frame::Panel }));
+        let node = self.leaf(style, Content::Text(Leaf { runs, align: Align::Left, wraps: true, end_line: false, frame: Frame::Panel }));
         self.note(node, Semantic::Code(lines));
         node
     }
@@ -586,8 +645,15 @@ impl<'a, 'env> Flow<'a, 'env> {
             Some(Content::Text(leaf)) => {
                 items.extend(self.frame(leaf.frame, x, y, layout.size));
                 let text = leaf.shape(Some(layout.content_box_width()), self.env.fonts);
+                let align = leaf.align;
+                let drawn: String = leaf.runs.iter().map(|run| run.text.as_str()).collect();
                 for notice in &text.notices {
                     self.notice(notice.0.clone());
+                }
+                if let Some(key) = self.paras.get(&node) {
+                    let rect = Rect { x: x + layout.padding.left, y: y + layout.padding.top, w: layout.content_box_width(), h: layout.content_box_height() };
+                    let (range, inline, size) = (key.range.clone(), key.inline.clone(), key.size);
+                    self.drawn.texts.push(DrawnText { range, inline, rect, size, align, shaped: Some((drawn, text.buffer.clone())) });
                 }
                 items.push(DisplayItem::Text { text, x: x + layout.padding.left, y: y + layout.padding.top });
             }
@@ -604,6 +670,15 @@ impl<'a, 'env> Flow<'a, 'env> {
                 items.extend(placeholder_items(label, Rect { x, y, w, h }, self.theme, self.env.fonts));
             }
             _ => {}
+        }
+        if let Some(range) = self.blocks.get(&node) {
+            self.drawn.blocks.push(DrawnBlock { range: range.clone(), rect: Rect { x, y, w, h } });
+        }
+        if let Some(range) = self.empty_items.get(&node) {
+            let inline = range.end..range.end;
+            let rect = Rect { x, y, w, h };
+            let size = self.region.size;
+            self.drawn.texts.push(DrawnText { range: range.clone(), inline, rect, size, align: Align::Left, shaped: None });
         }
         for child in self.tree.children(node).expect("every node is in the tree") {
             self.draw(child, (x, y), items);

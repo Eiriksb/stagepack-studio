@@ -26,6 +26,17 @@ impl Style {
             _ => {}
         }
     }
+
+    /// Whether the attribute `name` of a `<Text>` tag is one [`Style::apply_text_attr`]
+    /// knows, with a value it reads as written, so that the style holds all it says.
+    pub fn knows_text_attr(name: &str, value: &str) -> bool {
+        match name {
+            "color" => !value.is_empty(),
+            "size" => value.parse::<u32>().is_ok(),
+            "bold" | "italic" | "underline" => matches!(value, "true" | "false"),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -66,9 +77,15 @@ impl Tag {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Block {
-    Heading { level: u8, spans: Vec<Span>, range: Range<usize> },
-    Paragraph { spans: Vec<Span>, range: Range<usize> },
-    List { ordered: bool, items: Vec<Vec<Block>>, range: Range<usize> },
+    /// `inline` is the bytes of the heading's content, without its marker. `only_text` is
+    /// whether that content is text alone, as [`Block::Paragraph`]'s is.
+    Heading { level: u8, spans: Vec<Span>, range: Range<usize>, inline: Range<usize>, only_text: bool },
+    /// `inline` is the bytes of the paragraph's content. `only_text` is whether it holds
+    /// nothing but text, styled by Markdown or `<Text>` tags: no picture, no other tag, nothing
+    /// whose look or meaning the spans leave out.
+    Paragraph { spans: Vec<Span>, range: Range<usize>, inline: Range<usize>, only_text: bool },
+    /// `item_ranges` holds each item's bytes, its marker included, beside `items`.
+    List { ordered: bool, items: Vec<Vec<Block>>, range: Range<usize>, item_ranges: Vec<Range<usize>> },
     Table { rows: Vec<Vec<Vec<Span>>>, range: Range<usize> },
     Code { language: Option<String>, code: String, range: Range<usize> },
     Picture { src: String, alt: String, range: Range<usize> },
@@ -114,6 +131,9 @@ pub struct Slide {
     /// The tags, other than `<Text>`, that sit in the middle of a line, where nothing is
     /// drawn for them. Each is named once.
     pub inline_tags: Vec<String>,
+    /// Every block quote on the slide, at any depth. A quote has no block of its own: what's
+    /// in it is among `blocks`, and these say which of it was quoted.
+    pub quotes: Vec<Range<usize>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

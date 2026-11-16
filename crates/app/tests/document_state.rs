@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use slides_engine::{Fonts, Layer, pack_folder};
-use stagepack_studio::document::{Document, EditRefused, OpenProblem, Reload};
+use slides_format::{Change, SourceEdit};
+use stagepack_studio::document::{Document, EditRefused, EditRun, OpenProblem, Reload, panic_in_next_change};
 use stagepack_studio::export::{ExportKind, run_export};
 use stagepack_studio::saving::SaveTarget;
 use zip::ZipArchive;
@@ -607,18 +608,18 @@ fn undo_goes_back_through_every_kind_of_change() {
     assert!(doc.has_unsaved_changes());
     for (text, label) in texts.iter().rev().skip(1).zip(labels.iter().rev()) {
         assert_eq!(doc.undo_label(), Some(*label));
-        assert!(doc.undo().is_some());
+        assert!(doc.undo().unwrap().is_some());
         assert_eq!(doc.source(), text, "after undoing {label}");
         assert_eq!(doc.redo_label(), Some(*label));
     }
     assert!(!doc.can_undo());
     assert!(!doc.has_unsaved_changes(), "back to the text as it was opened");
     for (text, label) in texts.iter().skip(1).zip(&labels) {
-        assert!(doc.redo().is_some());
+        assert!(doc.redo().unwrap().is_some());
         assert_eq!(doc.source(), text, "after redoing {label}");
     }
     assert!(!doc.can_redo());
-    assert!(doc.undo().is_some());
+    assert!(doc.undo().unwrap().is_some());
     assert_eq!(doc.source(), texts[texts.len() - 2]);
 }
 
@@ -660,7 +661,7 @@ fn adding_a_slide_makes_it_the_current_one() {
 fn a_content_slide_needs_no_settings() {
     let (_d, mut doc) = talk("# One\n");
     doc.add_slide("content").unwrap();
-    assert_eq!(doc.source(), "# One\n---\n# \n");
+    assert_eq!(doc.source(), "# One\n---\n\n");
     assert!(doc.talk().slides[1].settings.is_none());
 }
 
@@ -787,4 +788,236 @@ fn a_slide_that_was_already_broken_can_still_be_moved() {
     assert!(doc.talk().slides[0].error.is_some());
     doc.duplicate_current().unwrap();
     assert_eq!(doc.slide_count(), 3);
+}
+
+#[test]
+fn a_refused_edit_leaves_the_deck_alone() {
+    let (_d, mut doc) = talk("# One\n\n---\n\n# Two\n\n---\n\n# Three\n");
+    let versions: Vec<_> = (0..3).map(|index| doc.slide_version(index)).collect();
+    let joined = doc.source().replacen("---\n", "", 1);
+    let refused = doc
+        .edit("Join", Change::single(SourceEdit { range: 0..doc.source().len(), text: joined }), 0)
+        .unwrap_err();
+    assert_eq!(refused, EditRefused::WouldChangeTheSlides);
+    assert_eq!(doc.slide_count(), 3);
+    assert_eq!((0..3).map(|index| doc.slide_version(index)).collect::<Vec<_>>(), versions);
+}
+
+#[test]
+fn a_panic_while_undoing_leaves_the_talk_as_it_was() {
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if info.payload().downcast_ref::<&str>() != Some(&"a change that panics, for a test") {
+            report(info);
+        }
+    }));
+    let (_d, mut doc) = talk("# One\n\n---\n\n# Two\n");
+    doc.set_notes(1, "Say this").unwrap();
+    let typed = doc.source().to_string();
+    let versions: Vec<_> = (0..2).map(|index| doc.slide_version(index)).collect();
+
+    panic_in_next_change();
+    let refused = doc.undo().unwrap_err();
+
+    assert_eq!(refused.to_string(), "That change couldn't be made, so nothing was changed.");
+    assert_eq!(doc.source(), typed);
+    assert_eq!((0..2).map(|index| doc.slide_version(index)).collect::<Vec<_>>(), versions);
+    assert_eq!(doc.undo_label(), Some("Edit notes"));
+    assert!(!doc.can_redo());
+    // It undoes as before once nothing panics.
+    assert!(doc.undo().unwrap().is_some());
+    assert_eq!(doc.source(), "# One\n\n---\n\n# Two\n");
+}
+
+#[test]
+fn an_edit_that_changes_another_slide_is_refused() {
+    let source = "# One\n\n---\n\n# Two\n\n---\n\n# Three\n";
+    let (_d, mut doc) = talk(source);
+    let versions: Vec<_> = (0..3).map(|index| doc.slide_version(index)).collect();
+    // Slide 2's heading, from an edit said to be slide 1's.
+    let two = source.find("Two").unwrap();
+    let change = Change::single(SourceEdit { range: two..two + 3, text: "Deux".into() });
+
+    let refused = doc.edit_slide("Edit", 0, change, EditRun::New).unwrap_err();
+
+    assert_eq!(refused, EditRefused::WouldChangeAnotherSlide);
+    assert_eq!(refused.to_string(), "That change would have changed another slide, so it wasn't made.");
+    assert_eq!(doc.source(), source);
+    assert!(!doc.can_undo());
+    assert_eq!((0..3).map(|index| doc.slide_version(index)).collect::<Vec<_>>(), versions);
+}
+
+#[test]
+fn an_edit_held_to_its_slide_is_made() {
+    let source = "# One\n\n---\n\n# Two\n\n---\n\n# Three\n";
+    let (_d, mut doc) = talk(source);
+    let two = source.find("Two").unwrap();
+    let change = Change::single(SourceEdit { range: two..two + 3, text: "Deux".into() });
+
+    let changed = doc.edit_slide("Edit", 1, change, EditRun::New).unwrap();
+
+    assert_eq!(changed, vec![1]);
+    assert_eq!(doc.current(), 1);
+    assert_eq!(doc.source(), "# One\n\n---\n\n# Deux\n\n---\n\n# Three\n");
+    assert_eq!(doc.undo_label(), Some("Edit"));
+}
+
+#[test]
+fn a_typed_code_fence_cannot_swallow_the_next_slide() {
+    // Slide 3 holds a code block with slide breaks in it.
+    let source = "# One\n\n---\n\n# Two\n\n---\n\n```\na\n---\nb\n---\nc\n```\n";
+    let (_d, mut doc) = talk(source);
+    assert_eq!(doc.slide_count(), 3);
+    // A fence opened on slide 1 hides the breaks of slides 2 and 3, and the two inside slide
+    // 3's block become breaks: the talk still has three slides.
+    let at = "# One\n".len();
+    let change = Change::single(SourceEdit { range: at..at, text: "```\n".into() });
+    let changed = change.apply(source);
+    assert_eq!(slides_format::parse_talk(&changed).slides.len(), 3, "the same count");
+
+    let refused = doc.edit_slide("Edit", 0, change, EditRun::New).unwrap_err();
+
+    assert_eq!(refused, EditRefused::WouldChangeAnotherSlide);
+    assert_eq!(doc.source(), source);
+    assert!(!doc.can_undo());
+}
+
+#[test]
+fn edits_that_continue_a_run_are_one_step() {
+    let (_d, mut doc) = talk(FOUR_SLIDES);
+    let at = FOUR_SLIDES.find("# Two").unwrap() + "# Two".len();
+    let typed = |at: usize, text: &str| Change::single(SourceEdit { range: at..at, text: text.into() });
+    assert_eq!(doc.open_run(), None);
+    doc.edit_slide("Typing", 1, typed(at, "!"), EditRun::New).unwrap();
+    let run = doc.open_run().expect("a new run is open");
+    doc.edit_slide("Typing", 1, typed(at + 1, "?"), EditRun::Continue(run)).unwrap();
+    assert_eq!(doc.open_run(), Some(run));
+    // A new run is a step of its own.
+    doc.edit_slide("Typing", 1, typed(at + 2, "."), EditRun::New).unwrap();
+    assert_ne!(doc.open_run(), Some(run));
+
+    doc.undo().unwrap();
+    assert!(doc.source().contains("# Two!?  \r\n"));
+    assert_eq!(doc.open_run(), None, "an undo ends the run");
+    doc.undo().unwrap();
+    assert_eq!(doc.source(), FOUR_SLIDES);
+}
+
+#[test]
+fn notes_left_as_they_are_on_another_slide_do_not_join_its_typing() {
+    let (_d, mut doc) = talk(FOUR_SLIDES);
+    doc.set_notes(2, "Two").unwrap();
+    doc.set_notes(1, "").unwrap();
+    doc.set_notes(1, "One").unwrap();
+    doc.undo().unwrap();
+    assert_eq!(doc.notes_of(1), None);
+    assert_eq!(doc.notes_of(2).as_deref(), Some("Two"));
+}
+
+/// Three slides, the first with nothing in its body.
+const EMPTY_BODY: &str = "# T\n\n---\n\n# Two\n\n---\n\n# Three\n";
+
+/// `EMPTY_BODY` with two empty lines typed into the first slide's body.
+fn with_empty_lines() -> (tempfile::TempDir, Document) {
+    let (dir, mut doc) = talk(EMPTY_BODY);
+    assert!(doc.begin_text_in_region(0, "body"));
+    doc.apply_text(|edit| edit.enter()).unwrap();
+    doc.apply_text(|edit| edit.enter()).unwrap();
+    assert!(doc.source().contains("&nbsp;"), "{}", doc.source());
+    (dir, doc)
+}
+
+/// One of the commands, as a test makes it.
+type Command = fn(&mut Document) -> Result<Vec<usize>, EditRefused>;
+
+#[test]
+fn typing_left_empty_is_tidied_before_another_edit() {
+    let edits: [(&str, Command); 5] = [
+        ("new slide", |doc| doc.add_slide("content")),
+        ("duplicate", Document::duplicate_current),
+        ("hide", |doc| doc.set_current_hidden(true)),
+        ("delete", Document::delete_current),
+        ("move", |doc| doc.move_slide(0, 1)),
+    ];
+    for (what, edit) in edits {
+        let (_d, mut doc) = with_empty_lines();
+        edit(&mut doc).unwrap();
+        assert!(doc.text().is_none(), "{what}: typing ended");
+        assert!(!doc.source().contains("<Text"), "{what}: {}", doc.source());
+        doc.undo().unwrap();
+        assert_eq!(doc.source(), EMPTY_BODY, "{what}: one undo takes the edit back");
+        assert!(!doc.can_undo(), "{what}: and the typing left no step");
+    }
+}
+
+#[test]
+fn a_change_worked_out_before_typing_was_tidied_is_refused() {
+    let (_d, mut doc) = with_empty_lines();
+    let typed = doc.source().to_string();
+    let end = typed.len();
+    let change = Change::single(SourceEdit { range: end..end, text: "\nMore\n".into() });
+    let refused = doc.edit_slide("Edit", 2, change, EditRun::New).unwrap_err();
+    assert_eq!(refused, EditRefused::CouldNotBeMade);
+    assert!(doc.text().is_none());
+    assert_eq!(doc.source(), EMPTY_BODY, "the empty lines were tidied all the same");
+}
+
+#[test]
+fn tab_on_the_first_bullet_of_an_empty_region_leaves_typing_working() {
+    let (_d, mut doc) = talk("# First\n");
+    assert!(doc.begin_text_in_region(0, "body"));
+    doc.apply_text(|edit| edit.toggle_list(false)).unwrap();
+    doc.apply_text(|edit| edit.indent()).unwrap();
+    doc.apply_text(|edit| edit.insert("a")).unwrap();
+    doc.apply_text(|edit| edit.insert("b")).unwrap();
+    assert_eq!(doc.source(), "# First\n\n- ab\n");
+}
+
+#[test]
+fn text_is_not_begun_in_a_region_the_layout_has_not_got() {
+    let (_d, mut doc) = talk("# T\n\nwords\n");
+    assert!(!doc.begin_text_in_region(0, "right"));
+    assert!(!doc.begin_text_in_region(0, "nowhere"));
+    assert!(doc.text().is_none());
+    assert!(doc.begin_text_in_region(0, "body"), "the body has text, typed at its end");
+}
+
+#[test]
+fn a_tidy_up_that_is_refused_is_said() {
+    let source = "# T\n\nwords\n\n---\n\n# Two\n";
+    let empty_the_body = |doc: &mut Document| {
+        assert!(doc.begin_text(0, 1, slides_format::Pos { para: 0, offset: 0 }));
+        doc.apply_text(|edit| edit.select_all()).unwrap();
+        doc.apply_text(|edit| edit.backspace()).unwrap();
+        panic_in_next_change();
+    };
+    let (_d, mut doc) = talk(source);
+    assert_eq!(doc.take_message(), None);
+    empty_the_body(&mut doc);
+    doc.select(1);
+    assert_eq!(doc.current(), 1);
+    assert!(doc.text().is_none());
+    assert!(doc.take_message().is_some(), "the refusal is said");
+    assert_eq!(doc.take_message(), None, "once");
+
+    let (_d, mut doc) = talk(source);
+    empty_the_body(&mut doc);
+    doc.begin_text_in_region(0, "title");
+    assert!(doc.take_message().is_some(), "the refusal is said");
+}
+
+#[test]
+fn a_command_goes_on_when_emptied_text_cannot_be_taken_away() {
+    // Seen in the real window: with a title emptied above a smaller heading, which taking the
+    // title away would make the title, the first press of New slide did nothing but say so.
+    let source = "# Title\n\n## Sub heading\n\nWords\n\n---\n\n# Two\n";
+    let (_d, mut doc) = talk(source);
+    assert!(doc.begin_text(0, 0, slides_format::Pos { para: 0, offset: 0 }));
+    doc.apply_text(|edit| edit.select_all()).unwrap();
+    doc.apply_text(|edit| edit.backspace()).unwrap();
+    doc.add_slide("content").unwrap();
+    assert_eq!((doc.slide_count(), doc.current()), (3, 1), "the slide was added");
+    assert!(doc.text().is_none());
+    assert!(doc.take_message().is_some(), "what was left is said");
+    assert_eq!(doc.take_message(), None, "once");
 }
