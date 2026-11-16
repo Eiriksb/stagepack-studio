@@ -1047,3 +1047,68 @@ fn a_new_file_is_written_beside_and_never_over_another() {
     let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
     assert_eq!(names, ["a.png"], "no temporary file is left");
 }
+
+/// A build index entering `tag`, as the app merges one in.
+fn an_index(tag: &str) -> Vec<u8> {
+    format!(r#"{{"format":1,"components":[{{"tag":"{tag}","file":"c","source_hash":"{}"}}]}}"#, "a".repeat(64)).into_bytes()
+}
+
+#[test]
+fn every_way_of_saving_takes_the_merged_build_index_in_place_of_the_talks_own() {
+    let dir = talk_folder();
+    std::fs::write(dir.path().join("build/index.json"), an_index("Old")).unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let extra = [new_file("build/index.json", &an_index("Merged")), new_file("assets/new.png", b"new picture")];
+    let one_index = |names: Vec<String>| names.iter().filter(|name| *name == "build/index.json").count() == 1;
+
+    let packed = work.path().join("talk.sptx");
+    pack_folder(dir.path(), &packed, "0.1.0").unwrap();
+    repack_with_slides(&packed, &packed, "# C\n", "0.1.0", &extra).unwrap();
+    let reopened = open_packed(&packed).unwrap();
+    assert_eq!(reopened.read("build/index.json").unwrap(), an_index("Merged"), "pack in place");
+    assert!(one_index(reopened.names()));
+
+    let out = work.path().join("out.sptx");
+    pack_folder_with_slides(dir.path(), &out, "# C\n", "0.1.0", &extra).unwrap();
+    let reopened = open_packed(&out).unwrap();
+    assert_eq!(reopened.read("build/index.json").unwrap(), an_index("Merged"), "folder to pack");
+    assert!(one_index(reopened.names()));
+
+    let copy = work.path().join("copy");
+    copy_talk_folder(dir.path(), &copy, "# C\n", &extra).unwrap();
+    assert_eq!(std::fs::read(copy.join("build/index.json")).unwrap(), an_index("Merged"), "folder to folder");
+
+    let plain = work.path().join("plain.sptx");
+    pack_folder(dir.path(), &plain, "0.1.0").unwrap();
+    let unpacked = work.path().join("unpacked");
+    unpack_with_slides(&plain, &unpacked, "# C\n", &extra).unwrap();
+    assert_eq!(std::fs::read(unpacked.join("build/index.json")).unwrap(), an_index("Merged"), "pack to folder");
+    assert_eq!(std::fs::read(dir.path().join("build/index.json")).unwrap(), an_index("Old"), "the talk itself isn't touched");
+}
+
+#[test]
+fn only_the_build_index_is_taken_in_place_and_only_as_an_index() {
+    let dir = talk_folder();
+    let work = tempfile::tempdir().unwrap();
+    let packed = work.path().join("talk.sptx");
+    pack_folder(dir.path(), &packed, "0.1.0").unwrap();
+    let before = entries_of(&packed);
+    for (what, extra) in [
+        ("not an index", vec![new_file("build/index.json", b"not json")]),
+        ("too large", vec![new_file("build/index.json", &vec![b' '; 1024 * 1024 + 1])]),
+        ("twice", vec![new_file("build/index.json", &an_index("A")), new_file("build/index.json", &an_index("B"))]),
+    ] {
+        let outcome = repack_with_slides(&packed, &packed, "# C\n", "0.1.0", &extra);
+        assert!(matches!(outcome, Err(PackError::UnsafeName(_))), "{what}: {outcome:?}");
+        assert_eq!(entries_of(&packed), before, "{what}");
+    }
+    // A file named like it but for case is any other file, and never written over.
+    std::fs::write(dir.path().join("build/index.json"), an_index("Old")).unwrap();
+    let out = work.path().join("cased.sptx");
+    let cased = [new_file("build/Index.json", &an_index("New"))];
+    assert!(matches!(pack_folder_with_slides(dir.path(), &out, "# C\n", "0.1.0", &cased), Err(PackError::NameTaken(_))));
+    // And every other file keeps the rule.
+    let other = [new_file("build/index.json", &an_index("New")), new_file("assets/a.png", b"other")];
+    assert!(matches!(pack_folder_with_slides(dir.path(), &out, "# C\n", "0.1.0", &other), Err(PackError::NameTaken(_))));
+    assert!(!out.exists());
+}

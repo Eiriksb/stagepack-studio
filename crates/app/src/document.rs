@@ -168,15 +168,48 @@ pub struct Brought {
     pub too_large: bool,
     /// What to say of a component the talk has a different one of, by the same name.
     pub different: Option<String>,
+    /// A pasted component had the name of one every talk has.
+    pub built_in: bool,
+    /// A component's build came without its source, so it couldn't be brought.
+    pub component_left_out: bool,
 }
 
 impl Brought {
-    /// The one thing to say of it, if any: a different component first, then files too big,
-    /// then files left out.
+    /// The one thing to say of it, if any: a different component first, then one with a
+    /// built-in's name, then files too big, then pictures left out, then a component left out.
     pub fn said(&self) -> Option<String> {
-        self.different.clone().or_else(|| self.too_large.then(|| clipboard::FILES_TOO_LARGE.to_string())).or_else(|| {
-            self.left_out.then(|| clipboard::MISSING_PICTURES.to_string())
-        })
+        let said = |is: bool, sentence: &str| is.then(|| sentence.to_string());
+        self.different
+            .clone()
+            .or_else(|| said(self.built_in, clipboard::BUILT_IN_NAME))
+            .or_else(|| said(self.too_large, clipboard::FILES_TOO_LARGE))
+            .or_else(|| said(self.left_out, clipboard::MISSING_PICTURES))
+            .or_else(|| said(self.component_left_out, clipboard::MISSING_COMPONENT))
+    }
+}
+
+/// The files a paste carries, as a talk's files, to tell which of them its text uses.
+struct CarriedFiles<'a>(&'a [PastedFile]);
+
+impl CarriedFiles<'_> {
+    fn find(&self, path: &str) -> Option<&PastedFile> {
+        let path = slides_engine::normalise(path)?;
+        self.0.iter().find(|file| file.path == path)
+    }
+}
+
+impl TalkFiles for CarriedFiles<'_> {
+    fn read(&self, path: &str) -> Option<Vec<u8>> {
+        self.find(path).map(|file| file.bytes.clone())
+    }
+
+    fn len(&self, path: &str) -> Option<u64> {
+        self.find(path).map(|file| file.bytes.len() as u64)
+    }
+
+    fn names_in(&self, folder: &str) -> Vec<String> {
+        let prefix = format!("{folder}/");
+        self.0.iter().filter(|file| file.path.starts_with(&prefix)).map(|file| file.path.clone()).collect()
     }
 }
 
@@ -1065,7 +1098,13 @@ impl Document {
     /// it if the text uses it then; till then it's kept with the talk's unsaved changes, and a
     /// slide that shows it shows it at once.
     pub fn add_file(&mut self, kind: FileKind, suggested: &str, bytes: Vec<u8>) -> Result<String, NotAdded> {
-        let (path, bytes) = match added_files::place(&*self.files, kind, suggested, bytes, |path| self.on_disk(path))? {
+        self.add_file_avoiding(kind, suggested, bytes, &BTreeSet::new())
+    }
+
+    /// [`Self::add_file`], never giving a new file a path in `avoid`, in lower case.
+    fn add_file_avoiding(&mut self, kind: FileKind, suggested: &str, bytes: Vec<u8>, avoid: &BTreeSet<String>) -> Result<String, NotAdded> {
+        let taken = |path: &str| self.on_disk(path) || avoid.contains(&path.to_ascii_lowercase());
+        let (path, bytes) = match added_files::place(&*self.files, kind, suggested, bytes, taken)? {
             Placed::There(path) => return Ok(path),
             Placed::New(path, bytes) => (path, bytes),
         };
@@ -1119,6 +1158,45 @@ impl Document {
     /// show what they showed. If one of those uses can't be rewritten exactly, or the file can't
     /// be brought back at all, `text` is taken as it is, and the window says so, once.
     pub fn recover_with_files(&mut self, text: String, files: Vec<(String, Arc<[u8]>)>) -> Result<Vec<usize>, EditRefused> {
+        self.recover_with_builds(text, files, Vec::new())
+    }
+
+    /// Takes `text` and `files` back as [`Self::recover_with_files`] does, with `builds`, the
+    /// builds a paste had entered in the talk's index, kept with them. Each is entered again only
+    /// as a paste would enter it: its source and build are files brought back here, the tag is
+    /// the one the app finds in that source, it isn't a built-in's, and the talk's index has no
+    /// entry for that component or file. The hash it records is compared, by the engine, with
+    /// the source's, as for any build. Any other is let go, and that component needs building.
+    pub fn recover_with_builds(
+        &mut self,
+        text: String,
+        files: Vec<(String, Arc<[u8]>)>,
+        builds: Vec<BuildEntry>,
+    ) -> Result<Vec<usize>, EditRefused> {
+        let changed = self.recover_files_and_text(text, files)?;
+        let mut entered = false;
+        for entry in builds {
+            let (source, build) = (format!("components/{}.rs", entry.file), format!("build/{}.wasm", entry.file));
+            let hash_like = entry.source_hash.len() == 64 && entry.source_hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+            let brought_back = slides_components::safe_stem(&entry.file) && self.pending.contains(&source) && self.pending.contains(&build);
+            let tag = brought_back.then(|| self.added.get(&source)).flatten().and_then(|bytes| {
+                std::str::from_utf8(&bytes).ok().and_then(slides_components::component_tag)
+            });
+            let indexed = added_files::build_index(&*self.files)
+                .is_some_and(|index| index.components.iter().any(|kept| kept.tag == entry.tag || kept.file == entry.file));
+            if hash_like && tag.as_deref() == Some(entry.tag.as_str()) && !self.deck.is_built_in(&entry.tag) && !indexed {
+                self.added.enter_build(entry);
+                entered = true;
+            }
+        }
+        if entered {
+            self.deck.files_added();
+            self.components_looked_at();
+        }
+        Ok(changed)
+    }
+
+    fn recover_files_and_text(&mut self, text: String, files: Vec<(String, Arc<[u8]>)>) -> Result<Vec<usize>, EditRefused> {
         let (renames, mut clashed) = self.bring_back_files(files);
         let text = if renames.is_empty() {
             text
@@ -1253,10 +1331,11 @@ impl Document {
         self.paste_slide(&text).map(|changed| (changed, brought))
     }
 
-    /// Adds `files` for `text`, as [`Self::bring_files`] does, and gives `text` naming them as
-    /// added. If it can't be made to name them exactly, it's given as it is, and that's left out.
+    /// Adds those of `files` that `text` uses, as [`Self::bring_files`] says, and gives `text`
+    /// naming them as added. If it can't be made to name them exactly, it's given as it is, and
+    /// that's left out.
     fn bring_files_for(&mut self, text: &str, files: PastedFiles) -> (String, Brought) {
-        let (renames, mut brought) = self.bring_files(files);
+        let (renames, mut brought) = self.bring_files(text, files);
         if renames.is_empty() {
             return (text.to_string(), brought);
         }
@@ -1269,40 +1348,78 @@ impl Document {
         }
     }
 
-    /// Adds `files`, pasted from another talk, as [`Self::add_file`] adds a dropped one, and gives
-    /// each path that had to change, `(as it was, as added)`, with what there is to say of them.
-    /// One that can't be added is left out.
+    /// Adds the files of `files`, pasted from another talk with `text`, that `text` uses, as
+    /// [`talk_uses`] finds them among the files pasted: a picture or data file a picture or a
+    /// tag's attribute names, and a component's source and build when a tag in `text` is the
+    /// component the app finds in that source. Which are used is decided before anything is
+    /// added, and the rest are dropped: nothing unused is added, named, kept or offered. Each is
+    /// added as [`Self::add_file`] adds a dropped one, and the paths that had to change are given,
+    /// `(as it was, as added)`, with what there is to say of them. One that can't be added is
+    /// left out. A new file never takes the name of a file `text` names that wasn't pasted, so a
+    /// name it had to be given is never one the text already meant for another.
     ///
-    /// A component's source and build are added only if the talk has no component of that name.
-    /// If it has one with the same source, that one is used as it is; with different source,
-    /// nothing of the pasted one is added, and that's said. A build is entered in the talk's
-    /// build index, kept with the files added until a save, only with its source, named for the
-    /// component the app finds in that source, and recorded as built from it only if the copy
+    /// A component's source and build are added only if the talk has no component of that name,
+    /// and it isn't the name of one every talk has. If it has one with the same source, that
+    /// one is used as it is; with different source, nothing of the pasted one is added, and
+    /// that's said. A build is added only beside its source, only to a free name, and only if the
+    /// talk's build index has no entry for that component or file: an entry there is never
+    /// replaced. It's entered in the index, kept with the files added until a save, named for
+    /// the component the app finds in that source, and recorded as built from it only if the copy
     /// says it was built from exactly those bytes, by their hash as the app works it out; if it
     /// says another, that's recorded, and the engine shows it out of date. Nothing is built, and
     /// no component's source or build is ever replaced.
-    fn bring_files(&mut self, files: PastedFiles) -> (Vec<(String, String)>, Brought) {
-        let mut brought = Brought { left_out: files.left_out, too_large: files.too_large, different: None };
+    ///
+    /// The hash a copy says a build was built from can't be checked without building it: a
+    /// clipboard that says the right one has its module shown as up to date for the pasted
+    /// source, exactly as a talk's own index does when the talk is opened. The module runs
+    /// sandboxed, as any component does, and is used only if it says it is that component.
+    fn bring_files(&mut self, text: &str, files: PastedFiles) -> (Vec<(String, String)>, Brought) {
+        let mut brought = Brought { left_out: files.left_out, too_large: files.too_large, ..Brought::default() };
+        let stem_of = |path: &str| path.split_once('/').and_then(|(_, name)| name.rsplit_once('.')).map(|(stem, _)| stem.to_string());
+        // A build carried without its source was the copied talk's, but can't be paired here.
+        let sources: BTreeSet<String> =
+            files.files.iter().filter(|file| file.kind == FileKind::ComponentSource).filter_map(|file| stem_of(&file.path)).collect();
+        brought.component_left_out = files
+            .files
+            .iter()
+            .any(|file| file.kind == FileKind::ComponentBuild && stem_of(&file.path).is_none_or(|stem| !sources.contains(&stem)));
+        let Ok(pasted) = guarded(|| parse_talk(text)) else {
+            brought.left_out = true;
+            return (Vec::new(), brought);
+        };
+        let carried = CarriedFiles(&files.files);
+        let used: Vec<bool> = files.files.iter().map(|file| guarded(|| talk_uses(&pasted, &carried, &file.path)).unwrap_or(false)).collect();
+        let files: Vec<PastedFile> = files.files.into_iter().zip(used).filter_map(|(file, used)| used.then_some(file)).collect();
+        // What `text` names that wasn't pasted, which nothing added may come to be.
+        let avoid: BTreeSet<String> = added_files::written_names(&pasted)
+            .into_iter()
+            .filter_map(slides_engine::normalise)
+            .filter(|name| !files.iter().any(|file| file.path == *name))
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
         let mut renames = Vec::new();
-        let (components, others): (Vec<PastedFile>, Vec<PastedFile>) = files.files.into_iter().partition(|file| file.kind.is_component());
+        let (components, others): (Vec<PastedFile>, Vec<PastedFile>) = files.into_iter().partition(|file| file.kind.is_component());
         for file in others {
             let name = file.path.split_once('/').map_or(file.path.as_str(), |(_, name)| name).to_string();
-            match self.add_file(file.kind, &name, file.bytes) {
+            match self.add_file_avoiding(file.kind, &name, file.bytes, &avoid) {
                 Ok(path) if path != file.path => renames.push((file.path, path)),
                 Ok(_) => {}
                 Err(_) => brought.left_out = true,
             }
         }
-        let stem_of = |file: &PastedFile| file.path.split_once('/').and_then(|(_, name)| name.rsplit_once('.')).map(|(stem, _)| stem.to_string());
         let (sources, mut builds): (Vec<PastedFile>, Vec<PastedFile>) =
             components.into_iter().partition(|file| file.kind == FileKind::ComponentSource);
         for source in sources {
-            let Some(stem) = stem_of(&source) else { continue };
-            let build = builds.iter().position(|build| stem_of(build).as_deref() == Some(stem.as_str())).map(|at| builds.swap_remove(at));
+            let Some(stem) = stem_of(&source.path) else { continue };
+            let build = builds.iter().position(|build| stem_of(&build.path).as_deref() == Some(stem.as_str())).map(|at| builds.swap_remove(at));
             let Some(tag) = std::str::from_utf8(&source.bytes).ok().and_then(slides_components::component_tag) else {
                 brought.left_out = true;
                 continue;
             };
+            if self.deck.is_built_in(&tag) {
+                brought.built_in = true;
+                continue;
+            }
             if let Some(info) = self.components().iter().find(|info| info.tag == tag) {
                 if !self.files.read(&info.file).is_some_and(|held| held == source.bytes) {
                     brought.different = Some(clipboard::different_component(&palette::label(&tag)));
@@ -1316,6 +1433,13 @@ impl Document {
             }
             // Without its build, it needs building, as any source does.
             let Some(build) = build else { continue };
+            let build_path = format!("build/{stem}.wasm");
+            let indexed = added_files::build_index(&*self.files)
+                .is_some_and(|index| index.components.iter().any(|entry| entry.tag == tag || entry.file == stem));
+            // A build or an entry already there is the talk's: the pasted one needs building.
+            if indexed || self.files.len(&build_path).is_some() || self.on_disk(&build_path) {
+                continue;
+            }
             let built_from = build.built_from.clone();
             if self.add_file(FileKind::ComponentBuild, &format!("{stem}.wasm"), build.bytes).is_err() {
                 brought.left_out = true;
@@ -1330,10 +1454,6 @@ impl Document {
             self.added.enter_build(BuildEntry { tag, file: stem, source_hash });
             self.deck.files_added();
             self.components_looked_at();
-        }
-        // A build with no source of its own pasted beside it would be paired with nothing.
-        if !builds.is_empty() {
-            brought.left_out = true;
         }
         (renames, brought)
     }
@@ -1393,13 +1513,18 @@ impl Document {
     /// Puts a copy of the thing selected on the slide it's on, as a paste of it would, as one
     /// step named "Duplicate", and selects the copy. The clipboard isn't touched.
     pub fn duplicate_selected(&mut self) -> Result<Vec<usize>, EditRefused> {
-        self.finish_before_edit()?;
+        // Typing is finished first, which can move the thing; the slide is drawn again if it did.
+        let tidied = self.finish_before_edit()?;
         let Some(Selected { slide, source }) = self.selected.clone() else {
-            return Ok(Vec::new());
+            return Ok(if tidied { vec![self.current] } else { Vec::new() });
         };
         let text = built(self.talk(), |talk| block_text(talk, slide, &source))?.ok_or(EditRefused::CouldNotBeMade)?;
         self.go_to(slide);
-        self.put_thing(DUPLICATE, &text, PastedFiles::default()).map(|(changed, _)| changed)
+        let (mut changed, _) = self.put_thing(DUPLICATE, &text, PastedFiles::default())?;
+        if tidied && !changed.contains(&slide) {
+            changed.push(slide);
+        }
+        Ok(changed)
     }
 
     /// Puts the thing `markdown` holds on the current slide, as one step named `label`, and
@@ -2977,7 +3102,7 @@ impl Document {
             self.place.clone(),
             None,
             self.added_files(),
-            self.builds_to_enter(),
+            self.index_for_save(),
         )
     }
 
@@ -2989,19 +3114,37 @@ impl Document {
             self.place.clone(),
             Some(target),
             self.added_files(),
-            self.builds_to_enter(),
+            self.index_for_save(),
         )
     }
 
     /// The builds entered in the talk's index with the files added to it, of builds its text
     /// uses, for a save to enter in the index it writes.
-    fn builds_to_enter(&self) -> Vec<BuildEntry> {
+    pub fn builds_to_enter(&self) -> Vec<BuildEntry> {
         let talk = self.talk();
         self.added
             .builds_entered()
             .into_iter()
             .filter(|entry| talk_uses(talk, &*self.files, &format!("build/{}.wasm", entry.file)))
             .collect()
+    }
+
+    /// The builds a save enters in the talk's index, as [`Self::builds_to_enter`] gives them,
+    /// and the index with them entered in it, as a save anywhere but the talk's own folder
+    /// writes it: the talk's own, with none of the entries of builds the text no longer uses.
+    /// `None` for the index if the talk's own can't be read, which a save leaves as it is.
+    fn index_for_save(&self) -> (Vec<BuildEntry>, Option<Vec<u8>>) {
+        let builds = self.builds_to_enter();
+        if builds.is_empty() {
+            return (builds, None);
+        }
+        let unused: Vec<BuildEntry> = self.added.builds_entered().into_iter().filter(|entry| !builds.contains(entry)).collect();
+        let index = added_files::build_index(&*self.files).and_then(|mut index| {
+            index.components.retain(|entry| !unused.contains(entry));
+            // The talk's own index couldn't be read, so none were entered in it.
+            builds.iter().all(|entry| index.components.contains(entry)).then(|| serde_json::to_vec_pretty(&index).ok()).flatten()
+        });
+        (builds, index)
     }
 
     /// Takes in a save that worked. The talk is saved if its text is still what was written,

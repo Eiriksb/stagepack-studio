@@ -14,7 +14,7 @@ use slides_engine::{
 use slides_components::{BuildEntry, INDEX_FILE};
 
 use crate::added_files::{NotAdded, is_added_path};
-use crate::builds;
+use crate::builds::{self, Unreadable};
 use crate::document::{SLIDES_FILE, TalkPlace};
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -40,6 +40,9 @@ pub struct SaveJob {
     /// The builds entered in the talk's index, of builds the text uses, that no save has
     /// written into the index on disk.
     builds: Vec<BuildEntry>,
+    /// The talk's build index with `builds` entered in it, for a save to anywhere but its own
+    /// folder, which takes it in place of the talk's; `None` if the talk's own can't be read.
+    index: Option<Vec<u8>>,
 }
 
 /// Why a save didn't write anything.
@@ -82,7 +85,8 @@ pub struct Saved {
     pub(crate) moved_to: Option<(TalkPlace, SharedFiles)>,
     /// The files added to the talk that were written, by their path in it.
     pub(crate) files_written: Vec<String>,
-    /// The builds entered in the index on disk.
+    /// The builds entered in the index of the place the talk is read from from now on, which
+    /// no longer need entering.
     pub(crate) builds_written: Vec<BuildEntry>,
     notices: Vec<String>,
 }
@@ -106,7 +110,7 @@ impl SaveJob {
         from: TalkPlace,
         to: Option<SaveTarget>,
         added: Vec<(String, Arc<[u8]>)>,
-        builds: Vec<BuildEntry>,
+        (builds, index): (Vec<BuildEntry>, Option<Vec<u8>>),
     ) -> SaveJob {
         SaveJob {
             text,
@@ -115,12 +119,15 @@ impl SaveJob {
             to,
             added,
             builds,
+            index,
         }
     }
 
-    /// Writes the talk out, with the files added to it that its text uses, and, to a folder, the
-    /// builds entered in its index, which a pack doesn't take: there, a pasted component needs
-    /// building once the pack is opened again. A failure says why,
+    /// Writes the talk out, with the files added to it that its text uses, and the builds entered
+    /// in its index: merged into the index in its own folder, one write at a time with any build,
+    /// or, anywhere else, as the merged index in place of the talk's. If the talk's own index
+    /// can't be read, it's left as it is, the builds stay to be entered, and that's said. A
+    /// failure says why,
     /// in words for the person saving, and leaves what was there as it was: a folder may have
     /// some of those files in it, which nothing uses until a save writes its text.
     pub fn run(self) -> Result<Saved, SaveError> {
@@ -131,10 +138,18 @@ impl SaveJob {
             to,
             added,
             builds,
+            index,
         } = self;
         let mut builds_written = Vec::new();
         let files_written: Vec<String> = added.iter().map(|(path, _)| path.clone()).collect();
-        let extra = || -> Vec<NewFile> { added.iter().map(|(path, bytes)| (path.clone(), bytes.to_vec())).collect() };
+        let index_kept = |place: &Path| failed(&place.join(INDEX_FILE), "it can't be read, so a pasted component needs building.");
+        // The merged index goes with the files, in place of the talk's own.
+        let index_written = !builds.is_empty() && index.is_some();
+        let extra = || -> Vec<NewFile> {
+            let index = index.iter().filter(|_| !builds.is_empty()).map(|index| (INDEX_FILE.to_string(), index.clone()));
+            added.iter().map(|(path, bytes)| (path.clone(), bytes.to_vec())).chain(index).collect()
+        };
+        let index_notice = |place: &Path| (!builds.is_empty() && index.is_none()).then(|| index_kept(place));
         if let (TalkPlace::Folder(folder), Some(SaveTarget::Folder(to) | SaveTarget::Packed(to))) =
             (&from, &to)
             && lies_within(to, folder)
@@ -157,10 +172,13 @@ impl SaveJob {
                 for (path, bytes) in &added {
                     write_added(folder, path, bytes)?;
                 }
-                builds::enter_builds(folder, &builds).map_err(|e| failed(&folder.join(INDEX_FILE), e))?;
-                builds_written = builds;
+                let entered = builds::merge_into_index(folder, &builds, Unreadable::Keep).map_err(|e| failed(&folder.join(INDEX_FILE), e))?;
+                let notices = (!builds.is_empty() && !entered).then(|| index_kept(folder)).into_iter().collect();
+                if entered {
+                    builds_written = builds.clone();
+                }
                 write_slides(folder, &text)?;
-                (None, Vec::new())
+                (None, notices)
             }
             (TalkPlace::Packed(file), None) => {
                 // A pack that can't be read is refused by the repack below.
@@ -168,18 +186,17 @@ impl SaveJob {
                     changed_outside(found, &on_disk, &text)?;
                 }
                 repack_with_slides(file, file, &text, APP_VERSION, &extra()).map_err(|e| failed(file, e))?;
-                (None, Vec::new())
+                (None, index_notice(file).into_iter().collect())
             }
             (TalkPlace::Folder(folder), Some(SaveTarget::Folder(to))) => {
                 let report = copy_talk_folder(folder, &to, &text, &extra()).map_err(|e| failed(&to, e))?;
-                builds::enter_builds(&to, &builds).map_err(|e| failed(&to.join(INDEX_FILE), e))?;
-                builds_written = builds;
                 let left_out = report.skipped.into_iter().map(|name| format!("{name} was left out"));
                 let outside = report
                     .outside_pictures
                     .into_iter()
                     .map(|name| format!("The picture {name} is outside assets/ and wasn't copied"));
-                (Some(in_folder(to)), left_out.chain(outside).collect())
+                let kept = index_notice(&to);
+                (Some(in_folder(to)), left_out.chain(outside).chain(kept).collect())
             }
             (TalkPlace::Folder(folder), Some(SaveTarget::Packed(out))) => {
                 let report = pack_folder_with_slides(folder, &out, &text, APP_VERSION, &extra())
@@ -192,20 +209,26 @@ impl SaveJob {
                 let behind = builds::behind(folder).into_iter().map(|tag| {
                     format!("{tag} couldn't be built just now, so the packed talk carries its last good build")
                 });
-                let notices = left_out.chain(outside).chain(behind).collect();
+                let kept = index_notice(&out);
+                let notices = left_out.chain(outside).chain(behind).chain(kept).collect();
                 (Some(in_pack(out)?), notices)
             }
             (TalkPlace::Packed(file), Some(SaveTarget::Packed(out))) => {
                 repack_with_slides(file, &out, &text, APP_VERSION, &extra()).map_err(|e| failed(&out, e))?;
-                (Some(in_pack(out)?), Vec::new())
+                let kept = index_notice(&out).into_iter().collect();
+                (Some(in_pack(out)?), kept)
             }
             (TalkPlace::Packed(file), Some(SaveTarget::Folder(to))) => {
                 unpack_with_slides(file, &to, &text, &extra()).map_err(|e| failed(&to, e))?;
-                builds::enter_builds(&to, &builds).map_err(|e| failed(&to.join(INDEX_FILE), e))?;
-                builds_written = builds;
-                (Some(in_folder(to)), Vec::new())
+                let kept = index_notice(&to).into_iter().collect();
+                (Some(in_folder(to)), kept)
             }
         };
+        // A pack saved in place is still read from the pack the talk opened, which holds none
+        // of them: they stay entered, for the talk as it shows now and the next save.
+        if moved_to.is_some() && index_written {
+            builds_written = builds;
+        }
         Ok(Saved {
             written: text,
             moved_to,

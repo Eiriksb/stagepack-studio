@@ -38,8 +38,9 @@ impl WorkspaceView {
         };
         let text = std::mem::take(&mut found.text);
         let files = found.files.clone();
+        let builds = found.builds.clone();
         let recovered = document.update(cx, |document, cx| {
-            let recovered = document.recover_with_files(text.clone(), files);
+            let recovered = document.recover_with_builds(text.clone(), files, builds);
             if recovered.is_ok() {
                 // A show of the talk has to know.
                 cx.notify();

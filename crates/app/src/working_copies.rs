@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui_kit::*;
+use slides_components::BuildEntry;
 
 use crate::document::{Document, TalkPlace};
 use crate::recovery::{Found, Recovery, hash_text};
@@ -39,6 +40,8 @@ struct Kept {
     on_disk: String,
     /// The files added to the talk that the text uses, by their path in it.
     files: Vec<String>,
+    /// The builds entered in the talk's index with them.
+    builds: Vec<BuildEntry>,
 }
 
 /// The copy from last time that was brought back, until this window's own copy or a save
@@ -63,6 +66,8 @@ enum Job {
         text: String,
         /// The files added to the talk that the text uses and no save has written.
         files: Vec<(String, Arc<[u8]>)>,
+        /// The builds entered in its index with them.
+        builds: Vec<BuildEntry>,
         adopted: Adopted,
     },
     /// Removes this window's copy, and the adopted one too if `adopted` is given.
@@ -96,11 +101,12 @@ impl Job {
                 on_disk,
                 text,
                 files,
+                builds,
                 adopted,
             } => {
                 if clears.load(Ordering::SeqCst) == at {
                     recovery
-                        .keep_with_files(&place, &hash_text(&on_disk), &text, &files)
+                        .keep_with_builds(&place, &hash_text(&on_disk), &text, &files, &builds)
                         .map_err(|_| ())?;
                 }
                 // Kept, or overtaken by a clear: either way it's no longer needed.
@@ -377,6 +383,7 @@ impl WorkingCopies {
             text: document.source().to_string(),
             on_disk: document.stamp_on_disk().to_string(),
             files: files.iter().map(|(path, _)| path.clone()).collect(),
+            builds: document.builds_to_enter(),
         };
         if self.kept.as_ref() == Some(&kept) {
             return None;
@@ -387,6 +394,7 @@ impl WorkingCopies {
             on_disk: kept.on_disk.clone(),
             text: kept.text.clone(),
             files,
+            builds: kept.builds.clone(),
             adopted: self.adopted.clone(),
         };
         self.kept = Some(kept);

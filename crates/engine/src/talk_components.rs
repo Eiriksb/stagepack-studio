@@ -220,7 +220,7 @@ fn assets_for_a_render(files: &Rc<dyn TalkFiles>, seen: &AssetsRead) -> Assets {
 }
 
 /// Whether `tag` is already taken, by the format or by a component every talk has.
-fn is_reserved(tag: &str, registry: &Registry) -> bool {
+pub(crate) fn is_reserved(tag: &str, registry: &Registry) -> bool {
     FORMAT_TAGS.contains(&tag) || registry.get(tag).is_some()
 }
 

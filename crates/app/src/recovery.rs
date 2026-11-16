@@ -15,6 +15,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use slides_components::BuildEntry;
 use slides_engine::{open_packed, read_talk_text, write_atomically};
 
 use crate::added_files::{FileKind, MAX_ADDED_BYTES, is_added_path};
@@ -26,6 +27,10 @@ const FOLDER: &str = "recovery";
 const ABOUT_FILE: &str = "about.json";
 /// The folder in a slot that holds the files added to the talk.
 const FILES_FOLDER: &str = "files";
+/// The file in a slot that holds the builds entered in the talk's index with those files.
+const BUILDS_FILE: &str = "builds.json";
+/// The largest file of builds entered that is read.
+const MAX_BUILDS_BYTES: u64 = 256 * 1024;
 /// How many hex characters name a talk's folder (from the hash of its path) and a slot.
 const KEY_LENGTH: usize = 16;
 /// The largest working copy that is read back.
@@ -53,6 +58,9 @@ pub struct Found {
     pub text: String,
     /// The files added to the talk that were kept with the text, by their path in the talk.
     pub files: Vec<(String, Arc<[u8]>)>,
+    /// The builds entered in the talk's index with those files, as a paste entered them. They
+    /// were written by the app, but are read back as untrusted as anything else here.
+    pub builds: Vec<BuildEntry>,
     /// Whether the talk's file still holds the text the edits started from.
     pub base_matches: bool,
     pub when: SystemTime,
@@ -150,6 +158,19 @@ impl Recovery {
         text: &str,
         files: &[(String, Arc<[u8]>)],
     ) -> io::Result<()> {
+        self.keep_with_builds(place, base_hash, text, files, &[])
+    }
+
+    /// Keeps `text` and `files` as [`Self::keep_with_files`] does, with `builds`, the builds
+    /// entered in the talk's index with those files, which are written before the text too.
+    pub fn keep_with_builds(
+        &self,
+        place: &TalkPlace,
+        base_hash: &str,
+        text: &str,
+        files: &[(String, Arc<[u8]>)],
+        builds: &[BuildEntry],
+    ) -> io::Result<()> {
         if let Some((odd, _)) = files.iter().find(|(path, _)| !is_added_path(path)) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{odd:?} isn't a file added to a talk")));
         }
@@ -170,6 +191,15 @@ impl Recovery {
         let about = serde_json::to_vec_pretty(&about).map_err(io::Error::other)?;
         for (path, bytes) in files {
             keep_file(&folder, path, bytes)?;
+        }
+        let builds_file = folder.join(BUILDS_FILE);
+        if builds.is_empty() {
+            match std::fs::remove_file(&builds_file) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+                _ => {}
+            }
+        } else {
+            write_private(&builds_file, &serde_json::to_vec(builds).map_err(io::Error::other)?)?;
         }
         // The text first and what it's about last: stopped between the two, the new text has
         // the base it had before, which can only make the talk look changed since when it
@@ -256,6 +286,7 @@ impl Recovery {
         Some(Found {
             text,
             files: kept_files(&slot),
+            builds: kept_builds(&slot),
             base_matches,
             when,
             slot,
@@ -343,6 +374,14 @@ fn kept_files(slot: &Path) -> Vec<(String, Arc<[u8]>)> {
     }
     kept.sort();
     kept
+}
+
+/// The builds entered kept in the working copy's `slot`, or none if there are none that can be
+/// read.
+fn kept_builds(slot: &Path) -> Vec<BuildEntry> {
+    read_small(&slot.join(BUILDS_FILE), MAX_BUILDS_BYTES)
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
 }
 
 /// The working copies' folders in the talk's folder `key_folder`.

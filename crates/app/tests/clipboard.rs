@@ -1408,6 +1408,8 @@ fn hostile_element_data_is_refused_or_made_safe() {
         "title: Evil\n---\n<Shape kind=\"rect\" />\n",
         "<Notes>\nsay this\n</Notes>\n",
         "<Shape kind=\"rect\" />\n\n<Notes>\nsay this\n</Notes>\n",
+        "<Box>\n\n<Notes>\nsecret\n</Notes>\n\n</Box>\n",
+        "<Box>\n\n<Box>\n\n<Notes>\nsecret\n</Notes>\n\n</Box>\n\n</Box>\n",
         "# A heading\n",
         "some words\n",
         "",
@@ -1416,6 +1418,9 @@ fn hostile_element_data_is_refused_or_made_safe() {
         assert_eq!(clipboard::one_element(&carried.markdown), None, "{markdown:?}");
     }
     assert!(clipboard::one_element(&"x".repeat(MAX_SLIDE_BYTES + 1)).is_none());
+    // A slide's notes are its own, at its end: never inside a thing on it.
+    assert_eq!(clipboard::carried_slide("# A\n\n<Box>\n\n<Notes>\nsecret\n</Notes>\n\n</Box>\n"), SlidePaste::NotOneSlide);
+    assert!(matches!(clipboard::carried_slide("# A\n\n<Notes>\nsay this\n</Notes>\n"), SlidePaste::Slide(_)));
     // Kinds and versions that aren't the app's are nothing of it.
     for (kind, version) in [("element", 2), ("elements", 1)] {
         let json = serde_json::json!({ APP_KEY: { "kind": kind, "version": version, "markdown": PICTURE_TAG } }).to_string();

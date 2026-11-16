@@ -72,6 +72,10 @@ pub const MISSING_PICTURES: &str = "Some pictures on the pasted slide aren't in 
 
 /// What the window says when the files a copied thing or slide uses were too big to go with it.
 pub const FILES_TOO_LARGE: &str = "The pictures were too large to copy with it.";
+/// What the window says when a pasted component has the name of one every talk has.
+pub const BUILT_IN_NAME: &str = "The pasted component has the name of a built-in one, so it wasn't added.";
+/// What the window says when a pasted component's build came without its source.
+pub const MISSING_COMPONENT: &str = "A component on the pasted slide isn't in this talk.";
 /// What the window says when a thing from a slide is pasted while text is being typed.
 pub const NOT_INTO_TEXT: &str = "That can't be pasted into text.";
 /// What the window says when the clipboard's thing isn't one thing a slide can take.
@@ -166,7 +170,10 @@ enum Payload {
 }
 
 /// A file a copy carries: its path in the talk, its bytes in base64, and, for a component's
-/// build, the hash of the source the talk it came from says it was built from.
+/// build, the hash of the source the talk it came from says it was built from. That hash can't
+/// be checked without building: a clipboard that gives the right one has its module shown as
+/// up to date for the pasted source, exactly as a talk's own index does when it's opened. The
+/// module runs sandboxed, and only as the component it says it is.
 #[derive(Serialize, Deserialize)]
 struct JsonFile {
     #[serde(default)]
@@ -238,7 +245,7 @@ pub struct PastedFile {
     pub kind: FileKind,
     pub bytes: Vec<u8>,
     /// For a component's build, the hash of the source it was built from, as the copy says: 64
-    /// lowercase hex digits, or `None`.
+    /// lowercase hex digits, or `None`. It's believed as a talk's own index is: see [`JsonFile`].
     pub built_from: Option<String>,
 }
 
@@ -416,11 +423,27 @@ pub fn one_element(text: &str) -> Option<String> {
         let [slide] = talk.slides.as_slice() else { return None };
         let alone = slide.settings.is_none() && slide.notes.is_none() && slide.error.is_none() && slide.inline_tags.is_empty() && slide.quotes.is_empty();
         let [block] = slide.blocks.as_slice() else { return None };
-        let a_thing = matches!(block, Block::Tag(tag) if tag.name != "Notes") || matches!(block, Block::Table { .. });
-        (alone && a_thing).then(|| block_text(&talk, 0, block.range())).flatten()
+        let a_thing = matches!(block, Block::Tag(_) | Block::Table { .. });
+        (alone && a_thing && !holds_notes(&talk.source, &slide.blocks)).then(|| block_text(&talk, 0, block.range())).flatten()
     })
     .ok()
     .flatten()
+}
+
+/// Whether any tag of `blocks`, whose text is in `source`, holds a `<Notes>` tag at any depth:
+/// a slide's notes are its own, at its end, and never inside anything on it. The format reads
+/// past one there, so it's looked for in the tag's own text.
+fn holds_notes(source: &str, blocks: &[Block]) -> bool {
+    let opens_notes = |text: &str| {
+        text.match_indices("<Notes").any(|(at, found)| {
+            text[at + found.len()..].chars().next().is_none_or(|next| next.is_whitespace() || matches!(next, '>' | '/'))
+        })
+    };
+    blocks.iter().any(|block| match block {
+        Block::Tag(tag) => source.get(tag.range.clone()).is_none_or(opens_notes),
+        Block::List { items, .. } => items.iter().any(|item| holds_notes(source, item)),
+        _ => false,
+    })
 }
 
 /// What a paste into the slide list makes of `markdown`, a copied slide's: see [`one_slide`].
@@ -581,6 +604,9 @@ pub fn one_slide(text: &str) -> Option<OneSlide> {
     std::panic::catch_unwind(|| {
         let talk = parse_talk(&as_talk);
         let slide = talk.slides.first().filter(|_| talk.slides.len() == 1)?;
+        if holds_notes(&talk.source, &slide.blocks) {
+            return None;
+        }
         let holds_nothing = slide.blocks.is_empty() && slide.notes.is_none() && slide.error.is_none();
         let text = slide_text_for_copy(&talk, 0);
         Some(OneSlide { text, holds_nothing })

@@ -3,6 +3,8 @@
 //! count) and read in bounded pieces afterwards.
 
 use crate::files::{FolderFiles, MAX_FILE_BYTES, TalkFiles};
+use crate::MAX_INDEX_BYTES;
+use slides_components::{BuildIndex, INDEX_FILE};
 use slides_format::{Block, Talk, parse_talk};
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
@@ -170,6 +172,11 @@ pub type NewFile = (String, Vec<u8>);
 /// as `read` gives them, is left out. One it has with other bytes, or under a name only the case
 /// of its letters tells apart from one it has, is refused rather than written over, and so is
 /// one named twice in `extra` with different bytes.
+///
+/// The one exception is the talk's build index, [`INDEX_FILE`]: the app keeps it, merging the
+/// builds a paste brings into the talk's own, so `extra` may hold it once, in place of the
+/// talk's. It must read as a build index within [`MAX_INDEX_BYTES`]. It's given back with the
+/// others, and [`replaces_index`] says whether the talk's own is to be left out.
 fn new_files<'a>(
     names: &[String],
     read: impl Fn(&str) -> Result<Vec<u8>, PackError>,
@@ -177,7 +184,16 @@ fn new_files<'a>(
     entry_bytes: u64,
 ) -> Result<Vec<&'a NewFile>, PackError> {
     let mut new: Vec<&NewFile> = Vec::new();
-    for file in extra {
+    let mut indexes = extra.iter().filter(|(name, _)| name == INDEX_FILE);
+    if let Some(index) = indexes.next() {
+        let (name, bytes) = index;
+        let readable = bytes.len() as u64 <= MAX_INDEX_BYTES && serde_json::from_slice::<BuildIndex>(bytes).is_ok();
+        if indexes.next().is_some() || !readable {
+            return Err(PackError::UnsafeName(name.clone()));
+        }
+        new.push(index);
+    }
+    for file in extra.iter().filter(|(name, _)| name != INDEX_FILE) {
         let (name, bytes) = file;
         let in_a_folder = name.split_once('/').is_some_and(|(folder, _)| PACKED_FOLDERS.contains(&folder));
         if !(in_a_folder && safe_name(name) && !name.ends_with('/') && normalise(name).as_ref() == Some(name)) {
@@ -562,6 +578,11 @@ fn check_sizes(
     Ok(())
 }
 
+/// Whether `extra`, as [`new_files`] gives it, replaces the talk's own build index.
+fn replaces_index(extra: &[&NewFile]) -> bool {
+    extra.iter().any(|(name, _)| name == INDEX_FILE)
+}
+
 /// The files of `extra` that the talk whose files are `files` doesn't have yet, as [`new_files`]
 /// finds them.
 fn new_folder_files<'a>(
@@ -621,8 +642,10 @@ fn pack(
         None => std::fs::read_to_string(folder.join(SLIDES_NAME)).unwrap_or_default(),
     };
 
+    let own_index = !replaces_index(&extra);
     let mut entries: Vec<(&str, Content)> = files
         .iter()
+        .filter(|(name, _)| own_index || name != INDEX_FILE)
         .map(|(name, path)| match slides {
             Some(slides) if name == SLIDES_NAME => (name.as_str(), Content::Bytes(slides.as_bytes())),
             _ => (name.as_str(), Content::File(path)),
@@ -780,8 +803,9 @@ fn unpack_into(files: &PackedFiles, folder: &Path, slides: Option<&str>, extra: 
             .read_checked(name)?
             .ok_or_else(|| PackError::Corrupt(format!("{name} is missing")))
     };
+    let own_index = !replaces_index(extra);
     let mut names = files.names();
-    names.retain(|name| name != MANIFEST_NAME && name != SLIDES_NAME);
+    names.retain(|name| name != MANIFEST_NAME && name != SLIDES_NAME && (own_index || name != INDEX_FILE));
     for name in names {
         write(&name, &read(&name)?)?;
     }
@@ -831,12 +855,16 @@ pub fn repack_with_slides(
         }
     }
     let manifest = manifest_for(app_version);
+    let own_index = !replaces_index(&extra);
     write_atomically(out, move |file| {
         let mut zip = files.zip.into_inner().unwrap_or_else(|e| e.into_inner());
         let mut writer = ZipWriter::new(file);
         for i in 0..zip.len() {
             let entry = zip.by_index_raw(i).map_err(io_other)?;
             let name = entry.name().map_err(io_other)?.to_string();
+            if !own_index && name == INDEX_FILE {
+                continue;
+            }
             let replacement = match name.as_str() {
                 SLIDES_NAME => Some(slides.as_bytes()),
                 MANIFEST_NAME => Some(manifest.as_slice()),
@@ -943,8 +971,9 @@ fn copy_into(
     limits: PackLimits,
 ) -> Result<(), PackError> {
     std::fs::create_dir_all(to)?;
+    let own_index = !replaces_index(extra);
     for (name, path) in files {
-        if name == SLIDES_NAME {
+        if name == SLIDES_NAME || (!own_index && name == INDEX_FILE) {
             continue;
         }
         let target = target_in(to, name)?;

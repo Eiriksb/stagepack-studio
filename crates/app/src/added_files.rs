@@ -384,7 +384,7 @@ pub(crate) fn read_outside(path: &Path) -> Result<Vec<u8>, NotAdded> {
 
 /// Every file name the talk's slides write where a file is named, as written, in order: the
 /// source of each picture and the value of each attribute of each tag, at any depth.
-fn written_names(talk: &Talk) -> Vec<&str> {
+pub(crate) fn written_names(talk: &Talk) -> Vec<&str> {
     let mut names = Vec::new();
     for slide in &talk.slides {
         let mut blocks: Vec<&Block> = slide.blocks.iter().rev().collect();

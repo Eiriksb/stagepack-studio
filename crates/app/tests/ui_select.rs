@@ -15,7 +15,9 @@ use gpui_kit::{Bounds, Modifiers, Pixels, Point, TestAppContext, px, size};
 use slides_engine::{ComponentState, ElementBox, Fonts, Hit, Pixmap};
 use slides_format::FlowPlace;
 use stagepack_studio::builds::Compile;
-use stagepack_studio::clipboard::MISSING_PICTURES;
+use stagepack_studio::clipboard::{self, AppData, CopiedFile, MISSING_PICTURES, PastedFiles};
+use stagepack_studio::recovery::{Recovery, hash_text};
+use stagepack_studio::saving::SaveTarget;
 use stagepack_studio::clipboard_tools::{COPY_ID, CUT_ID};
 use stagepack_studio::document::Document;
 use stagepack_studio::insert_tools::InsertTextBox;
@@ -836,4 +838,273 @@ fn the_home_tabs_copy_and_cut_act_on_the_thing_selected(cx: &mut TestAppContext)
     typing.settle(cx);
     assert_eq!(typing.source(cx), "# Only\n");
     assert_eq!(undo_label(&typing, cx), Some("Cut"));
+}
+
+// What a paste brings, through every way of saving and through a crash.
+
+/// A talk of one slide, `# Into`, in a folder, or packed if `packed`, and where it is.
+fn into_talk(packed: bool) -> (tempfile::TempDir, std::path::PathBuf, Document) {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("into");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(folder.join("slides.md"), "# Into\n").unwrap();
+    if !packed {
+        let document = Document::open(&folder, Fonts::bundled_only()).unwrap();
+        return (dir, folder, document);
+    }
+    let file = dir.path().join("into.sptx");
+    slides_engine::pack_folder(&folder, &file, "0.1.0").unwrap();
+    let document = Document::open_packed(&file, Fonts::bundled_only()).unwrap();
+    (dir, file, document)
+}
+
+fn reopen(at: &std::path::Path) -> Document {
+    if at.extension().is_some_and(|ext| ext == "sptx") {
+        Document::open_packed(at, Fonts::bundled_only()).unwrap()
+    } else {
+        Document::open(at, Fonts::bundled_only()).unwrap()
+    }
+}
+
+/// What copying the thing in `from` whose text starts with `start` puts on the clipboard, as a
+/// paste reads it.
+fn copied(from: &mut Document, start: &str) -> (String, PastedFiles) {
+    let at = from.source().find(start).unwrap();
+    let end = at + from.source()[at..].find("/>").unwrap() + 2;
+    assert!(from.select(0, at..end), "{start} is selected");
+    let (text, files) = from.copy_selected().unwrap();
+    let entry = clipboard::element_entry(&text, &files).unwrap();
+    match clipboard::read_app_data(entry.metadata.as_deref()) {
+        AppData::Element(carried) => (carried.markdown, carried.files),
+        _ => panic!("element data"),
+    }
+}
+
+fn score_state_of(document: &Document) -> Option<ComponentState> {
+    document.components().iter().find(|info| info.tag == "Score").map(|info| info.state)
+}
+
+/// Whether `document` shows Score up to date, drawn on its first slide.
+fn draws_score(document: &mut Document) -> bool {
+    document.go_to(0);
+    score_state_of(document) == Some(ComponentState::UpToDate) && document.notices().is_empty()
+}
+
+fn up_to_date_score() -> Document {
+    let folder = score_talk(&slides_components::source_hash(SCORE_SOURCE.as_bytes()));
+    let document = Document::open(folder.path(), Fonts::bundled_only()).unwrap();
+    std::mem::forget(folder);
+    document
+}
+
+fn save_document(document: &mut Document, target: Option<SaveTarget>) -> Vec<String> {
+    let job = match target {
+        Some(target) => document.save_as_job(target),
+        None => document.save_job(),
+    };
+    let saved = job.run().unwrap_or_else(|error| panic!("{error}"));
+    let notices = saved.notices().to_vec();
+    document.saved(saved);
+    notices
+}
+
+/// Pastes Score into a talk of one slide, packed if `packed`, saves it where `target` says,
+/// "pack" or "folder", or in place, and opens it again: it's up to date and draws throughout.
+fn pasted_score_survives(packed: bool, target: Option<&str>) {
+    let mut from = up_to_date_score();
+    let (markdown, files) = copied(&mut from, "<Score");
+    let what = format!("packed {packed}, to {target:?}");
+    let (dir, at, mut into) = into_talk(packed);
+    into.paste_element(&markdown, files).unwrap();
+    assert!(draws_score(&mut into), "{what}: right after the paste");
+    let saved_at = match target {
+        None => at.clone(),
+        Some("pack") => dir.path().join("out.sptx"),
+        Some(_) => dir.path().join("out"),
+    };
+    let target = target.map(|_| if saved_at.extension().is_some() { SaveTarget::Packed(saved_at.clone()) } else { SaveTarget::Folder(saved_at.clone()) });
+    let notices = save_document(&mut into, target);
+    assert!(notices.is_empty(), "{what}: {notices:?}");
+    assert!(draws_score(&mut into), "{what}: once saved");
+    // Saved again, the index still holds it.
+    save_document(&mut into, None);
+    let mut reopened = reopen(&saved_at);
+    assert!(draws_score(&mut reopened), "{what}: opened again: {:?} {:?}", score_state_of(&reopened), reopened.notices());
+}
+
+#[test]
+fn a_pasted_component_works_after_a_save_in_its_folder() {
+    pasted_score_survives(false, None);
+}
+
+#[test]
+fn a_pasted_component_works_after_a_save_in_its_pack() {
+    pasted_score_survives(true, None);
+}
+
+#[test]
+fn a_pasted_component_works_after_save_as_from_folder_to_pack() {
+    pasted_score_survives(false, Some("pack"));
+}
+
+#[test]
+fn a_pasted_component_works_after_save_as_from_pack_to_folder() {
+    pasted_score_survives(true, Some("folder"));
+}
+
+#[test]
+fn a_pasted_component_works_after_save_as_from_folder_to_folder() {
+    pasted_score_survives(false, Some("folder"));
+}
+
+#[test]
+fn a_pasted_component_works_after_save_as_from_pack_to_pack() {
+    pasted_score_survives(true, Some("pack"));
+}
+
+#[test]
+fn a_pasted_component_comes_back_from_a_crash_and_saves() {
+    let mut from = up_to_date_score();
+    let (markdown, files) = copied(&mut from, "<Score");
+    let (_dir, folder, mut into) = into_talk(false);
+    into.paste_element(&markdown, files).unwrap();
+    let kept = tempfile::tempdir().unwrap();
+    let recovery = Recovery::new(kept.path().to_path_buf());
+    let place = into.place().clone();
+    recovery
+        .keep_with_builds(&place, &hash_text(into.stamp_on_disk()), into.source(), &into.added_files(), &into.builds_to_enter())
+        .unwrap();
+    drop(into);
+    // The app stopped; the talk is opened again and its changes brought back.
+    let mut back = Document::open(&folder, Fonts::bundled_only()).unwrap();
+    let found = recovery.find(back.place()).expect("a working copy");
+    back.recover_with_builds(found.text, found.files, found.builds).unwrap();
+    assert!(draws_score(&mut back), "brought back as it was");
+    save_document(&mut back, None);
+    assert!(draws_score(&mut reopen(&folder)), "saved and opened again");
+
+    // Builds kept that weren't a paste's, or name what isn't there, are let go.
+    let (_dir, folder, mut into) = into_talk(false);
+    into.paste_element(&markdown, copied(&mut from, "<Score").1).unwrap();
+    let mut builds = into.builds_to_enter();
+    builds[0].tag = "Chart".into();
+    let forged = vec![builds[0].clone(), slides_components::BuildEntry { tag: "Score".into(), file: "../x".into(), source_hash: "a".repeat(64) }];
+    let mut back = Document::open(&folder, Fonts::bundled_only()).unwrap();
+    back.recover_with_builds(into.source().to_string(), into.added_files(), forged).unwrap();
+    assert_eq!(score_state_of(&back), Some(ComponentState::NeedsBuilding));
+}
+
+#[test]
+fn undoing_a_paste_saves_none_of_its_files_and_redoing_it_saves_them() {
+    let mut from = up_to_date_score();
+    let (markdown, files) = copied(&mut from, "<Score");
+    let (_dir, folder, mut into) = into_talk(false);
+    into.paste_element(&markdown, files).unwrap();
+    into.undo().unwrap();
+    save_document(&mut into, None);
+    for gone in ["components/score.rs", "build/score.wasm", "build/index.json"] {
+        assert!(!folder.join(gone).exists(), "{gone}");
+    }
+    into.redo().unwrap();
+    save_document(&mut into, None);
+    for there in ["components/score.rs", "build/score.wasm", "build/index.json"] {
+        assert!(folder.join(there).exists(), "{there}");
+    }
+    assert!(draws_score(&mut reopen(&folder)));
+}
+
+/// Element data holding `markdown` and the files `files`, each `(path, bytes, built_from)`.
+fn element_with(markdown: &str, files: &[(&str, &[u8], Option<String>)]) -> PastedFiles {
+    let copied: Vec<CopiedFile> = files
+        .iter()
+        .map(|(path, bytes, built_from)| CopiedFile { path: path.to_string(), bytes: (*bytes).into(), built_from: built_from.clone() })
+        .collect();
+    let entry = clipboard::element_entry(markdown, &copied).unwrap();
+    match clipboard::read_app_data(entry.metadata.as_deref()) {
+        AppData::Element(carried) => carried.files,
+        _ => panic!("element data"),
+    }
+}
+
+#[test]
+fn files_the_pasted_thing_does_not_use_are_not_added() {
+    let hash = Some(slides_components::source_hash(SCORE_SOURCE.as_bytes()));
+    let shape = "<Shape kind=\"rect\" x=\"10\" y=\"10\" w=\"100\" h=\"100\" />";
+    let files = element_with(
+        shape,
+        &[("components/score.rs", SCORE_SOURCE.as_bytes(), None), ("build/score.wasm", SCORE_BUILD, hash), ("assets/photo.png", &photo(), None)],
+    );
+    assert_eq!(files.files.len(), 3);
+    let (_dir, _folder, mut into) = into_talk(false);
+    let (_, brought) = into.paste_element(shape, files).unwrap();
+    assert_eq!(brought.said(), None);
+    assert_eq!(score_state_of(&into), None, "no component is added");
+    assert!(into.unsaved_files().is_empty(), "nothing is added, named or kept");
+    assert!(into.builds_to_enter().is_empty());
+    assert!(into.palette().iter().all(|entry| entry.tag != "Score"), "nor offered");
+}
+
+#[test]
+fn a_pasted_component_with_a_built_in_name_is_not_added() {
+    let chart = SCORE_SOURCE.replace("fn Score(", "fn Chart(");
+    let markdown = "<Chart kind=\"bar\" data=\"a,1\" x=\"10\" y=\"10\" w=\"100\" h=\"100\" />";
+    let files = element_with(markdown, &[("components/chart.rs", chart.as_bytes(), None)]);
+    assert_eq!(files.files.len(), 1);
+    let (_dir, _folder, mut into) = into_talk(false);
+    let (_, brought) = into.paste_element(markdown, files).unwrap();
+    assert_eq!(brought.said().as_deref(), Some("The pasted component has the name of a built-in one, so it wasn't added."));
+    assert!(into.unsaved_files().is_empty());
+    assert!(into.source().contains("<Chart"), "the thing is pasted, as the built-in one");
+}
+
+#[test]
+fn a_build_that_came_without_its_source_is_said_as_a_component() {
+    let files = element_with(SCORE, &[("build/score.wasm", SCORE_BUILD, Some("a".repeat(64)))]);
+    let (_dir, _folder, mut into) = into_talk(false);
+    let (_, brought) = into.paste_element(SCORE, files).unwrap();
+    assert_eq!(brought.said().as_deref(), Some("A component on the pasted slide isn't in this talk."));
+    assert!(into.unsaved_files().is_empty());
+}
+
+#[test]
+fn a_paste_never_replaces_an_entry_in_the_talks_index() {
+    // A build-only component, Other, whose build has the same bytes as the pasted Score's.
+    let (_dir, folder, _) = into_talk(false);
+    std::fs::create_dir(folder.join("build")).unwrap();
+    std::fs::write(folder.join("build/score.wasm"), SCORE_BUILD).unwrap();
+    let index = format!(r#"{{"format":1,"components":[{{"tag":"Other","file":"score","source_hash":"{}"}}]}}"#, "b".repeat(64));
+    std::fs::write(folder.join("build/index.json"), &index).unwrap();
+    let mut into = Document::open(&folder, Fonts::bundled_only()).unwrap();
+    let mut from = up_to_date_score();
+    let (markdown, files) = copied(&mut from, "<Score");
+    into.paste_element(&markdown, files).unwrap();
+    assert!(into.builds_to_enter().is_empty(), "nothing is entered");
+    assert_eq!(score_state_of(&into), Some(ComponentState::NeedsBuilding), "it follows the rules there are");
+    save_document(&mut into, None);
+    assert_eq!(std::fs::read_to_string(folder.join("build/index.json")).unwrap(), index, "the talk's entry is kept");
+}
+
+#[test]
+fn an_index_that_cannot_be_read_is_left_and_said_on_save() {
+    let (_dir, folder, _) = into_talk(false);
+    std::fs::create_dir(folder.join("build")).unwrap();
+    std::fs::write(folder.join("build/index.json"), "not an index").unwrap();
+    let mut into = Document::open(&folder, Fonts::bundled_only()).unwrap();
+    let mut from = up_to_date_score();
+    let (markdown, files) = copied(&mut from, "<Score");
+    into.paste_element(&markdown, files).unwrap();
+    let notices = save_document(&mut into, None);
+    assert_eq!(notices, ["Couldn't save index.json: it can't be read, so a pasted component needs building."]);
+    assert_eq!(std::fs::read_to_string(folder.join("build/index.json")).unwrap(), "not an index");
+    assert!(std::fs::read_to_string(folder.join("slides.md")).unwrap().contains("<Score"), "the rest is saved");
+}
+
+#[test]
+fn a_reference_that_was_not_pasted_never_comes_to_name_a_pasted_file() {
+    let markdown = "<Picture src=\"assets/Photo.png\" data=\"assets/photo.png\" x=\"10\" y=\"10\" w=\"100\" h=\"100\" />";
+    let files = element_with(markdown, &[("assets/Photo.png", &photo(), None)]);
+    let (_dir, _folder, mut into) = into_talk(false);
+    into.paste_element(markdown, files).unwrap();
+    assert!(into.source().contains("src=\"assets/photo-2.png\" data=\"assets/photo.png\""), "{}", into.source());
+    assert!(!into.has_file("assets/photo.png"));
 }

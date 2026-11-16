@@ -406,6 +406,12 @@ impl Deck {
         names
     }
 
+    /// Whether `tag` is the name of a component every talk has, or of a tag the format itself
+    /// reads, which a talk's own component can't take.
+    pub fn is_built_in(&self, tag: &str) -> bool {
+        crate::talk_components::is_reserved(tag, &self.registry)
+    }
+
     /// The talk's own components.
     pub fn components(&self) -> &[ComponentInfo] {
         self.components.infos()
