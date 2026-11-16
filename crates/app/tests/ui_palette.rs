@@ -5,7 +5,7 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[path = "support/typing.rs"]
 mod typing;
@@ -23,7 +23,8 @@ use stagepack_studio::insert::hex;
 use stagepack_studio::insert_tools::INSERT_COMPONENT_ID;
 use stagepack_studio::inspector::{INSPECTOR_HEADING_ID, Inspector};
 use stagepack_studio::palette::{
-    self, NEEDS_BUILDING_FIRST, NO_COMPONENTS_ID, NO_COMPONENTS_OF_ITS_OWN, OUT_OF_DATE, default_attrs, entry_id, note_id,
+    self, NEEDS_BUILDING_FIRST, NO_COMPONENTS_ID, NO_COMPONENTS_OF_ITS_OWN, OUT_OF_DATE, STILL_LOADING, default_attrs, entry_id,
+    note_id,
 };
 use stagepack_studio::permissions::BuildPermissions;
 use stagepack_studio::ribbon::{MORE_RIGHT_ID, TAB_INSERT_ID};
@@ -291,9 +292,11 @@ fn schema(name: &str, props: Vec<PropField>, children: bool) -> ComponentSchema 
 #[gpui_kit::test]
 fn the_palette_lists_chart_then_the_talks_own(cx: &mut TestAppContext) {
     let typing = open_folder(cx, components_talk(None), None);
+    open_list(&typing, cx);
     let palette = palette_of(&typing, cx);
     let tags: Vec<&str> = palette.iter().map(|entry| entry.tag.as_str()).collect();
     assert_eq!(tags, ["Chart", "Bars", "Callout", "Clock", "Reveal", "Score"]);
+    assert!(palette.iter().all(|entry| !entry.loading), "{palette:?}");
     let labels: Vec<&str> = palette.iter().map(|entry| entry.label.as_str()).collect();
     assert_eq!(labels, ["Chart", "Bars", "Callout", "Clock", "Reveal", "Score"]);
     assert!(!palette[0].ours && palette[0].state.is_none());
@@ -303,7 +306,6 @@ fn the_palette_lists_chart_then_the_talks_own(cx: &mut TestAppContext) {
     assert_eq!(palette::label("ScoreCard"), "Score Card");
     assert_eq!(palette::label("Chart"), "Chart");
 
-    open_list(&typing, cx);
     for entry in &palette {
         assert_eq!(label_of(&typing, cx, entry_id(&entry.tag)).as_deref(), Some(entry.label.as_str()), "{}", entry.tag);
         assert!(!is_shown(&typing, cx, note_id(&entry.tag)), "nothing to say of {}", entry.tag);
@@ -382,7 +384,12 @@ fn default_attrs_writes_each_required_argument_at_a_starting_value() {
     ];
     for (prop, wanted) in cases {
         let written = default_attrs(&schema("Thing", vec![prop.clone()], false), &theme);
-        let name = prop.name.replace('_', "-");
+        // Written with `-` for `_`, as the toolkit reads an argument's attribute.
+        let name = match prop.name.as_str() {
+            "bar_kind" => "bar-kind".to_string(),
+            "empty_choice" => "empty-choice".to_string(),
+            other => other.to_string(),
+        };
         let wanted: Vec<(String, String)> = wanted.into_iter().map(|value| (name.clone(), value)).collect();
         assert_eq!(written, wanted, "{prop:?}");
     }
@@ -438,11 +445,11 @@ fn a_component_that_needs_building_is_greyed_and_inserts_nothing(cx: &mut TestAp
 #[gpui_kit::test]
 fn an_out_of_date_component_is_marked_and_still_inserts(cx: &mut TestAppContext) {
     let typing = open_folder(cx, components_talk(Some(("Score", Built::OutOfDate))), None);
+    open_list(&typing, cx);
     let score = palette_of(&typing, cx).into_iter().find(|entry| entry.tag == "Score").expect("listed");
     assert_eq!(score.state, Some(ComponentState::OutOfDate));
     assert_eq!(palette::note(&score), Some(OUT_OF_DATE));
     assert_eq!(OUT_OF_DATE, "out of date");
-    open_list(&typing, cx);
     assert_eq!(label_of(&typing, cx, note_id("Score")).as_deref(), Some(OUT_OF_DATE));
     assert!(!is_shown(&typing, cx, note_id("Callout")));
     click_on(&typing, cx, entry_id("Score"));
@@ -563,8 +570,163 @@ fn a_packed_talk_lists_and_inserts_its_components(cx: &mut TestAppContext) {
 }
 
 #[test]
-fn a_document_opened_without_a_window_has_its_palette() {
+fn opening_a_talk_loads_no_component() {
     let folder = components_talk(None);
     let mut document = Document::open(folder.path(), Fonts::bundled_only()).unwrap();
-    assert_eq!(document.palette().len(), 6);
+    assert_eq!(document.modules_loaded(), 0, "opening loads nothing");
+    let palette = document.palette();
+    assert_eq!(palette.len(), 6, "listed, without anything loaded");
+    assert!(palette[1..].iter().all(|entry| entry.loading && !entry.takes_content), "{palette:?}");
+    assert_eq!(palette::note(&palette[1]), Some(STILL_LOADING));
+    assert_eq!(document.modules_loaded(), 0);
+    // Drawing the slide of scores loads the one it uses.
+    let _ = document.layers_of(1, 0.25);
+    assert_eq!(document.modules_loaded(), 1);
+    // Opening the palette loads the rest, a step at a time.
+    document.begin_palette();
+    while document.palette_step() {}
+    let palette = document.palette();
+    assert!(palette.iter().all(|entry| !entry.loading), "{palette:?}");
+    let content: Vec<&str> = palette.iter().filter(|entry| entry.takes_content).map(|entry| entry.tag.as_str()).collect();
+    assert_eq!(content, ["Callout"]);
+    assert_eq!(document.modules_loaded(), 5);
+}
+
+/// A module whose `schema` spins for as long as it's let.
+fn spinning_schema() -> Vec<u8> {
+    let text = r#"(module
+  (memory (export "memory") 1)
+  (func (export "abi_version") (result i32) (i32.const 1))
+  (func (export "alloc") (param i32) (result i32) (i32.const 0))
+  (func (export "schema") (result i64) (loop br 0) (i64.const 0))
+  (func (export "render") (param i32 i32) (result i64) (i64.const 0)))"#;
+    wat::parse_str(text).unwrap()
+}
+
+/// A talk of one slide with `count` components whose builds spin when asked what they take.
+fn spinning_talk(count: usize) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("slides.md"), "# T\n").unwrap();
+    std::fs::create_dir(dir.path().join("components")).unwrap();
+    std::fs::create_dir(dir.path().join("build")).unwrap();
+    let mut entries = Vec::new();
+    for n in 0..count {
+        let tag = format!("Spin{}", (b'a' + (n % 26) as u8) as char) + &"x".repeat(n / 26);
+        let file = tag.to_lowercase();
+        let source = format!("use toolkit::prelude::*;\n\n#[component]\nfn {tag}() -> Element {{\n    text(\"{tag}\")\n}}\n");
+        std::fs::write(dir.path().join(format!("components/{file}.rs")), &source).unwrap();
+        std::fs::write(dir.path().join(format!("build/{file}.wasm")), spinning_schema()).unwrap();
+        entries.push(format!(r#"{{"tag":"{tag}","file":"{file}","source_hash":"{}"}}"#, source_hash(source.as_bytes())));
+    }
+    std::fs::write(dir.path().join("build/index.json"), format!(r#"{{"format":1,"components":[{}]}}"#, entries.join(","))).unwrap();
+    dir
+}
+
+#[gpui_kit::test]
+fn the_palette_fills_in_within_its_budget(cx: &mut TestAppContext) {
+    let typing = open_folder(cx, spinning_talk(40), None);
+    assert_eq!(typing.document(cx).read_with(cx, |document, _| document.modules_loaded()), 0);
+    click_on(&typing, cx, TAB_INSERT_ID);
+    for _ in 0..10 {
+        let in_view = typing.with_window(cx, |window, cx| {
+            window.render_frame(cx);
+            let tool = window.try_find(INSERT_COMPONENT_ID).map(|found| found.bounds());
+            tool.is_some_and(|bounds| bounds.origin.x + bounds.size.width <= px(1280.))
+        });
+        if in_view {
+            break;
+        }
+        click_on(&typing, cx, MORE_RIGHT_ID);
+    }
+    // The list opens at once, every one of the talk's own still loading.
+    let started = Instant::now();
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        window.click(INSERT_COMPONENT_ID, cx);
+        window.render_frame(cx);
+    });
+    assert!(started.elapsed() < Duration::from_millis(250), "opening took {:?}", started.elapsed());
+    let palette = palette_of(&typing, cx);
+    assert_eq!(palette.len(), 41);
+    assert!(palette[1..].iter().all(|entry| entry.loading), "{palette:?}");
+    assert_eq!(label_of(&typing, cx, note_id("Spina")).as_deref(), Some(STILL_LOADING));
+    assert_eq!(label_of(&typing, cx, entry_id("Chart")).as_deref(), Some("Chart"), "a chart can go in already");
+
+    // Each is loaded in a step of its own, and the budget runs out long before all 40 are.
+    let started = Instant::now();
+    cx.run_until_parked();
+    typing.settle(cx);
+    assert!(started.elapsed() < Duration::from_secs(4), "loading took {:?}", started.elapsed());
+    let longest = typing.document(cx).read_with(cx, |document, _| document.palette_longest_step());
+    assert!(longest < Duration::from_millis(600), "a step took {longest:?}");
+    let loaded = typing.document(cx).read_with(cx, |document, _| document.modules_loaded());
+    assert!((1..10).contains(&loaded), "{loaded} loaded");
+    let palette = palette_of(&typing, cx);
+    assert!(palette.iter().all(|entry| !entry.loading), "nothing is left loading: {palette:?}");
+    assert!(!is_shown(&typing, cx, note_id("Spinf")));
+    // Left alone, it does nothing more.
+    cx.run_until_parked();
+    assert_eq!(typing.document(cx).read_with(cx, |document, _| document.modules_loaded()), loaded);
+    // One past the budget is loaded when it's chosen, and one that can't be is refused.
+    click_on(&typing, cx, entry_id("Spinf"));
+    assert_eq!(typing.source(cx), "# T\n", "nothing is added");
+    assert_eq!(typing.status(cx).as_deref(), Some(COULD_NOT_LOAD));
+}
+
+const COULD_NOT_LOAD: &str = "That component couldn't be loaded, so it wasn't added.";
+
+#[test]
+fn a_component_that_cannot_be_loaded_is_refused() {
+    let folder = spinning_talk(1);
+    let mut document = Document::open(folder.path(), Fonts::bundled_only()).unwrap();
+    let refused = document.insert_component("Spina").unwrap_err();
+    assert_eq!(refused.to_string(), COULD_NOT_LOAD);
+    assert_eq!(document.source(), "# T\n");
+    assert!(!document.can_undo());
+}
+
+/// The first release's build of Score, made by the real toolchain, and its source.
+const V1_SCORE: &[u8] = include_bytes!("../../components/tests/fixtures/v1/score.wasm");
+const V1_SCORE_SOURCE: &str = include_str!("../../components/tests/fixtures/v1/score.rs");
+
+#[test]
+fn a_real_score_draws_with_the_palettes_starting_values() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("slides.md"), "# T\n").unwrap();
+    std::fs::create_dir(dir.path().join("components")).unwrap();
+    std::fs::create_dir(dir.path().join("build")).unwrap();
+    std::fs::write(dir.path().join("components/score.rs"), V1_SCORE_SOURCE).unwrap();
+    std::fs::write(dir.path().join("build/score.wasm"), V1_SCORE).unwrap();
+    let index = format!(r#"{{"format":1,"components":[{{"tag":"Score","file":"score","source_hash":"{}"}}]}}"#, source_hash(V1_SCORE_SOURCE.as_bytes()));
+    std::fs::write(dir.path().join("build/index.json"), index).unwrap();
+    let mut document = Document::open(dir.path(), Fonts::bundled_only()).unwrap();
+    document.insert_component("Score").unwrap();
+    let written = parse_talk(document.source());
+    let tag = find_tag(&written, 0, &document.selected().expect("selected").source).expect("a tag").clone();
+    let attrs: Vec<(&str, &str)> = tag.attrs.iter().map(|attr| (attr.name.as_str(), attr.value.as_str())).collect();
+    assert_eq!(&attrs[..2], &[("team", ""), ("points", "0")], "{attrs:?}");
+    assert_eq!(attrs[2].0, "colour");
+    assert!(document.notices().is_empty(), "{:?}", document.notices());
+}
+
+#[gpui_kit::test]
+fn a_click_on_a_component_that_does_not_draw_its_words_selects_it(cx: &mut TestAppContext) {
+    let folder = components_talk(Some(("Clock", Built::Not)));
+    let slides = "# T\n\nBody words\n\n<Score team=\"\" points=\"0\" colour=\"#123456\" x=\"100\" y=\"300\" w=\"600\" h=\"300\">\n\nHidden words\n\n</Score>\n\n\
+                  <Nope x=\"800\" y=\"300\" w=\"400\" h=\"300\">\n\nUnknown words\n\n</Nope>\n\n\
+                  <Clock size=\"100\" x=\"1300\" y=\"300\" w=\"400\" h=\"300\">\n\nLater words\n\n</Clock>\n";
+    std::fs::write(folder.path().join("slides.md"), slides).unwrap();
+    let typing = open_folder(cx, folder, None);
+    for (x, y, start, name) in [(400.0, 450.0, "<Score", "Score"), (1000.0, 450.0, "<Nope", "Nope"), (1500.0, 450.0, "<Clock", "Clock")] {
+        let at = slides.find(start).unwrap();
+        let close = format!("</{name}>");
+        let range = at..at + slides[at..].find(&close).unwrap() + close.len();
+        let point = typing.at(cx, x, y);
+        typing.click(cx, point);
+        assert_eq!(selected(&typing, cx), Some(range), "{name} is selected");
+        assert!(typing.editing(cx).is_none(), "{name}: nothing is being typed");
+        typing.type_text(cx, "x");
+        assert_eq!(typing.source(cx), slides, "{name}: nothing is typed into the slide");
+        typing.press(cx, "escape");
+    }
 }

@@ -9,7 +9,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use crate::edit::{Change, SourceEdit, eol_in};
 use crate::model::{Block, Slide, Span, Style, Talk};
 use crate::parse::parse_talk;
-use crate::rich::{FlowPlace, MAX_LEVEL, Para, ParaKind, TextFlow, is_positioned, layout_of, text_flows, typed_tables};
+use crate::rich::{FlowPlace, MAX_LEVEL, Para, ParaKind, TextFlow, is_positioned, layout_of, text_flows, text_flows_with, typed_tables};
 use crate::split::split_slides;
 
 /// Markdown for one paragraph's content, as it's written on a line of its own: every
@@ -42,7 +42,13 @@ pub fn storable(paras: &[Para]) -> Vec<Para> {
 /// the talk would lose the slide, or for a line break in code, a heading of more than one
 /// line below level 2, or a list item deeper than the one before it allows.
 pub fn write_flow(talk: &Talk, slide: usize, flow: &TextFlow, paras: &[Para]) -> Option<Change> {
-    guarded(|| flow_change(talk, slide, flow, paras))
+    write_flow_with(talk, slide, flow, paras, &|_| false)
+}
+
+/// [`write_flow`], for a flow of those [`text_flows_with`] gives with `takes_content`, which
+/// is what the slide is read with again to check it.
+pub fn write_flow_with(talk: &Talk, slide: usize, flow: &TextFlow, paras: &[Para], takes_content: &dyn Fn(&str) -> bool) -> Option<Change> {
+    guarded(|| flow_change(talk, slide, flow, paras, takes_content))
 }
 
 /// The edits that put `paras` into region `region` of slide `slide`, a region of its layout
@@ -1074,12 +1080,12 @@ fn whole_change(src: &Source, flow: &TextFlow, new: &[Para], origin: &[Origin], 
     Some(vec![SourceEdit { range: src.line_start(first)..flow.source.last()?.block.end, text }])
 }
 
-fn flow_change(talk: &Talk, index: usize, flow: &TextFlow, paras: &[Para]) -> Option<Change> {
+fn flow_change(talk: &Talk, index: usize, flow: &TextFlow, paras: &[Para], takes_content: &dyn Fn(&str) -> bool) -> Option<Change> {
     if matches!(flow.place, FlowPlace::Cell { .. }) {
-        return cell_change(talk, index, flow, paras);
+        return cell_change(talk, index, flow, paras, takes_content);
     }
     let slide = talk.slides.get(index)?;
-    let flows = text_flows(talk, index);
+    let flows = text_flows_with(talk, index, takes_content);
     let at = flows.iter().position(|candidate| candidate == flow)?;
     let new = storable(paras);
     if new == flow.paras {
@@ -1107,7 +1113,7 @@ fn flow_change(talk: &Talk, index: usize, flow: &TextFlow, paras: &[Para]) -> Op
             &|| whole_change(&src, flow, &new, &origin, true),
             &|| whole_change(&src, flow, &new, &origin, false),
         ];
-        let found = tries.iter().filter_map(|attempt| attempt()).map(|edits| Change { edits }).find(|change| reads_as(talk, slide, change, &expected));
+        let found = tries.iter().filter_map(|attempt| attempt()).map(|edits| Change { edits }).find(|change| reads_as(talk, slide, change, &expected, takes_content));
         if found.is_some() {
             return found;
         }
@@ -1123,9 +1129,9 @@ const EMPTY_CELL: &str = "<Text></Text>";
 /// none, which empties it. Only the cell's content is written, with its `|`s escaped, and in a
 /// cell of white space alone, with a space each side. An emptied cell is two spaces between
 /// its `|`s.
-fn cell_change(talk: &Talk, index: usize, flow: &TextFlow, paras: &[Para]) -> Option<Change> {
+fn cell_change(talk: &Talk, index: usize, flow: &TextFlow, paras: &[Para], takes_content: &dyn Fn(&str) -> bool) -> Option<Change> {
     let slide = talk.slides.get(index)?;
-    let flows = text_flows(talk, index);
+    let flows = text_flows_with(talk, index, takes_content);
     let at = flows.iter().position(|candidate| candidate == flow)?;
     let new = match storable(paras).as_slice() {
         [] => vec![Para { kind: ParaKind::Body, spans: Vec::new() }],
@@ -1162,7 +1168,7 @@ fn cell_change(talk: &Talk, index: usize, flow: &TextFlow, paras: &[Para]) -> Op
             .map(|text| SourceEdit { range: cell.inline.clone(), text: if spaces { format!(" {text} ") } else { text } })
             .collect()
     };
-    edits.into_iter().map(Change::single).find(|change| reads_as(talk, slide, change, &expected))
+    edits.into_iter().map(Change::single).find(|change| reads_as(talk, slide, change, &expected, takes_content))
 }
 
 /// What starts the line of `at`, if it's blank.
@@ -1177,14 +1183,14 @@ fn src_base(source: &str, at: usize) -> Option<String> {
 
 /// Whether `change`, made inside `slide` of `talk`, leaves it one slide whose flows are
 /// `expected` and whose other content is as it was.
-fn reads_as(talk: &Talk, slide: &Slide, change: &Change, expected: &[(FlowPlace, Vec<Para>)]) -> bool {
+fn reads_as(talk: &Talk, slide: &Slide, change: &Change, expected: &[(FlowPlace, Vec<Para>)], takes_content: &dyn Fn(&str) -> bool) -> bool {
     let Some(new_text) = changed_slide(talk, slide, change) else { return false };
     let read = parse_talk(&new_text);
     let [new_slide] = read.slides.as_slice() else { return false };
     if new_slide.error.is_some() {
         return false;
     }
-    let flows = text_flows(&read, 0);
+    let flows = text_flows_with(&read, 0, takes_content);
     let same_flows = flows.len() == expected.len()
         && flows.iter().zip(expected).all(|(flow, (place, paras))| same_place(&flow.place, place) && flow.paras == *paras);
     same_flows && the_rest(new_slide) == the_rest(slide)
@@ -1320,7 +1326,7 @@ fn region_change(talk: &Talk, index: usize, region: &str, paras: &[Para]) -> Opt
     let place = FlowPlace::Region(region.to_string());
     let at = text_flows(&read, 0).iter().position(|flow| flow.place == place && flow.paras == new)?;
     expected.insert(at.min(expected.len()), (place, new));
-    reads_as(talk, slide, &change, &expected).then_some(change)
+    reads_as(talk, slide, &change, &expected, &|_| false).then_some(change)
 }
 
 /// The edit that puts `text`, blocks with the talk's line ending `eol`, into region `region`

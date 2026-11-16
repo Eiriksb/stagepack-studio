@@ -103,10 +103,23 @@ pub(crate) fn is_positioned(tag: &Tag) -> bool {
 /// Each run of editable text on slide `slide`, in the order it's in the file. A region's
 /// text is one flow per unbroken run of headings, paragraphs and lists. Anything else ends
 /// the run and belongs to no flow, as does a positioned tag, whose own text is a flow if
-/// it's a box of editable text. After all those come the cells of the slide's tables whose
-/// cells can be typed in, table by table, each row's cells in turn: each cell holding only
-/// text is a flow of one body paragraph.
+/// it's a box of editable text: a text box, a box or a shape. After all those come the cells
+/// of the slide's tables whose cells can be typed in, table by table, each row's cells in
+/// turn: each cell holding only text is a flow of one body paragraph.
 pub fn text_flows(talk: &Talk, slide: usize) -> Vec<TextFlow> {
+    text_flows_with(talk, slide, &no_others)
+}
+
+/// What takes content besides the format's own boxes: nothing.
+fn no_others(_: &str) -> bool {
+    false
+}
+
+/// [`text_flows`], with a positioned tag whose name `takes_content` says yes to a box of text
+/// too: one of the talk's components that draws what's written between its tags. Whoever
+/// lays the slide out and whoever edits it must ask the same question, so that the flows
+/// they count are the same.
+pub fn text_flows_with(talk: &Talk, slide: usize, takes_content: &dyn Fn(&str) -> bool) -> Vec<TextFlow> {
     let Some(slide) = talk.slides.get(slide) else { return Vec::new() };
     if slide.error.is_some() {
         return Vec::new();
@@ -126,7 +139,7 @@ pub fn text_flows(talk: &Talk, slide: usize) -> Vec<TextFlow> {
             }
             Block::Tag(tag) if is_positioned(tag) => {
                 end_run(&mut run, &mut flows);
-                flows.extend(box_flow(&talk.source, slide, tag));
+                flows.extend(box_flow(&talk.source, slide, tag, takes_content));
             }
             _ => {
                 let region = match block {
@@ -193,19 +206,11 @@ pub(crate) fn typed_tables(slide: &Slide) -> Vec<&Block> {
     out
 }
 
-/// The built-in tags that draw nothing written between them.
-const HOLD_NO_TEXT: [&str; 3] = ["Picture", "Icon", "Chart"];
-
-/// Whether a positioned tag named `name` is a box of the text written between its tags: a text
-/// box, a box or a shape, or a talk's own component, which draws that text where it puts what
-/// it's given.
-fn holds_text(name: &str) -> bool {
-    TEXT_BOXES.contains(&name) || !HOLD_NO_TEXT.contains(&name)
-}
-
-/// The flow of a positioned tag's text, if it's a box holding only editable text.
-fn box_flow(source: &str, slide: &Slide, tag: &Tag) -> Option<TextFlow> {
-    if !holds_text(&tag.name) || is_quoted(slide, &tag.range) || tag.children.is_empty() {
+/// The flow of a positioned tag's text, if it's a box holding only editable text: one of the
+/// format's own boxes, or a tag `takes_content` says yes to.
+fn box_flow(source: &str, slide: &Slide, tag: &Tag, takes_content: &dyn Fn(&str) -> bool) -> Option<TextFlow> {
+    let boxed = TEXT_BOXES.contains(&tag.name.as_str()) || takes_content(&tag.name);
+    if !boxed || is_quoted(slide, &tag.range) || tag.children.is_empty() {
         return None;
     }
     let mut read = Vec::new();
@@ -308,6 +313,11 @@ fn para(kind: ParaKind, spans: &[Span]) -> Para {
 /// For a byte position `at` on slide `slide` that's inside text in no flow, the sentence
 /// saying why it can't be edited. `None` for a position in a flow, or in nothing drawn.
 pub fn uneditable_reason(talk: &Talk, slide: usize, at: usize) -> Option<&'static str> {
+    uneditable_reason_with(talk, slide, at, &no_others)
+}
+
+/// [`uneditable_reason`], for the flows [`text_flows_with`] gives with `takes_content`.
+pub fn uneditable_reason_with(talk: &Talk, slide: usize, at: usize, takes_content: &dyn Fn(&str) -> bool) -> Option<&'static str> {
     let index = slide;
     let slide = talk.slides.get(index)?;
     if !slide.range.contains(&at) {
@@ -320,7 +330,7 @@ pub fn uneditable_reason(talk: &Talk, slide: usize, at: usize) -> Option<&'stati
     // Every byte of a block that was read into a flow is in it: its markers, the blank
     // lines between a list's items, a box's opening and closing tags.
     let read = block.is_some_and(|block| match block {
-        Block::Tag(tag) if is_positioned(tag) => box_flow(&talk.source, slide, tag).is_some(),
+        Block::Tag(tag) if is_positioned(tag) => box_flow(&talk.source, slide, tag, takes_content).is_some(),
         block => read_block(&talk.source, slide, block, &mut Vec::new()),
     });
     if read {

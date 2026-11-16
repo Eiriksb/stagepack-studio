@@ -6,17 +6,18 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use slides_components::Diagnostic;
 use slides_engine::{
-    AddedSet, Align, ComponentInfo, ComponentState, Deck, ElementBox, FolderFiles, Fonts, Layer, LayerTiming, Moment, PackError, Pixmap,
+    AddedSet, Align, ComponentInfo, ComponentState, Deck, SchemaLoad, ElementBox, FolderFiles, Fonts, Layer, LayerTiming, Moment, PackError, Pixmap,
     SlideTimeline, TalkFiles, TextLayout, Transition, WithAdded, layout_by_name, open_packed, text_align,
     read_talk_text,
 };
 use slides_format::{
-    Change, FlowPlace, MAX_SLIDE_BYTES, Para, Pos, Selection, SourceEdit, Talk, TextEdit, is_visible_char, parse_talk, reparse, set_align,
+    Change, FlowPlace, TextFlow, MAX_SLIDE_BYTES, Para, Pos, Selection, SourceEdit, Talk, TextEdit, is_visible_char, parse_talk, reparse, set_align,
     Block, NewTag, Tag, delete_block, find_tag, insert_block, set_tag_attr, set_tag_body, split_slides, storable,
-    tag_text, text_flows, write_flow, write_into_region, MAX_TABLE_COLUMNS, MAX_TABLE_ROWS, new_table, table_size,
+    tag_text, text_flows_with, write_flow_with, write_into_region, MAX_TABLE_COLUMNS, MAX_TABLE_ROWS, new_table, table_size,
 };
 use toolkit::{ComponentSchema, Theme};
 
@@ -97,6 +98,8 @@ pub enum EditRefused {
     RowTooLong,
     /// A table selected with no caret in it has no row or column of its own to act on.
     NeedsACell,
+    /// A component's build couldn't be loaded, so it couldn't be put on the slide.
+    ComponentNotLoaded,
 }
 
 impl std::fmt::Display for EditRefused {
@@ -125,6 +128,7 @@ impl std::fmt::Display for EditRefused {
             EditRefused::TooManyRows => MOST_ROWS,
             EditRefused::RowTooLong => LONG_ROW,
             EditRefused::NeedsACell => CLICK_IN_A_CELL,
+            EditRefused::ComponentNotLoaded => "That component couldn't be loaded, so it wasn't added.",
         })
     }
 }
@@ -360,9 +364,10 @@ pub struct Document {
     table_here: RefCell<Option<(TableKey, Option<TableHere>)>>,
     /// What the component palette offers, worked out again whenever the talk's components change.
     palette: Vec<PaletteEntry>,
-    /// The tags of the talk's own components that draw what's written between their tags, which
-    /// typing with one selected puts words in.
-    content_tags: Vec<String>,
+    /// The palette's components not loaded in this opening of it, which it doesn't try again.
+    palette_given_up: BTreeSet<String>,
+    /// The longest a step of loading the palette has taken.
+    palette_longest_step: Duration,
 }
 
 impl Document {
@@ -458,7 +463,8 @@ impl Document {
             files_to_save_walks: Cell::new(0),
             table_here: RefCell::new(None),
             palette: Vec::new(),
-            content_tags: Vec::new(),
+            palette_given_up: BTreeSet::new(),
+            palette_longest_step: Duration::ZERO,
         };
         document.components_looked_at();
         Ok(document)
@@ -1255,8 +1261,9 @@ impl Document {
     /// Which of its slide's `text_flows` the text being typed is, if it's in the talk yet: an
     /// empty region's isn't until something is typed in it.
     pub fn text_flow(&self) -> Option<usize> {
+        let content = self.content_tags();
         let editing = self.editing.as_ref()?;
-        let flows = guarded(|| text_flows(self.talk(), editing.slide)).ok()?;
+        let flows = guarded(|| flows_in(self.talk(), editing.slide, &content)).ok()?;
         editing.flow.find(&flows)
     }
 
@@ -1480,6 +1487,7 @@ impl Document {
     /// character in it, as Enter, a space or a paste of blank lines, writes nothing, and the box
     /// stays as it was, waiting.
     fn write_new_box(&mut self, editing: &EditingText, (x, y): (u32, u32), after: TextEdit, kind: Kind) -> Result<Vec<usize>, EditRefused> {
+        let content = self.content_tags();
         let Some(paras) = from_first_visible(&after.paras) else {
             // A choice of kind of paragraph is kept for what's typed next; blank text isn't.
             let kept = if kind == Kind::Formatted { after } else { editing.edit.clone() };
@@ -1490,13 +1498,13 @@ impl Document {
         let after = TextEdit { typing_style: after.typing_style.clone(), ..TextEdit::new(paras).move_to(end, false) };
         let slide = editing.slide;
         let align = editing.flow.new_box_align();
-        let (change, start) = guarded(|| new_box_change(self.talk(), slide, (x, y), align, &after.paras))?
+        let (change, start) = guarded(|| new_box_change(self.talk(), slide, (x, y), align, &after.paras, &content))?
             .ok_or(EditRefused::CouldNotBeTyped)?;
-        let count = guarded(|| text_flows(self.talk(), slide).len())? + 1;
+        let count = guarded(|| flows_in(self.talk(), slide, &content).len())? + 1;
         let expected = storable(&after.paras);
         let key = FlowKey::Tag { start };
         let reads_back = |candidate: &Talk| {
-            let flows = text_flows(candidate, slide);
+            let flows = flows_in(candidate, slide, &content);
             flows.len() == count && key.find(&flows).is_some_and(|index| flows[index].paras == expected)
         };
         let depth = self.history.depth();
@@ -1579,13 +1587,14 @@ impl Document {
     }
 
     fn work_out_table_here(&self) -> Option<TableHere> {
+        let content = self.content_tags();
         let talk = self.talk();
         let (slide, table, cell) = match &self.editing {
             Some(editing) => {
                 if !editing.is_cell() || editing.slide >= self.slide_count() {
                     return None;
                 }
-                let flows = text_flows(talk, editing.slide);
+                let flows = flows_in(talk, editing.slide, &content);
                 let FlowPlace::Cell { table, row, column } = &flows.get(editing.flow.find(&flows)?)?.place else {
                     return None;
                 };
@@ -1731,7 +1740,8 @@ impl Document {
     /// in, or that isn't there, gives way to the nearest of that row that can, or else the
     /// table's first. Says whether typing started.
     fn land_in_cell(&mut self, slide: usize, start: usize, (row, column): (usize, usize), end: bool) -> bool {
-        let Ok(flows) = guarded(|| text_flows(self.talk(), slide)) else {
+        let content = self.content_tags();
+        let Ok(flows) = guarded(|| flows_in(self.talk(), slide, &content)) else {
             return false;
         };
         let cells: Vec<(usize, usize, usize)> = flows
@@ -1759,6 +1769,7 @@ impl Document {
     /// typed in, and those a short row doesn't have, are gone past. Tab from the table's last
     /// cell, and Enter from its last row, add a row, as one step named "Add row", and go into it.
     pub fn move_in_table(&mut self, step: CellMove) -> Result<Vec<usize>, EditRefused> {
+        let content = self.content_tags();
         let Some(here) = self.table_here().filter(|here| here.caret) else {
             return Ok(Vec::new());
         };
@@ -1768,7 +1779,7 @@ impl Document {
             CellMove::Below => Beside::Below,
         };
         if let Some(index) = self.cell_beside(beside) {
-            let flows = guarded(|| text_flows(self.talk(), here.slide))?;
+            let flows = guarded(|| flows_in(self.talk(), here.slide, &content))?;
             let end = end_of(&flows[index].paras);
             self.begin_text(here.slide, index, end);
             return Ok(Vec::new());
@@ -1788,8 +1799,9 @@ impl Document {
     /// one before or after it in the order they're written, or the nearest above or below it in
     /// its column.
     pub fn cell_beside(&self, beside: Beside) -> Option<usize> {
+        let content = self.content_tags();
         let editing = self.editing.as_ref().filter(|editing| editing.is_cell())?;
-        let flows = guarded(|| text_flows(self.talk(), editing.slide)).ok()?;
+        let flows = guarded(|| flows_in(self.talk(), editing.slide, &content)).ok()?;
         let at = editing.flow.find(&flows)?;
         let FlowPlace::Cell { table, row, column } = &flows[at].place else {
             return None;
@@ -1811,15 +1823,16 @@ impl Document {
     /// Whether the thing selected takes typing: a shape, a box, or one of the talk's own
     /// components that takes content, with nothing in it, or with only text in it.
     pub fn selected_takes_text(&self) -> bool {
+        let content = self.content_tags();
         let Some(selected) = &self.selected else {
             return false;
         };
         let Some(tag) = self.selected_tag() else {
             return false;
         };
-        takes_text(tag, &self.content_tags)
+        takes_text(tag, &content)
             && (tag.children.is_empty()
-                || guarded(|| text_flows(self.talk(), selected.slide))
+                || guarded(|| flows_in(self.talk(), selected.slide, &content))
                     .is_ok_and(|flows| flows.iter().any(|flow| flow.place == FlowPlace::Tag(tag.range.clone()))))
     }
 
@@ -1842,10 +1855,11 @@ impl Document {
     /// `start` of slide `slide`: at the end of its text, or, with none, in it empty. Says whether
     /// it did.
     fn begin_text_in_tag(&mut self, slide: usize, start: usize) -> bool {
+        let content = self.content_tags();
         if slide >= self.slide_count() {
             return false;
         }
-        let Ok(flows) = guarded(|| text_flows(self.talk(), slide)) else {
+        let Ok(flows) = guarded(|| flows_in(self.talk(), slide, &content)) else {
             return false;
         };
         let key = FlowKey::Tag { start };
@@ -1853,7 +1867,7 @@ impl Document {
             let end = TextEdit::new(flows[index].paras.clone()).select_all().selection.end();
             return self.begin_text(slide, index, end);
         }
-        if !tag_starting_at(self.talk(), slide, start).is_some_and(|tag| waits_for_text(tag, &self.content_tags)) {
+        if !tag_starting_at(self.talk(), slide, start).is_some_and(|tag| waits_for_text(tag, &content)) {
             return false;
         }
         if let Err(refused) = self.end_text() {
@@ -1897,7 +1911,7 @@ impl Document {
         let para = editing.edit.selection.head.para;
         let inside = self
             .text_flow()
-            .is_some_and(|flow| selection::holds_para(self.talk(), editing.slide, flow, para, &selected.source));
+            .is_some_and(|flow| selection::holds_para(&self.text_flows(self.talk(), editing.slide), flow, para, &selected.source));
         if !inside {
             self.selected = None;
         }
@@ -1931,10 +1945,11 @@ impl Document {
     /// first, and `flow` is taken as it was before that. In the flow already being typed in,
     /// it only moves the caret. Says whether the slide has such a flow.
     pub fn begin_text(&mut self, slide: usize, flow: usize, pos: Pos) -> bool {
+        let content = self.content_tags();
         if slide >= self.slide_count() {
             return false;
         }
-        let Ok(flows) = guarded(|| text_flows(self.talk(), slide)) else {
+        let Ok(flows) = guarded(|| flows_in(self.talk(), slide, &content)) else {
             return false;
         };
         let Some(key) = FlowKey::of(&flows, flow) else {
@@ -1961,7 +1976,7 @@ impl Document {
             _ => flow,
         };
         self.go_to(slide);
-        let Ok(flows) = guarded(|| text_flows(self.talk(), slide)) else {
+        let Ok(flows) = guarded(|| flows_in(self.talk(), slide, &content)) else {
             return false;
         };
         let Some(key) = FlowKey::of(&flows, flow) else {
@@ -1985,6 +2000,7 @@ impl Document {
     /// text in it is typed into at the end of its first run of text. Says whether the slide's
     /// layout has such a region to type in.
     pub fn begin_text_in_region(&mut self, slide: usize, region: &str) -> bool {
+        let content = self.content_tags();
         if slide >= self.slide_count() {
             return false;
         }
@@ -1992,7 +2008,7 @@ impl Document {
             self.say(refused);
         }
         self.go_to(slide);
-        let Ok(flows) = guarded(|| text_flows(self.talk(), slide)) else {
+        let Ok(flows) = guarded(|| flows_in(self.talk(), slide, &content)) else {
             return false;
         };
         let place = slides_format::FlowPlace::Region(region.to_string());
@@ -2131,6 +2147,7 @@ impl Document {
         op: impl FnOnce(&TextEdit) -> TextEdit,
         label: Option<&'static str>,
     ) -> Result<Vec<usize>, EditRefused> {
+        let content = self.content_tags();
         // Anything done to the text drops what the system was composing: a commit types it.
         self.compose(None);
         let Some(editing) = self.editing.clone() else {
@@ -2138,9 +2155,9 @@ impl Document {
         };
         let slide = editing.slide;
         let flows = (slide < self.slide_count())
-            .then(|| guarded(|| text_flows(self.talk(), slide)).ok())
+            .then(|| guarded(|| flows_in(self.talk(), slide, &content)).ok())
             .flatten();
-        let Some(flows) = flows.filter(|flows| reads_as_typed(self.talk(), &self.content_tags, flows, &editing)) else {
+        let Some(flows) = flows.filter(|flows| reads_as_typed(self.talk(), &content, flows, &editing)) else {
             // The talk and what's typed have parted: nothing can be written safely.
             self.editing = None;
             self.held_color = None;
@@ -2162,7 +2179,7 @@ impl Document {
         }
         let found = editing.flow.find(&flows);
         let change = match (found, editing.flow.region()) {
-            (Some(index), _) => write_flow(self.talk(), slide, &flows[index], &after.paras),
+            (Some(index), _) => write_flow(self.talk(), slide, &flows[index], &after.paras, &content),
             // An empty region's first paragraph is written once it holds something.
             (None, Some(_)) if !holds_something(&after.paras) => {
                 self.keep_typed(after, editing.run);
@@ -2175,7 +2192,7 @@ impl Document {
                 return Ok(Vec::new());
             }
             (None, None) => match editing.flow.tag_start() {
-                Some(start) => guarded(|| write_into_tag(self.talk(), &self.content_tags, slide, start, &after.paras))?,
+                Some(start) => guarded(|| write_into_tag(self.talk(), &content, slide, start, &after.paras))?,
                 None => None,
             },
         };
@@ -2196,7 +2213,7 @@ impl Document {
         let count = flows.len() + usize::from(found.is_none());
         let key = editing.flow.clone();
         let reads_back = |candidate: &Talk| {
-            let flows = text_flows(candidate, slide);
+            let flows = flows_in(candidate, slide, &content);
             flows.len() == count
                 && key
                     .find(&flows)
@@ -2253,7 +2270,7 @@ impl Document {
         };
         let change = guarded(|| {
             let talk = self.talk();
-            let place = typed_place(talk, &editing)?;
+            let place = typed_place(talk, &editing, &self.content_tags())?;
             if text_align(talk, slide, &place) == Some(align) {
                 return Some(Change { edits: Vec::new() });
             }
@@ -2295,7 +2312,7 @@ impl Document {
             });
         }
         let talk = self.talk();
-        guarded(|| text_align(talk, editing.slide, &typed_place(talk, editing)?))
+        guarded(|| text_align(talk, editing.slide, &typed_place(talk, editing, &self.content_tags())?))
             .ok()
             .flatten()
     }
@@ -2328,6 +2345,7 @@ impl Document {
     /// away, as [`Self::end_text`] does; typing then goes on in its region, empty again, or
     /// ends if the region still has other text. Any other typing goes on as it was.
     pub fn settle_text(&mut self) -> Result<Vec<usize>, EditRefused> {
+        let content = self.content_tags();
         // What the system was composing isn't text yet, and isn't kept.
         self.compose(None);
         let given = self.give_held_first();
@@ -2344,7 +2362,7 @@ impl Document {
         let changed = joined(given, changed);
         if removed.is_some() {
             let region = editing.flow.region().unwrap_or_default();
-            let flows = guarded(|| text_flows(self.talk(), editing.slide)).ok();
+            let flows = guarded(|| flows_in(self.talk(), editing.slide, &content)).ok();
             self.editing = flows
                 .filter(|flows| !region_has_text(flows, region))
                 .map(|_| EditingText {
@@ -2371,20 +2389,21 @@ impl Document {
     /// take it, and if that leaves the step doing nothing, the step goes. A box of text is
     /// never taken away, as an empty box would be no text at all.
     fn tidy(&mut self, editing: &EditingText) -> Result<EndedText, EditRefused> {
+        let content = self.content_tags();
         let slide = editing.slide;
         if editing.flow.region().is_none() || slide >= self.slide_count() {
             return Ok((Vec::new(), None));
         }
         let (change, index, count) = {
             let talk = self.talk();
-            let flows = guarded(|| text_flows(talk, slide))?;
+            let flows = guarded(|| flows_in(talk, slide, &content))?;
             let Some(index) = editing.flow.find(&flows) else {
                 return Ok((Vec::new(), None));
             };
             if !holds_no_words(&flows[index].paras) {
                 return Ok((Vec::new(), None));
             }
-            (write_flow(talk, slide, &flows[index], &[]), index, flows.len())
+            (write_flow(talk, slide, &flows[index], &[], &content), index, flows.len())
         };
         let join = match editing.run {
             Some(run) if self.history.is_open(run) => Join::Run(EditRun::Continue(run)),
@@ -2408,7 +2427,7 @@ impl Document {
             return Ok((Vec::new(), None));
         }
         let depth = self.history.depth();
-        let emptied = |candidate: &Talk| text_flows(candidate, slide).len() + 1 == count;
+        let emptied = |candidate: &Talk| flows_in(candidate, slide, &content).len() + 1 == count;
         let changed = self
             .make_text(TYPING, slide, change, join, &emptied)
             .map_err(|_| EditRefused::CouldNotTidy)?;
@@ -2435,13 +2454,14 @@ impl Document {
     /// flow `index` of `editing`'s slide there: before it, the slide had all its other text as
     /// it is now, and not that flow.
     fn before_typed_in(&self, editing: &EditingText, index: usize) -> Option<Change> {
+        let content = self.content_tags();
         let undo = self.history.next_undo()?;
         let slide = editing.slide;
         let alike = guarded(|| {
             let before = reparse(self.talk(), undo.apply(self.source()));
-            let mut now = text_flows(self.talk(), slide);
+            let mut now = flows_in(self.talk(), slide, &content);
             now.remove(index);
-            let then = text_flows(&before, slide);
+            let then = flows_in(&before, slide, &content);
             before.slides.len() == self.slide_count()
                 && others_alike(self.talk(), &before, slide)
                 && then.len() == now.len()
@@ -2495,6 +2515,7 @@ impl Document {
     /// made again, and text found where only an empty region was is someone else's: in both,
     /// typing stays ended.
     fn resume_text(&mut self, mark: Option<TextMark>, before: bool) {
+        let content = self.content_tags();
         let Some(mark) = mark else {
             return;
         };
@@ -2510,7 +2531,7 @@ impl Document {
         if slide >= self.slide_count() {
             return;
         }
-        let Ok(flows) = guarded(|| text_flows(self.talk(), slide)) else {
+        let Ok(flows) = guarded(|| flows_in(self.talk(), slide, &content)) else {
             return;
         };
         self.editing = match (mark.flow.find(&flows), mark.flow.region()) {
@@ -2534,13 +2555,25 @@ impl Document {
             (None, None) => mark
                 .flow
                 .tag_start()
-                .filter(|&start| tag_starting_at(self.talk(), slide, start).is_some_and(|tag| waits_for_text(tag, &self.content_tags)))
+                .filter(|&start| tag_starting_at(self.talk(), slide, start).is_some_and(|tag| waits_for_text(tag, &content)))
                 .map(|start| EditingText {
                     session: mark.session,
                     ..EditingText::in_empty_tag(slide, start)
                 }),
             _ => None,
         };
+    }
+
+    /// The tags of the talk's components whose content is a box of text of its own as things
+    /// stand: those whose build is loaded, works and says it takes content. Nothing is loaded
+    /// to find out, so this is what the engine's text layout reads the slides with too.
+    fn content_tags(&self) -> Vec<String> {
+        self.deck.components().iter().filter(|info| self.deck.takes_content(&info.tag)).map(|info| info.tag.clone()).collect()
+    }
+
+    /// The flows of slide `slide` of `talk`, as the slide's text layout counts them.
+    pub fn text_flows(&self, talk: &Talk, slide: usize) -> Vec<TextFlow> {
+        flows_in(talk, slide, &self.content_tags())
     }
 
     /// The talk's own components, and whether each is built.
@@ -2571,48 +2604,96 @@ impl Document {
         self.palette.clone()
     }
 
-    /// Works out the palette again, and which of the talk's components take content, from the
-    /// talk's components as they are now.
+    /// Lists the palette again from the talk's components as they are now: which there are and
+    /// how built each is. Nothing is loaded: what each takes is known only once its build is.
     fn components_looked_at(&mut self) {
-        let deck = &mut self.deck;
-        let palette = guarded(|| {
-            let own: Vec<(String, ComponentState)> = deck.components().iter().map(|info| (info.tag.clone(), info.state)).collect();
-            let state_of = |tag: &str| own.iter().find(|(own, _)| own == tag).map(|(_, state)| *state);
-            let listed: Vec<String> = deck
-                .available_components()
-                .into_iter()
-                .filter(|tag| state_of(tag).is_some() && !LISTED_BUILT_INS.contains(&tag.as_str()))
-                .collect();
-            let built_ins = LISTED_BUILT_INS.iter().map(|tag| tag.to_string());
-            built_ins
-                .chain(listed)
-                .map(|tag| {
-                    let state = state_of(&tag);
-                    let takes_content = deck.component_schema(&tag).is_some_and(|schema| schema.children);
-                    PaletteEntry { label: palette::label(&tag), ours: state.is_some(), state, takes_content, tag }
-                })
-                .collect::<Vec<_>>()
+        let deck = &self.deck;
+        let listed = guarded(|| {
+            let own: Vec<String> = deck.components().iter().map(|info| info.tag.clone()).collect();
+            let theirs = deck.available_components().into_iter().filter(|tag| own.contains(tag) && !LISTED_BUILT_INS.contains(&tag.as_str()));
+            LISTED_BUILT_INS.iter().map(|tag| tag.to_string()).chain(theirs).collect::<Vec<_>>()
         });
-        self.palette = palette.unwrap_or_default();
-        self.content_tags = self.palette.iter().filter(|entry| entry.ours && entry.takes_content).map(|entry| entry.tag.clone()).collect();
+        let entries: Vec<PaletteEntry> = listed.unwrap_or_default().iter().map(|tag| self.palette_entry(tag)).collect();
+        self.palette = entries;
+    }
+
+    /// The palette's entry for `tag`, as far as is known without loading anything.
+    fn palette_entry(&self, tag: &str) -> PaletteEntry {
+        let state = self.deck.components().iter().find(|info| info.tag == tag).map(|info| info.state);
+        let (takes_content, loading) = match self.deck.loaded_schema(tag) {
+            SchemaLoad::Loaded(schema) => (schema.children, false),
+            SchemaLoad::Failed => (false, false),
+            _ => (false, state != Some(ComponentState::NeedsBuilding) && !self.palette_given_up.contains(tag)),
+        };
+        PaletteEntry { tag: tag.to_string(), label: palette::label(tag), ours: state.is_some(), state, takes_content, loading }
+    }
+
+    /// Starts an opening of the palette: each of its components whose build isn't loaded yet is
+    /// to be, by [`Self::palette_step`], with a budget of its own.
+    pub fn begin_palette(&mut self) {
+        self.palette_given_up.clear();
+        self.components_looked_at();
+    }
+
+    /// Loads the build of the first of the palette's components still loading, and fills in its
+    /// entry: one module at a time, which the sandbox holds to a quarter of a second of running.
+    /// Says whether any is still loading.
+    pub fn palette_step(&mut self) -> bool {
+        let Some(at) = self.palette.iter().position(|entry| entry.loading) else {
+            return false;
+        };
+        let tag = self.palette[at].tag.clone();
+        let deck = &mut self.deck;
+        let started = Instant::now();
+        let _ = guarded(|| deck.component_schema(&tag));
+        self.palette_longest_step = self.palette_longest_step.max(started.elapsed());
+        if let SchemaLoad::NotLoaded = self.deck.loaded_schema(&tag) {
+            // Nothing could be loaded for it: it isn't tried again this opening.
+            self.palette_given_up.insert(tag.clone());
+        }
+        self.palette[at] = self.palette_entry(&tag);
+        self.palette.iter().any(|entry| entry.loading)
+    }
+
+    /// Stops loading for this opening of the palette: what isn't loaded yet is listed as it is,
+    /// to be loaded if it's chosen.
+    pub fn give_up_palette(&mut self) {
+        let loading: Vec<String> = self.palette.iter().filter(|entry| entry.loading).map(|entry| entry.tag.clone()).collect();
+        self.palette_given_up.extend(loading);
+        self.components_looked_at();
+    }
+
+    /// The longest one [`Self::palette_step`] has taken, for tests.
+    #[doc(hidden)]
+    pub fn palette_longest_step(&self) -> Duration {
+        self.palette_longest_step
+    }
+
+    /// How many of the talk's modules have been loaded, or tried, for tests.
+    #[doc(hidden)]
+    pub fn modules_loaded(&self) -> usize {
+        self.deck.modules_loaded()
     }
 
     /// Puts the component `tag` from the palette on the current slide, [`COMPONENT_SIZE`] big,
     /// as one step named "Insert component", and selects it: written with what
     /// [`palette::default_attrs`] gives, and, if it takes content, an empty body. One the
-    /// palette doesn't offer, or one with no build, puts nothing there. Nothing is built.
+    /// palette doesn't offer, or one with no build, puts nothing there. One whose build can't
+    /// be loaded is refused. Nothing is built.
     pub fn insert_component(&mut self, tag: &str) -> Result<Vec<usize>, EditRefused> {
-        let Some(entry) = self.palette.iter().find(|entry| entry.tag == tag).filter(|entry| entry.can_insert()) else {
+        let listed = self.palette.iter().any(|entry| entry.tag == tag && entry.state != Some(ComponentState::NeedsBuilding));
+        if !listed {
             return Ok(Vec::new());
-        };
-        let takes_content = entry.takes_content;
+        }
         let deck = &mut self.deck;
-        let Some(schema) = guarded(|| deck.component_schema(tag))? else {
-            return Ok(Vec::new());
-        };
+        let schema = guarded(|| deck.component_schema(tag))?;
+        if let Some(at) = self.palette.iter().position(|entry| entry.tag == tag) {
+            self.palette[at] = self.palette_entry(tag);
+        }
+        let schema = schema.ok_or(EditRefused::ComponentNotLoaded)?;
         let attrs = palette::default_attrs(&schema, &self.deck.theme());
         let attrs: Vec<(&str, &str)> = attrs.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
-        let body = takes_content.then_some("");
+        let body = schema.children.then_some("");
         self.insert_sized(INSERT_COMPONENT, tag, &attrs, COMPONENT_SIZE, body)
     }
 
@@ -2824,6 +2905,17 @@ fn reads_as_typed(talk: &Talk, content: &[String], flows: &[slides_format::TextF
     }
 }
 
+/// The flows of slide `slide` of `talk`, with the tags in `content` taking content, as the
+/// engine's text layout reads them: see [`Document::content_tags`].
+fn flows_in(talk: &Talk, slide: usize, content: &[String]) -> Vec<TextFlow> {
+    text_flows_with(talk, slide, &|tag| content.iter().any(|name| name == tag))
+}
+
+/// [`write_flow_with`], with the tags in `content` taking content.
+fn write_flow(talk: &Talk, slide: usize, flow: &TextFlow, paras: &[Para], content: &[String]) -> Option<Change> {
+    write_flow_with(talk, slide, flow, paras, &|tag| content.iter().any(|name| name == tag))
+}
+
 /// Whether `tag` is one typing on it puts words in: a shape, a box, or one of the talk's own
 /// components that draws what's written between its tags, whose tags are `content`.
 fn takes_text(tag: &Tag, content: &[String]) -> bool {
@@ -2872,7 +2964,7 @@ fn from_first_visible(paras: &[Para]) -> Option<Vec<Para>> {
 /// at the end of slide `slide`'s content, as one edit, and where its tag starts once it's made:
 /// the box is written holding one empty paragraph, and that then written as `paras`. `None` if
 /// it can't be.
-fn new_box_change(talk: &Talk, slide: usize, (x, y): (u32, u32), align: Option<&str>, paras: &[Para]) -> Option<(Change, usize)> {
+fn new_box_change(talk: &Talk, slide: usize, (x, y): (u32, u32), align: Option<&str>, paras: &[Para], content: &[String]) -> Option<(Change, usize)> {
     let place = [x.to_string(), y.to_string(), insert::whole(TEXT_BOX_SIZE.0), insert::whole(TEXT_BOX_SIZE.1)];
     let mut attrs: Vec<(&str, &str)> = ["x", "y", "w", "h"].into_iter().zip(place.iter().map(String::as_str)).collect();
     attrs.extend(align.map(|align| ("align", align)));
@@ -2882,9 +2974,9 @@ fn new_box_change(talk: &Talk, slide: usize, (x, y): (u32, u32), align: Option<&
     let written = if edit.text.contains("\r\n") { text.replace('\n', "\r\n") } else { text.clone() };
     let start = edit.range.start + edit.text.find(&written)?;
     let held = reparse(talk, opened.apply(&talk.source));
-    let flows = text_flows(&held, slide);
+    let flows = flows_in(&held, slide, content);
     let index = FlowKey::Tag { start }.find(&flows)?;
-    let filled = write_flow(&held, slide, &flows[index], paras)?;
+    let filled = write_flow(&held, slide, &flows[index], paras, content)?;
     Some((one_edit(&talk.source, &filled.apply(&held.source)), start))
 }
 
@@ -2896,9 +2988,9 @@ fn write_into_tag(talk: &Talk, content: &[String], slide: usize, start: usize, p
     let tag = tag_starting_at(talk, slide, start).filter(|tag| waits_for_text(tag, content))?;
     let opened = set_tag_body(talk, slide, &tag.range, "&nbsp;")?;
     let held = reparse(talk, opened.apply(&talk.source));
-    let flows = text_flows(&held, slide);
+    let flows = flows_in(&held, slide, content);
     let index = FlowKey::Tag { start }.find(&flows)?;
-    let written = write_flow(&held, slide, &flows[index], paras)?;
+    let written = write_flow(&held, slide, &flows[index], paras, content)?;
     let text = written.apply(&held.source);
     Some(one_edit(&talk.source, &text))
 }
@@ -2924,11 +3016,11 @@ fn joined(mut a: Vec<usize>, b: Vec<usize>) -> Vec<usize> {
 }
 
 /// Where `editing`'s text is on its slide: its region, or the box it's in.
-fn typed_place(talk: &Talk, editing: &EditingText) -> Option<FlowPlace> {
+fn typed_place(talk: &Talk, editing: &EditingText, content: &[String]) -> Option<FlowPlace> {
     match &editing.flow {
         FlowKey::Region { name, .. } => Some(FlowPlace::Region(name.clone())),
         FlowKey::Box { .. } | FlowKey::Cell { .. } => {
-            let flows = text_flows(talk, editing.slide);
+            let flows = flows_in(talk, editing.slide, content);
             editing.flow.find(&flows).map(|index| flows[index].place.clone())
         }
         FlowKey::Tag { start } => {

@@ -4,7 +4,7 @@
 
 use std::ops::Range;
 
-use slides_format::{Block, Change, Talk, text_flows};
+use slides_format::{Block, Change, Talk, TextFlow};
 
 /// The thing selected: slide `slide`'s block or tag whose whole source is `source`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,9 +88,8 @@ pub(crate) fn block_at<'a>(blocks: &'a [Block], range: &Range<usize>) -> Option<
     })
 }
 
-/// Whether paragraph `para` of flow `flow` of slide `slide` is written inside `range`.
-pub(crate) fn holds_para(talk: &Talk, slide: usize, flow: usize, para: usize, range: &Range<usize>) -> bool {
-    let flows = text_flows(talk, slide);
+/// Whether paragraph `para` of flow `flow` of `flows`, a slide's, is written inside `range`.
+pub(crate) fn holds_para(flows: &[TextFlow], flow: usize, para: usize, range: &Range<usize>) -> bool {
     flows
         .get(flow)
         .and_then(|flow| flow.source.get(para))

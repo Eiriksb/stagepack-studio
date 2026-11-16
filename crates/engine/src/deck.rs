@@ -18,7 +18,7 @@ use crate::text_geometry::{LayerText, TextLayout};
 use crate::timeline::MAX_CLICK;
 use crate::{
     ComponentAsks, ComponentInfo, DisplayItem, Fonts, Layer, LayerSpec, LayerTiming, LayoutEnv, Moment, PictureCache, SlideTimeline,
-    TalkComponents, TalkFiles, Transition, builtin_registry, compose, layout_slide, render_layer, talk_theme,
+    SchemaLoad, TalkComponents, TalkFiles, Transition, builtin_registry, compose, layout_slide, render_layer, talk_theme,
 };
 
 /// How many scales of one slide are kept drawn. A zoom or a resize asks for many in a row.
@@ -60,8 +60,9 @@ struct Laid {
     texts: Vec<LayerText>,
     /// The regions of the layout with nothing in them.
     empty_regions: Vec<EmptyRegion>,
-    /// Where the slide's editable text is, once it's been asked for.
-    text_layout: Option<Arc<TextLayout>>,
+    /// Where the slide's editable text is, once it's been asked for, and the state of the
+    /// talk's loaded modules it was worked out for: which of them take content.
+    text_layout: Option<(u64, Arc<TextLayout>)>,
 }
 
 impl Laid {
@@ -427,6 +428,34 @@ impl Deck {
         self.components.problems()
     }
 
+    /// What the component `tag` takes, as far as is known without loading anything: a
+    /// built-in's, or one of the talk's own whose build is loaded already.
+    pub fn loaded_schema(&self, tag: &str) -> SchemaLoad {
+        if let Some(component) = self.registry.get(tag) {
+            return SchemaLoad::Loaded((component.schema)());
+        }
+        match self.components.loaded_schema(tag) {
+            None => SchemaLoad::NotLoaded,
+            Some(None) => SchemaLoad::Failed,
+            Some(Some(schema)) => SchemaLoad::Loaded(schema.clone()),
+        }
+    }
+
+    /// Whether `tag` is one of the talk's components whose build is loaded and working and
+    /// takes content, so that what's written between its tags is a box of text of its own.
+    /// Nothing is loaded to find out: a component not loaded yet, with no build, that
+    /// doesn't work, or no component at all, takes none. The text layout and whoever edits
+    /// the talk read its flows with this, as [`slides_format::text_flows_with`] does.
+    pub fn takes_content(&self, tag: &str) -> bool {
+        self.registry.get(tag).is_none() && self.components.takes_content(tag)
+    }
+
+    /// How many of the talk's modules have been loaded, or tried, for tests.
+    #[doc(hidden)]
+    pub fn modules_loaded(&self) -> usize {
+        self.components.loads()
+    }
+
     /// What the component `tag` takes, for a form: a built-in, or one of the talk's own.
     pub fn component_schema(&mut self, tag: &str) -> Option<ComponentSchema> {
         match self.registry.get(tag) {
@@ -681,11 +710,18 @@ impl Deck {
             return Arc::new(TextLayout::default());
         }
         let moment = self.ensure_whole(index);
-        let talk = &self.talk;
+        let (talk, components) = (&self.talk, &self.components);
+        let generation = components.loaded_generation();
         let laid = self.slides[index].laid_at_mut(moment);
-        laid.text_layout
-            .get_or_insert_with(|| Arc::new(TextLayout::build(talk, index, &laid.specs, &laid.texts, &laid.empty_regions)))
-            .clone()
+        if let Some((built_for, layout)) = &laid.text_layout
+            && *built_for == generation
+        {
+            return layout.clone();
+        }
+        let takes_content = |tag: &str| components.takes_content(tag);
+        let layout = Arc::new(TextLayout::build(talk, index, &laid.specs, &laid.texts, &laid.empty_regions, &takes_content));
+        laid.text_layout = Some((generation, layout.clone()));
+        layout
     }
 
     /// Every source range slide `index`'s text geometry is read from, in order, for tests.

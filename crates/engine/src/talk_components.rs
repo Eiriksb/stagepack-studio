@@ -57,6 +57,16 @@ pub struct ComponentInfo {
     pub state: ComponentState,
 }
 
+/// What's known of a component's schema without loading anything.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SchemaLoad {
+    /// Its build hasn't been loaded yet, or it has none.
+    NotLoaded,
+    /// Its build was loaded and doesn't work.
+    Failed,
+    Loaded(ComponentSchema),
+}
+
 /// What came of asking a talk's component to render.
 pub(crate) enum Rendered {
     Output(RenderOutput),
@@ -121,6 +131,10 @@ pub struct TalkComponents {
     /// The nodes made since the slide being laid out was started.
     nodes: usize,
     assets_read: AssetsRead,
+    /// How many modules have been loaded, or tried.
+    loads: usize,
+    /// Changes whenever a module is loaded or let go of, and so whenever what takes content can.
+    loaded_generation: u64,
 }
 
 struct NoFiles;
@@ -240,6 +254,8 @@ impl TalkComponents {
             spent: Duration::ZERO,
             nodes: 0,
             assets_read: AssetsRead::default(),
+            loads: 0,
+            loaded_generation: 0,
         };
         components.rescan(registry);
         components
@@ -280,6 +296,7 @@ impl TalkComponents {
         self.add_builds_with_no_source(&index, &named, registry);
 
         let runnable = &self.runnable;
+        let loaded_before = self.loaded.len();
         self.loaded.retain(|path, loaded| {
             runnable.values().filter_map(|runnable| runnable.build.as_ref()).any(|build| build.path == *path && build.identity == loaded.identity)
         });
@@ -288,7 +305,34 @@ impl TalkComponents {
         self.sources_seen.retain(|path, _| still_there(path));
         self.builds_seen.retain(|path, _| still_there(path));
         self.index_seen.retain(|path, _| still_there(path));
+        if self.loaded.len() != loaded_before {
+            self.loaded_generation += 1;
+        }
         self.summary() != before || assets_changed
+    }
+
+    /// What `tag` takes, if its build is loaded already: `None` if it isn't loaded, or there's
+    /// no build of it to load; `Some(None)` if it was tried and doesn't work. Nothing is loaded.
+    pub(crate) fn loaded_schema(&self, tag: &str) -> Option<Option<&ComponentSchema>> {
+        let build = self.runnable.get(tag)?.build.as_ref()?;
+        let loaded = self.loaded.get(&build.path).filter(|loaded| loaded.identity == build.identity)?;
+        Some(loaded.component.as_ref().ok().map(WasmComponent::schema).filter(|schema| schema.name == tag))
+    }
+
+    /// Whether `tag` is a component of the talk's whose build is loaded and working and says it
+    /// takes content: what's written between its tags is its to draw. Nothing is loaded.
+    pub(crate) fn takes_content(&self, tag: &str) -> bool {
+        self.loaded_schema(tag).flatten().is_some_and(|schema| schema.children)
+    }
+
+    /// Changes whenever a module is loaded or let go of.
+    pub(crate) fn loaded_generation(&self) -> u64 {
+        self.loaded_generation
+    }
+
+    /// How many modules have been loaded, or tried.
+    pub(crate) fn loads(&self) -> usize {
+        self.loads
     }
 
     pub(crate) fn assets_remembered(&self) -> usize {
@@ -365,6 +409,8 @@ impl TalkComponents {
     fn component(&mut self, tag: &str, build: &Build) -> Result<&WasmComponent, ComponentError> {
         if !self.loaded.contains_key(&build.path) {
             let (component, bytes) = self.load(&build.path);
+            self.loads += 1;
+            self.loaded_generation += 1;
             self.loaded.insert(build.path.clone(), Loaded { identity: build.identity.clone(), component, bytes });
         }
         let component = self.loaded[&build.path].component.as_ref().map_err(Clone::clone)?;

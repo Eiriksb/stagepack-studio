@@ -9,7 +9,7 @@
 //! the click does anything else, so a change never goes to the wrong thing.
 
 mod fields;
-mod labels;
+pub(crate) mod labels;
 
 use std::path::Path;
 use std::sync::Arc;

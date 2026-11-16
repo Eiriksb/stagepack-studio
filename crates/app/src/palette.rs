@@ -1,8 +1,15 @@
 //! The component palette: the list the Insert tab's Component tool opens, from which a chart or
 //! one of the talk's own components goes on the slide. What the list holds is the document's
-//! ([`crate::document::Document::palette`]), worked out again only when the talk's components
-//! change; what a new one is written with is [`default_attrs`]'s. A click on an entry asks the
-//! window to put it on the slide. Nothing here builds anything.
+//! ([`crate::document::Document::palette`]), listed again only when the talk's components
+//! change; what a new one is written with is [`default_attrs`]'s. Opening the list loads the
+//! builds not loaded yet, one at a time with the window drawn between, for at most
+//! [`LOADING_BUDGET`]; an entry still waiting says so. A click on an entry asks the window to
+//! put it on the slide. Nothing here builds anything.
+
+use std::future::Future;
+use std::pin::Pin;
+use std::task::Poll;
+use std::time::{Duration, Instant};
 
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, v_flex};
@@ -13,6 +20,7 @@ use toolkit::{ComponentSchema, PropKind, Theme};
 
 use crate::document::Document;
 use crate::insert::hex;
+use crate::inspector::labels::attribute;
 
 /// The list the Component tool opens.
 pub const COMPONENT_LIST_ID: &str = "component-list";
@@ -23,6 +31,11 @@ pub const NO_COMPONENTS_OF_ITS_OWN: &str = "This talk has no components of its o
 pub const NEEDS_BUILDING_FIRST: &str = "Build this talk's components first.";
 /// What an entry for a component whose build is older than its source says beside its name.
 pub const OUT_OF_DATE: &str = "out of date";
+/// What an entry whose build isn't loaded yet says beside its name, and when pointed at.
+pub const STILL_LOADING: &str = "Still loading…";
+
+/// The most time an opening of the palette spends loading its components' builds.
+pub const LOADING_BUDGET: Duration = Duration::from_secs(1);
 
 /// How big a new component is, in slide units.
 pub const COMPONENT_SIZE: (f32, f32) = (640.0, 360.0);
@@ -45,14 +58,18 @@ pub struct PaletteEntry {
     /// How built it is, for one of the talk's own.
     pub state: Option<ComponentState>,
     /// Whether it draws what's written between its tags, so that it's written with a body and
-    /// typing with it selected puts words in it.
+    /// typing with it selected puts words in it. Known once its build is loaded.
     pub takes_content: bool,
+    /// Whether its build is still to be loaded in this opening of the palette, which it can't
+    /// be put on the slide till it is.
+    pub loading: bool,
 }
 
 impl PaletteEntry {
-    /// Whether it can go on the slide: it has a build to run, or is a built-in.
+    /// Whether it can go on the slide: it has a build to run, or is a built-in, and isn't
+    /// waiting for its build to load.
     pub fn can_insert(&self) -> bool {
-        self.state != Some(ComponentState::NeedsBuilding)
+        self.state != Some(ComponentState::NeedsBuilding) && !self.loading
     }
 }
 
@@ -72,14 +89,20 @@ pub fn label(tag: &str) -> String {
     crate::selection::spaced(tag)
 }
 
-/// What `entry` says beside its name: that its build is out of date, if it is.
+/// What `entry` says beside its name: that its build is still loading, or out of date.
 pub fn note(entry: &PaletteEntry) -> Option<&'static str> {
+    if entry.loading {
+        return Some(STILL_LOADING);
+    }
     (entry.state == Some(ComponentState::OutOfDate)).then_some(OUT_OF_DATE)
 }
 
 /// What `entry` says when pointed at: why it can't go on the slide, if it can't.
 pub fn tooltip(entry: &PaletteEntry) -> Option<&'static str> {
-    (!entry.can_insert()).then_some(NEEDS_BUILDING_FIRST)
+    if entry.state == Some(ComponentState::NeedsBuilding) {
+        return Some(NEEDS_BUILDING_FIRST);
+    }
+    entry.loading.then_some(STILL_LOADING)
 }
 
 /// The attributes a new tag of the component `schema` describes is written with, in the order
@@ -105,7 +128,7 @@ pub fn default_attrs(schema: &ComponentSchema, theme: &Theme) -> Vec<(String, St
                 // Text, and any kind a later interface adds, which takes text.
                 _ => String::new(),
             };
-            let name = prop.name.replace('_', "-");
+            let name = attribute(&prop.name);
             (is_attr_name(&name) && is_writable(&value)).then_some((name, value))
         })
         .collect()
@@ -132,6 +155,8 @@ pub struct InsertComponent(pub String);
 pub struct ComponentList {
     document: Option<Entity<Document>>,
     open: bool,
+    /// Loading the builds of the components listed, while it's open and some are still to load.
+    loading: Option<Task<()>>,
     _document_changed: Option<Subscription>,
 }
 
@@ -148,23 +173,72 @@ impl ComponentList {
                 }
             })
         });
-        ComponentList { document, open: false, _document_changed: document_changed }
+        ComponentList { document, open: false, loading: None, _document_changed: document_changed }
     }
 
     pub fn is_open(&self) -> bool {
         self.open
     }
 
+    /// Opens the list, starting to load the builds of the components in it not loaded yet, or
+    /// closes it, stopping that.
     pub fn set_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        if self.open != open {
-            self.open = open;
-            cx.notify();
+        if self.open == open {
+            return;
         }
+        self.open = open;
+        self.loading = None;
+        if open && let Some(document) = self.document.clone() {
+            document.update(cx, |document, _| document.begin_palette());
+            let document = document.downgrade();
+            self.loading = Some(cx.spawn(async move |_, cx| load_builds(document, cx).await));
+        }
+        cx.notify();
     }
 
     fn pick(&mut self, tag: String, cx: &mut Context<Self>) {
         cx.emit(InsertComponent(tag));
         self.set_open(false, cx);
+    }
+}
+
+/// Loads the builds of `document`'s palette one at a time, letting the window draw between
+/// each, until they're all loaded or [`LOADING_BUDGET`] is spent. The list hears of each.
+async fn load_builds(document: WeakEntity<Document>, cx: &mut AsyncApp) {
+    let started = Instant::now();
+    loop {
+        Yield(false).await;
+        if started.elapsed() >= LOADING_BUDGET {
+            document.update(cx, |document, cx| {
+                document.give_up_palette();
+                cx.notify();
+            }).ok();
+            return;
+        }
+        let more = document.update(cx, |document, cx| {
+            let more = document.palette_step();
+            cx.notify();
+            more
+        });
+        if !matches!(more, Ok(true)) {
+            return;
+        }
+    }
+}
+
+/// Gives the executor back once, so that the window can draw.
+struct Yield(bool);
+
+impl Future for Yield {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<()> {
+        if self.0 {
+            return Poll::Ready(());
+        }
+        self.0 = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 
@@ -215,6 +289,8 @@ impl Render for ComponentList {
             .id(COMPONENT_LIST_ID)
             .test_support()
             .min_w(px(200.))
+            .max_h(px(420.))
+            .overflow_y_scroll()
             .p_1()
             .gap(px(2.))
             .children(rows)

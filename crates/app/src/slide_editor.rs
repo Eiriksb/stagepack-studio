@@ -17,7 +17,7 @@ use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use slides_engine::{Align, CaretRect, ElementBox, Hit, LineMove, Rect, SelectionRects, TextLayout};
-use slides_format::{Block, FlowPlace, Motion, Para, ParaKind, Pos, Selection, Span, StyleBit, TextEdit, text_flows, uneditable_reason};
+use slides_format::{Block, FlowPlace, Motion, Para, ParaKind, Pos, Selection, Span, StyleBit, TextEdit, uneditable_reason};
 
 use crate::clipboard::{self, TextPaste};
 use crate::clipboard_tools::write_clipboard;
@@ -462,9 +462,10 @@ impl SlideEditor {
     /// A cell of a table is typed in at once.
     fn box_of_text(&self, slide: usize, flow: usize, para: usize, (x, y): (f32, f32), cx: &mut Context<Self>) -> Option<Range<usize>> {
         let element = self.layout(slide, cx)?.element_at(x, y)?;
-        let talk = self.document.as_ref()?.read(cx).talk();
-        let in_cell = text_flows(talk, slide).get(flow).is_some_and(|flow| matches!(flow.place, FlowPlace::Cell { .. }));
-        (!in_cell && element.holds_text && selection::holds_para(talk, slide, flow, para, &element.source)).then_some(element.source)
+        let document = self.document.as_ref()?.read(cx);
+        let flows = document.text_flows(document.talk(), slide);
+        let in_cell = flows.get(flow).is_some_and(|flow| matches!(flow.place, FlowPlace::Cell { .. }));
+        (!in_cell && element.holds_text && selection::holds_para(&flows, flow, para, &element.source)).then_some(element.source)
     }
 
     /// Why the cell of the table `table` on slide `slide` that (`x`, `y`) is well inside can't be
@@ -1046,7 +1047,8 @@ impl SlideEditor {
         let Some(target) = at_edge.then(|| document.read(cx).cell_beside(beside)).flatten() else {
             return false;
         };
-        let paras = text_flows(document.read(cx).talk(), slide).get(target).map(|flow| flow.paras.clone()).unwrap_or_default();
+        let document = document.read(cx);
+        let paras = document.text_flows(document.talk(), slide).get(target).map(|flow| flow.paras.clone()).unwrap_or_default();
         let target_end = TextEdit::new(paras).select_all().selection.end();
         let x = self.wanted_x.or_else(|| layout.caret(flow, head).map(|caret| caret.x));
         let pos = match beside {

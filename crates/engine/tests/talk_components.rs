@@ -80,6 +80,17 @@ fn module_of_pages(name: &str, imports: &str, extra: &str, render: &str, pages: 
 }
 
 /// A module called `name` whose every render answers `answer`.
+/// A module called `name` whose schema says it takes no content, answering `answer`.
+fn answering_without_content(name: &str, answer: &str) -> Vec<u8> {
+    let wasm = answering(name, answer);
+    let (with, without) = (b"\"children\":true}", b"\"children\":false");
+    let at = wasm.windows(with.len()).position(|window| window == with).expect("the schema is in the module");
+    let mut wasm = wasm;
+    wasm[at..at + without.len()].copy_from_slice(without);
+    wasm[at + without.len()] = b'}';
+    wasm
+}
+
 fn answering(name: &str, answer: &str) -> Vec<u8> {
     let extra = data(ANSWER_AT, answer.as_bytes());
     module(name, "", &extra, &format!("(i64.const {})", packed(ANSWER_AT, answer.len())))
@@ -956,4 +967,62 @@ fn the_components_available_are_the_built_ins_and_the_talks_own() {
     files.put("components/apple.rs", source("Apple"));
     let deck = open(&files);
     assert_eq!(deck.available_components(), ["Apple", "Box", "Chart", "Hello", "Icon", "Picture", "Shape"]);
+}
+
+// What a click on a placed component lands on.
+
+/// The source range of the block starting with `start` in `source`, up to the end of its
+/// closing tag `</name>`.
+fn tag_range(source: &str, start: &str, name: &str) -> std::ops::Range<usize> {
+    let at = source.find(start).unwrap();
+    let close = format!("</{name}>");
+    at..at + source[at..].find(&close).unwrap() + close.len()
+}
+
+/// What a click in the middle of `rect` on slide 0 lands on.
+fn hit_in(deck: &mut Deck, x: f32, y: f32) -> Hit {
+    deck.text_layout(0).hit(x, y).expect("a point on the slide")
+}
+
+#[test]
+fn a_click_on_a_component_that_does_not_draw_its_words_selects_it() {
+    let source = "# T\n\nBody words\n\n<Hello x=\"100\" y=\"300\" w=\"700\" h=\"300\">\n\nHidden words\n\n</Hello>\n\n\
+                  <Nope x=\"900\" y=\"300\" w=\"300\" h=\"300\">\n\nUnknown words\n\n</Nope>\n\n\
+                  <Later x=\"1300\" y=\"300\" w=\"300\" h=\"300\">\n\nLater words\n\n</Later>\n";
+    // Hello takes no content, then takes it but doesn't put it anywhere; Nope is no component;
+    // Later has no build.
+    for hello in [answering_without_content("Hello", &text_answer("Drawn")), answering("Hello", &text_answer("Drawn"))] {
+        let files = talk_with_hello(source, hello);
+        files.put("components/later.rs", source_of_later());
+        let mut deck = open(&files);
+        assert_eq!(info(&deck, "Later").state, ComponentState::NeedsBuilding);
+        for (x, y, start, name) in [(450.0, 450.0, "<Hello", "Hello"), (1050.0, 450.0, "<Nope", "Nope"), (1450.0, 450.0, "<Later", "Later")] {
+            let hit = hit_in(&mut deck, x, y);
+            let Hit::Element(element) = &hit else { panic!("{name}: {hit:?}") };
+            assert_eq!(element.source, tag_range(source, start, name), "{name}");
+        }
+    }
+}
+
+fn source_of_later() -> String {
+    source("Later")
+}
+
+#[test]
+fn a_component_that_draws_its_words_takes_typing_there() {
+    let answer = r#"{"element":{"Stack":{"horizontal":false,"gap":0.0,"children":[{"Text":{"text":"Before","size":null,"bold":false,"color":null}},"Children"]}}}"#;
+    let source = "# T\n\n<Hello x=\"100\" y=\"300\" w=\"700\" h=\"400\">\n\nInside\n\n</Hello>\n";
+    let files = talk_with_hello(source, answering("Hello", answer));
+    let mut deck = open(&files);
+    assert!(!deck.takes_content("Hello"), "not loaded yet");
+    assert_eq!(deck.modules_loaded(), 0, "opening loads nothing");
+    let layout = deck.text_layout(0);
+    assert!(deck.takes_content("Hello"), "loaded as its slide was drawn");
+    assert_eq!(deck.modules_loaded(), 1);
+    let flows = slides_format::text_flows_with(&slides_format::parse_talk(source), 0, &|name| deck.takes_content(name));
+    let boxed = flows.iter().position(|flow| matches!(flow.place, slides_format::FlowPlace::Tag(_))).expect("its words are a flow");
+    let caret = layout.caret(boxed, slides_format::Pos { para: 0, offset: 0 }).expect("placed where it's drawn");
+    let hit = hit_in(&mut deck, caret.x + 1.0, caret.top + caret.height / 2.0);
+    assert_eq!(hit, Hit::Text { flow: boxed, pos: slides_format::Pos { para: 0, offset: 0 } });
+    assert!(!deck.takes_content("Nope"));
 }

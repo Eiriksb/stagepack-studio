@@ -7,7 +7,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use cosmic_text::{Align as TextAlign, BidiParagraphs, Buffer};
-use slides_format::{Block, FlowPlace, Pos, Talk, text_flows, uneditable_reason};
+use slides_format::{Block, FlowPlace, Pos, Talk, text_flows_with, uneditable_reason, uneditable_reason_with};
 use tiny_skia::{Point, Transform};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -330,6 +330,9 @@ fn is_element(block: &Block) -> bool {
     }
 }
 
+/// What a click on a component's words that it didn't draw says, if the format has nothing to say.
+const UNDRAWN: &str = "Text inside a component can't be edited on the slide yet.";
+
 /// The least an element is thick where it's picked, so that a line can be.
 const PICK_THICKNESS: f32 = 16.0;
 
@@ -418,8 +421,16 @@ fn para_lines(drawn: &DrawnText, rect: Rect, cell: Option<Rect>) -> ParaLines {
 
 impl TextLayout {
     /// The layout of slide `index` of `talk`, whose layers are `specs`, drew `drawn`, and
-    /// left `empty` empty.
-    pub(crate) fn build(talk: &Talk, index: usize, specs: &[LayerSpec], drawn: &[LayerText], empty: &[EmptyRegion]) -> TextLayout {
+    /// left `empty` empty. Its flows are those [`text_flows_with`] gives with `takes_content`,
+    /// the tags of the talk's components whose content is a box of text of its own.
+    pub(crate) fn build(
+        talk: &Talk,
+        index: usize,
+        specs: &[LayerSpec],
+        drawn: &[LayerText],
+        empty: &[EmptyRegion],
+        takes_content: &dyn Fn(&str) -> bool,
+    ) -> TextLayout {
         let mut layout = TextLayout {
             frames: specs.iter().zip(drawn).map(|(spec, text)| frame_of(spec.rect, spec.rotate, text.whole, text.region)).collect(),
             placeholders: empty
@@ -445,7 +456,8 @@ impl TextLayout {
                 found.insert((drawn.range.end, drawn.inline.start, drawn.inline.end), (layer, drawn));
             }
         }
-        for (f, flow) in text_flows(talk, index).iter().enumerate() {
+        let flows = text_flows_with(talk, index, takes_content);
+        for (f, flow) in flows.iter().enumerate() {
             for (p, source) in flow.source.iter().enumerate() {
                 let Some(&(layer, text)) = found.get(&(source.block.end, source.inline.start, source.inline.end)) else { continue };
                 // The flow is where the format crate says it is, or it isn't placed at all.
@@ -505,12 +517,22 @@ impl TextLayout {
                     layout.tables.push(TableGrid { layer, source: block.range.clone(), rect, element: at, cells: grid.collect() });
                     continue;
                 }
-                if let Some(reason) = uneditable_reason(talk, index, block.range.start) {
+                if let Some(reason) = uneditable_reason_with(talk, index, block.range.start, takes_content) {
                     found.push((if at.is_some() { picked(rect) } else { rect }, reason, at));
                 }
             }
+            // A tag whose words are a flow, but which drew none of them, is a thing to pick as a
+            // whole, as a tag whose words are no flow is: never a hole onto what's behind it.
+            let undrawn = |source: &Range<usize>| {
+                let flow = flows.iter().position(|flow| flow.place == FlowPlace::Tag(source.clone()));
+                flow.is_some_and(|flow| !layout.paras.iter().any(|placed| placed.flow == flow))
+                    .then(|| uneditable_reason(talk, index, source.start).unwrap_or(UNDRAWN))
+            };
             if text.whole
-                && let Some(reason) = specs[layer].source.as_ref().and_then(|source| uneditable_reason(talk, index, source.start))
+                && let Some(reason) = specs[layer]
+                    .source
+                    .as_ref()
+                    .and_then(|source| uneditable_reason_with(talk, index, source.start, takes_content).or_else(|| undrawn(source)))
             {
                 found.push((if whole.is_some() { picked(origin) } else { origin }, reason, whole));
             }

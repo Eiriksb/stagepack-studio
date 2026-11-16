@@ -263,23 +263,29 @@ fn text_in_a_box_is_a_flow_of_its_own() {
 }
 
 #[test]
-fn a_placed_component_holding_only_text_is_a_box_of_its_own() {
+fn a_placed_component_is_a_box_of_text_only_when_the_caller_says_it_takes_content() {
     let source = "# T\n\n<Callout title=\"Hi\" x=\"10\" y=\"10\" w=\"600\" h=\"300\">\n\nWords\n\n</Callout>\n";
     let talk = parse_talk(source);
-    let all = text_flows(&talk, 0);
+    let words = source.find("Words").unwrap();
+    // On its own, the format knows only its own boxes.
+    assert_eq!(text_flows(&talk, 0).len(), 1, "the title alone");
+    assert_eq!(uneditable_reason(&talk, 0, words), Some("Text inside a component can't be edited on the slide yet."));
+    let callout = |name: &str| name == "Callout";
+    let all = text_flows_with(&talk, 0, &callout);
     let tag = source.find("<Callout").unwrap()..source.trim_end().len();
     let boxed: Vec<&TextFlow> = all.iter().filter(|flow| flow.place == FlowPlace::Tag(tag.clone())).collect();
     assert_eq!(boxed.len(), 1, "{all:?}");
     assert_eq!(boxed[0].paras, vec![para(ParaKind::Body, "Words")]);
-    assert_eq!(uneditable_reason(&talk, 0, source.find("Words").unwrap()), None);
+    assert_eq!(uneditable_reason_with(&talk, 0, words, &callout), None);
+    // Written into with the same answer, it reads back.
+    let typed = vec![para(ParaKind::Body, "New words")];
+    let change = write_flow_with(&talk, 0, boxed[0], &typed, &callout).expect("written");
+    let after = parse_talk(&change.apply(source));
+    assert_eq!(text_flows_with(&after, 0, &callout)[1].paras, typed);
+    assert_eq!(write_flow(&talk, 0, boxed[0], &typed), None, "not a flow without the answer");
     // Not placed, it's part of the slide's own content, which it isn't text of.
     let unplaced = "# T\n\n<Callout title=\"Hi\">\n\nWords\n\n</Callout>\n";
-    assert_eq!(flows(unplaced).len(), 1, "the title alone");
-    // A built-in that draws nothing written inside it is no box.
-    for name in ["Chart", "Picture", "Icon"] {
-        let placed = format!("# T\n\n<{name} x=\"10\" y=\"10\" w=\"600\" h=\"300\">\n\nWords\n\n</{name}>\n");
-        assert_eq!(flows(&placed).len(), 1, "{name}");
-    }
+    assert_eq!(text_flows_with(&parse_talk(unplaced), 0, &callout).len(), 1, "the title alone");
 }
 
 #[test]
