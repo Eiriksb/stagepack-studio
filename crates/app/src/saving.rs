@@ -6,11 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use slides_engine::{
-    FolderFiles, PackError, TalkFiles, copy_talk_folder, lies_within, open_packed,
+    FolderFiles, NewFile, PackError, TalkFiles, copy_talk_folder, lies_within, open_packed,
     pack_folder_with_slides, read_talk_text, repack_with_slides, unpack_with_slides,
-    write_atomically,
+    write_atomically, write_new_atomically,
 };
 
+use crate::added_files::{NotAdded, is_added_path};
 use crate::builds;
 use crate::document::{SLIDES_FILE, TalkPlace};
 
@@ -32,6 +33,8 @@ pub struct SaveJob {
     on_disk: String,
     from: TalkPlace,
     to: Option<SaveTarget>,
+    /// The files added to the talk that the text uses and aren't saved yet, by their path in it.
+    added: Vec<(String, Arc<[u8]>)>,
 }
 
 /// Why a save didn't write anything.
@@ -72,6 +75,8 @@ pub struct Saved {
     pub(crate) written: String,
     /// Where the talk is kept now, and its files there, after a Save As.
     pub(crate) moved_to: Option<(TalkPlace, SharedFiles)>,
+    /// The files added to the talk that were written, by their path in it.
+    pub(crate) files_written: Vec<String>,
     notices: Vec<String>,
 }
 
@@ -93,24 +98,30 @@ impl SaveJob {
         on_disk: String,
         from: TalkPlace,
         to: Option<SaveTarget>,
+        added: Vec<(String, Arc<[u8]>)>,
     ) -> SaveJob {
         SaveJob {
             text,
             on_disk,
             from,
             to,
+            added,
         }
     }
 
-    /// Writes the talk out. A failure says why, in words for the person saving, and leaves
-    /// what was there as it was.
+    /// Writes the talk out, with the files added to it that its text uses. A failure says why,
+    /// in words for the person saving, and leaves what was there as it was: a folder may have
+    /// some of those files in it, which nothing uses until a save writes its text.
     pub fn run(self) -> Result<Saved, SaveError> {
         let SaveJob {
             text,
             on_disk,
             from,
             to,
+            added,
         } = self;
+        let files_written: Vec<String> = added.iter().map(|(path, _)| path.clone()).collect();
+        let extra = || -> Vec<NewFile> { added.iter().map(|(path, bytes)| (path.clone(), bytes.to_vec())).collect() };
         if let (TalkPlace::Folder(folder), Some(SaveTarget::Folder(to) | SaveTarget::Packed(to))) =
             (&from, &to)
             && lies_within(to, folder)
@@ -129,6 +140,10 @@ impl SaveJob {
                 if let Some(found) = found {
                     changed_outside(found, &on_disk, &text)?;
                 }
+                // Before the text, so that a talk cut short never names a file it hasn't got.
+                for (path, bytes) in &added {
+                    write_added(folder, path, bytes)?;
+                }
                 write_slides(folder, &text)?;
                 (None, Vec::new())
             }
@@ -137,11 +152,11 @@ impl SaveJob {
                 if let Ok(found) = open_packed(file).and_then(|packed| packed.slides()) {
                     changed_outside(found, &on_disk, &text)?;
                 }
-                repack_with_slides(file, file, &text, APP_VERSION).map_err(|e| failed(file, e))?;
+                repack_with_slides(file, file, &text, APP_VERSION, &extra()).map_err(|e| failed(file, e))?;
                 (None, Vec::new())
             }
             (TalkPlace::Folder(folder), Some(SaveTarget::Folder(to))) => {
-                let report = copy_talk_folder(folder, &to, &text).map_err(|e| failed(&to, e))?;
+                let report = copy_talk_folder(folder, &to, &text, &extra()).map_err(|e| failed(&to, e))?;
                 let left_out = report.skipped.into_iter().map(|name| format!("{name} was left out"));
                 let outside = report
                     .outside_pictures
@@ -150,7 +165,7 @@ impl SaveJob {
                 (Some(in_folder(to)), left_out.chain(outside).collect())
             }
             (TalkPlace::Folder(folder), Some(SaveTarget::Packed(out))) => {
-                let report = pack_folder_with_slides(folder, &out, &text, APP_VERSION)
+                let report = pack_folder_with_slides(folder, &out, &text, APP_VERSION, &extra())
                     .map_err(|e| failed(&out, e))?;
                 let left_out = report.skipped.into_iter().map(|name| format!("{name} was left out"));
                 let outside = report
@@ -164,17 +179,18 @@ impl SaveJob {
                 (Some(in_pack(out)?), notices)
             }
             (TalkPlace::Packed(file), Some(SaveTarget::Packed(out))) => {
-                repack_with_slides(file, &out, &text, APP_VERSION).map_err(|e| failed(&out, e))?;
+                repack_with_slides(file, &out, &text, APP_VERSION, &extra()).map_err(|e| failed(&out, e))?;
                 (Some(in_pack(out)?), Vec::new())
             }
             (TalkPlace::Packed(file), Some(SaveTarget::Folder(to))) => {
-                unpack_with_slides(file, &to, &text).map_err(|e| failed(&to, e))?;
+                unpack_with_slides(file, &to, &text, &extra()).map_err(|e| failed(&to, e))?;
                 (Some(in_folder(to)), Vec::new())
             }
         };
         Ok(Saved {
             written: text,
             moved_to,
+            files_written,
             notices,
         })
     }
@@ -205,6 +221,60 @@ fn unreadable(error: &std::io::Error) -> String {
 fn write_slides(folder: &Path, text: &str) -> Result<(), String> {
     let file = folder.join(SLIDES_FILE);
     write_atomically(&file, |out| out.write_all(text.as_bytes())).map_err(|e| failed(&file, e))
+}
+
+/// Writes `bytes`, a file added to the talk, at `path` in its `folder`, by way of a file beside
+/// it. Nothing is written through a link, and a file that's there is never written over: one
+/// with the same bytes is the file, and one with others means the save can't go ahead.
+fn write_added(folder: &Path, path: &str, bytes: &[u8]) -> Result<(), String> {
+    let Some((place, name)) = path.split_once('/').filter(|_| is_added_path(path)) else {
+        return Err(failed(folder, NotAdded::NameTaken));
+    };
+    let place = folder.join(place);
+    match std::fs::symlink_metadata(&place) {
+        // Not a link: a link's own kind is asked.
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Err(failed(&place, "something that isn't a folder is where its files go.")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&place).map_err(|e| failed(&place, e))?
+        }
+        Err(error) => return Err(failed(&place, error)),
+    }
+    let target = place.join(name);
+    if holds(&target, bytes).map_err(|e| failed(&target, e))? {
+        return Ok(());
+    }
+    match write_new_atomically(&target, bytes) {
+        Ok(()) => Ok(()),
+        // Put there since it was looked at.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => match holds(&target, bytes) {
+            Ok(true) => Ok(()),
+            _ => Err(failed(folder, NotAdded::NameTaken)),
+        },
+        Err(error) => Err(failed(&target, error)),
+    }
+}
+
+/// Whether `target` is a file holding `bytes`: `false` if nothing is there, and an error if
+/// something else is, which mustn't be written over.
+fn holds(target: &Path, bytes: &[u8]) -> Result<bool, NotAdded> {
+    use std::io::Read as _;
+    let meta = match std::fs::symlink_metadata(target) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(NotAdded::Unreadable),
+    };
+    if !meta.is_file() || meta.len() != bytes.len() as u64 {
+        return Err(NotAdded::NameTaken);
+    }
+    let mut there = Vec::new();
+    std::fs::File::open(target)
+        .and_then(|file| file.take(bytes.len() as u64 + 1).read_to_end(&mut there))
+        .map_err(|_| NotAdded::Unreadable)?;
+    if there != bytes {
+        return Err(NotAdded::NameTaken);
+    }
+    Ok(true)
 }
 
 fn in_folder(folder: PathBuf) -> (TalkPlace, SharedFiles) {

@@ -33,7 +33,7 @@ pub use highlight::*;
 pub use layouts::*;
 pub use native::*;
 pub use packed::*;
-pub use pictures::{PictureCache, icon_names, icon_preview};
+pub use pictures::{PictureCache, PictureFormat, icon_names, icon_preview, picture_as_png, picture_format};
 pub use render::*;
 pub use slide::*;
 pub use talk_components::{

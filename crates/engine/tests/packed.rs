@@ -812,7 +812,7 @@ fn a_repacked_talk_has_the_new_slides_and_everything_else_as_it_was() {
     pack_folder(dir.path(), &packed, "0.1.0").unwrap();
     let out = dir.path().join("again.sptx");
 
-    repack_with_slides(&packed, &out, "# New\r\n\r\n---\r\n\r\n# Slides\r\n", "0.2.0").unwrap();
+    repack_with_slides(&packed, &out, "# New\r\n\r\n---\r\n\r\n# Slides\r\n", "0.2.0", &[]).unwrap();
 
     let reopened = open_packed(&out).unwrap();
     assert_eq!(reopened.slides().unwrap(), "# New\r\n\r\n---\r\n\r\n# Slides\r\n");
@@ -840,10 +840,10 @@ fn repacking_over_itself_is_atomic() {
 
     // A failure part way leaves the pack as it was, and nothing beside it.
     let too_big = "x".repeat(MAX_FILE_BYTES as usize + 1);
-    assert!(repack_with_slides(&packed, &packed, &too_big, "0.1.0").is_err());
+    assert!(repack_with_slides(&packed, &packed, &too_big, "0.1.0", &[]).is_err());
     assert_eq!(entries_of(&packed), before);
 
-    repack_with_slides(&packed, &packed, "# Changed\n", "0.1.0").unwrap();
+    repack_with_slides(&packed, &packed, "# Changed\n", "0.1.0", &[]).unwrap();
     assert_eq!(open_packed(&packed).unwrap().slides().unwrap(), "# Changed\n");
     let mut left: Vec<String> = std::fs::read_dir(dir.path())
         .unwrap()
@@ -860,7 +860,7 @@ fn a_folder_is_copied_with_the_new_slides() {
     let work = tempfile::tempdir().unwrap();
     let to = work.path().join("copy");
 
-    let left_out = copy_talk_folder(dir.path(), &to, "# Copied\r\n").unwrap().skipped;
+    let left_out = copy_talk_folder(dir.path(), &to, "# Copied\r\n", &[]).unwrap().skipped;
 
     assert!(left_out.is_empty(), "{left_out:?}");
     assert_eq!(
@@ -880,9 +880,9 @@ fn a_folder_is_copied_with_the_new_slides() {
     // Into an empty folder too, but never one with things in it.
     let empty = work.path().join("empty");
     std::fs::create_dir(&empty).unwrap();
-    copy_talk_folder(dir.path(), &empty, "# Copied\r\n").unwrap();
+    copy_talk_folder(dir.path(), &empty, "# Copied\r\n", &[]).unwrap();
     assert_eq!(snapshot(&empty), snapshot(&to));
-    assert!(copy_talk_folder(dir.path(), &to, "# Again\n").is_err());
+    assert!(copy_talk_folder(dir.path(), &to, "# Again\n", &[]).is_err());
     assert_eq!(std::fs::read(to.join("slides.md")).unwrap(), b"# Copied\r\n");
 }
 
@@ -893,7 +893,7 @@ fn a_copied_folder_leaves_out_what_a_pack_would() {
     std::os::unix::fs::symlink("/etc/passwd", dir.path().join("assets/link.png")).unwrap();
     let work = tempfile::tempdir().unwrap();
     let to = work.path().join("copy");
-    let left_out = copy_talk_folder(dir.path(), &to, "# Copied\n").unwrap().skipped;
+    let left_out = copy_talk_folder(dir.path(), &to, "# Copied\n", &[]).unwrap().skipped;
     assert_eq!(left_out, ["assets/link.png"]);
     assert!(std::fs::symlink_metadata(to.join("assets/link.png")).is_err());
 }
@@ -905,7 +905,7 @@ fn a_packed_talk_is_unpacked_with_the_new_slides() {
     pack_folder(dir.path(), &packed, "0.1.0").unwrap();
     let work = tempfile::tempdir().unwrap();
     let folder = work.path().join("talk");
-    unpack_with_slides(&packed, &folder, "# Unpacked\n").unwrap();
+    unpack_with_slides(&packed, &folder, "# Unpacked\n", &[]).unwrap();
     assert_eq!(std::fs::read_to_string(folder.join("slides.md")).unwrap(), "# Unpacked\n");
     assert_eq!(std::fs::read(folder.join("assets/a.png")).unwrap(), b"\x89PNG not really");
 }
@@ -915,7 +915,7 @@ fn a_folder_is_packed_with_the_new_slides() {
     let dir = talk_folder();
     let work = tempfile::tempdir().unwrap();
     let out = work.path().join("talk.sptx");
-    pack_folder_with_slides(dir.path(), &out, "# Packed\n", "0.1.0").unwrap();
+    pack_folder_with_slides(dir.path(), &out, "# Packed\n", "0.1.0", &[]).unwrap();
     assert_eq!(open_packed(&out).unwrap().slides().unwrap(), "# Packed\n");
     assert_eq!(
         std::fs::read_to_string(dir.path().join("slides.md")).unwrap(),
@@ -929,9 +929,121 @@ fn a_folder_is_not_copied_into_itself() {
     let before = snapshot(dir.path());
     for inside in ["assets/copy", "copy", "assets/../copy"] {
         let to = dir.path().join(inside);
-        assert!(matches!(copy_talk_folder(dir.path(), &to, "# Copy\n"), Err(PackError::InsideTheTalk)), "{inside}");
+        assert!(matches!(copy_talk_folder(dir.path(), &to, "# Copy\n", &[]), Err(PackError::InsideTheTalk)), "{inside}");
         assert_eq!(snapshot(dir.path()), before, "{inside}");
     }
     assert!(lies_within(&dir.path().join("not/there/yet"), dir.path()));
     assert!(!lies_within(&dir.path().with_extension("copy"), dir.path()));
+}
+
+fn new_file(name: &str, bytes: &[u8]) -> (String, Vec<u8>) {
+    (name.to_string(), bytes.to_vec())
+}
+
+#[test]
+fn a_repack_writes_new_files_as_new_entries() {
+    let dir = talk_folder();
+    let packed = dir.path().join("talk.sptx");
+    pack_folder(dir.path(), &packed, "0.1.0").unwrap();
+    let before = entries_of(&packed);
+
+    let extra = [new_file("assets/new.png", b"new picture"), new_file("assets/data.csv", b"a,b\n1,2\n")];
+    repack_with_slides(&packed, &packed, "# Changed\n", "0.1.0", &extra).unwrap();
+
+    let after = entries_of(&packed);
+    assert_eq!(after.len(), before.len() + 2);
+    let reopened = open_packed(&packed).unwrap();
+    assert_eq!(reopened.read("assets/new.png").unwrap(), b"new picture");
+    assert_eq!(reopened.read("assets/data.csv").unwrap(), b"a,b\n1,2\n");
+    assert_eq!(reopened.read("assets/a.png").unwrap(), b"\x89PNG not really");
+    assert_eq!(reopened.slides().unwrap(), "# Changed\n");
+}
+
+#[test]
+fn a_repack_never_replaces_a_different_entry() {
+    let dir = talk_folder();
+    let packed = dir.path().join("talk.sptx");
+    pack_folder(dir.path(), &packed, "0.1.0").unwrap();
+    let before = entries_of(&packed);
+
+    for clash in ["assets/a.png", "assets/A.PNG"] {
+        let outcome = repack_with_slides(&packed, &packed, "# Changed\n", "0.1.0", &[new_file(clash, b"other bytes")]);
+        assert!(matches!(outcome, Err(PackError::NameTaken(_))), "{clash}: {outcome:?}");
+        assert_eq!(entries_of(&packed), before, "{clash}");
+    }
+    // Two new files under one name, with different bytes.
+    let twice = [new_file("assets/b.png", b"one"), new_file("assets/b.png", b"two")];
+    assert!(matches!(repack_with_slides(&packed, &packed, "# C\n", "0.1.0", &twice), Err(PackError::NameTaken(_))));
+    assert_eq!(entries_of(&packed), before);
+
+    // The same bytes under the same name are the entry that's there.
+    repack_with_slides(&packed, &packed, "# Changed\n", "0.1.0", &[new_file("assets/a.png", b"\x89PNG not really")]).unwrap();
+    assert_eq!(entries_of(&packed).len(), before.len());
+}
+
+#[test]
+fn a_new_file_with_a_name_that_leaves_the_talk_is_refused() {
+    let dir = talk_folder();
+    let packed = dir.path().join("talk.sptx");
+    pack_folder(dir.path(), &packed, "0.1.0").unwrap();
+    let work = tempfile::tempdir().unwrap();
+    for name in ["../x.png", "/x.png", "assets/../../x.png", "notes.txt", "slides.md", "talk.json", "assets/.hidden", "assets\\x.png", "assets/con.png", ""] {
+        let extra = [new_file(name, b"x")];
+        let outcome = repack_with_slides(&packed, &packed, "# C\n", "0.1.0", &extra);
+        assert!(matches!(outcome, Err(PackError::UnsafeName(_))), "{name:?}: {outcome:?}");
+        let to = work.path().join("copy");
+        assert!(matches!(copy_talk_folder(dir.path(), &to, "# C\n", &extra), Err(PackError::UnsafeName(_))), "{name:?}");
+        assert!(!to.exists(), "{name:?}");
+    }
+}
+
+#[test]
+fn every_other_way_of_saving_a_talk_carries_new_files() {
+    let dir = talk_folder();
+    let work = tempfile::tempdir().unwrap();
+    let extra = [new_file("assets/new.png", b"new picture"), new_file("components/d.rs", b"// d")];
+
+    let copy = work.path().join("copy");
+    copy_talk_folder(dir.path(), &copy, "# Copied\n", &extra).unwrap();
+    assert_eq!(std::fs::read(copy.join("assets/new.png")).unwrap(), b"new picture");
+    assert_eq!(std::fs::read(copy.join("components/d.rs")).unwrap(), b"// d");
+    assert_eq!(std::fs::read(copy.join("assets/a.png")).unwrap(), b"\x89PNG not really");
+
+    let out = work.path().join("talk.sptx");
+    pack_folder_with_slides(dir.path(), &out, "# Packed\n", "0.1.0", &extra).unwrap();
+    let packed = open_packed(&out).unwrap();
+    assert_eq!(packed.read("assets/new.png").unwrap(), b"new picture");
+    assert_eq!(packed.read("components/d.rs").unwrap(), b"// d");
+
+    let plain = work.path().join("plain.sptx");
+    pack_folder(dir.path(), &plain, "0.1.0").unwrap();
+    let unpacked = work.path().join("unpacked");
+    unpack_with_slides(&plain, &unpacked, "# Unpacked\n", &extra).unwrap();
+    assert_eq!(std::fs::read(unpacked.join("assets/new.png")).unwrap(), b"new picture");
+    assert_eq!(std::fs::read_to_string(unpacked.join("slides.md")).unwrap(), "# Unpacked\n");
+
+    // A file the talk has with other bytes is never written over, and nothing is left behind.
+    let clash = [new_file("assets/a.png", b"other")];
+    let to = work.path().join("clash");
+    assert!(matches!(copy_talk_folder(dir.path(), &to, "# C\n", &clash), Err(PackError::NameTaken(_))));
+    assert!(!to.exists());
+    let to = work.path().join("clash.sptx");
+    assert!(matches!(pack_folder_with_slides(dir.path(), &to, "# C\n", "0.1.0", &clash), Err(PackError::NameTaken(_))));
+    assert!(!to.exists());
+    let to = work.path().join("clash-unpacked");
+    assert!(matches!(unpack_with_slides(&plain, &to, "# C\n", &clash), Err(PackError::NameTaken(_))));
+    assert!(!to.exists());
+}
+
+#[test]
+fn a_new_file_is_written_beside_and_never_over_another() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("a.png");
+    write_new_atomically(&out, b"first").unwrap();
+    assert_eq!(std::fs::read(&out).unwrap(), b"first");
+    let again = write_new_atomically(&out, b"second").unwrap_err();
+    assert_eq!(again.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(std::fs::read(&out).unwrap(), b"first");
+    let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(names, ["a.png"], "no temporary file is left");
 }

@@ -37,7 +37,10 @@ impl WorkspaceView {
             return;
         };
         let text = std::mem::take(&mut found.text);
+        let files = found.files.clone();
         let recovered = document.update(cx, |document, cx| {
+            // First, so that the slides that show them show them as the text comes back.
+            document.bring_back_files(files);
             let recovered = document.recover(text.clone());
             if recovered.is_ok() {
                 // A show of the talk has to know.

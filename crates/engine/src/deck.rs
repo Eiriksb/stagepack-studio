@@ -378,6 +378,16 @@ impl Deck {
         self.slides_holding_pictures.clear();
     }
 
+    /// Takes in that files have been added to the talk's files, and returns the slides to show
+    /// again: all of them, as any could name one, and a picture that wasn't there leaves no trace
+    /// to find it by. Its components are looked at again too. Pictures read already are kept.
+    pub fn files_added(&mut self) -> Vec<usize> {
+        self.components.rescan(&self.registry);
+        self.files_generation += 1;
+        let talk = self.talk.clone();
+        self.take_talk(talk, true, Matching::ByPlace)
+    }
+
     /// The names of every component the talk can use: the built-ins and its own, sorted, for
     /// a palette to offer.
     pub fn available_components(&self) -> Vec<String> {

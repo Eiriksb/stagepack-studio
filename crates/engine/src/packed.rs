@@ -55,6 +55,8 @@ pub enum PackError {
     Corrupt(String),
     /// A talk was to be written in or under its own folder.
     InsideTheTalk,
+    /// A file was to be added to a talk that has a different one by that name.
+    NameTaken(String),
     Io(std::io::Error),
 }
 
@@ -71,6 +73,7 @@ impl fmt::Display for PackError {
             PackError::TooLarge(what) => write!(f, "This talk is too large to open: {what}."),
             PackError::Corrupt(what) => write!(f, "This file is damaged or isn't a talk: {what}."),
             PackError::InsideTheTalk => write!(f, "A talk can't be saved inside its own folder. Choose a place outside it."),
+            PackError::NameTaken(_) => write!(f, "This talk already has a different file with that name."),
             PackError::Io(e) => write!(f, "The file couldn't be read or written: {e}."),
         }
     }
@@ -141,7 +144,7 @@ fn safe_name(name: &str) -> bool {
 
 /// `path` with empty and `.` parts dropped and `..` resolved, or `None` if it starts at the root
 /// or climbs out, as a folder talk would refuse it too.
-fn normalise(path: &str) -> Option<String> {
+pub(crate) fn normalise(path: &str) -> Option<String> {
     if path.starts_with('/') {
         return None;
     }
@@ -156,6 +159,70 @@ fn normalise(path: &str) -> Option<String> {
         }
     }
     (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+/// A file to add to a talk as it's written: its path in the talk, and its bytes.
+pub type NewFile = (String, Vec<u8>);
+
+/// The files of `extra` that a talk holding the files `names` doesn't have yet, each checked
+/// to be a file a talk can hold, in a folder that's packed. One the talk has with the same bytes,
+/// as `read` gives them, is left out. One it has with other bytes, or under a name only the case
+/// of its letters tells apart from one it has, is refused rather than written over, and so is
+/// one named twice in `extra` with different bytes.
+fn new_files<'a>(
+    names: &[String],
+    read: impl Fn(&str) -> Result<Vec<u8>, PackError>,
+    extra: &'a [NewFile],
+    entry_bytes: u64,
+) -> Result<Vec<&'a NewFile>, PackError> {
+    let mut new: Vec<&NewFile> = Vec::new();
+    for file in extra {
+        let (name, bytes) = file;
+        let in_a_folder = name.split_once('/').is_some_and(|(folder, _)| PACKED_FOLDERS.contains(&folder));
+        if !(in_a_folder && safe_name(name) && !name.ends_with('/') && normalise(name).as_ref() == Some(name)) {
+            return Err(PackError::UnsafeName(name.clone()));
+        }
+        if bytes.len() as u64 > entry_bytes {
+            return Err(PackError::TooLarge(format!("{name} is bigger than {entry_bytes} bytes")));
+        }
+        let alike = |other: &str| other.eq_ignore_ascii_case(name);
+        if let Some(there) = names.iter().find(|other| alike(other)) {
+            if there == name && read(there)? == *bytes {
+                continue;
+            }
+            return Err(PackError::NameTaken(name.clone()));
+        }
+        if let Some((earlier, earlier_bytes)) = new.iter().copied().find(|(other, _)| alike(other)) {
+            if earlier == name && earlier_bytes == bytes {
+                continue;
+            }
+            return Err(PackError::NameTaken(name.clone()));
+        }
+        new.push(file);
+    }
+    Ok(new)
+}
+
+/// The bytes of the file at `path`, if it holds no more than `limit`.
+fn read_limited(path: &Path, limit: u64) -> Result<Vec<u8>, PackError> {
+    read_sized(File::open(path)?, limit, &path.display().to_string())
+}
+
+/// How an entry called `name` is written: pictures and fonts as they are, anything else compressed.
+fn entry_options(name: &str) -> SimpleFileOptions {
+    let extension = name
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    let method = if STORED_EXTENSIONS.contains(&extension.as_str()) {
+        CompressionMethod::Stored
+    } else {
+        CompressionMethod::Deflated
+    };
+    SimpleFileOptions::default()
+        .compression_method(method)
+        .last_modified_time(DateTime::default())
+        .unix_permissions(0o644)
 }
 
 /// A packed talk, read on demand.
@@ -457,20 +524,26 @@ fn manifest_for(app_version: &str) -> Vec<u8> {
 fn check_sizes(
     files: &[(String, std::path::PathBuf)],
     slides: Option<&str>,
+    extra: &[&NewFile],
     limits: PackLimits,
 ) -> Result<(), PackError> {
-    if files.len() + 1 > limits.entries {
+    if files.len() + extra.len() + 1 > limits.entries {
         return Err(PackError::TooLarge(format!(
             "it would hold more than {} files",
             limits.entries
         )));
     }
     let mut total = 0u64;
-    for (name, path) in files {
+    let sizes = files.iter().map(|(name, path)| {
         let size = match slides {
             Some(slides) if name == SLIDES_NAME => slides.len() as u64,
             _ => std::fs::metadata(path)?.len(),
         };
+        Ok::<_, PackError>((name, size))
+    });
+    let extra_sizes = extra.iter().map(|(name, bytes)| Ok((name, bytes.len() as u64)));
+    for sized in sizes.chain(extra_sizes) {
+        let (name, size) = sized?;
         total = total.saturating_add(size);
         if size > limits.entry_bytes {
             return Err(PackError::TooLarge(format!(
@@ -488,20 +561,44 @@ fn check_sizes(
     Ok(())
 }
 
+/// The files of `extra` that the talk whose files are `files` doesn't have yet, as [`new_files`]
+/// finds them.
+fn new_folder_files<'a>(
+    files: &[(String, std::path::PathBuf)],
+    extra: &'a [NewFile],
+    limits: PackLimits,
+) -> Result<Vec<&'a NewFile>, PackError> {
+    let names: Vec<String> = files.iter().map(|(name, _)| name.clone()).collect();
+    let read = |name: &str| {
+        let (_, path) = files.iter().find(|(there, _)| there == name).expect("a name from the list");
+        read_limited(path, limits.entry_bytes)
+    };
+    new_files(&names, read, extra, limits.entry_bytes)
+}
+
 /// Packs the talk in `folder` into the file `out`, replacing it only if packing succeeds.
 pub fn pack_folder(folder: &Path, out: &Path, app_version: &str) -> Result<PackReport, PackError> {
-    pack(folder, out, None, app_version)
+    pack(folder, out, None, app_version, &[])
 }
 
 /// Packs the talk in `folder` into the file `out` as [`pack_folder`] does, with `slides` as its
-/// `slides.md` in place of the file in the folder, which isn't touched.
+/// `slides.md` in place of the file in the folder, which isn't touched, and the files of `extra`
+/// as well, as [`repack_with_slides`] adds them.
 pub fn pack_folder_with_slides(
     folder: &Path,
     out: &Path,
     slides: &str,
     app_version: &str,
+    extra: &[NewFile],
 ) -> Result<PackReport, PackError> {
-    pack(folder, out, Some(slides), app_version)
+    pack(folder, out, Some(slides), app_version, extra)
+}
+
+/// What an entry of a pack being made holds.
+enum Content<'a> {
+    File(&'a Path),
+    Bytes(&'a [u8]),
+    Manifest,
 }
 
 fn pack(
@@ -509,11 +606,13 @@ fn pack(
     out: &Path,
     slides: Option<&str>,
     app_version: &str,
+    extra: &[NewFile],
 ) -> Result<PackReport, PackError> {
     let mut skipped = Vec::new();
     let files = collect(folder, &mut skipped)?;
     let limits = PackLimits::default();
-    check_sizes(&files, slides, limits)?;
+    let extra = new_folder_files(&files, extra, limits)?;
+    check_sizes(&files, slides, &extra, limits)?;
     let manifest = manifest_for(app_version);
     // Read once, so that what's packed and what's reported come from the same text.
     let source = match slides {
@@ -521,36 +620,25 @@ fn pack(
         None => std::fs::read_to_string(folder.join(SLIDES_NAME)).unwrap_or_default(),
     };
 
-    let mut entries: Vec<(String, Option<&Path>)> = files
+    let mut entries: Vec<(&str, Content)> = files
         .iter()
-        .map(|(name, path)| (name.clone(), Some(path.as_path())))
+        .map(|(name, path)| match slides {
+            Some(slides) if name == SLIDES_NAME => (name.as_str(), Content::Bytes(slides.as_bytes())),
+            _ => (name.as_str(), Content::File(path)),
+        })
+        .chain(extra.iter().map(|(name, bytes)| (name.as_str(), Content::Bytes(bytes))))
         .collect();
-    entries.push((MANIFEST_NAME.to_string(), None));
-    entries.sort();
+    entries.push((MANIFEST_NAME, Content::Manifest));
+    entries.sort_by_key(|(name, _)| *name);
 
     write_atomically(out, |file| {
         let mut zip = ZipWriter::new(file);
-        for (name, path) in &entries {
-            let extension = name
-                .rsplit_once('.')
-                .map(|(_, e)| e.to_ascii_lowercase())
-                .unwrap_or_default();
-            let method = if STORED_EXTENSIONS.contains(&extension.as_str()) {
-                CompressionMethod::Stored
-            } else {
-                CompressionMethod::Deflated
-            };
-            let options = SimpleFileOptions::default()
-                .compression_method(method)
-                .last_modified_time(DateTime::default())
-                .unix_permissions(0o644);
-            zip.start_file(name.as_str(), options).map_err(io_other)?;
-            match (path, slides) {
-                (None, _) => zip.write_all(&manifest)?,
-                (Some(_), Some(slides)) if name == SLIDES_NAME => {
-                    zip.write_all(slides.as_bytes())?
-                }
-                (Some(path), _) => {
+        for (name, content) in &entries {
+            zip.start_file(*name, entry_options(name)).map_err(io_other)?;
+            match content {
+                Content::Manifest => zip.write_all(&manifest)?,
+                Content::Bytes(bytes) => zip.write_all(bytes)?,
+                Content::File(path) => {
                     // Bounded, in case the file grows while it is read.
                     let mut reader = File::open(path)?.take(limits.entry_bytes + 1);
                     let copied = std::io::copy(&mut reader, &mut zip)?;
@@ -569,16 +657,17 @@ fn pack(
 /// Unpacks a packed talk into `folder`, which must be missing or empty. `talk.json` isn't
 /// written, since packing makes a new one. A failure leaves `folder` as it was.
 pub fn unpack_to_folder(packed: &Path, folder: &Path) -> Result<(), PackError> {
-    unpack(packed, folder, None)
+    unpack(packed, folder, None, &[])
 }
 
 /// Unpacks a packed talk into `folder` as [`unpack_to_folder`] does, with `slides` as its
-/// `slides.md` in place of the one in the pack.
-pub fn unpack_with_slides(packed: &Path, folder: &Path, slides: &str) -> Result<(), PackError> {
-    unpack(packed, folder, Some(slides))
+/// `slides.md` in place of the one in the pack, and the files of `extra` as well, as
+/// [`repack_with_slides`] adds them.
+pub fn unpack_with_slides(packed: &Path, folder: &Path, slides: &str, extra: &[NewFile]) -> Result<(), PackError> {
+    unpack(packed, folder, Some(slides), extra)
 }
 
-fn unpack(packed: &Path, folder: &Path, slides: Option<&str>) -> Result<(), PackError> {
+fn unpack(packed: &Path, folder: &Path, slides: Option<&str>, extra: &[NewFile]) -> Result<(), PackError> {
     let files = open_packed(packed)?;
     // Only what a talk is made of is written: not `.git/config` and the like.
     let under_a_folder =
@@ -598,8 +687,10 @@ fn unpack(packed: &Path, folder: &Path, slides: Option<&str>) -> Result<(), Pack
             files.entry_bytes
         )));
     }
+    let read = |name: &str| files.read_checked(name)?.ok_or_else(|| PackError::Corrupt(format!("{name} is missing")));
+    let extra = new_files(&files.names(), read, extra, files.entry_bytes)?;
     let existed = missing_or_empty(folder)?;
-    let result = unpack_into(&files, folder, slides);
+    let result = unpack_into(&files, folder, slides, &extra);
     if result.is_err() {
         clear_away(folder, existed);
     }
@@ -667,22 +758,13 @@ fn write_new(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 /// `slides.md` is written last, so that a folder cut short has no talk in it rather than a
 /// talk missing some of its files.
-fn unpack_into(files: &PackedFiles, folder: &Path, slides: Option<&str>) -> Result<(), PackError> {
+fn unpack_into(files: &PackedFiles, folder: &Path, slides: Option<&str>, extra: &[&NewFile]) -> Result<(), PackError> {
     std::fs::create_dir_all(folder)?;
     for directory in &files.directories {
         std::fs::create_dir_all(target_in(folder, directory)?)?;
     }
     let mut written = 0u64;
-    let mut names = files.names();
-    names.retain(|name| name != MANIFEST_NAME && name != SLIDES_NAME);
-    names.push(SLIDES_NAME.to_string());
-    for name in names {
-        let bytes = match slides {
-            Some(slides) if name == SLIDES_NAME => slides.as_bytes().to_vec(),
-            _ => files
-                .read_checked(&name)?
-                .ok_or_else(|| PackError::Corrupt(format!("{name} is missing")))?,
-        };
+    let mut write = |name: &str, bytes: &[u8]| {
         written = written.saturating_add(bytes.len() as u64);
         if written > files.total_bytes {
             return Err(PackError::TooLarge(format!(
@@ -690,20 +772,41 @@ fn unpack_into(files: &PackedFiles, folder: &Path, slides: Option<&str>) -> Resu
                 files.total_bytes
             )));
         }
-        write_new(&target_in(folder, &name)?, &bytes)?;
+        write_new(&target_in(folder, name)?, bytes).map_err(PackError::from)
+    };
+    let read = |name: &str| {
+        files
+            .read_checked(name)?
+            .ok_or_else(|| PackError::Corrupt(format!("{name} is missing")))
+    };
+    let mut names = files.names();
+    names.retain(|name| name != MANIFEST_NAME && name != SLIDES_NAME);
+    for name in names {
+        write(&name, &read(&name)?)?;
     }
-    Ok(())
+    for (name, bytes) in extra {
+        write(name, bytes)?;
+    }
+    match slides {
+        Some(slides) => write(SLIDES_NAME, slides.as_bytes()),
+        None => write(SLIDES_NAME, &read(SLIDES_NAME)?),
+    }
 }
 
 /// Copies the packed talk `packed` into the file `out`, with `slides` as its `slides.md` and a
 /// `talk.json` naming `app_version`. Every other entry is copied as it is, byte for byte, without
 /// being unpacked. `out` may be `packed` itself: the copy is written beside it and takes its
 /// place only once it's whole.
+///
+/// The files of `extra` are written as new entries after them. One the pack has already with
+/// the same bytes is the entry that's there. One it has with other bytes is refused, and
+/// nothing is written: an entry is never replaced.
 pub fn repack_with_slides(
     packed: &Path,
     out: &Path,
     slides: &str,
     app_version: &str,
+    extra: &[NewFile],
 ) -> Result<(), PackError> {
     let files = open_packed(packed)?;
     if slides.len() as u64 > files.entry_bytes {
@@ -711,6 +814,20 @@ pub fn repack_with_slides(
             "{SLIDES_NAME} is bigger than {} bytes",
             files.entry_bytes
         )));
+    }
+    let names = files.names();
+    let read = |name: &str| files.read_checked(name)?.ok_or_else(|| PackError::Corrupt(format!("{name} is missing")));
+    let extra = new_files(&names, read, extra, files.entry_bytes)?;
+    if !extra.is_empty() {
+        let limits = PackLimits::default();
+        if names.len() + files.directories.len() + extra.len() > limits.entries {
+            return Err(PackError::TooLarge(format!("it would hold more than {} files", limits.entries)));
+        }
+        let held: u64 = names.iter().filter(|name| *name != SLIDES_NAME).filter_map(|name| files.len(name)).sum();
+        let added: u64 = extra.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+        if held.saturating_add(added).saturating_add(slides.len() as u64) > files.total_bytes {
+            return Err(PackError::TooLarge(format!("it would hold more than {} bytes", files.total_bytes)));
+        }
     }
     let manifest = manifest_for(app_version);
     write_atomically(out, move |file| {
@@ -737,6 +854,10 @@ pub fn repack_with_slides(
                 None => writer.raw_copy_file(entry).map_err(io_other)?,
             }
         }
+        for (name, bytes) in &extra {
+            writer.start_file(name.as_str(), entry_options(name)).map_err(io_other)?;
+            writer.write_all(bytes)?;
+        }
         writer.finish().map_err(io_other)?;
         // The pack is let go of here, before the copy takes its place: Windows won't replace
         // a file that's open.
@@ -748,9 +869,10 @@ pub fn repack_with_slides(
 
 /// Copies the talk in `from` into the folder `to`, which must be missing or empty, with
 /// `slides` as its `slides.md`. What's copied is what [`pack_folder`] would pack, with the same
-/// refusals and limits, and what it left out is reported as a pack's is. `from` isn't touched,
-/// and a failure leaves `to` as it was.
-pub fn copy_talk_folder(from: &Path, to: &Path, slides: &str) -> Result<PackReport, PackError> {
+/// refusals and limits, and what it left out is reported as a pack's is. The files of `extra` are
+/// written as well, as [`repack_with_slides`] adds them. `from` isn't touched, and a failure
+/// leaves `to` as it was.
+pub fn copy_talk_folder(from: &Path, to: &Path, slides: &str, extra: &[NewFile]) -> Result<PackReport, PackError> {
     if lies_within(to, from) {
         // A copy in the talk's own folders would travel in every pack made from it.
         return Err(PackError::InsideTheTalk);
@@ -758,9 +880,10 @@ pub fn copy_talk_folder(from: &Path, to: &Path, slides: &str) -> Result<PackRepo
     let mut skipped = Vec::new();
     let files = collect(from, &mut skipped)?;
     let limits = PackLimits::default();
-    check_sizes(&files, Some(slides), limits)?;
+    let extra = new_folder_files(&files, extra, limits)?;
+    check_sizes(&files, Some(slides), &extra, limits)?;
     let existed = missing_or_empty(to)?;
-    let result = copy_into(&files, to, slides, limits);
+    let result = copy_into(&files, to, slides, &extra, limits);
     if result.is_err() {
         clear_away(to, existed);
     }
@@ -815,6 +938,7 @@ fn copy_into(
     files: &[(String, std::path::PathBuf)],
     to: &Path,
     slides: &str,
+    extra: &[&NewFile],
     limits: PackLimits,
 ) -> Result<(), PackError> {
     std::fs::create_dir_all(to)?;
@@ -838,6 +962,9 @@ fn copy_into(
                 limits.entry_bytes
             )));
         }
+    }
+    for (name, bytes) in extra {
+        write_new(&target_in(to, name)?, bytes)?;
     }
     write_new(&target_in(to, SLIDES_NAME)?, slides.as_bytes())?;
     Ok(())
@@ -878,6 +1005,51 @@ pub fn write_atomically(
         let _ = std::fs::remove_file(&temp);
     }
     result
+}
+
+/// Writes `bytes` as the new file `out` by way of a temporary file beside it, so a failure never
+/// leaves a half-written file there. Whatever is at `out` already is never replaced: that's an
+/// error of the kind `AlreadyExists`.
+pub fn write_new_atomically(out: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let name = out
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?
+        .to_string_lossy();
+    let (mut file, temp) = create_temp(out, &name)?;
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        place_without_replacing(&temp, out)?;
+        #[cfg(unix)]
+        {
+            let parent = match out.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p,
+                _ => Path::new("."),
+            };
+            File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    // Linked into place, or never placed: either way it's not needed. Once renamed, it's gone.
+    let _ = std::fs::remove_file(&temp);
+    result
+}
+
+/// Gives the file `temp` the name `out` too, unless something has it. A link can't replace
+/// anything, so no other program can slip a file in between looking and placing.
+fn place_without_replacing(temp: &Path, out: &Path) -> std::io::Result<()> {
+    match std::fs::hard_link(temp, out) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
+        // A disk that can't link, such as one formatted FAT: the next best is to look first.
+        Err(_) => {
+            if std::fs::symlink_metadata(out).is_ok() {
+                return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "a file is there already"));
+            }
+            rename_with_retry(temp, out)
+        }
+    }
 }
 
 /// A new temporary file beside `out`. The name has a random part and the file is created only

@@ -1,5 +1,5 @@
-//! A window's working copies of its talk's unsaved changes: keeping one a moment after the
-//! edits stop, clearing it once the changes are saved or let go, and the copy from last time
+//! A window's working copies of its talk's unsaved changes, with the files added to it that they
+//! use: keeping one a moment after the edits stop, clearing it once the changes are saved or let go, and the copy from last time
 //! that's offered back. The changes to the copies are made on background tasks, one after
 //! another in the order asked, and a window that closes waits for them with [`settled`].
 //!
@@ -58,6 +58,8 @@ enum Job {
         place: TalkPlace,
         on_disk: String,
         text: String,
+        /// The files added to the talk that the text uses and no save has written.
+        files: Vec<(String, Arc<[u8]>)>,
         adopted: Adopted,
     },
     /// Removes this window's copy, and the adopted one too if `adopted` is given.
@@ -81,11 +83,12 @@ impl Job {
                 place,
                 on_disk,
                 text,
+                files,
                 adopted,
             } => {
                 if clears.load(Ordering::SeqCst) == at {
                     recovery
-                        .keep(&place, &hash_text(&on_disk), &text)
+                        .keep_with_files(&place, &hash_text(&on_disk), &text, &files)
                         .map_err(|_| ())?;
                 }
                 // Kept, or overtaken by a clear: either way it's no longer needed.
@@ -323,6 +326,7 @@ impl WorkingCopies {
             place,
             on_disk: kept.on_disk.clone(),
             text: kept.text.clone(),
+            files: document.added_files(),
             adopted: self.adopted.clone(),
         };
         self.kept = Some(kept);

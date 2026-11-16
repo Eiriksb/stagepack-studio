@@ -2,7 +2,10 @@
 
 use std::fs::File;
 use std::io::{self, Read};
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 /// The biggest file a talk can use. Pictures and fonts are read whole, into memory.
@@ -155,5 +158,118 @@ impl TalkFiles for std::sync::Arc<dyn TalkFiles + Send + Sync> {
 
     fn never_changes(&self) -> bool {
         (**self).never_changes()
+    }
+}
+
+/// Files added to a talk while it's open, by their path in it, kept in memory until they're
+/// saved. Shared between the talk and whatever saves it, and only ever added to: a file once
+/// added keeps its bytes for as long as the set lasts.
+#[derive(Default)]
+pub struct AddedSet {
+    files: Mutex<BTreeMap<String, Arc<[u8]>>>,
+    /// How many files have been added, so that something holding on to what it read can
+    /// tell when there's more.
+    added: AtomicU64,
+}
+
+impl AddedSet {
+    pub fn new() -> AddedSet {
+        AddedSet::default()
+    }
+
+    fn files(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Arc<[u8]>>> {
+        // A map is whole even if a thread panicked holding it.
+        self.files.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Adds `bytes` as the file at `path`, unless there's one there already, which is kept:
+    /// whether it was added.
+    pub fn add(&self, path: &str, bytes: Arc<[u8]>) -> bool {
+        let Some(path) = crate::packed::normalise(path) else {
+            return false;
+        };
+        let mut files = self.files();
+        if files.contains_key(&path) {
+            return false;
+        }
+        files.insert(path, bytes);
+        self.added.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    /// The bytes added as `path`.
+    pub fn get(&self, path: &str) -> Option<Arc<[u8]>> {
+        self.files().get(&crate::packed::normalise(path)?).cloned()
+    }
+
+    /// The files added directly in `folder`, in name order.
+    pub fn names_in(&self, folder: &str) -> Vec<String> {
+        let Some(folder) = crate::packed::normalise(folder) else {
+            return Vec::new();
+        };
+        let prefix = format!("{folder}/");
+        self.files()
+            .keys()
+            .filter(|name| name.strip_prefix(&prefix).is_some_and(|rest| !rest.contains('/')))
+            .cloned()
+            .collect()
+    }
+
+    /// Changes each time a file is added.
+    pub fn stamp(&self) -> u64 {
+        self.added.load(Ordering::SeqCst)
+    }
+}
+
+/// A talk's files with those added to it since it opened, which are read first.
+pub struct WithAdded {
+    under: Arc<dyn TalkFiles + Send + Sync>,
+    added: Arc<AddedSet>,
+}
+
+impl WithAdded {
+    pub fn new(under: Arc<dyn TalkFiles + Send + Sync>, added: Arc<AddedSet>) -> WithAdded {
+        WithAdded { under, added }
+    }
+}
+
+impl TalkFiles for WithAdded {
+    fn read(&self, path: &str) -> Option<Vec<u8>> {
+        match self.added.get(path) {
+            Some(bytes) => Some(bytes.to_vec()),
+            None => self.under.read(path),
+        }
+    }
+
+    /// An added file never changes, so its length is its stamp; so is a file of a talk that
+    /// never changes, such as a pack, as nothing under this can say that any more.
+    fn stamp(&self, path: &str) -> Option<(u64, SystemTime)> {
+        if let Some(bytes) = self.added.get(path) {
+            return Some((bytes.len() as u64, SystemTime::UNIX_EPOCH));
+        }
+        if self.under.never_changes() {
+            return self.under.len(path).map(|len| (len, SystemTime::UNIX_EPOCH));
+        }
+        self.under.stamp(path)
+    }
+
+    fn len(&self, path: &str) -> Option<u64> {
+        match self.added.get(path) {
+            Some(bytes) => Some(bytes.len() as u64),
+            None => self.under.len(path),
+        }
+    }
+
+    fn names_in(&self, folder: &str) -> Vec<String> {
+        let mut names = self.under.names_in(folder);
+        names.extend(self.added.names_in(folder));
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Files can be added at any time.
+    fn never_changes(&self) -> bool {
+        false
     }
 }

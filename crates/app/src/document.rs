@@ -1,14 +1,15 @@
 //! An open talk, and which of its slides is showing.
 
 use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use slides_components::Diagnostic;
 use slides_engine::{
-    Align, ComponentInfo, Deck, FolderFiles, Fonts, Layer, LayerTiming, Moment, PackError, Pixmap,
-    SlideTimeline, TalkFiles, TextLayout, Transition, layout_by_name, open_packed, text_align,
+    AddedSet, Align, ComponentInfo, Deck, FolderFiles, Fonts, Layer, LayerTiming, Moment, PackError, Pixmap,
+    SlideTimeline, TalkFiles, TextLayout, Transition, WithAdded, layout_by_name, open_packed, text_align,
     read_talk_text,
 };
 use slides_format::{
@@ -16,6 +17,7 @@ use slides_format::{
     split_slides, storable, text_flows, write_flow, write_into_region,
 };
 
+use crate::added_files::{self, FileKind, NotAdded, Placed, talk_uses};
 use crate::export::ExportInput;
 use crate::history::{History, RunId};
 use crate::present::TalkShape;
@@ -253,8 +255,12 @@ impl TalkPlace {
 pub struct Document {
     deck: Deck,
     place: TalkPlace,
-    /// The talk's files, which exports read from their own thread.
+    /// The talk's files, with those added to it, which exports read from their own thread.
     files: Arc<dyn TalkFiles + Send + Sync>,
+    /// The files added to the talk while it's open, which [`Self::files`] reads first.
+    added: Arc<AddedSet>,
+    /// The files added that no save has written yet.
+    pending: BTreeSet<String>,
     /// The talk's own fonts, for exports to load into decks of their own.
     talk_fonts: Vec<Arc<Vec<u8>>>,
     /// What to call the talk if it has no title setting.
@@ -348,6 +354,8 @@ impl Document {
         for font in &talk_fonts {
             fonts.load_talk_font(font.clone());
         }
+        let added = Arc::new(AddedSet::new());
+        let files: Arc<dyn TalkFiles + Send + Sync> = Arc::new(WithAdded::new(files, added.clone()));
         Ok(Document {
             on_disk: source,
             outside: None,
@@ -355,6 +363,8 @@ impl Document {
             place_name: place.name(),
             place,
             files,
+            added,
+            pending: BTreeSet::new(),
             talk_fonts,
             current: 0,
             history: History::new(),
@@ -893,6 +903,69 @@ impl Document {
     /// Whether the talk has a file at `path`, relative to it, as a picture's is written.
     pub fn has_file(&self, path: &str) -> bool {
         self.files.len(path).is_some()
+    }
+
+    /// Adds `bytes` to the talk as a file of `kind`, named as like `suggested` as is safe, and
+    /// returns its path in the talk, as the text names it. A file the talk has with the same
+    /// bytes, saved or added, is that file. A name it has already is numbered, but a component's
+    /// never is, as its name is the component's. Nothing is written until a save, which writes
+    /// it if the text uses it then; till then it's kept with the talk's unsaved changes, and a
+    /// slide that shows it shows it at once.
+    pub fn add_file(&mut self, kind: FileKind, suggested: &str, bytes: Vec<u8>) -> Result<String, NotAdded> {
+        let folder = match &self.place {
+            TalkPlace::Folder(folder) => Some(folder.clone()),
+            TalkPlace::Packed(_) => None,
+        };
+        // Anything in the folder, a link or a folder included, which the talk's files don't list.
+        let on_disk = |path: &str| folder.as_ref().is_some_and(|folder| std::fs::symlink_metadata(folder.join(path)).is_ok());
+        let (path, bytes) = match added_files::place(&*self.files, kind, suggested, bytes, on_disk)? {
+            Placed::There(path) => return Ok(path),
+            Placed::New(path, bytes) => (path, bytes),
+        };
+        let added = self.added.add(&path, Arc::from(bytes));
+        debug_assert!(added, "a name that's free");
+        if !added {
+            return Err(NotAdded::NameTaken);
+        }
+        self.pending.insert(path.clone());
+        // A slide may name it already, and a component is found by its files.
+        if kind == FileKind::ComponentSource || kind == FileKind::ComponentBuild || talk_uses(self.talk(), &path) {
+            self.deck.files_added();
+        }
+        Ok(path)
+    }
+
+    /// The bytes of the file at `path`, outside the talk, to add to it with [`Self::add_file`].
+    /// A folder, a link to anything but a file, and a file over the limit are refused.
+    pub fn read_outside_file(path: &Path) -> Result<Vec<u8>, NotAdded> {
+        added_files::read_outside(path)
+    }
+
+    /// The files added to the talk that its text uses and no save has written yet, for a save.
+    pub fn added_files(&self) -> Vec<(String, Arc<[u8]>)> {
+        let talk = self.talk();
+        self.pending
+            .iter()
+            .filter(|path| talk_uses(talk, path))
+            .filter_map(|path| Some((path.clone(), self.added.get(path)?)))
+            .collect()
+    }
+
+    /// Takes back `files`, added to the talk before the app stopped and kept with its unsaved
+    /// changes, as added again, before the changes are brought back. One the talk has a file
+    /// for now, or that isn't a name the app gives, is left out.
+    pub fn bring_back_files(&mut self, files: Vec<(String, Arc<[u8]>)>) {
+        let mut any = false;
+        for (path, bytes) in files {
+            if !added_files::is_added_path(&path) || self.files.len(&path).is_some() || !self.added.add(&path, bytes) {
+                continue;
+            }
+            self.pending.insert(path);
+            any = true;
+        }
+        if any {
+            self.deck.files_added();
+        }
     }
 
     /// The current slide's own text, to copy it: see [`slides_format::slide_text_for_copy`].
@@ -1592,13 +1665,15 @@ impl Document {
         &self.place
     }
 
-    /// A save of the talk as it is now, where it's kept: for a folder, only its `slides.md`.
+    /// A save of the talk as it is now, where it's kept: for a folder, only its `slides.md` and
+    /// the files added that it uses.
     pub fn save_job(&self) -> SaveJob {
         SaveJob::new(
             self.source().to_string(),
             self.on_disk.clone(),
             self.place.clone(),
             None,
+            self.added_files(),
         )
     }
 
@@ -1609,17 +1684,23 @@ impl Document {
             self.on_disk.clone(),
             self.place.clone(),
             Some(target),
+            self.added_files(),
         )
     }
 
     /// Takes in a save that worked. The talk is saved if its text is still what was written,
     /// and after a Save As it's kept in the new place from now on.
     pub fn saved(&mut self, saved: Saved) {
+        // Part of the talk now, wherever it's kept. They're still read from memory, as a pack
+        // the talk has open is the one it opened.
+        for path in &saved.files_written {
+            self.pending.remove(path);
+        }
         if let Some((place, files)) = saved.moved_to {
             self.place_name = place.name();
             self.place = place;
-            self.files = files.clone();
-            self.deck.set_files(Box::new(files));
+            self.files = Arc::new(WithAdded::new(files, self.added.clone()));
+            self.deck.set_files(Box::new(self.files.clone()));
         }
         if self.source() == saved.written {
             self.history.mark_saved();

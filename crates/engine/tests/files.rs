@@ -123,3 +123,88 @@ fn a_folder_reads_as_absent() {
 fn a_pack_takes_entries_as_big_as_a_folder_reads() {
     assert_eq!(PackLimits::default().entry_bytes, MAX_FILE_BYTES);
 }
+
+fn with_added(root: &std::path::Path) -> (WithAdded, std::sync::Arc<AddedSet>) {
+    let under: std::sync::Arc<dyn TalkFiles + Send + Sync> = std::sync::Arc::new(FolderFiles::new(root.into()));
+    let added = std::sync::Arc::new(AddedSet::new());
+    (WithAdded::new(under, added.clone()), added)
+}
+
+#[test]
+fn an_added_file_is_read_with_the_talks_own() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("assets")).unwrap();
+    std::fs::write(dir.path().join("assets/a.txt"), b"on disk").unwrap();
+    let (files, added) = with_added(dir.path());
+    assert_eq!(files.read("assets/c.txt"), None);
+    assert_eq!(files.stamp("assets/c.txt"), None);
+
+    let before = added.stamp();
+    assert!(added.add("assets/c.txt", b"added".to_vec().into()));
+    assert_ne!(added.stamp(), before);
+
+    assert_eq!(files.read("assets/c.txt"), Some(b"added".to_vec()));
+    assert_eq!(files.read("./assets/c.txt"), Some(b"added".to_vec()));
+    assert_eq!(files.len("assets/c.txt"), Some(5));
+    assert!(files.stamp("assets/c.txt").is_some());
+    assert_eq!(files.read("assets/a.txt"), Some(b"on disk".to_vec()));
+    assert_eq!(files.names_in("assets"), ["assets/a.txt", "assets/c.txt"]);
+    assert_eq!(added.names_in("assets"), ["assets/c.txt"]);
+    assert_eq!(added.get("assets/c.txt").as_deref(), Some(&b"added"[..]));
+    // What can be added to changes.
+    assert!(!files.never_changes());
+}
+
+#[test]
+fn an_added_file_is_never_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let (files, added) = with_added(dir.path());
+    assert!(added.add("assets/c.txt", b"first".to_vec().into()));
+    let stamp = added.stamp();
+    let file_stamp = files.stamp("assets/c.txt");
+    assert!(!added.add("assets/c.txt", b"second".to_vec().into()));
+    assert_eq!(added.stamp(), stamp);
+    assert_eq!(files.read("assets/c.txt"), Some(b"first".to_vec()));
+    assert_eq!(files.stamp("assets/c.txt"), file_stamp);
+}
+
+#[test]
+fn a_packs_files_keep_one_stamp_under_what_is_added() {
+    let dir = tempfile::tempdir().unwrap();
+    let talk = dir.path().join("talk");
+    std::fs::create_dir_all(talk.join("assets")).unwrap();
+    std::fs::write(talk.join("slides.md"), "# One\n").unwrap();
+    std::fs::write(talk.join("assets/a.png"), b"a").unwrap();
+    let out = dir.path().join("talk.sptx");
+    pack_folder(&talk, &out, "0.1.0").unwrap();
+    let under: std::sync::Arc<dyn TalkFiles + Send + Sync> = std::sync::Arc::new(open_packed(&out).unwrap());
+    let files = WithAdded::new(under, std::sync::Arc::new(AddedSet::new()));
+    let stamp = files.stamp("assets/a.png");
+    assert!(stamp.is_some());
+    assert_eq!(files.stamp("assets/a.png"), stamp);
+    assert_eq!(files.stamp("assets/none.png"), None);
+}
+
+#[test]
+fn the_engine_tells_a_picture_from_its_bytes() {
+    let mut png = Vec::new();
+    image::RgbaImage::from_pixel(3, 2, image::Rgba([255, 0, 0, 255]))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    assert_eq!(picture_format(&png), Some(PictureFormat::Png));
+    let mut bmp = Vec::new();
+    image::RgbaImage::from_pixel(3, 2, image::Rgba([0, 0, 255, 255]))
+        .write_to(&mut std::io::Cursor::new(&mut bmp), image::ImageFormat::Bmp)
+        .unwrap();
+    assert_eq!(picture_format(&bmp), Some(PictureFormat::Bmp));
+    let again = picture_as_png(&bmp).unwrap();
+    assert_eq!(picture_format(&again), Some(PictureFormat::Png));
+    let decoded = image::load_from_memory(&again).unwrap().to_rgba8();
+    assert_eq!((decoded.width(), decoded.height()), (3, 2));
+    assert_eq!(decoded.get_pixel(1, 1).0, [0, 0, 255, 255]);
+    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4"/></svg>"#;
+    assert_eq!(picture_format(svg), Some(PictureFormat::Svg));
+    assert_eq!(picture_format(b"hello"), None);
+    assert_eq!(picture_format(b""), None);
+    assert_eq!(picture_format(&png[..png.len() / 2]), None);
+}

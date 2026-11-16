@@ -185,6 +185,66 @@ impl PictureCache {
     }
 }
 
+/// What kind of picture a file holds, told from its bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PictureFormat {
+    Png,
+    Jpeg,
+    Webp,
+    Gif,
+    Bmp,
+    Tiff,
+    Svg,
+    /// Another kind the engine reads, such as an icon file.
+    Other,
+}
+
+/// What kind of picture `bytes` hold, if they're a picture the engine draws, decoded with the
+/// same limits as when it's shown. Told from the bytes alone: a raster picture says what it is
+/// in its first bytes, and anything else is read as an SVG.
+pub fn picture_format(bytes: &[u8]) -> Option<PictureFormat> {
+    let format = image::guess_format(bytes).ok();
+    let drawn = match format {
+        Some(_) => decode("", bytes),
+        None => decode("picture.svg", bytes),
+    };
+    drawn?;
+    Some(match format {
+        None => PictureFormat::Svg,
+        Some(image::ImageFormat::Png) => PictureFormat::Png,
+        Some(image::ImageFormat::Jpeg) => PictureFormat::Jpeg,
+        Some(image::ImageFormat::WebP) => PictureFormat::Webp,
+        Some(image::ImageFormat::Gif) => PictureFormat::Gif,
+        Some(image::ImageFormat::Bmp) => PictureFormat::Bmp,
+        Some(image::ImageFormat::Tiff) => PictureFormat::Tiff,
+        Some(_) => PictureFormat::Other,
+    })
+}
+
+/// The raster picture in `bytes` written again as a PNG, at its own size, if the engine reads
+/// it. An animated one gives its first frame.
+pub fn picture_as_png(bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| {
+        let image = limited_reader(bytes)?.decode().ok()?;
+        let mut png = Vec::new();
+        image.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
+        Some(png)
+    })
+    .ok()
+    .flatten()
+}
+
+/// A reader of the raster picture in `bytes` that refuses one that claims too much.
+fn limited_reader(bytes: &[u8]) -> Option<ImageReader<Cursor<&[u8]>>> {
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_DECODED_SIDE);
+    limits.max_image_height = Some(MAX_DECODED_SIDE);
+    limits.max_alloc = Some(MAX_DECODED_BYTES);
+    let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format().ok()?;
+    reader.limits(limits);
+    Some(reader)
+}
+
 fn decode(path: &str, bytes: &[u8]) -> Option<Pixmap> {
     // The file is untrusted and the decoders are large, so a bug in one of them shows as
     // a bad picture instead of taking the app down.
@@ -196,13 +256,7 @@ fn is_svg(path: &str) -> bool {
 }
 
 fn decode_raster(bytes: &[u8]) -> Option<Pixmap> {
-    let mut limits = Limits::default();
-    limits.max_image_width = Some(MAX_DECODED_SIDE);
-    limits.max_image_height = Some(MAX_DECODED_SIDE);
-    limits.max_alloc = Some(MAX_DECODED_BYTES);
-    let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format().ok()?;
-    reader.limits(limits);
-    let mut image = reader.decode().ok()?;
+    let mut image = limited_reader(bytes)?.decode().ok()?;
     // Shrunk before it becomes RGBA, which can be four times what the limits allowed.
     if image.width().max(image.height()) > MAX_EDGE {
         image = image.thumbnail(MAX_EDGE, MAX_EDGE);
