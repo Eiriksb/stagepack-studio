@@ -8,7 +8,8 @@ use std::collections::BTreeSet;
 use std::io::Read as _;
 use std::path::Path;
 
-use slides_engine::{PictureFormat, TalkFiles, picture_as_png, picture_format};
+use slides_components::{BuildIndex, INDEX_FILE};
+use slides_engine::{MAX_INDEX_BYTES, MAX_SOURCE_BYTES, PictureFormat, TalkFiles, normalise, picture_as_png, picture_format};
 use slides_format::{Block, Talk};
 
 /// The largest file that can be added to a talk.
@@ -23,6 +24,12 @@ const DEVICE_NAMES: [&str; 22] = [
     "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3",
     "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
 ];
+/// What the window says when a file kept from last time is brought back under another name.
+pub const KEPT_FILE_RENAMED: &str =
+    "A file kept from last time has the same name as a different one in the talk, so it was brought back under another name.";
+/// What the window says when a file kept from last time couldn't be brought back.
+pub const KEPT_FILE_LEFT_OUT: &str =
+    "A file kept from last time has the same name as a different one in the talk, so it couldn't be brought back.";
 /// What a WebAssembly module starts with.
 const WASM_MAGIC: &[u8] = b"\0asm";
 
@@ -152,6 +159,17 @@ pub fn picture_bytes(bytes: Vec<u8>, hint_ext: Option<&str>) -> Result<(Vec<u8>,
     Ok((bytes, ext))
 }
 
+/// The name a component's file is given for `suggested`, without its extension: the name as it
+/// is, as a component's file is never renamed. The engine pairs a source, `components/<stem>.rs`,
+/// with its build, `build/<stem>.wasm`, by that stem, so making it "safe" would part them. `None`
+/// if it isn't a stem the engine takes (letters, digits, `_` and `-`, at most 64), or is a name
+/// Windows keeps for a device.
+fn component_stem(suggested: &str) -> Option<&str> {
+    let (stem, _) = split_extension(suggested);
+    let device = DEVICE_NAMES.iter().any(|device| device.eq_ignore_ascii_case(stem));
+    (slides_components::safe_stem(stem) && !device).then_some(stem)
+}
+
 /// `bytes` checked to be a file of `kind`, as they'd be written, with the extension they go under.
 fn checked(kind: FileKind, suggested: &str, bytes: Vec<u8>) -> Result<(Vec<u8>, &'static str), NotAdded> {
     if bytes.len() > MAX_ADDED_BYTES {
@@ -167,11 +185,13 @@ fn checked(kind: FileKind, suggested: &str, bytes: Vec<u8>) -> Result<(Vec<u8>, 
         Some(given) => *allowed.iter().find(|ext| ext.eq_ignore_ascii_case(given)).ok_or(NotAdded::NotThatKind)?,
     };
     let fits = match kind {
-        FileKind::Data | FileKind::ComponentSource => std::str::from_utf8(&bytes).is_ok(),
+        FileKind::Data => std::str::from_utf8(&bytes).is_ok(),
+        // The engine finds the component's tag in its source: one it can't is no component.
+        FileKind::ComponentSource => std::str::from_utf8(&bytes).ok().and_then(slides_components::component_tag).is_some(),
         FileKind::ComponentBuild => bytes.starts_with(WASM_MAGIC),
         FileKind::Picture => unreachable!("a picture is checked above"),
     };
-    if !fits {
+    if !fits || (kind.is_component() && component_stem(suggested).is_none()) {
         return Err(NotAdded::NotThatKind);
     }
     Ok((bytes, ext))
@@ -204,24 +224,24 @@ pub(crate) fn place(
         let (_, ext) = split_extension(path);
         ext.is_some_and(|ext| kind.extensions().iter().any(|allowed| allowed.eq_ignore_ascii_case(ext)))
     };
-    let stem = safe_stem(suggested);
-    if !kind.is_component()
-        && let Some(path) = there.iter().find(|path| of_this_kind(path) && same_bytes(path))
-    {
-        return Ok(Placed::There(path.clone()));
-    }
     let lower: BTreeSet<String> = there.iter().map(|path| path.to_ascii_lowercase()).collect();
-    let free = |path: &str| !lower.contains(path) && files.len(path).is_none() && !taken(path);
-    let first = format!("{folder}/{stem}.{ext}");
+    let free = |path: &str| !lower.contains(&path.to_ascii_lowercase()) && files.len(path).is_none() && !taken(path);
     if kind.is_component() {
-        if free(&first) {
-            return Ok(Placed::New(first, bytes));
+        let stem = component_stem(suggested).expect("checked above");
+        let path = format!("{folder}/{stem}.{ext}");
+        if free(&path) {
+            return Ok(Placed::New(path, bytes));
         }
-        return match there.iter().find(|path| path.eq_ignore_ascii_case(&first)) {
-            Some(path) if same_bytes(path) => Ok(Placed::There(path.clone())),
+        return match there.iter().find(|other| other.eq_ignore_ascii_case(&path)) {
+            Some(other) if same_bytes(other) => Ok(Placed::There(other.clone())),
             _ => Err(NotAdded::NameTaken),
         };
     }
+    if let Some(path) = there.iter().find(|path| of_this_kind(path) && same_bytes(path)) {
+        return Ok(Placed::There(path.clone()));
+    }
+    let stem = safe_stem(suggested);
+    let first = format!("{folder}/{stem}.{ext}");
     if free(&first) {
         return Ok(Placed::New(first, bytes));
     }
@@ -237,55 +257,95 @@ pub(crate) fn place(
     Err(NotAdded::NameTaken)
 }
 
-/// Whether `path` is one [`place`] could have made: a plain name in one of the folders a file is
-/// added to, with an extension a file there can have.
-pub(crate) fn is_added_path(path: &str) -> bool {
-    let Some((folder, name)) = path.split_once('/') else {
-        return false;
-    };
-    let Some((stem, ext)) = name.rsplit_once('.') else {
-        return false;
-    };
+/// The kind of file that the path `path` is, if it's one [`place`] could have made: a plain name
+/// in one of the folders a file is added to, with an extension a file there can have.
+pub(crate) fn kind_of_path(path: &str) -> Option<FileKind> {
+    let (folder, name) = path.split_once('/')?;
+    let (stem, ext) = name.rsplit_once('.')?;
     let kinds = [FileKind::Picture, FileKind::Data, FileKind::ComponentSource, FileKind::ComponentBuild];
-    kinds.iter().any(|kind| kind.folder() == folder && kind.extensions().contains(&ext))
-        && (1..=MAX_STEM).contains(&stem.len())
-        && stem.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    let kind = kinds.into_iter().find(|kind| kind.folder() == folder && kind.extensions().contains(&ext))?;
+    let plain = if kind.is_component() {
+        component_stem(stem) == Some(stem) && !stem.contains('.')
+    } else {
+        (1..=MAX_STEM).contains(&stem.len()) && stem.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    };
+    plain.then_some(kind)
 }
 
-/// Whether `talk` uses the file at `path`: a picture shows it, or an attribute of a tag on a slide
-/// is exactly it. A component's source, `components/<name>.rs`, and its build,
-/// `build/<name>.wasm`, are used when a tag on a slide has the name a file of it is given here.
-/// Nothing else counts: a path only written in words or code isn't a use.
-pub fn talk_uses(talk: &Talk, path: &str) -> bool {
-    let component = path
-        .strip_prefix("components/")
-        .and_then(|name| name.strip_suffix(".rs"))
-        .or_else(|| path.strip_prefix("build/").and_then(|name| name.strip_suffix(".wasm")));
-    let names_it = |tag_name: &str| component.is_some_and(|stem| safe_stem(tag_name) == stem);
+/// Whether `path` is one [`place`] could have made.
+pub(crate) fn is_added_path(path: &str) -> bool {
+    kind_of_path(path).is_some()
+}
+
+/// The tag the component whose source is `components/<stem>.rs` in `files` is, as the engine
+/// finds it in the source.
+fn component_tag_of(files: &dyn TalkFiles, stem: &str) -> Option<String> {
+    let path = format!("components/{stem}.rs");
+    if files.len(&path).is_some_and(|len| len > MAX_SOURCE_BYTES) {
+        return None;
+    }
+    let source = files.read(&path)?;
+    slides_components::component_tag(std::str::from_utf8(&source).ok()?)
+}
+
+/// The tags the talk's build index in `files` gives the build `build/<file>.wasm`.
+fn indexed_tags(files: &dyn TalkFiles, file: &str) -> Vec<String> {
+    if files.len(INDEX_FILE).is_some_and(|len| len > MAX_INDEX_BYTES) {
+        return Vec::new();
+    }
+    let Some(index) = files.read(INDEX_FILE).and_then(|bytes| serde_json::from_slice::<BuildIndex>(&bytes).ok()) else {
+        return Vec::new();
+    };
+    index.components.into_iter().filter(|entry| entry.file == file).map(|entry| entry.tag).collect()
+}
+
+/// Whether `talk`, whose files are `files`, uses the file at `path`. Paths are compared as the
+/// talk's files read them, so `./assets/a.png` is `assets/a.png`.
+///
+/// - A picture shows it, or an attribute of a tag on a slide names it.
+/// - A component's source, `components/<stem>.rs`, is used when a tag on a slide is the tag the
+///   engine finds in that source.
+/// - A build, `build/<stem>.wasm`, is used when a tag on a slide is the tag the talk's build index
+///   gives it, as the engine pairs them, or the tag of the source of the same stem, which is the
+///   build that source is built to.
+///
+/// Nothing else counts: a path written only in words or code isn't a use.
+pub fn talk_uses(talk: &Talk, files: &dyn TalkFiles, path: &str) -> bool {
+    let Some(path) = normalise(path) else {
+        return false;
+    };
+    let names_it = |written: &str| normalise(written).as_ref() == Some(&path);
+    let mut tags: BTreeSet<&str> = BTreeSet::new();
     let mut blocks: Vec<&Block> = Vec::new();
     for slide in &talk.slides {
-        if slide.inline_tags.iter().any(|name| names_it(name)) {
-            return true;
-        }
+        tags.extend(slide.inline_tags.iter().map(String::as_str));
         blocks.extend(&slide.blocks);
     }
     while let Some(block) = blocks.pop() {
         match block {
-            Block::Picture { src, .. } if src == path => return true,
+            Block::Picture { src, .. } if names_it(src) => return true,
             Block::List { items, .. } => blocks.extend(items.iter().flatten()),
             Block::Tag(tag) => {
-                if names_it(&tag.name) || tag.attrs.iter().any(|attr| attr.value == path) {
+                if tag.attrs.iter().any(|attr| names_it(&attr.value)) {
                     return true;
                 }
+                tags.insert(&tag.name);
                 blocks.extend(&tag.children);
             }
             _ => {}
         }
     }
+    let on_a_slide = |tag: Option<String>| tag.is_some_and(|tag| tags.contains(tag.as_str()));
+    if let Some(stem) = path.strip_prefix("components/").and_then(|name| name.strip_suffix(".rs")) {
+        return on_a_slide(component_tag_of(files, stem));
+    }
+    if let Some(stem) = path.strip_prefix("build/").and_then(|name| name.strip_suffix(".wasm")) {
+        return indexed_tags(files, stem).into_iter().any(|tag| on_a_slide(Some(tag))) || on_a_slide(component_tag_of(files, stem));
+    }
     false
 }
 
-/// The bytes of the file at `path`, outside any talk, to add to one. A folder, or a link to
+/// The bytes of the file at `path`, outside any talk, to add to it. A folder, or a link to
 /// anything but a file, can't be read; nor can a file that holds more than
 /// [`MAX_ADDED_BYTES`], which is looked at before it's read and again as it is.
 pub(crate) fn read_outside(path: &Path) -> Result<Vec<u8>, NotAdded> {
@@ -294,7 +354,15 @@ pub(crate) fn read_outside(path: &Path) -> Result<Vec<u8>, NotAdded> {
     if !metadata.is_file() {
         return Err(NotAdded::Unreadable);
     }
-    let file = std::fs::File::open(path).map_err(|_| NotAdded::Unreadable)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    // And opened without waiting, in case it was swapped for one since.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(|_| NotAdded::Unreadable)?;
     let opened = file.metadata().map_err(|_| NotAdded::Unreadable)?;
     if !opened.is_file() {
         return Err(NotAdded::Unreadable);

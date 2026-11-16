@@ -143,8 +143,9 @@ fn safe_name(name: &str) -> bool {
 }
 
 /// `path` with empty and `.` parts dropped and `..` resolved, or `None` if it starts at the root
-/// or climbs out, as a folder talk would refuse it too.
-pub(crate) fn normalise(path: &str) -> Option<String> {
+/// or climbs out, as a folder talk would refuse it too. This is the path a pack and the files
+/// added to a talk read `path` as.
+pub fn normalise(path: &str) -> Option<String> {
     if path.starts_with('/') {
         return None;
     }

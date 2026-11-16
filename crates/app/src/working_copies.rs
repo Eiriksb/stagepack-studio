@@ -5,6 +5,7 @@
 //!
 //! [`settled`]: WorkingCopies::settled
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -36,6 +37,8 @@ struct Kept {
     place: PathBuf,
     text: String,
     on_disk: String,
+    /// The files added to the talk that the text uses, by their path in it.
+    files: Vec<String>,
 }
 
 /// The copy from last time that was brought back, until this window's own copy or a save
@@ -67,6 +70,15 @@ enum Job {
         recovery: Recovery,
         place: TalkPlace,
         adopted: Option<Adopted>,
+    },
+    /// Keeps a file added to the talk, as it's added. Made only if no clear has been asked for
+    /// since it was: a save has written it then, or the text doesn't use it yet, and the next
+    /// keep of a text that does carries it.
+    KeepFile {
+        recovery: Recovery,
+        place: TalkPlace,
+        path: String,
+        bytes: Arc<[u8]>,
     },
     /// Removes a copy from last time.
     Discard(Recovery, Found),
@@ -106,6 +118,16 @@ impl Job {
                     recovery.discard(&adopted);
                 }
             }
+            Job::KeepFile {
+                recovery,
+                place,
+                path,
+                bytes,
+            } => {
+                if clears.load(Ordering::SeqCst) == at {
+                    recovery.keep_file(&place, &path, &bytes).map_err(|_| ())?;
+                }
+            }
             Job::Discard(recovery, found) => recovery.discard(&found),
         }
         Ok(())
@@ -135,6 +157,10 @@ pub struct WorkingCopies {
     /// Whether the window is closing: nothing more is kept, and it may close whatever is
     /// unsaved.
     closing: bool,
+    /// How many files had been added to the talk when this last looked.
+    files_seen: u64,
+    /// The files added to the talk that this window's copy holds, or is about to.
+    files_kept: BTreeSet<String>,
 }
 
 impl EventEmitter<KeepFailed> for WorkingCopies {}
@@ -153,6 +179,8 @@ impl WorkingCopies {
             chain: None,
             clears: Arc::new(AtomicU64::new(0)),
             closing: false,
+            files_seen: 0,
+            files_kept: BTreeSet::new(),
         }
     }
 
@@ -185,7 +213,10 @@ impl WorkingCopies {
         else {
             return;
         };
-        if found.text == document.read(cx).source() {
+        let document = document.read(cx);
+        let files = document.export_input().files;
+        let has_them = found.files.iter().all(|(path, bytes)| files.read(path).is_some_and(|held| *held == **bytes));
+        if found.text == document.source() && has_them {
             // Nothing in it that isn't here.
             self.enqueue(Job::Discard(recovery, found), cx);
             return;
@@ -239,10 +270,36 @@ impl WorkingCopies {
     /// for a moment, or [`WORKING_COPY_MOST_WAIT`] after the first edit it doesn't hold, if
     /// that's sooner.
     pub fn talk_changed(&mut self, cx: &mut Context<Self>) {
+        self.keep_added_files(cx);
         let now = cx.background_executor().now();
         let since = *self.unkept_since.get_or_insert(now);
         let left = WORKING_COPY_MOST_WAIT.saturating_sub(now.saturating_duration_since(since));
         self.keep_after(WORKING_COPY_DELAY.min(left), cx);
+    }
+
+    /// Keeps each file added to the talk since this last looked, straight away: a picture that
+    /// shows on a slide is kept from the moment it's added, whether or not the text changed.
+    fn keep_added_files(&mut self, cx: &mut Context<Self>) {
+        let (Some(recovery), Some(document)) = (self.recovery.clone(), self.document.clone()) else {
+            return;
+        };
+        if self.closing {
+            return;
+        }
+        let document = document.read(cx);
+        let stamp = document.files_added_stamp();
+        if stamp == self.files_seen {
+            return;
+        }
+        self.files_seen = stamp;
+        let place = document.place().clone();
+        let new: Vec<(String, Arc<[u8]>)> =
+            document.unsaved_files().into_iter().filter(|(path, _)| !self.files_kept.contains(path)).collect();
+        for (path, bytes) in new {
+            self.files_kept.insert(path.clone());
+            let job = Job::KeepFile { recovery: recovery.clone(), place: place.clone(), path, bytes };
+            self.enqueue(job, cx);
+        }
     }
 
     fn keep_after(&mut self, delay: Duration, cx: &mut Context<Self>) {
@@ -306,6 +363,7 @@ impl WorkingCopies {
         let place = document.place().clone();
         if !document.has_unsaved_changes() {
             self.kept.take()?;
+            self.files_kept.clear();
             return Some(Job::Clear {
                 recovery,
                 place,
@@ -313,10 +371,12 @@ impl WorkingCopies {
             });
         }
         let (TalkPlace::Folder(path) | TalkPlace::Packed(path)) = &place;
+        let files = document.added_files();
         let kept = Kept {
             place: path.clone(),
             text: document.source().to_string(),
             on_disk: document.stamp_on_disk().to_string(),
+            files: files.iter().map(|(path, _)| path.clone()).collect(),
         };
         if self.kept.as_ref() == Some(&kept) {
             return None;
@@ -326,7 +386,7 @@ impl WorkingCopies {
             place,
             on_disk: kept.on_disk.clone(),
             text: kept.text.clone(),
-            files: document.added_files(),
+            files,
             adopted: self.adopted.clone(),
         };
         self.kept = Some(kept);
@@ -347,6 +407,8 @@ impl WorkingCopies {
 
     fn clear(&mut self, place: TalkPlace, cx: &mut Context<Self>) {
         self.kept = None;
+        // The slot goes, files and all.
+        self.files_kept.clear();
         self.pending = None;
         self.unkept_since = None;
         let Some(recovery) = self.recovery.clone() else {

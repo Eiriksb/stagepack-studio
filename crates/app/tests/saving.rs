@@ -731,7 +731,7 @@ fn a_packed_save_never_replaces_a_different_entry() {
 
     let problem = doc.save_job().run().err().expect("the save fails").to_string();
 
-    assert!(!problem.is_empty());
+    assert!(problem.ends_with("This talk already has a different file with that name."), "{problem}");
     assert_eq!(std::fs::read(&file).unwrap(), before);
     assert_eq!(open_packed(&file).unwrap().read(&path).unwrap(), b"someone else's");
     assert!(doc.has_unsaved_changes());

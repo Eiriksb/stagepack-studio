@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use proptest::prelude::*;
-use slides_engine::{FolderFiles, Fonts, TalkFiles as _};
+use slides_engine::{FolderFiles, Fonts, TalkFiles};
 use slides_format::{Change, SourceEdit, parse_talk};
-use stagepack_studio::added_files::{FileKind, MAX_ADDED_BYTES, NotAdded, picture_bytes, safe_name, talk_uses};
+use stagepack_studio::added_files::{FileKind, KEPT_FILE_RENAMED, MAX_ADDED_BYTES, NotAdded, picture_bytes, safe_name, talk_uses};
 use stagepack_studio::document::Document;
 
 const ONE: &str = "---\ntitle: T\n---\n\n# One\n";
@@ -172,6 +172,10 @@ fn a_file_that_cannot_be_used_adds_nothing() {
         ("a program as data", FileKind::Data, "run.exe", b"MZ".to_vec(), NotAdded::NotThatKind),
         ("data that isn't text", FileKind::Data, "sales.csv", vec![0xFF, 0xFE, 0], NotAdded::NotThatKind),
         ("a build that isn't one", FileKind::ComponentBuild, "score", b"not wasm".to_vec(), NotAdded::NotThatKind),
+        ("a source with no component", FileKind::ComponentSource, "score.rs", b"fn main() {}\n".to_vec(), NotAdded::NotThatKind),
+        ("a component named with a space", FileKind::ComponentSource, "my score.rs", component("Score"), NotAdded::NotThatKind),
+        ("a component named for a device", FileKind::ComponentSource, "con.rs", component("Score"), NotAdded::NotThatKind),
+        ("a build named with a dot", FileKind::ComponentBuild, "a.b.wasm", b"\0asm\x01\0\0\0".to_vec(), NotAdded::NotThatKind),
     ];
     for (what, kind, name, bytes, refused) in bytes {
         assert_eq!(doc.add_file(kind, name, bytes), Err(refused), "{what}");
@@ -181,7 +185,7 @@ fn a_file_that_cannot_be_used_adds_nothing() {
     assert!(!doc.has_unsaved_changes());
     assert!(doc.added_files().is_empty());
     assert_eq!(names_under(&folder), ["slides.md"]);
-    for name in ["assets/text.png", "assets/empty.png", "assets/big.png", "assets/huge.png", "assets/run.csv", "assets/sales.csv", "build/score.wasm"] {
+    for name in ["assets/text.png", "assets/empty.png", "assets/big.png", "assets/huge.png", "assets/run.csv", "assets/sales.csv", "build/score.wasm", "components/score.rs", "components/con.rs"] {
         assert!(!doc.has_file(name), "{name}");
     }
 }
@@ -294,13 +298,13 @@ fn the_same_bytes_twice_are_one_file() {
     assert_eq!(doc.add_file(FileKind::Picture, "sky again", blue).unwrap(), "assets/Sky.PNG");
 
     // A component's source, under its own name.
-    let source = b"// a component".to_vec();
+    let source = component("Score");
     let path = doc.add_file(FileKind::ComponentSource, "Score", source.clone()).unwrap();
-    assert_eq!(path, "components/score.rs");
-    assert_eq!(doc.add_file(FileKind::ComponentSource, "score.rs", source).unwrap(), path);
+    assert_eq!(path, "components/Score.rs");
+    assert_eq!(doc.add_file(FileKind::ComponentSource, "Score.rs", source).unwrap(), path);
     let build = b"\0asm\x01\0\0\0".to_vec();
-    assert_eq!(doc.add_file(FileKind::ComponentBuild, "Score", build.clone()).unwrap(), "build/score.wasm");
-    assert_eq!(doc.add_file(FileKind::ComponentBuild, "score", build).unwrap(), "build/score.wasm");
+    assert_eq!(doc.add_file(FileKind::ComponentBuild, "Score", build.clone()).unwrap(), "build/Score.wasm");
+    assert_eq!(doc.add_file(FileKind::ComponentBuild, "Score.wasm", build).unwrap(), "build/Score.wasm");
     let data = b"a,b\n1,2\n".to_vec();
     assert_eq!(doc.add_file(FileKind::Data, "Sales.csv", data.clone()).unwrap(), "assets/sales.csv");
     assert_eq!(doc.add_file(FileKind::Data, "other", data).unwrap(), "assets/sales.csv");
@@ -326,8 +330,9 @@ fn a_taken_name_gets_a_number() {
     assert_eq!(doc.add_file(FileKind::Picture, &long, png([0, 2, 0, 255])).unwrap(), format!("assets/{}-2.png", "l".repeat(38)));
 
     // A component is never renamed.
-    doc.add_file(FileKind::ComponentSource, "score", b"// one".to_vec()).unwrap();
-    assert_eq!(doc.add_file(FileKind::ComponentSource, "score", b"// two".to_vec()), Err(NotAdded::NameTaken));
+    doc.add_file(FileKind::ComponentSource, "score", component("Score")).unwrap();
+    assert_eq!(doc.add_file(FileKind::ComponentSource, "score", component("Other")), Err(NotAdded::NameTaken));
+    assert_eq!(doc.add_file(FileKind::ComponentSource, "Score", component("Other")), Err(NotAdded::NameTaken), "whatever the case");
     doc.add_file(FileKind::ComponentBuild, "score", b"\0asm\x01\0\0\0".to_vec()).unwrap();
     assert_eq!(doc.add_file(FileKind::ComponentBuild, "score", b"\0asm\x01\0\0\0 other".to_vec()), Err(NotAdded::NameTaken));
 }
@@ -394,23 +399,146 @@ fn the_engine_sees_an_added_file_at_once() {
     assert_eq!(doc.notices(), ["Can't show the picture assets/late.png"]);
     assert_eq!(doc.add_file(FileKind::Picture, "late", red_png()).unwrap(), "assets/late.png");
     assert!(draws_red(&mut doc));
-    assert!(!doc.has_unsaved_changes(), "adding a file changes no text");
+    assert_eq!(doc.source(), "---\ntitle: T\n---\n\n# One\n\n![](assets/late.png)\n", "adding a file changes no text");
+    assert!(doc.has_unsaved_changes(), "but a save would write it");
     assert_eq!(doc.added_files().len(), 1, "but it's used, so a save writes it");
+}
+
+/// The source of a component whose tag is `tag`.
+fn component(tag: &str) -> Vec<u8> {
+    format!("#[component]\nfn {tag}() {{}}\n").into_bytes()
+}
+
+/// The talk's files as `doc` reads them, added ones too.
+fn files_of(doc: &Document) -> std::sync::Arc<dyn TalkFiles + Send + Sync> {
+    doc.export_input().files
 }
 
 #[test]
 fn a_file_is_used_where_the_talk_names_it() {
+    let (_dir, _folder, doc) = talk();
+    let files = files_of(&doc);
     let talk = parse_talk(concat!(
         "# One\n\n![](assets/a.png)\n\n- <Picture src=\"assets/in-a-list.png\" />\n\n",
         "<Box x=\"10\">\n\n<Chart data=\"assets/sales.csv\" />\n\n</Box>\n\n---\n\n<Score value=\"3\" />\n\n",
         "Says assets/words.png in words, and `assets/code.png`.\n"
     ));
-    for used in ["assets/a.png", "assets/in-a-list.png", "assets/sales.csv", "components/score.rs", "build/score.wasm"] {
-        assert!(talk_uses(&talk, used), "{used}");
+    for used in ["assets/a.png", "assets/in-a-list.png", "assets/sales.csv"] {
+        assert!(talk_uses(&talk, &*files, used), "{used}");
     }
     for unused in ["assets/words.png", "assets/code.png", "assets/a", "assets/A.png", "components/chart2.rs", "build/box2.wasm", "assets/score.rs"] {
-        assert!(!talk_uses(&talk, unused), "{unused}");
+        assert!(!talk_uses(&talk, &*files, unused), "{unused}");
     }
+}
+
+#[test]
+fn a_component_is_used_by_the_tag_its_source_gives() {
+    let (_dir, folder, mut doc) = talk();
+    // The file is named the Rust way, and the tag is what the source says.
+    let source = doc.add_file(FileKind::ComponentSource, "score_card.rs", component("ScoreCard")).unwrap();
+    assert_eq!(source, "components/score_card.rs");
+    let build = doc.add_file(FileKind::ComponentBuild, "score_card.wasm", b"\0asm\x01\0\0\0".to_vec()).unwrap();
+    assert_eq!(build, "build/score_card.wasm");
+    // A build the talk's index pairs with the tag, under another name.
+    std::fs::create_dir_all(folder.join("build")).unwrap();
+    std::fs::write(
+        folder.join("build/index.json"),
+        r#"{"format":1,"components":[{"tag":"ScoreCard","file":"older","source_hash":"x"}]}"#,
+    )
+    .unwrap();
+    let older = doc.add_file(FileKind::ComponentBuild, "older", b"\0asm\x01\0\0\0 older".to_vec()).unwrap();
+    let files = files_of(&doc);
+
+    for unused_by in ["<Score_card />\n", "<ScoreCard2 />\n", "Says ScoreCard.\n", "<scorecard />\n"] {
+        let talk = parse_talk(unused_by);
+        for path in [&source, &build, &older] {
+            assert!(!talk_uses(&talk, &*files, path), "{unused_by:?} {path}");
+        }
+    }
+    let talk = parse_talk("# One\n\n---\n\n- <ScoreCard value=\"1\" />\n");
+    for path in [&source, &build, &older] {
+        assert!(talk_uses(&talk, &*files, path), "{path}");
+    }
+
+    let end = doc.source().len();
+    doc.edit("Insert", Change::single(SourceEdit { range: end..end, text: "\n<ScoreCard />\n".to_string() }), 0).unwrap();
+    let mut pending: Vec<String> = doc.added_files().into_iter().map(|(path, _)| path).collect();
+    pending.sort();
+    assert_eq!(pending, [older.clone(), build.clone(), source.clone()]);
+    save(&mut doc);
+    for path in [&source, &build, &older] {
+        assert!(folder.join(path).is_file(), "{path}");
+    }
+}
+
+/// A way of writing `assets/photo.png` that reads as it.
+fn spelling() -> impl Strategy<Value = String> {
+    let before = prop::sample::select(vec!["", "./", "././", "x/../", "assets/../", "a/b/../../"]);
+    let between = prop::sample::select(vec!["/", "//", "/./", "/x/../"]);
+    (before, between).prop_map(|(before, between)| format!("{before}assets{between}photo.png"))
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(24))]
+    #[test]
+    fn a_path_written_another_way_is_still_used(spelled in spelling()) {
+        let (_dir, folder, mut doc) = talk();
+        let path = doc.add_file(FileKind::Picture, "photo", red_png()).unwrap();
+        prop_assert_eq!(&path, "assets/photo.png");
+        prop_assume!(doc.has_file(&spelled));
+        let files = files_of(&doc);
+        for text in [format!("![]({spelled})\n"), format!("<Picture src=\"{spelled}\" />\n")] {
+            prop_assert!(talk_uses(&parse_talk(&text), &*files, &path), "{}", text);
+        }
+        show(&mut doc, &spelled);
+        prop_assert_eq!(doc.added_files().len(), 1);
+        save(&mut doc);
+        prop_assert!(folder.join(&path).is_file());
+    }
+}
+
+#[test]
+fn an_added_file_the_text_uses_is_an_unsaved_change() {
+    let (_dir, _folder, mut doc) = talk_with("---\ntitle: T\n---\n\n# One\n\n![](assets/late.png)\n");
+    assert!(!doc.has_unsaved_changes());
+    doc.add_file(FileKind::Picture, "unused", png([0, 0, 255, 255])).unwrap();
+    assert!(!doc.has_unsaved_changes(), "nothing uses it, so a save wouldn't write it");
+    doc.add_file(FileKind::Picture, "late", red_png()).unwrap();
+    assert!(doc.has_unsaved_changes(), "a save would write it");
+    save(&mut doc);
+    assert!(!doc.has_unsaved_changes());
+}
+
+#[test]
+fn a_kept_file_whose_name_is_taken_comes_back_under_another() {
+    let (_dir, folder, mut doc) = talk();
+    std::fs::create_dir(folder.join("assets")).unwrap();
+    let theirs = png([0, 0, 255, 255]);
+    std::fs::write(folder.join("assets/photo.png"), &theirs).unwrap();
+
+    // The same bytes are the file the talk has: nothing to say.
+    doc.bring_back_files(vec![("assets/photo.png".to_string(), theirs.into())]);
+    assert_eq!(doc.take_message(), None);
+    assert!(doc.added_files().is_empty());
+    assert!(!doc.has_file("assets/photo-2.png"));
+
+    doc.bring_back_files(vec![("assets/photo.png".to_string(), red_png().into())]);
+    assert_eq!(doc.take_message().as_deref(), Some(KEPT_FILE_RENAMED));
+    assert!(doc.has_file("assets/photo-2.png"));
+    assert_eq!(files_of(&doc).read("assets/photo-2.png"), Some(red_png()));
+    assert_eq!(files_of(&doc).read("assets/photo.png"), Some(png([0, 0, 255, 255])), "theirs is as it was");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_named_pipe_is_refused_without_waiting() {
+    let dir = tempfile::tempdir().unwrap();
+    let pipe = dir.path().join("pipe.png");
+    assert!(std::process::Command::new("mkfifo").arg(&pipe).status().unwrap().success());
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || done.send(Document::read_outside_file(&pipe)));
+    let read = finished.recv_timeout(std::time::Duration::from_secs(5)).expect("the read waited for a writer");
+    assert_eq!(read, Err(NotAdded::Unreadable));
 }
 
 #[test]

@@ -159,17 +159,7 @@ impl Recovery {
             ));
         }
         let talk = canonical(place);
-        let key_folder = self.root.join(key(&talk));
-        let folder = key_folder.join(&self.slot);
-        refuse_link(&key_folder)?;
-        refuse_link(&folder)?;
-        create_private(&folder)?;
-        // Made just now, but something may have put a link there meanwhile.
-        refuse_link(&key_folder)?;
-        refuse_link(&folder)?;
-        make_private(&self.root)?;
-        make_private(&key_folder)?;
-        make_private(&folder)?;
+        let folder = self.slot_folder(&talk)?;
         let about = About {
             talk,
             base_sha256: base_hash.to_string(),
@@ -186,6 +176,34 @@ impl Recovery {
         // isn't. The other way round, older text would be taken as made from the file as it is.
         write_private(&folder.join(SLIDES_FILE), text.as_bytes())?;
         write_private(&folder.join(ABOUT_FILE), &about)
+    }
+
+    /// Keeps `bytes`, the file added to the talk at `place` whose path in it is `path`, in this
+    /// slot, as it's added. It's found with the next text kept, which brings it back; a slot that
+    /// holds no text yet offers nothing.
+    pub fn keep_file(&self, place: &TalkPlace, path: &str, bytes: &[u8]) -> io::Result<()> {
+        if !is_added_path(path) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{path:?} isn't a file added to a talk")));
+        }
+        let folder = self.slot_folder(&canonical(place))?;
+        keep_file(&folder, path, bytes)
+    }
+
+    /// This slot's folder for the talk at the canonical path `talk`, made if it isn't there, and
+    /// never through a link.
+    fn slot_folder(&self, talk: &Path) -> io::Result<PathBuf> {
+        let key_folder = self.root.join(key(talk));
+        let folder = key_folder.join(&self.slot);
+        refuse_link(&key_folder)?;
+        refuse_link(&folder)?;
+        create_private(&folder)?;
+        // Made just now, but something may have put a link there meanwhile.
+        refuse_link(&key_folder)?;
+        refuse_link(&folder)?;
+        make_private(&self.root)?;
+        make_private(&key_folder)?;
+        make_private(&folder)?;
+        Ok(folder)
     }
 
     /// Removes this slot's working copy of the talk at `place`, if there is one.
@@ -286,10 +304,10 @@ fn keep_file(slot: &Path, path: &str, bytes: &[u8]) -> io::Result<()> {
         make_private(made)?;
     }
     let file = slot.join(FILES_FOLDER).join(path);
-    match std::fs::symlink_metadata(&file) {
-        Ok(meta) if meta.is_file() && meta.len() == bytes.len() as u64 => Ok(()),
-        _ => write_private(&file, bytes),
+    if read_small(&file, MAX_ADDED_BYTES as u64).is_some_and(|kept| kept == bytes) {
+        return Ok(());
     }
+    write_private(&file, bytes)
 }
 
 /// The files added to the talk kept in the working copy's `slot`: plain files only, with names a

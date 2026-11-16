@@ -832,8 +832,15 @@ impl Document {
     }
 
     /// Whether the talk has edits that its file doesn't.
+    /// A file added to the talk that a save would write counts too, as the file holds neither.
     pub fn has_unsaved_changes(&self) -> bool {
-        !self.history.is_saved()
+        !self.history.is_saved() || self.has_files_to_save()
+    }
+
+    /// Whether a save would write a file added to the talk.
+    fn has_files_to_save(&self) -> bool {
+        let talk = self.talk();
+        self.pending.iter().any(|path| talk_uses(talk, &*self.files, path))
     }
 
     /// Takes `text`, the working copy of edits that weren't saved, as the talk's text, and
@@ -929,13 +936,7 @@ impl Document {
     /// it if the text uses it then; till then it's kept with the talk's unsaved changes, and a
     /// slide that shows it shows it at once.
     pub fn add_file(&mut self, kind: FileKind, suggested: &str, bytes: Vec<u8>) -> Result<String, NotAdded> {
-        let folder = match &self.place {
-            TalkPlace::Folder(folder) => Some(folder.clone()),
-            TalkPlace::Packed(_) => None,
-        };
-        // Anything in the folder, a link or a folder included, which the talk's files don't list.
-        let on_disk = |path: &str| folder.as_ref().is_some_and(|folder| std::fs::symlink_metadata(folder.join(path)).is_ok());
-        let (path, bytes) = match added_files::place(&*self.files, kind, suggested, bytes, on_disk)? {
+        let (path, bytes) = match added_files::place(&*self.files, kind, suggested, bytes, |path| self.on_disk(path))? {
             Placed::There(path) => return Ok(path),
             Placed::New(path, bytes) => (path, bytes),
         };
@@ -946,7 +947,7 @@ impl Document {
         }
         self.pending.insert(path.clone());
         // A slide may name it already, and a component is found by its files.
-        if kind == FileKind::ComponentSource || kind == FileKind::ComponentBuild || talk_uses(self.talk(), &path) {
+        if kind == FileKind::ComponentSource || kind == FileKind::ComponentBuild || talk_uses(self.talk(), &*self.files, &path) {
             self.deck.files_added();
         }
         Ok(path)
@@ -963,25 +964,70 @@ impl Document {
         let talk = self.talk();
         self.pending
             .iter()
-            .filter(|path| talk_uses(talk, path))
+            .filter(|path| talk_uses(talk, &*self.files, path))
             .filter_map(|path| Some((path.clone(), self.added.get(path)?)))
             .collect()
     }
 
+    /// The files added to the talk that no save has written, used or not, for its working copy.
+    pub fn unsaved_files(&self) -> Vec<(String, Arc<[u8]>)> {
+        self.pending.iter().filter_map(|path| Some((path.clone(), self.added.get(path)?))).collect()
+    }
+
+    /// Changes each time a file is added to the talk.
+    pub fn files_added_stamp(&self) -> u64 {
+        self.added.stamp()
+    }
+
     /// Takes back `files`, added to the talk before the app stopped and kept with its unsaved
-    /// changes, as added again, before the changes are brought back. One the talk has a file
-    /// for now, or that isn't a name the app gives, is left out.
+    /// changes, as added again, before the changes are brought back. One the talk has already is
+    /// left as it is. One whose name the talk now gives a different file comes back under
+    /// another name, and the window says so, as the text still names the talk's own; nothing in
+    /// the text is changed. One that isn't a name the app gives is left out.
     pub fn bring_back_files(&mut self, files: Vec<(String, Arc<[u8]>)>) {
         let mut any = false;
         for (path, bytes) in files {
-            if !added_files::is_added_path(&path) || self.files.len(&path).is_some() || !self.added.add(&path, bytes) {
+            let Some(kind) = added_files::kind_of_path(&path) else {
+                continue;
+            };
+            let same = self.files.len(&path) == Some(bytes.len() as u64) && self.files.read(&path).is_some_and(|held| *held == *bytes);
+            if same {
                 continue;
             }
-            self.pending.insert(path);
-            any = true;
+            let free = self.files.len(&path).is_none() && !self.on_disk(&path);
+            let path = if free {
+                path
+            } else {
+                let (_, name) = path.split_once('/').expect("a path from kind_of_path");
+                match added_files::place(&*self.files, kind, name, bytes.to_vec(), |path| self.on_disk(path)) {
+                    Ok(Placed::New(path, _)) => {
+                        self.message = Some(added_files::KEPT_FILE_RENAMED.to_string());
+                        path
+                    }
+                    // The same bytes under another name already.
+                    Ok(Placed::There(_)) => continue,
+                    Err(_) => {
+                        self.message = Some(added_files::KEPT_FILE_LEFT_OUT.to_string());
+                        continue;
+                    }
+                }
+            };
+            if self.added.add(&path, bytes) {
+                self.pending.insert(path);
+                any = true;
+            }
         }
         if any {
             self.deck.files_added();
+        }
+    }
+
+    /// Whether anything is at `path` in a folder talk's folder, a link or a folder included,
+    /// which the talk's files don't list.
+    fn on_disk(&self, path: &str) -> bool {
+        match &self.place {
+            TalkPlace::Folder(folder) => std::fs::symlink_metadata(folder.join(path)).is_ok(),
+            TalkPlace::Packed(_) => false,
         }
     }
 
