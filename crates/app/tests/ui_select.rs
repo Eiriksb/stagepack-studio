@@ -1,7 +1,6 @@
 //! Picking a thing on the slide with a click, the outline that shows it, and taking it away.
 
 use std::collections::BTreeSet;
-use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -23,7 +22,6 @@ use stagepack_studio::clipboard_tools::{COPY_ID, CUT_ID};
 use stagepack_studio::document::Document;
 use stagepack_studio::insert_tools::InsertTextBox;
 use stagepack_studio::permissions::BuildPermissions;
-use stagepack_studio::slide_editor::SELECTION_OUTLINE_ID;
 use stagepack_studio::slide_strip::strip_row_id;
 
 const SHOWCASE: &str = include_str!("../../../fixtures/showcase/slides.md");
@@ -33,32 +31,6 @@ const THINGS: usize = 5;
 const BOX: usize = 4;
 const ICON: &str = "<Icon name=\"arrow-right\" x=\"100\" y=\"840\" size=\"96\" />";
 const CANNOT_REMOVE: &str = "That couldn't be taken away without changing what's around it.";
-
-/// Goes on to slide `index` with the keys, from the first.
-fn go_to(typing: &Typing, cx: &mut TestAppContext, index: usize) {
-    for _ in 0..index {
-        typing.press(cx, "pagedown");
-    }
-    assert_eq!(typing.current(cx), index);
-}
-
-/// The thing on the current slide whose source starts with `start`.
-fn thing(typing: &Typing, cx: &mut TestAppContext, start: &str) -> ElementBox {
-    let source = typing.source(cx);
-    typing
-        .layout(cx)
-        .elements()
-        .iter()
-        .find(|element| source[element.source.clone()].starts_with(start))
-        .cloned()
-        .unwrap_or_else(|| panic!("no thing starts with {start:?}"))
-}
-
-/// The middle of `element` in the window.
-fn middle(typing: &Typing, cx: &TestAppContext, element: &ElementBox) -> Point<Pixels> {
-    let rect = element.rect;
-    typing.at(cx, rect.x + rect.w / 2., rect.y + rect.h / 2.)
-}
 
 /// A point on the line under the first cell of the table `table`, in the window, which a click
 /// on picks the table: the middle of the band a click there does, whatever the rounding.
@@ -72,24 +44,6 @@ fn border(typing: &Typing, cx: &mut TestAppContext, table: &ElementBox) -> Point
         .collect();
     assert!(!band.is_empty(), "the line under the cell picks the table");
     typing.at(cx, x, band[band.len() / 2])
-}
-
-fn selected(typing: &Typing, cx: &TestAppContext) -> Option<(usize, Range<usize>)> {
-    typing.document(cx).read_with(cx, |document, _| {
-        document
-            .selected()
-            .map(|selected| (selected.slide, selected.source.clone()))
-    })
-}
-
-/// Where the selection's outline is drawn, if it is.
-fn outline(typing: &Typing, cx: &mut TestAppContext) -> Option<Bounds<Pixels>> {
-    typing.with_window(cx, |window, cx| {
-        window.render_frame(cx);
-        window
-            .try_find(SELECTION_OUTLINE_ID)
-            .map(|outline| outline.bounds())
-    })
 }
 
 /// The window's box around `element` as it's drawn, turned.

@@ -11,7 +11,6 @@ use typing::*;
 use gpui_kit::component::color_picker::ColorPickerState;
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{Action as _, AppContext as _, Entity, Hsla, TestAppContext, rgb};
-use slides_engine::ElementBox;
 use slides_format::{find_tag, parse_talk};
 use stagepack_studio::inspector::{
     INSPECTOR_CHOOSE_FILE_ID, INSPECTOR_HEADING_ID, INSPECTOR_ID, INSPECTOR_MESSAGE_ID, Inspector, NOTHING_SELECTED,
@@ -38,26 +37,6 @@ const NO_SUCH_COMPONENT: &str = "This talk has no component of that name.";
 
 /// A chart on a slide of its own, placed.
 const CHART: &str = "# Sales\n\n<Chart kind=\"bar\" labels=\"A, B\" values=\"1, 2\" title=\"Sales\" x=\"300\" y=\"300\" w=\"800\" h=\"500\" />\n";
-
-/// Goes on to slide `index` with the keys, from the first.
-fn go_to(typing: &Typing, cx: &mut TestAppContext, index: usize) {
-    for _ in 0..index {
-        typing.press(cx, "pagedown");
-    }
-    assert_eq!(typing.current(cx), index);
-}
-
-/// The thing on the current slide whose source starts with `start`.
-fn thing(typing: &Typing, cx: &mut TestAppContext, start: &str) -> ElementBox {
-    let source = typing.source(cx);
-    typing
-        .layout(cx)
-        .elements()
-        .iter()
-        .find(|element| source[element.source.clone()].starts_with(start))
-        .cloned()
-        .unwrap_or_else(|| panic!("no thing starts with {start:?}"))
-}
 
 /// Clicks the thing on the current slide whose source starts with `start`, which selects it.
 fn select(typing: &Typing, cx: &mut TestAppContext, start: &str) -> Range<usize> {

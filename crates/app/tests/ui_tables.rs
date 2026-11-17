@@ -78,15 +78,6 @@ fn at_cell(typing: &Typing, cx: &TestAppContext) -> Option<(usize, usize)> {
     }
 }
 
-fn click_on(typing: &Typing, cx: &mut TestAppContext, id: impl Into<ElementId>) {
-    let id = id.into();
-    typing.with_window(cx, |window, cx| {
-        window.render_frame(cx);
-        window.click(id, cx);
-    });
-    typing.settle(cx);
-}
-
 /// Clicks tool `id` in what `scope` holds: the ribbon, scrolled along to it, or the inspector.
 fn click_in(typing: &Typing, cx: &mut TestAppContext, scope: &'static str, id: &'static str) {
     if scope == RIBBON_ID {

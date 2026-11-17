@@ -12,7 +12,7 @@ use typing::*;
 
 use gpui_kit::test::{TestQueryExt, TestWindowExt};
 use gpui_kit::{
-    AppContext as _, ClipboardEntry, ClipboardItem, ElementId, Entity, ExternalPaths, FileDropEvent, Image, ImageFormat,
+    AppContext as _, ClipboardEntry, ClipboardItem, Entity, ExternalPaths, FileDropEvent, Image, ImageFormat,
     InputEvent as _, Pixels, Point, TestAppContext, px, size,
 };
 use slides_engine::{Deck, FolderFiles, Fonts, NativeContent};
@@ -71,23 +71,6 @@ fn selected_text(typing: &Typing, cx: &TestAppContext) -> Option<String> {
 
 fn can_undo(typing: &Typing, cx: &TestAppContext) -> bool {
     typing.document(cx).read_with(cx, |document, _| document.can_undo())
-}
-
-fn click_on(typing: &Typing, cx: &mut TestAppContext, id: impl Into<ElementId>) {
-    let id = id.into();
-    typing.with_window(cx, |window, cx| {
-        window.render_frame(cx);
-        window.click(id, cx);
-    });
-    typing.settle(cx);
-}
-
-fn bounds_of(typing: &Typing, cx: &mut TestAppContext, id: impl Into<ElementId>) -> Option<gpui_kit::Bounds<Pixels>> {
-    let id = id.into();
-    typing.with_window(cx, |window, cx| {
-        window.render_frame(cx);
-        window.try_find(id).map(|found| found.bounds())
-    })
 }
 
 fn insert_tab(typing: &Typing, cx: &mut TestAppContext) {

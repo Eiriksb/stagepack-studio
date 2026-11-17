@@ -54,15 +54,6 @@ fn new_box(typing: &Typing, cx: &TestAppContext) -> Option<(usize, (f32, f32, f3
     typing.document(cx).read_with(cx, |document, _| document.new_box())
 }
 
-fn click_on(typing: &Typing, cx: &mut TestAppContext, id: impl Into<ElementId>) {
-    let id = id.into();
-    typing.with_window(cx, |window, cx| {
-        window.render_frame(cx);
-        window.click(id, cx);
-    });
-    typing.settle(cx);
-}
-
 fn is_shown(typing: &Typing, cx: &mut TestAppContext, id: impl Into<ElementId>) -> bool {
     let id = id.into();
     typing.with_window(cx, |window, cx| {

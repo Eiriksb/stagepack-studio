@@ -195,15 +195,6 @@ fn palette_of(typing: &Typing, cx: &mut TestAppContext) -> Vec<PaletteEntry> {
     typing.document(cx).update(cx, |document, _| document.palette())
 }
 
-fn click_on(typing: &Typing, cx: &mut TestAppContext, id: impl Into<ElementId>) {
-    let id = id.into();
-    typing.with_window(cx, |window, cx| {
-        window.render_frame(cx);
-        window.click(id, cx);
-    });
-    typing.settle(cx);
-}
-
 fn is_shown(typing: &Typing, cx: &mut TestAppContext, id: impl Into<ElementId>) -> bool {
     let id = id.into();
     typing.with_window(cx, |window, cx| {
