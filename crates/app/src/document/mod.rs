@@ -59,7 +59,7 @@ pub use arranging::{MOVE, NUDGE, RESIZE, TURN};
 pub use clipboard::Brought;
 pub use self::core::EditRun;
 use self::core::{Holds, Join, others_alike};
-pub use errors::{AREA_STAYS, EditRefused, InsertFailed, LAYOUT_FAILED, OpenProblem, panic_in_next_change, panic_in_next_layout};
+pub use errors::{AREA_STAYS, DRAG_OUT_FIRST, EditRefused, InsertFailed, LAYOUT_FAILED, OpenProblem, panic_in_next_change, panic_in_next_layout};
 use errors::{built, guarded, laid_out, read_after, worked_out};
 pub use open::TalkPlace;
 pub use reading::talk_settings;

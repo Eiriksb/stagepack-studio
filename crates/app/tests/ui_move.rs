@@ -7,7 +7,7 @@ mod typing;
 
 use typing::*;
 
-use gpui_kit::{Modifiers, Pixels, Point, TestAppContext, VisualTestContext, point, px};
+use gpui_kit::{Focusable as _, Modifiers, Pixels, Point, TestAppContext, VisualTestContext, point, px};
 use slides_format::number_text;
 use stagepack_studio::inspector::field_id;
 use stagepack_studio::selection::{Selection, Thing};
@@ -446,4 +446,170 @@ fn nothing_redraws_after_a_drag_ends(cx: &mut TestAppContext) {
     wait(cx, 20_000);
     assert_eq!((editor_count.get(), view_count.get(), canvas_count.get()), (0, 0, 0));
     assert!(outline(&typing, cx).is_some());
+}
+
+#[gpui_kit::test]
+fn a_run_of_nudges_ends_when_another_thing_is_selected(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    click_thing(&typing, cx, RECT, Modifiers::default());
+    typing.press(cx, "right");
+    typing.press(cx, "tab");
+    assert_eq!(selection(&typing, cx).map(|selection| selection.things), Some(vec![Thing::Block(of(&typing, cx, ELLIPSE))]));
+    typing.press(cx, "right");
+    let both = TALK.replacen(RECT_PLACE, "x=\"1301\" y=\"300\"", 1).replacen("x=\"1600\"", "x=\"1601\"", 1);
+    assert_eq!(typing.source(cx), both);
+    undo(&typing, cx);
+    assert_eq!(typing.source(cx), TALK.replacen(RECT_PLACE, "x=\"1301\" y=\"300\"", 1), "one undo takes back only the second");
+    assert_eq!(selection(&typing, cx).map(|selection| selection.things), Some(vec![Thing::Block(of(&typing, cx, ELLIPSE))]));
+    // Shift and a click to add a thing makes a new run too.
+    typing.press(cx, "right");
+    click_thing(&typing, cx, RECT, Modifiers::shift());
+    typing.press(cx, "right");
+    undo(&typing, cx);
+    assert_eq!(typing.source(cx), both, "the two moved together are their own step");
+}
+
+#[gpui_kit::test]
+fn a_drag_with_a_thing_in_the_text_moves_nothing(cx: &mut TestAppContext) {
+    let talk = "---\ntitle: T\n---\n\n# Shapes\n\n<Shape kind=\"ellipse\" fill=\"#2563eb\" />\n\n\
+<Shape kind=\"rect\" fill=\"#2563eb\" x=\"1300\" y=\"300\" w=\"200\" h=\"200\" />\n";
+    let typing = open(cx, talk);
+    click_thing(&typing, cx, RECT, Modifiers::default());
+    click_thing(&typing, cx, ELLIPSE, Modifiers::shift());
+    assert_eq!(selection(&typing, cx).map(|selection| selection.things.len()), Some(2));
+    let from = middle_of(&typing, cx, RECT);
+    drag_through(&typing, cx, from, &[from + point(px(30.), px(0.)), from + point(px(90.), px(20.))], Modifiers::default());
+    assert_eq!(typing.source(cx), talk, "neither moves");
+    assert!(!placing(&typing, cx));
+    assert_eq!(typing.status(cx).as_deref(), Some(DRAG_OUT_FIRST));
+}
+
+#[gpui_kit::test]
+fn the_keys_work_after_a_release_that_was_never_heard(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    let from = middle_of(&typing, cx, RECT);
+    // Pressed, and never let go of as far as the window heard.
+    typing.mouse_down(cx, from, 1, Modifiers::default());
+    typing.press(cx, "right");
+    assert_eq!(typing.source(cx), TALK.replacen(RECT_PLACE, "x=\"1301\" y=\"300\"", 1), "the arrow moves it");
+    typing.mouse_down(cx, from, 1, Modifiers::default());
+    typing.press(cx, "escape");
+    assert_eq!(selection(&typing, cx), None, "escape lets go");
+}
+
+#[gpui_kit::test]
+fn a_selection_changed_with_the_button_down_ends_the_drag(cx: &mut TestAppContext) {
+    for key in ["tab", "ctrl-a"] {
+        let typing = open(cx, TALK);
+        let to = press_and_move(&typing, cx);
+        typing.press(cx, key);
+        assert!(!placing(&typing, cx), "{key}: put back at once");
+        let picked = selection(&typing, cx);
+        typing.move_held(cx, to + point(px(30.), px(0.)), Modifiers::default());
+        typing.mouse_up(cx, to, 1, Modifiers::default());
+        left_nothing(&typing, cx, TALK, None, key);
+        assert_eq!(selection(&typing, cx), picked, "{key}: what the key selected stays");
+    }
+}
+
+#[gpui_kit::test]
+fn the_keyboard_going_elsewhere_ends_the_drag(cx: &mut TestAppContext) {
+    // To somewhere that leaves the selection be, so nothing else ends the drag.
+    let typing = open(cx, TALK);
+    typing.with_window(cx, |window, _| window.activate_window());
+    typing.settle(cx);
+    let to = press_and_move(&typing, cx);
+    let elsewhere = cx.update(|cx| cx.focus_handle());
+    typing.with_window(cx, |window, cx| elsewhere.focus(window, cx));
+    typing.settle(cx);
+    assert!(!placing(&typing, cx), "put back at once");
+    typing.mouse_up(cx, to, 1, Modifiers::default());
+    left_nothing(&typing, cx, TALK, None, "the keyboard elsewhere");
+    // To the notes and to the list of slides, which let go of what's selected too.
+    for to_notes in [true, false] {
+        let typing = open(cx, TALK);
+        typing.with_window(cx, |window, _| window.activate_window());
+        typing.settle(cx);
+        let to = press_and_move(&typing, cx);
+        let panel = cx.read(|cx| {
+            let view = typing.view.read(cx);
+            if to_notes { view.notes_panel().read(cx).field().focus_handle(cx) } else { view.slide_strip().read(cx).focus_handle().clone() }
+        });
+        typing.with_window(cx, |window, cx| panel.focus(window, cx));
+        typing.settle(cx);
+        assert!(!placing(&typing, cx), "notes {to_notes}: put back at once");
+        typing.mouse_up(cx, to, 1, Modifiers::default());
+        left_nothing(&typing, cx, TALK, None, "a panel");
+        assert_eq!(selection(&typing, cx), None, "notes {to_notes}: nothing is selected");
+    }
+}
+
+#[gpui_kit::test]
+fn a_turned_thing_is_moved_without_writing_its_turn(cx: &mut TestAppContext) {
+    let talk = TALK.replacen("w=\"200\" h=\"200\" />", "w=\"200\" h=\"200\" rotate=\"30\" />", 1);
+    let typing = open(cx, &talk);
+    let from = middle_of(&typing, cx, RECT);
+    let to = from + point(px(60.), px(30.));
+    typing.drag(cx, from, to);
+    let (dx, dy) = on_slide(&typing, cx, from, to);
+    let place = format!("x=\"{}\" y=\"{}\"", written(1300., dx), written(300., dy));
+    assert_eq!(typing.source(cx), talk.replacen(RECT_PLACE, &place, 1));
+}
+
+#[gpui_kit::test]
+fn a_move_straight_down_keeps_a_hand_written_left(cx: &mut TestAppContext) {
+    let talk = TALK.replacen(RECT_PLACE, "x=\"1300.25\" y=\"300\"", 1);
+    let typing = open(cx, &talk);
+    let from = middle_of(&typing, cx, RECT);
+    let to = from + point(px(0.), px(50.));
+    typing.drag(cx, from, to);
+    let (_, dy) = on_slide(&typing, cx, from, to);
+    assert_eq!(typing.source(cx), talk.replacen("y=\"300\"", &format!("y=\"{}\"", written(300., dy)), 1), "x's bytes stay");
+}
+
+#[gpui_kit::test]
+fn a_thing_with_a_left_but_no_top_gains_one(cx: &mut TestAppContext) {
+    let talk = TALK.replacen(RECT_PLACE, "x=\"1300\"", 1);
+    let typing = open(cx, &talk);
+    let rect = thing(&typing, cx, RECT);
+    assert!(rect.placed, "a left alone places it");
+    let from = middle(&typing, cx, &rect);
+    let to = from + point(px(40.), px(40.));
+    typing.drag(cx, from, to);
+    let (dx, dy) = on_slide(&typing, cx, from, to);
+    let written_now = typing.source(cx);
+    let tag = &written_now[thing(&typing, cx, RECT).source];
+    assert!(tag.contains(&format!("x=\"{}\"", written(1300., dx))), "{tag}");
+    assert!(tag.contains(&format!("y=\"{}\"", written(rect.rect.y, dy))), "{tag}");
+    undo(&typing, cx);
+    assert_eq!(typing.source(cx), talk);
+}
+
+#[gpui_kit::test]
+fn a_press_on_a_neighbouring_areas_offer_is_that_areas(cx: &mut TestAppContext) {
+    // The right column moved to start just past the left one's edge, and empty.
+    let talk = "---\ntitle: T\nlayout: two-columns\nregion.right: x=950\n---\n\n# Columns\n\nSome words here\n";
+    let typing = open(cx, talk);
+    let left = typing.layout(cx).region("left").expect("the left column").rect;
+    let flow = (0..typing.flows(cx, 0).len()).find(|&flow| typing.layout(cx).region_of_flow(flow) == Some("left")).expect("its text");
+    typing.click_text(cx, flow, pos(0, 3));
+    let frame = typing.at(cx, left.x, left.y + left.h / 2.);
+    typing.click(cx, frame);
+    assert_eq!(selection(&typing, cx).map(|selection| selection.things), Some(vec![Thing::Region("left".into())]));
+    // Just past its right edge, in the gap: still the left column, which a drag there moves.
+    let gap = typing.at(cx, left.x + left.w + 5., left.y + left.h / 2.);
+    let to = gap + point(px(0.), px(40.));
+    typing.drag(cx, gap, to);
+    let (_, dy) = on_slide(&typing, cx, gap, to);
+    let moved = talk.replace("region.right: x=950\n", &format!("region.right: x=950\nregion.left: y={}\n", written(left.y, dy)));
+    assert_eq!(typing.source(cx), moved, "the gap is the left column's frame");
+    undo(&typing, cx);
+    // Just as near its edge, but inside the right column's offer: that column is typed in.
+    let left = typing.layout(cx).region("left").expect("the left column").rect;
+    let offer = typing.at(cx, left.x + left.w + 12., left.y + left.h / 2.);
+    typing.click(cx, offer);
+    assert_eq!(selection(&typing, cx), None);
+    let editing = typing.editing(cx).expect("typing");
+    assert_eq!(editing.flow.region(), Some("right"));
+    assert_eq!(typing.source(cx), talk);
 }

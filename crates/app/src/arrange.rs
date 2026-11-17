@@ -1,22 +1,13 @@
 //! Where things go as they're moved on a slide: the box a turned thing covers, and how far a
 //! move can take things before they'd leave the slide. Only numbers, so it's tested alone.
 
-use slides_engine::Rect;
+use slides_engine::{MAX_POSITION, MIN_POSITION, Rect, SLIDE_HEIGHT, SLIDE_WIDTH};
 
 /// How many pixels the pointer goes, with the button down, before a press is a drag.
 pub const MOVE_STARTS: f32 = 4.0;
 
-/// What's said when a thing written in the slide's text, which has no place of its own, is
-/// moved with the keys.
-pub const DRAG_OUT_FIRST: &str = "Drag it out of the text first.";
-
-const SLIDE_WIDTH: f32 = 1920.0;
-const SLIDE_HEIGHT: f32 = 1080.0;
 /// How much of a thing, in slide units each way, stays on the slide however it's moved.
 const KEPT_ON: f32 = 16.0;
-/// The farthest a thing can be placed from the slide's corner, either way, as the engine holds it.
-const MIN_POSITION: f32 = -3840.0;
-const MAX_POSITION: f32 = 7680.0;
 
 /// Where a thing or an area is: its rectangle before it's turned, in slide units, and the
 /// degrees it's turned by about the rectangle's centre.

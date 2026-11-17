@@ -3,8 +3,8 @@
 //! written until the button is let go of; the geometry is [`crate::arrange`]'s.
 
 use super::*;
-use crate::arrange::{self, DRAG_OUT_FIRST, MOVE_STARTS, Placed};
-use crate::document::{EditRun, MOVE, NUDGE};
+use crate::arrange::{self, MOVE_STARTS, Placed};
+use crate::document::{DRAG_OUT_FIRST, EditRun, MOVE, NUDGE};
 use crate::history::RunId;
 
 /// Moves the things selected by `dx` across and `dy` down, in slide units.
@@ -21,11 +21,14 @@ const NUDGE_PAUSE: Duration = Duration::from_secs(1);
 /// A press on things selected, which becomes a drag of them once the pointer has gone far
 /// enough with the button down.
 pub(super) struct Drag {
-    /// The slide pressed on, and the talk's text as it was then: once either changes, as by an
-    /// undo, another slide or a reload, the drag is over.
+    /// The slide pressed on, the talk's text as it was then, and the pick that selected what's
+    /// dragged: once any of them changes, as by an undo, another slide, a reload or Tab, the
+    /// drag is over.
     slide: usize,
     version: u64,
-    /// What's dragged, each where it was when pressed: the things selected that can be moved.
+    pick: u64,
+    /// What's dragged, each where it was when pressed: the things selected, or nothing if any
+    /// of them can't be moved where it's written.
     things: Vec<(Thing, Placed)>,
     /// Where the press was, in the window.
     from: Point<Pixels>,
@@ -33,9 +36,13 @@ pub(super) struct Drag {
     begun: bool,
 }
 
-/// The run of nudges going on: its run in the history, and the wait after the last nudge, once
-/// over which the next is a step of its own.
-pub(super) type Nudging = (RunId, Task<()>);
+/// The run of nudges going on: its run in the history, what it moved, as selected after the
+/// last nudge, and the wait after that nudge, once over which the next is a step of its own.
+pub(super) struct Nudging {
+    run: RunId,
+    moved: selection::Selection,
+    _pause: Task<()>,
+}
 
 impl SlideEditor {
     /// Readies a drag of what's selected on the slide shown, from a press at `from` on `thing`,
@@ -48,20 +55,34 @@ impl SlideEditor {
         let Some(document) = self.document.clone() else {
             return;
         };
-        let (things, version) = document.update(cx, |document, _| (document.movable_selected().0, document.text_version()));
-        self.drag = Some(Drag { slide: selection.slide, version, things, from, begun: false });
+        let (things, version, pick) = document.update(cx, |document, _| {
+            // A thing written in the text can't be moved yet, and nothing is moved without it.
+            let (things, left_out) = document.movable_selected();
+            (if left_out { Vec::new() } else { things }, document.text_version(), document.selection_pick())
+        });
+        self.drag = Some(Drag { slide: selection.slide, version, pick, things, from, begun: false });
     }
 
-    /// Whether the talk is as it was when the drag was readied, on the same slide.
+    /// Whether the talk is as it was when the drag was readied, on the same slide, with the same
+    /// things selected.
     fn drag_holds(&self, cx: &App) -> bool {
         let (Some(drag), Some(document)) = (&self.drag, &self.document) else {
             return false;
         };
         let document = document.read(cx);
-        document.text_version() == drag.version && document.current() == drag.slide
+        document.text_version() == drag.version && document.current() == drag.slide && document.selection_pick() == drag.pick
     }
 
-    /// Ends a drag readied or going on if the talk changed under it, by any edit but its own.
+    /// Ends a drag readied but not begun, as a key does: a press whose release was never heard
+    /// doesn't hold the keys back.
+    pub(super) fn end_unbegun_drag(&mut self, cx: &mut Context<Self>) {
+        if self.drag.as_ref().is_some_and(|drag| !drag.begun) {
+            self.end_drag(cx);
+        }
+    }
+
+    /// Ends a drag readied or going on if the talk or what's selected changed under it, by
+    /// anything but the drag itself.
     pub(super) fn follow_drag(&mut self, cx: &mut Context<Self>) {
         if self.drag.is_some() && !self.drag_holds(cx) {
             self.end_drag(cx);
@@ -186,6 +207,8 @@ impl SlideEditor {
         let Some(document) = self.document.clone() else {
             return;
         };
+        // A drag going on keeps the keys back; one readied whose release was never heard doesn't.
+        self.end_unbegun_drag(cx);
         if self.drag.is_some() {
             return;
         }
@@ -197,9 +220,11 @@ impl SlideEditor {
         let starts: Vec<Placed> = things.iter().map(|(_, placed)| *placed).collect();
         let by = arrange::kept_move(&starts, by);
         let places: Vec<(Thing, Placed)> = things.iter().map(|(thing, placed)| (thing.clone(), arrange::moved(placed, by))).collect();
+        // The run goes on only for the same things: once others are selected, it's a new step.
+        let selected = self.selection_here(cx);
         let run = match &self.nudging {
-            Some((run, _)) => EditRun::Continue(*run),
-            None => EditRun::New,
+            Some(nudging) if selected.as_ref() == Some(&nudging.moved) => EditRun::Continue(nudging.run),
+            _ => EditRun::New,
         };
         let changed = self.run(|document| document.place_things(NUDGE, &places, run), cx);
         if changed.is_some_and(|changed| !changed.is_empty()) {
@@ -207,7 +232,8 @@ impl SlideEditor {
                 cx.background_executor().timer(NUDGE_PAUSE).await;
                 this.update(cx, |this, _| this.nudging = None).ok();
             });
-            self.nudging = document.read(cx).open_run().map(|run| (run, pause));
+            let run = document.read(cx).open_run();
+            self.nudging = run.zip(self.selection_here(cx)).map(|(run, moved)| Nudging { run, moved, _pause: pause });
         }
     }
 }

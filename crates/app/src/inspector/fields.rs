@@ -21,12 +21,12 @@ pub const NUMBER_LIMIT: f64 = 1_000_000.0;
 
 /// The farthest a thing can be placed from the slide's corner, in slide units, either way, as
 /// the engine holds it.
-pub const MIN_POSITION: f64 = -3840.0;
-pub const MAX_POSITION: f64 = 7680.0;
+pub const MIN_POSITION: f64 = slides_engine::MIN_POSITION as f64;
+pub const MAX_POSITION: f64 = slides_engine::MAX_POSITION as f64;
 /// The largest a thing can be, as the engine holds it.
-pub const MAX_SIZE: f64 = 3840.0;
+pub const MAX_SIZE: f64 = slides_engine::MAX_SIZE as f64;
 /// The most a thing can be turned, either way, in degrees.
-pub const MAX_TURN: f64 = 360.0;
+pub const MAX_TURN: f64 = slides_engine::MAX_ROTATION as f64;
 
 /// The fields that place a thing on the slide: its attribute, its label and what it's held to.
 pub const PLACE: [(&str, &str, (f64, f64)); 5] = [

@@ -102,6 +102,8 @@ impl SlideEditor {
 
     /// Lets go of what's selected on the slide shown, as Escape does once nothing is typed.
     pub(super) fn let_go(&mut self, cx: &mut Context<Self>) {
+        // A drag readied whose release was never heard ends, and Escape goes on to let go.
+        self.end_unbegun_drag(cx);
         if self.drag.is_some() {
             // A drag ends first, writing nothing, and what was dragged stays selected.
             self.end_drag(cx);

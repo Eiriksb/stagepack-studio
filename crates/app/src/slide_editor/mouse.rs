@@ -252,6 +252,8 @@ impl SlideEditor {
         let other = match layout.hit(x, y) {
             Some(Hit::Text { flow, .. }) => layout.region_of_flow(flow) != Some(region),
             Some(Hit::Element(_)) => true,
+            // Inside another area's offer to start text, the press is that area's.
+            Some(Hit::Placeholder(other)) => other != region,
             _ => false,
         };
         // On a line of the area's own text, as at the start of a line that touches the frame,

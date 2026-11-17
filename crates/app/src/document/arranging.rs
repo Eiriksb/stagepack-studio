@@ -72,11 +72,17 @@ impl Document {
     /// `run` says, and returns the slides to show again. Only the numbers that differ from where
     /// the slide has the thing now are written, positions and sizes to a whole unit; a thing
     /// written in the slide's text, with no place of its own, is left be. Where nothing differs,
-    /// nothing is written and no step made.
+    /// nothing is written and no step made. It's refused if finishing the typing first changes
+    /// the talk.
     pub fn place_things(&mut self, label: &'static str, places: &[(Thing, Placed)], run: EditRun) -> Result<Vec<usize>, EditRefused> {
         self.drop_preview();
-        // Typing is finished first, which can move the things.
+        // Typing is finished first. That can move the things, and then where `places` says
+        // they are written is no longer where they are: it's refused.
+        let version = self.text_version();
         self.finish_before_edit()?;
+        if self.text_version() != version {
+            return Err(EditRefused::CouldNotBeMade);
+        }
         let slide = self.current;
         let layout = self.text_layout(slide);
         let mut words: Vec<(Target, &'static str, String)> = Vec::new();

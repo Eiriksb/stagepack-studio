@@ -96,6 +96,8 @@ impl std::fmt::Display for InsertFailed {
 
 impl std::error::Error for InsertFailed {}
 
+/// What's said when a thing written in the slide's text, with no place of its own, is moved.
+pub const DRAG_OUT_FIRST: &str = "Drag it out of the text first.";
 /// What's said when only a layout's areas are selected and Delete, Cut, Copy or Duplicate is asked.
 pub const AREA_STAYS: &str = "A layout's area can't be deleted or copied. Choose another layout to change the areas.";
 

@@ -16,8 +16,9 @@ use crate::{
     Transition, layout_by_name, shape_text,
 };
 
-pub(crate) const SLIDE_WIDTH: f32 = 1920.0;
-pub(crate) const SLIDE_HEIGHT: f32 = 1080.0;
+/// How wide and high a slide is, in slide units.
+pub const SLIDE_WIDTH: f32 = 1920.0;
+pub const SLIDE_HEIGHT: f32 = 1080.0;
 const DEFAULT_LAYOUT: &str = "content";
 
 /// The attributes that place a component, which it doesn't see as props.
@@ -25,10 +26,10 @@ pub const PLACEMENT_ATTRS: [&str; 8] = ["x", "y", "w", "h", "rotate", "click", "
 
 // The most a talk can ask for in a place on the slide, so one line of a settings block
 // can't make a layer that needs gigabytes.
-pub(crate) const MIN_POSITION: f32 = -3840.0;
-pub(crate) const MAX_POSITION: f32 = 7680.0;
-pub(crate) const MAX_SIZE: f32 = 3840.0;
-pub(crate) const MAX_ROTATION: f32 = 360.0;
+pub const MIN_POSITION: f32 = -3840.0;
+pub const MAX_POSITION: f32 = 7680.0;
+pub const MAX_SIZE: f32 = 3840.0;
+pub const MAX_ROTATION: f32 = 360.0;
 
 /// What's said of an `align` that's given where it does nothing.
 pub(crate) const ALIGN_UNPLACED: &str = "Only a box placed on the slide can be aligned, so align is ignored here";
