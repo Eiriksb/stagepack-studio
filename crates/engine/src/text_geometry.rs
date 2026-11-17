@@ -56,6 +56,28 @@ pub struct ElementBox {
     pub rotate: f32,
     /// Whether there's text in it that can be edited.
     pub holds_text: bool,
+    /// Whether it's a tag at the top level of the slide with a place of its own, so that it can
+    /// be moved without being lifted out of the text.
+    pub placed: bool,
+    /// Whether it keeps its proportions when it's made bigger or smaller: a picture or an icon.
+    pub keeps_shape: bool,
+}
+
+/// A region of the slide's layout, where it is on the slide.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegionBox {
+    pub name: String,
+    /// Where it is, in slide units before it's turned.
+    pub rect: Rect,
+    /// The degrees it's turned by, about the centre of `rect`.
+    pub rotate: f32,
+    /// Whether the slide's settings place or turn it, away from where its layout has it.
+    pub moved: bool,
+    /// Whether nothing reads into it.
+    pub empty: bool,
+    /// Whether what's in it is a list or more than one block, so that it can be shown a
+    /// piece at a time.
+    pub is_list: bool,
 }
 
 /// What's under a point of the slide.
@@ -244,6 +266,10 @@ pub struct TextLayout {
     placeholders: Vec<Placeholder>,
     /// Every table, with its cells.
     tables: Vec<TableGrid>,
+    /// Every region of the slide's layout, in its order.
+    regions: Vec<RegionBox>,
+    /// The region each flow reads into, by flow.
+    flow_regions: Vec<Option<String>>,
 }
 
 /// A table on the slide: where each of its cells is, and the text of each cell that has some
@@ -319,6 +345,18 @@ fn block_at<'a>(blocks: &'a [Block], range: &Range<usize>) -> Option<&'a Block> 
         }
     })
 }
+
+/// Whether `block` is a thing that keeps its proportions: a picture or an icon.
+fn keeps_shape(block: &Block) -> bool {
+    match block {
+        Block::Picture { .. } => true,
+        Block::Tag(tag) => tag.name == PICTURE_TAG || tag.name == ICON_TAG,
+        _ => false,
+    }
+}
+
+const PICTURE_TAG: &str = "Picture";
+const ICON_TAG: &str = "Icon";
 
 /// Whether `block`, drawn among others, is a thing of its own. A `<Text>` tag only styles
 /// the text in it.
@@ -421,7 +459,7 @@ fn para_lines(drawn: &DrawnText, rect: Rect, cell: Option<Rect>) -> ParaLines {
 
 impl TextLayout {
     /// The layout of slide `index` of `talk`, whose layers are `specs`, drew `drawn`, and
-    /// left `empty` empty. Its flows are those [`text_flows_with`] gives with `takes_content`,
+    /// left `empty` empty, and whose layout's regions are `regions`. Its flows are those [`text_flows_with`] gives with `takes_content`,
     /// the tags of the talk's components whose content is a box of text of its own.
     pub(crate) fn build(
         talk: &Talk,
@@ -429,6 +467,7 @@ impl TextLayout {
         specs: &[LayerSpec],
         drawn: &[LayerText],
         empty: &[EmptyRegion],
+        regions: &[RegionBox],
         takes_content: &dyn Fn(&str) -> bool,
     ) -> TextLayout {
         let mut layout = TextLayout {
@@ -443,6 +482,7 @@ impl TextLayout {
                     align: region.align,
                 })
                 .collect(),
+            regions: regions.to_vec(),
             ..TextLayout::default()
         };
         // The block of each paragraph placed, for what holds editable text.
@@ -457,6 +497,18 @@ impl TextLayout {
             }
         }
         let flows = text_flows_with(talk, index, takes_content);
+        let is_region = |name: &str| regions.iter().any(|region| region.name == name);
+        layout.flow_regions = flows
+            .iter()
+            .map(|flow| match &flow.place {
+                FlowPlace::Region(name) => Some(name.clone()).filter(|name| is_region(name)),
+                FlowPlace::Tag(_) => None,
+                FlowPlace::Cell { table, .. } => {
+                    let layer = drawn.iter().find(|layer| layer.tables.iter().any(|drawn| drawn.range == *table));
+                    layer.and_then(|layer| layer.region).map(|(name, _)| name.to_string())
+                }
+            })
+            .collect();
         for (f, flow) in flows.iter().enumerate() {
             for (p, source) in flow.source.iter().enumerate() {
                 let Some(&(layer, text)) = found.get(&(source.block.end, source.inline.start, source.inline.end)) else { continue };
@@ -489,20 +541,22 @@ impl TextLayout {
             let origin = specs[layer].rect;
             let frame = layout.frames[layer];
             // An element of the layer, `rect` relative to the slide before the layer's turn.
-            let mut element = |source: &Range<usize>, rect: Rect| {
+            let mut element = |source: &Range<usize>, rect: Rect, block: &Block, placed: bool| {
                 let (x, y) = turned(rect.x + rect.w / 2.0, rect.y + rect.h / 2.0, frame.centre, frame.rotate);
                 let rect = Rect { x: x - rect.w / 2.0, y: y - rect.h / 2.0, ..rect };
-                layout.elements.push(ElementBox { source: source.clone(), rect, rotate: frame.rotate, holds_text: holds_text(source) });
+                let keeps_shape = keeps_shape(block);
+                layout.elements.push(ElementBox { source: source.clone(), rect, rotate: frame.rotate, holds_text: holds_text(source), placed, keeps_shape });
                 layout.elements.len() - 1
             };
             // A positioned tag is drawn first in its layer, then what's in it.
-            let whole = specs[layer].source.as_ref().filter(|source| text.whole && matches!(block_at(blocks, source), Some(Block::Tag(_))));
-            let whole = whole.map(|source| element(source, origin));
+            let whole = specs[layer].source.as_ref().filter(|_| text.whole);
+            let whole = whole.and_then(|source| Some((source, block_at(blocks, source).filter(|block| matches!(block, Block::Tag(_)))?)));
+            let whole = whole.map(|(source, block)| element(source, origin, block, true));
             let mut found: Vec<(Rect, &'static str, Option<usize>)> = Vec::new();
             for block in &text.blocks {
                 let rect = Rect { x: origin.x + block.rect.x, y: origin.y + block.rect.y, ..block.rect };
                 let found_block = block_at(blocks, &block.range);
-                let at = found_block.filter(|block| is_element(block)).map(|_| element(&block.range, rect));
+                let at = found_block.filter(|block| is_element(block)).map(|found| element(&block.range, rect, found, false));
                 // A table answers for itself, cell by cell.
                 if let (Some(Block::Table { .. }), Some(at)) = (found_block, at)
                     && let Some(table) = text.tables.iter().find(|table| table.range == block.range)
@@ -540,6 +594,21 @@ impl TextLayout {
             layout.uneditable.extend(found.into_iter().map(|(rect, reason, element)| (layer, rect, reason, element)));
         }
         layout
+    }
+
+    /// Every region of the slide's layout, in its order, where it's placed.
+    pub fn regions(&self) -> &[RegionBox] {
+        &self.regions
+    }
+
+    /// The region of the slide's layout called `name`.
+    pub fn region(&self, name: &str) -> Option<&RegionBox> {
+        self.regions.iter().find(|region| region.name == name)
+    }
+
+    /// The region flow `flow` reads into, or `None` for text in a placed tag.
+    pub fn region_of_flow(&self, flow: usize) -> Option<&str> {
+        self.flow_regions.get(flow)?.as_deref()
     }
 
     /// Each placed paragraph, flow by flow.

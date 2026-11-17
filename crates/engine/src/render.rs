@@ -1,5 +1,7 @@
 //! Draws a `LayerSpec` into its own pixmap, and puts layers together.
 
+use std::sync::Arc;
+
 use tiny_skia::{
     ColorU8, FillRule, FilterQuality, Paint, Pixmap, PixmapPaint, Point, Shader, Stroke, Transform,
 };
@@ -54,7 +56,7 @@ fn extent(spec: &LayerSpec) -> (f32, f32, f32, f32) {
 
 /// What a layer whose place makes no sense draws: nothing.
 fn blank_layer() -> Layer {
-    Layer { pixmap: Pixmap::new(1, 1).expect("1 by 1 is a valid size"), x: 0, y: 0 }
+    Layer { pixmap: Arc::new(Pixmap::new(1, 1).expect("1 by 1 is a valid size")), x: 0, y: 0 }
 }
 
 fn pixmap_side(from: f32, to: f32) -> u32 {
@@ -125,7 +127,7 @@ pub fn render_layer(spec: &LayerSpec, scale: f32, fonts: &mut Fonts) -> Layer {
         }
     }
     Layer {
-        pixmap,
+        pixmap: Arc::new(pixmap),
         x: min_x.clamp(-MAX_OFFSET, MAX_OFFSET) as i32,
         y: min_y.clamp(-MAX_OFFSET, MAX_OFFSET) as i32,
     }
@@ -134,7 +136,7 @@ pub fn render_layer(spec: &LayerSpec, scale: f32, fonts: &mut Fonts) -> Layer {
 /// Draws the layers over `target`, first to last.
 pub fn compose(target: &mut Pixmap, layers: &[Layer]) {
     for layer in layers {
-        target.draw_pixmap(layer.x, layer.y, layer.pixmap.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+        target.draw_pixmap(layer.x, layer.y, Pixmap::as_ref(&layer.pixmap), &PixmapPaint::default(), Transform::identity(), None);
     }
 }
 

@@ -15,6 +15,7 @@ pub struct Rect {
     pub h: f32,
 }
 
+#[derive(Clone)]
 pub enum DisplayItem {
     Fill { path: tiny_skia::Path, color: Color },
     Stroke { path: tiny_skia::Path, color: Color, width: f32 },
@@ -25,6 +26,7 @@ pub enum DisplayItem {
 
 /// One element's drawing. Item coordinates are relative to `rect`'s top-left corner,
 /// and `rotate` (degrees) turns the whole layer around the centre of `rect`.
+#[derive(Clone)]
 pub struct LayerSpec {
     pub source: Option<Range<usize>>,
     pub rect: Rect,
@@ -42,9 +44,10 @@ pub struct LayerSpec {
 }
 
 /// A drawn element in device pixels, placed at (`x`, `y`) on the slide. It has no
-/// source range: a cached layer can outlive the positions it was drawn from.
+/// source range: a cached layer can outlive the positions it was drawn from. A layer only
+/// moved shows the same pixmap somewhere else.
 pub struct Layer {
-    pub pixmap: tiny_skia::Pixmap,
+    pub pixmap: Arc<tiny_skia::Pixmap>,
     pub x: i32,
     pub y: i32,
 }

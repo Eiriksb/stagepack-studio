@@ -109,3 +109,11 @@ fn click_each_items_with_the_same_text_are_drawn_apart() {
     assert!(!std::sync::Arc::ptr_eq(&layers[2], &layers[3]));
     assert_ne!((layers[2].x, layers[2].y), (layers[3].x, layers[3].y));
 }
+
+#[test]
+fn fixed_steps_counts_a_one_at_a_time_list() {
+    assert_eq!(deck("---\nregion.body: click=each\n---\n\n# T\n\n- one\n- two\n- three\n").fixed_steps(0), 3);
+    assert_eq!(deck("<Box x=\"0\" y=\"0\" w=\"9\" h=\"9\" click=\"2\" />\n\n<Box x=\"9\" y=\"0\" w=\"9\" h=\"9\" click=\"1\" />\n").fixed_steps(0), 0);
+    assert_eq!(deck("---\nregion.body: click=2\n---\n\n# T\n\n- one\n- two\n").fixed_steps(0), 0, "a numbered region");
+    assert_eq!(deck("# T\n").fixed_steps(5), 0, "a slide the talk doesn't have");
+}

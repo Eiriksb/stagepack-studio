@@ -21,7 +21,7 @@ impl SlideEditor {
         if let Some((x, y)) = key.new_box() {
             // A new box, not written yet: at its corner.
             let (w, h) = TEXT_BOX_SIZE;
-            let element = ElementBox { source: 0..0, rect: Rect { x: x as f32, y: y as f32, w, h }, rotate: 0.0, holds_text: true };
+            let element = ElementBox { source: 0..0, rect: Rect { x: x as f32, y: y as f32, w, h }, rotate: 0.0, holds_text: true, placed: true, keeps_shape: false };
             return Some(empty_box_caret(&element, false));
         }
         if let Some(start) = key.tag_start() {

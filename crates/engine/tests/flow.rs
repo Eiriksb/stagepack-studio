@@ -272,3 +272,12 @@ fn a_notice_is_only_given_once_per_slide() {
     let (slide, _) = lay_out("\u{4e2d}\n\n\u{4e2d}\n");
     assert_eq!(slide.notices.len(), 1);
 }
+
+#[test]
+fn layouts_are_listed_in_order() {
+    let names: Vec<&str> = layouts().iter().map(|layout| layout.name).collect();
+    assert_eq!(names, ["title", "content", "two-columns", "section", "blank"]);
+    for layout in layouts() {
+        assert!(std::ptr::eq(layout_by_name(layout.name).unwrap(), layout));
+    }
+}

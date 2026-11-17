@@ -1054,3 +1054,81 @@ fn big_tables_are_read_and_laid_out_quickly() {
         );
     }
 }
+
+#[test]
+fn every_region_of_the_layout_is_listed() {
+    let layout = layout("---\nlayout: two-columns\n---\n\n# T\n\nOn the left\n");
+    let names: Vec<&str> = layout.regions().iter().map(|region| region.name.as_str()).collect();
+    assert_eq!(names, ["title", "left", "right"]);
+    let empty: Vec<bool> = layout.regions().iter().map(|region| region.empty).collect();
+    assert_eq!(empty, [false, false, true]);
+    assert!(layout.regions().iter().all(|region| !region.moved && region.rotate == 0.0));
+    assert_eq!(layout.region("right").unwrap().rect, Rect { x: 980.0, y: 220.0, w: 840.0, h: 780.0 });
+    assert_eq!(layout.region("body"), None);
+    assert!(self::layout("<Box x=\"0\" y=\"0\" w=\"10\" h=\"10\" />\n").regions().iter().all(|region| region.empty), "a placed box reads into none");
+}
+
+#[test]
+fn a_moved_region_says_so() {
+    let layout = layout("---\nregion.body: x=200 w=900 rotate=5 click=each\n---\n\n# T\n\nBody\n");
+    let body = layout.region("body").unwrap();
+    assert!(body.moved);
+    assert_eq!((body.rect.x, body.rect.w, body.rotate), (200.0, 900.0, 5.0));
+    assert!(!layout.region("title").unwrap().moved);
+    for line in ["click=each enter=fade align=center", "x=abc", ""] {
+        let layout = self::layout(&format!("---\nregion.body: {line}\n---\n\n# T\n\nBody\n"));
+        assert!(!layout.region("body").unwrap().moved, "{line}");
+    }
+    let empty = self::layout("---\nregion.body: y=300\n---\n\n# T\n");
+    let body = empty.region("body").unwrap();
+    assert!(body.moved && body.empty);
+    assert_eq!(body.rect.y, 300.0);
+}
+
+#[test]
+fn a_flow_knows_its_region() {
+    let source = "# T\n\n- one\n- two\n\n<Box x=\"1000\" y=\"600\" w=\"400\" h=\"200\">\n\nIn a box\n\n</Box>\n";
+    let d = &mut deck(source);
+    let layout = d.text_layout(0);
+    let flows = text_flows(d.talk(), 0);
+    for (flow, text) in flows.iter().enumerate() {
+        let expected = match &text.place {
+            FlowPlace::Region(name) => Some(name.as_str()),
+            _ => None,
+        };
+        assert_eq!(layout.region_of_flow(flow), expected, "flow {flow}");
+    }
+    assert!(flows.iter().any(|flow| matches!(flow.place, FlowPlace::Tag(_))));
+    assert_eq!(layout.region_of_flow(flows.len()), None);
+    assert!(layout.region("body").unwrap().is_list);
+    assert!(!layout.region("title").unwrap().is_list);
+    assert!(self::layout("# T\n\nIntro\n\nMore\n").region("body").unwrap().is_list, "two blocks");
+    assert!(!self::layout("# T\n\nJust one\n").region("body").unwrap().is_list);
+}
+
+#[test]
+fn a_picture_keeps_its_shape_and_a_shape_does_not() {
+    let source = "<Icon x=\"100\" y=\"100\" name=\"star\" size=\"64\" />\n\n<Shape x=\"400\" y=\"100\" w=\"200\" h=\"100\" kind=\"ellipse\" />\n\n<Picture x=\"700\" y=\"100\" w=\"200\" h=\"100\" src=\"missing.png\" />\n\n<Box x=\"1000\" y=\"100\" w=\"200\" h=\"100\" />\n";
+    let d = &mut deck(source);
+    let layout = d.text_layout(0);
+    let element = |start: &str| layout.element(&block_starting(d, 0, start)).unwrap_or_else(|| panic!("{start}"));
+    for (start, keeps) in [("<Icon", true), ("<Shape", false), ("<Picture", true), ("<Box", false)] {
+        let element = element(start);
+        assert_eq!(element.keeps_shape, keeps, "{start}");
+        assert!(element.placed, "{start}");
+    }
+}
+
+#[test]
+fn a_tag_in_the_text_is_not_placed() {
+    let source = "# T\n\n<Box fill=\"#dbeafe\">\n\nBoxed but not placed\n\n</Box>\n\n| a |\n|---|\n| b |\n\n<Box x=\"1000\" y=\"600\" w=\"400\" h=\"200\" fill=\"#dbeafe\">\n\n<Icon name=\"star\" />\n\n</Box>\n";
+    let d = &mut deck(source);
+    let layout = d.text_layout(0);
+    let element = |start: &str| layout.elements().iter().find(|element| element.source == block_starting(d, 0, start)).cloned().unwrap_or_else(|| panic!("{start}"));
+    assert!(!element("<Box fill").placed);
+    assert!(!element("| a |").placed);
+    assert!(element("<Box x=").placed);
+    let icon = element("<Icon");
+    assert!(!icon.placed, "inside a placed box");
+    assert!(icon.keeps_shape);
+}
