@@ -16,6 +16,7 @@ use std::ops::Range;
 
 use crate::attrs::scan_open_tag;
 use crate::edit::{Change, SourceEdit, add_settings, eol_in, set_attr, set_setting};
+use crate::element_ops::top_tag;
 use crate::model::{Block, Notes, Slide, Talk};
 use crate::rich::FlowPlace;
 use crate::parse::parse_talk;
@@ -180,10 +181,7 @@ pub fn set_align(talk: &Talk, index: usize, place: &FlowPlace, align: &str) -> O
             Some(Change { edits })
         }
         FlowPlace::Tag(range) => {
-            let tag = slide.blocks.iter().find_map(|block| match block {
-                Block::Tag(tag) if tag.range == *range => Some(tag),
-                _ => None,
-            })?;
+            let tag = top_tag(slide, range)?;
             let edit = (tag.attr("align") != Some(align)).then(|| set_attr(source, tag, "align", align));
             Some(edit.map_or_else(no_change, Change::single))
         }
@@ -253,13 +251,15 @@ fn word_ranges(source: &str, range: Range<usize>) -> Vec<Range<usize>> {
 /// The edits that set or take away `words` on the slide's `region.<name>` settings lines, all
 /// against the text as it is. A word set changes the one [`written_word`] picks, or is added
 /// at the line's end; one taken away goes with the white space before it, and every word of
-/// that name goes. A line that's missing is added, and the settings block with it, as
+/// that name goes. The edits are sorted, those of one place in the order asked. A line that's missing is added, and the settings block with it, as
 /// [`set_setting`] adds them; one left with no words goes, and the block with it when that was
 /// its only line, as [`remove_setting`] takes them. A word already as asked makes no edit.
 /// `None` where the edits can't be made.
 pub(crate) fn set_region_values(source: &str, slide: &Slide, words: &[RegionWord]) -> Option<Vec<SourceEdit>> {
+    // In the order a value is first set on each, so that new lines come in that order whatever
+    // else is asked, and then those only taken from.
     let mut regions: Vec<&str> = Vec::new();
-    for word in words {
+    for word in words.iter().filter(|word| word.value.is_some()).chain(words) {
         if !regions.contains(&word.region) {
             regions.push(word.region);
         }
@@ -316,6 +316,7 @@ pub(crate) fn set_region_values(source: &str, slide: &Slide, words: &[RegionWord
         let lines: Vec<(&str, &str)> = new_lines.iter().map(|(key, value)| (key.as_str(), value.as_str())).collect();
         edits.push(add_settings(source, slide, &lines));
     }
+    edits.sort_by_key(|edit| (edit.range.start, edit.range.end));
     Some(edits)
 }
 

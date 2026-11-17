@@ -80,6 +80,14 @@ pub fn find_tag<'a>(talk: &'a Talk, slide: usize, range: &Range<usize>) -> Optio
     guarded(|| tag_at(talk, slide, range))
 }
 
+/// The tag at the top level of `slide` whose range is exactly `range`.
+pub(crate) fn top_tag<'a>(slide: &'a Slide, range: &Range<usize>) -> Option<&'a Tag> {
+    slide.blocks.iter().find_map(|block| match block {
+        Block::Tag(tag) if tag.range == *range => Some(tag),
+        _ => None,
+    })
+}
+
 fn tag_at<'a>(talk: &'a Talk, slide: usize, range: &Range<usize>) -> Option<&'a Tag> {
     match find_block(&talk.slides.get(slide)?.blocks, range)? {
         Block::Tag(tag) => Some(tag),
@@ -369,32 +377,46 @@ fn attr_change(talk: &Talk, index: usize, range: &Range<usize>, name: &str, valu
         return None;
     }
     let source = talk.source.as_str();
-    let edits = match value {
-        Some(value) => vec![set_attr_as_typed(source, tag, name, value)?],
-        None => remove_attr(source, tag, name),
-    };
-    let edits: Vec<SourceEdit> = edits.into_iter().filter(|edit| source.get(edit.range.clone()) != Some(edit.text.as_str())).collect();
+    let edits = attr_edits(source, tag, name, value)?;
     if edits.is_empty() {
         return Some(Change { edits });
     }
-    if edits.iter().any(|edit| edit.range.start <= tag.range.start || edit.range.end >= tag.open_end) {
-        return None;
-    }
-
     let mut expected = slide.blocks.clone();
     with_block(&mut expected, range, &mut |blocks, at| {
-        let Block::Tag(tag) = &mut blocks[at] else { return };
-        match value {
-            Some(value) => match tag.attrs.iter_mut().find(|attr| attr.name == name) {
-                Some(attr) => attr.value = value.to_string(),
-                None => tag.attrs.push(Attr { name: name.to_string(), value: value.to_string(), name_range: 0..0, value_range: 0..0 }),
-            },
-            None => tag.attrs.retain(|attr| attr.name != name),
+        if let Block::Tag(tag) = &mut blocks[at] {
+            set_attr_read(tag, name, value);
         }
     });
     let change = Change { edits };
     let after = reparse(talk, change.apply(source));
     reads_as(talk, &after, index, &expected).then_some(change)
+}
+
+/// The edits that set attribute `name` of `tag` to `value`, written as [`tag_text`] writes
+/// values, or with `None` take every one of that name away, leaving out any that change no
+/// byte. `None` where the value can't be written, or an edit would reach outside the opening
+/// tag.
+pub(crate) fn attr_edits(source: &str, tag: &Tag, name: &str, value: Option<&str>) -> Option<Vec<SourceEdit>> {
+    let edits = match value {
+        Some(value) => vec![set_attr_as_typed(source, tag, name, value)?],
+        None => remove_attr(source, tag, name),
+    };
+    let edits: Vec<SourceEdit> = edits.into_iter().filter(|edit| source.get(edit.range.clone()) != Some(edit.text.as_str())).collect();
+    if edits.iter().any(|edit| edit.range.start <= tag.range.start || edit.range.end >= tag.open_end) {
+        return None;
+    }
+    Some(edits)
+}
+
+/// `tag` as it reads once [`attr_edits`] has set `name` to `value`, or taken it away.
+pub(crate) fn set_attr_read(tag: &mut Tag, name: &str, value: Option<&str>) {
+    match value {
+        Some(value) => match tag.attrs.iter_mut().find(|attr| attr.name == name) {
+            Some(attr) => attr.value = value.to_string(),
+            None => tag.attrs.push(Attr { name: name.to_string(), value: value.to_string(), name_range: 0..0, value_range: 0..0 }),
+        },
+        None => tag.attrs.retain(|attr| attr.name != name),
+    }
 }
 
 // ---------------------------------------------------------------------------------------

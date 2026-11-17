@@ -479,3 +479,66 @@ fn background(theme: &Theme) -> LayerSpec {
         varies: false,
     }
 }
+
+#[cfg(test)]
+mod region_words {
+    //! The editor writes the word of a region's line that the format crate says the engine
+    //! reads. These hold the two to the same reading, so neither drifts from the other.
+
+    use proptest::prelude::*;
+    use slides_format::{parse_talk, region_value};
+
+    use super::*;
+
+    /// Words a person might write on a region's line, with what the engine ignores.
+    const WORDS: [&str; 26] = [
+        "x=10", "x=-5", "x=abc", "x=1e3", "x=inf", "x=", "x==5", "y=20.5", "w=500", "h=7", "rotate=3", "rotate=NaN", "click=each", "click=2",
+        "click=0", "click=1000", "click=+1", "click=zz", "enter=fade", "enter=fly-up", "enter=zoom", "align=center", "align=right",
+        "align=middle", "foo=bar", "bare",
+    ];
+
+    proptest! {
+        #[test]
+        fn region_value_is_the_word_the_engine_reads(words in prop::collection::vec(prop::sample::select(WORDS.to_vec()), 0..6)) {
+            let source = format!("---\nregion.body: {}\n---\n# T\n", words.join("\t"));
+            let talk = parse_talk(&source);
+            let slide = &talk.slides[0];
+            let mut notices = Vec::new();
+            let layout = slide_layout(slide, &mut notices);
+            let region = layout.regions.iter().find(|region| region.name == "body").expect("the layout has a body");
+            let value = |name: &str| region_value(slide, "body", name);
+            let number = |name: &str, default: f32| value(name).map_or(default, |value| value.parse::<f32>().expect("a number"));
+
+            let (rect, rotate) = placement(slide, region);
+            prop_assert_eq!(rect.x, number("x", region.rect.x));
+            prop_assert_eq!(rect.y, number("y", region.rect.y));
+            prop_assert_eq!(rect.w, number("w", region.rect.w));
+            prop_assert_eq!(rect.h, number("h", region.rect.h));
+            prop_assert_eq!(rotate, number("rotate", 0.0));
+
+            let timing = read_region_timing(region_line(slide, region), &mut notices);
+            let click = match value("click") {
+                None => RegionClick::Absent,
+                Some("each") => RegionClick::Each,
+                Some(step) => RegionClick::Step(step.parse().expect("a step")),
+            };
+            prop_assert_eq!(timing.click, click);
+            let enter = match value("enter") {
+                None | Some("appear") => Enter::Appear,
+                Some("fade") => Enter::Fade,
+                Some("fly-up") => Enter::FlyUp,
+                Some(other) => panic!("the engine has no entrance {other}"),
+            };
+            prop_assert_eq!(timing.enter, enter);
+
+            let align = match value("align") {
+                None => region.align,
+                Some("left") => Align::Left,
+                Some("center") => Align::Center,
+                Some("right") => Align::Right,
+                Some(other) => panic!("the engine has no alignment {other}"),
+            };
+            prop_assert_eq!(region_align(slide, region, &mut notices), align);
+        }
+    }
+}

@@ -272,6 +272,26 @@ proptest! {
             slide.settings.iter().flat_map(|settings| &settings.entries).filter(|entry| !entry.key.starts_with("region.")).map(|entry| (entry.key.clone(), entry.value.clone())).collect()
         };
         prop_assert_eq!(keys(slide), keys(now));
+        // Each line of settings not named, and each attribute not named, keeps its bytes.
+        let named_keys: Vec<String> = asked.iter().filter_map(|(target, _, _)| match target {
+            Target::Region(region) => Some(format!("region.{region}")),
+            _ => None,
+        }).collect();
+        let lines = |talk: &Talk| -> Vec<String> {
+            talk.slides[index].settings.iter().flat_map(|settings| &settings.entries).filter(|entry| !named_keys.contains(&entry.key)).map(|entry| talk.source[entry.line.clone()].to_string()).collect()
+        };
+        prop_assert_eq!(lines(&talk), lines(&after));
+        for (at, tag) in top_tags(slide) {
+            let Block::Tag(new_tag) = &now.blocks[at] else { panic!("not a tag any more") };
+            let names = named(&asked, &Target::Tag(tag.range.clone()));
+            let bytes = |source: &str, tag: &Tag| -> Vec<String> {
+                tag.attrs.iter().filter(|attr| !names.contains(&attr.name.as_str())).map(|attr| source[attr.name_range.start..attr.value_range.end.max(attr.name_range.end)].to_string()).collect()
+            };
+            prop_assert_eq!(bytes(&source, tag), bytes(&new, new_tag));
+        }
+        // A value asked for that's there already adds no edit, among others too.
+        let rest: Vec<_> = asked.iter().filter(|edit| !same.iter().any(|other| other.0 == edit.0 && other.1 == edit.1)).cloned().collect();
+        prop_assert_eq!(set_values(&talk, index, &value_edits(&rest)), Some(change.clone()));
         // Every byte outside the tags and the settings named is the same.
         let named_regions = asked.iter().any(|(target, _, _)| matches!(target, Target::Region(_)));
         for edit in &change.edits {
@@ -308,6 +328,53 @@ proptest! {
             let new = change.apply(&source);
             prop_assert_eq!(change.inverse(&source).apply(&new), source);
         }
+    }
+
+    #[test]
+    fn removing_the_last_word_removes_the_line(source in arranged_talk(), index in 0..9usize, which in 0..4usize) {
+        let talk = parse_talk(&source);
+        let index = index % talk.slides.len();
+        let slide = &talk.slides[index];
+        let (regions, _) = layout(slide);
+        let region = regions[which % regions.len()];
+        let key = format!("region.{region}");
+        let Some(settings) = &slide.settings else { return Ok(()) };
+        if settings.get(&key).is_none() || slide.error.is_some() {
+            return Ok(());
+        }
+        // Every word with a name on the line.
+        let mut names: Vec<String> = words(slide, region).iter().filter_map(|word| Some(word.split_once('=')?.0.to_string())).collect();
+        names.sort();
+        names.dedup();
+        let edits: Vec<ValueEdit> = names.iter().map(|name| ValueEdit { target: Target::Region(region.to_string()), name, value: None }).collect();
+        let change = set_values(&talk, index, &edits);
+        let lines = settings.entries.iter().filter(|entry| entry.key == key).count();
+        if lines > 1 {
+            // The next line of that region would become the one read.
+            if let Some(change) = &change {
+                prop_assert!(change.is_empty() || words(slide, region).iter().any(|word| !word.contains('=')));
+            }
+            return Ok(());
+        }
+        let change = change.expect("every word can be taken off a region's only line");
+        let new = change.apply(&source);
+        let after = parse_talk(&new);
+        prop_assert!(other_slides_alike(&talk, &after, index));
+        let now = &after.slides[index];
+        let left: Vec<String> = words(slide, region).into_iter().filter(|word| !word.contains('=')).collect();
+        let line = now.settings.as_ref().and_then(|settings| settings.get(&key));
+        if left.is_empty() && !names.is_empty() {
+            prop_assert_eq!(line, None, "{:?}", new);
+            if settings.entries.len() == 1 {
+                prop_assert!(now.settings.as_ref().is_none_or(|settings| settings.entries.is_empty()), "{:?}", new);
+            } else {
+                prop_assert_eq!(now.settings.as_ref().unwrap().entries.len(), settings.entries.len() - 1);
+            }
+        } else {
+            // A line that keeps a bare word stays, with only those.
+            prop_assert_eq!(words(now, region), left);
+        }
+        prop_assert_eq!(change.inverse(&source).apply(&new), source);
     }
 
     #[test]
@@ -459,7 +526,10 @@ proptest! {
                         old.remove(at);
                     }
                     None => {
+                        // The list it was in is as taking the block away leaves it.
                         let holder = slide.blocks.iter().position(|b| b.range().start <= range.start && range.end <= b.range().end).unwrap();
+                        let deleted = parse_talk(&delete_block(&talk, index, &range).unwrap().apply(&source));
+                        prop_assert_eq!(&kept[holder], &top_texts(&deleted, index)[holder]);
                         old.remove(holder);
                         kept.remove(holder);
                     }
@@ -634,7 +704,7 @@ fn a_repeated_word_changes_the_one_the_engine_uses() {
 }
 
 #[test]
-fn removing_the_last_word_removes_the_line() {
+fn words_taken_off_a_line_by_hand() {
     on_both(|e| {
         let remove = |src: &str, slide: usize, region: &str, names: &[&'static str]| {
             let edits: Vec<ValueEdit> = names.iter().map(|name| ValueEdit { target: body(region), name, value: None }).collect();
@@ -658,6 +728,39 @@ fn removing_the_last_word_removes_the_line() {
         let src = e("---\nregion.body: x=5 foo=bar\n---\n# T\n");
         assert_eq!(remove(&src, 0, "body", &["x"]), e("---\nregion.body: foo=bar\n---\n# T\n"));
     });
+}
+
+#[test]
+fn lifting_a_heading_keeps_the_title() {
+    on_both(|e| {
+        // Lifted out, the first heading would leave the second to be the title.
+        let src = e("# T\n\n## Sub\n\nText\n");
+        let talk = parse_talk(&src);
+        assert_eq!(lift(&talk, 0, &tag_range(&talk, 0, "# T"), (1.0, 2.0, 3.0, 4.0)), None);
+        let new = lift(&talk, 0, &tag_range(&talk, 0, "## Sub"), (1.0, 2.0, 3.0, 4.0)).unwrap().apply(&src);
+        assert_eq!(new, e("# T\n\nText\n\n<Box x=\"1\" y=\"2\" w=\"3\" h=\"4\">\n\n## Sub\n\n</Box>\n"));
+        // A region's marker before it says where the rest goes.
+        let src = e("<Region name=\"body\" />\n\n# T\n\n## Sub\n");
+        let talk = parse_talk(&src);
+        assert!(lift(&talk, 0, &tag_range(&talk, 0, "# T"), (1.0, 2.0, 3.0, 4.0)).is_some());
+    });
+}
+
+#[test]
+fn a_tag_value_that_cant_be_written_is_refused() {
+    let src = "# T\n\n<Icon name=\"a\" x=\"1\" />\n";
+    let talk = parse_talk(src);
+    let tag = tag_range(&talk, 0, "<Icon");
+    for value in ["a\"b'c", "a\nb", "a\r\nb", "a\u{7}b", "a\tb"] {
+        let edit = [ValueEdit { target: Target::Tag(tag.clone()), name: "name", value: Some(value) }];
+        assert_eq!(set_values(&talk, 0, &edit), None, "{value:?}");
+    }
+    // One kind of quote is written between the other.
+    let edit = [ValueEdit { target: Target::Tag(tag.clone()), name: "name", value: Some("a\"b") }];
+    assert_eq!(set_values(&talk, 0, &edit).unwrap().apply(src), "# T\n\n<Icon name='a\"b' x=\"1\" />\n");
+    // And an attribute name that isn't one.
+    let edit = [ValueEdit { target: Target::Tag(tag), name: "Name", value: Some("b") }];
+    assert_eq!(set_values(&talk, 0, &edit), None);
 }
 
 const THREE: &str = "# T\n\nText\n\n<Icon name=\"a\" x=\"1\" />\n\n<Icon name=\"b\" x=\"2\" />\n\n<Icon name=\"c\" x=\"3\" />\n";
@@ -720,8 +823,9 @@ fn lifting_a_table_out_of_a_list_is_refused_or_exact() {
         let talk = parse_talk(&src);
         let Block::List { items, .. } = &talk.slides[0].blocks[1] else { panic!("no list") };
         let table = items[0][1].range().clone();
-        let Some(change) = lift(&talk, 0, &table, (10.0, 20.0, 300.0, 100.0)) else { return };
+        let change = lift(&talk, 0, &table, (10.0, 20.0, 300.0, 100.0)).expect("a table in a list can be lifted out");
         let new = change.apply(&src);
+        assert_eq!(new, e("# T\n\n- item\n\nAfter\n\n<Box x=\"10\" y=\"20\" w=\"300\" h=\"100\">\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n</Box>\n"));
         let after = parse_talk(&new);
         let blocks = &after.slides[0].blocks;
         assert_eq!(blocks.len(), 4, "{new:?}");

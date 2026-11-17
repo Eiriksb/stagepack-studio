@@ -5,10 +5,10 @@
 
 use std::ops::Range;
 
-use crate::edit::{Change, SourceEdit, eol_in, remove_attr, set_attr_as_typed, set_setting};
+use crate::edit::{Change, SourceEdit, eol_in, set_setting};
 use crate::element_ops::{
-    NewTag, content_end, delete_block, ending_len, guarded, insert_block, is_attr_name, is_blank, line_end, line_start, readable, reads_as,
-    tag_text, with_block,
+    NewTag, attr_edits, content_end, delete_block, ending_len, guarded, insert_block, is_attr_name, is_blank, line_end, line_start, readable,
+    reads_as, set_attr_read, tag_text, top_tag, with_block,
 };
 use crate::model::{Attr, Block, Slide, Tag, Talk};
 use crate::reparse::reparse;
@@ -50,7 +50,9 @@ pub enum Order {
 /// the block when it was its only line. A value already as asked makes no edit. `None` if a
 /// target isn't there, a name or value can't be written (as [`tag_text`] writes them, and a
 /// region's value is letters, digits and `.`, `+` and `-`), two edits name the same target and
-/// name, or the slide wouldn't read back as it did but for those values.
+/// name, or the slide wouldn't read back as it did but for those values. So a region value the
+/// engine can't read is refused where another word of its name, one the engine can read, would
+/// still be the one read.
 pub fn set_values(talk: &Talk, slide: usize, edits: &[ValueEdit]) -> Option<Change> {
     guarded(|| values_change(talk, slide, edits))
 }
@@ -138,14 +140,6 @@ fn merged(mut edits: Vec<SourceEdit>) -> Option<Change> {
     Some(Change { edits: out })
 }
 
-/// The tag at the top level of `slide` whose range is exactly `range`.
-fn top_tag<'a>(slide: &'a Slide, range: &Range<usize>) -> Option<&'a Tag> {
-    slide.blocks.iter().find_map(|block| match block {
-        Block::Tag(tag) if tag.range == *range => Some(tag),
-        _ => None,
-    })
-}
-
 /// Whether `value` can be a word's value on a region's line.
 fn is_word_value(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'-'))
@@ -191,22 +185,10 @@ fn values_change(talk: &Talk, index: usize, asked: &[ValueEdit]) -> Option<Chang
                 if tag.attr(edit.name) == edit.value {
                     continue;
                 }
-                let made = match edit.value {
-                    Some(value) => vec![set_attr_as_typed(source, tag, edit.name, value)?],
-                    None => remove_attr(source, tag, edit.name),
-                };
-                if made.iter().any(|made| made.range.start <= tag.range.start || made.range.end >= tag.open_end) {
-                    return None;
-                }
-                edits.extend(made);
+                edits.extend(attr_edits(source, tag, edit.name, edit.value)?);
                 with_block(&mut expected, range, &mut |blocks, at| {
-                    let Block::Tag(tag) = &mut blocks[at] else { return };
-                    match edit.value {
-                        Some(value) => match tag.attrs.iter_mut().find(|attr| attr.name == edit.name) {
-                            Some(attr) => attr.value = value.to_string(),
-                            None => tag.attrs.push(Attr { name: edit.name.to_string(), value: value.to_string(), name_range: 0..0, value_range: 0..0 }),
-                        },
-                        None => tag.attrs.retain(|attr| attr.name != edit.name),
+                    if let Block::Tag(tag) = &mut blocks[at] {
+                        set_attr_read(tag, edit.name, edit.value);
                     }
                 });
             }
@@ -390,7 +372,11 @@ fn lift_change(talk: &Talk, index: usize, range: &Range<usize>, place: (f32, f32
             }
             let target = || Target::Tag(range.clone());
             let edits = [("x", &x), ("y", &y), ("w", &w), ("h", &h)].map(|(name, value)| ValueEdit { target: target(), name, value: Some(value) });
-            return values_change(talk, index, &edits);
+            let change = values_change(talk, index, &edits)?;
+            let after = reparse(talk, change.apply(&talk.source));
+            let mut was = block_regions(slide);
+            was[at_top?] = None;
+            return (block_regions(after.slides.get(index)?) == was).then_some(change);
         }
         _ => {}
     }
@@ -416,6 +402,9 @@ fn lift_change(talk: &Talk, index: usize, range: &Range<usize>, place: (f32, f32
 
     let removal = delete_block(talk, index, range)?;
     let [cut] = removal.edits.as_slice() else { return None };
+    if !cut.text.is_empty() {
+        return None;
+    }
     let between = reparse(talk, removal.apply(source));
     let insertion = insert_block(&between, index, &boxed)?;
     let [put] = insertion.edits.as_slice() else { return None };
@@ -433,7 +422,17 @@ fn lift_change(talk: &Talk, index: usize, range: &Range<usize>, place: (f32, f32
     let attrs = attrs.map(|(name, value)| Attr { name: name.to_string(), value: value.to_string(), name_range: 0..0, value_range: 0..0 });
     expected.push(Block::Tag(Tag { name: "Box".to_string(), attrs: attrs.to_vec(), children: vec![block.clone()], range: 0..0, open_end: 0 }));
     let after = reparse(talk, change.apply(source));
-    reads_as(talk, &after, index, &expected).then_some(change)
+    if !reads_as(talk, &after, index, &expected) {
+        return None;
+    }
+    // Every block left reads into the region it did, as a heading lifted out could otherwise
+    // send the next one to the title. A list a block was lifted from stays where it was.
+    let mut was = block_regions(slide);
+    if let Some(at) = at_top {
+        was.remove(at);
+    }
+    was.push(None);
+    (block_regions(&after.slides[index]) == was).then_some(change)
 }
 
 /// The block at exactly `range` in a list among `blocks`, at any depth, but never inside a tag.
