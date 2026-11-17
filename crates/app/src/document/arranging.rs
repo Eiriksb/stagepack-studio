@@ -2,7 +2,7 @@
 //! yet, as while they're dragged, and writing their place once they're let go of.
 
 use slides_engine::{Placing, is_positioned};
-use slides_format::{Order, number_text, reorder};
+use slides_format::{Order, can_reorder, number_text, reorder};
 
 use super::*;
 use crate::arrange::{AlignTo, Placed, aligned, distributed};
@@ -247,6 +247,22 @@ impl Document {
         here
     }
 
+    /// What can be done to arrange what's selected, as [`Self::arrange_here`] says, but with
+    /// each way the one thing selected can go tried as the reorder would make it: for a menu, as
+    /// it opens.
+    pub fn arrange_menu(&self) -> ArrangeHere {
+        let mut here = self.arrange_here();
+        if let Some(selection) = &self.selection
+            && let [Thing::Block(source)] = selection.things.as_slice()
+        {
+            for order in [Order::Forward, Order::Backward, Order::Front, Order::Back] {
+                let can = &mut here.can[order_index(order)];
+                *can = *can && can_reorder(self.talk(), selection.slide, source, order);
+            }
+        }
+        here
+    }
+
     /// Lines the things selected up on the line `to`, as one step named "Align", and returns
     /// the slides to show again: one thing on the slide's line, several on that of the box
     /// that holds them all. Refused if one of them is written in the slide's text.
@@ -290,14 +306,22 @@ impl Document {
     /// where it's there already. Refused for several things, an area, or a thing written in
     /// the slide's text.
     pub fn reorder_selected(&mut self, order: Order) -> Result<Vec<usize>, EditRefused> {
-        // Typing is finished first, which can move the thing.
-        self.finish_before_edit()?;
-        let Some(selection) = self.selection.clone() else {
+        if self.selection.is_none() {
             return Ok(Vec::new());
-        };
+        }
         if let Some(refused) = self.arrange_here().order_refused {
             return Err(refused);
         }
+        // Typing is finished first. That can move the thing, and then what's selected is no
+        // longer what was asked to move: it's refused.
+        let version = self.text_version();
+        self.finish_before_edit()?;
+        if self.text_version() != version {
+            return Err(EditRefused::CouldNotBeMade);
+        }
+        let Some(selection) = self.selection.clone() else {
+            return Ok(Vec::new());
+        };
         let [Thing::Block(source)] = selection.things.as_slice() else {
             return Err(EditRefused::CouldNotBeMade);
         };

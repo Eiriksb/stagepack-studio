@@ -68,7 +68,8 @@ impl AlignTo {
 
 /// `things` lined up on the line `to`: one thing on the slide's, several on that of the box
 /// that holds them all. Each moves, across or down only, so that the box it covers as it's
-/// turned meets the line; sizes and turns stay as they were.
+/// turned meets the line; sizes and turns stay as they were. Each is held, as a move is, to
+/// keep part of it on the slide, so a line far off it takes a thing only part of the way.
 pub fn aligned(things: &[Placed], to: AlignTo) -> Vec<Placed> {
     let slide = Rect { x: 0., y: 0., w: SLIDE_WIDTH, h: SLIDE_HEIGHT };
     let target = if things.len() == 1 { Some(slide) } else { holding(things.iter().copied()) };
@@ -80,15 +81,15 @@ pub fn aligned(things: &[Placed], to: AlignTo) -> Vec<Placed> {
         .iter()
         .map(|placed| {
             let by = line - to.line(&bounds(placed));
-            moved(placed, if to.across() { (by, 0.) } else { (0., by) })
+            kept_moved(placed, if to.across() { (by, 0.) } else { (0., by) })
         })
         .collect()
 }
 
 /// `things` spaced out across, or down, with the same gap between the boxes each covers as
 /// it's turned, in their order along that way by their middles. The first and the last stay
-/// where they are, and the others move between them, across or down only. `None` for fewer
-/// than three.
+/// where they are, and the others move between them, across or down only, each held as a move
+/// is to keep part of it on the slide. `None` for fewer than three.
 pub fn distributed(things: &[Placed], across: bool) -> Option<Vec<Placed>> {
     if things.len() < 3 {
         return None;
@@ -114,7 +115,7 @@ pub fn distributed(things: &[Placed], across: bool) -> Option<Vec<Placed>> {
     for &index in &order[1..order.len() - 1] {
         let (start, length) = span(&things[index]);
         let by = at - start;
-        out[index] = moved(&things[index], if across { (by, 0.) } else { (0., by) });
+        out[index] = kept_moved(&things[index], if across { (by, 0.) } else { (0., by) });
         at += length + gap;
     }
     Some(out)
@@ -134,6 +135,11 @@ pub fn kept_on_slide(rect: Rect) -> Rect {
 /// `placed` moved by `by`, in slide units.
 pub fn moved(placed: &Placed, (dx, dy): (f32, f32)) -> Placed {
     Placed { rect: Rect { x: placed.rect.x + dx, y: placed.rect.y + dy, ..placed.rect }, rotate: placed.rotate }
+}
+
+/// `placed` moved by as much of `by` as [`kept_move`] lets it go.
+fn kept_moved(placed: &Placed, by: (f32, f32)) -> Placed {
+    moved(placed, kept_move(std::slice::from_ref(placed), by))
 }
 
 /// `by` kept to one direction, across or up and down, whichever it goes further in.

@@ -106,7 +106,7 @@ impl Inspector {
     }
 
     /// Commits the text or number field that has the keyboard, if one does.
-    pub(super) fn commit_typing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn commit_typing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let typed_in = self.form.iter().flat_map(|form| form.fields.iter().enumerate()).find_map(|(index, field)| match &field.widget {
             Widget::Input(input) if input.read(cx).focus_handle(cx).is_focused(window) => Some(index),
             _ => None,

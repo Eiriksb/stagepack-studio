@@ -351,7 +351,7 @@ impl Ribbon {
                 cx,
             ),
             self.text_tools.clone().into_any_element(),
-            arrange_tools::arrange_group(&arrange, self.slide_focus.clone(), cx),
+            arrange_tools::arrange_group(&arrange, self.document.clone(), self.slide_focus.clone(), cx),
         ]
         .into_iter()
         .chain(table.map(|table| table_tools::ribbon_group(&table, cx)))

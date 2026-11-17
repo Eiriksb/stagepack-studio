@@ -508,13 +508,14 @@ fn the_keyboard_rule_holds_after_the_menu_closes(cx: &mut TestAppContext) {
     // Closed by a click on the list of slides, which takes the keyboard.
     right_click_thing(&typing, cx, RECT);
     let row = bounds_of(&typing, cx, strip_row_id(1)).expect("the second row").center();
+    // The one click closes the menu and is the row's too.
     typing.click(cx, row);
-    if menu_open(&typing, cx) {
-        // The click that closes the menu goes no further: the next is the row's.
-        typing.click(cx, row);
-    }
+    assert!(!menu_open(&typing, cx), "the menu closed");
+    assert_eq!(typing.current(cx), 1, "the row's slide is shown");
+    assert!(list_has_keyboard(&typing, cx), "the list has the keyboard");
+    assert!(!slide_has_keyboard(&typing, cx));
+    assert_eq!(selection(&typing, cx), None, "and nothing is selected");
     holds_the_rule(&typing, cx, "a click on the list");
-    assert!(list_has_keyboard(&typing, cx));
     // Delete there takes the slide, as nothing on it is selected.
     typing.press(cx, "delete");
     assert_eq!(typing.slide_count(cx), 1);
@@ -540,4 +541,184 @@ fn the_form_can_be_hidden_and_shown(cx: &mut TestAppContext) {
     click_on(&typing, cx, TOGGLE_INSPECTOR_ID);
     assert!(bounds_of(&typing, cx, INSPECTOR_ID).is_some(), "shown again");
     assert_eq!(typing.slide_bounds(cx).size.width, width);
+}
+
+/// A text box with a line of text, below which there's room in the box.
+const BOXED: &str = "# T\n\n<Text x=\"200\" y=\"300\" w=\"800\" h=\"400\">\n\nHi there\n\n</Text>\n\n---\n\n# Two\n";
+
+#[gpui_kit::test]
+fn a_right_click_on_a_box_emptied_by_typing_never_acts_on_the_slide(cx: &mut TestAppContext) {
+    // Asked in review: picking an emptied box ends its typing, which takes the box away. Every
+    // point of a box being typed in is its text, though, so the press is left be.
+    let typing = open_wide(cx, BOXED);
+    let layout = typing.layout(cx);
+    let flow = (0..typing.flows(cx, 0).len()).find(|&flow| layout.region_of_flow(flow).is_none()).expect("the box's text");
+    typing.double_click_text(cx, flow, pos(0, 2));
+    assert!(typing.editing(cx).is_some(), "typing in the box");
+    typing.press(cx, "ctrl-a");
+    typing.press(cx, "backspace");
+    // Its corners, an edge, and well below its emptied line.
+    for (x, y) in [(202., 302.), (998., 698.), (202., 500.), (600., 620.)] {
+        let at = typing.at(cx, x, y);
+        right_click(&typing, cx, at);
+        assert!(!menu_open(&typing, cx), "at {x}, {y}");
+        assert!(typing.editing(cx).is_some(), "typing goes on");
+    }
+    typing.press(cx, "escape");
+    assert_eq!(typing.slide_count(cx), 2, "the slide stays");
+}
+
+#[gpui_kit::test]
+fn with_nothing_selected_no_item_of_the_things_menu_acts_on_the_slide(cx: &mut TestAppContext) {
+    let typing = open_wide(cx, TALK);
+    // Something of the slide's own on the clipboard, which Paste puts on the slide.
+    click_thing(&typing, cx, RECT, Modifiers::default());
+    typing.press(cx, "ctrl-c");
+    for (at, item) in THING_MENU.iter().enumerate().filter(|(_, item)| !item.is_empty()) {
+        right_click_thing(&typing, cx, ELLIPSE);
+        assert!(menu_open(&typing, cx));
+        // What was selected goes while the menu is open.
+        typing.document(cx).update(cx, |document, cx| {
+            document.deselect();
+            cx.notify();
+        });
+        typing.settle(cx);
+        let before = typing.source(cx);
+        click_item(&typing, cx, at);
+        if menu_open(&typing, cx) {
+            typing.press(cx, "escape");
+        }
+        assert_eq!(typing.slide_count(cx), 2, "{item} left the slides as they were");
+        if *item != "Paste" {
+            assert_eq!(typing.source(cx), before, "{item} did nothing");
+        } else if typing.source(cx) != before {
+            typing.press(cx, "ctrl-z");
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn an_order_the_talk_cannot_take_is_off_in_both_menus(cx: &mut TestAppContext) {
+    // The rectangle shares its last line with the ellipse, so its lines can't be moved alone.
+    let talk = "# T\n\n<Shape kind=\"rect\" fill=\"#2563eb\" x=\"200\" y=\"500\" w=\"200\" h=\"200\">\n</Shape> <Shape kind=\"ellipse\" fill=\"#dc2626\" x=\"700\" y=\"550\" w=\"100\" h=\"100\" />\n";
+    let typing = open_wide(cx, talk);
+    click_thing(&typing, cx, RECT, Modifiers::default());
+    let (quick, tried) = typing.document(cx).read_with(cx, |document, _| (document.arrange_here().can, document.arrange_menu().can));
+    assert!(quick[0], "the quick look says it could come forward");
+    assert!(!tried[0], "but the talk can't take it");
+    open_arrange(&typing, cx);
+    assert!(arrange_item_off(&typing, cx, "Bring forward"));
+    typing.press(cx, "escape");
+    right_click_thing(&typing, cx, RECT);
+    let at = THING_MENU.iter().position(|item| *item == "Bring forward").unwrap();
+    click_item(&typing, cx, at);
+    assert!(menu_open(&typing, cx), "the item is off");
+    typing.press(cx, "escape");
+    assert_eq!(typing.source(cx), talk);
+}
+
+#[gpui_kit::test]
+fn aligning_never_takes_a_thing_off_the_slide(cx: &mut TestAppContext) {
+    // Found in review: a thing mostly off the slide took another wholly off with it.
+    let talk = "# T\n\n<Shape kind=\"rect\" fill=\"#2563eb\" x=\"-984\" y=\"300\" w=\"1000\" h=\"100\" />\n\n\
+<Shape kind=\"ellipse\" fill=\"#dc2626\" x=\"600\" y=\"600\" w=\"500\" h=\"100\" />\n";
+    let typing = open_wide(cx, talk);
+    let on = typing.at(cx, 8., 350.);
+    typing.click(cx, on);
+    click_thing(&typing, cx, ELLIPSE, Modifiers::shift());
+    assert_eq!(picked(&typing, cx).len(), 2);
+    arrange(&typing, cx, "Align left");
+    assert_eq!(value_of(&typing, cx, ELLIPSE, "x"), "-484", "sixteen units of it stay on the slide");
+    assert_eq!(value_of(&typing, cx, RECT, "x"), "-984");
+    assert_eq!(undo_label(&typing, cx), Some("Align"));
+}
+
+#[gpui_kit::test]
+fn hiding_the_form_writes_what_was_typed_and_gives_the_slide_the_keyboard(cx: &mut TestAppContext) {
+    let typing = open_wide(cx, TALK);
+    click_thing(&typing, cx, RECT, Modifiers::default());
+    click_on(&typing, cx, gpui_kit::SharedString::from(stagepack_studio::inspector::field_id("x")));
+    typing.press(cx, "ctrl-a");
+    typing.type_text(cx, "250");
+    assert!(!slide_has_keyboard(&typing, cx), "the field has the keyboard");
+    // Hidden while the field has the keyboard, as by the View tab's toggle.
+    typing.with_window(cx, |window, cx| window.dispatch_action(Box::new(stagepack_studio::workspace_view::ToggleInspector), cx));
+    typing.settle(cx);
+    assert!(bounds_of(&typing, cx, INSPECTOR_ID).is_none(), "the form is hidden");
+    assert_eq!(value_of(&typing, cx, RECT, "x"), "250", "what was typed is written");
+    assert_eq!(picked(&typing, cx), [&RECT[..18]], "the thing is still selected");
+    assert!(slide_has_keyboard(&typing, cx), "and the slide has the keyboard");
+    holds_the_rule(&typing, cx, "hiding the form");
+    typing.press(cx, "right");
+    assert_eq!(value_of(&typing, cx, RECT, "x"), "251", "the arrow keys move it");
+}
+
+fn notes_have_keyboard(typing: &Typing, cx: &mut TestAppContext) -> bool {
+    typing.with_window(cx, |window, cx| typing.view.read(cx).notes_panel().read(cx).is_focused(window, cx))
+}
+
+#[gpui_kit::test]
+fn a_right_click_on_a_thing_takes_the_keyboard_from_the_notes(cx: &mut TestAppContext) {
+    let typing = open_wide(cx, TALK);
+    click_on(&typing, cx, stagepack_studio::notes_panel::NOTES_ID);
+    assert!(notes_have_keyboard(&typing, cx));
+    right_click_thing(&typing, cx, RECT);
+    assert!(menu_open(&typing, cx));
+    assert_eq!(picked(&typing, cx), [&RECT[..18]]);
+    typing.press(cx, "escape");
+    assert!(slide_has_keyboard(&typing, cx), "the slide has the keyboard");
+    assert!(!notes_have_keyboard(&typing, cx));
+    assert_eq!(picked(&typing, cx), [&RECT[..18]], "and the thing is selected");
+}
+
+#[gpui_kit::test]
+fn a_right_click_on_the_empty_slide_from_the_list_selects_nothing(cx: &mut TestAppContext) {
+    let typing = open_wide(cx, TALK);
+    click_thing(&typing, cx, RECT, Modifiers::default());
+    click_on(&typing, cx, strip_row_id(0));
+    assert!(list_has_keyboard(&typing, cx));
+    let empty = typing.at(cx, 1880., 1060.);
+    right_click(&typing, cx, empty);
+    assert_eq!(menu_items(&typing, cx, 1), ["Paste"]);
+    assert_eq!(selection(&typing, cx), None);
+    typing.press(cx, "escape");
+    // As a click on the slide does, it takes the keyboard from the list, with nothing selected.
+    assert!(slide_has_keyboard(&typing, cx), "the slide has the keyboard");
+    assert!(!list_has_keyboard(&typing, cx));
+    assert_eq!(selection(&typing, cx), None, "and nothing is selected");
+    holds_the_rule(&typing, cx, "Escape");
+}
+
+#[gpui_kit::test]
+fn a_right_click_on_an_areas_text_offers_only_paste_and_lets_go(cx: &mut TestAppContext) {
+    let typing = open_wide(cx, TALK);
+    click_thing(&typing, cx, RECT, Modifiers::default());
+    let layout = typing.layout(cx);
+    let body = (0..typing.flows(cx, 0).len()).find(|&flow| layout.region_of_flow(flow) == Some("body")).unwrap();
+    let at = typing.point_of(cx, body, pos(0, 3));
+    right_click(&typing, cx, at);
+    assert_eq!(menu_items(&typing, cx, 1), ["Paste"]);
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        assert!(window.within("popup-menu").try_find(1usize).is_none(), "nothing else");
+    });
+    assert_eq!(selection(&typing, cx), None, "what was selected is let go of");
+    assert!(typing.editing(cx).is_none(), "and nothing is typed in");
+    typing.press(cx, "escape");
+    assert_eq!(typing.source(cx), TALK);
+}
+
+#[gpui_kit::test]
+fn a_right_click_off_any_thing_while_typing_does_nothing(cx: &mut TestAppContext) {
+    let typing = open_wide(cx, TALK);
+    let layout = typing.layout(cx);
+    let body = (0..typing.flows(cx, 0).len()).find(|&flow| layout.region_of_flow(flow) == Some("body")).unwrap();
+    typing.click_text(cx, body, pos(0, 3));
+    let typed = typing.editing(cx).expect("typing").edit.selection;
+    let empty = typing.at(cx, 1880., 1060.);
+    right_click(&typing, cx, empty);
+    assert!(!menu_open(&typing, cx), "no menu");
+    assert_eq!(typing.editing(cx).map(|editing| editing.edit.selection), Some(typed), "typing goes on where it was");
+    assert!(slide_has_keyboard(&typing, cx));
+    assert_eq!(typing.source(cx), TALK);
 }

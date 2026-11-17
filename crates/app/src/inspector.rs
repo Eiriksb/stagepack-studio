@@ -244,12 +244,19 @@ impl Inspector {
         }
     }
 
-    /// Whether any of the form's text or number fields has the keyboard.
+    /// Whether any of the form's fields has the keyboard, or what one of them opened, as a
+    /// choice's list or the icon picker's search.
     pub fn has_any_keyboard(&self, window: &Window, cx: &App) -> bool {
         self.form.as_ref().is_some_and(|form| {
-            form.fields.iter().any(|field| match &field.widget {
-                Widget::Input(input) => input.read(cx).focus_handle(cx).is_focused(window),
-                _ => false,
+            form.fields.iter().any(|field| {
+                let focus = match &field.widget {
+                    Widget::Input(input) => input.read(cx).focus_handle(cx),
+                    Widget::Choice { select, .. } => select.read(cx).focus_handle(cx),
+                    Widget::Color { picker, .. } => picker.read(cx).focus_handle(cx),
+                    Widget::Icon(picker) => picker.read(cx).search_focus(cx),
+                    Widget::Flag | Widget::File => return false,
+                };
+                focus.contains_focused(window, cx)
             })
         })
     }

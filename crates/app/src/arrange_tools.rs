@@ -14,7 +14,7 @@ use gpui_kit::*;
 use slides_format::Order;
 
 use crate::arrange::AlignTo;
-use crate::document::{ArrangeHere, EditRefused};
+use crate::document::{ArrangeHere, Document, EditRefused};
 use crate::ribbon::group;
 
 /// The Arrange tool, which opens its menu.
@@ -72,9 +72,10 @@ pub fn reason(menu: PopupMenu, why: EditRefused) -> PopupMenu {
     menu.item(PopupMenuItem::label(why.to_string()))
 }
 
-/// The Arrange group, for what `here` says is selected. It's off while nothing is. Once its
-/// menu closes, the keyboard goes to `slide`, the slide's.
-pub fn arrange_group(here: &ArrangeHere, slide: FocusHandle, cx: &App) -> AnyElement {
+/// The Arrange group of `document`'s window, for what `here` says is selected. It's off while
+/// nothing is. Its menu tries each way the thing can go as it opens. Once the menu closes, the
+/// keyboard goes to `slide`, the slide's.
+pub fn arrange_group(here: &ArrangeHere, document: Option<Entity<Document>>, slide: FocusHandle, cx: &App) -> AnyElement {
     let here = *here;
     let tool = Button::new(ARRANGE_ID)
         .ghost()
@@ -84,7 +85,8 @@ pub fn arrange_group(here: &ArrangeHere, slide: FocusHandle, cx: &App) -> AnyEle
         .dropdown_caret(true)
         .tooltip("Line things up, space them out, or bring them forward or back")
         .disabled(here.count == 0)
-        .dropdown_menu(move |menu, _, _| {
+        .dropdown_menu(move |menu, _, cx| {
+            let here = document.as_ref().map_or(here, |document| document.read(cx).arrange_menu());
             let menu = order_items(menu.action_context(slide.clone()), &here).separator();
             let menu = ALIGNS.iter().fold(menu, |menu, &(to, label)| {
                 menu.menu_with_disabled(label, Box::new(AlignThings { to }), !here.can_align())

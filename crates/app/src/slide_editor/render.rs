@@ -1,6 +1,6 @@
 //! Drawing the editor: the slide, the marks over it, and the keys and mouse it takes.
 
-use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 
 use super::*;
 use crate::arrange_tools::{order_items, reason};
@@ -393,29 +393,31 @@ impl Render for SlideEditor {
                 let Some(editor) = menu_editor.upgrade() else {
                     return menu;
                 };
-                editor.read(cx).menu(menu.action_context(menu_focus.clone()), cx)
+                editor.read(cx).menu(menu.action_context(menu_focus.clone()), &menu_editor, cx)
             })
     }
 }
 
 impl SlideEditor {
-    /// The menu a right-click opened, from `menu`: for a thing, what can be done to it, and for
-    /// the slide, Paste. Each item does what its key does, on the slide.
-    fn menu(&self, menu: PopupMenu, cx: &App) -> PopupMenu {
+    /// The menu a right-click opened, from `menu`, `editor` being this editor: for a thing, what
+    /// can be done to it, and for the slide, or a thing no longer selected, Paste. Each item does
+    /// what its key does, on the slide.
+    fn menu(&self, menu: PopupMenu, editor: &WeakEntity<Self>, cx: &App) -> PopupMenu {
         let document = match (self.menu_on, &self.document) {
-            (Some(MenuOn::Thing), Some(document)) => document.read(cx),
+            (Some(MenuOn::Thing), Some(document)) if self.selection_here(cx).is_some() => document.read(cx),
             (Some(_), _) => return menu.menu("Paste", Box::new(PasteFromClipboard)),
             (None, _) => return menu,
         };
-        let here = document.arrange_here();
+        let here = document.arrange_menu();
         // An area can't be cut, copied, duplicated or deleted.
         let areas = document.selection().is_some_and(|selection| selection.blocks().next().is_none());
+        let item = |label: &'static str, action: Box<dyn Action>| thing_item(label, action, areas, editor.clone());
         let menu = menu
-            .menu_with_disabled("Cut", Box::new(CutToClipboard), areas)
-            .menu_with_disabled("Copy", Box::new(CopyToClipboard), areas)
+            .item(item("Cut", Box::new(CutToClipboard)))
+            .item(item("Copy", Box::new(CopyToClipboard)))
             .menu("Paste", Box::new(PasteFromClipboard))
-            .menu_with_disabled("Duplicate", Box::new(DuplicateSelected), areas)
-            .menu_with_disabled("Delete", Box::new(TakeAwaySelected), areas)
+            .item(item("Duplicate", Box::new(DuplicateSelected)))
+            .item(item("Delete", Box::new(TakeAwaySelected)))
             .separator();
         let menu = order_items(menu, &here);
         match here.order_refused {
@@ -423,4 +425,21 @@ impl SlideEditor {
             None => menu,
         }
     }
+}
+
+/// An item of a thing's menu named `label`, off with `disabled`, that does what `action` does on
+/// the slide of `editor`, but only while something is selected there: the window's own Cut and
+/// Copy act on the slide itself with nothing selected, and this menu never does.
+fn thing_item(label: &'static str, action: Box<dyn Action>, disabled: bool, editor: WeakEntity<SlideEditor>) -> PopupMenuItem {
+    PopupMenuItem::new(label).action(action.boxed_clone()).disabled(disabled).on_click(move |_, window, cx| {
+        let Some(editor) = editor.upgrade() else {
+            return;
+        };
+        if editor.read(cx).selection_here(cx).is_none() {
+            return;
+        }
+        let focus = editor.read(cx).focus_handle.clone();
+        focus.focus(window, cx);
+        window.dispatch_action(action.boxed_clone(), cx);
+    })
 }

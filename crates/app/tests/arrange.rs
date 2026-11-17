@@ -374,6 +374,27 @@ fn things(least: usize) -> impl Strategy<Value = Vec<Placed>> {
     proptest::collection::vec(a_thing(), least..6)
 }
 
+/// A thing at any turn whose box lies on the slide, 40 units in from its edges at least.
+fn a_thing_on_the_slide() -> impl Strategy<Value = Placed> {
+    let rotate = prop_oneof![Just(0f32), Just(37.), Just(90.), Just(180.), Just(359.9), Just(-360.), -360f32..360.];
+    (1f32..700., 1f32..700., rotate, 0f32..=1., 0f32..=1.).prop_map(|(w, h, rotate, along, down)| {
+        let covers = bounds(&Placed { rect: Rect { x: 0., y: 0., w, h }, rotate });
+        let middle = (40. + covers.w / 2. + along * (1840. - covers.w), 40. + covers.h / 2. + down * (1000. - covers.h));
+        Placed { rect: Rect { x: middle.0 - w / 2., y: middle.1 - h / 2., w, h }, rotate }
+    })
+}
+
+fn things_on_the_slide(least: usize) -> impl Strategy<Value = Vec<Placed>> {
+    proptest::collection::vec(a_thing_on_the_slide(), least..6)
+}
+
+/// Whether `after`, moved from `before`, keeps as much on the slide each way as a move keeps.
+fn kept_on(before: &Placed, after: &Placed) -> bool {
+    let (was, is) = (bounds(before), bounds(after));
+    on(is.x, is.w, 1920.) + 0.01 >= on(was.x, was.w, 1920.).min(is.w.min(16.))
+        && on(is.y, is.h, 1080.) + 0.01 >= on(was.y, was.h, 1080.).min(is.h.min(16.))
+}
+
 fn align_to() -> impl Strategy<Value = AlignTo> {
     proptest::sample::select(ALIGNS.to_vec())
 }
@@ -386,7 +407,7 @@ fn middle_along(placed: &Placed, across: bool) -> f32 {
 
 proptest! {
     #[test]
-    fn aligning_uses_the_turned_bounds(things in things(1), to in align_to()) {
+    fn aligning_uses_the_turned_bounds(things in things_on_the_slide(1), to in align_to()) {
         let slide = Rect { x: 0., y: 0., w: 1920., h: 1080. };
         let target = if things.len() == 1 { slide } else { holding(things.iter().copied()).unwrap() };
         let line = line_of(target, to);
@@ -397,7 +418,7 @@ proptest! {
     }
 
     #[test]
-    fn aligning_twice_changes_nothing_more(things in things(1), to in align_to()) {
+    fn aligning_twice_changes_nothing_more(things in things_on_the_slide(1), to in align_to()) {
         let once = aligned(&things, to);
         let twice = aligned(&once, to);
         for (a, b) in once.iter().zip(&twice) {
@@ -421,7 +442,7 @@ proptest! {
     }
 
     #[test]
-    fn distributing_makes_the_gaps_equal(things in things(3), across in any::<bool>()) {
+    fn distributing_makes_the_gaps_equal(things in things_on_the_slide(3), across in any::<bool>()) {
         let out = distributed(&things, across).expect("three or more");
         prop_assert_eq!(out.len(), things.len());
         // In their order along the direction, as they were.
@@ -449,6 +470,16 @@ proptest! {
     }
 
     #[test]
+    fn aligning_and_spacing_out_keep_things_on_the_slide(things in things(1), to in align_to(), across in any::<bool>()) {
+        for (before, after) in things.iter().zip(aligned(&things, to)) {
+            prop_assert!(kept_on(before, &after), "aligned off the slide: {before:?} to {after:?}");
+        }
+        for (before, after) in things.iter().zip(distributed(&things, across).unwrap_or_else(|| things.clone())) {
+            prop_assert!(kept_on(before, &after), "spaced off the slide: {before:?} to {after:?}");
+        }
+    }
+
+    #[test]
     fn distributing_fewer_than_three_is_none(things in proptest::collection::vec(a_thing(), 0..3), across in any::<bool>()) {
         prop_assert!(distributed(&things, across).is_none());
     }
@@ -465,4 +496,14 @@ fn one_thing_aligns_to_the_slide_and_several_to_each_other() {
     // A thing turned a quarter lines up by the box it covers: 100 wide by 200 tall.
     let turned = Placed { rect: Rect { x: 500., y: 300., w: 200., h: 100. }, rotate: 90. };
     assert_eq!(aligned(&[turned], AlignTo::Top)[0].rect.y, 50.);
+}
+
+#[test]
+fn a_line_far_off_the_slide_takes_a_thing_only_part_of_the_way() {
+    // Found in review: a thing mostly off the slide took another wholly off with it.
+    let far = Placed { rect: Rect { x: -984., y: 100., w: 1000., h: 100. }, rotate: 0. };
+    let other = Placed { rect: Rect { x: 600., y: 400., w: 500., h: 100. }, rotate: 0. };
+    let lined = aligned(&[far, other], AlignTo::Left);
+    assert_eq!(lined[0], far, "the far one is on the line already");
+    assert_eq!(lined[1].rect.x, -484., "sixteen units of the other stay on");
 }

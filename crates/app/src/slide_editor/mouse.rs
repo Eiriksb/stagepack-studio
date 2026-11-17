@@ -208,10 +208,13 @@ impl SlideEditor {
 
     /// A right press. On a thing, or on an area's frame, it's selected, unless it's one of the
     /// things selected already, and the slide takes the keyboard, before the thing's menu opens.
-    /// Elsewhere what's selected is let go of, and the menu offers only Paste. On the text being
-    /// typed, anywhere but on a thing while text is typed, or with no talk, the press is left
-    /// be, and no menu opens.
+    /// Elsewhere, on the empty slide, the desk, or a layout area's text that isn't being typed,
+    /// what's selected is let go of, and the menu offers only Paste; so too where picking the
+    /// thing left nothing selected. On the text being typed, anywhere but on a thing while text
+    /// is typed, or with no talk, the press is left be, and no menu opens.
     pub(super) fn right_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // A colour held for the selection goes to it before the press moves it.
+        self.give_held_color(cx);
         self.end_drag(cx);
         self.dragging = false;
         self.pressed = None;
@@ -227,7 +230,8 @@ impl SlideEditor {
                 } else {
                     self.select_one(slide, thing, window, cx);
                 }
-                self.menu_on = Some(MenuOn::Thing);
+                // Picking it can leave nothing selected, as when ending the typing takes it away.
+                self.menu_on = Some(if self.selection_here(cx).is_some() { MenuOn::Thing } else { MenuOn::Slide });
             }
             None if self.is_editing(cx) || self.document.is_none() => {
                 cx.stop_propagation();

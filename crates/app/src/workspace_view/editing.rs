@@ -500,8 +500,26 @@ impl WorkspaceView {
                 .focus_handle()
                 .contains_focused(window, cx);
         let form_away = !self.show_inspector && self.inspector.read(cx).has_any_keyboard(window, cx);
-        if notes_away || list_away || form_away {
+        if notes_away || list_away {
             self.focus_handle.focus(window, cx);
+        } else if form_away {
+            // What was typed in the form is written, once this edit to the window is done, and
+            // then the keyboard goes to the slide while a thing on it is selected, or else to
+            // the window.
+            let (inspector, document) = (self.inspector.clone(), self.document.clone());
+            let (slide, away) = (self.slide_editor.read(cx).focus_handle().clone(), self.focus_handle.clone());
+            window.defer(cx, move |window, cx| {
+                inspector.update(cx, |inspector, cx| inspector.commit_typing(window, cx));
+                let selected_here = document.is_some_and(|document| {
+                    let document = document.read(cx);
+                    document.selection().is_some_and(|selection| selection.slide == document.current())
+                });
+                if selected_here {
+                    slide.focus(window, cx);
+                } else {
+                    away.focus(window, cx);
+                }
+            });
         }
         cx.notify();
     }
