@@ -225,3 +225,131 @@ fn things_dragged_together_do_not_snap_to_each_other(cx: &mut TestAppContext) {
         .replacen("x=\"1300\" y=\"700\"", &format!("x=\"{}\" y=\"{}\"", written(1300., dx), written(700., dy)), 1);
     assert_eq!(typing.source(cx), expected);
 }
+
+/// Whether a guide is drawn across the slide at `y` of it, a pixel tall.
+fn level_guide_at(typing: &Typing, cx: &mut TestAppContext, y: f32) -> bool {
+    let at = typing.at(cx, 0., y).y;
+    guides(typing, cx).iter().any(|guide| guide.size.height == px(1.) && guide.size.width > px(1.) && (guide.center().y - at).abs() <= px(1.))
+}
+
+fn any_level_guide(typing: &Typing, cx: &mut TestAppContext) -> bool {
+    guides(typing, cx).iter().any(|guide| guide.size.height == px(1.) && guide.size.width > px(1.))
+}
+
+/// The rectangle 5 below the ellipse's top: its top, at 705, is in reach of the line at 700.
+fn five_below() -> String {
+    TALK.replacen("x=\"300\" y=\"700\"", "x=\"300\" y=\"705\"", 1)
+}
+
+#[gpui_kit::test]
+fn shift_snaps_only_the_way_it_goes(cx: &mut TestAppContext) {
+    let talk = five_below();
+    let typing = open(cx, &talk);
+    let from = middle_of(&typing, cx, RECT);
+    // Mostly across, to near the slide's middle, and a little down.
+    let through = [from + pixels(&typing, cx, (200., 10.)), from + pixels(&typing, cx, (558., 30.))];
+    typing.mouse_down(cx, from, 1, Modifiers::default());
+    for at in through {
+        typing.move_held(cx, at, Modifiers::shift());
+    }
+    assert!(upright_guide_at(&typing, cx, 960.), "{:?}", guides(&typing, cx));
+    assert!(!any_level_guide(&typing, cx), "nothing across: it doesn't go up or down");
+    typing.mouse_up(cx, through[1], 1, Modifiers::shift());
+    assert_eq!(typing.source(cx), talk.replacen("x=\"300\" y=\"705\"", "x=\"860\" y=\"705\"", 1), "across only, onto the middle");
+}
+
+#[gpui_kit::test]
+fn a_line_across_the_way_shift_holds_still_gives_no_snap(cx: &mut TestAppContext) {
+    let talk = five_below();
+    // Without Shift, a drag straight across snaps its top up to the ellipse's.
+    let typing = open(cx, &talk);
+    let from = middle_of(&typing, cx, RECT);
+    let to = from + pixels(&typing, cx, (200., 0.));
+    typing.mouse_down(cx, from, 1, Modifiers::default());
+    typing.move_held(cx, from + pixels(&typing, cx, (100., 0.)), Modifiers::default());
+    typing.move_held(cx, to, Modifiers::default());
+    assert!(level_guide_at(&typing, cx, 700.), "{:?}", guides(&typing, cx));
+    typing.mouse_up(cx, to, 1, Modifiers::default());
+    assert_eq!(typing.source(cx), talk.replacen("x=\"300\" y=\"705\"", "x=\"500\" y=\"700\"", 1));
+    // With Shift, going across, the top stays where it is, and no line across shows.
+    let typing = open(cx, &talk);
+    let to = from + pixels(&typing, cx, (200., 3.));
+    typing.mouse_down(cx, from, 1, Modifiers::default());
+    typing.move_held(cx, from + pixels(&typing, cx, (100., 1.)), Modifiers::shift());
+    typing.move_held(cx, to, Modifiers::shift());
+    assert_eq!(guides(&typing, cx), Vec::new());
+    typing.mouse_up(cx, to, 1, Modifiers::shift());
+    assert_eq!(typing.source(cx), talk.replacen("x=\"300\" y=\"705\"", "x=\"500\" y=\"705\"", 1));
+}
+
+#[gpui_kit::test]
+fn a_snap_never_takes_a_thing_further_off_the_slide_than_it_may_go(cx: &mut TestAppContext) {
+    // A rectangle 200 tall, and a thin one whose top is at 1068: a thing dragged down as far as
+    // it goes keeps 16 of itself on, its top at 1064, 4 short of that line.
+    let talk = "---\ntitle: T\n---\n\n# Snap\n\n\
+<Shape kind=\"rect\" fill=\"#2563eb\" x=\"300\" y=\"500\" w=\"200\" h=\"200\" />\n\n\
+<Shape kind=\"ellipse\" fill=\"#2563eb\" x=\"1300\" y=\"1068\" w=\"200\" h=\"10\" />\n";
+    let typing = open(cx, talk);
+    let from = middle_of(&typing, cx, RECT);
+    let to = point(from.x, px(790.));
+    typing.mouse_down(cx, from, 1, Modifiers::default());
+    typing.move_held(cx, from + point(px(0.), px(100.)), Modifiers::default());
+    typing.move_held(cx, to, Modifiers::default());
+    assert!(!any_level_guide(&typing, cx), "held back, it isn't on the line: {:?}", guides(&typing, cx));
+    typing.mouse_up(cx, to, 1, Modifiers::default());
+    assert_eq!(typing.source(cx), talk.replacen("y=\"500\"", "y=\"1064\"", 1));
+}
+
+#[gpui_kit::test]
+fn a_side_snapped_too_near_the_other_stops_at_the_least_a_side_can_be(cx: &mut TestAppContext) {
+    // Another shape's left at 305, 5 past the rectangle's left, at 300.
+    let talk = "---\ntitle: T\n---\n\n# Snap\n\n\
+<Shape kind=\"rect\" fill=\"#2563eb\" x=\"300\" y=\"500\" w=\"200\" h=\"100\" />\n\n\
+<Shape kind=\"ellipse\" fill=\"#2563eb\" x=\"305\" y=\"850\" w=\"200\" h=\"100\" />\n";
+    let typing = open(cx, talk);
+    click_thing(&typing, cx, RECT, Modifiers::default());
+    let from = handle_at(&typing, cx, Handle::Right);
+    let to = from + pixels(&typing, cx, (-193., 0.));
+    typing.mouse_down(cx, from, 1, Modifiers::default());
+    typing.move_held(cx, from + pixels(&typing, cx, (-100., 0.)), Modifiers::default());
+    typing.move_held(cx, to, Modifiers::default());
+    assert_eq!(guides(&typing, cx), Vec::new(), "held at the least, it isn't on the line");
+    typing.mouse_up(cx, to, 1, Modifiers::default());
+    assert_eq!(attr(&typing, cx, RECT, "w"), Some(8.));
+    assert_eq!(attr(&typing, cx, RECT, "x"), Some(300.));
+}
+
+#[gpui_kit::test]
+fn a_resize_snap_leaves_the_corner_across_where_it_was(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    click_thing(&typing, cx, RECT, Modifiers::default());
+    // The top left corner, its left to 3 short of the heading's left, at 100.
+    let from = handle_at(&typing, cx, Handle::TopLeft);
+    let to = from + pixels(&typing, cx, (-197., -45.));
+    typing.mouse_down(cx, from, 1, Modifiers::default());
+    typing.move_held(cx, from + pixels(&typing, cx, (-100., -20.)), Modifiers::default());
+    typing.move_held(cx, to, Modifiers::default());
+    assert!(upright_guide_at(&typing, cx, 100.), "{:?}", guides(&typing, cx));
+    typing.mouse_up(cx, to, 1, Modifiers::default());
+    let [x, y, w, h] = ["x", "y", "w", "h"].map(|name| attr(&typing, cx, RECT, name).expect(name));
+    assert_eq!((x, w), (100., 400.), "the left on the line");
+    assert_eq!((x + w, y + h), (500., 800.), "the bottom right corner stays");
+    assert!(y < 700., "it grew up too: {y}");
+}
+
+#[gpui_kit::test]
+fn a_thing_of_an_odd_size_centred_is_written_to_a_whole_unit(cx: &mut TestAppContext) {
+    // 101 wide: centred, its left is at 909.5.
+    let talk = TALK.replacen("w=\"200\" h=\"100\"", "w=\"101\" h=\"100\"", 1);
+    let typing = open(cx, &talk);
+    let from = middle_of(&typing, cx, RECT);
+    let to = from + pixels(&typing, cx, (607., 0.));
+    typing.mouse_down(cx, from, 1, Modifiers::default());
+    typing.move_held(cx, from + pixels(&typing, cx, (300., 0.)), Modifiers::default());
+    typing.move_held(cx, to, Modifiers::default());
+    let shown = thing(&typing, cx, RECT).rect.x;
+    assert!((shown - 909.5).abs() < 0.01, "the slide shows it centred: {shown}");
+    typing.mouse_up(cx, to, 1, Modifiers::default());
+    let written_x = attr(&typing, cx, RECT, "x").expect("x");
+    assert_eq!(written_x, shown.round(), "written to a whole unit");
+}

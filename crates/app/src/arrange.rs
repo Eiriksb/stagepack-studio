@@ -28,6 +28,14 @@ pub fn bounds(placed: &Placed) -> Rect {
     Rect { x: cx - width / 2., y: cy - height / 2., w: width, h: height }
 }
 
+/// The upright box that holds all of `things`, each as it covers the slide turned, if there are
+/// any.
+pub fn holding(things: impl IntoIterator<Item = Placed>) -> Option<Rect> {
+    let edges = things.into_iter().map(|placed| bounds(&placed)).map(|rect| (rect.x, rect.y, rect.x + rect.w, rect.y + rect.h));
+    let (left, top, right, bottom) = edges.reduce(|(l0, t0, r0, b0), (l1, t1, r1, b1)| (l0.min(l1), t0.min(t1), r0.max(r1), b0.max(b1)))?;
+    Some(Rect { x: left, y: top, w: right - left, h: bottom - top })
+}
+
 /// `rect` moved, if it has to be, so that at least [`KEPT_ON`] units of it are on the slide
 /// each way, or all of it where it's smaller than that, and held within where the engine can
 /// place a thing.

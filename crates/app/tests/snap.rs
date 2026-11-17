@@ -37,9 +37,14 @@ fn a_whole_rect() -> impl Strategy<Value = Rect> {
     (-20i32..200, -20i32..120, 1i32..80, 1i32..60).prop_map(|(x, y, w, h)| Rect { x: x as f32 * 10., y: y as f32 * 10., w: w as f32 * 10., h: h as f32 * 10. })
 }
 
+/// No wider or no taller than nothing, as a line drawn across.
+fn a_thin_rect() -> impl Strategy<Value = Rect> {
+    (a_whole_rect(), any::<bool>()).prop_map(|(rect, flat)| if flat { Rect { h: 0., ..rect } } else { Rect { w: 0., ..rect } })
+}
+
 fn some_rects() -> impl Strategy<Value = (Rect, Vec<Rect>, f32)> {
-    let rect = prop_oneof![a_rect(), a_whole_rect()];
-    (rect.clone(), prop::collection::vec(rect, 0..8), 0f32..40.)
+    let rect = prop_oneof![4 => a_rect(), 4 => a_whole_rect(), 1 => a_thin_rect()];
+    (rect.clone(), prop::collection::vec(rect, 0..8), prop_oneof![9 => 0f32..40., 1 => Just(0.)])
 }
 
 proptest! {
@@ -170,4 +175,87 @@ fn centres_line_up() {
     assert_eq!((snapped.dx, snapped.dy), (2., 3.));
     assert!(snapped.guides.contains(&Guide { vertical: true, at: 250., from: 700., to: 800. }), "{:?}", snapped.guides);
     assert!(snapped.guides.contains(&Guide { vertical: false, at: 750., from: 100., to: 400. }), "{:?}", snapped.guides);
+}
+
+/// Numbers that aren't, endless ones, the largest there is, and less than nothing.
+const HOSTILE: [f32; 6] = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX, f32::MIN, -5.];
+
+#[test]
+fn a_box_or_a_reach_that_makes_no_sense_snaps_to_nothing() {
+    let fine = Rect { x: 855., y: 103., w: 200., h: 100. };
+    let others = [Rect { x: 300., y: 300., w: 200., h: 100. }];
+    for bad in HOSTILE {
+        // A reach that isn't a number, is endless or is less than nothing.
+        if !(bad.is_finite() && bad >= 0.) || bad == f32::MAX {
+            let within = if bad == f32::MAX { f32::INFINITY } else { bad };
+            assert_eq!(snap_move(fine, &others, within), Snapped::default(), "within {within}");
+            assert_eq!(snap_edge(957., true, &others, within), None, "within {within}");
+        }
+        // A box with any of its numbers so.
+        for at in 0..4 {
+            let mut numbers = [fine.x, fine.y, fine.w, fine.h];
+            numbers[at] = bad;
+            let [x, y, w, h] = numbers;
+            let moving = Rect { x, y, w, h };
+            if bad == -5. && at < 2 {
+                // Left of the slide, or above it, is a place like another.
+                continue;
+            }
+            let snapped = snap_move(moving, &others, 6.);
+            if bad.is_finite() && !(bad < 0. && at >= 2) {
+                // As big or as far out as there is: the way it's so never snaps, its lines being
+                // endless or too coarse to meet, and the other way snaps as ever.
+                let across = at % 2 == 0;
+                assert_eq!(if across { snapped.dx } else { snapped.dy }, 0., "{moving:?}");
+                assert!(snapped.guides.iter().all(|guide| guide.vertical != across && guide.at.is_finite()), "{moving:?}: {snapped:?}");
+                assert_eq!(snapped.dx, if across { 0. } else { 5. }, "{moving:?}");
+            } else {
+                // Not a number, endless, or less than nothing wide or tall.
+                assert_eq!(snapped, Snapped::default(), "{moving:?}");
+            }
+            // Among the others, it's passed over, and the slide is still there.
+            let mut numbers = [300., 300., 200., 100.];
+            numbers[at] = bad;
+            let [x, y, w, h] = numbers;
+            let moving = Rect { x, y, w, h };
+            let snapped = snap_move(fine, &[moving], 6.);
+            assert_eq!((snapped.dx, snapped.dy), (5., 0.), "{moving:?} among the others");
+            assert!(snapped.guides.iter().all(|guide| guide.at.is_finite() && guide.from.is_finite() && guide.to.is_finite()), "{snapped:?}");
+            assert_eq!(snap_edge(957., true, &[moving], 6.).map(|(shift, _)| shift), Some(3.), "{moving:?} among the others");
+        }
+        if bad != -5. {
+            assert_eq!(snap_edge(bad, true, &others, 6.), None, "an edge at {bad}");
+        }
+    }
+    // An endless reach meeting an endless line still takes the nearest line there is.
+    let endless = Rect { x: f32::MAX, y: 0., w: f32::MAX, h: 10. };
+    assert_eq!(snap_move(fine, &[endless], 6.).dx, 5.);
+}
+
+#[test]
+fn a_box_with_no_width_snaps_by_its_one_line() {
+    let line = Rect { x: 957., y: 103., w: 0., h: 100. };
+    let snapped = snap_move(line, &[], 6.);
+    assert_eq!((snapped.dx, snapped.dy), (3., 0.));
+    assert_eq!(snapped.guides, vec![Guide { vertical: true, at: 960., from: 0., to: SLIDE_HEIGHT }]);
+    // And one is a line to snap to.
+    let moving = Rect { x: 300., y: 703., w: 100., h: 50. };
+    let snapped = snap_move(moving, &[Rect { x: 1200., y: 700., w: 300., h: 0. }], 6.);
+    assert_eq!((snapped.dx, snapped.dy), (0., -3.));
+}
+
+#[test]
+fn of_two_lines_as_near_the_first_wins() {
+    // Its left 5 short of the slide's middle and 5 past another's right: the slide's first.
+    let moving = Rect { x: 955., y: 103., w: 30., h: 30. };
+    let past = Rect { x: 750., y: 600., w: 200., h: 100. };
+    assert_eq!(snap_move(moving, &[past], 6.).dx, 5.);
+    assert_eq!(snap_edge(955., true, &[past], 6.).map(|(shift, _)| shift), Some(5.));
+    // Of two others, 4 one way and 4 the other, the first given wins, either way round.
+    let moving = Rect { x: 304., y: 103., w: 30., h: 30. };
+    let (before, after) = (Rect { x: 200., y: 600., w: 100., h: 10. }, Rect { x: 308., y: 800., w: 200., h: 10. });
+    assert_eq!(snap_move(moving, &[before, after], 6.).dx, -4.);
+    assert_eq!(snap_move(moving, &[after, before], 6.).dx, 4.);
+    assert_eq!(snap_edge(304., true, &[before, after], 6.).map(|(shift, _)| shift), Some(-4.));
+    assert_eq!(snap_edge(304., true, &[after, before], 6.).map(|(shift, _)| shift), Some(4.));
 }

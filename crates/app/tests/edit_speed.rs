@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use slides_engine::{Fonts, Rect};
 use slides_format::{FlowPlace, Pos, text_flows};
-use stagepack_studio::arrange::{Placed, bounds};
+use stagepack_studio::arrange::{Placed, bounds, holding, moved};
 use stagepack_studio::document::{Document, Thing};
 use stagepack_studio::snap::snap_move;
 
@@ -218,12 +218,12 @@ fn sixty_things() -> String {
     talk
 }
 
-/// Every thing on a slide of sixty dragged: each frame snaps the box holding them all to sixty
-/// others, shows them all at their new place, and the slide's layers and its text's places are
-/// worked out again, as the window does before it draws.
-#[test]
-#[ignore = "timing; run in release"]
-fn a_frame_of_a_drag_on_a_slide_of_sixty_things_is_quick() {
+/// Every thing on a slide of sixty dragged, by `by` at each of 200 frames: each frame snaps the
+/// box holding them all to `others`, made from where the sixty start, shows them all at their
+/// new place, and the slide's layers and its text's places are worked out again, as the window
+/// does before it draws. Gives the median and the slowest frame, how many frames snapped, and
+/// how many showed the same place as the frame before.
+fn drag_frames(others: impl Fn(&[(Thing, Placed)]) -> Vec<Rect>, by: impl Fn(usize) -> (f32, f32)) -> (Duration, Duration, usize, usize) {
     let talk = sixty_things();
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("slides.md"), &talk).unwrap();
@@ -236,40 +236,66 @@ fn a_frame_of_a_drag_on_a_slide_of_sixty_things_is_quick() {
     // The window's scale: a slide 1280 pixels wide.
     let scale = 1280. / 1920.;
     doc.editor_layers(scale);
-    // What's dragged snaps to the things it isn't: here, sixty more, as many lines as the sixty
-    // have. They're out of reach, as every line is looked at all the same: frames held on one
-    // line would show the same place, which isn't shown again, and time nothing.
-    let others: Vec<Rect> = starts.iter().map(|(_, placed)| Rect { x: placed.rect.x + 5000., y: placed.rect.y + 5000., ..bounds(placed) }).collect();
+    let others = others(&starts);
     let within = 6. / scale;
-    let mut times = Vec::new();
+    let (mut times, mut snapped_frames, mut held, mut last) = (Vec::new(), 0, 0, None);
     for frame in 1..=200 {
-        let by = frame as f32 * 1.5;
+        let (dx, dy) = by(frame);
         let start = Instant::now();
-        let covers: Vec<Rect> = starts.iter().map(|(_, placed)| bounds(&Placed { rect: Rect { x: placed.rect.x + by, y: placed.rect.y + by / 2., ..placed.rect }, rotate: placed.rotate })).collect();
-        let left = covers.iter().map(|rect| rect.x).fold(f32::INFINITY, f32::min);
-        let top = covers.iter().map(|rect| rect.y).fold(f32::INFINITY, f32::min);
-        let right = covers.iter().map(|rect| rect.x + rect.w).fold(f32::NEG_INFINITY, f32::max);
-        let bottom = covers.iter().map(|rect| rect.y + rect.h).fold(f32::NEG_INFINITY, f32::max);
-        let snapped = snap_move(Rect { x: left, y: top, w: right - left, h: bottom - top }, &others, within);
-        let places: Vec<(Thing, Placed)> = starts
-            .iter()
-            .map(|(thing, placed)| {
-                let rect = Rect { x: placed.rect.x + by + snapped.dx, y: placed.rect.y + by / 2. + snapped.dy, ..placed.rect };
-                (thing.clone(), Placed { rect, rotate: placed.rotate })
-            })
-            .collect();
+        let held_by = holding(starts.iter().map(|(_, placed)| moved(placed, (dx, dy)))).expect("sixty");
+        let snapped = snap_move(held_by, &others, within);
+        let places: Vec<(Thing, Placed)> = starts.iter().map(|(thing, placed)| (thing.clone(), moved(placed, (dx + snapped.dx, dy + snapped.dy)))).collect();
         doc.preview_places(&places);
         let layers = doc.editor_layers(scale);
         let layout = doc.text_layout(slide);
         times.push(start.elapsed());
         assert!(layers.len() > 60, "frame {frame}: the heading and the sixty");
         assert_eq!(layout.elements().len(), 60);
+        snapped_frames += usize::from(!snapped.guides.is_empty());
+        held += usize::from(last.as_ref() == Some(&places));
+        last = Some(places);
     }
     doc.drop_preview();
     assert_eq!(doc.source(), talk, "nothing written");
     times.sort();
-    let median = times[times.len() / 2];
-    println!("median drag frame of sixty things on a {SLIDES}-slide talk: {median:?} (slowest {:?})", times.last().unwrap());
+    (times[times.len() / 2], *times.last().unwrap(), snapped_frames, held)
+}
+
+/// Where a drag of sixty has them at `frame`: each frame at another place, so that each is
+/// shown afresh, as a place shown already isn't.
+fn here_and_there(frame: usize) -> (f32, f32) {
+    ((frame as f32 * 7.3) % 300., (frame as f32 * 3.1) % 150.)
+}
+
+/// Dragging sixty things, snapping to sixty others out of reach, so only now and then to the
+/// slide: every line is looked at all the same.
+#[test]
+#[ignore = "timing; run in release"]
+fn a_frame_of_a_drag_on_a_slide_of_sixty_things_is_quick() {
+    let away = |starts: &[(Thing, Placed)]| starts.iter().map(|(_, placed)| Rect { x: placed.rect.x + 5000., y: placed.rect.y + 5000., ..bounds(placed) }).collect();
+    let (median, slowest, snapped, held) = drag_frames(away, here_and_there);
+    println!("median drag frame of sixty things on a {SLIDES}-slide talk: {median:?} (slowest {slowest:?}), {snapped} of 200 snapped, {held} held");
+    assert!(snapped <= 100 && held <= 10, "{snapped} snapped, {held} held");
+    assert!(median < MOST_FOR_A_DRAG_FRAME, "a drag frame took {median:?}");
+}
+
+/// Dragging sixty things, snapping to sixty others scattered over the slide, in reach of most
+/// frames, each frame at another place, so that a snap and its guides are worked out each time.
+#[test]
+#[ignore = "timing; run in release"]
+fn a_frame_of_a_snapping_drag_on_a_slide_of_sixty_things_is_quick() {
+    let scattered = |_: &[(Thing, Placed)]| {
+        let mut seed = 12345u32;
+        let mut next = move |most: f32| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (seed >> 8) as f32 / (1u32 << 24) as f32 * most
+        };
+        (0..60).map(|_| Rect { x: next(1800.), y: next(1000.), w: 20. + next(200.), h: 20. + next(150.) }).collect()
+    };
+    let (median, slowest, snapped, held) = drag_frames(scattered, here_and_there);
+    println!("median snapping drag frame of sixty things on a {SLIDES}-slide talk: {median:?} (slowest {slowest:?}), {snapped} of 200 snapped, {held} held");
+    assert!(snapped >= 150, "most frames snap: {snapped}");
+    assert!(held <= 10, "most frames show a place of their own: {held} held");
     assert!(median < MOST_FOR_A_DRAG_FRAME, "a drag frame took {median:?}");
 }
 

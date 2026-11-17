@@ -46,18 +46,24 @@ fn targets(others: &[Rect]) -> impl Iterator<Item = &Rect> + '_ {
 }
 
 /// The smallest shift, at most `within`, that puts one of `moving`'s lines on a line of one of
-/// `others` or of the slide, upright lines if `vertical`: the first of several as near.
+/// `others` or of the slide, upright lines if `vertical`, and that really puts it there. Of
+/// several as near, the first wins: the slide's before the others', in their order, and each
+/// box's start, middle and end in that order, met by the moving start, middle and end in turn;
+/// a shift either way as near is no different.
+/// A `within` that isn't a number, or is less than none or endless, snaps to nothing.
 fn nearest(moving: &[f32], vertical: bool, others: &[Rect], within: f32) -> Option<f32> {
-    if within.is_nan() || within < 0. || moving.iter().any(|line| !line.is_finite()) {
+    if !within.is_finite() || within < 0. || moving.iter().any(|line| !line.is_finite()) {
         return None;
     }
     let mut best: Option<f32> = None;
     for target in targets(others) {
         let ((start, length), _) = along(target, vertical);
-        for line in lines(start, length) {
+        for line in lines(start, length).into_iter().filter(|line| line.is_finite()) {
             for &from in moving {
                 let shift = line - from;
-                if shift.abs() <= within && best.is_none_or(|best| shift.abs() < best.abs()) {
+                // Far out, where the numbers are too coarse, a shift can miss its line.
+                let lands = (from + shift - line).abs() <= MET;
+                if lands && shift.abs() <= within && best.is_none_or(|best| shift.abs() < best.abs()) {
                     best = Some(shift);
                 }
             }
@@ -73,7 +79,7 @@ fn guides_met(moving: &[f32], vertical: bool, beside: Option<(f32, f32)>, others
     let mut guides: Vec<Guide> = Vec::new();
     for target in targets(others) {
         let ((start, length), (across, size)) = along(target, vertical);
-        for line in lines(start, length) {
+        for line in lines(start, length).into_iter().filter(|line| line.is_finite()) {
             if !moving.iter().any(|&on| (on - line).abs() <= MET) {
                 continue;
             }
@@ -93,13 +99,21 @@ fn guides_met(moving: &[f32], vertical: bool, beside: Option<(f32, f32)>, others
 /// The smallest shift, at most `within` each way, that puts `moving`'s left, middle or right on
 /// the slide's left, middle or right, or on another of `others`' left, middle or right, and the
 /// same for top, middle and bottom: each way decided on its own. A guide is given for each line
-/// met, running the length of both boxes. Nothing within reach gives no shift and no guide.
+/// met, running the length of both boxes. Nothing within reach gives no shift and no guide, and
+/// so does a box that isn't a number, endless, or less than nothing wide or tall.
 pub fn snap_move(moving: Rect, others: &[Rect], within: f32) -> Snapped {
     if !usable(&moving) {
         return Snapped::default();
     }
-    let across = nearest(&lines(moving.x, moving.w), true, others, within);
-    let down = nearest(&lines(moving.y, moving.h), false, others, within);
+    let mut across = nearest(&lines(moving.x, moving.w), true, others, within);
+    let mut down = nearest(&lines(moving.y, moving.h), false, others, within);
+    // A way whose shifted box meets no line, as can happen far out, doesn't snap, as an edge
+    // doesn't.
+    let meets = |shift: Option<f32>, start: f32, length: f32, vertical: bool| {
+        shift.filter(|shift| !guides_met(&lines(start + shift, length), vertical, None, others).is_empty())
+    };
+    across = meets(across, moving.x, moving.w, true);
+    down = meets(down, moving.y, moving.h, false);
     let (dx, dy) = (across.unwrap_or(0.), down.unwrap_or(0.));
     let now = Rect { x: moving.x + dx, y: moving.y + dy, ..moving };
     let mut guides = Vec::new();
@@ -120,4 +134,15 @@ pub fn snap_edge(edge: f32, vertical: bool, others: &[Rect], within: f32) -> Opt
     let shift = nearest(&[edge], vertical, others, within)?;
     let guide = guides_met(&[edge + shift], vertical, None, others).into_iter().next()?;
     Some((shift, guide))
+}
+
+/// A guide for each line of the slide and of `others` that one of `moving`'s lines is on, as
+/// [`snap_move`] gives them, without snapping it: what a box shown where it is meets.
+pub fn guides_on(moving: Rect, others: &[Rect]) -> Vec<Guide> {
+    if !usable(&moving) {
+        return Vec::new();
+    }
+    let mut guides = guides_met(&lines(moving.x, moving.w), true, Some((moving.y, moving.h)), others);
+    guides.extend(guides_met(&lines(moving.y, moving.h), false, Some((moving.x, moving.w)), others));
+    guides
 }
