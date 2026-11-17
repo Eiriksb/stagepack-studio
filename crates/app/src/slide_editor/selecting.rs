@@ -107,8 +107,19 @@ impl SlideEditor {
         if self.drag.is_some() {
             // A drag ends first, writing nothing, and what was dragged stays selected.
             self.end_drag(cx);
-        } else if self.selection_here(cx).is_some() {
-            self.deselect(cx);
+        } else if let Some(selection) = self.selection_here(cx) {
+            // From what a box holds alone, back to the box.
+            let held = self.document.clone().and_then(|document| document.update(cx, |document, _| document.holding_box_selected()));
+            match (held, &self.document) {
+                (Some((Thing::Block(held), _)), Some(document)) => {
+                    document.update(cx, |document, cx| {
+                        document.select(selection.slide, held);
+                        cx.notify();
+                    });
+                    self.tell_selection(cx);
+                }
+                _ => self.deselect(cx),
+            }
         } else {
             cx.propagate();
         }

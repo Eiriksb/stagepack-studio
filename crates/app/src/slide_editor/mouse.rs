@@ -178,8 +178,13 @@ impl SlideEditor {
             Hit::Element(element) => {
                 cx.stop_propagation();
                 let reason = self.cell_reason(slide, &element.source, point, cx);
-                let source = self.picked(slide, element.source, cx);
+                let source = self.picked(slide, element.source.clone(), cx);
+                // On what the box selected alone holds: that, once let go of without a drag.
+                let inner = (source != element.source && self.is_selected(slide, &source, cx)).then_some(element.source);
                 self.press_thing(slide, Thing::Block(source), false, event.position, window, cx);
+                if let Some(inner) = inner {
+                    self.pressed = Some((slide, Thing::Block(inner)));
+                }
                 if let Some(reason) = reason {
                     cx.emit(EditorEvent::Said(reason.into()));
                 }
@@ -267,9 +272,13 @@ impl SlideEditor {
         Some((slide, Thing::Block(source)))
     }
 
-    /// What a press on the thing at `source` of slide `slide` picks: the thing, or the box with a
-    /// place of its own that holds it and nothing else, as a table moved out of the text is held.
+    /// What a press on the thing at `source` of slide `slide` picks: the box with a place of its
+    /// own that holds it and nothing else, as a table moved out of the text is held, unless the
+    /// thing is selected already; or else the thing.
     fn picked(&self, slide: usize, source: Range<usize>, cx: &App) -> Range<usize> {
+        if self.is_selected(slide, &source, cx) {
+            return source;
+        }
         let document = self.document.as_ref().map(|document| document.read(cx));
         document.and_then(|document| selection::box_holding(document.talk(), slide, &source)).unwrap_or(source)
     }

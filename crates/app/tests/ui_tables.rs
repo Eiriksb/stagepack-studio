@@ -555,11 +555,16 @@ fn a_table_in_a_box_is_typed_in_and_its_tools_work(cx: &mut TestAppContext) {
         assert_eq!(typing.source(cx), boxed, "{tool}: one step");
     }
     // Picked by its border, it's the box that's selected, and the table has its tools still.
+    // Escape in a cell selects the table, and again the box it's in, then nothing.
+    let start = boxed.find("<Box").unwrap();
     typing.press(cx, "escape");
+    assert_eq!(selected(&typing, cx), Some(boxed.find("| a").unwrap()..boxed.find("\n\n</Box>").unwrap()));
     typing.press(cx, "escape");
+    assert_eq!(selected(&typing, cx), Some(start..boxed.len() - 1));
+    typing.press(cx, "escape");
+    assert_eq!(selected(&typing, cx), None);
     let border = border_point(&typing, cx);
     typing.click(cx, border);
-    let start = boxed.find("<Box").unwrap();
     assert_eq!(selected(&typing, cx), Some(start..boxed.len() - 1));
     assert_eq!(label_of(&typing, cx, INSPECTOR_HEADING_ID).as_deref(), Some("Table in a box"));
     assert!(shown_in(&typing, cx, INSPECTOR_ID, TABLE_TOOLS_ID));

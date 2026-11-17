@@ -5,7 +5,7 @@
 
 use std::ops::Range;
 
-use slides_format::{Block, Change, Talk, TextFlow};
+use slides_format::{Block, Change, Tag, Talk, TextFlow};
 
 /// The thing selected: slide `slide`'s block or tag whose whole source is `source`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -173,11 +173,16 @@ pub(crate) fn block_at<'a>(blocks: &'a [Block], range: &Range<usize>) -> Option<
 /// what a press on that block picks, as what moves.
 pub(crate) fn box_holding(talk: &Talk, slide: usize, range: &Range<usize>) -> Option<Range<usize>> {
     talk.slides.get(slide)?.blocks.iter().find_map(|block| match block {
-        Block::Tag(tag) if tag.name == "Box" && slides_engine::is_positioned(tag) && matches!(tag.children.as_slice(), [only] if only.range() == range) => {
+        Block::Tag(tag) if is_placed_box(tag) && matches!(tag.children.as_slice(), [only] if only.range() == range) => {
             Some(tag.range.clone())
         }
         _ => None,
     })
+}
+
+/// Whether `tag` is a box with a place of its own.
+pub(crate) fn is_placed_box(tag: &Tag) -> bool {
+    tag.name == "Box" && slides_engine::is_positioned(tag)
 }
 
 /// Whether paragraph `para` of flow `flow` of `flows`, a slide's, is written inside `range`.
@@ -201,8 +206,8 @@ pub fn name_of(talk: &Talk, slide: usize, range: &Range<usize>) -> Option<String
         Block::Picture { .. } => "Picture".to_string(),
         Block::Table { .. } => "Table".to_string(),
         // A table or a picture moved out of the text, in the box that places it.
-        Block::Tag(tag) if tag.name == "Box" && matches!(tag.children.as_slice(), [Block::Table { .. }]) => "Table in a box".to_string(),
-        Block::Tag(tag) if tag.name == "Box" && matches!(tag.children.as_slice(), [Block::Picture { .. }]) => "Picture in a box".to_string(),
+        Block::Tag(tag) if is_placed_box(tag) && matches!(tag.children.as_slice(), [Block::Table { .. }]) => "Table in a box".to_string(),
+        Block::Tag(tag) if is_placed_box(tag) && matches!(tag.children.as_slice(), [Block::Picture { .. }]) => "Picture in a box".to_string(),
         Block::Tag(tag) => match tag.name.as_str() {
             "Picture" | "Shape" | "Icon" | "Table" | "Chart" => tag.name.clone(),
             // Text boxes, as the Insert tab and the format name them.

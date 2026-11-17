@@ -43,6 +43,10 @@ pub enum EditRefused {
     NeedsThree,
     /// A thing selected is written in the slide's text, with no place of its own.
     InTheText,
+    /// The thing dragged out of the text is inside a box with a place of its own, which moves it.
+    InAPlacedBox,
+    /// The thing dragged out of the text is part of something else on the slide, as a component.
+    PartOfWhatItSitsIn,
     /// A layout's area can't be put in front of or behind anything.
     AreaOrder,
     /// Several things are selected, and only one at a time is put in front or behind.
@@ -86,6 +90,8 @@ impl std::fmt::Display for EditRefused {
             EditRefused::AreaStays => AREA_STAYS,
             EditRefused::NeedsThree => "Select three or more things to space them out.",
             EditRefused::InTheText => DRAG_OUT_FIRST,
+            EditRefused::InAPlacedBox => "Drag the box it's in instead.",
+            EditRefused::PartOfWhatItSitsIn => "It's part of what it sits in, and moves with it.",
             EditRefused::AreaOrder => "A layout's area always sits behind the things on the slide.",
             EditRefused::OneToOrder => "Select one thing to bring it forward or send it back.",
             EditRefused::NothingToAnimate => "Select something on the slide first.",

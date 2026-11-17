@@ -218,8 +218,19 @@ impl Document {
         let Rect { x, y, w, h } = element.rect;
         let place = (x.round(), y.round(), w.round(), h.round());
         let liftable = guarded(|| lift(self.talk(), selection.slide, source, place)).ok().flatten().is_some();
+        // It keeps the size it's drawn at, however wide, as a table across the main text is: made
+        // narrower to fit where it's dropped, a table's columns would be laid out again.
         let placed = Placed { rect: element.rect, rotate: element.rotate };
-        Some(if liftable { Ok((Thing::Block(source.clone()), placed)) } else { Err(EditRefused::CouldNotBeMade) })
+        Some(if liftable { Ok((Thing::Block(source.clone()), placed)) } else { Err(why_not_lifted(self.talk(), selection.slide, source)) })
+    }
+
+    /// The box with a place of its own that holds the one thing selected and nothing else, and
+    /// where it is: what a drag of that thing moves.
+    pub fn holding_box_selected(&mut self) -> Option<(Thing, Placed)> {
+        let selection = self.selection.clone()?;
+        let held = selection::box_holding(self.talk(), selection.slide, selection.one_block()?)?;
+        let element = self.text_layout(selection.slide).element(&held).filter(|element| element.placed)?;
+        Some((Thing::Block(held), Placed { rect: element.rect, rotate: element.rotate }))
     }
 
     /// Gives the one thing selected, written in the slide's text, the place `to`, its position and
@@ -247,7 +258,7 @@ impl Document {
         let slide = selection.slide;
         let Rect { x, y, w, h } = to.rect;
         let place = (x.round(), y.round(), w.round(), h.round());
-        let change = built(self.talk(), |talk| lift(talk, slide, source, place))?.ok_or(EditRefused::CouldNotBeMade)?;
+        let change = built(self.talk(), |talk| lift(talk, slide, source, place))?.ok_or_else(|| why_not_lifted(self.talk(), slide, source))?;
         let depth = self.history.depth();
         let changed = self.make(MOVE_OUT, change, Holds::Slide(slide), slide, slide, None)?;
         if self.history.depth() > depth {
@@ -410,6 +421,23 @@ impl Document {
             self.history.select_mark_last(SelectMark { before: Some(selection), after });
         }
         Ok(changed)
+    }
+}
+
+/// Why the block at `source` on slide `slide` of `talk` can't be given a place of its own: in a
+/// box with a place, it's the box that's dragged; in anything else at the top of the slide, as a
+/// component, it goes with that.
+fn why_not_lifted(talk: &Talk, slide: usize, source: &Range<usize>) -> EditRefused {
+    let holder = talk.slides.get(slide).and_then(|written| {
+        written.blocks.iter().find_map(|block| match block {
+            Block::Tag(tag) if tag.range != *source && tag.range.start <= source.start && source.end <= tag.range.end => Some(tag),
+            _ => None,
+        })
+    });
+    match holder {
+        Some(tag) if is_positioned(tag) => EditRefused::InAPlacedBox,
+        Some(_) => EditRefused::PartOfWhatItSitsIn,
+        None => EditRefused::CouldNotBeMade,
     }
 }
 

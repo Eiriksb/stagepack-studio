@@ -40,7 +40,7 @@ impl Document {
                 // A table moved out of the text is selected by the box that places it.
                 let selected = self.selected.as_ref()?;
                 let table = match selection::block_at(&talk.slides.get(selected.slide)?.blocks, &selected.source)? {
-                    Block::Tag(tag) if tag.name == "Box" && matches!(tag.children.as_slice(), [Block::Table { .. }]) => tag.children[0].range().clone(),
+                    Block::Tag(tag) if selection::is_placed_box(tag) && matches!(tag.children.as_slice(), [Block::Table { .. }]) => tag.children[0].range().clone(),
                     _ => selected.source.clone(),
                 };
                 (selected.slide, table, None)

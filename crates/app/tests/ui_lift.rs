@@ -5,13 +5,17 @@ use std::ops::Range;
 
 #[path = "support/typing.rs"]
 mod typing;
+#[path = "support/components.rs"]
+mod components;
 
+use components::components_talk;
 use typing::*;
 
 use gpui_kit::{Bounds, Modifiers, Pixels, Point, SharedString, TestAppContext, point, px};
 use slides_engine::{Hit, Rect};
 use slides_format::{FlowPlace, number_text};
 use stagepack_studio::arrange::Handle;
+use stagepack_studio::inspector::field_id;
 use stagepack_studio::selection::Thing;
 use stagepack_studio::slide_editor::{LIFT_OUTLINE_ID, SNAP_GUIDE_ID, handle_id};
 use stagepack_studio::text_editing::FlowKey;
@@ -23,7 +27,8 @@ const SHAPE_TALK: &str = "---\ntitle: T\n---\n\n# Things\n\nSome words here\n\n<
 const PICTURE: &str = "![A photo](assets/photo.png)";
 const PICTURE_TALK: &str = "---\ntitle: T\n---\n\n# Things\n\nSome words here\n\n![A photo](assets/photo.png)\n\nMore words\n";
 const DRAG_OUT_FIRST: &str = "Drag it out of the text first.";
-const NOT_MADE: &str = "That change couldn't be made, so nothing was changed.";
+const IN_A_PLACED_BOX: &str = "Drag the box it's in instead.";
+const PART_OF_IT: &str = "It's part of what it sits in, and moves with it.";
 const MOVE_OUT: &str = "Move out of the text";
 /// Held while dragging where a test is about what a drag writes, not about snapping.
 const NO_SNAP: Modifiers = Modifiers { alt: true, shift: false, control: false, platform: false, function: false };
@@ -164,6 +169,10 @@ fn a_table_dragged_out_is_in_a_box_where_it_was_dropped(cx: &mut TestAppContext)
     let shown = typing.layout(cx).element(&last_box(&typing, cx)).expect("the box is drawn");
     assert!(shown.placed);
     assert_eq!((shown.rect.x, shown.rect.y), ((before.x + dx).round(), (before.y + dy).round()));
+    // The table in it is drawn at the size of the outline it was dragged as.
+    let table = table_rect(&typing, cx);
+    assert!((table.w - before.w.round()).abs() <= 0.5 && (table.h - before.h.round()).abs() <= 0.5, "{table:?} as {before:?}");
+    assert_eq!((table.x, table.y), (shown.rect.x, shown.rect.y));
 }
 
 #[gpui_kit::test]
@@ -285,6 +294,8 @@ fn a_hand_written_picture_is_lifted_in_a_box(cx: &mut TestAppContext) {
     let Rect { x, y, w, h } = picture.rect;
     assert_eq!(typing.source(cx), lifted(PICTURE_TALK, PICTURE, (x + dx, y + dy, w, h)));
     assert_eq!(typing.status(cx).as_deref(), Some("Picture in a box selected"));
+    let shown = thing(&typing, cx, PICTURE).rect;
+    assert!((shown.w - w.round()).abs() <= 0.5 && (shown.h - h.round()).abs() <= 0.5, "drawn at the outline's size: {shown:?}");
     undo(&typing, cx);
     assert_eq!(typing.source(cx), PICTURE_TALK);
 }
@@ -358,21 +369,243 @@ fn escape_leaves_it_in_the_text(cx: &mut TestAppContext) {
     assert_eq!(selection(&typing, cx), Some(vec![Thing::Block(table)]), "it stays selected");
 }
 
-#[gpui_kit::test]
-fn a_thing_inside_a_component_is_refused_in_words(cx: &mut TestAppContext) {
-    let talk = "---\ntitle: T\n---\n\n# Things\n\n<Box fill=\"#dbeafe\">\n\n<Icon name=\"star\" />\n\n</Box>\n\nMore words\n";
-    let typing = open(cx, talk);
-    let icon = thing(&typing, cx, "<Icon");
-    let from = middle(&typing, cx, &icon);
+/// Presses on `from`, drags some way and says what the slide says, before letting go there.
+fn drag_saying(typing: &Typing, cx: &mut TestAppContext, from: Point<Pixels>) -> Option<String> {
     typing.mouse_down(cx, from, 1, Modifiers::default());
-    assert_eq!(selection(&typing, cx), Some(vec![Thing::Block(icon.source.clone())]), "the icon is what's pressed on");
     typing.move_held(cx, from + point(px(20.), px(10.)), NO_SNAP);
     typing.move_held(cx, from + point(px(120.), px(80.)), NO_SNAP);
-    assert!(bounds_of(&typing, cx, LIFT_OUTLINE_ID).is_none(), "no outline");
-    assert_eq!(typing.status(cx).as_deref(), Some(NOT_MADE));
+    assert!(bounds_of(typing, cx, LIFT_OUTLINE_ID).is_none(), "no outline");
+    let said = typing.status(cx);
     typing.mouse_up(cx, from + point(px(120.), px(80.)), 1, NO_SNAP);
+    said
+}
+
+#[gpui_kit::test]
+fn a_thing_inside_a_component_is_refused_in_words(cx: &mut TestAppContext) {
+    // One of the talk's own components that draws what's written between its tags.
+    let talk = "---\ntitle: T\n---\n\n# Things\n\n<Callout title=\"Note\">\n\n<Icon name=\"star\" />\n\n</Callout>\n\nMore words\n";
+    let folder = components_talk(None);
+    std::fs::write(folder.path().join("slides.md"), talk).unwrap();
+    let typing = open_folder(cx, folder, None);
+    typing.with_window(cx, |window, _| window.activate_window());
+    typing.settle(cx);
+    let icon = thing(&typing, cx, "<Icon");
+    let from = middle(&typing, cx, &icon);
+    typing.click(cx, from);
+    assert_eq!(selection(&typing, cx), Some(vec![Thing::Block(icon.source.clone())]), "the icon is what's pressed on");
+    assert_eq!(drag_saying(&typing, cx, from).as_deref(), Some(PART_OF_IT));
     assert_eq!(typing.source(cx), talk);
     assert!(!can_undo(&typing, cx));
+    // So in a box with no place of its own.
+    let talk = "---\ntitle: T\n---\n\n# Things\n\n<Box fill=\"#dbeafe\">\n\n<Icon name=\"star\" />\n\n</Box>\n\nMore words\n";
+    let typing = open(cx, talk);
+    let from = middle_of(&typing, cx, "<Icon");
+    assert_eq!(drag_saying(&typing, cx, from).as_deref(), Some(PART_OF_IT));
+    assert_eq!(typing.source(cx), talk);
+    assert!(!can_undo(&typing, cx));
+}
+
+#[gpui_kit::test]
+fn a_table_in_a_placed_box_with_more_says_to_drag_the_box(cx: &mut TestAppContext) {
+    let talk = "---\ntitle: T\n---\n\n# Things\n\n<Box x=\"200\" y=\"500\" w=\"900\" h=\"400\">\n\nAbove\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n</Box>\n";
+    let typing = open(cx, talk);
+    let from = border_point(&typing, cx);
+    typing.click(cx, from);
+    assert_eq!(selection(&typing, cx), Some(vec![Thing::Block(table_source(&typing, cx))]));
+    assert_eq!(drag_saying(&typing, cx, from).as_deref(), Some(IN_A_PLACED_BOX));
+    assert_eq!(typing.source(cx), talk);
+    assert!(!can_undo(&typing, cx));
+}
+
+const ICON_BOX: &str = "---\ntitle: T\n---\n\n# Things\n\n<Box x=\"200\" y=\"500\" w=\"400\" h=\"300\">\n\n<Icon name=\"star\" size=\"96\" />\n\n</Box>\n";
+
+#[gpui_kit::test]
+fn a_second_press_picks_what_a_box_holds_and_escape_goes_back(cx: &mut TestAppContext) {
+    let typing = open(cx, ICON_BOX);
+    let boxed = thing(&typing, cx, "<Box").source;
+    let icon = thing(&typing, cx, "<Icon").source;
+    let at = middle_of(&typing, cx, "<Icon");
+    typing.click(cx, at);
+    assert_eq!(selection(&typing, cx), Some(vec![Thing::Block(boxed.clone())]), "the first press picks the box");
+    typing.click(cx, at);
+    assert_eq!(selection(&typing, cx), Some(vec![Thing::Block(icon.clone())]), "the next, what it holds");
+    assert_eq!(typing.status(cx).as_deref(), Some("Icon selected"));
+    // Its own form.
+    click_on(&typing, cx, SharedString::from(field_id("size")));
+    typing.press(cx, "ctrl-a");
+    typing.type_text(cx, "120");
+    typing.press(cx, "enter");
+    assert_eq!(typing.source(cx), ICON_BOX.replacen("size=\"96\"", "size=\"120\"", 1));
+    // A press on it again keeps it selected.
+    let source = typing.source(cx);
+    let icon = thing(&typing, cx, "<Icon").source;
+    typing.click(cx, at);
+    assert_eq!(selection(&typing, cx), Some(vec![Thing::Block(icon)]));
+    typing.press(cx, "escape");
+    assert_eq!(selection(&typing, cx), Some(vec![Thing::Block(thing(&typing, cx, "<Box").source)]), "Escape goes back to the box");
+    typing.press(cx, "escape");
+    assert_eq!(selection(&typing, cx), None);
+    assert_eq!(typing.source(cx), source);
+}
+
+#[gpui_kit::test]
+fn a_drag_of_what_a_box_holds_moves_the_box(cx: &mut TestAppContext) {
+    let typing = open(cx, ICON_BOX);
+    let at = middle_of(&typing, cx, "<Icon");
+    typing.click(cx, at);
+    typing.click(cx, at);
+    let icon = thing(&typing, cx, "<Icon").source;
+    assert_eq!(selection(&typing, cx), Some(vec![Thing::Block(icon)]));
+    let to = at + point(px(60.), px(30.));
+    drag_through(&typing, cx, at, &[at + point(px(20.), px(10.)), to], NO_SNAP);
+    let (dx, dy) = on_slide(&typing, cx, at, to);
+    let place = format!("<Box x=\"{}\" y=\"{}\"", whole(200. + dx), whole(500. + dy));
+    assert_eq!(typing.source(cx), ICON_BOX.replacen("<Box x=\"200\" y=\"500\"", &place, 1));
+    assert_eq!(undo_label(&typing, cx), Some("Move"));
+    assert_eq!(selection(&typing, cx), Some(vec![Thing::Block(thing(&typing, cx, "<Icon").source)]), "what it holds stays selected");
+    // From the box selected, a drag on what it holds moves the box and keeps the box selected.
+    let typing = open(cx, ICON_BOX);
+    typing.click(cx, at);
+    drag_through(&typing, cx, at, &[at + point(px(20.), px(10.)), to], NO_SNAP);
+    assert_eq!(typing.source(cx), ICON_BOX.replacen("<Box x=\"200\" y=\"500\"", &place, 1));
+    assert_eq!(selection(&typing, cx), Some(vec![Thing::Block(thing(&typing, cx, "<Box").source)]));
+}
+
+#[gpui_kit::test]
+fn tab_reaches_what_a_box_holds(cx: &mut TestAppContext) {
+    let typing = open(cx, ICON_BOX);
+    let icon = thing(&typing, cx, "<Icon").source;
+    let at = middle_of(&typing, cx, "<Icon");
+    typing.click(cx, at);
+    let reached = (0..4).any(|_| {
+        typing.press(cx, "tab");
+        selection(&typing, cx) == Some(vec![Thing::Block(icon.clone())])
+    });
+    assert!(reached);
+}
+
+#[gpui_kit::test]
+fn delete_takes_what_is_selected_of_a_box(cx: &mut TestAppContext) {
+    // What it holds alone.
+    let typing = open(cx, ICON_BOX);
+    let at = middle_of(&typing, cx, "<Icon");
+    typing.click(cx, at);
+    typing.click(cx, at);
+    typing.press(cx, "delete");
+    let source = typing.source(cx);
+    assert!(source.contains("<Box x=\"200\"") && !source.contains("<Icon"), "{source}");
+    undo(&typing, cx);
+    assert_eq!(typing.source(cx), ICON_BOX);
+    // The box, and what it holds with it.
+    let typing = open(cx, ICON_BOX);
+    typing.click(cx, at);
+    typing.press(cx, "delete");
+    let source = typing.source(cx);
+    assert!(!source.contains("<Box") && !source.contains("<Icon"), "{source}");
+}
+
+/// Readies a drag of `TALK`'s table out of the text, and moves it some way, button down.
+fn start_lift(typing: &Typing, cx: &mut TestAppContext) -> Point<Pixels> {
+    let from = border_point(typing, cx);
+    typing.mouse_down(cx, from, 1, Modifiers::default());
+    typing.move_held(cx, from + point(px(20.), px(10.)), NO_SNAP);
+    let to = from + point(px(120.), px(80.));
+    typing.move_held(cx, to, NO_SNAP);
+    assert!(bounds_of(typing, cx, LIFT_OUTLINE_ID).is_some(), "dragging");
+    to
+}
+
+/// That the drag left no outline, no step and the bytes `source`, once let go of at `to`.
+fn lift_left_nothing(typing: &Typing, cx: &mut TestAppContext, to: Point<Pixels>, source: &str, what: &str) {
+    assert!(bounds_of(typing, cx, LIFT_OUTLINE_ID).is_none(), "{what}: the outline goes at once");
+    typing.move_held(cx, to + point(px(30.), px(0.)), NO_SNAP);
+    typing.mouse_up(cx, to, 1, NO_SNAP);
+    assert!(bounds_of(typing, cx, LIFT_OUTLINE_ID).is_none(), "{what}");
+    assert_eq!(typing.source(cx), source, "{what}");
+    assert_ne!(undo_label(typing, cx), Some(MOVE_OUT), "{what}: no step");
+}
+
+#[gpui_kit::test]
+fn a_lift_ended_any_other_way_leaves_it_in_the_text(cx: &mut TestAppContext) {
+    // The keyboard going elsewhere.
+    let typing = open(cx, TALK);
+    let to = start_lift(&typing, cx);
+    let elsewhere = cx.update(|cx| cx.focus_handle());
+    typing.with_window(cx, |window, cx| elsewhere.focus(window, cx));
+    typing.settle(cx);
+    lift_left_nothing(&typing, cx, to, TALK, "focus");
+
+    // An edit arriving: the file changed outside.
+    let typing = open(cx, TALK);
+    let to = start_lift(&typing, cx);
+    let outside = TALK.replace("# Two", "# Two, changed");
+    typing.view.update(cx, |view, cx| view.reload_for_test(Some(outside.clone()), cx));
+    typing.settle(cx);
+    lift_left_nothing(&typing, cx, to, &outside, "an edit");
+
+    // What's selected changing.
+    let typing = open(cx, TALK);
+    let to = start_lift(&typing, cx);
+    typing.press(cx, "ctrl-a");
+    lift_left_nothing(&typing, cx, to, TALK, "a selection change");
+
+    // The button let go of where the window never heard.
+    let typing = open(cx, TALK);
+    let to = start_lift(&typing, cx);
+    typing.with_window(cx, |window, cx| {
+        use gpui_kit::InputEvent as _;
+        window.dispatch_event(gpui_kit::MouseMoveEvent { position: to, pressed_button: None, modifiers: Modifiers::default() }.to_platform_input(), cx);
+    });
+    typing.settle(cx);
+    lift_left_nothing(&typing, cx, to, TALK, "a lost release");
+}
+
+/// Drags the thing at `from` out of the text, and says whether it was lifted: then one undo gives
+/// `talk` back byte for byte. Otherwise nothing was written, and the slide said why in words.
+fn lifted_exactly_or_refused(typing: &Typing, cx: &mut TestAppContext, talk: &str, from: Point<Pixels>, what: &str) -> bool {
+    typing.mouse_down(cx, from, 1, Modifiers::default());
+    typing.move_held(cx, from + point(px(20.), px(10.)), NO_SNAP);
+    typing.move_held(cx, from + point(px(100.), px(60.)), NO_SNAP);
+    let said = typing.status(cx);
+    typing.mouse_up(cx, from + point(px(100.), px(60.)), 1, NO_SNAP);
+    if typing.source(cx) == talk {
+        assert!(!can_undo(typing, cx), "{what}");
+        let said = said.unwrap_or_default();
+        assert!(said.ends_with('.') && !said.ends_with("selected"), "{what}: said why: {said:?}");
+        return false;
+    }
+    assert_eq!(undo_label(typing, cx), Some(MOVE_OUT), "{what}");
+    undo(typing, cx);
+    assert_eq!(typing.source(cx), talk, "{what}: undo is exact");
+    true
+}
+
+#[gpui_kit::test]
+fn a_lift_is_exact_or_refused_on_odd_slides(cx: &mut TestAppContext) {
+    let with_notes = "---\ntitle: T\n---\n\n# Things\n\nSome words here\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\nMore words\n\n<Notes>\nSay this.\n</Notes>\n";
+    let typing = open(cx, with_notes);
+    let from = border_point(&typing, cx);
+    assert!(lifted_exactly_or_refused(&typing, cx, with_notes, from, "notes"), "with notes it's lifted");
+
+    let in_a_list = "---\ntitle: T\n---\n\n# Things\n\n- Item\n\n  | a | b |\n  | --- | --- |\n  | 1 | 2 |\n\n- Next\n";
+    let typing = open(cx, in_a_list);
+    let from = border_point(&typing, cx);
+    assert!(lifted_exactly_or_refused(&typing, cx, in_a_list, from, "a list"), "a list: lifted");
+
+    let only_a_table = "| a | b |\n| --- | --- |\n| 1 | 2 |\n";
+    let typing = open(cx, only_a_table);
+    let from = border_point(&typing, cx);
+    assert!(lifted_exactly_or_refused(&typing, cx, only_a_table, from, "only a table"), "only a table: lifted");
+
+    let only_a_picture = "![A photo](assets/photo.png)\n";
+    let typing = open_with_photo(cx, only_a_picture);
+    let from = middle_of(&typing, cx, PICTURE);
+    assert!(lifted_exactly_or_refused(&typing, cx, only_a_picture, from, "only a picture"), "only a picture: lifted");
+
+    let crlf = TALK.replace('\n', "\r\n");
+    let typing = open(cx, &crlf);
+    let from = border_point(&typing, cx);
+    assert!(lifted_exactly_or_refused(&typing, cx, &crlf, from, "crlf"), "with CRLF it's lifted");
 }
 
 #[gpui_kit::test]

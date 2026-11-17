@@ -175,11 +175,17 @@ impl SlideEditor {
         let (things, lifting, refused, version, pick) = document.update(cx, |document, _| {
             // One thing written in the text is lifted out of it; with others, nothing is moved.
             let (things, left_out) = document.movable_selected();
-            let (things, lifting, refused) = match (left_out, left_out.then(|| document.liftable_selected()).flatten()) {
-                (false, _) => (things, false, None),
-                (true, Some(Ok(one))) => (vec![one], true, None),
-                (true, Some(Err(why))) => (Vec::new(), false, Some(why)),
-                (true, None) => (Vec::new(), false, Some(EditRefused::InTheText)),
+            // What a box holds alone moves with the box.
+            let (things, lifting, refused) = if !left_out {
+                (things, false, None)
+            } else if let Some(held) = document.holding_box_selected() {
+                (vec![held], false, None)
+            } else {
+                match document.liftable_selected() {
+                    Some(Ok(one)) => (vec![one], true, None),
+                    Some(Err(why)) => (Vec::new(), false, Some(why)),
+                    None => (Vec::new(), false, Some(EditRefused::InTheText)),
+                }
             };
             (things, lifting, refused, document.text_version(), document.selection_pick())
         });
@@ -389,9 +395,10 @@ impl SlideEditor {
             }
         }
         let Some((places, guides)) = self.dragged_to(event.position, event.modifiers, cx) else {
-            // Nowhere to show it: no line is met either.
-            if let Some(drag) = self.drag.as_mut().filter(|drag| !drag.guides.is_empty()) {
+            // Nowhere to show it: no line is met either, nor an outline shown.
+            if let Some(drag) = self.drag.as_mut().filter(|drag| !drag.guides.is_empty() || drag.outline.is_some()) {
                 drag.guides.clear();
+                drag.outline = None;
                 cx.notify();
             }
             return;
