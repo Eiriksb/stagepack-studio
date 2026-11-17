@@ -802,6 +802,39 @@ fn typing_on_a_selected_picture_does_nothing(cx: &mut TestAppContext) {
     assert!(typing.editing(cx).is_none());
 }
 
+#[gpui_kit::test]
+fn blank_input_on_a_selected_shape_writes_nothing(cx: &mut TestAppContext) {
+    // Found in review: a space typed on a selected shape wrote an invisible body into it.
+    let typing = open(cx, TALK);
+    insert_shape(&typing, cx, "rect");
+    let shape = "<Shape kind=\"rect\" fill=\"#2563eb\" x=\"720\" y=\"380\" w=\"480\" h=\"320\" />";
+    for blank in [" ", "\u{a0}", "\u{200b}", "\t", "  "] {
+        typing.type_text(cx, blank);
+        assert_eq!(typing.source(cx), with_inserted(shape), "{blank:?} writes nothing");
+        assert_eq!(selected_text(&typing, cx).as_deref(), Some(shape), "{blank:?}: the shape stays selected");
+        assert_eq!(undo_label(&typing, cx), Some("Insert shape"), "{blank:?}: and no step is made");
+    }
+    // The first visible character starts the text, with nothing before it.
+    typing.type_text(cx, " Hi");
+    let typed = "<Shape kind=\"rect\" fill=\"#2563eb\" x=\"720\" y=\"380\" w=\"480\" h=\"320\">\n\nHi\n\n</Shape>";
+    assert_eq!(typing.source(cx), with_inserted(typed));
+    typing.press(cx, "escape");
+    assert_eq!(typing.source(cx), with_inserted(typed));
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), with_inserted(shape), "one step takes the words away");
+}
+
+#[gpui_kit::test]
+fn blank_input_on_a_selected_shape_then_escape_leaves_it_as_it_was(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    insert_shape(&typing, cx, "ellipse");
+    let with_shape = typing.source(cx);
+    typing.type_text(cx, " ");
+    typing.press(cx, "escape");
+    assert_eq!(typing.source(cx), with_shape);
+    assert!(typing.editing(cx).is_none());
+}
+
 // ---------------------------------------------------------------------------------------
 // Text boxes
 

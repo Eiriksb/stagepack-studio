@@ -2587,6 +2587,20 @@ impl Document {
             return self.write_new_box(&editing, place, after, kind);
         }
         let found = editing.flow.find(&flows);
+        // An empty shape's, box's or component's first text, as a new box's, starts at its first
+        // visible character: what has none writes nothing, and the thing stays as it was.
+        let after = if found.is_none() && editing.flow.region().is_none() {
+            let Some(paras) = from_first_visible(&after.paras) else {
+                // A choice of kind of paragraph is kept for what's typed next; blank text isn't.
+                let kept = if kind == Kind::Formatted { after } else { editing.edit.clone() };
+                self.keep_typed(kept, editing.run);
+                return Ok(Vec::new());
+            };
+            let end = TextEdit::new(paras.clone()).select_all().selection.end();
+            TextEdit { typing_style: after.typing_style.clone(), ..TextEdit::new(paras).move_to(end, false) }
+        } else {
+            after
+        };
         let change = match (found, editing.flow.region()) {
             (Some(index), _) => write_flow(self.talk(), slide, &flows[index], &after.paras, &content),
             // An empty region's first paragraph is written once it holds something.
@@ -2595,11 +2609,6 @@ impl Document {
                 return Ok(Vec::new());
             }
             (None, Some(region)) => write_into_region(self.talk(), slide, region, &after.paras),
-            // So is an empty box's.
-            (None, None) if !holds_something(&after.paras) => {
-                self.keep_typed(after, editing.run);
-                return Ok(Vec::new());
-            }
             (None, None) => match editing.flow.tag_start() {
                 Some(start) => guarded(|| write_into_tag(self.talk(), &content, slide, start, &after.paras))?,
                 None => None,
