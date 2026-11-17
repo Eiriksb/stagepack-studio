@@ -10,10 +10,10 @@ use crate::insert::{ICON_SIZE, INSERT_ICON};
 /// What the window says when a file that isn't a picture is dropped on the slide.
 pub const ONLY_PICTURES: &str = "Only pictures can be dropped on a slide.";
 /// What the window says when the dialog to choose pictures couldn't be shown.
-pub const DIALOG_FAILED: &str = "The picture couldn't be opened.";
-/// The most files a drop, or a paste of files, puts on the slide.
+pub const DIALOG_FAILED: &str = "The file chooser couldn't be opened.";
+/// The most files a drop, a paste of files, or the dialog puts on the slide.
 pub const MOST_DROPPED: usize = 20;
-/// What the window says when more files than that were dropped.
+/// What the window says when more files than that were dropped or chosen.
 pub const ONLY_THE_FIRST: &str = "Only the first 20 pictures were added.";
 /// What a picture pasted from the clipboard is named, as like as is safe.
 const PASTED_PICTURE: &str = "pasted-picture.png";
@@ -49,19 +49,25 @@ impl WorkspaceView {
     }
 
     /// Puts the pictures in the files at `paths` on the slide, each in turn, one step each, as
-    /// the dialog to choose them gives them. What isn't a picture is said, and left out.
+    /// the dialog to choose them gives them, the first [`MOST_DROPPED`] of them. What isn't a
+    /// picture is said, and left out.
     pub fn chosen_pictures(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        for path in paths {
-            self.insert_file(&path, false, cx);
-        }
+        self.insert_files(paths, false, cx);
     }
 
     /// Puts the pictures in the files at `paths`, dropped on the slide from outside the app, on
-    /// it, each in turn, one step each. A file that isn't a picture is said, and left out.
+    /// it, each in turn, one step each, the first [`MOST_DROPPED`] of them. A file that isn't a
+    /// picture is said, and left out.
     pub(super) fn dropped(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        self.insert_files(paths, true, cx);
+    }
+
+    /// Puts the pictures in the first [`MOST_DROPPED`] of the files at `paths` on the slide, and
+    /// says if there were more.
+    fn insert_files(&mut self, paths: Vec<PathBuf>, dropped: bool, cx: &mut Context<Self>) {
         let more = paths.len() > MOST_DROPPED;
         for path in paths.iter().take(MOST_DROPPED) {
-            self.insert_file(path, true, cx);
+            self.insert_file(path, dropped, cx);
         }
         if more {
             // After the status line has heard what's selected, so that this is what it says.

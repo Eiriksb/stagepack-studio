@@ -1098,7 +1098,24 @@ fn more_than_twenty_dropped_files_take_the_first_twenty(cx: &mut TestAppContext)
     assert_eq!(typing.source(cx).matches("<Picture").count(), 20);
     assert_eq!(typing.status(cx).as_deref(), Some(ONLY_THE_FIRST));
     assert_eq!(ONLY_THE_FIRST, "Only the first 20 pictures were added.");
-    assert_eq!(DIALOG_FAILED, "The picture couldn't be opened.");
+    // Said when the dialog itself can't be shown: no picture was chosen to be opened.
+    assert_eq!(DIALOG_FAILED, "The file chooser couldn't be opened.");
+}
+
+#[gpui_kit::test]
+fn more_than_twenty_chosen_pictures_take_the_first_twenty(cx: &mut TestAppContext) {
+    // Found in review: the dialog's pictures weren't capped as a drop's are.
+    let typing = open(cx, TALK);
+    let dir = tempfile::tempdir().unwrap();
+    let paths: Vec<PathBuf> = (0..21).map(|at| outside_file(&dir, &format!("p{at}.png"), &png(10, 10, [at as u8, 0, 0, 255]))).collect();
+    choose(&typing, cx, paths.clone());
+    assert_eq!(typing.source(cx).matches("<Picture").count(), 20);
+    assert_eq!(typing.status(cx).as_deref(), Some(ONLY_THE_FIRST));
+    // Twenty are taken as they are.
+    let typing = open(cx, TALK);
+    choose(&typing, cx, paths[..20].to_vec());
+    assert_eq!(typing.source(cx).matches("<Picture").count(), 20);
+    assert_ne!(typing.status(cx).as_deref(), Some(ONLY_THE_FIRST));
 }
 
 // ---------------------------------------------------------------------------------------
