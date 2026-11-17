@@ -91,10 +91,11 @@ fn body_flow(typing: &Typing, cx: &mut TestAppContext) -> usize {
         .expect("the main text")
 }
 
-/// A point on the left line of area `name`'s frame, halfway down.
+/// A point on the left line of area `name`'s frame, a quarter of the way down: away from the
+/// handles at its corners and the middle of its side, which resize it once it's selected.
 fn on_frame(typing: &Typing, cx: &mut TestAppContext, name: &str) -> Point<Pixels> {
     let rect = typing.layout(cx).region(name).expect("the area").rect;
-    typing.at(cx, rect.x, rect.y + rect.h / 2.)
+    typing.at(cx, rect.x, rect.y + rect.h / 4.)
 }
 
 #[gpui_kit::test]
@@ -596,8 +597,9 @@ fn a_press_on_a_neighbouring_areas_offer_is_that_areas(cx: &mut TestAppContext) 
     let frame = typing.at(cx, left.x, left.y + left.h / 2.);
     typing.click(cx, frame);
     assert_eq!(selection(&typing, cx).map(|selection| selection.things), Some(vec![Thing::Region("left".into())]));
-    // Just past its right edge, in the gap: still the left column, which a drag there moves.
-    let gap = typing.at(cx, left.x + left.w + 5., left.y + left.h / 2.);
+    // Just past its right edge, in the gap: still the left column, which a drag there moves,
+    // away from the handle on the middle of that side.
+    let gap = typing.at(cx, left.x + left.w + 5., left.y + left.h / 4.);
     let to = gap + point(px(0.), px(40.));
     typing.drag(cx, gap, to);
     let (_, dy) = on_slide(&typing, cx, gap, to);
@@ -606,7 +608,7 @@ fn a_press_on_a_neighbouring_areas_offer_is_that_areas(cx: &mut TestAppContext) 
     undo(&typing, cx);
     // Just as near its edge, but inside the right column's offer: that column is typed in.
     let left = typing.layout(cx).region("left").expect("the left column").rect;
-    let offer = typing.at(cx, left.x + left.w + 12., left.y + left.h / 2.);
+    let offer = typing.at(cx, left.x + left.w + 12., left.y + left.h / 4.);
     typing.click(cx, offer);
     assert_eq!(selection(&typing, cx), None);
     let editing = typing.editing(cx).expect("typing");

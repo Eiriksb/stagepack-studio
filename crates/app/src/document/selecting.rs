@@ -174,6 +174,35 @@ impl Document {
         let Selected { slide, source } = thing.clone();
         let change = built(self.talk(), |talk| set_tag_attr(talk, slide, &source, name, value))?
             .ok_or(EditRefused::CouldNotBeMade)?;
+        self.make_setting(thing, change)
+    }
+
+    /// Sets each attribute of `values` on the tag selected, as [`Self::set_selected_attr`] does
+    /// one, all in one step.
+    pub fn set_selected_attrs(&mut self, values: &[(&str, Option<&str>)]) -> Result<Vec<usize>, EditRefused> {
+        self.finish_before_edit()?;
+        let Some(selected) = self.selected.clone() else {
+            return Ok(Vec::new());
+        };
+        self.set_attrs_of(&selected, values)
+    }
+
+    /// Sets each attribute of `values` on `thing`, a tag at the top level of a slide, as
+    /// [`Self::set_attr_of`] does one, all in one step.
+    pub fn set_attrs_of(&mut self, thing: &Selected, values: &[(&str, Option<&str>)]) -> Result<Vec<usize>, EditRefused> {
+        if let [(name, value)] = values {
+            return self.set_attr_of(thing, name, *value);
+        }
+        self.finish_before_edit()?;
+        let Selected { slide, source } = thing.clone();
+        let edits: Vec<ValueEdit> = values.iter().map(|&(name, value)| ValueEdit { target: Target::Tag(source.clone()), name, value }).collect();
+        let change = built(self.talk(), |talk| set_values(talk, slide, &edits))?.ok_or(EditRefused::CouldNotBeMade)?;
+        self.make_setting(thing, change)
+    }
+
+    /// Makes `change` to the settings of `thing` as one step named "Change setting".
+    fn make_setting(&mut self, thing: &Selected, change: Change) -> Result<Vec<usize>, EditRefused> {
+        let Selected { slide, source } = thing.clone();
         let selected = self.selected.as_ref() == Some(thing);
         let depth = self.history.depth();
         let changed = self.make(CHANGE_SETTING, change, Holds::Slide(slide), slide, slide, None)?;

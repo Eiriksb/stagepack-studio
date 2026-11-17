@@ -90,7 +90,7 @@ impl WorkspaceView {
         }
     }
 
-    /// Sets attribute `name` of the thing the inspector shows to `value`, or takes it away, as
+    /// Sets each attribute of `values` on the thing the inspector shows, or takes it away, as
     /// one edit, or says why it wasn't made. The inspector shows the thing picked `pick`,
     /// now at `target`: while it's still the one selected, the selection's is the one changed;
     /// once another is picked, as by the click that took the keyboard from a field, the change
@@ -99,8 +99,7 @@ impl WorkspaceView {
         &mut self,
         pick: u64,
         target: &Selected,
-        name: &str,
-        value: Option<&str>,
+        values: &[(&str, Option<&str>)],
         cx: &mut Context<Self>,
     ) -> Result<(), EditRefused> {
         let Some(document) = self.document.clone() else {
@@ -111,9 +110,9 @@ impl WorkspaceView {
         self.edit(
             |document| {
                 let result = if picked {
-                    document.set_selected_attr(name, value)
+                    document.set_selected_attrs(values)
                 } else {
-                    document.set_attr_of(target, name, value)
+                    document.set_attrs_of(target, values)
                 };
                 made = result.as_ref().map(|_| ()).map_err(|refused| *refused);
                 result

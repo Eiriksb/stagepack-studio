@@ -30,6 +30,14 @@ impl SlideEditor {
         ))
     }
 
+    /// Where `position`, in the window, is in slide units from the slide's corner, on the slide
+    /// or off it.
+    pub(super) fn slide_units(&self, position: Point<Pixels>, cx: &App) -> Option<(f32, f32)> {
+        let slide = self.canvas.read(cx).slide_bounds()?;
+        let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
+        (unit > 0.0).then(|| (f32::from(position.x - slide.origin.x) / unit, f32::from(position.y - slide.origin.y) / unit))
+    }
+
     /// What's at (`x`, `y`) of the current slide.
     pub(super) fn hit(&self, (x, y): (f32, f32), cx: &mut Context<Self>) -> Option<(usize, Hit)> {
         let slide = self.document.as_ref()?.read(cx).current();
@@ -54,6 +62,13 @@ impl SlideEditor {
         self.end_drag(cx);
         self.dragging = false;
         self.pressed = None;
+        if let Some((handles, handle)) = self.handle_under(event.position, cx) {
+            // A handle of the thing selected, on the slide or just off it, before what's under it.
+            cx.stop_propagation();
+            self.focus_handle.focus(window, cx);
+            self.ready_handle_drag(handles, handle, event.position, cx);
+            return;
+        }
         let Some(point) = self.slide_point(event.position, cx) else {
             // The desk around the slide.
             self.stop_typing(window, cx);
@@ -280,6 +295,9 @@ impl SlideEditor {
         if self.drag.is_some() {
             self.drag_to(event, cx);
             return;
+        }
+        if event.pressed_button.is_none() {
+            self.hover(event.position, cx);
         }
         if !self.dragging || event.pressed_button != Some(MouseButton::Left) {
             return;

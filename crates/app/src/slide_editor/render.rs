@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// How many sides the round turn handle is drawn with.
+const HANDLE_ROUND: usize = 16;
+
 impl Render for SlideEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = cx.entity().downgrade();
@@ -30,6 +33,13 @@ impl Render for SlideEditor {
             Some((name, outline_corners(area.rect, area.rotate)))
         });
         let selecting = !outlines.is_empty() && !self.is_editing(cx);
+        // The handles on the one thing selected, and what the pointer shows over them.
+        let handles = self.handles(cx).map(|handles| (handles.spots, handles.rotate()));
+        if handles.is_none() && !self.handle_drag() {
+            self.pointer = None;
+        }
+        let pointer = self.pointer;
+        let handle_color = cx.theme().background;
         let placed = {
             let canvas = self.canvas.read(cx);
             canvas.slide_bounds().zip(canvas.area())
@@ -58,6 +68,19 @@ impl Render for SlideEditor {
             .filter_map(|(at, corners)| {
                 let id = if at + 1 == outlines.len() { SELECTION_OUTLINE_ID.into() } else { selection_outline_id(at).into() };
                 Some((id, boxed(corners)?))
+            })
+            .collect();
+        // Where each handle is in the editor, for whoever looks for it.
+        let handle_boxes: Vec<(SharedString, Bounds<Pixels>)> = handles
+            .iter()
+            .flat_map(|(spots, _)| spots.iter())
+            .filter_map(|&(handle, (x, y))| {
+                let (slide, area) = placed?;
+                let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
+                let half = HANDLE_SIZE / 2.;
+                let middle = slide.origin + point(px(x * unit), px(y * unit));
+                let bounds = Bounds { origin: middle - point(px(half), px(half)), size: size(px(HANDLE_SIZE), px(HANDLE_SIZE)) };
+                Some((SharedString::from(handle_id(handle)), in_editor(bounds, area)))
             })
             .collect();
         let frame_box = frame.as_ref().and_then(|(name, corners)| Some((SharedString::from(region_frame_id(name)), boxed(corners)?)));
@@ -146,6 +169,22 @@ impl Render for SlideEditor {
                         );
                     }
                 });
+                // Handles show past the slide's edge too, as the turn handle of a thing at its top.
+                if let Some((spots, rotate)) = &handles {
+                    let half = HANDLE_SIZE / 2. / unit;
+                    for &(handle, (x, y)) in spots {
+                        let points: Vec<(f32, f32)> = if handle == Handle::Turn {
+                            (0..HANDLE_ROUND).map(|at| turned((x + half, y), (x, y), 360. * at as f32 / HANDLE_ROUND as f32)).collect()
+                        } else {
+                            corners(x - half, y - half, half * 2., half * 2., (x, y), *rotate).to_vec()
+                        };
+                        paint_polygon(&points, slide, unit, handle_color, window);
+                        paint_outline(&points, slide, unit, outline_color, window);
+                    }
+                }
+                if let Some(style) = pointer {
+                    window.set_window_cursor_style(style);
+                }
             },
         )
         .absolute()
@@ -277,7 +316,7 @@ impl Render for SlideEditor {
                         .h(bounds.size.height),
                 )
             })
-            .children(frame_box.into_iter().chain(outline_boxes).map(|(id, bounds)| {
+            .children(frame_box.into_iter().chain(outline_boxes).chain(handle_boxes).map(|(id, bounds)| {
                 div()
                     .id(id)
                     .test_support()

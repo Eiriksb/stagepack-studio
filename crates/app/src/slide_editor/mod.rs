@@ -19,6 +19,7 @@ use gpui_kit::*;
 use slides_engine::{Align, CaretRect, ElementBox, Hit, LineMove, Rect, SelectionRects, TextLayout};
 use slides_format::{Block, FlowPlace, Motion, Para, ParaKind, Pos, Selection, Span, StyleBit, TextEdit, uneditable_reason};
 
+use crate::arrange::Handle;
 use crate::clipboard::{self, TextPaste};
 use crate::clipboard_tools::write_clipboard;
 use crate::document::{Beside, CellMove, Document, EditRefused};
@@ -59,6 +60,22 @@ pub fn selection_outline_id(n: usize) -> String {
     format!("selection-outline-{n}")
 }
 
+/// The handle `handle` on the one thing or area selected.
+pub fn handle_id(handle: Handle) -> String {
+    let name = match handle {
+        Handle::TopLeft => "top-left",
+        Handle::Top => "top",
+        Handle::TopRight => "top-right",
+        Handle::Right => "right",
+        Handle::BottomRight => "bottom-right",
+        Handle::Bottom => "bottom",
+        Handle::BottomLeft => "bottom-left",
+        Handle::Left => "left",
+        Handle::Turn => "turn",
+    };
+    format!("handle-{name}")
+}
+
 /// The dashed frame around the area `name` of the slide's layout, while its text is typed.
 pub fn region_frame_id(name: &str) -> String {
     format!("region-frame-{name}")
@@ -80,6 +97,14 @@ const CARET_WIDTH: f32 = 2.0;
 const OUTLINE_WIDTH: f32 = 2.0;
 /// How near the frame of the area being typed in, in the window's pixels, a press picks the area.
 const FRAME_REACH: f32 = 5.0;
+/// How wide a handle is drawn, in the window's pixels.
+const HANDLE_SIZE: f32 = 9.0;
+/// How near a handle's middle, in the window's pixels, a press takes it.
+const HANDLE_REACH: f32 = 6.0;
+/// How far above a thing's top edge the turn handle is, in the window's pixels.
+const TURN_GAP: f32 = 24.0;
+/// How far apart, in the window's pixels, a thing's corner handles are at least drawn.
+const HANDLES_APART: f32 = 24.0;
 /// How big the text being composed is drawn, to the height of the caret.
 const COMPOSITION_TEXT: f32 = 0.7;
 
@@ -138,6 +163,8 @@ pub struct SlideEditor {
     drag: Option<arranging::Drag>,
     /// The run of arrow-key moves going on, if one is.
     nudging: Option<arranging::Nudging>,
+    /// What the pointer shows, over a handle or dragging one, if not the usual.
+    pointer: Option<CursorStyle>,
 
     /// Where the caret and any composition were last drawn, so that the system's input method
     /// is told when they move, and only then.
@@ -238,9 +265,16 @@ impl SlideEditor {
             told: None,
             drag: None,
             nudging: None,
+            pointer: None,
             ime_place: None,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// What the pointer shows over the slide, if not the usual: which way a handle under it
+    /// resizes, or that it turns.
+    pub fn pointer(&self) -> Option<CursorStyle> {
+        self.pointer
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {

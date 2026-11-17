@@ -1,7 +1,8 @@
-//! Where things go as they're moved on a slide: the box a turned thing covers, and how far a
-//! move can take things before they'd leave the slide. Only numbers, so it's tested alone.
+//! Where things go as they're moved, resized and turned on a slide: the box a turned thing
+//! covers, how far a move can take things before they'd leave the slide, and where a handle
+//! dragged or turned takes a thing. Only numbers, so it's tested alone.
 
-use slides_engine::{MAX_POSITION, MIN_POSITION, Rect, SLIDE_HEIGHT, SLIDE_WIDTH};
+use slides_engine::{MAX_POSITION, MAX_SIZE, MIN_POSITION, Rect, SLIDE_HEIGHT, SLIDE_WIDTH};
 
 /// How many pixels the pointer goes, with the button down, before a press is a drag.
 pub const MOVE_STARTS: f32 = 4.0;
@@ -69,4 +70,130 @@ pub fn kept_move(things: &[Placed], (dx, dy): (f32, f32)) -> (f32, f32) {
     }
     let within = |by: f32, (low, high): (f32, f32)| if by.is_finite() { by.clamp(low, high) } else { 0. };
     (within(dx, across), within(dy, down))
+}
+
+/// The least a thing's side can be made, in slide units, by dragging a handle.
+pub const MIN_SIZE: f32 = 8.0;
+
+/// A handle on a thing selected: one on each corner and side, which resizes it, and one above
+/// it, which turns it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Handle {
+    TopLeft,
+    Top,
+    TopRight,
+    Right,
+    BottomRight,
+    Bottom,
+    BottomLeft,
+    Left,
+    Turn,
+}
+
+impl Handle {
+    pub const ALL: [Handle; 9] = [
+        Handle::TopLeft,
+        Handle::Top,
+        Handle::TopRight,
+        Handle::Right,
+        Handle::BottomRight,
+        Handle::Bottom,
+        Handle::BottomLeft,
+        Handle::Left,
+        Handle::Turn,
+    ];
+
+    /// Where the handle is on the thing before it's turned, as parts of its width and height:
+    /// the turn handle as the middle of the top.
+    fn spot(self) -> (f32, f32) {
+        match self {
+            Handle::TopLeft => (0., 0.),
+            Handle::Top | Handle::Turn => (0.5, 0.),
+            Handle::TopRight => (1., 0.),
+            Handle::Right => (1., 0.5),
+            Handle::BottomRight => (1., 1.),
+            Handle::Bottom => (0.5, 1.),
+            Handle::BottomLeft => (0., 1.),
+            Handle::Left => (0., 0.5),
+        }
+    }
+}
+
+/// `(x, y)` turned by `degrees` about `centre`, as the engine turns a thing.
+fn turned((x, y): (f32, f32), (cx, cy): (f32, f32), degrees: f32) -> (f32, f32) {
+    let (sin, cos) = degrees.to_radians().sin_cos();
+    let (dx, dy) = (x - cx, y - cy);
+    (cx + dx * cos - dy * sin, cy + dx * sin + dy * cos)
+}
+
+fn centre(rect: &Rect) -> (f32, f32) {
+    (rect.x + rect.w / 2., rect.y + rect.h / 2.)
+}
+
+/// Where `handle` sits on the slide, on `placed` turned: the turn handle `turn_gap` units
+/// beyond the middle of its top edge.
+pub fn handle_point(placed: &Placed, handle: Handle, turn_gap: f32) -> (f32, f32) {
+    let Rect { x, y, w, h } = placed.rect;
+    let (fx, fy) = handle.spot();
+    let gap = if handle == Handle::Turn { turn_gap } else { 0. };
+    turned((x + fx * w, y + fy * h - gap), centre(&placed.rect), placed.rotate)
+}
+
+/// `start` with `handle` dragged to `to`, in slide units. The corner or edge across from the
+/// handle stays where it is on the slide, at any turn. A side the handle changes is never
+/// under [`MIN_SIZE`] nor over the most a thing can be, and the thing never flips over; a side
+/// it doesn't change stays as it was. With `keep_shape`, a corner keeps the proportions it
+/// started with, where both sides can within those limits; an edge never does. The turn
+/// handle resizes nothing.
+pub fn resized(start: &Placed, handle: Handle, to: (f32, f32), keep_shape: bool) -> Placed {
+    if handle == Handle::Turn {
+        return *start;
+    }
+    let Rect { x, y, w, h } = start.rect;
+    let middle = centre(&start.rect);
+    // The pointer as it is on the thing before it's turned.
+    let (px, py) = turned(to, middle, -start.rotate);
+    let (fx, fy) = handle.spot();
+    let (ax, ay) = (x + (1. - fx) * w, y + (1. - fy) * h);
+    let anchor = turned((ax, ay), middle, start.rotate);
+    let side = |part: f32, pointer: f32, across: f32, now: f32| {
+        if part == 1. {
+            pointer - across
+        } else if part == 0. {
+            across - pointer
+        } else {
+            now
+        }
+    };
+    let (raw_w, raw_h) = (side(fx, px, ax, w), side(fy, py, ay, h));
+    let held = |length: f32, now: f32, changes: bool| if changes { length.clamp(MIN_SIZE, MAX_SIZE) } else { now };
+    let (across, down) = (fx != 0.5, fy != 0.5);
+    let (mut new_w, mut new_h) = (held(raw_w, w, across), held(raw_h, h, down));
+    if keep_shape && across && down && w > 0. && h > 0. {
+        // As far as the pointer goes the furthest way, within what both sides can be.
+        let (low, high) = ((MIN_SIZE / w).max(MIN_SIZE / h), (MAX_SIZE / w).min(MAX_SIZE / h));
+        if low <= high {
+            let scale = (raw_w / w).max(raw_h / h).clamp(low, high);
+            (new_w, new_h) = (w * scale, h * scale);
+        }
+    }
+    // The anchor stays where it is on the slide: the middle goes where that leaves it.
+    let (ox, oy) = turned(((0.5 - fx) * new_w, (0.5 - fy) * new_h), (0., 0.), start.rotate);
+    let (mx, my) = (anchor.0 - ox, anchor.1 - oy);
+    Placed { rect: Rect { x: mx - new_w / 2., y: my - new_h / 2., w: new_w, h: new_h }, rotate: start.rotate }
+}
+
+/// `start` turned so that its top points from its middle towards `to`, in slide units: in whole
+/// degrees from -180 to 180, or in steps of 15 when `stepped`. At its very middle, it stays.
+pub fn turned_to(start: &Placed, to: (f32, f32), stepped: bool) -> Placed {
+    let (cx, cy) = centre(&start.rect);
+    let (dx, dy) = (to.0 - cx, to.1 - cy);
+    if dx == 0. && dy == 0. || !dx.is_finite() || !dy.is_finite() {
+        return *start;
+    }
+    let degrees = dx.atan2(-dy).to_degrees();
+    let step = if stepped { 15. } else { 1. };
+    let rotate = ((degrees / step).round() * step).clamp(-180., 180.);
+    // Never -0, which is written as it reads.
+    Placed { rect: start.rect, rotate: rotate + 0. }
 }

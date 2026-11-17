@@ -11,10 +11,16 @@ impl Inspector {
             return Err(EditRefused::CouldNotBeMade);
         };
         let (pick, target) = (form.shape.pick, form.target.clone());
+        // An icon's size is its width and height too, where it has them of its own: they're
+        // set to it in the same step, or they'd hold it at the size it was.
+        let mut values = vec![(name, value)];
+        if name == "size" && form.shape.tag.as_deref() == Some("Icon") && value.is_some() {
+            values.extend(["w", "h"].into_iter().filter(|side| self.talk_attr(side, cx).is_some()).map(|side| (side, value)));
+        }
         let made = match &target {
             Subject::Thing(target) => self
                 .workspace
-                .update(cx, |workspace, cx| workspace.set_attr_from_inspector(pick, target, name, value, cx))
+                .update(cx, |workspace, cx| workspace.set_attr_from_inspector(pick, target, &values, cx))
                 .unwrap_or(Err(EditRefused::CouldNotBeMade)),
             Subject::Area { slide, name: area, .. } => self
                 .workspace
@@ -193,7 +199,7 @@ impl Inspector {
         cx.defer(move |cx| {
             for (name, color) in held {
                 workspace
-                    .update(cx, |workspace, cx| workspace.set_attr_from_inspector(pick, &target, &name, Some(&color), cx))
+                    .update(cx, |workspace, cx| workspace.set_attr_from_inspector(pick, &target, &[(&name, Some(&color))], cx))
                     .ok();
             }
         });

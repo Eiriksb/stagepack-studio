@@ -70,7 +70,8 @@ impl Document {
 
     /// Writes each of `places` on the current slide, as one step named `label` joining the run
     /// `run` says, and returns the slides to show again. Only the numbers that differ from where
-    /// the slide has the thing now are written, positions and sizes to a whole unit; a thing
+    /// the slide has the thing now are written, positions and sizes to a whole unit, and a turn
+    /// back to upright is taken away rather than written as 0; a thing
     /// written in the slide's text, with no place of its own, is left be. Where nothing differs,
     /// nothing is written and no step made. It's refused if finishing the typing first changes
     /// the talk.
@@ -85,7 +86,8 @@ impl Document {
         }
         let slide = self.current;
         let layout = self.text_layout(slide);
-        let mut words: Vec<(Target, &'static str, String)> = Vec::new();
+        // Each value to write, or `None` to take away: an upright turn isn't written.
+        let mut words: Vec<(Target, &'static str, Option<String>)> = Vec::new();
         for (thing, placed) in places {
             let now = match thing {
                 Thing::Block(source) => layout.element(source).filter(|element| element.placed).map(|element| (element.rect, element.rotate)),
@@ -105,14 +107,15 @@ impl Document {
             ];
             for (name, asked, value, old) in numbers {
                 if value.is_finite() && (asked - old).abs() > MOVED && number_text(value) != number_text(old) {
-                    words.push((target_of(thing), name, number_text(value)));
+                    let value = (name != "rotate" || value != 0.).then(|| number_text(value));
+                    words.push((target_of(thing), name, value));
                 }
             }
         }
         if words.is_empty() {
             return Ok(Vec::new());
         }
-        let edits: Vec<ValueEdit> = words.iter().map(|(target, name, value)| ValueEdit { target: target.clone(), name, value: Some(value) }).collect();
+        let edits: Vec<ValueEdit> = words.iter().map(|(target, name, value)| ValueEdit { target: target.clone(), name, value: value.as_deref() }).collect();
         let change = built(self.talk(), |talk| set_values(talk, slide, &edits))?.ok_or(EditRefused::CouldNotBeMade)?;
         let before = self.selection.clone().filter(|selection| selection.slide == slide);
         let depth = self.history.depth();
