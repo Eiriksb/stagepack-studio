@@ -7,7 +7,7 @@
 use slides_format::Target;
 
 /// The last step a slide can have.
-pub const MAX_STEP: u32 = 999;
+pub const MAX_STEP: u32 = slides_engine::MAX_CLICK;
 
 /// What one thing or area of a slide has now.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,16 +33,6 @@ pub enum Choice {
     Each(bool),
 }
 
-/// The step `value`, as a talk writes it, reads as: a whole number from 1 to [`MAX_STEP`], or
-/// none.
-pub fn click_of(value: &str) -> Option<u32> {
-    let value = value.trim();
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    value.parse::<u32>().ok().filter(|click| (1..=MAX_STEP).contains(click))
-}
-
 /// How many steps the slide whose things and areas are `all` takes, `fixed` of them fixed.
 pub fn steps_shown(all: &[Stepped], fixed: u32) -> u32 {
     all.iter().filter_map(|stepped| stepped.click).fold(fixed.min(MAX_STEP), u32::max)
@@ -62,13 +52,13 @@ pub fn chosen(all: &[Stepped], fixed: u32, chosen: &[Target], choice: Choice) ->
     let was: Vec<Option<u32>> = all.iter().map(|stepped| stepped.click).collect();
     let picked: Vec<bool> = all.iter().map(|stepped| chosen.contains(&stepped.target)).collect();
     let mut now = was.clone();
-    let last = steps_shown(all, fixed);
     match choice {
         Choice::Animate => {
-            let after = last.checked_add(1).filter(|step| *step <= MAX_STEP);
+            // After every other step, once the steps nothing comes in on are closed: past
+            // the last there can be, until they are.
             for (at, stepped) in all.iter().enumerate() {
                 if picked[at] && stepped.click.is_none() && !stepped.each {
-                    now[at] = Some(after?);
+                    now[at] = Some(MAX_STEP + 1);
                 }
             }
         }
@@ -113,6 +103,10 @@ pub fn chosen(all: &[Stepped], fixed: u32, chosen: &[Target], choice: Choice) ->
         return None;
     }
     let changes = changed(all, &now, fixed);
+    // A slide with every step taken has none for another.
+    if changes.iter().any(|(_, click)| click.is_some_and(|click| click > MAX_STEP)) {
+        return None;
+    }
     (!changes.is_empty()).then_some(changes)
 }
 

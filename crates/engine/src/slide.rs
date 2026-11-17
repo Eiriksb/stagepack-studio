@@ -61,6 +61,8 @@ pub struct LaidOutSlide {
     pub(crate) regions: Vec<RegionBox>,
     /// The most steps a region shown one block at a time takes.
     pub(crate) each_steps: u32,
+    /// Each region shown a piece at a time, by name, and the steps it takes.
+    pub(crate) each_regions: Vec<(String, u32)>,
 }
 
 /// A place to show a thing or a region at that its source doesn't say yet, as while it's
@@ -167,11 +169,12 @@ pub(crate) fn layout_slide_placed(talk: &Talk, index: usize, env: &mut LayoutEnv
         layers.push(error_layer(slide, &error.message, &theme, env.fonts));
         texts.push(LayerText { whole: true, ..LayerText::default() });
         let asks = std::mem::take(&mut env.asks);
-        return LaidOutSlide { layers, notices, transition: Transition::None, asks, texts, empty_regions: Vec::new(), regions: Vec::new(), each_steps: 0 };
+        return LaidOutSlide { layers, notices, transition: Transition::None, asks, texts, empty_regions: Vec::new(), regions: Vec::new(), each_steps: 0, each_regions: Vec::new() };
     }
     let mut empty_regions = Vec::new();
     let mut regions = Vec::new();
     let mut each_steps = 0;
+    let mut each_regions = Vec::new();
     if aligns_inline(&talk.source, &slide.blocks) {
         notices.push(Notice(ALIGN_UNPLACED.to_string()));
     }
@@ -207,6 +210,7 @@ pub(crate) fn layout_slide_placed(talk: &Talk, index: usize, env: &mut LayoutEnv
         };
         if timing.click == RegionClick::Each {
             each_steps = each_steps.max(1);
+            each_regions.push((region.name.to_string(), 1));
             if rotate != 0.0 {
                 notices.push(Notice(format!(
                     "The {} region is rotated, so click=each shows it all on click 1",
@@ -216,7 +220,11 @@ pub(crate) fn layout_slide_placed(talk: &Talk, index: usize, env: &mut LayoutEnv
                 let (pieces, varies) =
                     noting_asks(env, |env| flow_region_each(blocks, region, rect.w, &theme, env, &mut notices));
                 if !pieces.is_empty() {
-                    each_steps = each_steps.max((pieces.len() as u32).min(MAX_CLICK));
+                    let steps = (pieces.len() as u32).min(MAX_CLICK);
+                    each_steps = each_steps.max(steps);
+                    if let Some((_, taken)) = each_regions.last_mut() {
+                        *taken = steps;
+                    }
                     for (step, piece) in pieces.into_iter().enumerate() {
                         let rect = Rect { x: rect.x + piece.rect.x, y: rect.y + piece.rect.y, ..piece.rect };
                         layers.push(LayerSpec {
@@ -255,7 +263,7 @@ pub(crate) fn layout_slide_placed(talk: &Talk, index: usize, env: &mut LayoutEnv
         }
     }
     let notices = notices.into_iter().map(|notice| Notice(shortened(&notice.0, MAX_NOTICE_CHARS))).collect();
-    LaidOutSlide { layers, notices, transition, asks: std::mem::take(&mut env.asks), texts, empty_regions, regions, each_steps }
+    LaidOutSlide { layers, notices, transition, asks: std::mem::take(&mut env.asks), texts, empty_regions, regions, each_steps, each_regions }
 }
 
 /// The layer of the placed tag at the top level of slide `index` whose source is `range`,

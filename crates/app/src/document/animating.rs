@@ -1,11 +1,11 @@
 //! Animating what's selected: the step each thing and area comes in on, how it comes in, an
 //! area shown a piece at a time, and how a slide is arrived at.
 
-use slides_engine::{Enter, is_positioned};
+use slides_engine::{Enter, enter_word, is_positioned, read_click, read_enter};
 use slides_format::{region_value, set_transition};
 
 use super::*;
-use crate::animate::{Choice, MAX_STEP, Stepped, chosen, click_of, closed_up, steps_shown};
+use crate::animate::{Choice, Stepped, chosen, closed_up, steps_shown};
 
 /// What Undo shows for a choice made on the Animate tab, and for a slide's transition.
 pub const ANIMATE: &str = "Change animation";
@@ -14,7 +14,8 @@ pub const TRANSITION: &str = "Change transition";
 /// What the Animate tab's tools are about: what they act on, and what it has now.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct AnimateHere {
-    /// The things and areas chosen: those selected, or the area whose text is being typed.
+    /// The things and areas chosen: those selected, or with nothing selected, the area or the box
+    /// whose text is being typed.
     pub targets: Vec<Target>,
     /// The step they come in on, when they share one.
     pub click: Option<u32>,
@@ -22,9 +23,13 @@ pub struct AnimateHere {
     pub steps: u32,
     /// How the first of them that's animated comes in, if any is.
     pub enter: Option<Enter>,
+    /// Whether some of them are animated and some aren't.
+    pub mixed: bool,
     /// Whether the one area chosen is shown a piece at a time; `None` unless one area is.
     pub each: Option<bool>,
-    /// Whether the one area chosen holds a list, or more than one block, to show that way.
+    /// Whether the one area chosen holds a list, or more than one block, to show that way. A
+    /// turned area can be too: the show has it all on click 1 while it's turned, and a piece at a
+    /// time once it's upright again.
     pub can_each: bool,
     /// How the slide is arrived at.
     pub transition: Transition,
@@ -42,6 +47,9 @@ pub struct StepBadge {
     pub rotate: f32,
 }
 
+/// A value to write: on what, its name, and what, or `None` to take it away.
+type Word = (Target, &'static str, Option<String>);
+
 impl Document {
     /// What the Animate tab's tools are about, on the current slide.
     pub fn animate_here(&mut self) -> AnimateHere {
@@ -49,33 +57,30 @@ impl Document {
         let transition = if slide < self.slide_count() { self.deck.timeline(slide).transition } else { Transition::None };
         let (all, fixed) = self.stepped(slide);
         let steps = steps_shown(&all, fixed);
-        let targets = match self.animate_targets() {
+        let typed = self.typed_target();
+        let targets = match self.animate_targets(typed) {
             Ok(targets) => targets,
             Err(why) => return AnimateHere { steps, transition, why_not: Some(why), ..AnimateHere::default() },
         };
         let picked: Vec<&Stepped> = all.iter().filter(|stepped| targets.contains(&stepped.target)).collect();
+        let animated = |stepped: &Stepped| stepped.click.is_some() || stepped.each;
         let first = picked.first().and_then(|stepped| stepped.click);
         let click = first.filter(|_| picked.iter().all(|stepped| stepped.click == first));
-        let enter = picked
-            .iter()
-            .find(|stepped| stepped.click.is_some() || stepped.each)
-            .map(|stepped| self.entrance_of(slide, &stepped.target));
+        let enter = picked.iter().find(|stepped| animated(stepped)).map(|stepped| self.entrance_of(slide, &stepped.target));
+        let mixed = picked.iter().any(|stepped| animated(stepped)) && !picked.iter().all(|stepped| animated(stepped));
         let (each, can_each) = match targets.as_slice() {
-            [Target::Region(name)] => {
-                let layout = self.text_layout(slide);
-                let is_list = layout.region(name).is_some_and(|region| region.is_list);
-                (Some(picked.iter().any(|stepped| stepped.each)), is_list)
-            }
+            [Target::Region(name)] => (Some(picked.iter().any(|stepped| stepped.each)), self.holds_a_list(slide, name)),
             _ => (None, false),
         };
-        AnimateHere { targets, click, steps, enter, each, can_each, transition, why_not: None }
+        AnimateHere { targets, click, steps, enter, mixed, each, can_each, transition, why_not: None }
     }
 
     /// Makes `choice` for what [`Self::animate_here`] says the tools are about, as one step
     /// named "Change animation", and returns the slides to show again. Making it still takes
-    /// its entrance away too, and an area's showing a piece at a time. Refused with nothing to
-    /// animate, with a thing written in the slide's text, or for a thing to animate on a slide
-    /// with as many steps as it can have.
+    /// its click and entrance away, whatever they're written as. Refused with nothing to
+    /// animate, with a thing written in the slide's text, for an area that holds no list to
+    /// show a piece at a time, or for a thing to animate on a slide with every step taken. A
+    /// choice that changes nothing leaves the typing be.
     pub fn animate(&mut self, choice: Choice) -> Result<Vec<usize>, EditRefused> {
         self.animated(choice, None)
     }
@@ -101,7 +106,8 @@ impl Document {
         self.make(TRANSITION, change, holds, current, current, None)
     }
 
-    /// A badge for each thing and area on the current slide that's animated, areas first.
+    /// A badge for each thing and area on the current slide that's animated, areas first, where
+    /// it's shown: at the place a drag shows it, while one does.
     pub fn step_badges(&mut self) -> Vec<StepBadge> {
         let slide = self.current;
         let (all, _) = self.stepped(slide);
@@ -109,15 +115,14 @@ impl Document {
             return Vec::new();
         }
         let layout = self.text_layout(slide);
-        let pieces = if all.iter().any(|stepped| stepped.each) { self.pieces(slide) } else { Vec::new() };
         all.iter()
             .filter_map(|stepped| {
                 let words = match (stepped.click, &stepped.target) {
                     (Some(click), _) => click.to_string(),
-                    (None, Target::Region(name)) if stepped.each => {
-                        let count = pieces.iter().find(|(region, _)| region == name).map_or(1, |(_, count)| *count);
-                        if count > 1 { format!("1\u{2013}{count}") } else { "1".to_string() }
-                    }
+                    (None, Target::Region(name)) if stepped.each => match self.deck.each_steps(slide, name) {
+                        Some(steps) if steps > 1 => format!("1\u{2013}{steps}"),
+                        _ => "1".to_string(),
+                    },
                     _ => return None,
                 };
                 let (rect, rotate) = match &stepped.target {
@@ -131,34 +136,75 @@ impl Document {
 
     /// What `choice` makes, with each target then coming in as `enter` says, if it says.
     fn animated(&mut self, choice: Choice, enter: Option<Enter>) -> Result<Vec<usize>, EditRefused> {
-        let targets = self.animate_targets()?;
-        // Only one area is shown a piece at a time.
-        if matches!(choice, Choice::Each(_)) && !matches!(targets.as_slice(), [Target::Region(_)]) {
+        let slide = self.current;
+        // The area or box typed in is chosen by its name, or where its tag starts, which
+        // finishing the typing doesn't change.
+        let typed = self.typed_target();
+        let words = self.animation_words(slide, choice, enter, typed.clone())?;
+        if words.is_empty() {
             return Ok(Vec::new());
         }
-        // Text being typed in an area is finished first: the area is chosen by its name, which
-        // that doesn't change.
-        let typed_in = self.editing.as_ref().and_then(|editing| editing.flow.region().map(str::to_string));
-        let typed_in = typed_in.filter(|_| self.selection.is_none());
+        let version = self.text_version();
         self.finish_before_edit()?;
-        let slide = self.current;
-        let made = self.animation_made(slide, &targets, choice, enter);
-        // The area typed in stays the one the tools act on, whatever came of it.
-        if let Some(name) = typed_in {
-            self.select_region(slide, &name);
+        let words = if self.text_version() == version {
+            words
+        } else {
+            // Finishing the typing tidied the talk: what's selected may no longer be what was
+            // asked about, and what's typed in is worked out again.
+            if typed.is_none() {
+                return Err(EditRefused::CouldNotBeMade);
+            }
+            self.animation_words(slide, choice, enter, typed.clone())?
+        };
+        let fixed = self.deck.fixed_steps(slide);
+        let depth = self.history.depth();
+        let mut changed = if words.is_empty() { Vec::new() } else { self.write_values(slide, &words, EditRun::New)? };
+        // An area no longer shown a piece at a time can leave steps that nothing comes in on.
+        if !words.is_empty() && self.deck.fixed_steps(slide) < fixed {
+            let (all, fixed) = self.stepped(slide);
+            let closing: Vec<Word> = closed_up(&all, fixed).into_iter().map(|(target, click)| (target, "click", click.map(|click| click.to_string()))).collect();
+            if !closing.is_empty() {
+                let run = self.open_run().map_or(EditRun::New, EditRun::Continue);
+                changed.extend(self.write_values(slide, &closing, run)?);
+            }
         }
-        made
+        // What was typed in is selected, so the tools stay on it; Undo goes back to nothing
+        // selected, and Redo selects it again.
+        if let Some(target) = typed {
+            let picked = match &target {
+                Target::Region(name) => self.select_region(slide, name),
+                Target::Tag(source) => match self.tag_from(slide, source.start) {
+                    Some(range) => self.select(slide, range),
+                    None => false,
+                },
+            };
+            if picked && self.history.depth() > depth {
+                self.history.select_mark_last(SelectMark { before: None, after: self.selection.clone() });
+            }
+        }
+        Ok(changed)
     }
 
-    /// Makes `choice` for `targets` on slide `slide`, as [`Self::animated`] says.
-    fn animation_made(&mut self, slide: usize, targets: &[Target], choice: Choice, enter: Option<Enter>) -> Result<Vec<usize>, EditRefused> {
+    /// The values `choice` writes on slide `slide` for what the tools are about, with each
+    /// chosen then coming in as `enter` says, if it says: none where nothing would change.
+    fn animation_words(&mut self, slide: usize, choice: Choice, enter: Option<Enter>, typed: Option<Target>) -> Result<Vec<Word>, EditRefused> {
+        let targets = self.animate_targets(typed)?;
+        if let Choice::Each(on) = choice {
+            // Only one area is shown a piece at a time, and only one that holds a list.
+            let [Target::Region(name)] = targets.as_slice() else {
+                return Ok(Vec::new());
+            };
+            if on && !self.holds_a_list(slide, name) {
+                return Err(EditRefused::NotAList);
+            }
+        }
         let (all, fixed) = self.stepped(slide);
-        let steps = chosen(&all, fixed, targets, choice);
+        let steps = chosen(&all, fixed, &targets, choice);
         let still = all.iter().any(|stepped| targets.contains(&stepped.target) && stepped.click.is_none() && !stepped.each);
-        if choice == Choice::Animate && steps.is_none() && still && steps_shown(&all, fixed) >= MAX_STEP {
+        if choice == Choice::Animate && steps.is_none() && still {
             return Err(EditRefused::TooManySteps);
         }
-        let mut words: Vec<(Target, &'static str, Option<String>)> = Vec::new();
+        let mut words: Vec<Word> = Vec::new();
         let mut word = |target: &Target, name: &'static str, value: Option<String>| {
             match words.iter_mut().find(|(at, named, _)| at == target && *named == name) {
                 Some(found) => found.2 = value,
@@ -168,16 +214,15 @@ impl Document {
         for (target, click) in steps.iter().flatten() {
             word(target, "click", click.map(|click| click.to_string()));
         }
-        for stepped in all.iter().filter(|stepped| targets.contains(&stepped.target)) {
-            let target = &stepped.target;
+        for target in all.iter().map(|stepped| &stepped.target).filter(|target| targets.contains(target)) {
             match choice {
                 Choice::Each(on) => word(target, "click", on.then(|| "each".to_string())),
+                // Whatever is written, read or not.
                 Choice::Remove => {
-                    if stepped.each {
-                        word(target, "click", None);
-                    }
-                    if self.entrance_written(slide, target) {
-                        word(target, "enter", None);
+                    for name in ["click", "enter"] {
+                        if self.written(slide, target, name).is_some() {
+                            word(target, name, None);
+                        }
                     }
                 }
                 _ => {}
@@ -188,26 +233,12 @@ impl Document {
         }
         // What's already as asked isn't written again.
         words.retain(|(target, name, value)| self.written(slide, target, name).as_deref() != value.as_deref());
-        if words.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut changed = self.write_values(slide, &words, EditRun::New)?;
-        // An area no longer shown a piece at a time can leave steps that nothing comes in on.
-        if self.deck.fixed_steps(slide) < fixed {
-            let (all, fixed) = self.stepped(slide);
-            let closing: Vec<(Target, &'static str, Option<String>)> =
-                closed_up(&all, fixed).into_iter().map(|(target, click)| (target, "click", click.map(|click| click.to_string()))).collect();
-            if !closing.is_empty() {
-                let run = self.open_run().map_or(EditRun::New, EditRun::Continue);
-                changed.extend(self.write_values(slide, &closing, run)?);
-            }
-        }
-        Ok(changed)
+        Ok(words)
     }
 
     /// Writes each of `words` on slide `slide` as one step joining the run `run` says, keeping
     /// what's selected.
-    fn write_values(&mut self, slide: usize, words: &[(Target, &'static str, Option<String>)], run: EditRun) -> Result<Vec<usize>, EditRefused> {
+    fn write_values(&mut self, slide: usize, words: &[Word], run: EditRun) -> Result<Vec<usize>, EditRefused> {
         let edits: Vec<ValueEdit> = words.iter().map(|(target, name, value)| ValueEdit { target: target.clone(), name, value: value.as_deref() }).collect();
         let change = built(self.talk(), |talk| set_values(talk, slide, &edits))?.ok_or(EditRefused::CouldNotBeMade)?;
         let before = self.selection.clone().filter(|selection| selection.slide == slide);
@@ -219,49 +250,81 @@ impl Document {
         Ok(changed)
     }
 
+    /// With nothing selected on the current slide, what's typed in there: the area, or the
+    /// top-level tag of the box or shape.
+    fn typed_target(&self) -> Option<Target> {
+        let slide = self.current;
+        if self.selection.as_ref().is_some_and(|selection| selection.slide == slide && !selection.things.is_empty()) {
+            return None;
+        }
+        let editing = self.editing.as_ref().filter(|editing| editing.slide == slide)?;
+        if let Some(name) = editing.flow.region() {
+            return Some(Target::Region(name.to_string()));
+        }
+        let start = editing.flow.tag_start()?;
+        self.tag_from(slide, start).map(Target::Tag)
+    }
+
+    /// The top-level tag on slide `slide` that starts at byte `start`, by its whole range.
+    fn tag_from(&self, slide: usize, start: usize) -> Option<Range<usize>> {
+        self.talk().slides.get(slide)?.blocks.iter().find_map(|block| match block {
+            Block::Tag(tag) if tag.range.start == start => Some(tag.range.clone()),
+            _ => None,
+        })
+    }
+
     /// The things and areas the Animate tab acts on: those selected on the current slide, or
-    /// with nothing selected, the area whose text is being typed.
-    fn animate_targets(&self) -> Result<Vec<Target>, EditRefused> {
+    /// with nothing selected, `typed`, what's typed in.
+    fn animate_targets(&self, typed: Option<Target>) -> Result<Vec<Target>, EditRefused> {
         let slide = self.current;
         let Some(written) = self.talk().slides.get(slide) else {
             return Err(EditRefused::NothingToAnimate);
         };
-        if let Some(selection) = self.selection.as_ref().filter(|selection| selection.slide == slide && !selection.things.is_empty()) {
-            return selection
+        let placed = |source: &Range<usize>| written.blocks.iter().any(|block| matches!(block, Block::Tag(tag) if is_positioned(tag) && tag.range == *source));
+        let things: Vec<Target> = match self.selection.as_ref().filter(|selection| selection.slide == slide && !selection.things.is_empty()) {
+            Some(selection) => selection
                 .things
                 .iter()
                 .map(|thing| match thing {
-                    Thing::Region(name) => Ok(Target::Region(name.clone())),
-                    Thing::Block(source) => {
-                        let placed = written.blocks.iter().any(|block| matches!(block, Block::Tag(tag) if is_positioned(tag) && tag.range == *source));
-                        if placed { Ok(Target::Tag(source.clone())) } else { Err(EditRefused::InTheText) }
-                    }
+                    Thing::Region(name) => Target::Region(name.clone()),
+                    Thing::Block(source) => Target::Tag(source.clone()),
                 })
-                .collect();
+                .collect(),
+            None => typed.into_iter().collect(),
+        };
+        if things.is_empty() {
+            return Err(EditRefused::NothingToAnimate);
         }
-        match self.editing.as_ref().filter(|editing| editing.slide == slide).and_then(|editing| editing.flow.region()) {
-            Some(name) => Ok(vec![Target::Region(name.to_string())]),
-            None => Err(EditRefused::NothingToAnimate),
+        if things.iter().any(|target| matches!(target, Target::Tag(source) if !placed(source))) {
+            return Err(EditRefused::InTheText);
         }
+        Ok(things)
+    }
+
+    /// Whether area `name` of slide `slide` holds a list, or more than one block.
+    fn holds_a_list(&mut self, slide: usize, name: &str) -> bool {
+        self.text_layout(slide).region(name).is_some_and(|region| region.is_list)
     }
 
     /// What each thing with a place of its own and each area of slide `slide` has now, and how
-    /// many of its steps are fixed ones.
+    /// many of its steps are fixed ones. An area is shown a piece at a time as the engine shows
+    /// it, so that its steps are among the fixed ones.
     fn stepped(&mut self, slide: usize) -> (Vec<Stepped>, u32) {
         if slide >= self.slide_count() {
             return (Vec::new(), 0);
         }
         let layout = self.text_layout(slide);
         let fixed = self.deck.fixed_steps(slide);
+        let each: Vec<bool> = layout.regions().iter().map(|region| self.deck.each_steps(slide, &region.name).is_some()).collect();
         let Some(written) = self.talk().slides.get(slide) else {
             return (Vec::new(), fixed);
         };
-        let areas = layout.regions().iter().map(|region| {
+        let areas = layout.regions().iter().zip(each).map(|(region, each)| {
             let value = guarded(|| region_value(written, &region.name, "click")).ok().flatten();
-            Stepped { target: Target::Region(region.name.clone()), click: value.and_then(click_of), each: value == Some("each") }
+            Stepped { target: Target::Region(region.name.clone()), click: value.and_then(read_click), each }
         });
         let things = written.blocks.iter().filter_map(|block| match block {
-            Block::Tag(tag) if is_positioned(tag) => Some(Stepped { target: Target::Tag(tag.range.clone()), click: tag.attr("click").and_then(click_of), each: false }),
+            Block::Tag(tag) if is_positioned(tag) => Some(Stepped { target: Target::Tag(tag.range.clone()), click: tag.attr("click").and_then(read_click), each: false }),
             _ => None,
         });
         (areas.chain(things).collect(), fixed)
@@ -279,91 +342,8 @@ impl Document {
         }
     }
 
-    /// Whether `target` has an entrance written, readable or not.
-    fn entrance_written(&self, slide: usize, target: &Target) -> bool {
-        self.written(slide, target, "enter").is_some()
-    }
-
     /// How `target` comes in, as the engine reads it.
     fn entrance_of(&self, slide: usize, target: &Target) -> Enter {
-        match self.written(slide, target, "enter").as_deref().map(str::trim) {
-            Some("fade") => Enter::Fade,
-            Some("fly-up") => Enter::FlyUp,
-            _ => Enter::Appear,
-        }
-    }
-
-    /// How many pieces each area of slide `slide` shown a piece at a time is shown in, by its
-    /// name: the layers the engine draws it in, one for each step from 1.
-    fn pieces(&mut self, slide: usize) -> Vec<(String, u32)> {
-        let layout = self.text_layout(slide);
-        let content = self.content_tags();
-        let flows = guarded(|| flows_in(self.talk(), slide, &content)).unwrap_or_default();
-        // Where each area's text is written, to tell its pieces from the next area's layer.
-        let text_of = |name: &str| -> Vec<Range<usize>> {
-            flows
-                .iter()
-                .enumerate()
-                .filter(|(at, _)| layout.region_of_flow(*at) == Some(name))
-                .flat_map(|(_, flow)| flow.source.iter().map(|source| source.block.clone()))
-                .collect()
-        };
-        let Some(written) = self.talk().slides.get(slide) else {
-            return Vec::new();
-        };
-        // Each area that holds anything, in the layout's order, and whether it's shown a piece
-        // at a time: a turned one is shown whole.
-        let areas: Vec<(&str, bool)> = layout
-            .regions()
-            .iter()
-            .filter(|region| !region.empty)
-            .map(|region| {
-                let line = |name: &str| guarded(|| region_value(written, &region.name, name).map(str::to_string)).ok().flatten();
-                let turned = line("rotate").and_then(|value| value.parse::<f32>().ok()).is_some_and(|turn| turn.is_finite() && turn != 0.);
-                (region.name.as_str(), line("click").as_deref() == Some("each") && !turned)
-            })
-            .collect();
-        let deck = &mut self.deck;
-        let Ok(layers) = guarded(|| deck.specs_fonts_and_files(slide).0.iter().map(|spec| (spec.source.clone(), spec.click)).collect::<Vec<_>>()) else {
-            return Vec::new();
-        };
-        let mut pieces = Vec::new();
-        // The background comes first, then each area that holds anything, in the layout's order.
-        let mut at = 1;
-        for (name, each) in areas {
-            if !each {
-                at += 1;
-                continue;
-            }
-            let others: Vec<Range<usize>> = layout
-                .regions()
-                .iter()
-                .filter(|other| other.name != name)
-                .flat_map(|other| text_of(&other.name))
-                .collect();
-            let mut count = 0;
-            while let Some((source, click)) = layers.get(at) {
-                let of_another = source.as_ref().is_some_and(|source| others.iter().any(|text| source.start <= text.start && text.end <= source.end));
-                if *click != Some(count + 1) || of_another {
-                    break;
-                }
-                count += 1;
-                at += 1;
-            }
-            if count == 0 {
-                at += 1;
-            }
-            pieces.push((name.to_string(), count.max(1)));
-        }
-        pieces
-    }
-}
-
-/// How `enter` is written.
-fn enter_word(enter: Enter) -> &'static str {
-    match enter {
-        Enter::Appear => "appear",
-        Enter::Fade => "fade",
-        Enter::FlyUp => "fly-up",
+        self.written(slide, target, "enter").as_deref().and_then(read_enter).unwrap_or_default()
     }
 }

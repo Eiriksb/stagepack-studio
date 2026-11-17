@@ -397,11 +397,146 @@ fn hand_written_click_zero_reads_as_not_animated(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn a_slide_at_its_last_step_refuses_another(cx: &mut TestAppContext) {
+fn a_click_written_at_the_last_step_makes_room_for_another(cx: &mut TestAppContext) {
     let talk = talk_with(RECT, " click=\"999\"");
+    let typing = open_animate(cx, &talk);
+    click_thing(&typing, cx, ELLIPSE, Modifiers::default());
+    pick(&typing, cx, ENTRANCE_ID, &ENTRANCES, "Fade in");
+    assert!(tag_of(&typing, cx, RECT).contains("click=\"1\""), "{}", typing.source(cx));
+    assert!(tag_of(&typing, cx, ELLIPSE).contains("click=\"2\" enter=\"fade\""), "{}", typing.source(cx));
+}
+
+#[gpui_kit::test]
+fn a_slide_with_every_step_taken_refuses_another(cx: &mut TestAppContext) {
+    // A list shown an item at a time, of as many items as a slide has steps.
+    let mut talk = String::from("---\nregion.body: click=each\n---\n\n# Full\n\n");
+    for _ in 0..999 {
+        talk.push_str("- a\n");
+    }
+    talk.push_str("\n<Shape kind=\"ellipse\" x=\"700\" y=\"550\" w=\"100\" h=\"100\" />\n");
     let typing = open_animate(cx, &talk);
     click_thing(&typing, cx, ELLIPSE, Modifiers::default());
     pick(&typing, cx, ENTRANCE_ID, &ENTRANCES, "Fade in");
     assert_eq!(typing.status(cx).as_deref(), Some(TOO_MANY));
     assert_eq!(typing.source(cx), talk);
+}
+
+#[gpui_kit::test]
+fn no_animation_takes_away_a_click_that_cannot_be_read(cx: &mut TestAppContext) {
+    for written in [" click=\"0\" enter=\"fade\"", " click=\"x\"", " enter=\"sideways\""] {
+        let talk = talk_with(RECT, written);
+        let typing = open_animate(cx, &talk);
+        click_thing(&typing, cx, RECT, Modifiers::default());
+        pick(&typing, cx, ENTRANCE_ID, &ENTRANCES, "No animation");
+        assert_eq!(typing.source(cx), TALK, "{written}");
+    }
+}
+
+#[gpui_kit::test]
+fn the_box_being_typed_in_is_the_target(cx: &mut TestAppContext) {
+    let talk = "# T\n\n<Text x=\"200\" y=\"300\" w=\"800\" h=\"400\">\n\nHi there\n\n</Text>\n";
+    let typing = open_animate(cx, talk);
+    let flow = (0..typing.flows(cx, 0).len()).find(|&flow| typing.layout(cx).region_of_flow(flow).is_none()).expect("the box's text");
+    typing.double_click_text(cx, flow, pos(0, 2));
+    assert!(typing.editing(cx).is_some());
+    assert_eq!(label_of(&typing, cx, STEP_LABEL_ID).as_deref(), Some("Not animated"));
+    pick(&typing, cx, ENTRANCE_ID, &ENTRANCES, "Fade in");
+    assert_eq!(typing.source(cx), talk.replace("h=\"400\">", "h=\"400\" click=\"1\" enter=\"fade\">"));
+    let source = typing.source(cx);
+    assert_eq!(selected(&typing, cx).map(|(_, range)| source[range].starts_with("<Text")), Some(true), "the box is selected");
+    // Typed in, the box was selected all along: Undo leaves it so.
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), talk);
+    assert_eq!(selected(&typing, cx).map(|(_, range)| talk[range].starts_with("<Text")), Some(true));
+    typing.press(cx, "ctrl-shift-z");
+    assert_eq!(typing.source(cx), talk.replace("h=\"400\">", "h=\"400\" click=\"1\" enter=\"fade\">"));
+    assert!(selected(&typing, cx).is_some(), "selected after Redo");
+}
+
+#[gpui_kit::test]
+fn a_choice_that_changes_nothing_leaves_the_typing_be(cx: &mut TestAppContext) {
+    let typing = open_animate(cx, TALK);
+    let body = body_flow(&typing, cx, 0);
+    typing.click_text(cx, body, pos(0, 2));
+    pick(&typing, cx, ENTRANCE_ID, &ENTRANCES, "No animation");
+    typing.with_window(cx, |window, cx| window.dispatch_action(Box::new(ChooseAnimation { choice: Choice::Earlier }), cx));
+    typing.settle(cx);
+    assert!(typing.editing(cx).is_some(), "still typing");
+    assert_eq!(typing.source(cx), TALK);
+    assert!(typing.document(cx).read_with(cx, |document, _| !document.can_undo()));
+    // The area chosen while typed in is selected; Undo lets go of it.
+    pick(&typing, cx, ENTRANCE_ID, &ENTRANCES, "Appear");
+    let selection = typing.document(cx).read_with(cx, |document, _| document.selection().cloned());
+    assert_eq!(selection.map(|selection| selection.things), Some(vec![Thing::Region("body".to_string())]));
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), TALK);
+    assert!(typing.document(cx).read_with(cx, |document, _| document.selection().is_none()));
+}
+
+#[gpui_kit::test]
+fn an_area_emptied_by_typing_is_still_the_target(cx: &mut TestAppContext) {
+    let typing = open_animate(cx, TALK);
+    go_to(&typing, cx, 1);
+    let body = body_flow(&typing, cx, 1);
+    typing.click_text(cx, body, pos(0, 2));
+    typing.press(cx, "ctrl-a");
+    typing.press(cx, "backspace");
+    pick(&typing, cx, ENTRANCE_ID, &ENTRANCES, "Fade in");
+    assert!(typing.source(cx).contains("region.body: click=1 enter=fade"), "{}", typing.source(cx));
+    assert!(!typing.source(cx).contains("Just one paragraph"));
+}
+
+#[gpui_kit::test]
+fn one_paragraph_is_not_shown_a_piece_at_a_time_however_it_is_asked(cx: &mut TestAppContext) {
+    let typing = open_animate(cx, TALK);
+    go_to(&typing, cx, 1);
+    select_body(&typing, cx);
+    typing.with_window(cx, |window, cx| window.dispatch_action(Box::new(ChooseAnimation { choice: Choice::Each(true) }), cx));
+    typing.settle(cx);
+    assert_eq!(typing.status(cx).as_deref(), Some("Select an area that holds a list to show it one item at a time."));
+    assert_eq!(typing.source(cx), TALK);
+}
+
+#[gpui_kit::test]
+fn some_animated_and_some_not_says_so(cx: &mut TestAppContext) {
+    let talk = talk_with(RECT, " click=\"1\"");
+    let typing = open_animate(cx, &talk);
+    click_thing(&typing, cx, RECT, Modifiers::default());
+    click_thing(&typing, cx, ELLIPSE, Modifiers::shift());
+    assert_eq!(label_of(&typing, cx, STEP_LABEL_ID).as_deref(), Some("Some aren't animated"));
+    let talk = talk.replacen("h=\"100\" />", "h=\"100\" click=\"2\" />", 1);
+    let typing = open_animate(cx, &talk);
+    click_thing(&typing, cx, RECT, Modifiers::default());
+    click_thing(&typing, cx, ELLIPSE, Modifiers::shift());
+    assert_eq!(label_of(&typing, cx, STEP_LABEL_ID).as_deref(), Some("Clicks differ"));
+}
+
+#[gpui_kit::test]
+fn a_badge_follows_a_thing_dragged(cx: &mut TestAppContext) {
+    let talk = talk_with(RECT, " click=\"1\"");
+    let typing = open_animate(cx, &talk);
+    let rect = thing(&typing, cx, RECT).rect;
+    let from = typing.at(cx, rect.x + rect.w / 2., rect.y + rect.h / 2.);
+    let to = typing.at(cx, rect.x + rect.w / 2. + 300., rect.y + rect.h / 2. + 100.);
+    typing.mouse_down(cx, from, 1, Modifiers::default());
+    typing.move_held(cx, typing.at(cx, rect.x + rect.w / 2. + 150., rect.y + rect.h / 2. + 50.), Modifiers::default());
+    typing.move_held(cx, to, Modifiers::default());
+    let badge = bounds_of(&typing, cx, step_badge_id(0)).expect("the badge").origin;
+    let corner = typing.at(cx, rect.x + 300., rect.y + 100.);
+    assert!((badge.x - corner.x).abs() <= px(2.) && (badge.y - corner.y).abs() <= px(2.), "{badge:?} isn't at {corner:?}");
+    typing.mouse_up(cx, to, 1, Modifiers::default());
+    let rect = thing(&typing, cx, RECT).rect;
+    let corner = typing.at(cx, rect.x, rect.y);
+    let badge = bounds_of(&typing, cx, step_badge_id(0)).expect("the badge").origin;
+    assert!((badge.x - corner.x).abs() <= px(1.) && (badge.y - corner.y).abs() <= px(1.), "{badge:?} isn't at {corner:?}");
+}
+
+#[gpui_kit::test]
+fn a_turned_list_shown_one_at_a_time_comes_in_whole_on_click_one(cx: &mut TestAppContext) {
+    let talk = TALK
+        .replacen("title: T\n", "title: T\nregion.body: click=each rotate=10\n", 1)
+        .replacen("h=\"200\" />", "h=\"200\" click=\"2\" />", 1);
+    let typing = open_animate(cx, &talk);
+    assert_eq!(badges(&typing, cx), ["1", "2"]);
+    assert_eq!(typing.document(cx).update(cx, |document, _| document.timeline_of(0).steps), 2);
 }

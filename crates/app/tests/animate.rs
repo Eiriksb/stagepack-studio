@@ -40,6 +40,14 @@ fn without_gaps(all: &[Stepped], fixed: u32) -> Vec<Stepped> {
         .collect()
 }
 
+/// The step `click` of `all` is at once the steps above `fixed` that nothing has are closed.
+fn closed(all: &[Stepped], fixed: u32, click: Option<u32>) -> Option<u32> {
+    let mut used: Vec<u32> = all.iter().filter_map(|was| was.click).filter(|click| *click > fixed).collect();
+    used.sort_unstable();
+    used.dedup();
+    click.map(|click| if click > fixed { fixed + 1 + used.iter().position(|used| *used == click).unwrap() as u32 } else { click })
+}
+
 /// Whether every step from `fixed + 1` to the slide's last has something on it.
 fn no_empty_step(all: &[Stepped], fixed: u32) -> bool {
     (fixed + 1..=steps_shown(all, fixed)).all(|step| all.iter().any(|was| was.click == Some(step)))
@@ -112,24 +120,36 @@ proptest! {
                 }
             }
         }
-        // On a slide without gaps, what's below the steps the chosen left or came to is left
-        // be, and animating moves nothing else.
+        // Animating renumbers the others only to close the gaps the slide has.
+        if choice == Choice::Animate {
+            for at in &not_chosen {
+                prop_assert_eq!(after[*at].click, closed(&all, fixed, all[*at].click), "{:?}", all[*at]);
+            }
+        }
+        // On a slide without gaps, another moves only as the chosen leave room for it.
         let all = without_gaps(&all, fixed);
         let Some(result) = chosen(&all, fixed, &picked, choice) else { return Ok(()) };
-        let low = result
-            .iter()
-            .filter(|(target, _)| picked.contains(target))
-            .flat_map(|(target, click)| [all.iter().find(|was| was.target == *target).unwrap().click, *click])
-            .flatten()
-            .min()
-            .unwrap_or(u32::MAX);
-        for (target, _) in &result {
-            if picked.contains(target) {
-                continue;
+        let after = applied(&all, &result);
+        // Whether only chosen things came in on `step`, and some did.
+        let only_chosen = |step: u32| {
+            all.iter().any(|was| was.click == Some(step)) && all.iter().all(|was| was.click != Some(step) || picked.contains(&was.target))
+        };
+        for &at in &not_chosen {
+            let (Some(was), Some(now)) = (all[at].click, after[at].click) else { continue };
+            match choice {
+                // Up only into a run of steps just above it that only the chosen came in on, as
+                // they move, and down no further than the steps below it they came in on alone.
+                Choice::Later | Choice::Earlier => {
+                    let alone_below = (fixed + 1..was).filter(|step| only_chosen(*step)).count() as u32;
+                    prop_assert!((was + 1..=now).all(only_chosen) && was - now.min(was) <= alone_below, "{:?} went from {was} to {now}", all[at]);
+                }
+                Choice::Remove | Choice::Each(true) => {
+                    // The steps below it that only the chosen came in on, which are left empty.
+                    let emptied = (fixed + 1..was).filter(|step| only_chosen(*step)).count() as u32;
+                    prop_assert_eq!(now, was - emptied, "{:?}", all[at]);
+                }
+                Choice::Animate | Choice::Each(false) => prop_assert_eq!(now, was),
             }
-            prop_assert!(choice != Choice::Animate, "animating moved {target:?}");
-            let was = all.iter().find(|was| was.target == *target).unwrap().click.unwrap();
-            prop_assert!(was > fixed && was + 1 >= low, "{target:?} at {was} moved, the chosen at {low}");
         }
     }
 
@@ -256,10 +276,18 @@ fn one_at_a_time_takes_the_areas_numbered_click() {
 
 #[test]
 fn nothing_goes_past_the_last_step() {
-    let all = [stepped(tag(0), Some(MAX_STEP)), stepped(tag(1), None), stepped(tag(2), Some(MAX_STEP))];
-    assert_eq!(chosen(&all, 0, &[tag(1)], Choice::Animate), None);
-    assert_eq!(chosen(&all, 0, &[tag(0)], Choice::Later), None);
-    assert_eq!(steps_shown(&all, 0), MAX_STEP);
+    // Every step is taken, by an area shown a piece at a time.
+    let all = [Stepped { target: area("body"), click: None, each: true }, stepped(tag(1), None), stepped(tag(2), Some(MAX_STEP))];
+    assert_eq!(chosen(&all, MAX_STEP, &[tag(1)], Choice::Animate), None);
+    assert_eq!(chosen(&all, MAX_STEP, &[tag(2)], Choice::Later), None);
+    assert_eq!(steps_shown(&all, MAX_STEP), MAX_STEP);
     assert_eq!(steps_shown(&all, 4), MAX_STEP);
     assert_eq!(steps_shown(&[], 4), 4);
+}
+
+#[test]
+fn a_click_written_at_the_last_step_is_closed_up_to_make_room() {
+    let all = [stepped(tag(0), Some(MAX_STEP)), stepped(tag(1), None), stepped(tag(2), Some(MAX_STEP))];
+    assert_eq!(chosen(&all, 0, &[tag(1)], Choice::Animate), Some(vec![(tag(0), Some(1)), (tag(1), Some(2)), (tag(2), Some(1))]));
+    assert_eq!(chosen(&all, 3, &[tag(1)], Choice::Animate), Some(vec![(tag(0), Some(4)), (tag(1), Some(5)), (tag(2), Some(4))]));
 }

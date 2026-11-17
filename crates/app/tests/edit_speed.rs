@@ -224,7 +224,17 @@ fn sixty_things() -> String {
 /// does before it draws. Gives the median and the slowest frame, how many frames snapped, and
 /// how many showed the same place as the frame before.
 fn drag_frames(others: impl Fn(&[(Thing, Placed)]) -> Vec<Rect>, by: impl Fn(usize) -> (f32, f32)) -> (Duration, Duration, usize, usize) {
-    let talk = sixty_things();
+    drag_frames_on(sixty_things(), others, by, |_| {})
+}
+
+/// [`drag_frames`] on `talk`, whose last slide has sixty placed things, with `more` worked out
+/// at each frame too.
+fn drag_frames_on(
+    talk: String,
+    others: impl Fn(&[(Thing, Placed)]) -> Vec<Rect>,
+    by: impl Fn(usize) -> (f32, f32),
+    more: impl Fn(&mut Document),
+) -> (Duration, Duration, usize, usize) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("slides.md"), &talk).unwrap();
     let mut doc = Document::open(dir.path(), Fonts::bundled_only()).unwrap();
@@ -248,6 +258,7 @@ fn drag_frames(others: impl Fn(&[(Thing, Placed)]) -> Vec<Rect>, by: impl Fn(usi
         doc.preview_places(&places);
         let layers = doc.editor_layers(scale);
         let layout = doc.text_layout(slide);
+        more(&mut doc);
         times.push(start.elapsed());
         assert!(layers.len() > 60, "frame {frame}: the heading and the sixty");
         assert_eq!(layout.elements().len(), 60);
@@ -297,6 +308,79 @@ fn a_frame_of_a_snapping_drag_on_a_slide_of_sixty_things_is_quick() {
     assert!(snapped >= 150, "most frames snap: {snapped}");
     assert!(held <= 10, "most frames show a place of their own: {held} held");
     assert!(median < MOST_FOR_A_DRAG_FRAME, "a drag frame took {median:?}");
+}
+
+/// Dragging sixty things, each animated, on the Animate tab, beside a list shown an item at a
+/// time: each frame the slide's badges and the tab's tools are worked out again, as the window
+/// does before it draws.
+#[test]
+#[ignore = "timing; run in release"]
+fn a_frame_of_a_drag_on_the_animate_tab_is_quick() {
+    let talk = sixty_things()
+        .replacen("---\n\n# Sixty\n\n", "---\nregion.body: click=each\n---\n\n# Sixty\n\n- one\n- two\n- three\n\n", 1)
+        .replace("h=\"80\" />", "h=\"80\" click=\"2\" enter=\"fade\" />");
+    let away = |starts: &[(Thing, Placed)]| starts.iter().map(|(_, placed)| Rect { x: placed.rect.x + 5000., y: placed.rect.y + 5000., ..bounds(placed) }).collect();
+    let badges = |doc: &mut Document| {
+        assert_eq!(doc.step_badges().len(), 61);
+        assert_eq!(doc.animate_here().targets.len(), 60);
+    };
+    let (median, slowest, snapped, held) = drag_frames_on(talk, away, here_and_there, badges);
+    println!("median drag frame of sixty things on the Animate tab on a {SLIDES}-slide talk: {median:?} (slowest {slowest:?}), {snapped} of 200 snapped, {held} held");
+    assert!(median < MOST_FOR_A_DRAG_FRAME, "a drag frame took {median:?}");
+}
+
+/// A letter typed in a list shown an item at a time, on the Animate tab: the slide's badges and
+/// the tab's tools are worked out again after it, as the window does before it draws.
+#[test]
+#[ignore = "timing; run in release"]
+fn a_keystroke_on_the_animate_tab_is_quick() {
+    let slide = SLIDES / 2;
+    let talk = long_talk().replacen(&format!("---\n\n# Slide {slide}\n"), &format!("---\nregion.body: click=each\n---\n\n# Slide {slide}\n"), 1);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("slides.md"), talk).unwrap();
+    let mut doc = Document::open(dir.path(), Fonts::bundled_only()).unwrap();
+    doc.go_to(slide);
+    let flows = text_flows(doc.talk(), slide);
+    let body = flows.iter().position(|flow| flow.place == FlowPlace::Region("body".into())).expect("the slide has words");
+    let words: usize = flows[body].paras[0].spans.iter().map(|span| span.text.len()).sum();
+    assert!(doc.begin_text(slide, body, Pos { para: 0, offset: words }));
+    doc.text_layout(slide);
+    let mut times = Vec::with_capacity(KEYSTROKES);
+    for key in 0..KEYSTROKES {
+        let letter = if key % 6 == 5 { " " } else { "a" };
+        let start = Instant::now();
+        doc.apply_text(|edit| edit.insert(letter)).unwrap();
+        doc.text_layout(slide);
+        let badges = doc.step_badges();
+        let here = doc.animate_here();
+        times.push(start.elapsed());
+        assert_eq!(badges.len(), 1);
+        assert_eq!(here.each, Some(true));
+    }
+    report("keystroke typed on the Animate tab", times);
+}
+
+/// Every slide of a long talk given a transition, as one step: a step taken once, by a tool.
+#[test]
+#[ignore = "timing; run in release"]
+fn apply_to_all_slides_on_a_long_talk_is_quick() {
+    let talk = long_talk();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("slides.md"), &talk).unwrap();
+    let mut doc = Document::open(dir.path(), Fonts::bundled_only()).unwrap();
+    let mut times = Vec::new();
+    for _ in 0..10 {
+        let start = Instant::now();
+        doc.set_slide_transition(slides_engine::Transition::Fade, true).unwrap();
+        times.push(start.elapsed());
+        assert_eq!(doc.timeline_of(SLIDES - 1).transition, slides_engine::Transition::Fade);
+        doc.undo().unwrap();
+        assert_eq!(doc.source(), talk, "one step");
+    }
+    times.sort();
+    let median = times[times.len() / 2];
+    println!("median Apply to all slides on a {SLIDES}-slide talk: {median:?} (slowest {:?})", times.last().unwrap());
+    assert!(median < MOST_FOR_SIXTY, "Apply to all slides took {median:?}");
 }
 
 /// How long one step on every thing of a slide of sixty may take, at the median: a step taken

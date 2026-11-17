@@ -117,3 +117,32 @@ fn fixed_steps_counts_a_one_at_a_time_list() {
     assert_eq!(deck("---\nregion.body: click=2\n---\n\n# T\n\n- one\n- two\n").fixed_steps(0), 0, "a numbered region");
     assert_eq!(deck("# T\n").fixed_steps(5), 0, "a slide the talk doesn't have");
 }
+
+#[test]
+fn each_steps_counts_one_region_shown_a_piece_at_a_time() {
+    let source = "---\nlayout: two-columns\nregion.left: click=each\nregion.right: click=each\n---\n\n# T\n\n<Region name=\"left\" />\n\n- one\n- two\n- three\n\n<Region name=\"right\" />\n\nA\n\nB\n";
+    let mut d = deck(source);
+    assert_eq!(d.each_steps(0, "left"), Some(3));
+    assert_eq!(d.each_steps(0, "right"), Some(2));
+    assert_eq!(d.each_steps(0, "title"), None, "not shown that way");
+    assert_eq!(d.each_steps(3, "left"), None, "a slide the talk doesn't have");
+    // Turned, it shows whole on click 1.
+    let mut d = deck("---\nregion.body: click=each rotate=10\n---\n\n# T\n\n- one\n- two\n");
+    assert_eq!(d.each_steps(0, "body"), Some(1));
+    assert_eq!(d.fixed_steps(0), 1);
+    // With nothing in it, there's nothing to show.
+    let mut d = deck("---\nregion.body: click=each\n---\n\n# T\n");
+    assert_eq!(d.each_steps(0, "body"), None);
+}
+
+#[test]
+fn clicks_and_entrances_read_as_they_are_written() {
+    for (value, click) in [("1", Some(1)), ("999", Some(999)), ("0", None), ("1000", None), ("x", None), ("", None), (" 7 ", Some(7)), ("-1", None)] {
+        assert_eq!(read_click(value), click, "{value:?}");
+    }
+    for enter in [Enter::Appear, Enter::Fade, Enter::FlyUp] {
+        assert_eq!(read_enter(enter_word(enter)), Some(enter));
+    }
+    assert_eq!(read_enter("slide"), None);
+    assert_eq!(MAX_CLICK, 999);
+}

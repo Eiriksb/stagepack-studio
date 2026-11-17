@@ -13,7 +13,7 @@ use gpui_kit::*;
 use slides_engine::{Enter, Transition};
 
 use crate::animate::Choice;
-use crate::document::AnimateHere;
+use crate::document::{AnimateHere, EditRefused};
 use crate::ribbon::group;
 
 /// The tool that chooses how the slide is arrived at, and the one that gives every slide that.
@@ -69,6 +69,7 @@ pub fn step_words(here: &AnimateHere) -> String {
     match (here.click, here.enter, here.each) {
         (_, _, Some(true)) => "One at a time".to_string(),
         (Some(click), ..) => format!("Click {click} of {}", here.steps),
+        (None, Some(_), _) if here.mixed => "Some aren't animated".to_string(),
         (None, Some(_), _) => "Clicks differ".to_string(),
         (None, None, _) => NOT_ANIMATED.to_string(),
     }
@@ -156,7 +157,7 @@ pub fn animate_tab(here: &AnimateHere, has_talk: bool, cx: &App) -> Vec<AnyEleme
         .label("One at a time")
         .tooltip(match here.why_not {
             Some(why) => SharedString::from(why.to_string()),
-            None if !here.can_each => "Select an area that holds a list".into(),
+            None if !here.can_each => EditRefused::NotAList.to_string().into(),
             None => "Show the list a click at a time".into(),
         })
         .selected(each)

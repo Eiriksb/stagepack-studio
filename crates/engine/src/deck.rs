@@ -120,6 +120,8 @@ struct Laid {
     regions: Vec<RegionBox>,
     /// The most steps a region shown a piece at a time takes.
     each_steps: u32,
+    /// Each region shown a piece at a time, by name, and the steps it takes.
+    each_regions: Vec<(String, u32)>,
     /// Where the slide's editable text is, once it's been asked for, and the state of the
     /// talk's loaded modules it was worked out for: which of them take content.
     text_layout: Option<(u64, Arc<TextLayout>)>,
@@ -806,6 +808,18 @@ impl Deck {
         laid.each_steps.max(laid.asks.steps).min(MAX_CLICK)
     }
 
+    /// The steps region `region` of slide `slide` takes, shown a piece at a time from click 1:
+    /// one for a region turned, which shows whole on click 1. `None` for a region not shown
+    /// that way, one with nothing in it, or a slide the talk doesn't have.
+    pub fn each_steps(&mut self, slide: usize, region: &str) -> Option<u32> {
+        if slide >= self.slides.len() {
+            return None;
+        }
+        self.ensure_laid(slide);
+        let laid = self.slides[slide].laid.as_ref().expect("the slide was just laid out");
+        laid.each_regions.iter().find(|(name, _)| name == region).map(|(_, steps)| *steps)
+    }
+
     /// A slide's specs in its whole state, with what they are drawn from: the fonts, and the talk's
     /// files. They're always as the source says: unlike [`Self::specs`], never with a placing.
     pub fn specs_fonts_and_files(&mut self, index: usize) -> (&[LayerSpec], &mut Fonts, &dyn TalkFiles) {
@@ -1168,6 +1182,7 @@ impl Deck {
             empty_regions: laid.empty_regions,
             regions: laid.regions,
             each_steps: laid.each_steps,
+            each_regions: laid.each_regions,
             text_layout: None,
         }
     }
