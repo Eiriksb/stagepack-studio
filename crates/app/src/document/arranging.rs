@@ -105,10 +105,26 @@ impl Document {
                 ("h", to.h, to.h.round(), rect.h),
                 ("rotate", placed.rotate, placed.rotate, rotate),
             ];
+            let first = words.len();
             for (name, asked, value, old) in numbers {
                 if value.is_finite() && (asked - old).abs() > MOVED && number_text(value) != number_text(old) {
                     let value = (name != "rotate" || value != 0.).then(|| number_text(value));
                     words.push((target_of(thing), name, value));
+                }
+            }
+            // A tag with only one of its width and height, or neither, has the other worked out
+            // from what it shows, as a picture's from its proportions: given one, it's given both,
+            // so that it reads back the size it was made.
+            if let Thing::Block(source) = thing {
+                let sizes = [("w", to.w), ("h", to.h)];
+                let written: Vec<&str> = words[first..].iter().map(|(_, name, _)| *name).filter(|name| sizes.iter().any(|(size, _)| size == name)).collect();
+                let tag = guarded(|| find_tag(self.talk(), slide, source)).ok().flatten();
+                if !written.is_empty() && let Some(tag) = tag {
+                    for (name, value) in sizes {
+                        if !written.contains(&name) && tag.attr(name).is_none() && value.is_finite() {
+                            words.push((target_of(thing), name, Some(number_text(value.round()))));
+                        }
+                    }
                 }
             }
         }

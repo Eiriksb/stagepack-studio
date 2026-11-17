@@ -187,16 +187,29 @@ impl Document {
         self.set_attrs_of(&selected, values)
     }
 
-    /// Sets each attribute of `values` on `thing`, a tag at the top level of a slide, as
-    /// [`Self::set_attr_of`] does one, all in one step.
+    /// Sets each attribute of `values` on `thing`, a tag on a slide at any depth, as
+    /// [`Self::set_attr_of`] does one, all in one step. Each is set in turn, and each refused as
+    /// that one would be.
     pub fn set_attrs_of(&mut self, thing: &Selected, values: &[(&str, Option<&str>)]) -> Result<Vec<usize>, EditRefused> {
         if let [(name, value)] = values {
             return self.set_attr_of(thing, name, *value);
         }
         self.finish_before_edit()?;
         let Selected { slide, source } = thing.clone();
-        let edits: Vec<ValueEdit> = values.iter().map(|&(name, value)| ValueEdit { target: Target::Tag(source.clone()), name, value }).collect();
-        let change = built(self.talk(), |talk| set_values(talk, slide, &edits))?.ok_or(EditRefused::CouldNotBeMade)?;
+        let mut tag = source;
+        let mut after: Option<Talk> = None;
+        for &(name, value) in values {
+            let talk = after.as_ref().unwrap_or(self.talk());
+            let step = built(talk, |talk| set_tag_attr(talk, slide, &tag, name, value))?.ok_or(EditRefused::CouldNotBeMade)?;
+            let text = step.apply(&talk.source);
+            // Only the tag's own text changed, after its start.
+            tag.end = (tag.end + text.len()).checked_sub(talk.source.len()).ok_or(EditRefused::CouldNotBeMade)?;
+            after = Some(read_after(talk, text)?);
+        }
+        let Some(after) = after else {
+            return Ok(Vec::new());
+        };
+        let change = one_edit(&self.talk().source, &after.source);
         self.make_setting(thing, change)
     }
 

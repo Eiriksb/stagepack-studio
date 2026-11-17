@@ -165,6 +165,8 @@ pub struct SlideEditor {
     nudging: Option<arranging::Nudging>,
     /// What the pointer shows, over a handle or dragging one, if not the usual.
     pointer: Option<CursorStyle>,
+    /// The handles on the thing selected, as last worked out.
+    handles_seen: Option<arranging::HandlesSeen>,
 
     /// Where the caret and any composition were last drawn, so that the system's input method
     /// is told when they move, and only then.
@@ -266,6 +268,7 @@ impl SlideEditor {
             drag: None,
             nudging: None,
             pointer: None,
+            handles_seen: None,
             ime_place: None,
             _subscriptions: subscriptions,
         }

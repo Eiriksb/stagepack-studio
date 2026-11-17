@@ -62,8 +62,15 @@ impl SlideEditor {
         self.end_drag(cx);
         self.dragging = false;
         self.pressed = None;
-        if let Some((handles, handle)) = self.handle_under(event.position, cx) {
-            // A handle of the thing selected, on the slide or just off it, before what's under it.
+        // A handle of the thing selected, on the slide or just off it, before what's under it;
+        // but with Shift or Ctrl the press adds or takes away what's under it, and a second
+        // click is the handle's only right on it, so a double click by an edge still types.
+        let at = self.slide_units(event.position, cx);
+        let grabbed = (!event.modifiers.shift && !event.modifiers.control)
+            .then(|| self.handle_under(event.position, cx))
+            .flatten()
+            .filter(|(handles, handle)| event.click_count <= 1 || at.is_some_and(|at| handles.right_on(*handle, at)));
+        if let Some((handles, handle)) = grabbed {
             cx.stop_propagation();
             self.focus_handle.focus(window, cx);
             self.ready_handle_drag(handles, handle, event.position, cx);

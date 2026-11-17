@@ -54,12 +54,22 @@ pub(super) struct Drag {
 /// The handles on the one thing selected on the slide shown: what it is, where it is, whether
 /// it keeps its shape, and where each handle is drawn, in slide units, `unit` window pixels to
 /// a slide unit.
+#[derive(Clone)]
 pub(super) struct Handles {
     thing: Thing,
     placed: Placed,
     keeps_shape: bool,
     pub(super) spots: [(Handle, (f32, f32)); 9],
     unit: f32,
+}
+
+/// The handles last worked out, and what they were worked out for.
+pub(super) struct HandlesSeen {
+    layout: Arc<TextLayout>,
+    pick: u64,
+    editing: bool,
+    unit: f32,
+    handles: Option<Handles>,
 }
 
 impl Handles {
@@ -72,6 +82,13 @@ impl Handles {
             .filter(|&(_, away)| away <= HANDLE_REACH)
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(handle, _)| handle)
+    }
+
+    /// Whether `(x, y)` of the slide is on `handle` as it's drawn, not only near it.
+    pub(super) fn right_on(&self, handle: Handle, (x, y): (f32, f32)) -> bool {
+        self.spots.iter().any(|&(spot, (hx, hy))| {
+            spot == handle && (hx - x).abs().max((hy - y).abs()) * self.unit <= HANDLE_SIZE / 2.
+        })
     }
 
     /// How far the thing is turned, in degrees.
@@ -146,21 +163,40 @@ impl SlideEditor {
 
     /// The handles on what's selected on the slide shown, if they show: with one thing or area
     /// selected that has a place of its own, and not typed in. A thing too small to tell its
-    /// handles apart has them drawn further apart than its corners.
-    pub(super) fn handles(&self, cx: &mut Context<Self>) -> Option<Handles> {
+    /// handles apart has them drawn further apart than its corners. They're worked out again
+    /// only once the slide's layout, what's selected, the typing or the slide's scale changes,
+    /// and then the pointer no longer shows what a handle under it did.
+    pub(super) fn handles(&mut self, cx: &mut Context<Self>) -> Option<Handles> {
         let selection = self.selection_here(cx).filter(|selection| selection.things.len() == 1)?;
-        if self.is_editing(cx) {
-            return None;
-        }
         let unit = f32::from(self.canvas.read(cx).slide_bounds()?.size.width) / SLIDE_WIDTH;
         if unit <= 0.0 {
             return None;
         }
+        let layout = self.layout(selection.slide, cx)?;
+        let (pick, editing) = (self.document.as_ref()?.read(cx).selection_pick(), self.is_editing(cx));
+        let seen = self
+            .handles_seen
+            .as_ref()
+            .filter(|seen| Arc::ptr_eq(&seen.layout, &layout) && seen.pick == pick && seen.editing == editing && seen.unit == unit);
+        if let Some(seen) = seen {
+            return seen.handles.clone();
+        }
+        let handles = (!editing).then(|| self.work_out_handles(&layout, unit, cx)).flatten();
+        if !self.handle_drag() {
+            self.pointer = None;
+        }
+        self.handles_seen = Some(HandlesSeen { layout, pick, editing, unit, handles: handles.clone() });
+        handles
+    }
+
+    /// The handles on the one thing selected, on a slide laid out as `layout`, `unit` window
+    /// pixels to a slide unit.
+    fn work_out_handles(&self, layout: &TextLayout, unit: f32, cx: &mut Context<Self>) -> Option<Handles> {
         let document = self.document.clone()?;
         let (things, left_out) = document.update(cx, |document, _| document.movable_selected());
         let (thing, placed) = things.into_iter().next().filter(|_| !left_out)?;
         let keeps_shape = match &thing {
-            Thing::Block(source) => self.layout(selection.slide, cx)?.element(source)?.keeps_shape,
+            Thing::Block(source) => layout.element(source)?.keeps_shape,
             Thing::Region(_) => false,
         };
         let shown = spread(&placed, HANDLES_APART / unit);
@@ -169,7 +205,7 @@ impl SlideEditor {
     }
 
     /// The handles showing and the one at `position` in the window, if the pointer is on one.
-    pub(super) fn handle_under(&self, position: Point<Pixels>, cx: &mut Context<Self>) -> Option<(Handles, Handle)> {
+    pub(super) fn handle_under(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> Option<(Handles, Handle)> {
         let handles = self.handles(cx)?;
         let handle = handles.under(self.slide_units(position, cx)?)?;
         Some((handles, handle))
@@ -408,15 +444,25 @@ fn moved_to(drag: &Drag, pointer: (f32, f32), modifiers: Modifiers) -> Vec<(Thin
 
 /// Where `handle` dragged to `pointer` of the slide takes what's dragged: a corner keeps the
 /// shape of a thing that keeps its shape, and Shift does the opposite.
+/// It's shown as it'll be written, its sides and place to whole units.
 fn resized_to(drag: &Drag, handle: Handle, pointer: (f32, f32), modifiers: Modifiers) -> Vec<(Thing, Placed)> {
-    let to = (drag.held_at.0 + pointer.0 - drag.pressed_at.0, drag.held_at.1 + pointer.1 - drag.pressed_at.1);
+    let to = held_to(drag, pointer);
     let keep_shape = drag.keeps_shape != modifiers.shift;
-    drag.things.iter().map(|(thing, placed)| (thing.clone(), arrange::resized(placed, handle, to, keep_shape))).collect()
+    drag.things
+        .iter()
+        .map(|(thing, placed)| (thing.clone(), arrange::whole(placed, &arrange::resized(placed, handle, to, keep_shape), handle)))
+        .collect()
 }
 
 /// Where the turn handle dragged to `pointer` of the slide turns what's dragged: in whole
 /// degrees, or with Shift in steps of fifteen.
 fn turned_to(drag: &Drag, pointer: (f32, f32), modifiers: Modifiers) -> Vec<(Thing, Placed)> {
-    let to = (drag.held_at.0 + pointer.0 - drag.pressed_at.0, drag.held_at.1 + pointer.1 - drag.pressed_at.1);
+    let to = held_to(drag, pointer);
     drag.things.iter().map(|(thing, placed)| (thing.clone(), arrange::turned_to(placed, to, modifiers.shift))).collect()
+}
+
+/// Where the point a handle drag has hold of is with the pointer at `pointer` of the slide: as
+/// far from where it was as the pointer is from the press.
+fn held_to(drag: &Drag, pointer: (f32, f32)) -> (f32, f32) {
+    (drag.held_at.0 + pointer.0 - drag.pressed_at.0, drag.held_at.1 + pointer.1 - drag.pressed_at.1)
 }

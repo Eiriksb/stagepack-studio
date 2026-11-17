@@ -2,6 +2,7 @@
 //! the area typed in are drawn, and the drawing of them.
 
 use super::*;
+pub(super) use crate::arrange::{corners, turned};
 
 /// What's drawn over the slide for the text being typed, in slide units.
 pub(super) struct Marks {
@@ -62,25 +63,6 @@ impl SlideEditor {
         };
         Some(Marks { caret, selection })
     }
-}
-
-/// `(x, y)` turned by `degrees` around `centre`, as the engine turns a layer.
-pub(super) fn turned((x, y): (f32, f32), centre: (f32, f32), degrees: f32) -> (f32, f32) {
-    if degrees == 0.0 {
-        return (x, y);
-    }
-    let (sin, cos) = degrees.to_radians().sin_cos();
-    let (dx, dy) = (x - centre.0, y - centre.1);
-    (
-        centre.0 + dx * cos - dy * sin,
-        centre.1 + dx * sin + dy * cos,
-    )
-}
-
-/// The corners of the rectangle at `x`, `top`, `w` wide and `h` tall, turned, in slide units.
-pub(super) fn corners(x: f32, top: f32, w: f32, h: f32, centre: (f32, f32), degrees: f32) -> [(f32, f32); 4] {
-    [(x, top), (x + w, top), (x + w, top + h), (x, top + h)]
-        .map(|corner| turned(corner, centre, degrees))
 }
 
 /// The caret's corners, `unit` window pixels to a slide unit.

@@ -113,9 +113,11 @@ impl Render for SlideEditor {
         // selected, where it starts the typing.
         let input = (self.is_editing(cx) || self.takes_typing(cx))
             .then(|| (self.focus_handle.clone(), cx.entity()));
+        let handle_dragging = self.handle_drag();
         let overlay = canvas(
-            |_, _, _| {},
-            move |area, _, window, cx| {
+            // What the pointer shows over a handle shows only where nothing lies over the editor.
+            |area, window, _| window.insert_hitbox(area, HitboxBehavior::Normal),
+            move |area, hitbox, window, cx| {
                 if let Some((focus, editor)) = &input {
                     window.handle_input(focus, ElementInputHandler::new(area, editor.clone()), cx);
                 }
@@ -182,8 +184,11 @@ impl Render for SlideEditor {
                         paint_outline(&points, slide, unit, outline_color, window);
                     }
                 }
-                if let Some(style) = pointer {
-                    window.set_window_cursor_style(style);
+                // A handle dragged holds the pointer wherever it goes.
+                match pointer {
+                    Some(style) if handle_dragging => window.set_window_cursor_style(style),
+                    Some(style) => window.set_cursor_style(style, &hitbox),
+                    None => {}
                 }
             },
         )

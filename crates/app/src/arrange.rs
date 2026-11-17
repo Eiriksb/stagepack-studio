@@ -120,10 +120,19 @@ impl Handle {
 }
 
 /// `(x, y)` turned by `degrees` about `centre`, as the engine turns a thing.
-fn turned((x, y): (f32, f32), (cx, cy): (f32, f32), degrees: f32) -> (f32, f32) {
+pub fn turned((x, y): (f32, f32), centre: (f32, f32), degrees: f32) -> (f32, f32) {
+    if degrees == 0.0 {
+        return (x, y);
+    }
     let (sin, cos) = degrees.to_radians().sin_cos();
-    let (dx, dy) = (x - cx, y - cy);
-    (cx + dx * cos - dy * sin, cy + dx * sin + dy * cos)
+    let (dx, dy) = (x - centre.0, y - centre.1);
+    (centre.0 + dx * cos - dy * sin, centre.1 + dx * sin + dy * cos)
+}
+
+/// The corners of the rectangle at `x`, `top`, `w` wide and `h` tall, turned by `degrees`
+/// about `centre`.
+pub fn corners(x: f32, top: f32, w: f32, h: f32, centre: (f32, f32), degrees: f32) -> [(f32, f32); 4] {
+    [(x, top), (x + w, top), (x + w, top + h), (x, top + h)].map(|corner| turned(corner, centre, degrees))
 }
 
 fn centre(rect: &Rect) -> (f32, f32) {
@@ -139,11 +148,41 @@ pub fn handle_point(placed: &Placed, handle: Handle, turn_gap: f32) -> (f32, f32
     turned((x + fx * w, y + fy * h - gap), centre(&placed.rect), placed.rotate)
 }
 
+/// The thing `w` wide and `h` tall, turned by `rotate`, with the point of it at `(fx, fy)`, as
+/// parts of its width and height, at `anchor` on the slide.
+fn placed_about(anchor: (f32, f32), (fx, fy): (f32, f32), (w, h): (f32, f32), rotate: f32) -> Placed {
+    let (ox, oy) = turned(((fx - 0.5) * w, (fy - 0.5) * h), (0., 0.), rotate);
+    let (mx, my) = (anchor.0 - ox, anchor.1 - oy);
+    Placed { rect: Rect { x: mx - w / 2., y: my - h / 2., w, h }, rotate }
+}
+
+/// How far `at` lies outside where the engine can place a thing.
+fn out_of_place(at: f32) -> f32 {
+    (MIN_POSITION - at).max(at - MAX_POSITION).max(0.)
+}
+
+/// Whether `now`, resized from `start`, keeps as much on the slide each way as [`kept_move`]
+/// keeps of a thing moved, and stays where the engine can place it, or no further from either
+/// than `start` was.
+fn kept_resize(start: &Placed, now: &Placed) -> bool {
+    let (before, after) = (bounds(start), bounds(now));
+    let on = |low: f32, length: f32, side: f32| ((low + length).min(side) - low.max(0.)).max(0.);
+    let kept = |low0: f32, length0: f32, low1: f32, length1: f32, side: f32| {
+        on(low1, length1, side) + 0.01 >= on(low0, length0, side).min(length1.min(KEPT_ON))
+    };
+    let placeable = |was: f32, is: f32| out_of_place(is) <= out_of_place(was) + 0.01;
+    kept(before.x, before.w, after.x, after.w, SLIDE_WIDTH)
+        && kept(before.y, before.h, after.y, after.h, SLIDE_HEIGHT)
+        && placeable(start.rect.x, now.rect.x)
+        && placeable(start.rect.y, now.rect.y)
+}
+
 /// `start` with `handle` dragged to `to`, in slide units. The corner or edge across from the
 /// handle stays where it is on the slide, at any turn. A side the handle changes is never
 /// under [`MIN_SIZE`] nor over the most a thing can be, and the thing never flips over; a side
 /// it doesn't change stays as it was. With `keep_shape`, a corner keeps the proportions it
-/// started with, where both sides can within those limits; an edge never does. The turn
+/// started with, where both sides can within those limits; an edge never does. It's held, as
+/// a move is, to keep part of it on the slide and where the engine can place it. The turn
 /// handle resizes nothing.
 pub fn resized(start: &Placed, handle: Handle, to: (f32, f32), keep_shape: bool) -> Placed {
     if handle == Handle::Turn {
@@ -154,7 +193,8 @@ pub fn resized(start: &Placed, handle: Handle, to: (f32, f32), keep_shape: bool)
     // The pointer as it is on the thing before it's turned.
     let (px, py) = turned(to, middle, -start.rotate);
     let (fx, fy) = handle.spot();
-    let (ax, ay) = (x + (1. - fx) * w, y + (1. - fy) * h);
+    let across_from = (1. - fx, 1. - fy);
+    let (ax, ay) = (x + across_from.0 * w, y + across_from.1 * h);
     let anchor = turned((ax, ay), middle, start.rotate);
     let side = |part: f32, pointer: f32, across: f32, now: f32| {
         if part == 1. {
@@ -177,10 +217,64 @@ pub fn resized(start: &Placed, handle: Handle, to: (f32, f32), keep_shape: bool)
             (new_w, new_h) = (w * scale, h * scale);
         }
     }
-    // The anchor stays where it is on the slide: the middle goes where that leaves it.
-    let (ox, oy) = turned(((0.5 - fx) * new_w, (0.5 - fy) * new_h), (0., 0.), start.rotate);
-    let (mx, my) = (anchor.0 - ox, anchor.1 - oy);
-    Placed { rect: Rect { x: mx - new_w / 2., y: my - new_h / 2., w: new_w, h: new_h }, rotate: start.rotate }
+    // The anchor stays where it is on the slide: the middle goes where that leaves it. Where
+    // that would take too much of it off the slide, it goes only part of the way there from
+    // where it was.
+    let from = (held(w, w, across), held(h, h, down));
+    let at = |part: f32| {
+        let size = (from.0 + (new_w - from.0) * part, from.1 + (new_h - from.1) * part);
+        placed_about(anchor, across_from, size, start.rotate)
+    };
+    let whole_way = at(1.);
+    if kept_resize(start, &whole_way) {
+        return whole_way;
+    }
+    let (mut kept, mut lost) = (0f32, 1f32);
+    for _ in 0..32 {
+        let half = (kept + lost) / 2.;
+        if kept_resize(start, &at(half)) {
+            kept = half;
+        } else {
+            lost = half;
+        }
+    }
+    at(kept)
+}
+
+/// How far a number has to change, in slide units, to be written again.
+const CHANGED: f32 = 0.01;
+
+/// `now`, resized from `start` by `handle`, as it's written: each side that changed to a whole
+/// unit, the corner or edge across from the handle kept where it is on the slide, and then the
+/// left and the top that changed to a whole unit, so that corner moves by half a unit at most.
+pub fn whole(start: &Placed, now: &Placed, handle: Handle) -> Placed {
+    if handle == Handle::Turn {
+        return *now;
+    }
+    let to_whole = |is: f32, was: f32| if (is - was).abs() > CHANGED { is.round() } else { is };
+    let size = (to_whole(now.rect.w, start.rect.w), to_whole(now.rect.h, start.rect.h));
+    let (fx, fy) = handle.spot();
+    let across_from = (1. - fx, 1. - fy);
+    let anchor = handle_point(now, opposite(handle), 0.);
+    let mut placed = placed_about(anchor, across_from, size, now.rotate);
+    placed.rect.x = to_whole(placed.rect.x, start.rect.x);
+    placed.rect.y = to_whole(placed.rect.y, start.rect.y);
+    placed
+}
+
+/// The handle across the thing from `handle`, or the turn handle itself.
+fn opposite(handle: Handle) -> Handle {
+    match handle {
+        Handle::TopLeft => Handle::BottomRight,
+        Handle::Top => Handle::Bottom,
+        Handle::TopRight => Handle::BottomLeft,
+        Handle::Right => Handle::Left,
+        Handle::BottomRight => Handle::TopLeft,
+        Handle::Bottom => Handle::Top,
+        Handle::BottomLeft => Handle::TopRight,
+        Handle::Left => Handle::Right,
+        Handle::Turn => Handle::Turn,
+    }
 }
 
 /// `start` turned so that its top points from its middle towards `to`, in slide units: in whole

@@ -180,7 +180,12 @@ fn the_pointer_shows_what_a_handle_does(cx: &mut TestAppContext) {
 
 /// A talk with a picture 400 by 300, in a folder with its file.
 fn open_picture(cx: &mut TestAppContext) -> (Typing, String) {
-    let talk = "---\ntitle: T\n---\n\n# Picture\n\n<Picture src=\"assets/photo.png\" x=\"300\" y=\"300\" w=\"400\" h=\"300\" />\n".to_string();
+    open_picture_with(cx, "<Picture src=\"assets/photo.png\" x=\"300\" y=\"300\" w=\"400\" h=\"300\" />")
+}
+
+/// A talk with the picture `picture`, in a folder with its file.
+fn open_picture_with(cx: &mut TestAppContext, picture: &str) -> (Typing, String) {
+    let talk = format!("---\ntitle: T\n---\n\n# Picture\n\n{picture}\n");
     let folder = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(folder.path().join("assets")).unwrap();
     std::fs::write(folder.path().join("slides.md"), &talk).unwrap();
@@ -273,7 +278,7 @@ fn a_turned_shape_resizes_from_its_own_corner(cx: &mut TestAppContext) {
     assert_ne!(typing.source(cx), turned);
     assert_eq!(attr(&typing, cx, RECT, "rotate"), Some(37.), "the turn stays");
     let after = turned_point(&typing, cx, RECT, (0., 0.));
-    assert!((after.0 - before.0).abs() <= 1.5 && (after.1 - before.1).abs() <= 1.5, "{before:?} went to {after:?}");
+    assert!((after.0 - before.0).abs() <= 0.75 && (after.1 - before.1).abs() <= 0.75, "{before:?} went to {after:?}");
 }
 
 #[gpui_kit::test]
@@ -302,8 +307,9 @@ fn an_area_resizes_and_its_text_wraps_in_the_preview(cx: &mut TestAppContext) {
     assert!(height(&typing, cx) > tall + 1., "the text wraps as it's shown");
     assert_eq!(typing.source(cx), talk, "nothing written yet");
     typing.mouse_up(cx, narrower, 1, Modifiers::default());
-    let source = typing.source(cx);
-    assert!(source.contains("title: T\nregion.body: w="), "{source}");
+    // Only its width changed, and only that is written.
+    let w = written(area.w, units(&typing, cx, f32::from(narrower.x - from.x)));
+    assert_eq!(typing.source(cx), talk.replace("title: T\n", &format!("title: T\nregion.body: w={w}\n")));
     assert_eq!(undo_label(&typing, cx), Some("Resize"));
     undo(&typing, cx);
     assert_eq!(typing.source(cx), talk);
@@ -420,4 +426,129 @@ fn an_icons_size_moves_its_width_and_height(cx: &mut TestAppContext) {
     // One with no width or height of its own gains none.
     set_size(&typing, cx, "<Icon name=\"star\"", "80");
     assert_eq!(typing.source(cx), talk.replacen("size=\"64\"", "size=\"80\"", 1));
+}
+
+#[gpui_kit::test]
+fn a_press_halfway_down_a_selected_areas_side_takes_its_handle(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    let layout = typing.layout(cx);
+    let body = (0..typing.flows(cx, 0).len()).find(|&flow| layout.region_of_flow(flow) == Some("body")).expect("the main text");
+    let area = layout.region("body").expect("the area").rect;
+    typing.click_text(cx, body, pos(0, 3));
+    let frame = typing.at(cx, area.x, area.y + area.h / 4.);
+    typing.click(cx, frame);
+    assert_eq!(selection(&typing, cx).map(|selection| selection.things), Some(vec![Thing::Region("body".into())]));
+    // On the frame halfway down its left side: the handle there, which resizes it.
+    let side = typing.at(cx, area.x, area.y + area.h / 2.);
+    let to = side + point(px(40.), px(0.));
+    typing.drag(cx, side, to);
+    let by = units(&typing, cx, 40.);
+    let (x, w) = (written(area.x, by), written(area.w, -by));
+    assert_eq!(typing.source(cx), TALK.replace("title: T\n", &format!("title: T\nregion.body: x={x} w={w}\n")));
+    assert_eq!(undo_label(&typing, cx), Some("Resize"));
+}
+
+#[gpui_kit::test]
+fn a_picture_or_icon_sized_by_itself_reads_back_the_size_it_was_made(cx: &mut TestAppContext) {
+    // A picture with no width or height of its own.
+    let (typing, _) = open_picture_with(cx, "<Picture src=\"assets/photo.png\" x=\"300\" y=\"300\" />");
+    let icon = "<Icon name=\"star\" x=\"1300\" y=\"300\" size=\"96\" />";
+    for (typing, start) in [(typing, "<Picture"), (open(cx, &format!("---\ntitle: T\n---\n\n# Icon\n\n{icon}\n")), "<Icon")] {
+        click_thing(&typing, cx, start, Modifiers::default());
+        let from = handle_at(&typing, cx, Handle::Right).expect("the handle");
+        let to = from + point(px(40.), px(0.));
+        typing.mouse_down(cx, from, 1, Modifiers::default());
+        typing.move_held(cx, from + point(px(20.), px(0.)), Modifiers::default());
+        typing.move_held(cx, to, Modifiers::default());
+        let shown = thing(&typing, cx, start).rect;
+        typing.mouse_up(cx, to, 1, Modifiers::default());
+        let (w, h) = (attr(&typing, cx, start, "w"), attr(&typing, cx, start, "h"));
+        assert_eq!((w, h), (Some(shown.w.round()), Some(shown.h.round())), "{start}: both are written");
+        let now = thing(&typing, cx, start).rect;
+        assert!((now.w - shown.w).abs() <= 0.5 && (now.h - shown.h).abs() <= 0.5, "{start}: {shown:?} reads back as {now:?}");
+    }
+}
+
+#[gpui_kit::test]
+fn a_nested_icons_size_moves_its_width_and_height(cx: &mut TestAppContext) {
+    let icon = "<Icon name=\"star\" size=\"64\" w=\"64\" h=\"64\" />";
+    let talk = format!("---\ntitle: T\n---\n\n# Icons\n\n<Box x=\"200\" y=\"300\" w=\"600\" h=\"400\">\n\n{icon}\n\n</Box>\n");
+    let typing = open(cx, &talk);
+    let source = thing(&typing, cx, "<Icon").source;
+    typing.document(cx).update(cx, |document, cx| {
+        document.select(0, source);
+        cx.notify();
+    });
+    typing.settle(cx);
+    click_on(&typing, cx, SharedString::from(field_id("size")));
+    typing.press(cx, "ctrl-a");
+    typing.type_text(cx, "80");
+    typing.press(cx, "enter");
+    assert_eq!(typing.source(cx), talk.replacen(icon, "<Icon name=\"star\" size=\"80\" w=\"80\" h=\"80\" />", 1));
+    undo(&typing, cx);
+    assert_eq!(typing.source(cx), talk, "one step");
+}
+
+#[gpui_kit::test]
+fn a_turn_or_a_resize_ended_any_way_leaves_nothing(cx: &mut TestAppContext) {
+    for (handle, key) in [(Handle::Turn, "escape"), (Handle::BottomRight, "tab"), (Handle::Turn, "pagedown"), (Handle::Right, "ctrl-a")] {
+        let typing = open(cx, TALK);
+        click_thing(&typing, cx, RECT, Modifiers::default());
+        let from = handle_at(&typing, cx, handle).expect("the handle");
+        typing.mouse_down(cx, from, 1, Modifiers::default());
+        typing.move_held(cx, from + point(px(30.), px(10.)), Modifiers::default());
+        typing.move_held(cx, from + point(px(60.), px(30.)), Modifiers::default());
+        assert!(placing(&typing, cx), "{key}: dragging");
+        typing.press(cx, key);
+        assert!(!placing(&typing, cx), "{key}: put back at once");
+        typing.move_held(cx, from + point(px(90.), px(30.)), Modifiers::default());
+        typing.mouse_up(cx, from + point(px(90.), px(30.)), 1, Modifiers::default());
+        assert_eq!(typing.source(cx), TALK, "{key}");
+        assert!(!can_undo(&typing, cx), "{key}");
+        assert!(!placing(&typing, cx), "{key}");
+    }
+}
+
+#[gpui_kit::test]
+fn the_pointer_lets_go_of_a_handle_once_the_handles_change(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    click_thing(&typing, cx, RECT, Modifiers::default());
+    for key in ["right", "tab"] {
+        let at = handle_at(&typing, cx, Handle::Right).expect("a handle");
+        move_pointer(&typing, cx, at);
+        assert_eq!(pointer(&typing, cx), Some(CursorStyle::ResizeLeftRight), "{key}");
+        typing.press(cx, key);
+        typing.with_window(cx, |window, cx| window.render_frame(cx));
+        assert_eq!(pointer(&typing, cx), None, "{key}: the handle under it has gone");
+    }
+}
+
+#[gpui_kit::test]
+fn shift_by_a_handle_adds_the_thing_under_it(cx: &mut TestAppContext) {
+    // The ellipse starts where the rectangle's right side ends.
+    let talk = TALK.replacen("x=\"1600\"", "x=\"1500\"", 1);
+    let typing = open(cx, &talk);
+    click_thing(&typing, cx, RECT, Modifiers::default());
+    let handle = handle_at(&typing, cx, Handle::Right).expect("the handle");
+    let near = handle + point(px(4.), px(0.));
+    typing.clicks(cx, near, 1, Modifiers::shift());
+    assert_eq!(selection(&typing, cx).map(|selection| selection.things.len()), Some(2), "the ellipse is added");
+    assert_eq!(typing.source(cx), talk);
+}
+
+#[gpui_kit::test]
+fn a_double_click_by_a_handle_but_off_it_types(cx: &mut TestAppContext) {
+    let words = "Words that fill the box from side to side and line after line, so that its middle holds text everywhere it can";
+    let talk = format!("---\ntitle: T\n---\n\n# Box\n\n<Box x=\"300\" y=\"300\" w=\"500\" h=\"200\">\n\n{words}\n\n</Box>\n");
+    let typing = open(cx, &talk);
+    let rect = thing(&typing, cx, "<Box").rect;
+    let side = typing.at(cx, rect.x, rect.y + rect.h / 2.);
+    // Selected by a click, the box has handles; a double click just inside its left side, in
+    // reach of the handle there but off it, types.
+    let inside = side + point(px(5.5), px(0.));
+    typing.click(cx, inside);
+    assert!(handle_at(&typing, cx, Handle::Left).is_some());
+    typing.clicks(cx, inside, 2, Modifiers::default());
+    assert!(typing.editing(cx).is_some(), "typing");
+    assert_eq!(typing.source(cx), talk);
 }

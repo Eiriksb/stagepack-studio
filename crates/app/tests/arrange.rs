@@ -3,7 +3,7 @@
 
 use proptest::prelude::*;
 use slides_engine::{CaretRect, Rect};
-use stagepack_studio::arrange::{Handle, MIN_SIZE, Placed, bounds, handle_point, kept_move, kept_on_slide, resized, straight, turned_to};
+use stagepack_studio::arrange::{Handle, MIN_SIZE, Placed, bounds, handle_point, kept_move, kept_on_slide, resized, straight, turned_to, whole};
 
 /// The corners of `placed`, turned about its centre.
 fn corners(placed: &Placed) -> [(f32, f32); 4] {
@@ -124,6 +124,23 @@ fn sized(low: f32) -> impl Strategy<Value = Rect> {
     (-3840f32..7680., -3840f32..7680., low..3840., low..3840.).prop_map(|(x, y, w, h)| Rect { x, y, w, h })
 }
 
+/// Where `handle` is on a thing, as parts of its width and height.
+fn part(handle: Handle) -> (f32, f32) {
+    let start = Placed { rect: Rect { x: 0., y: 0., w: 1., h: 1. }, rotate: 0. };
+    handle_point(&start, handle, 0.)
+}
+
+/// `(x, y)` turned back by `degrees`.
+fn unturned((x, y): (f32, f32), degrees: f32) -> (f32, f32) {
+    let (sin, cos) = (-degrees).to_radians().sin_cos();
+    (x * cos - y * sin, x * sin + y * cos)
+}
+
+/// How far `at` is outside where the engine can place a thing.
+fn outside(at: f32) -> f32 {
+    (-3840. - at).max(at - 7680.).max(0.)
+}
+
 fn pointer() -> impl Strategy<Value = (f32, f32)> {
     (-6000f32..10000., -6000f32..10000.)
 }
@@ -186,12 +203,57 @@ proptest! {
                 prop_assert_eq!(side, before);
             }
         }
-        // Nor does it flip: the handle stays on the same side of the one across from it.
+        // Nor does it flip: on the thing before it's turned, the handle stays on its own side
+        // of the one across from it, each way it moves.
+        let anchor = handle_point(&resized, opposite(handle), 0.);
+        let is = handle_point(&resized, handle, 0.);
+        let (dx, dy) = unturned((is.0 - anchor.0, is.1 - anchor.1), rotate);
+        let (fx, fy) = part(handle);
+        if fx != 0.5 {
+            prop_assert!((dx > 0.) == (fx == 1.), "across: {dx} for {handle:?}: {resized:?}");
+        }
+        if fy != 0.5 {
+            prop_assert!((dy > 0.) == (fy == 1.), "down: {dy} for {handle:?}: {resized:?}");
+        }
+        // It keeps on the slide what a move would, and stays where the engine can place it, or
+        // goes no further from either.
+        let (before, after) = (bounds(&start), bounds(&resized));
+        prop_assert!(on(after.x, after.w, 1920.) + 0.02 >= on(before.x, before.w, 1920.).min(after.w.min(16.)), "{start:?} to {resized:?}");
+        prop_assert!(on(after.y, after.h, 1080.) + 0.02 >= on(before.y, before.h, 1080.).min(after.h.min(16.)), "{start:?} to {resized:?}");
+        for (was, is) in [(rect.x, resized.rect.x), (rect.y, resized.rect.y)] {
+            prop_assert!(outside(is) <= outside(was) + 0.02, "{was} to {is}");
+        }
+    }
+
+    #[test]
+    fn a_handle_dragged_onto_the_corner_across_leaves_the_least(
+        rect in sized(0.),
+        rotate in turn(),
+        handle in side_handle(),
+        keep_shape in any::<bool>(),
+    ) {
+        let start = Placed { rect, rotate };
         let anchor = handle_point(&start, opposite(handle), 0.);
-        let (was, is) = (handle_point(&start, handle, 0.), handle_point(&resized, handle, 0.));
-        let along = (was.0 - anchor.0) * (is.0 - anchor.0) + (was.1 - anchor.1) * (is.1 - anchor.1);
-        if rect.w >= 1. && rect.h >= 1. {
-            prop_assert!(along > 0., "{was:?} and {is:?} are either side of {anchor:?}");
+        let resized = resized(&start, handle, anchor, keep_shape);
+        prop_assert!(resized.rect.x.is_finite() && resized.rect.y.is_finite() && resized.rect.w.is_finite() && resized.rect.h.is_finite());
+        prop_assert!(near(handle_point(&resized, opposite(handle), 0.), anchor, 0.5));
+        prop_assert!(resized.rect.w >= rect.w.min(MIN_SIZE) - 0.01 && resized.rect.h >= rect.h.min(MIN_SIZE) - 0.01, "{resized:?}");
+    }
+
+    #[test]
+    fn written_to_whole_units_the_corner_across_moves_half_a_unit_at_most(
+        rect in sized(MIN_SIZE),
+        rotate in turn(),
+        handle in side_handle(),
+        to in pointer(),
+        keep_shape in any::<bool>(),
+    ) {
+        let start = Placed { rect, rotate };
+        let anchor = handle_point(&start, opposite(handle), 0.);
+        let written = whole(&start, &resized(&start, handle, to, keep_shape), handle);
+        prop_assert!(near(handle_point(&written, opposite(handle), 0.), anchor, 0.51), "{written:?}");
+        for (was, is) in [(rect.x, written.rect.x), (rect.y, written.rect.y), (rect.w, written.rect.w), (rect.h, written.rect.h)] {
+            prop_assert!(is == is.round() || (is - was).abs() <= 0.011, "{was} written as {is}");
         }
     }
 
@@ -275,4 +337,12 @@ fn a_corner_dragged_out_makes_it_bigger() {
     // Past the corner across from it, it stays eight units, on its own side.
     assert_eq!(resized(&start, Handle::TopLeft, (900., 900.), false).rect, Rect { x: 292., y: 192., w: 8., h: 8. });
     assert_eq!(resized(&start, Handle::Turn, (900., 900.), false), start);
+}
+
+#[test]
+fn a_thing_mostly_off_the_slide_cannot_be_resized_off_it() {
+    let start = Placed { rect: Rect { x: -1000., y: 300., w: 1100., h: 200. }, rotate: 0. };
+    let resized = resized(&start, Handle::Right, (-900., 400.), false);
+    assert_eq!(resized.rect.x, -1000.);
+    assert!((resized.rect.w - 1016.).abs() < 0.01, "sixteen units stay on: {resized:?}");
 }
