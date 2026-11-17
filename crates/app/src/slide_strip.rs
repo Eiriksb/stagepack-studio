@@ -604,10 +604,13 @@ impl SlideStrip {
                     this.take_keyboard(window, cx);
                     window.dispatch_action(Box::new(SelectSlide { index }), cx);
                 }))
-                // The menu acts on the slide in hand, so a right-click takes it in hand.
+                // The menu acts on the slide in hand, so a right-click takes it in hand. The
+                // menu keeps the press from reaching the list, so the row lets go of the thing
+                // selected itself.
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, _, window, cx| {
+                        this.let_go_of_selection(window, cx);
                         this.take_keyboard(window, cx);
                         window.dispatch_action(Box::new(SelectSlide { index }), cx);
                     }),

@@ -507,7 +507,13 @@ enum ToTheList {
     Wobble,
     /// A press on the empty part of the list, below the rows.
     BelowTheRows,
+    /// A right-click on the slide's row, which opens its menu, and Escape to close the menu.
+    RightClick,
 }
+
+/// Every way the mouse gives the list of slides the keyboard.
+const TO_THE_LIST: [ToTheList; 4] =
+    [ToTheList::Click, ToTheList::Wobble, ToTheList::BelowTheRows, ToTheList::RightClick];
 
 fn to_the_list(typing: &Typing, cx: &mut TestAppContext, how: ToTheList) {
     match how {
@@ -522,6 +528,14 @@ fn to_the_list(typing: &Typing, cx: &mut TestAppContext, how: ToTheList) {
             assert!(list.bottom() > last.bottom() + px(40.), "room below the rows");
             let below = gpui_kit::point(list.center().x, last.bottom() + px(20.));
             typing.click(cx, below);
+        }
+        ToTheList::RightClick => {
+            typing.with_window(cx, |window, cx| {
+                window.render_frame(cx);
+                window.right_click(strip_row_id(0), cx);
+            });
+            typing.settle(cx);
+            typing.press(cx, "escape");
         }
     }
     assert!(list_has_keyboard(typing, cx), "{how:?} gives the list the keyboard");
@@ -564,9 +578,10 @@ fn delete_after_redo_in_the_list_takes_the_thing_and_not_the_slide(cx: &mut Test
 #[gpui_kit::test]
 fn a_row_wobbled_or_a_press_below_the_rows_lets_go_of_the_thing(cx: &mut TestAppContext) {
     // Found in review: a press on a row moved a few pixels starts a drag and drops the click,
-    // and a press below the rows gives the list the keyboard; neither let go of the thing, and
-    // Delete took the slide while the thing showed as selected.
-    for how in [ToTheList::Wobble, ToTheList::BelowTheRows] {
+    // a press below the rows gives the list the keyboard, and a right-click on a row opens its
+    // menu before the list hears of the press; none let go of the thing, and Delete took the
+    // slide while the thing showed as selected.
+    for how in [ToTheList::Wobble, ToTheList::BelowTheRows, ToTheList::RightClick] {
         let typing = open(cx, TALK);
         insert_shape(&typing, cx, "rect");
         to_the_list(&typing, cx, how);
@@ -581,7 +596,7 @@ fn a_row_wobbled_or_a_press_below_the_rows_lets_go_of_the_thing(cx: &mut TestApp
 
 #[gpui_kit::test]
 fn the_list_never_has_the_keyboard_while_a_thing_is_selected(cx: &mut TestAppContext) {
-    for how in [ToTheList::Click, ToTheList::Wobble, ToTheList::BelowTheRows] {
+    for how in TO_THE_LIST {
         // A thing selected before the list takes the keyboard.
         let typing = open(cx, TALK);
         insert_shape(&typing, cx, "rect");
@@ -710,7 +725,7 @@ fn the_list_taking_the_keyboard_ends(cx: &mut TestAppContext, typed: Typed) {
     let escaped = start_typing(cx, typed);
     escaped.press(cx, "escape");
     let after_escape = escaped.source(cx);
-    for how in [ToTheList::Click, ToTheList::Wobble, ToTheList::BelowTheRows] {
+    for how in TO_THE_LIST {
         let typing = start_typing(cx, typed);
         to_the_list(&typing, cx, how);
         let case = format!("{typed:?} then {how:?}");
