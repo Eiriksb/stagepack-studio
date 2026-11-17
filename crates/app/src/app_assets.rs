@@ -11,7 +11,8 @@ icon_assets!(
         Underline, DropletOff, List, ListOrdered, ListIndentDecrease, ListIndentIncrease, TextAlignStart,
         TextAlignCenter, TextAlignEnd, ImagePlus, Shapes, RectangleHorizontal, SquareRoundCorner, Circle, Minus,
         MoveRight, MessageSquare, TextCursorInput, Star, Table, BetweenHorizontalStart, BetweenHorizontalEnd,
-        BetweenVerticalStart, BetweenVerticalEnd, Blocks, BringToFront,
+        BetweenVerticalStart, BetweenVerticalEnd, Blocks, BringToFront, Film, CopyCheck, Sparkles, StepBack, StepForward,
+        ListStart,
     ]
 );
 

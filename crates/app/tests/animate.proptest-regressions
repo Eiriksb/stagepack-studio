@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f2756d79d997cb02b1d456fe9faca30c276771788868b00c1feeaaafa149dab8 # shrinks to (all, fixed, picked) = ([Stepped { target: Tag(0..5), click: None, each: false }, Stepped { target: Tag(10..15), click: None, each: false }, Stepped { target: Tag(20..25), click: Some(3), each: false }, Stepped { target: Tag(30..35), click: Some(2), each: false }, Stepped { target: Tag(40..45), click: Some(4), each: false }], 0, [Tag(20..25), Tag(30..35)]), choice = Later

@@ -19,6 +19,8 @@ use gpui_kit::*;
 use slides_components::{Bundle, Diagnostic};
 use slides_engine::{ComponentState, Fonts};
 
+use crate::animate::Choice;
+use crate::animate_tools::{ChooseAnimation, ChooseEntrance, ChooseTransition};
 use crate::arrange_tools::{AlignThings, DistributeThings, ReorderThing};
 use crate::builds::{self, BuildOutcome, Compile};
 use crate::cargo_file::{self, write_cargo_file};
@@ -37,7 +39,7 @@ use crate::notes_panel::{
 use crate::permissions::BuildPermissions;
 use crate::present_view::{self, Presentation, start_show};
 use crate::recovery::Recovery;
-use crate::ribbon::{Panels, Ribbon};
+use crate::ribbon::{Panels, Ribbon, RibbonTab};
 use crate::save_flow::{CloseAnswer, Effect, SaveFlow, SaveOutcome};
 use crate::saving::{SaveError, SaveJob, SaveTarget, Saved};
 use crate::slide_canvas::{ScaleChanged, SlideCanvas};
@@ -352,6 +354,8 @@ pub struct WorkspaceView {
     _notes_focused: Subscription,
     /// A size chosen from the Insert tab's grid of tables.
     _table_picked: Subscription,
+    /// The slide shows the steps things come in on while the Animate tab is open.
+    _tab_changed: Subscription,
     _component_picked: Subscription,
 }
 
@@ -463,6 +467,14 @@ impl WorkspaceView {
         let slide_focus = slide_editor.read(cx).focus_handle().clone();
         let ribbon = cx.new(|cx| {
             Ribbon::new(document.clone(), clipboard_tools.clone(), text_tools, icon_picker, slide_focus, panels, cx)
+        });
+        // Typing in an area goes on while the Animate tab's tools, which act on it, have the keyboard.
+        let animate_focus = ribbon.read(cx).animate_focus().clone();
+        slide_editor.update(cx, |editor, cx| editor.keep_typing_with(animate_focus, window, cx));
+        let editor = slide_editor.clone();
+        let tab_changed = cx.observe(&ribbon, move |_, ribbon, cx| {
+            let animate = ribbon.read(cx).tab() == RibbonTab::Animate;
+            editor.update(cx, |editor, cx| editor.show_steps(animate, cx));
         });
         let table_grid = ribbon.read(cx).table_grid().clone();
         let table_picked = cx.subscribe_in(&table_grid, window, |this, _, picked: &InsertTable, window, cx| {
@@ -594,6 +606,7 @@ impl WorkspaceView {
             _list_focused: list_focused,
             _notes_focused: notes_focused,
             _table_picked: table_picked,
+            _tab_changed: tab_changed,
             _component_picked: component_picked,
         };
         view.always_build = view.is_always_built();
@@ -1363,6 +1376,18 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, action: &DistributeThings, _, cx| {
                 let across = action.across;
                 this.edit(|document| document.distribute_things(across), cx)
+            }))
+            .on_action(cx.listener(|this, action: &ChooseAnimation, _, cx| {
+                let choice = action.choice;
+                this.edit(|document| document.animate(choice), cx)
+            }))
+            .on_action(cx.listener(|this, action: &ChooseEntrance, _, cx| match action.enter {
+                Some(enter) => this.edit(|document| document.set_entrance(enter), cx),
+                None => this.edit(|document| document.animate(Choice::Remove), cx),
+            }))
+            .on_action(cx.listener(|this, action: &ChooseTransition, _, cx| {
+                let (transition, all) = (action.transition, action.all);
+                this.edit(|document| document.set_slide_transition(transition, all), cx)
             }))
             .on_action(cx.listener(|this, action: &ReorderThing, _, cx| {
                 let order = action.order;

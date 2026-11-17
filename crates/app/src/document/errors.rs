@@ -47,6 +47,10 @@ pub enum EditRefused {
     AreaOrder,
     /// Several things are selected, and only one at a time is put in front or behind.
     OneToOrder,
+    /// Nothing is selected on the slide, nor an area typed in, for the Animate tab to act on.
+    NothingToAnimate,
+    /// The slide has as many steps as it can have, so nothing more can come in on one.
+    TooManySteps,
 }
 
 impl std::fmt::Display for EditRefused {
@@ -82,6 +86,8 @@ impl std::fmt::Display for EditRefused {
             EditRefused::InTheText => DRAG_OUT_FIRST,
             EditRefused::AreaOrder => "A layout's area always sits behind the things on the slide.",
             EditRefused::OneToOrder => "Select one thing to bring it forward or send it back.",
+            EditRefused::NothingToAnimate => "Select something on the slide first.",
+            EditRefused::TooManySteps => "This slide has as many clicks as it can have.",
         })
     }
 }

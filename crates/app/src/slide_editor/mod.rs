@@ -89,6 +89,12 @@ pub fn region_frame_id(name: &str) -> String {
     format!("region-frame-{name}")
 }
 
+/// The badge at the top-left corner of the `n`th thing or area animated, in the order the
+/// document gives them, shown while the Animate tab is open.
+pub fn step_badge_id(n: usize) -> String {
+    format!("step-badge-{n}")
+}
+
 /// The key context the editor's keys apply in, while text is being typed.
 pub const EDITOR_CONTEXT: &str = "SlideEditor";
 /// The key context the editor's keys apply in while a thing on the slide is selected and no
@@ -191,6 +197,8 @@ pub struct SlideEditor {
     handles_seen: Option<arranging::HandlesSeen>,
     /// What the menu a right-click opens is for, once one has.
     menu_on: Option<MenuOn>,
+    /// Whether the step each thing animated comes in on is shown, as it is on the Animate tab.
+    show_steps: bool,
 
     /// Where the caret and any composition were last drawn, so that the system's input method
     /// is told when they move, and only then.
@@ -294,6 +302,7 @@ impl SlideEditor {
             pointer: None,
             handles_seen: None,
             menu_on: None,
+            show_steps: false,
             ime_place: None,
             _subscriptions: subscriptions,
         }
@@ -307,6 +316,14 @@ impl SlideEditor {
 
     pub fn focus_handle(&self) -> &FocusHandle {
         &self.focus_handle
+    }
+
+    /// Shows the step each thing and area animated comes in on, with `show`, or stops.
+    pub fn show_steps(&mut self, show: bool, cx: &mut Context<Self>) {
+        if self.show_steps != show {
+            self.show_steps = show;
+            cx.notify();
+        }
     }
 
     /// Lets what holds `tools` have the keyboard while typing goes on, as the text tools can:

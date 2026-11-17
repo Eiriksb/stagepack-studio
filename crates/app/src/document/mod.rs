@@ -39,6 +39,7 @@ use crate::text_editing::{
     holds_no_words, holds_something, region_has_text,
 };
 
+mod animating;
 mod arranging;
 mod clipboard;
 mod components;
@@ -55,6 +56,7 @@ mod slides;
 mod tables;
 mod typing;
 
+pub use animating::{ANIMATE, AnimateHere, StepBadge, TRANSITION};
 pub use arranging::{ALIGN, ArrangeHere, DISTRIBUTE, MOVE, NUDGE, ORDER, RESIZE, TURN};
 pub use clipboard::Brought;
 pub use self::core::EditRun;

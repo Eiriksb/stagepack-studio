@@ -99,6 +99,24 @@ impl Render for SlideEditor {
                 (unit > 0.0).then(|| (id, in_editor(guide_bounds(guide, slide, unit), area)))
             })
             .collect();
+        // On the Animate tab, the step each thing animated comes in on, at its top-left corner.
+        let badges: Vec<(SharedString, Point<Pixels>, String)> = match (self.show_steps, self.document.clone(), placed) {
+            (true, Some(document), Some((slide, area))) => {
+                let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
+                document
+                    .update(cx, |document, _| document.step_badges())
+                    .into_iter()
+                    .enumerate()
+                    .filter(|_| unit > 0.0)
+                    .map(|(at, badge)| {
+                        let corner = in_editor(corners_box(&outline_corners(badge.rect, badge.rotate), slide, unit), area).origin;
+                        (step_badge_id(at).into(), corner, badge.words)
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        let (badge_color, badge_text) = (cx.theme().primary, cx.theme().primary_foreground);
         let frame_box = frame.as_ref().and_then(|(name, corners)| Some((SharedString::from(region_frame_id(name)), boxed(corners)?)));
         // Where the new box is in the editor, for whoever looks for it.
         let new_box_bounds = new_box.zip(placed).and_then(|((x, y, w, h), (slide, area))| {
@@ -354,6 +372,21 @@ impl Render for SlideEditor {
                     .top(bounds.origin.y)
                     .w(bounds.size.width)
                     .h(bounds.size.height)
+            }))
+            .children(badges.into_iter().map(|(id, corner, words)| {
+                div()
+                    .id(id)
+                    .test_support()
+                    .aria_label(words.clone())
+                    .absolute()
+                    .left(corner.x)
+                    .top(corner.y)
+                    .px_1()
+                    .rounded_sm()
+                    .bg(badge_color)
+                    .text_color(badge_text)
+                    .text_xs()
+                    .child(words)
             }))
             .when_some(caret_box, |this, caret| {
                 this.child(

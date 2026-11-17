@@ -11,6 +11,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::animate_tools;
 use crate::arrange_tools;
 use crate::clipboard_tools::ClipboardTools;
 use crate::document::Document;
@@ -56,7 +57,7 @@ pub const MORE_RIGHT_ID: &str = "ribbon-more-right";
 /// How wide the arrows at the row's cut ends are.
 const MORE_WIDTH: Pixels = px(28.);
 
-/// What a tab whose tools aren't made yet says.
+/// What a tab whose tools aren't made yet says: every tab has its tools now, and none says it.
 pub const ON_THE_WAY: &str = "Tools for this tab are on the way.";
 
 /// The layouts the New slide list offers, by the names people know them by, and the engine's
@@ -140,6 +141,9 @@ pub struct Ribbon {
     component_list: Entity<ComponentList>,
     /// The slide's keyboard, which the Arrange menu gives back once it closes.
     slide_focus: FocusHandle,
+    /// What holds the Animate tab's tools: the keyboard can go there, as to a menu they open,
+    /// and the text being typed goes on being the one they act on.
+    animate_focus: FocusHandle,
     tab: RibbonTab,
     panels: Panels,
     /// How far the row of tools is scrolled.
@@ -179,6 +183,7 @@ impl Ribbon {
             table_grid,
             component_list,
             slide_focus,
+            animate_focus: cx.focus_handle(),
             tab: RibbonTab::default(),
             panels,
             scroll: ScrollHandle::new(),
@@ -211,6 +216,11 @@ impl Ribbon {
 
     pub fn tab(&self) -> RibbonTab {
         self.tab
+    }
+
+    /// What holds the Animate tab's tools, which can have the keyboard while typing goes on.
+    pub fn animate_focus(&self) -> &FocusHandle {
+        &self.animate_focus
     }
 
     /// Shows which panels are showing.
@@ -428,20 +438,6 @@ impl Ribbon {
             cx,
         )]
     }
-
-    fn on_the_way(cx: &App) -> Vec<AnyElement> {
-        vec![
-            div()
-                .id(ON_THE_WAY_ID)
-                .test_support()
-                .aria_label(ON_THE_WAY)
-                .px_3()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(ON_THE_WAY)
-                .into_any_element(),
-        ]
-    }
 }
 
 /// Whether the row of tools `scroll` scrolls goes on past its left end, and past its right.
@@ -554,8 +550,12 @@ impl Render for Ribbon {
             RibbonTab::Insert => {
                 crate::insert_tools::insert_tab(self.document.is_some(), &self.icon_picker, &self.table_grid, &self.component_list, cx)
             }
-            RibbonTab::Animate => Self::on_the_way(cx),
+            RibbonTab::Animate => {
+                let here = self.document.as_ref().map(|document| document.update(cx, |document, _| document.animate_here())).unwrap_or_default();
+                animate_tools::animate_tab(&here, self.document.is_some(), cx)
+            }
         };
+        let animate = self.tab == RibbonTab::Animate;
         let mut tools = Vec::with_capacity(groups.len() * 2);
         for (index, group) in groups.into_iter().enumerate() {
             if index > 0 {
@@ -614,6 +614,10 @@ impl Render for Ribbon {
                             .items_center()
                             .overflow_x_scroll()
                             .track_scroll(&self.scroll)
+                            // A press on the Animate tab's tools leaves the keyboard where it is.
+                            .when(animate, |this| {
+                                this.track_focus(&self.animate_focus).capture_any_mouse_down(|_, window, _| window.prevent_default())
+                            })
                             .children(tools),
                     )
                     .when(more_left, |this| this.child(self.more_arrow(false, cx)))

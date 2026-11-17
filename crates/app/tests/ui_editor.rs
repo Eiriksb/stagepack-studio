@@ -17,7 +17,7 @@ use stagepack_studio::insert_tools::INSERT_PICTURE_ID;
 use stagepack_studio::notes_panel::{NOTES_CAPTION_ID, NOTES_ID, NOTES_PLACEHOLDER};
 use stagepack_studio::ribbon::{
     DELETE_ID, DUPLICATE_ID, HIDE_ID, MARKDOWN_TOGGLE_ID, NEW_SLIDE_ID, NEW_SLIDE_LAYOUTS_ID,
-    MORE_RIGHT_ID, NOTES_TOGGLE_ID, ON_THE_WAY, ON_THE_WAY_ID, PRESENT_ID, REDO_ID, REHEARSE_ID, RIBBON_ID,
+    MORE_RIGHT_ID, NOTES_TOGGLE_ID, ON_THE_WAY_ID, PRESENT_ID, REDO_ID, REHEARSE_ID, RIBBON_ID,
     SLIDE_LIST_TOGGLE_ID, TAB_ANIMATE_ID, TAB_HOME_ID, TAB_INSERT_ID, TAB_SLIDE_SHOW_ID,
     TAB_VIEW_ID, UNDO_ID,
 };
@@ -279,10 +279,8 @@ fn each_tab_shows_its_own_tools(cx: &mut TestAppContext) {
     });
     click(cx, handle, TAB_ANIMATE_ID);
     with_window(cx, handle, |window, _| {
-        let line = window.find(ON_THE_WAY_ID);
-        assert!(line.visible());
-        assert_eq!(line.label(), Some(ON_THE_WAY));
-        assert_eq!(ON_THE_WAY, "Tools for this tab are on the way.");
+        assert!(window.try_find(ON_THE_WAY_ID).is_none(), "the Animate tab has its tools");
+        assert_eq!(window.find(stagepack_studio::animate_tools::TRANSITION_ALL_ID).label(), Some("Apply to all slides"));
         assert!(
             window.try_find(NEW_SLIDE_ID).is_none(),
             "Home's tools are put away"
