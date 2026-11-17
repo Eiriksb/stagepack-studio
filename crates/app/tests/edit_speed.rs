@@ -158,7 +158,7 @@ fn a_keystroke_with_added_pictures_to_save_is_quick() {
 #[ignore = "timing; run in release"]
 fn a_keystroke_in_a_table_cell_is_quick() {
     let slide = SLIDES / 2;
-    let table = slides_format::new_table(6, 8).unwrap();
+    let table = slides_format::new_table(6, 8).unwrap().replace("|  ", "| word ");
     let source = long_talk().replacen(
         &format!("A closing line with `code` in it.\n\n<Notes>\nWhat to say on slide {slide}."),
         &format!("A closing line with `code` in it.\n\n{table}\n\n<Notes>\nWhat to say on slide {slide}."),
@@ -173,7 +173,10 @@ fn a_keystroke_in_a_table_cell_is_quick() {
         .iter()
         .position(|flow| matches!(flow.place, FlowPlace::Cell { row: 4, column: 3, .. }))
         .expect("the slide has the table");
-    assert_eq!(flows.iter().filter(|flow| matches!(flow.place, FlowPlace::Cell { .. })).count(), 6 * 9);
+    let cells: Vec<_> = flows.iter().filter(|flow| matches!(flow.place, FlowPlace::Cell { .. })).collect();
+    assert_eq!(cells.len(), 6 * 9);
+    // Every cell holds a word, as a table typed in does.
+    assert!(cells.iter().all(|cell| cell.paras.iter().any(|para| !para.spans.is_empty())), "a cell is empty");
     assert!(doc.begin_text(slide, cell, Pos::default()));
     doc.text_layout(slide);
 
@@ -190,7 +193,7 @@ fn a_keystroke_in_a_table_cell_is_quick() {
     let flows = text_flows(doc.talk(), slide);
     let text: String = flows[cell].paras[0].spans.iter().map(|span| span.text.as_str()).collect();
     let typed: String = (0..KEYSTROKES).map(|key| if key % 6 == 5 { ' ' } else { 'a' }).collect();
-    assert_eq!(text, typed.trim_end());
+    assert_eq!(text, format!("{typed}word"));
     assert_eq!(doc.undo_label(), Some("Typing"));
     assert_eq!(doc.table_at_caret().map(|(_, row, column)| (row, column)), Some((4, 3)));
     report("keystroke typed in a table cell", times);

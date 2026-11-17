@@ -1007,9 +1007,13 @@ fn an_element_moves_with_its_slide_when_text_before_it_changes() {
 fn big_tables_are_read_and_laid_out_quickly() {
     use std::time::{Duration, Instant};
     for (columns, rows) in [(6, 8), (20, 50)] {
-        let mut table = slides_format::new_table(columns, rows).unwrap();
-        table = table.replace("| |", "| word |").replace("| |", "| word |");
+        let table = slides_format::new_table(columns, rows).unwrap().replace("|  ", "| word ");
         let source = format!("# A table\n\n{table}\n");
+        // Every cell holds a word, as a table typed in does.
+        let flows = text_flows(&slides_format::parse_talk(&source), 0);
+        let cells: Vec<_> = flows.iter().filter(|flow| matches!(flow.place, FlowPlace::Cell { .. })).collect();
+        assert_eq!(cells.len(), columns * (rows + 1));
+        assert!(cells.iter().all(|cell| cell.paras.iter().any(|para| !para.spans.is_empty())), "a cell is empty");
         let mut deck = deck(&source);
         deck.text_layout(0);
         let median = |mut times: Vec<Duration>| {
