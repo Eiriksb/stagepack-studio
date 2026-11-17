@@ -37,8 +37,13 @@ impl Document {
                 (editing.slide, table.clone(), Some((*row, *column)))
             }
             None => {
+                // A table moved out of the text is selected by the box that places it.
                 let selected = self.selected.as_ref()?;
-                (selected.slide, selected.source.clone(), None)
+                let table = match selection::block_at(&talk.slides.get(selected.slide)?.blocks, &selected.source)? {
+                    Block::Tag(tag) if tag.name == "Box" && matches!(tag.children.as_slice(), [Block::Table { .. }]) => tag.children[0].range().clone(),
+                    _ => selected.source.clone(),
+                };
+                (selected.slide, table, None)
             }
         };
         let Some(Block::Table { rows, .. }) = selection::block_at(&talk.slides.get(slide)?.blocks, &table) else {

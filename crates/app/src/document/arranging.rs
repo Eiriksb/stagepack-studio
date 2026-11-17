@@ -2,7 +2,7 @@
 //! yet, as while they're dragged, and writing their place once they're let go of.
 
 use slides_engine::{Placing, is_positioned};
-use slides_format::{Order, can_reorder, number_text, reorder};
+use slides_format::{Order, can_reorder, lift, number_text, reorder};
 
 use super::*;
 use crate::arrange::{AlignTo, Placed, aligned, distributed};
@@ -16,6 +16,8 @@ pub const NUDGE: &str = "Move";
 pub const ALIGN: &str = "Align";
 pub const DISTRIBUTE: &str = "Distribute";
 pub const ORDER: &str = "Change order";
+/// What Undo shows for a thing in the slide's text given a place of its own.
+pub const MOVE_OUT: &str = "Move out of the text";
 
 /// What can be done to arrange what's selected, for the tools that do it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -200,6 +202,64 @@ impl Document {
         let changed = self.make(label, change, Holds::Slide(slide), slide, slide, Some(run))?;
         if before.is_some() && self.history.depth() > depth {
             self.history.select_mark_last(SelectMark { before, after: self.selection.clone() });
+        }
+        Ok(changed)
+    }
+
+    /// The one thing selected, if it's written in the slide's text with no place of its own, and
+    /// where it's drawn there; or why it can't be given a place, as one inside a component can't.
+    /// `None` where anything else is selected, or nothing.
+    pub fn liftable_selected(&mut self) -> Option<Result<(Thing, Placed), EditRefused>> {
+        let selection = self.selection.clone()?;
+        let [Thing::Block(source)] = selection.things.as_slice() else {
+            return None;
+        };
+        let element = self.text_layout(selection.slide).element(source).filter(|element| !element.placed)?;
+        let Rect { x, y, w, h } = element.rect;
+        let place = (x.round(), y.round(), w.round(), h.round());
+        let liftable = guarded(|| lift(self.talk(), selection.slide, source, place)).ok().flatten().is_some();
+        let placed = Placed { rect: element.rect, rotate: element.rotate };
+        Some(if liftable { Ok((Thing::Block(source.clone()), placed)) } else { Err(EditRefused::CouldNotBeMade) })
+    }
+
+    /// Gives the one thing selected, written in the slide's text, the place `to`, its position and
+    /// size to a whole unit, as one step named "Move out of the text", and returns the slides to
+    /// show again. A tag at the top level has its place written on it, and stays selected; any
+    /// other block is moved into a box of its own at the end of the slide's content, and the box
+    /// is selected, as what now moves. The slide's text closes up behind it. Refused where that
+    /// can't be done without the slide reading differently, as for a thing inside a component,
+    /// and where several things are selected.
+    pub fn lift_selected(&mut self, to: Placed) -> Result<Vec<usize>, EditRefused> {
+        self.drop_preview();
+        // Typing is finished first. That can move the thing, and then what's selected is no
+        // longer what was asked to move: it's refused.
+        let version = self.text_version();
+        self.finish_before_edit()?;
+        if self.text_version() != version {
+            return Err(EditRefused::CouldNotBeMade);
+        }
+        let Some(selection) = self.selection.clone() else {
+            return Ok(Vec::new());
+        };
+        let [Thing::Block(source)] = selection.things.as_slice() else {
+            return Err(EditRefused::InTheText);
+        };
+        let slide = selection.slide;
+        let Rect { x, y, w, h } = to.rect;
+        let place = (x.round(), y.round(), w.round(), h.round());
+        let change = built(self.talk(), |talk| lift(talk, slide, source, place))?.ok_or(EditRefused::CouldNotBeMade)?;
+        let depth = self.history.depth();
+        let changed = self.make(MOVE_OUT, change, Holds::Slide(slide), slide, slide, None)?;
+        if self.history.depth() > depth {
+            // A tag is followed to where it is now; a block taken into a box is gone from where it
+            // was, and the box it's in is the last block of the slide.
+            let boxed = || {
+                let last = self.talk().slides.get(slide)?.blocks.last()?;
+                matches!(last, Block::Tag(tag) if tag.name == "Box").then(|| selection::Selection { slide, things: vec![Thing::Block(last.range().clone())] })
+            };
+            let after = self.selection.clone().or_else(boxed);
+            self.set_selection(after.clone());
+            self.history.select_mark_last(SelectMark { before: Some(selection), after });
         }
         Ok(changed)
     }

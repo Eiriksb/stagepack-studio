@@ -76,6 +76,9 @@ pub fn handle_id(handle: Handle) -> String {
     format!("handle-{name}")
 }
 
+/// The dashed outline of a thing being dragged out of the slide's text, where it'll go.
+pub const LIFT_OUTLINE_ID: &str = "lift-outline";
+
 /// The guide line drawn while a thing dragged snaps to a line, or of several, the first.
 pub const SNAP_GUIDE_ID: &str = "snap-guide";
 

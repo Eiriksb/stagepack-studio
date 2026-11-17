@@ -38,6 +38,8 @@ impl Render for SlideEditor {
         let selecting = !outlines.is_empty() && !self.is_editing(cx);
         // The lines what's dragged snaps to, while the button is down.
         let guides = self.guides().to_vec();
+        // A thing being dragged out of the slide's text: a dashed line where it'll go.
+        let lift_outline = self.lift_outline().map(|placed| outline_corners(placed.rect, placed.rotate));
         // The handles on the one thing selected, and what the pointer shows over them.
         let handles = self.handles(cx).map(|handles| (handles.spots, handles.rotate()));
         if handles.is_none() && !self.handle_drag() {
@@ -117,6 +119,7 @@ impl Render for SlideEditor {
             _ => Vec::new(),
         };
         let (badge_color, badge_text) = (cx.theme().primary, cx.theme().primary_foreground);
+        let lift_box = lift_outline.as_ref().and_then(|corners| Some((SharedString::from(LIFT_OUTLINE_ID), boxed(corners)?)));
         let frame_box = frame.as_ref().and_then(|(name, corners)| Some((SharedString::from(region_frame_id(name)), boxed(corners)?)));
         // Where the new box is in the editor, for whoever looks for it.
         let new_box_bounds = new_box.zip(placed).and_then(|((x, y, w, h), (slide, area))| {
@@ -184,6 +187,9 @@ impl Render for SlideEditor {
                     }
                     for corners in &outlines {
                         paint_outline(corners, slide, unit, outline_color, window);
+                    }
+                    if let Some(corners) = &lift_outline {
+                        paint_dashed(corners, slide, unit, outline_color, window);
                     }
                     for guide in &guides {
                         window.paint_quad(fill(guide_bounds(guide, slide, unit), outline_color));
@@ -363,7 +369,7 @@ impl Render for SlideEditor {
                         .h(bounds.size.height),
                 )
             })
-            .children(frame_box.into_iter().chain(outline_boxes).chain(handle_boxes).chain(guide_boxes).map(|(id, bounds)| {
+            .children(frame_box.into_iter().chain(lift_box).chain(outline_boxes).chain(handle_boxes).chain(guide_boxes).map(|(id, bounds)| {
                 div()
                     .id(id)
                     .test_support()

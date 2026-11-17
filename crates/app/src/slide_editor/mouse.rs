@@ -106,7 +106,7 @@ impl SlideEditor {
         };
         if adding {
             let thing = match &hit {
-                Hit::Element(element) => Some(element.source.clone()),
+                Hit::Element(element) => Some(self.picked(slide, element.source.clone(), cx)),
                 // Not in the text being typed, where Shift extends what's selected of it.
                 Hit::Text { flow, pos } if elsewhere => self.box_of_text(slide, *flow, pos.para, point, cx),
                 _ => None,
@@ -178,7 +178,8 @@ impl SlideEditor {
             Hit::Element(element) => {
                 cx.stop_propagation();
                 let reason = self.cell_reason(slide, &element.source, point, cx);
-                self.press_thing(slide, Thing::Block(element.source), false, event.position, window, cx);
+                let source = self.picked(slide, element.source, cx);
+                self.press_thing(slide, Thing::Block(source), false, event.position, window, cx);
                 if let Some(reason) = reason {
                     cx.emit(EditorEvent::Said(reason.into()));
                 }
@@ -257,13 +258,20 @@ impl SlideEditor {
         }
         let (slide, hit) = self.hit(point, cx)?;
         let source = match hit {
-            Hit::Element(element) => element.source,
+            Hit::Element(element) => self.picked(slide, element.source, cx),
             Hit::Text { flow, pos } if !self.editing_flow(slide, flow, cx) => self
                 .box_of_text(slide, flow, pos.para, point, cx)
                 .or_else(|| Some(self.layout(slide, cx)?.element_at(point.0, point.1)?.source))?,
             _ => return None,
         };
         Some((slide, Thing::Block(source)))
+    }
+
+    /// What a press on the thing at `source` of slide `slide` picks: the thing, or the box with a
+    /// place of its own that holds it and nothing else, as a table moved out of the text is held.
+    fn picked(&self, slide: usize, source: Range<usize>, cx: &App) -> Range<usize> {
+        let document = self.document.as_ref().map(|document| document.read(cx));
+        document.and_then(|document| selection::box_holding(document.talk(), slide, &source)).unwrap_or(source)
     }
 
     /// A press at `from` on `thing` of slide `slide`. With `adding`, it's added to what's

@@ -57,7 +57,7 @@ mod tables;
 mod typing;
 
 pub use animating::{ANIMATE, AnimateHere, StepBadge, TRANSITION};
-pub use arranging::{ALIGN, ArrangeHere, DISTRIBUTE, MOVE, NUDGE, ORDER, RESIZE, TURN};
+pub use arranging::{ALIGN, ArrangeHere, DISTRIBUTE, MOVE, MOVE_OUT, NUDGE, ORDER, RESIZE, TURN};
 pub use clipboard::Brought;
 pub use self::core::EditRun;
 use self::core::{Holds, Join, others_alike};

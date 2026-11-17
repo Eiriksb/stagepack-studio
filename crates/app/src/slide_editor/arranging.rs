@@ -3,6 +3,8 @@
 //! where the pointer has them, and nothing is written until the button is let go of; the
 //! geometry is [`crate::arrange`]'s. A thing moved or resized snaps to the slide and to the
 //! things around it, as [`crate::snap`] has it, unless Alt is held; the arrow keys never snap.
+//! One thing written in the slide's text is dragged out of it as a dashed outline of its size,
+//! and given a place of its own where it's let go of.
 
 use super::*;
 use crate::arrange::{self, Handle, MOVE_STARTS, Placed};
@@ -40,9 +42,17 @@ pub(super) struct Drag {
     slide: usize,
     version: u64,
     pick: u64,
-    /// What's dragged, each where it was when pressed: the things selected, or nothing if any
-    /// of them can't be moved where it's written.
+    /// What's dragged, each where it was when pressed: the things selected, the one thing
+    /// selected in the slide's text where it's drawn there, or nothing if any of several can't be
+    /// moved where it's written.
     things: Vec<(Thing, Placed)>,
+    /// Whether what's dragged is one thing written in the slide's text, which is shown as a
+    /// dashed outline where the pointer has it and is given a place of its own once let go of.
+    lifting: bool,
+    /// Why nothing is dragged, said once the drag begins.
+    refused: Option<EditRefused>,
+    /// Where the outline of the thing lifted out of the text is shown, once the pointer moves.
+    outline: Option<Placed>,
     /// Where the press was, in the window, and on the slide, in slide units.
     from: Point<Pixels>,
     pressed_at: (f32, f32),
@@ -162,16 +172,38 @@ impl SlideEditor {
         let Some(pressed_at) = self.slide_units(from, cx) else {
             return;
         };
-        let (things, version, pick) = document.update(cx, |document, _| {
-            // A thing written in the text can't be moved yet, and nothing is moved without it.
+        let (things, lifting, refused, version, pick) = document.update(cx, |document, _| {
+            // One thing written in the text is lifted out of it; with others, nothing is moved.
             let (things, left_out) = document.movable_selected();
-            (if left_out { Vec::new() } else { things }, document.text_version(), document.selection_pick())
+            let (things, lifting, refused) = match (left_out, left_out.then(|| document.liftable_selected()).flatten()) {
+                (false, _) => (things, false, None),
+                (true, Some(Ok(one))) => (vec![one], true, None),
+                (true, Some(Err(why))) => (Vec::new(), false, Some(why)),
+                (true, None) => (Vec::new(), false, Some(EditRefused::InTheText)),
+            };
+            (things, lifting, refused, document.text_version(), document.selection_pick())
         });
         let grip = Grip::Move;
         let (held_at, keeps_shape) = (pressed_at, false);
         let others = self.snap_targets(selection.slide, &things, cx);
         let guides = Vec::new();
-        self.drag = Some(Drag { slide: selection.slide, version, pick, things, from, pressed_at, begun: false, grip, held_at, keeps_shape, others, guides });
+        self.drag = Some(Drag {
+            slide: selection.slide,
+            version,
+            pick,
+            things,
+            lifting,
+            refused,
+            outline: None,
+            from,
+            pressed_at,
+            begun: false,
+            grip,
+            held_at,
+            keeps_shape,
+            others,
+            guides,
+        });
     }
 
     /// The boxes on slide `slide` that `things` dragged snap to: the box each thing with a place
@@ -198,6 +230,11 @@ impl SlideEditor {
     /// The lines what's dragged snaps to where the pointer has it, while the button is down.
     pub(super) fn guides(&self) -> &[Guide] {
         self.drag.as_ref().map_or(&[], |drag| &drag.guides)
+    }
+
+    /// Where the outline of a thing being dragged out of the slide's text is shown, if one is.
+    pub(super) fn lift_outline(&self) -> Option<Placed> {
+        self.drag.as_ref().filter(|drag| drag.begun).and_then(|drag| drag.outline)
     }
 
     /// The handles on what's selected on the slide shown, if they show: with one thing or area
@@ -271,6 +308,9 @@ impl SlideEditor {
             version,
             pick,
             things,
+            lifting: false,
+            refused: None,
+            outline: None,
             from,
             pressed_at,
             begun: false,
@@ -343,7 +383,8 @@ impl SlideEditor {
             // A drag of several takes them all, rather than selecting the one pressed alone.
             self.pressed = None;
             if drag.things.is_empty() {
-                cx.emit(EditorEvent::Said(DRAG_OUT_FIRST.into()));
+                let why = drag.refused.map_or_else(|| DRAG_OUT_FIRST.to_string(), |why| why.to_string());
+                cx.emit(EditorEvent::Said(why.into()));
                 return;
             }
         }
@@ -355,8 +396,15 @@ impl SlideEditor {
             }
             return;
         };
-        if let Some(drag) = &mut self.drag {
-            drag.guides = guides;
+        let Some(drag) = &mut self.drag else {
+            return;
+        };
+        drag.guides = guides;
+        if drag.lifting {
+            // The engine can't show a thing in the text elsewhere: its outline shows instead.
+            drag.outline = places.first().map(|(_, placed)| *placed);
+            cx.notify();
+            return;
         }
         if let Some(document) = &self.document {
             document.update(cx, |document, _| document.preview_places(&places));
@@ -392,14 +440,23 @@ impl SlideEditor {
         }
         let inside = Bounds { origin: Point::default(), size: window.viewport_size() }.contains(&event.position);
         let places = (inside && self.drag_holds(cx)).then(|| self.dragged_to(event.position, event.modifiers, cx)).flatten().map(|(places, _)| places);
-        let label = match self.drag.take().map(|drag| drag.grip) {
+        let drag = self.drag.take();
+        let lifting = drag.as_ref().is_some_and(|drag| drag.lifting);
+        let label = match drag.map(|drag| drag.grip) {
             Some(Grip::Handle(Handle::Turn)) => TURN,
             Some(Grip::Handle(_)) => RESIZE,
             _ => MOVE,
         };
         self.pressed = None;
         self.pointer = None;
-        let changed = places.and_then(|places| self.run(|document| document.place_things(label, &places, EditRun::New), cx));
+        let changed = match places {
+            Some(places) if lifting => {
+                let to = places.first().map(|(_, placed)| *placed);
+                to.and_then(|to| self.run(|document| document.lift_selected(to), cx))
+            }
+            Some(places) => self.run(|document| document.place_things(label, &places, EditRun::New), cx),
+            None => None,
+        };
         if changed.is_none_or(|changed| changed.is_empty()) {
             // Nothing written, so nothing else draws the slide again as the talk has it.
             self.drop_preview(cx);

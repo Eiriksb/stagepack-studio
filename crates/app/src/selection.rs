@@ -168,6 +168,18 @@ pub(crate) fn block_at<'a>(blocks: &'a [Block], range: &Range<usize>) -> Option<
     })
 }
 
+/// The box at the top level of slide `slide` of `talk`, with a place of its own, that holds the
+/// block at `range` and nothing else, as a table or a picture moved out of the text is held:
+/// what a press on that block picks, as what moves.
+pub(crate) fn box_holding(talk: &Talk, slide: usize, range: &Range<usize>) -> Option<Range<usize>> {
+    talk.slides.get(slide)?.blocks.iter().find_map(|block| match block {
+        Block::Tag(tag) if tag.name == "Box" && slides_engine::is_positioned(tag) && matches!(tag.children.as_slice(), [only] if only.range() == range) => {
+            Some(tag.range.clone())
+        }
+        _ => None,
+    })
+}
+
 /// Whether paragraph `para` of flow `flow` of `flows`, a slide's, is written inside `range`.
 pub(crate) fn holds_para(flows: &[TextFlow], flow: usize, para: usize, range: &Range<usize>) -> bool {
     flows
@@ -188,6 +200,9 @@ pub fn name_of(talk: &Talk, slide: usize, range: &Range<usize>) -> Option<String
     let what = match block_at(&slide.blocks, range)? {
         Block::Picture { .. } => "Picture".to_string(),
         Block::Table { .. } => "Table".to_string(),
+        // A table or a picture moved out of the text, in the box that places it.
+        Block::Tag(tag) if tag.name == "Box" && matches!(tag.children.as_slice(), [Block::Table { .. }]) => "Table in a box".to_string(),
+        Block::Tag(tag) if tag.name == "Box" && matches!(tag.children.as_slice(), [Block::Picture { .. }]) => "Picture in a box".to_string(),
         Block::Tag(tag) => match tag.name.as_str() {
             "Picture" | "Shape" | "Icon" | "Table" | "Chart" => tag.name.clone(),
             // Text boxes, as the Insert tab and the format name them.
