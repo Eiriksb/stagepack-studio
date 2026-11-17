@@ -187,6 +187,21 @@ impl SlideStrip {
         }
     }
 
+    /// Takes the keyboard for the slide in hand, letting go of any thing selected on a slide:
+    /// from here Delete and the clipboard act on whole slides, and a thing still shown as
+    /// selected would say otherwise.
+    fn take_keyboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus_handle, cx);
+        if let Some(document) = &self.document {
+            document.update(cx, |document, cx| {
+                if document.selected().is_some() {
+                    document.deselect();
+                    cx.notify();
+                }
+            });
+        }
+    }
+
     pub fn focus_handle(&self) -> &FocusHandle {
         &self.focus_handle
     }
@@ -566,14 +581,14 @@ impl SlideStrip {
                 .when(!selected, |row| row.hover(|row| row.bg(theme.list_hover)))
                 .when(dragged == Some(index), |row| row.opacity(0.4))
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    window.focus(&this.focus_handle, cx);
+                    this.take_keyboard(window, cx);
                     window.dispatch_action(Box::new(SelectSlide { index }), cx);
                 }))
                 // The menu acts on the slide in hand, so a right-click takes it in hand.
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, _, window, cx| {
-                        window.focus(&this.focus_handle, cx);
+                        this.take_keyboard(window, cx);
                         window.dispatch_action(Box::new(SelectSlide { index }), cx);
                     }),
                 )

@@ -24,7 +24,7 @@ use stagepack_studio::recovery::Recovery;
 use stagepack_studio::ribbon::{MORE_RIGHT_ID, RIBBON_ID, TAB_HOME_ID, TAB_INSERT_ID};
 use stagepack_studio::text_tools::{ALIGN_CENTER_ID, BOLD_ID, BULLETS_ID, NUMBERING_ID};
 use stagepack_studio::inspector::{INSPECTOR_HEADING_ID, INSPECTOR_MESSAGE_ID};
-use stagepack_studio::slide_editor::{NEW_BOX_ID, SlideEditor};
+use stagepack_studio::slide_editor::{NEW_BOX_ID, SELECTION_OUTLINE_ID, SlideEditor};
 use stagepack_studio::slide_strip::{STRIP_ID, strip_row_id};
 use stagepack_studio::workspace_view::{DIALOG_FAILED, ExportPdf, ONLY_THE_FIRST, RECOVER_ID};
 use toolkit::ShapeKind;
@@ -466,6 +466,22 @@ fn a_shape_put_on_the_slide_from_the_list_of_slides_takes_the_typing(cx: &mut Te
     typing.type_text(cx, "Hi");
     let shape = "<Shape kind=\"rect\" fill=\"#2563eb\" x=\"720\" y=\"380\" w=\"480\" h=\"320\">\n\nHi\n\n</Shape>";
     assert_eq!(typing.source(cx), with_inserted(shape));
+}
+
+#[gpui_kit::test]
+fn a_click_in_the_list_of_slides_lets_go_of_the_thing_selected(cx: &mut TestAppContext) {
+    // Seen in the window: a shape selected, then its slide clicked in the list, still showed as
+    // selected, outline, form and all, while Delete took the whole slide away.
+    let typing = open(cx, TALK);
+    insert_shape(&typing, cx, "rect");
+    assert!(selected(&typing, cx).is_some());
+    click_on(&typing, cx, strip_row_id(0));
+    assert_eq!(selected(&typing, cx), None, "nothing is selected on the slide");
+    assert_ne!(typing.status(cx).as_deref(), Some("Shape selected"));
+    assert!(bounds_of(&typing, cx, SELECTION_OUTLINE_ID).is_none(), "no outline");
+    // Ctrl+Z still undoes the insert, from the list.
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), TALK);
 }
 
 #[gpui_kit::test]
