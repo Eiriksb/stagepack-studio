@@ -633,6 +633,107 @@ fn ctrl_d_duplicates_the_slide_from_the_list_and_the_thing_from_the_slide(cx: &m
     assert_eq!(typing.source(cx).matches("<Shape").count(), 4, "with its shapes");
 }
 
+/// What's being typed on the slide as the list of slides takes the keyboard.
+#[derive(Clone, Copy, Debug)]
+enum Typed {
+    /// A letter typed in a region's text.
+    InRegion,
+    /// A region's text all rubbed out, which ending the typing takes away.
+    RegionEmptied,
+    /// A letter typed in a shape.
+    InShape,
+    /// A letter typed in a table's cell.
+    InCell,
+    /// A new text box waiting for its first letter.
+    PendingBox,
+}
+
+const TABLE_TALK: &str = "---\ntitle: T\n---\n\n# One\n\n| a | b |\n| --- | --- |\n| c | d |\n\n---\n\n# Two\n";
+
+/// Opens a talk and starts `typed` on its first slide.
+fn start_typing(cx: &mut TestAppContext, typed: Typed) -> Typing {
+    let typing = open(cx, if matches!(typed, Typed::InCell) { TABLE_TALK } else { TALK });
+    match typed {
+        Typed::InRegion | Typed::RegionEmptied => {
+            let body = typing.flows(cx, 0).len() - 1;
+            typing.click_text(cx, body, pos(0, 2));
+            if matches!(typed, Typed::InRegion) {
+                typing.type_text(cx, "x");
+            } else {
+                typing.press(cx, "ctrl-a");
+                typing.press(cx, "backspace");
+            }
+        }
+        Typed::InShape => {
+            insert_shape(&typing, cx, "rect");
+            typing.type_text(cx, "x");
+        }
+        Typed::InCell => {
+            let flows = typing.flows(cx, 0);
+            let cell = flows
+                .iter()
+                .position(|flow| matches!(flow.place, slides_format::FlowPlace::Cell { row: 1, column: 0, .. }))
+                .expect("the cell");
+            typing.click_text(cx, cell, pos(0, 1));
+            typing.type_text(cx, "x");
+        }
+        Typed::PendingBox => insert_text_box(&typing, cx),
+    }
+    let started = typing.editing(cx).is_some();
+    assert!(started, "{typed:?}: typing has started");
+    typing
+}
+
+/// Found in review: a press below the rows, or a row moved a few pixels, gave the list the
+/// keyboard while the caret was still drawn in the text, and Backspace took the slide. Each
+/// way the mouse gives the list the keyboard ends `typed` as Escape does.
+fn the_list_taking_the_keyboard_ends(cx: &mut TestAppContext, typed: Typed) {
+    // What the talk holds once Escape has ended the typing.
+    let escaped = start_typing(cx, typed);
+    escaped.press(cx, "escape");
+    let after_escape = escaped.source(cx);
+    for how in [ToTheList::Click, ToTheList::Wobble, ToTheList::BelowTheRows] {
+        let typing = start_typing(cx, typed);
+        to_the_list(&typing, cx, how);
+        let case = format!("{typed:?} then {how:?}");
+        assert!(typing.editing(cx).is_none(), "{case}: nothing is being typed");
+        assert!(typing.caret(cx).is_none(), "{case}: no caret is drawn");
+        assert!(new_box(&typing, cx).is_none(), "{case}: no text box is waiting");
+        assert!(bounds_of(&typing, cx, NEW_BOX_ID).is_none(), "{case}: no new box is drawn");
+        assert_eq!(selected(&typing, cx), None, "{case}: nothing is selected");
+        assert_eq!(typing.source(cx), after_escape, "{case}: the talk is as after Escape");
+        // Only now that nothing on the slide shows as its target does the key take a slide.
+        let slides = typing.slide_count(cx);
+        typing.press(cx, if matches!(typed, Typed::PendingBox) { "delete" } else { "backspace" });
+        assert_eq!(typing.slide_count(cx), slides - 1, "{case}: the key acts on the list");
+    }
+}
+
+#[gpui_kit::test]
+fn the_list_taking_the_keyboard_ends_typing_in_a_region(cx: &mut TestAppContext) {
+    the_list_taking_the_keyboard_ends(cx, Typed::InRegion);
+}
+
+#[gpui_kit::test]
+fn the_list_taking_the_keyboard_tidies_a_region_rubbed_out(cx: &mut TestAppContext) {
+    the_list_taking_the_keyboard_ends(cx, Typed::RegionEmptied);
+}
+
+#[gpui_kit::test]
+fn the_list_taking_the_keyboard_ends_typing_in_a_shape(cx: &mut TestAppContext) {
+    the_list_taking_the_keyboard_ends(cx, Typed::InShape);
+}
+
+#[gpui_kit::test]
+fn the_list_taking_the_keyboard_ends_typing_in_a_cell(cx: &mut TestAppContext) {
+    the_list_taking_the_keyboard_ends(cx, Typed::InCell);
+}
+
+#[gpui_kit::test]
+fn the_list_taking_the_keyboard_drops_a_pending_text_box(cx: &mut TestAppContext) {
+    the_list_taking_the_keyboard_ends(cx, Typed::PendingBox);
+}
+
 #[gpui_kit::test]
 fn a_picture_dropped_while_the_list_of_slides_has_the_keyboard_is_taken_away_by_delete(cx: &mut TestAppContext) {
     let typing = open(cx, TALK);

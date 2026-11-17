@@ -21,6 +21,7 @@ use gpui_kit::*;
 use slides_engine::{Pixmap, to_bgra_frame};
 
 use crate::document::Document;
+use crate::slide_editor::SlideEditor;
 use crate::workspace_view::{
     CopyToClipboard, CutToClipboard, DeleteSlide, DuplicateSlide, MoveSlideDown, MoveSlideTo,
     MoveSlideUp, NewSlide, PasteFromClipboard, SelectSlide, ToggleHidden,
@@ -156,6 +157,8 @@ pub struct SlideStrip {
     /// The rows the list last laid out. It also lays out a row by itself to measure it, before
     /// the rows on screen, so the last of a frame is the one that's on screen.
     laid_out: Option<Range<usize>>,
+    /// What types on the slide, whose typing ends as the list takes the keyboard.
+    editor: Option<WeakEntity<SlideEditor>>,
     _document_changed: Option<Subscription>,
 }
 
@@ -183,6 +186,7 @@ impl SlideStrip {
             scrolling: false,
             drag_ended: false,
             laid_out: None,
+            editor: None,
             _document_changed: document_changed,
         }
     }
@@ -193,10 +197,21 @@ impl SlideStrip {
         window.focus(&self.focus_handle, cx);
     }
 
-    /// Lets go of the thing selected on a slide, as the list takes the keyboard: from here Delete
-    /// and the clipboard act on whole slides, and a thing still shown as selected would say
-    /// otherwise.
-    pub fn let_go_of_selection(&mut self, cx: &mut Context<Self>) {
+    /// Has the typing that `editor` does on the slide end as the list takes the keyboard.
+    pub fn end_typing_of(&mut self, editor: WeakEntity<SlideEditor>) {
+        self.editor = Some(editor);
+    }
+
+    /// Lets go of the thing selected on a slide, and ends any typing on it as Escape does, as
+    /// the list takes the keyboard: from here Delete and the clipboard act on whole slides, and
+    /// a thing still shown as selected, a caret still drawn or a new text box still waiting for
+    /// its first letter would say otherwise. Typing ends at once, before anything the press
+    /// goes on to do, so that nothing resumes it and takes the keyboard back for the slide.
+    pub fn let_go_of_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let typing = self.document.as_ref().is_some_and(|document| document.read(cx).text().is_some());
+        if let Some(editor) = self.editor.as_ref().and_then(WeakEntity::upgrade).filter(|_| typing) {
+            editor.update(cx, |editor, cx| editor.stop_typing(window, cx));
+        }
         if let Some(document) = &self.document {
             document.update(cx, |document, cx| {
                 if document.selected().is_some() {
@@ -732,7 +747,7 @@ impl Render for SlideStrip {
             .key_context(STRIP_CONTEXT)
             .track_focus(&self.focus_handle)
             // Any press on the list gives it the keyboard, on a row, below the rows, or to drag.
-            .on_any_mouse_down(cx.listener(|this, _, _, cx| this.let_go_of_selection(cx)))
+            .on_any_mouse_down(cx.listener(|this, _, window, cx| this.let_go_of_selection(window, cx)))
             .relative()
             .overflow_hidden()
             .size_full()

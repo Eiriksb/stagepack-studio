@@ -475,9 +475,13 @@ impl WorkspaceView {
         // selected while the list has it takes the keyboard for the slide.
         let list_focus = slide_strip.read(cx).focus_handle().clone();
         slide_editor.update(cx, |editor, _| editor.take_keyboard_from_list(list_focus.clone()));
+        // Typing on the slide ends then too, as Escape ends it: no caret shows, and no new text
+        // box waits, while the list has the keyboard.
+        let editor = slide_editor.downgrade();
+        slide_strip.update(cx, |strip, _| strip.end_typing_of(editor));
         let strip = slide_strip.clone();
-        let list_focused = cx.on_focus_in(&list_focus, window, move |_, _, cx| {
-            strip.update(cx, |strip, cx| strip.let_go_of_selection(cx));
+        let list_focused = cx.on_focus_in(&list_focus, window, move |_, window, cx| {
+            strip.update(cx, |strip, cx| strip.let_go_of_selection(window, cx));
         });
         let notes_panel = cx.new(|cx| NotesPanel::new(document.clone(), window, cx));
         let workspace = cx.weak_entity();
