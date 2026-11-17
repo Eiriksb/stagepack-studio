@@ -32,6 +32,9 @@ pub enum FlowPlace {
     Region(String),
     /// The positioned tag, by its range, whose text this is.
     Tag(Range<usize>),
+    /// A cell of the table whose range is `table`: row `row`, the header being row 0, and
+    /// column `column`.
+    Cell { table: Range<usize>, row: usize, column: usize },
 }
 
 /// Where one paragraph is in the talk's source.
@@ -53,6 +56,7 @@ pub struct TextFlow {
 }
 
 const TABLE: &str = "Tables can't be edited on the slide yet.";
+const CELL_WITH_MORE: &str = "This cell holds more than text, so it can't be typed in yet.";
 const CODE: &str = "Code can't be edited on the slide yet.";
 const QUOTE: &str = "Quotes can't be edited on the slide yet.";
 const PICTURE: &str = "Pictures can't be edited on the slide yet.";
@@ -99,8 +103,23 @@ pub(crate) fn is_positioned(tag: &Tag) -> bool {
 /// Each run of editable text on slide `slide`, in the order it's in the file. A region's
 /// text is one flow per unbroken run of headings, paragraphs and lists. Anything else ends
 /// the run and belongs to no flow, as does a positioned tag, whose own text is a flow if
-/// it's a box of editable text.
+/// it's a box of editable text: a text box, a box or a shape. After all those come the cells
+/// of the slide's tables whose cells can be typed in, table by table, each row's cells in
+/// turn: each cell holding only text is a flow of one body paragraph.
 pub fn text_flows(talk: &Talk, slide: usize) -> Vec<TextFlow> {
+    text_flows_with(talk, slide, &no_others)
+}
+
+/// What takes content besides the format's own boxes: nothing.
+fn no_others(_: &str) -> bool {
+    false
+}
+
+/// [`text_flows`], with a positioned tag whose name `takes_content` says yes to a box of text
+/// too: one of the talk's components that draws what's written between its tags. Whoever
+/// lays the slide out and whoever edits it must ask the same question, so that the flows
+/// they count are the same.
+pub fn text_flows_with(talk: &Talk, slide: usize, takes_content: &dyn Fn(&str) -> bool) -> Vec<TextFlow> {
     let Some(slide) = talk.slides.get(slide) else { return Vec::new() };
     if slide.error.is_some() {
         return Vec::new();
@@ -120,7 +139,7 @@ pub fn text_flows(talk: &Talk, slide: usize) -> Vec<TextFlow> {
             }
             Block::Tag(tag) if is_positioned(tag) => {
                 end_run(&mut run, &mut flows);
-                flows.extend(box_flow(&talk.source, slide, tag));
+                flows.extend(box_flow(&talk.source, slide, tag, takes_content));
             }
             _ => {
                 let region = match block {
@@ -145,12 +164,53 @@ pub fn text_flows(talk: &Talk, slide: usize) -> Vec<TextFlow> {
         }
     }
     end_run(&mut run, &mut flows);
+    for table in typed_tables(slide) {
+        let Block::Table { rows, cells, range, .. } = table else { continue };
+        for (r, (spans, sources)) in rows.iter().zip(cells).enumerate() {
+            for (c, (spans, source)) in spans.iter().zip(sources).enumerate() {
+                if source.only_text {
+                    flows.push(TextFlow {
+                        place: FlowPlace::Cell { table: range.clone(), row: r, column: c },
+                        paras: vec![para(ParaKind::Body, spans)],
+                        source: vec![ParaSource { block: source.range.clone(), inline: source.inline.clone() }],
+                    });
+                }
+            }
+        }
+    }
     flows
 }
 
-/// The flow of a positioned tag's text, if it's a box holding only editable text.
-fn box_flow(source: &str, slide: &Slide, tag: &Tag) -> Option<TextFlow> {
-    if !TEXT_BOXES.contains(&tag.name.as_str()) || is_quoted(slide, &tag.range) || tag.children.is_empty() {
+/// The tables on `slide` whose cells can be typed in, in the order they're in the file: those
+/// in the slide's regions, in its lists and in its positioned boxes of text, but not in a quote.
+pub(crate) fn typed_tables(slide: &Slide) -> Vec<&Block> {
+    // `top` says whether `blocks` are the slide's own, where a positioned tag is a box.
+    fn walk<'a>(slide: &'a Slide, blocks: &'a [Block], top: bool, out: &mut Vec<&'a Block>) {
+        for block in blocks {
+            match block {
+                Block::Table { range, .. } if !is_quoted(slide, range) => out.push(block),
+                Block::List { items, .. } => {
+                    for item in items {
+                        walk(slide, item, false, out);
+                    }
+                }
+                Block::Tag(tag) if top && is_positioned(tag) && TEXT_BOXES.contains(&tag.name.as_str()) => walk(slide, &tag.children, false, out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if slide.error.is_none() {
+        walk(slide, &slide.blocks, true, &mut out);
+    }
+    out
+}
+
+/// The flow of a positioned tag's text, if it's a box holding only editable text: one of the
+/// format's own boxes, or a tag `takes_content` says yes to.
+fn box_flow(source: &str, slide: &Slide, tag: &Tag, takes_content: &dyn Fn(&str) -> bool) -> Option<TextFlow> {
+    let boxed = TEXT_BOXES.contains(&tag.name.as_str()) || takes_content(&tag.name);
+    if !boxed || is_quoted(slide, &tag.range) || tag.children.is_empty() {
         return None;
     }
     let mut read = Vec::new();
@@ -253,6 +313,11 @@ fn para(kind: ParaKind, spans: &[Span]) -> Para {
 /// For a byte position `at` on slide `slide` that's inside text in no flow, the sentence
 /// saying why it can't be edited. `None` for a position in a flow, or in nothing drawn.
 pub fn uneditable_reason(talk: &Talk, slide: usize, at: usize) -> Option<&'static str> {
+    uneditable_reason_with(talk, slide, at, &no_others)
+}
+
+/// [`uneditable_reason`], for the flows [`text_flows_with`] gives with `takes_content`.
+pub fn uneditable_reason_with(talk: &Talk, slide: usize, at: usize, takes_content: &dyn Fn(&str) -> bool) -> Option<&'static str> {
     let index = slide;
     let slide = talk.slides.get(index)?;
     if !slide.range.contains(&at) {
@@ -265,7 +330,7 @@ pub fn uneditable_reason(talk: &Talk, slide: usize, at: usize) -> Option<&'stati
     // Every byte of a block that was read into a flow is in it: its markers, the blank
     // lines between a list's items, a box's opening and closing tags.
     let read = block.is_some_and(|block| match block {
-        Block::Tag(tag) if is_positioned(tag) => box_flow(&talk.source, slide, tag).is_some(),
+        Block::Tag(tag) if is_positioned(tag) => box_flow(&talk.source, slide, tag, takes_content).is_some(),
         block => read_block(&talk.source, slide, block, &mut Vec::new()),
     });
     if read {
@@ -273,6 +338,12 @@ pub fn uneditable_reason(talk: &Talk, slide: usize, at: usize) -> Option<&'stati
     }
     if slide.quotes.iter().any(|quote| quote.contains(&at)) {
         return Some(QUOTE);
+    }
+    // In a table whose cells can be typed in, only a cell holding more than text can't be:
+    // its `|`s and its alignment row are part of the table.
+    if let Some(Block::Table { cells, .. }) = typed_tables(slide).into_iter().find(|table| table.range().contains(&at)) {
+        let more = cells.iter().flatten().any(|cell| !cell.only_text && cell.inline.contains(&at));
+        return more.then_some(CELL_WITH_MORE);
     }
     reason_in(block?, at)
 }

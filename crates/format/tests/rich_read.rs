@@ -77,6 +77,32 @@ fn an_empty_line_reads_as_an_empty_paragraph_in_either_spelling() {
 }
 
 #[test]
+fn a_no_break_space_item_with_items_under_it_can_be_typed_in() {
+    let source = "# T\n\n- &nbsp;\n  - b\n- c\n";
+    let talk = parse_talk(source);
+    let flows = text_flows(&talk, 0);
+    let bullet = |level| ParaKind::Bullet { level };
+    assert_eq!(flows[1].paras, [para(bullet(0), "\u{a0}"), para(bullet(1), "b"), para(bullet(0), "c")]);
+    let mut paras = flows[1].paras.clone();
+    paras[1].spans[0].text.push('x');
+    let after = write_flow(&talk, 0, &flows[1], &paras).expect("typing is written").apply(source);
+    assert_eq!(after, "# T\n\n- &nbsp;\n  - bx\n- c\n");
+    // Alone, with nothing under it, it's an empty item.
+    assert_eq!(text_flows(&parse_talk("# T\n\n- &nbsp;\n- c\n"), 0)[1].paras[0], Para { kind: bullet(0), spans: vec![] });
+}
+
+#[test]
+fn a_no_break_space_item_left_with_nothing_under_it_keeps_its_space() {
+    let source = "# T\n\n- &nbsp;\n  - b\n- c\n";
+    let talk = parse_talk(source);
+    let flow = &text_flows(&talk, 0)[1];
+    let paras = [flow.paras[0].clone(), flow.paras[2].clone()];
+    let after = write_flow(&talk, 0, flow, &paras).expect("the item under it can go").apply(source);
+    assert_eq!(text_flows(&parse_talk(&after), 0)[1].paras, paras, "{after:?}");
+    assert!(after.ends_with("\n- c\n"), "{after:?}");
+}
+
+#[test]
 fn an_item_whose_content_the_parser_drops_is_in_no_flow() {
     for source in ["- ***\n- a\n", "- [r]: http://x\n- a\n"] {
         assert!(flows(source).is_empty(), "{source:?}");
@@ -103,10 +129,47 @@ fn text_tags_and_links_the_model_cannot_hold_are_in_no_flow() {
 #[test]
 fn a_table_splits_the_text_around_it() {
     let flows = flows("# T\n\nBefore.\n\n| a | b |\n| - | - |\n| 1 | 2 |\n\nAfter.\n");
-    assert_eq!(flows.len(), 3);
+    assert_eq!(flows.len(), 3 + 4, "the region's three, then the table's four cells");
     assert_eq!(flows[1].paras, vec![para(ParaKind::Body, "Before.")]);
     assert_eq!(flows[2].paras, vec![para(ParaKind::Body, "After.")]);
     assert_eq!(flows[1].place, flows[2].place);
+}
+
+#[test]
+fn each_cell_of_a_table_is_a_flow_after_the_others() {
+    let source = "# T\n\n| a | `b\\|c` |\n| :- | -: |\n| **1** |  |\n| x |\n\nAfter.\n";
+    let flows = flows(source);
+    let table = 5..source.find("\n\nAfter").unwrap();
+    let cells: Vec<_> = flows[2..].iter().map(|flow| (flow.place.clone(), flow.paras.clone(), &source[flow.source[0].inline.clone()])).collect();
+    let cell = |row, column| FlowPlace::Cell { table: table.clone(), row, column };
+    let code = Span { text: "b|c".into(), style: Style { code: true, ..Style::default() } };
+    let bold = Span { text: "1".into(), style: Style { bold: true, ..Style::default() } };
+    assert_eq!(
+        cells,
+        [
+            (cell(0, 0), vec![para(ParaKind::Body, "a")], "a"),
+            (cell(0, 1), vec![Para { kind: ParaKind::Body, spans: vec![code] }], "`b\\|c`"),
+            (cell(1, 0), vec![Para { kind: ParaKind::Body, spans: vec![bold] }], "**1**"),
+            (cell(1, 1), vec![Para { kind: ParaKind::Body, spans: Vec::new() }], "  "),
+            (cell(2, 0), vec![para(ParaKind::Body, "x")], "x"),
+        ],
+        "a row shorter than the header has only its own cells"
+    );
+    let empty = &flows[5].source[0];
+    assert_eq!(&source[empty.inline.clone()], "  ", "an empty cell's content is all the space between its `|`s");
+    let Block::Table { rule, .. } = &parse_talk(source).slides[0].blocks[1] else { panic!() };
+    assert_eq!(&source[rule.clone()], "| :- | -: |");
+}
+
+#[test]
+fn a_table_in_a_quote_or_a_component_has_no_flows() {
+    for source in ["> | a |\n> | - |\n> | 1 |\n", "<Chart>\n\n| a |\n| - |\n| 1 |\n\n</Chart>\n"] {
+        assert!(flows(source).is_empty(), "{source:?}");
+        assert!(uneditable_reason(&parse_talk(source), 0, source.find('1').unwrap()).is_some(), "{source:?}");
+    }
+    let boxed = "<Box x=\"10\" y=\"10\">\n\n| a |\n| - |\n| 1 |\n\n</Box>\n\n- item\n\n  | b |\n  | - |\n";
+    let places: Vec<_> = flows(boxed).into_iter().map(|flow| flow.place).collect();
+    assert!(places.iter().all(|place| matches!(place, FlowPlace::Cell { .. })) && places.len() == 3, "{places:?}");
 }
 
 #[test]
@@ -200,6 +263,32 @@ fn text_in_a_box_is_a_flow_of_its_own() {
 }
 
 #[test]
+fn a_placed_component_is_a_box_of_text_only_when_the_caller_says_it_takes_content() {
+    let source = "# T\n\n<Callout title=\"Hi\" x=\"10\" y=\"10\" w=\"600\" h=\"300\">\n\nWords\n\n</Callout>\n";
+    let talk = parse_talk(source);
+    let words = source.find("Words").unwrap();
+    // On its own, the format knows only its own boxes.
+    assert_eq!(text_flows(&talk, 0).len(), 1, "the title alone");
+    assert_eq!(uneditable_reason(&talk, 0, words), Some("Text inside a component can't be edited on the slide yet."));
+    let callout = |name: &str| name == "Callout";
+    let all = text_flows_with(&talk, 0, &callout);
+    let tag = source.find("<Callout").unwrap()..source.trim_end().len();
+    let boxed: Vec<&TextFlow> = all.iter().filter(|flow| flow.place == FlowPlace::Tag(tag.clone())).collect();
+    assert_eq!(boxed.len(), 1, "{all:?}");
+    assert_eq!(boxed[0].paras, vec![para(ParaKind::Body, "Words")]);
+    assert_eq!(uneditable_reason_with(&talk, 0, words, &callout), None);
+    // Written into with the same answer, it reads back.
+    let typed = vec![para(ParaKind::Body, "New words")];
+    let change = write_flow_with(&talk, 0, boxed[0], &typed, &callout).expect("written");
+    let after = parse_talk(&change.apply(source));
+    assert_eq!(text_flows_with(&after, 0, &callout)[1].paras, typed);
+    assert_eq!(write_flow(&talk, 0, boxed[0], &typed), None, "not a flow without the answer");
+    // Not placed, it's part of the slide's own content, which it isn't text of.
+    let unplaced = "# T\n\n<Callout title=\"Hi\">\n\nWords\n\n</Callout>\n";
+    assert_eq!(text_flows_with(&parse_talk(unplaced), 0, &callout).len(), 1, "the title alone");
+}
+
+#[test]
 fn a_box_with_a_component_in_it_is_in_no_flow() {
     let source = "<Box x=\"1\" y=\"2\">\n\nWords\n\n<Chart />\n\n</Box>\n";
     assert!(flows(source).is_empty());
@@ -272,7 +361,7 @@ fn uneditable_reason_names_tables_code_and_quotes() {
     let source = "# T\n\n| a | b |\n| - | - |\n| 1 | 2 |\n\n```\nlet x = 1;\n```\n\n> A quote\n\nWords.\n";
     let talk = parse_talk(source);
     let reason = |text: &str| uneditable_reason(&talk, 0, source.find(text).unwrap());
-    assert_eq!(reason("| 1"), Some("Tables can't be edited on the slide yet."));
+    assert_eq!(reason("| 1"), None, "a table's cells can be typed in");
     assert_eq!(reason("let x"), Some("Code can't be edited on the slide yet."));
     assert_eq!(reason("A quote"), Some("Quotes can't be edited on the slide yet."));
     assert_eq!(reason("Words"), None);
@@ -329,8 +418,13 @@ fn mixed_source() -> impl Strategy<Value = String> {
 fn assert_flows_are_sound(talk: &Talk) -> Result<(), TestCaseError> {
     for (index, slide) in talk.slides.iter().enumerate() {
         let flows = text_flows(talk, index);
-        let mut blocks = Vec::new();
+        // A table's cells come after the other flows, so they're in order among themselves.
+        let (mut blocks, mut cells) = (Vec::new(), Vec::new());
         for flow in &flows {
+            let in_a_cell = matches!(flow.place, FlowPlace::Cell { .. });
+            if in_a_cell {
+                prop_assert!(flow.paras.len() == 1 && flow.paras[0].kind == ParaKind::Body);
+            }
             prop_assert_eq!(flow.paras.len(), flow.source.len());
             prop_assert!(!flow.paras.is_empty());
             if let FlowPlace::Tag(range) = &flow.place {
@@ -347,24 +441,44 @@ fn assert_flows_are_sound(talk: &Talk) -> Result<(), TestCaseError> {
                 // give the same spans, where they read as one paragraph at all: a lone
                 // `- *` is a list in a list, though it's text after another line.
                 let content = &talk.source[at.inline.clone()];
+                // A heading's content is tried both ways it's written: underlined, `>` starts
+                // a quote, and after `# `, a `#` can be read as part of the marker.
                 let alone = match para.kind {
-                    ParaKind::Heading(_) => format!("{content}\n==="),
-                    ParaKind::Bullet { .. } | ParaKind::Numbered { .. } => format!("- {content}"),
-                    ParaKind::Body => content.to_string(),
+                    ParaKind::Heading(_) => vec![format!("{content}\n==="), format!("# {content}")],
+                    // An item whose first line is a marker alone, as `*` is, holds a list
+                    // when it's read alone, and its other lines go with that.
+                    ParaKind::Bullet { .. } | ParaKind::Numbered { .. }
+                        if matches!(content.split(['\n', '\r']).next().map(str::trim_end), Some("*" | "-" | "+")) =>
+                    {
+                        vec![]
+                    }
+                    ParaKind::Bullet { .. } | ParaKind::Numbered { .. } => vec![format!("- {content}")],
+                    // A cell's content is read alone in a cell: a `|` in it is escaped there.
+                    ParaKind::Body if in_a_cell => vec![format!("| {content} |\n| - |")],
+                    ParaKind::Body => vec![content.to_string()],
                 };
+                let read_alone: Vec<Vec<Span>> = alone
+                    .iter()
+                    .filter_map(|alone| match text_flows(&parse_talk(alone), 0).as_slice() {
+                        [flow] if flow.paras.len() == 1 => Some(flow.paras[0].spans.clone()),
+                        _ => None,
+                    })
+                    .collect();
                 if content.is_empty() {
                     prop_assert!(para.spans.is_empty());
-                } else if let [flow] = text_flows(&parse_talk(&alone), 0).as_slice()
-                    && let [read_alone] = flow.paras.as_slice()
-                {
-                    prop_assert_eq!(&read_alone.spans, &para.spans, "content {:?} of {:?}", content, &talk.source);
+                } else if content == "&nbsp;" {
+                    // Empty, or, in an item with items under it, the character.
+                    prop_assert!(para.spans.is_empty() || para.spans == [plain("\u{a0}")], "{:?}", &para.spans);
+                } else if !read_alone.is_empty() {
+                    prop_assert!(read_alone.contains(&para.spans), "content {:?} of {:?} reads alone as {:?}", content, &talk.source, read_alone);
                 }
-                blocks.push(at.block.clone());
+                if in_a_cell { cells.push(at.block.clone()) } else { blocks.push(at.block.clone()) }
             }
             // Every byte of what the flow was read from is in it: a box from its opening tag
             // to its closing one, a list's markers and the lines between its items.
             let read: Vec<std::ops::Range<usize>> = match &flow.place {
                 FlowPlace::Tag(range) => vec![range.clone()],
+                FlowPlace::Cell { .. } => flow.source.iter().map(|at| at.block.clone()).collect(),
                 FlowPlace::Region(_) => slide
                     .blocks
                     .iter()
@@ -378,16 +492,18 @@ fn assert_flows_are_sound(talk: &Talk) -> Result<(), TestCaseError> {
                 }
             }
         }
-        let in_file_order = blocks.clone();
-        blocks.sort_by_key(|block| block.start);
-        prop_assert_eq!(&blocks, &in_file_order);
-        prop_assert!(blocks.windows(2).all(|pair| pair[0].end <= pair[1].start), "overlapping: {:?}", blocks);
+        for blocks in [&mut blocks, &mut cells] {
+            let in_file_order = blocks.clone();
+            blocks.sort_by_key(|block| block.start);
+            prop_assert_eq!(&*blocks, &in_file_order);
+            prop_assert!(blocks.windows(2).all(|pair| pair[0].end <= pair[1].start), "overlapping: {:?}", blocks);
+        }
     }
     Ok(())
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(512))]
+    #![proptest_config(ProptestConfig::with_cases(cases(512)))]
 
     #[test]
     fn flows_never_overlap_and_stay_inside_their_slide(generated in gen_talk()) {

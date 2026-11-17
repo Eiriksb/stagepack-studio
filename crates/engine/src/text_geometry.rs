@@ -7,10 +7,11 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use cosmic_text::{Align as TextAlign, BidiParagraphs, Buffer};
-use slides_format::{FlowPlace, Pos, Talk, text_flows, uneditable_reason};
+use slides_format::{Block, FlowPlace, Pos, Talk, text_flows_with, uneditable_reason, uneditable_reason_with};
 use tiny_skia::{Point, Transform};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::flow::TEXT_TAG;
 use crate::slide::EmptyRegion;
 use crate::text::LINE_HEIGHT;
 use crate::{Align, LayerSpec, Rect};
@@ -43,11 +44,27 @@ impl CaretRect {
     }
 }
 
+/// Something on the slide that can be picked as a whole: a positioned tag, a picture, an icon,
+/// a shape, a component or a table.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ElementBox {
+    /// Its tag's or its block's whole source.
+    pub source: Range<usize>,
+    /// Where it's drawn, in slide units before it's turned.
+    pub rect: Rect,
+    /// The degrees it's turned by, about the centre of `rect`.
+    pub rotate: f32,
+    /// Whether there's text in it that can be edited.
+    pub holds_text: bool,
+}
+
 /// What's under a point of the slide.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Hit {
     /// Editable text: the caret goes at `pos` of flow `flow`.
     Text { flow: usize, pos: Pos },
+    /// A thing of its own whose text, if it has any, can't be edited where the point is.
+    Element(ElementBox),
     /// Something whose text can't be edited, and the sentence saying why.
     Uneditable(&'static str),
     /// An empty region of the slide's layout, by name, where text can be started.
@@ -87,6 +104,9 @@ pub(crate) struct DrawnText {
     pub align: Align,
     /// The text, and the text shaped. An empty list item has neither.
     pub shaped: Option<(String, Arc<Buffer>)>,
+    /// For a table's cell, the cell's whole box, relative to the layer: a caret in it when
+    /// it's empty is held within it.
+    pub cell: Option<Rect>,
 }
 
 /// A block drawn in a layer, relative to the layer.
@@ -96,11 +116,19 @@ pub(crate) struct DrawnBlock {
     pub rect: Rect,
 }
 
+/// A table drawn in a layer: each of its cells, row by row, relative to the layer.
+#[derive(Clone)]
+pub(crate) struct DrawnTable {
+    pub range: Range<usize>,
+    pub cells: Vec<Vec<Rect>>,
+}
+
 /// What one layer drew of the slide's blocks.
 #[derive(Clone, Default)]
 pub(crate) struct LayerText {
     pub texts: Vec<DrawnText>,
     pub blocks: Vec<DrawnBlock>,
+    pub tables: Vec<DrawnTable>,
     /// The layout region the layer is, if it is one, and where that region is on the slide.
     pub region: Option<(&'static str, Rect)>,
     /// Whether the layer stands for one thing, a positioned tag or a slide that couldn't be
@@ -119,12 +147,16 @@ impl LayerText {
         for block in &mut self.blocks {
             shift(&mut block.range);
         }
+        for table in &mut self.tables {
+            shift(&mut table.range);
+        }
     }
 
     /// Every source range it holds, for tests.
     pub(crate) fn sources(&self) -> impl Iterator<Item = Range<usize>> + '_ {
         let texts = self.texts.iter().flat_map(|text| [text.range.clone(), text.inline.clone()]);
-        texts.chain(self.blocks.iter().map(|block| block.range.clone()))
+        let tables = self.tables.iter().map(|table| table.range.clone());
+        texts.chain(self.blocks.iter().map(|block| block.range.clone())).chain(tables)
     }
 }
 
@@ -200,12 +232,55 @@ struct Frame {
 pub struct TextLayout {
     paras: Vec<PlacedPara>,
     lines: Vec<ParaLines>,
+    /// The flows that are tables' cells.
+    cell_flows: std::collections::HashSet<usize>,
     frames: Vec<Frame>,
-    /// What can't be edited, by layer, and why: innermost first among those that overlap.
-    uneditable: Vec<(usize, Rect, &'static str)>,
+    /// What can't be edited, by layer, and why, with the element it is if it's one: innermost
+    /// first among those that overlap.
+    uneditable: Vec<(usize, Rect, &'static str, Option<usize>)>,
+    /// Every element, in the order it's drawn.
+    elements: Vec<ElementBox>,
     /// The empty regions, their place and turn, and the size and alignment of their text.
     placeholders: Vec<Placeholder>,
+    /// Every table, with its cells.
+    tables: Vec<TableGrid>,
 }
+
+/// A table on the slide: where each of its cells is, and the text of each cell that has some
+/// that can be typed in.
+#[derive(Clone, Debug, PartialEq)]
+struct TableGrid {
+    layer: usize,
+    /// The table's source.
+    source: Range<usize>,
+    /// Where it's drawn, in slide units before its layer's turn.
+    rect: Rect,
+    /// Its element, an index into the layout's elements.
+    element: usize,
+    /// Each cell, row by row, in slide units before the layer's turn, and its placed
+    /// paragraph, an index into the layout's paragraphs, if it has one.
+    cells: Vec<Vec<(Rect, Option<usize>)>>,
+}
+
+/// How near a table's lines, either side, a point is on them rather than in a cell.
+const BORDER_PICK: f32 = 4.0;
+
+impl TableGrid {
+    /// What's at `point`, in the table's layer's frame and on the table: the cell it's in,
+    /// away from the table's lines, or `None` on a line or where no cell is.
+    fn cell_at(&self, (x, y): (f32, f32)) -> Option<&(Rect, Option<usize>)> {
+        let cell = self.cells.iter().flatten().find(|(rect, _)| contains(rect, (x, y)))?;
+        let rect = cell.0;
+        // A cell's lines are drawn along its left and top edges, and its right and bottom ones
+        // are its neighbours' or the table's last.
+        let near = |at: f32, line: f32| (at - (line + OUTLINE_CENTRE)).abs() <= BORDER_PICK;
+        let on_a_line = near(x, rect.x) || near(x, rect.x + rect.w) || near(y, rect.y) || near(y, rect.y + rect.h);
+        (!on_a_line).then_some(cell)
+    }
+}
+
+/// How far into a cell, from its edge, the line along that edge is drawn at its middle.
+const OUTLINE_CENTRE: f32 = 0.5;
 
 /// An empty region of the slide's layout.
 #[derive(Clone, Debug, PartialEq)]
@@ -231,6 +306,43 @@ fn contains(rect: &Rect, (x, y): (f32, f32)) -> bool {
     x >= rect.x && x <= rect.x + rect.w && y >= rect.y && y <= rect.y + rect.h
 }
 
+/// The block of `blocks`, at any depth, whose source is `range`.
+fn block_at<'a>(blocks: &'a [Block], range: &Range<usize>) -> Option<&'a Block> {
+    blocks.iter().find_map(|block| {
+        if block.range() == range {
+            return Some(block);
+        }
+        match block {
+            Block::List { items, .. } => items.iter().find_map(|item| block_at(item, range)),
+            Block::Tag(tag) => block_at(&tag.children, range),
+            _ => None,
+        }
+    })
+}
+
+/// Whether `block`, drawn among others, is a thing of its own. A `<Text>` tag only styles
+/// the text in it.
+fn is_element(block: &Block) -> bool {
+    match block {
+        Block::Picture { .. } | Block::Table { .. } => true,
+        Block::Tag(tag) => tag.name != TEXT_TAG,
+        _ => false,
+    }
+}
+
+/// What a click on a component's words that it didn't draw says, if the format has nothing to say.
+const UNDRAWN: &str = "Text inside a component can't be edited on the slide yet.";
+
+/// The least an element is thick where it's picked, so that a line can be.
+const PICK_THICKNESS: f32 = 16.0;
+
+/// Where an element drawn in `rect` is picked: at least `PICK_THICKNESS` each way, about
+/// its middle.
+fn picked(rect: Rect) -> Rect {
+    let (w, h) = (rect.w.max(PICK_THICKNESS), rect.h.max(PICK_THICKNESS));
+    Rect { x: rect.x + (rect.w - w) / 2.0, y: rect.y + (rect.h - h) / 2.0, w, h }
+}
+
 fn frame_of(rect: Rect, rotate: f32, whole: bool, region: Option<(&'static str, Rect)>) -> Frame {
     Frame { rect, rotate, centre: (rect.x + rect.w / 2.0, rect.y + rect.h / 2.0), whole, region }
 }
@@ -243,8 +355,8 @@ fn align_x(align: Align, width: f32) -> f32 {
     }
 }
 
-/// The lines of `drawn`, whose layer's corner is at `origin`.
-fn para_lines(drawn: &DrawnText, rect: Rect) -> ParaLines {
+/// The lines of `drawn`, placed at `rect` on the slide, in a cell at `cell` if it's in one.
+fn para_lines(drawn: &DrawnText, rect: Rect, cell: Option<Rect>) -> ParaLines {
     let empty_x = rect.x + align_x(drawn.align, rect.w);
     let mut lines = Vec::new();
     let mut len = 0;
@@ -291,15 +403,34 @@ fn para_lines(drawn: &DrawnText, rect: Rect) -> ParaLines {
     }
     if len == 0 || lines.is_empty() {
         len = 0;
-        lines = vec![Line { top: rect.y, height: drawn.size * LINE_HEIGHT, stops: vec![(0, empty_x)] }];
+        let height = drawn.size * LINE_HEIGHT;
+        let line = match cell {
+            // An empty cell can be less tall than a line: the line is held within the cell,
+            // about its text's middle.
+            Some(cell) => {
+                let height = height.min(cell.h);
+                let top = (rect.y + rect.h / 2.0 - height / 2.0).min(cell.y + cell.h - height).max(cell.y);
+                Line { top, height, stops: vec![(0, empty_x)] }
+            }
+            None => Line { top: rect.y, height, stops: vec![(0, empty_x)] },
+        };
+        lines = vec![line];
     }
     ParaLines { lines, len, empty_x, size: drawn.size, align: drawn.align }
 }
 
 impl TextLayout {
     /// The layout of slide `index` of `talk`, whose layers are `specs`, drew `drawn`, and
-    /// left `empty` empty.
-    pub(crate) fn build(talk: &Talk, index: usize, specs: &[LayerSpec], drawn: &[LayerText], empty: &[EmptyRegion]) -> TextLayout {
+    /// left `empty` empty. Its flows are those [`text_flows_with`] gives with `takes_content`,
+    /// the tags of the talk's components whose content is a box of text of its own.
+    pub(crate) fn build(
+        talk: &Talk,
+        index: usize,
+        specs: &[LayerSpec],
+        drawn: &[LayerText],
+        empty: &[EmptyRegion],
+        takes_content: &dyn Fn(&str) -> bool,
+    ) -> TextLayout {
         let mut layout = TextLayout {
             frames: specs.iter().zip(drawn).map(|(spec, text)| frame_of(spec.rect, spec.rotate, text.whole, text.region)).collect(),
             placeholders: empty
@@ -314,45 +445,99 @@ impl TextLayout {
                 .collect(),
             ..TextLayout::default()
         };
+        // The block of each paragraph placed, for what holds editable text.
+        let mut placed_text: Vec<Range<usize>> = Vec::new();
         // Each drawn text by the end of its block and its content, which tell paragraphs apart.
         let mut found: HashMap<(usize, usize, usize), (usize, &DrawnText)> = HashMap::new();
+        // The placed paragraph of each cell's flow, by its table's source, row and column.
+        let mut cells: HashMap<(usize, usize, usize, usize), usize> = HashMap::new();
         for (layer, text) in drawn.iter().enumerate() {
             for drawn in &text.texts {
                 found.insert((drawn.range.end, drawn.inline.start, drawn.inline.end), (layer, drawn));
             }
         }
-        for (f, flow) in text_flows(talk, index).iter().enumerate() {
+        let flows = text_flows_with(talk, index, takes_content);
+        for (f, flow) in flows.iter().enumerate() {
             for (p, source) in flow.source.iter().enumerate() {
                 let Some(&(layer, text)) = found.get(&(source.block.end, source.inline.start, source.inline.end)) else { continue };
                 // The flow is where the format crate says it is, or it isn't placed at all.
                 let in_place = match &flow.place {
                     FlowPlace::Region(name) => drawn[layer].region.is_some_and(|(region, _)| region == name.as_str()),
                     FlowPlace::Tag(range) => drawn[layer].whole && specs[layer].source.as_ref() == Some(range),
+                    FlowPlace::Cell { table, .. } => drawn[layer].tables.iter().any(|drawn| drawn.range == *table),
                 };
                 if !in_place {
                     continue;
                 }
+                if let FlowPlace::Cell { table, row, column } = &flow.place {
+                    cells.insert((table.start, table.end, *row, *column), layout.paras.len());
+                }
                 let origin = specs[layer].rect;
                 let rect = Rect { x: origin.x + text.rect.x, y: origin.y + text.rect.y, ..text.rect };
                 layout.paras.push(PlacedPara { flow: f, para: p, layer, rect });
-                layout.lines.push(para_lines(text, rect));
+                if matches!(flow.place, FlowPlace::Cell { .. }) {
+                    layout.cell_flows.insert(f);
+                }
+                let cell = text.cell.map(|cell| Rect { x: origin.x + cell.x, y: origin.y + cell.y, ..cell });
+                layout.lines.push(para_lines(text, rect, cell));
+                placed_text.push(source.block.clone());
             }
         }
+        let blocks = talk.slides.get(index).filter(|slide| slide.error.is_none()).map_or(&[][..], |slide| &slide.blocks[..]);
+        let holds_text = |source: &Range<usize>| placed_text.iter().any(|block| source.start <= block.start && block.end <= source.end);
         for (layer, text) in drawn.iter().enumerate() {
             let origin = specs[layer].rect;
-            let mut found: Vec<(Rect, &'static str)> = Vec::new();
+            let frame = layout.frames[layer];
+            // An element of the layer, `rect` relative to the slide before the layer's turn.
+            let mut element = |source: &Range<usize>, rect: Rect| {
+                let (x, y) = turned(rect.x + rect.w / 2.0, rect.y + rect.h / 2.0, frame.centre, frame.rotate);
+                let rect = Rect { x: x - rect.w / 2.0, y: y - rect.h / 2.0, ..rect };
+                layout.elements.push(ElementBox { source: source.clone(), rect, rotate: frame.rotate, holds_text: holds_text(source) });
+                layout.elements.len() - 1
+            };
+            // A positioned tag is drawn first in its layer, then what's in it.
+            let whole = specs[layer].source.as_ref().filter(|source| text.whole && matches!(block_at(blocks, source), Some(Block::Tag(_))));
+            let whole = whole.map(|source| element(source, origin));
+            let mut found: Vec<(Rect, &'static str, Option<usize>)> = Vec::new();
             for block in &text.blocks {
-                if let Some(reason) = uneditable_reason(talk, index, block.range.start) {
-                    found.push((Rect { x: origin.x + block.rect.x, y: origin.y + block.rect.y, ..block.rect }, reason));
+                let rect = Rect { x: origin.x + block.rect.x, y: origin.y + block.rect.y, ..block.rect };
+                let found_block = block_at(blocks, &block.range);
+                let at = found_block.filter(|block| is_element(block)).map(|_| element(&block.range, rect));
+                // A table answers for itself, cell by cell.
+                if let (Some(Block::Table { .. }), Some(at)) = (found_block, at)
+                    && let Some(table) = text.tables.iter().find(|table| table.range == block.range)
+                {
+                    let place = |cell: &Rect| Rect { x: origin.x + cell.x, y: origin.y + cell.y, ..*cell };
+                    let grid = table.cells.iter().enumerate().map(|(r, row)| {
+                        row.iter()
+                            .enumerate()
+                            .map(|(c, cell)| (place(cell), cells.get(&(block.range.start, block.range.end, r, c)).copied()))
+                            .collect()
+                    });
+                    layout.tables.push(TableGrid { layer, source: block.range.clone(), rect, element: at, cells: grid.collect() });
+                    continue;
+                }
+                if let Some(reason) = uneditable_reason_with(talk, index, block.range.start, takes_content) {
+                    found.push((if at.is_some() { picked(rect) } else { rect }, reason, at));
                 }
             }
+            // A tag whose words are a flow, but which drew none of them, is a thing to pick as a
+            // whole, as a tag whose words are no flow is: never a hole onto what's behind it.
+            let undrawn = |source: &Range<usize>| {
+                let flow = flows.iter().position(|flow| flow.place == FlowPlace::Tag(source.clone()));
+                flow.is_some_and(|flow| !layout.paras.iter().any(|placed| placed.flow == flow))
+                    .then(|| uneditable_reason(talk, index, source.start).unwrap_or(UNDRAWN))
+            };
             if text.whole
-                && let Some(reason) = specs[layer].source.as_ref().and_then(|source| uneditable_reason(talk, index, source.start))
+                && let Some(reason) = specs[layer]
+                    .source
+                    .as_ref()
+                    .and_then(|source| uneditable_reason_with(talk, index, source.start, takes_content).or_else(|| undrawn(source)))
             {
-                found.push((origin, reason));
+                found.push((if whole.is_some() { picked(origin) } else { origin }, reason, whole));
             }
             found.sort_by(|a, b| (a.0.w * a.0.h).total_cmp(&(b.0.w * b.0.h)));
-            layout.uneditable.extend(found.into_iter().map(|(rect, reason)| (layer, rect, reason)));
+            layout.uneditable.extend(found.into_iter().map(|(rect, reason, element)| (layer, rect, reason, element)));
         }
         layout
     }
@@ -447,7 +632,9 @@ impl TextLayout {
     }
 
     /// What's under the point (`x`, `y`) of the slide, in slide units: the topmost layer's
-    /// text, or why it can't be edited, then an empty region. `None` for a point that isn't one.
+    /// text, or why it can't be edited, then an empty region. In a table, anywhere in a cell
+    /// that can be typed in is that cell's text, and a point on the table's lines or in another
+    /// cell is the table. `None` for a point that isn't one.
     pub fn hit(&self, x: f32, y: f32) -> Option<Hit> {
         if !x.is_finite() || !y.is_finite() {
             return None;
@@ -460,9 +647,25 @@ impl TextLayout {
                 let placed = &self.paras[at];
                 return Some(Hit::Text { flow: placed.flow, pos: Pos { para: placed.para, offset: self.offset_at(at, point) } });
             }
-            let why = self.uneditable.iter().find(|(on, rect, _)| *on == layer && contains(rect, point));
-            if let Some((_, _, reason)) = why {
-                return Some(Hit::Uneditable(reason));
+            // In a table, a cell's text is typed in anywhere in the cell, and the table is picked
+            // on its lines and where a cell has no text that can be typed in.
+            if let Some(table) = self.tables.iter().rev().find(|table| table.layer == layer && contains(&table.rect, point)) {
+                return Some(match table.cell_at(point) {
+                    Some((_, Some(at))) => {
+                        let flow = self.paras[*at].flow;
+                        self.nearest(|placed| placed.flow == flow, (x, y)).unwrap_or(Hit::Nothing)
+                    }
+                    _ => Hit::Element(self.elements[table.element].clone()),
+                });
+            }
+            let under = |(on, rect, ..): &&(usize, Rect, &'static str, Option<usize>)| *on == layer && contains(rect, point);
+            if let Some((_, _, reason, element)) = self.uneditable.iter().find(under) {
+                // What can't be typed in an element is part of it: the innermost that holds it.
+                let element = element.or_else(|| self.uneditable.iter().filter(under).find_map(|(.., element)| *element));
+                return Some(match element {
+                    Some(at) => Hit::Element(self.elements[at].clone()),
+                    None => Hit::Uneditable(reason),
+                });
             }
             // In a box of text away from its text, the caret goes to the nearest paragraph.
             if frame.whole
@@ -473,11 +676,12 @@ impl TextLayout {
             }
         }
         // So it does in a region of text away from its text: between paragraphs, on a marker,
-        // below the last.
+        // below the last. Never to a table's cell: a cell is typed in by a click in it.
         for frame in self.frames.iter().rev() {
             let Some((name, area)) = frame.region else { continue };
+            let in_region = |placed: &PlacedPara| self.frames[placed.layer].region.is_some_and(|(other, _)| other == name);
             if contains(&area, turned(x, y, frame.centre, -frame.rotate))
-                && let Some(hit) = self.nearest(|placed| self.frames[placed.layer].region.is_some_and(|(other, _)| other == name), (x, y))
+                && let Some(hit) = self.nearest(|placed| in_region(placed) && !self.is_a_cell(placed), (x, y))
             {
                 return Some(hit);
             }
@@ -488,6 +692,43 @@ impl TextLayout {
             }
         }
         Some(Hit::Nothing)
+    }
+
+    /// The topmost element under the point (`x`, `y`) of the slide, whether or not the point
+    /// is on its text: the one drawn last, each in its turned shape and at least
+    /// `PICK_THICKNESS` thick.
+    pub fn element_at(&self, x: f32, y: f32) -> Option<ElementBox> {
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        let under = |element: &&ElementBox| {
+            let Rect { x: left, y: top, w, h } = element.rect;
+            contains(&picked(element.rect), turned(x, y, (left + w / 2.0, top + h / 2.0), -element.rotate))
+        };
+        self.elements.iter().rev().find(under).cloned()
+    }
+
+    /// Where the cell at `row` and `column`, the header being row 0, of the table whose source
+    /// is `table` is drawn: its whole box, its lines with it, in slide units before its layer is
+    /// turned. `None` if the table isn't drawn, or the row has no such cell.
+    pub fn cell_rect(&self, table: &Range<usize>, row: usize, column: usize) -> Option<Rect> {
+        let grid = self.tables.iter().find(|grid| grid.source == *table)?;
+        grid.cells.get(row)?.get(column).map(|(rect, _)| *rect)
+    }
+
+    /// Every element on the slide, in the order they're drawn.
+    pub fn elements(&self) -> &[ElementBox] {
+        &self.elements
+    }
+
+    /// The element whose source is `source`, as `element_at` would give it.
+    pub fn element(&self, source: &Range<usize>) -> Option<ElementBox> {
+        self.elements.iter().rev().find(|element| element.source == *source).cloned()
+    }
+
+    /// Whether `placed`, one of the placed paragraphs, is a table's cell.
+    fn is_a_cell(&self, placed: &PlacedPara) -> bool {
+        self.cell_flows.contains(&placed.flow)
     }
 
     /// The place in the paragraphs `among` takes nearest the point (`x`, `y`) of the slide:

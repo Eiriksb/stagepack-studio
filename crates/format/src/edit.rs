@@ -114,7 +114,13 @@ pub fn set_attr(source: &str, tag: &Tag, name: &str, value: &str) -> SourceEdit 
         };
         return SourceEdit { range: r, text };
     }
-    let at = match tag.attrs.last() {
+    let at = new_attr_at(source, tag);
+    SourceEdit { range: at..at, text: format!(" {name}=\"{}\"", escape(value, '"')) }
+}
+
+/// Where a new attribute goes in `tag`'s opening tag: after its last attribute, or its name.
+fn new_attr_at(source: &str, tag: &Tag) -> usize {
+    match tag.attrs.last() {
         Some(last) => match value_form(source, last) {
             ValueForm::Quoted(_) => last.value_range.end + 1,
             _ => last.value_range.end,
@@ -127,8 +133,84 @@ pub fn set_attr(source: &str, tag: &Tag, name: &str, value: &str) -> SourceEdit 
             }
             i
         }
+    }
+}
+
+/// `value` with each `&` that could be read as starting a character reference written as
+/// `&amp;`, so that it reads back as typed: one before a name and `;`, and one before a name
+/// that runs to the end, which the `markdown` crate can't read past. The rest are left as they
+/// are, as `Q&A` is.
+fn escape_references(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for (at, character) in value.char_indices() {
+        out.push(character);
+        if character == '&' {
+            let name = value[at + 1..].bytes().take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'#').count();
+            if name > 0 && matches!(value.as_bytes().get(at + 1 + name), None | Some(b';')) {
+                out.push_str("amp;");
+            }
+        }
+    }
+    out
+}
+
+/// `value` written as a quoted attribute value that reads back as exactly `value`: between
+/// `"`, or between `'` when it holds a `"`. `None` for a value holding both, or a line
+/// ending or other control character, which can't be written so.
+pub(crate) fn quote_value(value: &str) -> Option<String> {
+    if value.chars().any(char::is_control) {
+        return None;
+    }
+    let quote = match (value.contains('"'), value.contains('\'')) {
+        (true, true) => return None,
+        (true, false) => '\'',
+        (false, _) => '"',
     };
-    SourceEdit { range: at..at, text: format!(" {name}=\"{}\"", escape(value, '"')) }
+    Some(format!("{quote}{}{quote}", escape_references(value)))
+}
+
+/// Sets attribute `name` on `tag` to `value`, written as [`quote_value`] has it. The first
+/// attribute of that name, the one [`Tag::attr`] reads, is the one changed, and keeps its
+/// quotes when `value` can go between them. `None` where `value` can't be written.
+pub(crate) fn set_attr_as_typed(source: &str, tag: &Tag, name: &str, value: &str) -> Option<SourceEdit> {
+    let quoted = quote_value(value)?;
+    let Some(attr) = tag.attrs.iter().find(|a| a.name == name) else {
+        let at = new_attr_at(source, tag);
+        return Some(SourceEdit { range: at..at, text: format!(" {name}={quoted}") });
+    };
+    let r = attr.value_range.clone();
+    Some(match value_form(source, attr) {
+        ValueForm::Bare => SourceEdit { range: r, text: format!("={quoted}") },
+        ValueForm::Quoted(quote) if !value.contains(quote) => SourceEdit { range: r, text: escape_references(value) },
+        ValueForm::Quoted(_) => SourceEdit { range: r.start - 1..r.end + 1, text: quoted },
+        ValueForm::Unquoted => SourceEdit { range: r, text: quoted },
+    })
+}
+
+/// The edits that take every attribute named `name` out of `tag`, each with the space or tab
+/// before it, or, for one on a line of its own, with that line's indentation and the line
+/// ending before it.
+pub(crate) fn remove_attr(source: &str, tag: &Tag, name: &str) -> Vec<SourceEdit> {
+    tag.attrs
+        .iter()
+        .filter(|attr| attr.name == name)
+        .map(|attr| {
+            let start = attr.name_range.start;
+            let before = &source[tag.range.start..start];
+            let indent = before.len() - before.trim_end_matches([' ', '\t']).len();
+            let line_ending = ["\r\n", "\n"].into_iter().find(|ending| before[..before.len() - indent].ends_with(ending));
+            let start = match line_ending {
+                Some(ending) => start - indent - ending.len(),
+                None => start - indent.min(1),
+            };
+            let end = match value_form(source, attr) {
+                ValueForm::Bare => attr.name_range.end,
+                ValueForm::Quoted(_) => attr.value_range.end + 1,
+                ValueForm::Unquoted => attr.value_range.end,
+            };
+            SourceEdit { range: start..end, text: String::new() }
+        })
+        .collect()
 }
 
 /// The first line ending in `text`, or `\n` when it has none.

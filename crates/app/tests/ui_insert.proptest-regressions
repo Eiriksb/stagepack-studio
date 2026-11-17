@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 20e5fc4cfedf260cb5bbedaa2ae9e9e53fefe607a4283c4ce086474baf536f39 # shrinks to inputs = [Enter]
+cc 0b9be67317af6d665cf8dd9450b2f29c502f0d82ebc78f61c568e9e997753904 # shrinks to inputs = [Text([("\u{200b}", false)])]

@@ -545,8 +545,150 @@ fn a_paragraph_between_two_items_has_a_blank_line_on_each_side() {
     assert_eq!(flows[1].paras, paras);
 }
 
+#[test]
+fn emptying_a_deep_item_leaves_the_hand_indented_items_around_it() {
+    let source = "# T\n\n- a\n    - b\n        - c\n- d\n";
+    let talk = parse_talk(source);
+    let flow = &text_flows(&talk, 0)[1];
+    let mut paras = flow.paras.clone();
+    paras[2].spans.clear();
+    let after = write_flow(&talk, 0, flow, &paras).expect("written").apply(source);
+    assert!(after.starts_with("# T\n\n- a\n    - b\n"), "{after:?}");
+    assert!(after.ends_with("\n- d\n"), "{after:?}");
+    assert_eq!(text_flows(&parse_talk(&after), 0)[1].paras, paras);
+}
+
+#[test]
+fn an_item_made_before_a_hand_indented_one_takes_its_indentation() {
+    for (source, expected) in [
+        ("# T\n\n- a\n    - b\n    - x\n- d\n", "# T\n\n- a\n\n    -\n    - b\n    - x\n- d\n"),
+        ("# T\n\n- a\n\t- b\n\t- x\n- d\n", "# T\n\n- a\n\n\t-\n\t- b\n\t- x\n- d\n"),
+        ("# T\n\n- a\n    - b\n        - c\n- d\n", "# T\n\n- a\n\n    -\n    - b\n        - c\n- d\n"),
+    ] {
+        let talk = parse_talk(source);
+        let flow = &text_flows(&talk, 0)[1];
+        let paras = TextEdit::new(flow.paras.clone()).move_to(Pos { para: 1, offset: 0 }, false).enter().paras;
+        let after = write_flow(&talk, 0, flow, &paras).expect("written").apply(source);
+        assert_eq!(after, expected);
+        assert_eq!(text_flows(&parse_talk(&after), 0)[1].paras, paras);
+    }
+}
+
+#[test]
+fn a_list_written_again_keeps_its_untouched_items_as_they_were() {
+    // Each made body at item `which`, and what the rest of the list keeps.
+    for (source, which, expected) in [
+        ("# T\n\n- a\n    - deep\n- b\n- c\n", 3, "# T\n\n- a\n    - deep\n- b\n\nc\n"),
+        ("# T\n\n- a\n\t- deep\n- b\n- c\n", 3, "# T\n\n- a\n\t- deep\n- b\n\nc\n"),
+        ("# T\n\n - a\n - b\n - c\n", 2, "# T\n\n - a\n - b\n\nc\n"),
+        ("# T\n\n#   Odd   heading\n\n- a\n- b\n", 2, "# T\n\n#   Odd   heading\n\n- a\n\nb\n"),
+    ] {
+        assert_eq!(made_body(source, which), expected, "{source:?}");
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // Properties
+
+/// An edit that changes a list's structure.
+#[derive(Clone, Copy, Debug)]
+enum Structural {
+    SetKind(ParaKind),
+    ToggleList(bool),
+    Indent,
+    Outdent,
+    /// Backspace at the paragraph's start, or for a list item, where that outdents, Delete at
+    /// the end of the one before.
+    Join,
+    Split,
+    PasteTwo,
+}
+
+fn structural() -> impl Strategy<Value = Structural> {
+    let kinds = vec![BODY, ParaKind::Heading(2), BULLET, ParaKind::Bullet { level: 1 }, NUMBERED, ParaKind::Numbered { level: 1 }];
+    prop_oneof![
+        prop::sample::select(kinds).prop_map(Structural::SetKind),
+        any::<bool>().prop_map(Structural::ToggleList),
+        Just(Structural::Indent),
+        Just(Structural::Outdent),
+        Just(Structural::Join),
+        Just(Structural::Split),
+        Just(Structural::PasteTwo),
+    ]
+}
+
+/// `op` done to paragraph `which` of `paras`, the caret `at` of the way along it, and where
+/// each old paragraph is afterwards: `None` for the ones it was done to.
+fn structural_edit(paras: &[Para], which: usize, at: prop::sample::Index, op: Structural) -> Option<(Vec<Para>, Vec<Option<usize>>)> {
+    let len: usize = paras[which].spans.iter().map(|span| span.text.len()).sum();
+    let edit = TextEdit::new(paras.to_vec());
+    let caret = edit.move_to(Pos { para: which, offset: at.index(len + 1) }, false);
+    let start = edit.move_to(Pos { para: which, offset: 0 }, false);
+    let mut done = which..which + 1;
+    let after = match op {
+        Structural::SetKind(kind) => start.set_kind(kind),
+        Structural::ToggleList(numbered) => start.toggle_list(numbered),
+        Structural::Indent => start.indent(),
+        Structural::Outdent => start.outdent(),
+        Structural::Join => {
+            let before = which.checked_sub(1)?;
+            done = before..which + 1;
+            if matches!(paras[which].kind, ParaKind::Bullet { .. } | ParaKind::Numbered { .. }) {
+                let end: usize = paras[before].spans.iter().map(|span| span.text.len()).sum();
+                edit.move_to(Pos { para: before, offset: end }, false).delete()
+            } else {
+                start.backspace()
+            }
+        }
+        Structural::Split => caret.enter(),
+        Structural::PasteTwo => caret.paste(&[para(BODY, "one"), para(BODY, "two")]),
+    };
+    let grown = after.paras.len() as isize - paras.len() as isize;
+    let moved = (0..paras.len())
+        .map(|i| match i {
+            i if i < done.start => Some(i),
+            i if i >= done.end => Some((i as isize + grown) as usize),
+            _ => None,
+        })
+        .collect();
+    Some((after.paras, moved))
+}
+
+/// The items `paras[index]` sits in, nearest first.
+fn holders(paras: &[Para], index: usize) -> Vec<usize> {
+    let level = |kind: ParaKind| match kind {
+        ParaKind::Bullet { level } | ParaKind::Numbered { level } => Some(level),
+        _ => None,
+    };
+    let mut out = Vec::new();
+    let Some(mut at) = level(paras[index].kind) else { return out };
+    for back in (0..index).rev() {
+        match level(paras[back].kind) {
+            _ if at == 0 => break,
+            Some(above) if above < at => {
+                out.push(back);
+                at = above;
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    out
+}
+
+/// The lines `block` is on in `source`, without the last one's ending, and with an item's
+/// number left out.
+fn own_lines(source: &str, block: &std::ops::Range<usize>, kind: ParaKind) -> String {
+    let start = source[..block.start].rfind('\n').map_or(0, |i| i + 1);
+    let end = source[block.end..].find(['\n', '\r']).map_or(source.len(), |i| block.end + i);
+    let lines = &source[start..end];
+    if !matches!(kind, ParaKind::Numbered { .. }) {
+        return lines.to_string();
+    }
+    let indent = lines.len() - lines.trim_start_matches(['\u{feff}', ' ', '\t']).len();
+    let digits = lines[indent..].bytes().take_while(u8::is_ascii_digit).count();
+    format!("{}{}", &lines[..indent], &lines[indent + digits..])
+}
 
 fn text_piece() -> impl Strategy<Value = &'static str> {
     prop::sample::select(vec![
@@ -723,6 +865,57 @@ proptest! {
         prop_assert_eq!(&text_flows(&parse_talk(&after), 0)[at].paras, &paras);
     }
 
+    /// A change to a list's structure made to one paragraph of a hand-written talk leaves
+    /// every other paragraph of its flow that's the same afterwards, in the same items, as it
+    /// was, to the byte. A numbered item's number may change.
+    #[test]
+    fn a_structural_edit_keeps_untouched_items_bytes(
+        generated in gen_talk(),
+        flow in any::<prop::sample::Index>(),
+        para in any::<prop::sample::Index>(),
+        at in any::<prop::sample::Index>(),
+        op in structural(),
+    ) {
+        let source = generated.text();
+        let talk = parse_talk(&source);
+        // A flow of one paragraph, most often a slide's title, has nothing else to keep.
+        let many: Vec<(usize, usize)> = (0..talk.slides.len())
+            .flat_map(|slide| text_flows(&talk, slide).into_iter().enumerate().filter(|(_, flow)| flow.paras.len() > 1).map(move |(at, _)| (slide, at)))
+            .collect();
+        if many.is_empty() {
+            return Ok(());
+        }
+        let (slide, place) = many[flow.index(many.len())];
+        let flows = text_flows(&talk, slide);
+        let flow = &flows[place];
+        let which = para.index(flow.paras.len());
+        let Some((paras, moved)) = structural_edit(&flow.paras, which, at, op) else { return Ok(()) };
+        // A refusal changes nothing, and other properties see that what's written reads back.
+        let Some(change) = write_flow(&talk, slide, flow, &paras) else { return Ok(()) };
+        let after = change.apply(&source);
+        let read = text_flows(&parse_talk(&after), slide);
+        let stored = storable(&paras);
+        prop_assert_eq!(&read[place].paras, &stored, "{:?}", after);
+        for (old, new) in moved.iter().enumerate() {
+            let Some(new) = *new else { continue };
+            let same_holders = holders(&flow.paras, old).iter().map(|&holder| moved[holder]).collect::<Vec<_>>()
+                == holders(&stored, new).into_iter().map(Some).collect::<Vec<_>>();
+            // `&nbsp;` holds a no-break space only in an item with items under it: left with
+            // none, it would read as an empty item, and must be written another way.
+            let under = |paras: &[Para], at: usize| at + 1 < paras.len() && holders(paras, at + 1).first() == Some(&at);
+            let spelled_empty = &source[flow.source[old].inline.clone()] == "&nbsp;" && under(&flow.paras, old) != under(&stored, new);
+            if flow.paras[old] != stored[new] || !same_holders || spelled_empty {
+                continue;
+            }
+            let kind = stored[new].kind;
+            prop_assert_eq!(
+                own_lines(&after, &read[place].source[new].block, kind),
+                own_lines(&source, &flow.source[old].block, kind),
+                "{:?} on paragraph {} of {:?} gave {:?}", op, which, source, after
+            );
+        }
+    }
+
     /// Typing a letter at the start or end of any paragraph of a hand-written talk changes
     /// no byte outside that paragraph's lines.
     #[test]
@@ -759,4 +952,37 @@ proptest! {
         prop_assert_eq!(&after[..start], &source[..start], "{:?}", after);
         prop_assert!(after.ends_with(&source[end..]), "{:?} became {:?}", source, after);
     }
+}
+
+/// The flow of the cell at `row` and `column` among `flows`.
+fn cell_in(flows: &[TextFlow], row: usize, column: usize) -> usize {
+    flows
+        .iter()
+        .position(|flow| matches!(flow.place, FlowPlace::Cell { row: r, column: c, .. } if (r, c) == (row, column)))
+        .expect("a cell's flow")
+}
+
+#[test]
+fn typing_in_a_hand_written_cell_changes_its_content_alone() {
+    let source = "# T\n\nBefore\nc  |  d\n:-|-:\n  e |f\n";
+    let talk = parse_talk(source);
+    let flows = text_flows(&talk, 0);
+    let (after, flows) = written(source, 0, cell_in(&flows, 1, 1), &[Para { kind: BODY, spans: vec![plain("f"), styled("g", bold())] }]);
+    assert_eq!(after, "# T\n\nBefore\nc  |  d\n:-|-:\n  e |f**g**\n");
+    let (after, _) = written(&after, 0, cell_in(&flows, 0, 0), &[para(BODY, "a | b")]);
+    assert_eq!(after, "# T\n\nBefore\na \\| b  |  d\n:-|-:\n  e |f**g**\n");
+}
+
+#[test]
+fn what_a_cell_cannot_hold_is_refused() {
+    let source = "| a |\n| - |\n| b |\n";
+    let talk = parse_talk(source);
+    let flows = text_flows(&talk, 0);
+    let flow = &flows[cell_in(&flows, 1, 0)];
+    assert_eq!(write_flow(&talk, 0, flow, &[para(BODY, "two\nlines")]), None);
+    assert_eq!(write_flow(&talk, 0, flow, &[para(BULLET, "x")]), None);
+    assert_eq!(write_flow(&talk, 0, flow, &[para(BODY, "x"), para(BODY, "y")]), None);
+    assert_eq!(set_align(&talk, 0, &flow.place, "center"), None, "a cell has no alignment of its own");
+    let (after, _) = written(source, 0, cell_in(&flows, 1, 0), &[]);
+    assert_eq!(after, "| a |\n| - |\n|  |\n", "no paragraph at all empties it");
 }

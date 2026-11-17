@@ -158,7 +158,8 @@ pub fn remove_setting(source: &str, slide: &Slide, key: &str) -> Option<SourceEd
 /// A region's alignment is the `align=` of its `region.<name>` settings line: the first one
 /// there is changed, or one is added at the line's end, or the line, or the settings block,
 /// is added, and whatever else the line says stays. A box's is its own `align` attribute.
-/// Aligning as it is already changes nothing. `None` if the slide, or the box, isn't there.
+/// Aligning as it is already changes nothing. `None` if the slide, or the box, isn't there,
+/// and for a table's cell, which has no alignment of its own.
 pub fn set_align(talk: &Talk, index: usize, place: &FlowPlace, align: &str) -> Option<Change> {
     let slide = talk.slides.get(index)?;
     let source = talk.source.as_str();
@@ -171,6 +172,7 @@ pub fn set_align(talk: &Talk, index: usize, place: &FlowPlace, align: &str) -> O
             })?;
             (tag.attr("align") != Some(align)).then(|| set_attr(source, tag, "align", align))
         }
+        FlowPlace::Cell { .. } => return None,
     };
     Some(edit.map_or_else(no_change, Change::single))
 }
@@ -309,7 +311,7 @@ fn without_notes(source: &str, raw: &RawSlide, mut removal: SourceEdit, eol: &st
 }
 
 /// Whether two lists of blocks say the same, wherever they are in the file.
-fn blocks_alike(a: &[Block], b: &[Block]) -> bool {
+pub(crate) fn blocks_alike(a: &[Block], b: &[Block]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(a, b)| block_alike(a, b))
 }
 

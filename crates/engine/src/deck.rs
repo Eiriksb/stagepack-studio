@@ -11,12 +11,14 @@ use slides_components::Diagnostic;
 use slides_format::{Settings, Talk, is_hidden, parse_talk};
 use toolkit::{ComponentSchema, Registry};
 
-use crate::slide::{EmptyRegion, SLIDE_WIDTH, empty_region_layer};
+use crate::builtins::DEFAULT_ICON_SIZE;
+use crate::pictures::picture_size;
+use crate::slide::{EmptyRegion, MAX_SIZE, SLIDE_WIDTH, empty_region_layer};
 use crate::text_geometry::{LayerText, TextLayout};
 use crate::timeline::MAX_CLICK;
 use crate::{
     ComponentAsks, ComponentInfo, DisplayItem, Fonts, Layer, LayerSpec, LayerTiming, LayoutEnv, Moment, PictureCache, SlideTimeline,
-    TalkComponents, TalkFiles, Transition, builtin_registry, compose, layout_slide, render_layer, talk_theme,
+    SchemaLoad, TalkComponents, TalkFiles, Transition, builtin_registry, compose, layout_slide, render_layer, talk_theme,
 };
 
 /// How many scales of one slide are kept drawn. A zoom or a resize asks for many in a row.
@@ -58,8 +60,9 @@ struct Laid {
     texts: Vec<LayerText>,
     /// The regions of the layout with nothing in them.
     empty_regions: Vec<EmptyRegion>,
-    /// Where the slide's editable text is, once it's been asked for.
-    text_layout: Option<Arc<TextLayout>>,
+    /// Where the slide's editable text is, once it's been asked for, and the state of the
+    /// talk's loaded modules it was worked out for: which of them take content.
+    text_layout: Option<(u64, Arc<TextLayout>)>,
 }
 
 impl Laid {
@@ -376,6 +379,23 @@ impl Deck {
         self.slides_holding_pictures.clear();
     }
 
+    /// Changes whenever any slide's text does, or how it's drawn: a slide's text changing always
+    /// gives it a new version. For telling cheaply whether anything worked out from the text is
+    /// still right.
+    pub fn text_version(&self) -> u64 {
+        self.versions_made
+    }
+
+    /// Takes in that files have been added to the talk's files, and returns the slides to show
+    /// again: all of them, as any could name one, and a picture that wasn't there leaves no trace
+    /// to find it by. Its components are looked at again too. Pictures read already are kept.
+    pub fn files_added(&mut self) -> Vec<usize> {
+        self.components.rescan(&self.registry);
+        self.files_generation += 1;
+        let talk = self.talk.clone();
+        self.take_talk(talk, true, Matching::ByPlace)
+    }
+
     /// The names of every component the talk can use: the built-ins and its own, sorted, for
     /// a palette to offer.
     pub fn available_components(&self) -> Vec<String> {
@@ -384,6 +404,12 @@ impl Deck {
         names.sort();
         names.dedup();
         names
+    }
+
+    /// Whether `tag` is the name of a component every talk has, or of a tag the format itself
+    /// reads, which a talk's own component can't take.
+    pub fn is_built_in(&self, tag: &str) -> bool {
+        crate::talk_components::is_reserved(tag, &self.registry)
     }
 
     /// The talk's own components.
@@ -408,11 +434,68 @@ impl Deck {
         self.components.problems()
     }
 
+    /// What the component `tag` takes, as far as is known without loading anything: a
+    /// built-in's, or one of the talk's own whose build is loaded already.
+    pub fn loaded_schema(&self, tag: &str) -> SchemaLoad {
+        if let Some(component) = self.registry.get(tag) {
+            return SchemaLoad::Loaded((component.schema)());
+        }
+        match self.components.loaded_schema(tag) {
+            None => SchemaLoad::NotLoaded,
+            Some(None) => SchemaLoad::Failed,
+            Some(Some(schema)) => SchemaLoad::Loaded(schema.clone()),
+        }
+    }
+
+    /// Whether `tag` is one of the talk's components whose build is loaded and working and
+    /// takes content, so that what's written between its tags is a box of text of its own.
+    /// Nothing is loaded to find out: a component not loaded yet, with no build, that
+    /// doesn't work, or no component at all, takes none. The text layout and whoever edits
+    /// the talk read its flows with this, as [`slides_format::text_flows_with`] does.
+    pub fn takes_content(&self, tag: &str) -> bool {
+        self.registry.get(tag).is_none() && self.components.takes_content(tag)
+    }
+
+    /// How many of the talk's modules have been loaded, or tried, for tests.
+    #[doc(hidden)]
+    pub fn modules_loaded(&self) -> usize {
+        self.components.loads()
+    }
+
     /// What the component `tag` takes, for a form: a built-in, or one of the talk's own.
     pub fn component_schema(&mut self, tag: &str) -> Option<ComponentSchema> {
         match self.registry.get(tag) {
             Some(component) => Some((component.schema)()),
             None => self.components.schema(tag),
+        }
+    }
+
+    /// The size, in slide units, a new `tag` with `attrs` is given: a picture its own size,
+    /// made smaller to fit in half the slide, an icon the size it asks for, and anything
+    /// else a box of a third of the slide's width.
+    pub fn default_size(&mut self, tag: &str, attrs: &[(&str, &str)]) -> (f32, f32) {
+        const ROOM: (f64, f64) = (960.0, 540.0);
+        const OTHERWISE: (f32, f32) = (640.0, 360.0);
+        let attr = |name: &str| attrs.iter().find(|(key, _)| *key == name).map(|(_, value)| *value);
+        match tag {
+            "Picture" => {
+                let size = attr("src").and_then(|src| picture_size(src, &self.files.read(src)?));
+                let Some((w, h)) = size.map(|(w, h)| (f64::from(w), f64::from(h))) else { return OTHERWISE };
+                let (w, h) = if w <= ROOM.0 && h <= ROOM.1 {
+                    (w, h)
+                } else if w * ROOM.1 >= h * ROOM.0 {
+                    (ROOM.0, h * ROOM.0 / w)
+                } else {
+                    (w * ROOM.1 / h, ROOM.1)
+                };
+                (w as f32, h as f32)
+            }
+            "Icon" => {
+                let size = attr("size").and_then(|size| size.trim().parse::<f32>().ok()).filter(|size| size.is_finite() && *size > 0.0);
+                let size = size.unwrap_or(DEFAULT_ICON_SIZE).min(MAX_SIZE);
+                (size, size)
+            }
+            _ => OTHERWISE,
         }
     }
 
@@ -633,11 +716,18 @@ impl Deck {
             return Arc::new(TextLayout::default());
         }
         let moment = self.ensure_whole(index);
-        let talk = &self.talk;
+        let (talk, components) = (&self.talk, &self.components);
+        let generation = components.loaded_generation();
         let laid = self.slides[index].laid_at_mut(moment);
-        laid.text_layout
-            .get_or_insert_with(|| Arc::new(TextLayout::build(talk, index, &laid.specs, &laid.texts, &laid.empty_regions)))
-            .clone()
+        if let Some((built_for, layout)) = &laid.text_layout
+            && *built_for == generation
+        {
+            return layout.clone();
+        }
+        let takes_content = |tag: &str| components.takes_content(tag);
+        let layout = Arc::new(TextLayout::build(talk, index, &laid.specs, &laid.texts, &laid.empty_regions, &takes_content));
+        laid.text_layout = Some((generation, layout.clone()));
+        layout
     }
 
     /// Every source range slide `index`'s text geometry is read from, in order, for tests.
@@ -898,10 +988,11 @@ impl SlideState {
                     *source = source.start - from + to..source.end - from + to;
                 }
             }
-            // The text layout holds no ranges: it's the same wherever the slide's text sits.
             for text in &mut laid.texts {
                 text.moved(from, to);
             }
+            // The text layout's elements say where each is written: it's made again from these.
+            laid.text_layout = None;
         }
     }
 

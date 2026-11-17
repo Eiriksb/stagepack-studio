@@ -24,6 +24,14 @@ pub struct BuildEntry {
     pub source_hash: String,
 }
 
+impl BuildIndex {
+    /// Enters `entry`, in place of any entry for the same component or the same file.
+    pub fn enter(&mut self, entry: BuildEntry) {
+        self.components.retain(|kept| kept.tag != entry.tag && kept.file != entry.file);
+        self.components.push(entry);
+    }
+}
+
 /// The SHA-256 of `bytes`, in lowercase hex.
 pub fn source_hash(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()

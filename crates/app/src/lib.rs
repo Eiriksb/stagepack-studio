@@ -1,5 +1,6 @@
 //! Stagepack Studio: a native editor for Markdown slide talks.
 
+pub mod added_files;
 pub mod app_assets;
 pub mod builds;
 pub mod cargo_file;
@@ -8,8 +9,13 @@ pub mod clipboard_tools;
 pub mod document;
 pub mod export;
 pub mod history;
+pub mod icon_picker;
+pub mod insert;
+pub mod insert_tools;
+pub mod inspector;
 pub mod markdown_panel;
 pub mod notes_panel;
+pub mod palette;
 pub mod permissions;
 pub mod present;
 pub mod present_view;
@@ -17,9 +23,11 @@ pub mod recovery;
 pub mod ribbon;
 pub mod save_flow;
 pub mod saving;
+pub mod selection;
 pub mod slide_canvas;
 pub mod slide_editor;
 pub mod slide_strip;
+pub mod table_tools;
 pub mod text_editing;
 pub mod text_tools;
 pub mod watcher;

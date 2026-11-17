@@ -10,7 +10,7 @@ use futures::channel::mpsc;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input;
 use gpui_kit::component::menu::DropdownMenu as _;
-use gpui_kit::component::resizable::{h_resizable, resizable_panel, v_resizable};
+use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
 use gpui_kit::component::{
     ActiveTheme as _, Sizable as _, TitleBar, WindowExt as _, h_flex, v_flex,
 };
@@ -25,6 +25,10 @@ use crate::clipboard::ClipboardOp;
 use crate::clipboard_tools::ClipboardTools;
 use crate::document::{Document, EditRefused, OpenProblem, Reload, SLIDES_FILE, TalkPlace, UNREADABLE_FILE};
 use crate::export::{self, ExportKind, run_export, stagepack_executable};
+use crate::icon_picker::{self, IconPicked, IconPicker};
+use crate::palette::InsertComponent;
+use crate::insert_tools::{InsertPicture, InsertShape, InsertTextBox};
+use crate::inspector::{self, Inspector};
 use crate::markdown_panel::MarkdownPanel;
 use crate::notes_panel::{
     NOTES_HEIGHT, NOTES_MAX_HEIGHT, NOTES_MIN_HEIGHT, NotesEdited, NotesPanel,
@@ -37,6 +41,9 @@ use crate::save_flow::{CloseAnswer, Effect, SaveFlow, SaveOutcome};
 use crate::saving::{SaveError, SaveJob, SaveTarget, Saved};
 use crate::slide_canvas::{ScaleChanged, SlideCanvas};
 use crate::slide_editor::{self, EditorEvent, SlideEditor};
+use crate::table_tools::{
+    InsertTable, TableColumnLeft, TableColumnRight, TableDeleteColumn, TableDeleteRow, TableRowAbove, TableRowBelow,
+};
 use crate::text_tools::TextTools;
 use crate::slide_strip::{
     self, STRIP_CONTEXT, STRIP_MAX_WIDTH, STRIP_MIN_WIDTH, STRIP_WIDTH, SlideStrip,
@@ -45,12 +52,23 @@ use crate::watcher::{self, Change};
 use crate::working_copies::{KEEP_FAILED, KeepFailed, WorkingCopies};
 
 mod editing;
+mod inserting;
 mod saving;
+
+pub use inserting::{DIALOG_FAILED, ONLY_PICTURES, ONLY_THE_FIRST};
 
 pub const CANVAS_ID: &str = "canvas";
 pub const TITLE_ID: &str = "title";
 pub const NOTICES_ID: &str = "notices";
 pub const STATUS_ID: &str = "status";
+/// The slide's column: the slide on its desk, and the notes under it.
+pub const SLIDE_COLUMN_ID: &str = "slide-column";
+
+/// The narrowest the window can be: room for the slide list, the slide, the Markdown and the
+/// inspector, each at its narrowest or more.
+pub const MIN_WINDOW_WIDTH: Pixels = px(1024.);
+/// The narrowest the slide's column is ever made by the panels beside it.
+pub const SLIDE_COLUMN_MIN_WIDTH: Pixels = px(240.);
 pub const PROBLEM_ID: &str = "problem";
 pub const MARKDOWN_ID: &str = "markdown";
 pub const FILE_MENU_ID: &str = "file-menu";
@@ -89,7 +107,8 @@ const RELOAD_DELAY: Duration = Duration::from_millis(100);
 const STATUS_FADE: Duration = Duration::from_secs(5);
 
 const MARKDOWN_WIDTH: Pixels = px(380.);
-const MARKDOWN_MIN_WIDTH: Pixels = px(200.);
+/// The Markdown panel gives way down to this before the slide does.
+const MARKDOWN_MIN_WIDTH: Pixels = px(240.);
 const MARKDOWN_MAX_WIDTH: Pixels = px(800.);
 
 const SLIDEV_TALK: &str =
@@ -211,6 +230,8 @@ pub fn bind_keys(cx: &mut App) {
     ]);
     slide_strip::bind_keys(cx);
     slide_editor::bind_keys(cx);
+    inspector::bind_keys(cx);
+    icon_picker::bind_keys(cx);
     present_view::bind_keys(cx);
 }
 
@@ -268,6 +289,10 @@ pub struct WorkspaceView {
     show_slide_list: bool,
     notes_panel: Entity<NotesPanel>,
     show_notes: bool,
+    /// The form for the thing selected, always at the right.
+    inspector: Entity<Inspector>,
+    /// How wide the slide list, the slide's column and the Markdown are.
+    columns: Entity<ResizableState>,
     focus_handle: FocusHandle,
     /// Keeps the talk's folder watched for as long as the window is open.
     watcher: Option<watcher::TalkWatcher>,
@@ -318,6 +343,11 @@ pub struct WorkspaceView {
     _editor_events: Subscription,
     _working_copies_changed: Subscription,
     _keep_failed: Subscription,
+    _icon_picked: Subscription,
+    _list_focused: Subscription,
+    /// A size chosen from the Insert tab's grid of tables.
+    _table_picked: Subscription,
+    _component_picked: Subscription,
 }
 
 impl WorkspaceView {
@@ -408,6 +438,7 @@ impl WorkspaceView {
             cx.subscribe(&slide_editor, |this, _, event: &EditorEvent, cx| match event {
                 EditorEvent::Edited => this.edited(cx),
                 EditorEvent::Said(said) => this.say(said.clone(), cx),
+                EditorEvent::Unsaid(said) => this.unsay(said, cx),
             });
         let panels = Panels {
             notes: true,
@@ -415,9 +446,46 @@ impl WorkspaceView {
             markdown: false,
         };
         let clipboard_tools = cx.new(|cx| ClipboardTools::new(document.clone(), &slide_editor, cx));
-        let ribbon = cx.new(|cx| Ribbon::new(document.clone(), clipboard_tools.clone(), text_tools, panels, cx));
+        let icon_picker = cx.new(|cx| IconPicker::new(window, cx));
+        // Typing in the picker's search leaves a text box waiting for its first character as it is.
+        let search_focus = icon_picker.read(cx).search_focus(cx);
+        slide_editor.update(cx, |editor, cx| editor.keep_typing_with(search_focus, window, cx));
+        let icon_picked = cx.subscribe_in(&icon_picker, window, |this, _, picked: &IconPicked, window, cx| {
+            this.insert_icon(picked.0, cx);
+            this.keyboard_to_the_slide(window, cx);
+        });
+        let ribbon = cx.new(|cx| {
+            Ribbon::new(document.clone(), clipboard_tools.clone(), text_tools, icon_picker, panels, cx)
+        });
+        let table_grid = ribbon.read(cx).table_grid().clone();
+        let table_picked = cx.subscribe_in(&table_grid, window, |this, _, picked: &InsertTable, window, cx| {
+            let InsertTable { columns, rows } = *picked;
+            this.edit(|document| document.insert_table(columns, rows), cx);
+            this.keyboard_to_the_slide(window, cx);
+        });
+        let component_list = ribbon.read(cx).component_list().clone();
+        let component_picked = cx.subscribe_in(&component_list, window, |this, _, picked: &InsertComponent, window, cx| {
+            this.edit(|document| document.insert_component(&picked.0), cx);
+            this.keyboard_to_the_slide(window, cx);
+        });
         let slide_strip = cx.new(|cx| SlideStrip::new(document.clone(), cx));
+        // A thing is shown as selected only while the list of slides hasn't the keyboard, where
+        // Delete and the clipboard act on whole slides: the list taking the keyboard lets go of
+        // it (at once on a press, and by the keyboard as the window next draws), and a thing
+        // selected while the list has it takes the keyboard for the slide.
+        let list_focus = slide_strip.read(cx).focus_handle().clone();
+        slide_editor.update(cx, |editor, _| editor.take_keyboard_from_list(list_focus.clone()));
+        // Typing on the slide ends then too, as Escape ends it: no caret shows, and no new text
+        // box waits, while the list has the keyboard.
+        let editor = slide_editor.downgrade();
+        slide_strip.update(cx, |strip, _| strip.end_typing_of(editor));
+        let strip = slide_strip.clone();
+        let list_focused = cx.on_focus_in(&list_focus, window, move |_, window, cx| {
+            strip.update(cx, |strip, cx| strip.let_go_of_selection(window, cx));
+        });
         let notes_panel = cx.new(|cx| NotesPanel::new(document.clone(), window, cx));
+        let workspace = cx.weak_entity();
+        let inspector = cx.new(|cx| Inspector::new(document.clone(), workspace, cx));
         let notes_focus = notes_panel.read(cx).field().focus_handle(cx);
         clipboard_tools.update(cx, |tools, cx| tools.follow_notes(notes_focus, window, cx));
         let notes_edited = cx.subscribe_in(
@@ -478,6 +546,8 @@ impl WorkspaceView {
             show_slide_list: panels.slide_list,
             notes_panel,
             show_notes: panels.notes,
+            inspector,
+            columns: cx.new(|_| ResizableState::default()),
             focus_handle,
             watcher: None,
             opened_from_path: false,
@@ -505,6 +575,10 @@ impl WorkspaceView {
             _editor_events: editor_events,
             _working_copies_changed: working_copies_changed,
             _keep_failed: keep_failed,
+            _icon_picked: icon_picked,
+            _list_focused: list_focused,
+            _table_picked: table_picked,
+            _component_picked: component_picked,
         };
         view.always_build = view.is_always_built();
         view
@@ -572,6 +646,10 @@ impl WorkspaceView {
         &self.notes_panel
     }
 
+    pub fn inspector(&self) -> &Entity<Inspector> {
+        &self.inspector
+    }
+
     /// Whether the talk's folder is being watched for saves.
     pub fn follows_saves(&self) -> bool {
         self.followed.is_some()
@@ -590,7 +668,7 @@ impl WorkspaceView {
                 title: Some("Stagepack Studio".into()),
                 ..TitleBar::title_bar_options()
             }),
-            window_min_size: Some(size(px(800.), px(500.))),
+            window_min_size: Some(size(MIN_WINDOW_WIDTH, px(500.))),
             app_id: Some(APP_ID.into()),
             ..TitleBar::window_options()
         }
@@ -861,6 +939,15 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    /// Takes `status` off the status line, if it's still what the line says.
+    fn unsay(&mut self, status: &SharedString, cx: &mut Context<Self>) {
+        if self.status.as_ref() == Some(status) {
+            self.status = None;
+            self.status_fading = None;
+            cx.notify();
+        }
+    }
+
     /// Puts `status` on the status line until [`STATUS_FADE`] has passed, or the next edit.
     fn say_for_a_while(&mut self, status: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.say(status, cx);
@@ -1031,6 +1118,11 @@ fn export_menu(has_talk: bool) -> impl IntoElement {
         })
 }
 
+/// A footer line with nothing on it, as tall as one with something.
+fn blank_footer_line() -> impl IntoElement {
+    div().w_full().px_2().py_1().text_xs().child("\u{a0}")
+}
+
 /// One line of small print under the slide.
 fn footer_line(id: &'static str, line: SharedString, color: Hsla) -> impl IntoElement {
     div()
@@ -1152,7 +1244,7 @@ impl WorkspaceView {
 }
 
 impl Render for WorkspaceView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let build_bar = self.build_bar(cx);
         // The bars that need an answer.
         let bars: Vec<AnyElement> = self
@@ -1217,7 +1309,12 @@ impl Render for WorkspaceView {
             // A click on the slide gives it the keyboard, for its keys.
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                 focus_handle.focus(window, cx)
-            });
+            })
+            // Pictures dropped on it from outside the app go on the slide.
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.dropped(paths.paths().to_vec(), cx);
+                this.keyboard_to_the_slide(window, cx);
+            }));
         v_flex()
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus_handle)
@@ -1229,7 +1326,7 @@ impl Render for WorkspaceView {
             }))
             .on_action(cx.listener(|this, action: &SelectSlide, window, cx| {
                 let index = action.index;
-                this.select(|document| document.select(index), window, cx)
+                this.select(|document| document.go_to(index), window, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleMarkdown, window, cx| {
                 this.toggle_panel(|this| &mut this.show_markdown, window, cx)
@@ -1263,6 +1360,18 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &PasteFromClipboard, window, cx| {
                 this.clipboard(ClipboardOp::Paste, window, cx)
             }))
+            .on_action(cx.listener(|this, _: &InsertPicture, window, cx| this.ask_for_pictures(window, cx)))
+            .on_action(cx.listener(|this, action: &InsertShape, window, cx| {
+                this.insert_shape(action.kind, cx);
+                this.keyboard_to_the_slide(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &InsertTextBox, _, cx| this.insert_text_box(cx)))
+            .on_action(cx.listener(|this, _: &TableRowAbove, _, cx| this.edit(|document| document.add_row(false), cx)))
+            .on_action(cx.listener(|this, _: &TableRowBelow, _, cx| this.edit(|document| document.add_row(true), cx)))
+            .on_action(cx.listener(|this, _: &TableColumnLeft, _, cx| this.edit(|document| document.add_column(false), cx)))
+            .on_action(cx.listener(|this, _: &TableColumnRight, _, cx| this.edit(|document| document.add_column(true), cx)))
+            .on_action(cx.listener(|this, _: &TableDeleteRow, _, cx| this.edit(Document::remove_row, cx)))
+            .on_action(cx.listener(|this, _: &TableDeleteColumn, _, cx| this.edit(Document::remove_column, cx)))
             .on_action(cx.listener(|this, _: &Undo, _, cx| this.step_history(Document::undo, cx)))
             .on_action(cx.listener(|this, _: &Redo, _, cx| this.step_history(Document::redo, cx)))
             .on_action(cx.listener(|this, _: &OpenFolder, _, cx| this.ask_to_open(true, cx)))
@@ -1300,7 +1409,7 @@ impl Render for WorkspaceView {
                 ),
             )
             .child(self.ribbon.clone())
-            .child(self.editor_area(canvas, bars, cx))
+            .child(self.editor_area(canvas, bars, window.viewport_size().width, cx))
             .children(component_problems)
             .children(build_bar)
             .when(!notices.is_empty(), |this| {
@@ -1310,8 +1419,12 @@ impl Render for WorkspaceView {
                     muted_text,
                 ))
             })
-            .when_some(self.status.clone(), |this, status| {
-                this.child(footer_line(STATUS_ID, status, muted_text))
+            .map(|this| match self.status.clone() {
+                Some(status) => this.child(footer_line(STATUS_ID, status, muted_text)),
+                // The line keeps its room with nothing on it, so the slide stays put as what's
+                // said comes and goes, as it does with each click that selects a thing.
+                None if self.document.is_some() => this.child(blank_footer_line()),
+                None => this,
             })
     }
 }

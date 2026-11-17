@@ -233,7 +233,7 @@ impl TagPlace {
 }
 
 /// Whether a tag asks for a place on the slide, which gives it a layer of its own.
-pub(crate) fn is_positioned(tag: &Tag) -> bool {
+pub fn is_positioned(tag: &Tag) -> bool {
     let place = TagPlace::of(tag);
     place.x.is_some() || place.y.is_some() || place.w.is_some() || place.h.is_some()
 }
@@ -308,7 +308,7 @@ fn region_align(slide: &Slide, region: &RegionDef, notices: &mut Vec<Notice>) ->
 /// How the text in `place` on slide `index` is set to be aligned: a region's as its
 /// `region.<name>` line says or its layout has it, a positioned box's as its `align` says, or
 /// at the left. It's what's asked for, whatever a list in it is drawn at. `None` if the slide
-/// has no such region or box.
+/// has no such region or box, and for a table's cell.
 pub fn text_align(talk: &Talk, index: usize, place: &FlowPlace) -> Option<Align> {
     let slide = talk.slides.get(index)?;
     let mut notices = Vec::new();
@@ -322,6 +322,8 @@ pub fn text_align(talk: &Talk, index: usize, place: &FlowPlace) -> Option<Align>
             Block::Tag(tag) if tag.range == *range && is_positioned(tag) => Some(TagPlace::of(tag).align.unwrap_or(Align::Left)),
             _ => None,
         }),
+        // A cell has no alignment of its own to set.
+        FlowPlace::Cell { .. } => None,
     }
 }
 

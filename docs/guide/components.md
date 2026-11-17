@@ -76,6 +76,24 @@ The app knows the type of each argument, so a form for the tag can show a field 
 
 For a fixed list of choices, write an `enum` above the component with `#[derive(Prop)]` on it, and use it as an argument's type. The form shows a dropdown, and the first choice is used when the value is missing or wrong. A choice written `LineChart` in Rust is written `line-chart` in the tag.
 
+### What the form looks like to someone who doesn't code
+
+Once the component is built, it's in the list under *Component* on the Insert tab. Putting it on a slide writes its tag with a starting value for every argument it must have, selects it, and shows its form in the panel at the right of the window. Selecting it later shows the same form. Each argument is one field, under a label, in the order the arguments are written:
+
+- **Text** (`String`): a box to type in. What's typed is written when the field is left or Enter is pressed, and Escape puts back what was there. Quotes, `<` and `&` are written so they read back as typed. A value holding both kinds of quote mark, or a new line, can't be written, and the field says so.
+- **Whole number** (`u32`, `i32`) and **number** (`f32`): a box with − and + beside it, and the Up and Down keys step it. A comma is taken as the decimal mark, so `1,5` is 1.5. Text that isn't a number, or a fraction in a whole number, is refused with a sentence under the field.
+- **Yes or no** (`bool`): a checkbox, written at once.
+- **Colour** (`Color`): a swatch that opens a palette and sliders, written at once.
+- **Picture** and **data file** (`PictureFile`, `DataFile`): *Choose file…* and the file's name. A file chosen from outside the talk is added to it, and saved with it.
+- **A fixed list of choices** (a `#[derive(Prop)]` enum): a dropdown, its choices as words.
+- **Can be left out** (`Option<…>`): the same field. Emptied, the argument is taken out of the tag; a colour has a *None* button for it.
+
+Under the arguments are the tag's place on the slide: *Left*, *Top*, *Width*, *Height* and *Turn*.
+
+A label is the argument's name as words: each `_` is a space and the first letter is a capital, so `team_name` shows as *Team name* and `points` as *Points*. A choice is shown the same way, so `LineChart`, written `line-chart`, shows as *Line chart*. Name the arguments for the person who will fill the form in.
+
+An argument called `children` has no field. It makes the component one whose words can be typed on the slide: a click on it selects it, and a second click, or a double-click, puts the caret in its words. A component without `children` is set up through its form alone.
+
 ## Putting elements together
 
 These make elements:

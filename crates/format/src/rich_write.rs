@@ -9,7 +9,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use crate::edit::{Change, SourceEdit, eol_in};
 use crate::model::{Block, Slide, Span, Style, Talk};
 use crate::parse::parse_talk;
-use crate::rich::{FlowPlace, MAX_LEVEL, Para, ParaKind, TextFlow, is_positioned, layout_of, text_flows};
+use crate::rich::{FlowPlace, MAX_LEVEL, Para, ParaKind, TextFlow, is_positioned, layout_of, text_flows, text_flows_with, typed_tables};
 use crate::split::split_slides;
 
 /// Markdown for one paragraph's content, as it's written on a line of its own: every
@@ -19,7 +19,7 @@ use crate::split::split_slides;
 /// near as they can.
 pub fn write_inline(spans: &[Span]) -> String {
     let spans = tidy(spans);
-    let ctx = Inline { heading: false, indent: "", eol: "\n" };
+    let ctx = Inline { heading: false, indent: "", eol: "\n", cell: false };
     inline_for(&spans, Probe::Body, &ctx, PLAIN).unwrap_or_else(|| render(&spans, &ctx, Form::Tags, Escapes::Safe, NOTHING))
 }
 
@@ -42,7 +42,13 @@ pub fn storable(paras: &[Para]) -> Vec<Para> {
 /// the talk would lose the slide, or for a line break in code, a heading of more than one
 /// line below level 2, or a list item deeper than the one before it allows.
 pub fn write_flow(talk: &Talk, slide: usize, flow: &TextFlow, paras: &[Para]) -> Option<Change> {
-    guarded(|| flow_change(talk, slide, flow, paras))
+    write_flow_with(talk, slide, flow, paras, &|_| false)
+}
+
+/// [`write_flow`], for a flow of those [`text_flows_with`] gives with `takes_content`, which
+/// is what the slide is read with again to check it.
+pub fn write_flow_with(talk: &Talk, slide: usize, flow: &TextFlow, paras: &[Para], takes_content: &dyn Fn(&str) -> bool) -> Option<Change> {
+    guarded(|| flow_change(talk, slide, flow, paras, takes_content))
 }
 
 /// The edits that put `paras` into region `region` of slide `slide`, a region of its layout
@@ -71,6 +77,8 @@ struct Inline<'a> {
     /// What starts each line after a line break.
     indent: &'a str,
     eol: &'a str,
+    /// In a table's cell, where a `|` anywhere, in code too, would end the cell.
+    cell: bool,
 }
 
 /// How bold and italic are written.
@@ -114,6 +122,7 @@ enum Probe {
     Atx,
     Setext,
     Item,
+    Cell,
 }
 
 /// The content for `spans`, in the first way of writing it that reads back as them, if any
@@ -133,6 +142,7 @@ fn reads_back(text: &str, spans: &[Span], probe: Probe, eol: &str) -> bool {
         Probe::Atx => format!("# {text}"),
         Probe::Setext => format!("{text}{eol}==="),
         Probe::Item => format!("- {text}"),
+        Probe::Cell => format!("| {text} |{eol}| - |"),
     };
     let talk = parse_talk(&source);
     let flows = text_flows(&talk, 0);
@@ -202,7 +212,9 @@ fn render(spans: &[Span], ctx: &Inline, form: Form, escapes: Escapes, nothing: &
             }
         }
     }
-    writer.out
+    // In a cell, a `|` anywhere, in text, code, a link's address or a tag's attribute, would end
+    // the cell; escaped, it reads as itself there.
+    if ctx.cell { writer.out.replace('|', "\\|") } else { writer.out }
 }
 
 /// The attributes of a `<Text>` tag giving these styles, each with a space before it.
@@ -381,12 +393,16 @@ impl Writer<'_> {
                     self.line_start || around != (true, true)
                 }
                 '\\' if least => after.is_none_or(|after| after.is_ascii_punctuation()),
-                '|' if least => false,
+                // In a cell, every `|` written is escaped once the content is rendered.
+                '|' if least || self.ctx.cell => false,
                 // Before a link, `!` would make it a picture.
                 '!' if least => after.is_none() && at + 1 < self.edge.len(),
                 '!' => true,
                 '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '&' | '|' => true,
                 '#' => self.line_start || self.ctx.heading,
+                // A row can't start with `{`, and one starting with `:` can be taken for an
+                // alignment row.
+                '{' | ':' if self.ctx.cell => self.line_start,
                 '>' | '-' | '+' | '=' | '~' => self.line_start,
                 '.' | ')' => self.leading_digits,
                 _ => false,
@@ -515,14 +531,14 @@ impl Source<'_> {
 
 /// How a list item is written: what's before its marker, the marker, and the column of
 /// its text.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct Shape {
     indent: String,
     marker: Marker,
     content: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum Marker {
     Bullet(char),
     Number(u64, char),
@@ -617,7 +633,11 @@ struct Look {
 /// it. Others take the indentation and marker of the item before them at their level, or
 /// the text column of the item they're in, and run on the numbering, but keep the marker
 /// of the shape `old_shape` gives them, if any, and its spacing too where they're at its
-/// column. `blank_before` says which have a blank line before them. `start` gives the number a numbered item starts a list with.
+/// column. An item that `own` gives the indentation it had at its level keeps that wherever
+/// it still reads as the item it is, and, if `own` says the edit left it untouched, all of
+/// its old shape, its number aside. `blank_before` says which have a blank line before them.
+/// `start` gives the number a numbered item starts a list with.
+#[allow(clippy::too_many_arguments)]
 fn shapes(
     new: &[Para],
     base: &str,
@@ -626,6 +646,7 @@ fn shapes(
     old_shape: impl Fn(usize) -> Option<Shape>,
     start: impl Fn(usize) -> Option<u64>,
     blank_before: impl Fn(usize) -> bool,
+    own: impl Fn(usize) -> Option<(String, bool)>,
 ) -> Option<Vec<Option<Shape>>> {
     let mut shapes: Vec<Option<Shape>> = Vec::with_capacity(new.len());
     for (index, para) in new.iter().enumerate() {
@@ -667,11 +688,16 @@ fn shapes(
             });
             break;
         }
-        let (indent, mut marker) = match found {
+        let (mut indent, mut marker) = match found {
             Some(found) => found,
             None if level == 0 => fresh(base.to_string()),
             None => return None,
         };
+        let (own_indent, untouched) = own(index).unzip();
+        if let Some(own_indent) = own_indent.filter(|own_indent| *own_indent != indent && fits(new, &shapes, index, base, own_indent)) {
+            indent = own_indent;
+        }
+        let untouched = untouched.unwrap_or(false);
         let old = old_shape(index);
         let mut kept = false;
         match old.as_ref().map(|old| &old.marker) {
@@ -686,14 +712,61 @@ fn shapes(
             }
             _ => {}
         }
-        if let Some(old) = old.filter(|old| kept && old.indent == indent) {
-            shapes.push(Some(old));
+        if let Some(old) = old.filter(|old| old.indent == indent && (kept || untouched)) {
+            if kept {
+                shapes.push(Some(old));
+            } else {
+                // Only its number changes.
+                let spaces = old.content.len().saturating_sub(old.indent.len() + old.marker.text().len());
+                let content = format!("{}{}", old.indent, " ".repeat(marker.text().len() + spaces));
+                shapes.push(Some(Shape { indent: old.indent, marker, content }));
+            }
             continue;
         }
         let content = format!("{indent}{}", " ".repeat(marker.text().len() + 1));
         shapes.push(Some(Shape { indent, marker, content }));
     }
     Some(shapes)
+}
+
+/// The column `text`, blank space from a line's start, ends at, a tab going on to the next
+/// multiple of four.
+fn columns(text: &str) -> usize {
+    text.chars().fold(0, |at, c| if c == '\t' { at + 4 - at % 4 } else { at + 1 })
+}
+
+/// Whether `new[index]`, a list item, written `indent` in, reads as the item it is after the
+/// items before it, written in `shapes`: no more than three columns past the text of the
+/// item it's in, or the flow's `base`, and not as far in as the text of the item before it
+/// at its own level.
+fn fits(new: &[Para], shapes: &[Option<Shape>], index: usize, base: &str, indent: &str) -> bool {
+    let Some(level) = level_of(new[index].kind) else { return false };
+    let at = columns(indent);
+    let mut least = (level == 0).then(|| columns(base));
+    let mut sibling = None;
+    for back in (0..index).rev() {
+        let (Some(above), Some(shape)) = (level_of(new[back].kind), shapes[back].as_ref()) else { break };
+        if above == level && sibling.is_none() {
+            sibling = Some(columns(&shape.content));
+        }
+        if above + 1 == level {
+            least = Some(columns(&shape.content));
+            break;
+        }
+        if above < level || (level == 0 && sibling.is_some()) {
+            break;
+        }
+    }
+    least.is_some_and(|least| least <= at && at <= least + 3) && sibling.is_none_or(|sibling| at < sibling)
+}
+
+/// Whether old paragraph `i` of `flow`, an item written `&nbsp;` that holds a no-break space
+/// because items are under it, has none under it as `new[j]`, and so would read as empty if
+/// its bytes were kept.
+fn loses_its_space(src: &Source, flow: &TextFlow, i: usize, new: &[Para], j: usize) -> bool {
+    let Some(level) = level_of(new[j].kind) else { return false };
+    let under = new.get(j + 1).and_then(|next| level_of(next.kind)).is_some_and(|next| next > level);
+    !under && !new[j].spans.is_empty() && src.text.get(flow.source[i].inline.clone()) == Some(EMPTY_LINE)
 }
 
 /// What goes between two paragraphs written one after the other.
@@ -711,7 +784,7 @@ fn separator(before: &Para, after: &Para, eol: &str) -> String {
 fn block_text(para: &Para, shape: Option<&Shape>, src: &Source, keep: Option<&str>) -> Option<String> {
     let inline = |probe: Probe, heading: bool, indent: &str| match keep {
         Some(kept) => Some(kept.to_string()),
-        None => inline_for(&para.spans, probe, &Inline { heading, indent, eol: src.eol }, src.ways),
+        None => inline_for(&para.spans, probe, &Inline { heading, indent, eol: src.eol, cell: false }, src.ways),
     };
     match para.kind {
         ParaKind::Body if para.spans.is_empty() => Some(EMPTY_LINE.to_string()),
@@ -821,12 +894,13 @@ fn least_change(
         _ => None,
     };
     let blank = |j: usize| j > 0 && separator(&new[j - 1], &new[j], src.eol).len() > src.eol.len();
-    let shapes = shapes(new, &src.base, &look, keeps_shape, |_| None, |j| old_number(src, flow, origin[j]), blank)?;
+    let shapes = shapes(new, &src.base, &look, keeps_shape, |_| None, |j| old_number(src, flow, origin[j]), blank, |_| None)?;
     let mut edits = Vec::new();
     let mut j = 0;
     while j < new.len() {
         let para = &new[j];
         match origin[j] {
+            Origin::Kept(i) if loses_its_space(src, flow, i, new, j) => edits.push(paired_edit(src, flow, i, para, shapes[j].as_ref())?),
             Origin::Kept(_) => {}
             Origin::Paired(i) => edits.push(paired_edit(src, flow, i, para, shapes[j].as_ref())?),
             Origin::New => {
@@ -910,7 +984,7 @@ fn paired_edit(src: &Source, flow: &TextFlow, i: usize, para: &Para, shape: Opti
         };
         let indent = src.column(source.inline.start)?;
         let heading = matches!(probe, Probe::Atx);
-        let text = inline_for(&para.spans, probe, &Inline { heading, indent: &indent, eol: src.eol }, src.ways)?;
+        let text = inline_for(&para.spans, probe, &Inline { heading, indent: &indent, eol: src.eol, cell: false }, src.ways)?;
         return Some(SourceEdit { range: source.inline.clone(), text });
     }
     // The whole paragraph is written again, from the start of its line.
@@ -922,8 +996,9 @@ fn paired_edit(src: &Source, flow: &TextFlow, i: usize, para: &Para, shape: Opti
 
 /// The change that writes the whole flow's markers, indentation and spacing again.
 /// Paragraphs whose words didn't change keep their content's bytes, and items whose kind
-/// didn't change keep their markers.
-fn whole_change(src: &Source, flow: &TextFlow, new: &[Para], origin: &[Origin]) -> Option<Vec<SourceEdit>> {
+/// didn't change keep their markers. With `own`, a paragraph the change leaves as it was
+/// keeps all its bytes, its indentation and marker too, wherever they still read as it.
+fn whole_change(src: &Source, flow: &TextFlow, new: &[Para], origin: &[Origin], own: bool) -> Option<Vec<SourceEdit>> {
     let blank_line = format!("{}{}", src.eol, src.eol);
     let first = flow.source.first()?.block.start;
     src.prefix(first)?;
@@ -951,14 +1026,50 @@ fn whole_change(src: &Source, flow: &TextFlow, new: &[Para], origin: &[Origin]) 
             kept_gap || separator(&new[j - 1], &new[j], src.eol).len() > src.eol.len()
         })
         .collect();
-    let shapes = shapes(new, &src.base, &look, |_| None, keeps_marker, |j| old_number(src, flow, origin[j]), |j| blank[j])?;
+    let untouched = |j: usize| own && matches!(origin[j], Origin::Kept(i) if !loses_its_space(src, flow, i, new, j));
+    // The indentation item `j` had, if it was an item at the level it's at.
+    let had = |j: usize| match origin[j] {
+        Origin::Kept(i) | Origin::Paired(i) if level_of(new[j].kind).is_some() && level_of(flow.paras[i].kind) == level_of(new[j].kind) => {
+            old_shape(src, flow, i).map(|shape| shape.indent)
+        }
+        _ => None,
+    };
+    // An item at the level it was at keeps its indentation where it can, and a new one takes
+    // that of the item it's made beside, the next at its level in the same item, so as not
+    // to push that one in or out.
+    let own_indent = |j: usize| {
+        if !own {
+            return None;
+        }
+        if origin[j] != Origin::New {
+            return had(j).map(|indent| (indent, untouched(j)));
+        }
+        let level = level_of(new[j].kind)?;
+        let beside = (j + 1..new.len()).find(|&k| level_of(new[k].kind).is_none_or(|at| at <= level))?;
+        (level_of(new[beside].kind) == Some(level)).then(|| had(beside)).flatten().map(|indent| (indent, false))
+    };
+    let shapes = shapes(new, &src.base, &look, |_| None, keeps_marker, |j| old_number(src, flow, origin[j]), |j| blank[j], own_indent)?;
     let mut text = String::new();
     for (j, para) in new.iter().enumerate() {
         if j > 0 {
             text.push_str(if blank[j] { &blank_line } else { src.eol });
         }
+        // An untouched paragraph written where and as it was is its old bytes.
+        let as_it_was = match origin[j] {
+            Origin::Kept(i) if untouched(j) && (level_of(para.kind).is_none() || shapes[j] == old_shape(src, flow, i)) => {
+                let block = &flow.source[i].block;
+                src.prefix(block.start).and_then(|_| src.text.get(src.line_start(block.start)..block.end))
+            }
+            _ => None,
+        };
+        if let Some(bytes) = as_it_was {
+            text.push_str(bytes);
+            continue;
+        }
         let keep = match origin[j] {
-            Origin::Kept(i) | Origin::Paired(i) if !para.spans.is_empty() && flow.paras[i].spans == para.spans => {
+            Origin::Kept(i) | Origin::Paired(i)
+                if !para.spans.is_empty() && flow.paras[i].spans == para.spans && !loses_its_space(src, flow, i, new, j) =>
+            {
                 src.text.get(flow.source[i].inline.clone())
             }
             _ => None,
@@ -969,9 +1080,12 @@ fn whole_change(src: &Source, flow: &TextFlow, new: &[Para], origin: &[Origin]) 
     Some(vec![SourceEdit { range: src.line_start(first)..flow.source.last()?.block.end, text }])
 }
 
-fn flow_change(talk: &Talk, index: usize, flow: &TextFlow, paras: &[Para]) -> Option<Change> {
+fn flow_change(talk: &Talk, index: usize, flow: &TextFlow, paras: &[Para], takes_content: &dyn Fn(&str) -> bool) -> Option<Change> {
+    if matches!(flow.place, FlowPlace::Cell { .. }) {
+        return cell_change(talk, index, flow, paras, takes_content);
+    }
     let slide = talk.slides.get(index)?;
-    let flows = text_flows(talk, index);
+    let flows = text_flows_with(talk, index, takes_content);
     let at = flows.iter().position(|candidate| candidate == flow)?;
     let new = storable(paras);
     if new == flow.paras {
@@ -993,17 +1107,68 @@ fn flow_change(talk: &Talk, index: usize, flow: &TextFlow, paras: &[Para]) -> Op
     // else on the slide, in tags and with every escape.
     for ways in [PLAIN, GUARDED] {
         let src = Source { text: &talk.source, eol: eol_in(&talk.source), base: base.clone(), ways };
-        let tries: [&dyn Fn() -> Option<Vec<SourceEdit>>; 3] = [
+        let tries: [&dyn Fn() -> Option<Vec<SourceEdit>>; 4] = [
             &|| least_change(&src, flow, &new, &origin, &gone, slide.range.end, false),
             &|| least_change(&src, flow, &new, &origin, &gone, slide.range.end, true).filter(|_| new.is_empty()),
-            &|| whole_change(&src, flow, &new, &origin),
+            &|| whole_change(&src, flow, &new, &origin, true),
+            &|| whole_change(&src, flow, &new, &origin, false),
         ];
-        let found = tries.iter().filter_map(|attempt| attempt()).map(|edits| Change { edits }).find(|change| reads_as(talk, slide, change, &expected));
+        let found = tries.iter().filter_map(|attempt| attempt()).map(|edits| Change { edits }).find(|change| reads_as(talk, slide, change, &expected, takes_content));
         if found.is_some() {
             return found;
         }
     }
     None
+}
+
+/// What a cell is emptied to where a space between its `|`s won't do, at a row's edge with no
+/// `|` there: something that reads as text, and holds none.
+const EMPTY_CELL: &str = "<Text></Text>";
+
+/// The edit that makes `flow`, a cell's flow, hold `paras`: one body paragraph of one line, or
+/// none, which empties it. Only the cell's content is written, with its `|`s escaped, and in a
+/// cell of white space alone, with a space each side. An emptied cell is two spaces between
+/// its `|`s.
+fn cell_change(talk: &Talk, index: usize, flow: &TextFlow, paras: &[Para], takes_content: &dyn Fn(&str) -> bool) -> Option<Change> {
+    let slide = talk.slides.get(index)?;
+    let flows = text_flows_with(talk, index, takes_content);
+    let at = flows.iter().position(|candidate| candidate == flow)?;
+    let new = match storable(paras).as_slice() {
+        [] => vec![Para { kind: ParaKind::Body, spans: Vec::new() }],
+        [para] if para.kind == ParaKind::Body => vec![para.clone()],
+        _ => return None,
+    };
+    if new == flow.paras {
+        return Some(Change { edits: Vec::new() });
+    }
+    let spans = &new[0].spans;
+    if spans.iter().any(|span| span.text.contains('\n')) {
+        return None;
+    }
+    let [cell] = flow.source.as_slice() else { return None };
+    let source = talk.source.as_str();
+    let mut expected: Vec<(FlowPlace, Vec<Para>)> = flows.iter().map(|flow| (flow.place.clone(), flow.paras.clone())).collect();
+    expected[at].1 = new.clone();
+    let edits: Vec<SourceEdit> = if spans.is_empty() {
+        let bytes = source.as_bytes();
+        let start = cell.block.start + usize::from(bytes.get(cell.block.start) == Some(&b'|'));
+        // The `|` closing the row is the cell's, but not one that's part of its content.
+        let closed = cell.block.end > start && bytes.get(cell.block.end - 1) == Some(&b'|') && cell.inline.end < cell.block.end;
+        let end = if closed { cell.block.end - 1 } else { cell.block.end };
+        vec![
+            SourceEdit { range: start..end, text: "  ".to_string() },
+            SourceEdit { range: cell.inline.clone(), text: EMPTY_CELL.to_string() },
+        ]
+    } else {
+        let ctx = Inline { heading: false, indent: "", eol: eol_in(source), cell: true };
+        let spaces = source.get(cell.inline.clone()).is_some_and(|content| content.trim().is_empty());
+        [PLAIN, GUARDED]
+            .iter()
+            .filter_map(|ways| inline_for(spans, Probe::Cell, &ctx, *ways))
+            .map(|text| SourceEdit { range: cell.inline.clone(), text: if spaces { format!(" {text} ") } else { text } })
+            .collect()
+    };
+    edits.into_iter().map(Change::single).find(|change| reads_as(talk, slide, change, &expected, takes_content))
 }
 
 /// What starts the line of `at`, if it's blank.
@@ -1018,14 +1183,30 @@ fn src_base(source: &str, at: usize) -> Option<String> {
 
 /// Whether `change`, made inside `slide` of `talk`, leaves it one slide whose flows are
 /// `expected` and whose other content is as it was.
-fn reads_as(talk: &Talk, slide: &Slide, change: &Change, expected: &[(FlowPlace, Vec<Para>)]) -> bool {
+fn reads_as(talk: &Talk, slide: &Slide, change: &Change, expected: &[(FlowPlace, Vec<Para>)], takes_content: &dyn Fn(&str) -> bool) -> bool {
+    let Some(new_text) = changed_slide(talk, slide, change) else { return false };
+    let read = parse_talk(&new_text);
+    let [new_slide] = read.slides.as_slice() else { return false };
+    if new_slide.error.is_some() {
+        return false;
+    }
+    let flows = text_flows_with(&read, 0, takes_content);
+    let same_flows = flows.len() == expected.len()
+        && flows.iter().zip(expected).all(|(flow, (place, paras))| same_place(&flow.place, place) && flow.paras == *paras);
+    same_flows && the_rest(new_slide) == the_rest(slide)
+}
+
+/// The text of `slide` with `change`, a change of edits all inside it, made, if it's still one
+/// slide: no break is added or lost, and no fence is left open to swallow the next slide's
+/// break. `None` for an empty change.
+pub(crate) fn changed_slide(talk: &Talk, slide: &Slide, change: &Change) -> Option<String> {
     let range = &slide.range;
     let inside = change.edits.iter().all(|edit| range.start <= edit.range.start && edit.range.end <= range.end);
     let ordered = change.edits.windows(2).all(|pair| pair[0].range.end <= pair[1].range.start);
     if !inside || !ordered || change.is_empty() {
-        return false;
+        return None;
     }
-    let Some(old_text) = talk.source.get(range.clone()) else { return false };
+    let old_text = talk.source.get(range.clone())?;
     let local = Change {
         edits: change
             .edits
@@ -1034,39 +1215,44 @@ fn reads_as(talk: &Talk, slide: &Slide, change: &Change, expected: &[(FlowPlace,
             .collect(),
     };
     let new_text = local.apply(old_text);
-    // The slide still ends where the next one starts, and is still a slide: no break is
-    // added or lost, and no fence is left open to swallow the next slide's break.
+    // The slide still ends where the next one starts, and is still a slide.
     let next_line = talk.source[range.end..].find('\n').map_or(talk.source.len(), |i| range.end + i + 1);
     let probe = format!("{new_text}{}", &talk.source[range.end..next_line]);
     let raw = split_slides(&probe);
     let slides = if next_line > range.end { 2 } else { 1 };
-    if raw.len() != slides || raw[0].range.end != new_text.len() {
-        return false;
-    }
-    let read = parse_talk(&new_text);
-    let [new_slide] = read.slides.as_slice() else { return false };
-    if new_slide.error.is_some() {
-        return false;
-    }
-    let flows = text_flows(&read, 0);
-    let same_flows = flows.len() == expected.len()
-        && flows.iter().zip(expected).all(|(flow, (place, paras))| same_place(&flow.place, place) && flow.paras == *paras);
-    same_flows && the_rest(new_slide) == the_rest(slide)
+    (raw.len() == slides && raw[0].range.end == new_text.len()).then_some(new_text)
 }
 
+/// Whether `a` and `b` are the same kind of place: the same region, both boxes, or the same
+/// cell of a table, whose ranges move with the text before them.
 fn same_place(a: &FlowPlace, b: &FlowPlace) -> bool {
     match (a, b) {
         (FlowPlace::Region(a), FlowPlace::Region(b)) => a == b,
         (FlowPlace::Tag(_), FlowPlace::Tag(_)) => true,
+        (FlowPlace::Cell { row: r1, column: c1, .. }, FlowPlace::Cell { row: r2, column: c2, .. }) => (r1, c1) == (r2, c2),
         _ => false,
     }
 }
 
-/// What's on a slide besides its editable text, without positions.
+/// What's on a slide besides its editable text, without positions. A table whose cells can be
+/// typed in is sketched by its shape and the cells that aren't text alone: its other cells are
+/// flows.
 fn the_rest(slide: &Slide) -> (Vec<String>, Option<String>, usize, Vec<String>) {
-    fn sketch(block: &Block, out: &mut Vec<String>) {
+    let typed: Vec<Range<usize>> = typed_tables(slide).iter().map(|table| table.range().clone()).collect();
+    fn sketch(block: &Block, typed: &[Range<usize>], out: &mut Vec<String>) {
         match block {
             Block::Heading { .. } | Block::Paragraph { .. } | Block::List { .. } => {}
+            Block::Table { rows, cells, range, .. } if typed.contains(range) => {
+                let shape: Vec<usize> = rows.iter().map(Vec::len).collect();
+                let more: Vec<_> = rows
+                    .iter()
+                    .zip(cells)
+                    .flat_map(|(spans, sources)| spans.iter().zip(sources))
+                    .filter(|(_, source)| !source.only_text)
+                    .map(|(spans, _)| spans)
+                    .collect();
+                out.push(format!("table {shape:?} {more:?}"));
+            }
             Block::Table { rows, .. } => out.push(format!("table {rows:?}")),
             Block::Code { language, code, .. } => out.push(format!("code {language:?} {code:?}")),
             Block::Picture { src, alt, .. } => out.push(format!("picture {src:?} {alt:?}")),
@@ -1076,14 +1262,14 @@ fn the_rest(slide: &Slide) -> (Vec<String>, Option<String>, usize, Vec<String>) 
                 let attrs: Vec<_> = tag.attrs.iter().map(|attr| (&attr.name, &attr.value)).collect();
                 out.push(format!("tag {} {attrs:?}", tag.name));
                 for child in &tag.children {
-                    sketch(child, out);
+                    sketch(child, typed, out);
                 }
             }
         }
     }
     let mut blocks = Vec::new();
     for block in &slide.blocks {
-        sketch(block, &mut blocks);
+        sketch(block, &typed, &mut blocks);
     }
     (blocks, slide.notes.as_ref().map(|notes| notes.text.clone()), slide.quotes.len(), slide.inline_tags.clone())
 }
@@ -1097,7 +1283,7 @@ fn region_change(talk: &Talk, index: usize, region: &str, paras: &[Para]) -> Opt
         return None;
     }
     let new = storable(paras);
-    let (regions, main) = layout_of(slide);
+    let (regions, _) = layout_of(slide);
     if !regions.contains(&region) || has_content(slide, region) {
         return None;
     }
@@ -1114,7 +1300,7 @@ fn region_change(talk: &Talk, index: usize, region: &str, paras: &[Para]) -> Opt
     let src = Source { text: &talk.source, eol, base: String::new(), ways: PLAIN };
     let look = Look { bullets: ['-'; MAX_LEVEL as usize + 1], delim: '.' };
     let blank = |j: usize| j > 0 && separator(&new[j - 1], &new[j], eol).len() > eol.len();
-    let shapes = shapes(&new, "", &look, |_| None, |_| None, |_| None, blank)?;
+    let shapes = shapes(&new, "", &look, |_| None, |_| None, |_| None, blank, |_| None)?;
     let mut text = String::new();
     for (j, para) in new.iter().enumerate() {
         if j > 0 {
@@ -1124,10 +1310,34 @@ fn region_change(talk: &Talk, index: usize, region: &str, paras: &[Para]) -> Opt
         text.push_str(&block_text(para, shapes[j].as_ref(), &src, None)?);
     }
     let source = &talk.source;
+    let edit = empty_region_edit(source, slide, region, &text, eol)?;
+    let change = Change::single(edit);
+    let mut expected: Vec<(FlowPlace, Vec<Para>)> =
+        text_flows(talk, index).into_iter().map(|flow| (flow.place, flow.paras)).collect();
+    // The new flow sits wherever it reads: find it, and check the rest are as they were.
+    let new_text = {
+        let local = SourceEdit {
+            range: change.edits[0].range.start - slide.range.start..change.edits[0].range.end - slide.range.start,
+            text: change.edits[0].text.clone(),
+        };
+        local.apply(source.get(slide.range.clone())?)
+    };
+    let read = parse_talk(&new_text);
+    let place = FlowPlace::Region(region.to_string());
+    let at = text_flows(&read, 0).iter().position(|flow| flow.place == place && flow.paras == new)?;
+    expected.insert(at.min(expected.len()), (place, new));
+    reads_as(talk, slide, &change, &expected, &|_| false).then_some(change)
+}
+
+/// The edit that puts `text`, blocks with the talk's line ending `eol`, into region `region`
+/// of `slide`, a region of its layout with nothing in it: as [`write_into_region`] places a
+/// region's first text.
+pub(crate) fn empty_region_edit(source: &str, slide: &Slide, region: &str, text: &str, eol: &str) -> Option<SourceEdit> {
+    let (_, main) = layout_of(slide);
     let body = body_start(source, slide)?;
     let after_blocks = slide.blocks.last().map(|block| block.range().end);
     // At the end of a line that may have no line ending, and before what follows.
-    let at_end = |at: usize, what: String| {
+    let at_end = |at: usize, what: &str| {
         let lead = if at == 0 || source[..at].ends_with('\n') { "" } else { eol };
         SourceEdit { range: at..at, text: format!("{lead}{what}{eol}") }
     };
@@ -1138,7 +1348,7 @@ fn region_change(talk: &Talk, index: usize, region: &str, paras: &[Para]) -> Opt
         })
     };
     let has_markers = slide.blocks.iter().any(|block| matches!(block, Block::Region { .. }));
-    let edit = if region == "title" {
+    Some(if region == "title" {
         let rest = source.get(body..slide.range.end)?;
         // A blank line under the slide's opening lines stays above the title, as a person
         // would write it.
@@ -1173,7 +1383,10 @@ fn region_change(talk: &Talk, index: usize, region: &str, paras: &[Para]) -> Opt
                     }
                     edit
                 } else {
-                    SourceEdit { range: body..body, text: format!("{text}{eol}{eol}") }
+                    // Under a blank line after the slide's opening lines, as for a title, so
+                    // that it isn't left as a second one before what follows.
+                    let skip = if source[..body].ends_with('\n') && rest.starts_with(eol) { eol.len() } else { 0 };
+                    SourceEdit { range: body + skip..body + skip, text: format!("{text}{eol}{eol}") }
                 }
             }
         }
@@ -1181,29 +1394,21 @@ fn region_change(talk: &Talk, index: usize, region: &str, paras: &[Para]) -> Opt
         let marker = format!("<Region name=\"{region}\" />{eol}{eol}{text}");
         match after_blocks {
             Some(end) => SourceEdit { range: end..end, text: format!("{eol}{eol}{marker}") },
-            None => at_end(body, marker),
+            None => {
+                let mut edit = at_end(body, &marker);
+                // A blank line before notes or anything else that follows.
+                let rest = source.get(body..slide.range.end)?;
+                if !rest.lines().next().is_none_or(|line| line.trim().is_empty()) {
+                    edit.text.push_str(eol);
+                }
+                edit
+            }
         }
-    };
-    let change = Change::single(edit);
-    let mut expected: Vec<(FlowPlace, Vec<Para>)> =
-        text_flows(talk, index).into_iter().map(|flow| (flow.place, flow.paras)).collect();
-    // The new flow sits wherever it reads: find it, and check the rest are as they were.
-    let new_text = {
-        let local = SourceEdit {
-            range: change.edits[0].range.start - slide.range.start..change.edits[0].range.end - slide.range.start,
-            text: change.edits[0].text.clone(),
-        };
-        local.apply(source.get(slide.range.clone())?)
-    };
-    let read = parse_talk(&new_text);
-    let place = FlowPlace::Region(region.to_string());
-    let at = text_flows(&read, 0).iter().position(|flow| flow.place == place && flow.paras == new)?;
-    expected.insert(at.min(expected.len()), (place, new));
-    reads_as(talk, slide, &change, &expected).then_some(change)
+    })
 }
 
 /// Where a slide's body starts: after its settings, or its break line, if it has either.
-fn body_start(source: &str, slide: &Slide) -> Option<usize> {
+pub(crate) fn body_start(source: &str, slide: &Slide) -> Option<usize> {
     if let Some(settings) = &slide.settings {
         return Some(settings.range.end);
     }
@@ -1217,23 +1422,27 @@ fn body_start(source: &str, slide: &Slide) -> Option<usize> {
 
 /// Whether anything on `slide` is drawn in `region`, as the engine sends blocks to regions.
 fn has_content(slide: &Slide, region: &str) -> bool {
+    block_regions(slide).contains(&Some(region))
+}
+
+/// The region each of the slide's blocks is drawn in, as the engine sends blocks to regions:
+/// none for a `<Region>` line or a tag with a place of its own.
+pub(crate) fn block_regions(slide: &Slide) -> Vec<Option<&'static str>> {
     let (regions, main) = layout_of(slide);
     let mut title = regions.contains(&"title").then_some("title");
     let mut current = main;
-    for block in &slide.blocks {
-        let place = match block {
+    slide
+        .blocks
+        .iter()
+        .map(|block| match block {
             Block::Region { name, .. } => {
                 title = None;
                 current = regions.iter().find(|known| *known == name).copied().unwrap_or(main);
-                continue;
+                None
             }
-            Block::Tag(tag) if is_positioned(tag) => continue,
-            Block::Heading { .. } => title.take().unwrap_or(current),
-            _ => current,
-        };
-        if place == region {
-            return true;
-        }
-    }
-    false
+            Block::Tag(tag) if is_positioned(tag) => None,
+            Block::Heading { .. } => Some(title.take().unwrap_or(current)),
+            _ => Some(current),
+        })
+        .collect()
 }

@@ -40,23 +40,63 @@ fn is_break(text: &str) -> bool {
     text.trim_end_matches(' ') == "---"
 }
 
+/// A code fence: the mark it's made of, how many of them open it, and the column they
+/// start at.
+#[derive(Clone, Copy)]
+struct Fence {
+    mark: u8,
+    length: usize,
+    column: usize,
+}
+
+/// The run of fence marks starting `text` after its blank space, if they start no further in
+/// than column `most`, a tab going on to the next multiple of four.
+fn fence_marks(text: &str, most: usize) -> Option<(Fence, &str)> {
+    let blank = text.len() - text.trim_start_matches([' ', '\t']).len();
+    let column = text[..blank].bytes().fold(0, |at, byte| if byte == b'\t' { at + 4 - at % 4 } else { at + 1 });
+    if column > most {
+        return None;
+    }
+    let rest = &text[blank..];
+    let mark = *rest.as_bytes().first().filter(|mark| matches!(mark, b'`' | b'~'))?;
+    let length = rest.bytes().take_while(|byte| *byte == mark).count();
+    (length >= 3).then(|| (Fence { mark, length, column }, &rest[length..]))
+}
+
+/// The fence `text` opens, if it opens one: three or more tildes, or three or more
+/// backticks with no backtick after them on the line, as a line with more is code in a
+/// paragraph. Four columns in is code by indentation, as CommonMark has it.
+fn opens(text: &str) -> Option<Fence> {
+    let (fence, info) = fence_marks(text, 3)?;
+    (fence.mark == b'~' || !info.contains('`')).then_some(fence)
+}
+
+/// Whether `text` closes `open`: at least as many of its marks, and nothing after them but
+/// spaces and tabs. A closing line can be up to three columns further in than the opening
+/// one, as far as a fence in a list item can be closed past its item's text, which the
+/// opening line is never left of.
+fn closes(text: &str, open: Fence) -> bool {
+    fence_marks(text, open.column + 3).is_some_and(|(fence, rest)| {
+        fence.mark == open.mark && fence.length >= open.length && rest.trim_matches([' ', '\t']).is_empty()
+    })
+}
+
 /// Splits a file into slides. Every byte belongs to exactly one slide.
 pub fn split_slides(source: &str) -> Vec<RawSlide> {
     let bom = if source.starts_with('\u{feff}') { 3 } else { 0 };
     let all = lines(source);
     let mut breaks = Vec::new(); // (line index, closing line index if settings)
-    let mut fence: Option<char> = None;
+    let mut fence: Option<Fence> = None;
     let mut i = 0;
     while i < all.len() {
         let text = all[i].text;
         let text = if i == 0 { &text[bom.min(text.len())..] } else { text };
-        let trimmed = text.trim_start();
         if let Some(open) = fence {
-            if trimmed.starts_with(&open.to_string().repeat(3)) {
+            if closes(text, open) {
                 fence = None;
             }
-        } else if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            fence = trimmed.chars().next();
+        } else if let Some(open) = opens(text) {
+            fence = Some(open);
         } else if is_break(text) {
             let close = settings_close(&all, i);
             breaks.push((i, close));

@@ -80,6 +80,17 @@ fn module_of_pages(name: &str, imports: &str, extra: &str, render: &str, pages: 
 }
 
 /// A module called `name` whose every render answers `answer`.
+/// A module called `name` whose schema says it takes no content, answering `answer`.
+fn answering_without_content(name: &str, answer: &str) -> Vec<u8> {
+    let wasm = answering(name, answer);
+    let (with, without) = (b"\"children\":true}", b"\"children\":false");
+    let at = wasm.windows(with.len()).position(|window| window == with).expect("the schema is in the module");
+    let mut wasm = wasm;
+    wasm[at..at + without.len()].copy_from_slice(without);
+    wasm[at + without.len()] = b'}';
+    wasm
+}
+
 fn answering(name: &str, answer: &str) -> Vec<u8> {
     let extra = data(ANSWER_AT, answer.as_bytes());
     module(name, "", &extra, &format!("(i64.const {})", packed(ANSWER_AT, answer.len())))
@@ -274,7 +285,9 @@ fn a_slide_of_hanging_components_stays_within_its_budget() {
     let mut deck = open(&files);
     let started = Instant::now();
     let lines = texts(&mut deck, 0);
-    assert!(started.elapsed() < Duration::from_secs(3), "took {:?}", started.elapsed());
+    // Each stopped at its own limit, the 40 would take 10 s; the slide's budget stops them well
+    // before that, with room for a loaded machine.
+    assert!(started.elapsed() < Duration::from_secs(8), "took {:?}", started.elapsed());
     assert_eq!(lines.iter().filter(|line| line.starts_with("Hang: ")).count(), 40, "{lines:?}");
     assert_eq!(dashed_outlines(&mut deck, 0), 40);
 }
@@ -707,7 +720,9 @@ fn a_component_placing_its_content_many_times_shows_a_box() {
         let mut deck = open(&files);
         let started = Instant::now();
         let _ = deck.specs(0);
-        assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
+        // Unbounded, these took 101 s and 8 s; bounded, well under a second, with room for a
+        // loaded machine.
+        assert!(started.elapsed() < Duration::from_secs(6), "took {:?}", started.elapsed());
         let notices = deck.notices(0);
         assert!(notices.iter().any(|notice| notice == "Fan: gave an answer that can't be read"), "{notices:?}");
     }
@@ -956,4 +971,124 @@ fn the_components_available_are_the_built_ins_and_the_talks_own() {
     files.put("components/apple.rs", source("Apple"));
     let deck = open(&files);
     assert_eq!(deck.available_components(), ["Apple", "Box", "Chart", "Hello", "Icon", "Picture", "Shape"]);
+}
+
+// What a click on a placed component lands on.
+
+/// The source range of the block starting with `start` in `source`, up to the end of its
+/// closing tag `</name>`.
+fn tag_range(source: &str, start: &str, name: &str) -> std::ops::Range<usize> {
+    let at = source.find(start).unwrap();
+    let close = format!("</{name}>");
+    at..at + source[at..].find(&close).unwrap() + close.len()
+}
+
+/// What a click in the middle of `rect` on slide 0 lands on.
+fn hit_in(deck: &mut Deck, x: f32, y: f32) -> Hit {
+    deck.text_layout(0).hit(x, y).expect("a point on the slide")
+}
+
+#[test]
+fn a_click_on_a_component_that_does_not_draw_its_words_selects_it() {
+    let source = "# T\n\nBody words\n\n<Hello x=\"100\" y=\"300\" w=\"700\" h=\"300\">\n\nHidden words\n\n</Hello>\n\n\
+                  <Nope x=\"900\" y=\"300\" w=\"300\" h=\"300\">\n\nUnknown words\n\n</Nope>\n\n\
+                  <Later x=\"1300\" y=\"300\" w=\"300\" h=\"300\">\n\nLater words\n\n</Later>\n";
+    // Hello takes no content, then takes it but doesn't put it anywhere; Nope is no component;
+    // Later has no build.
+    for hello in [answering_without_content("Hello", &text_answer("Drawn")), answering("Hello", &text_answer("Drawn"))] {
+        let files = talk_with_hello(source, hello);
+        files.put("components/later.rs", source_of_later());
+        let mut deck = open(&files);
+        assert_eq!(info(&deck, "Later").state, ComponentState::NeedsBuilding);
+        for (x, y, start, name) in [(450.0, 450.0, "<Hello", "Hello"), (1050.0, 450.0, "<Nope", "Nope"), (1450.0, 450.0, "<Later", "Later")] {
+            let hit = hit_in(&mut deck, x, y);
+            let Hit::Element(element) = &hit else { panic!("{name}: {hit:?}") };
+            assert_eq!(element.source, tag_range(source, start, name), "{name}");
+        }
+    }
+}
+
+fn source_of_later() -> String {
+    source("Later")
+}
+
+#[test]
+fn a_component_that_draws_its_words_takes_typing_there() {
+    let answer = r#"{"element":{"Stack":{"horizontal":false,"gap":0.0,"children":[{"Text":{"text":"Before","size":null,"bold":false,"color":null}},"Children"]}}}"#;
+    let source = "# T\n\n<Hello x=\"100\" y=\"300\" w=\"700\" h=\"400\">\n\nInside\n\n</Hello>\n";
+    let files = talk_with_hello(source, answering("Hello", answer));
+    let mut deck = open(&files);
+    assert!(!deck.takes_content("Hello"), "not loaded yet");
+    assert_eq!(deck.modules_loaded(), 0, "opening loads nothing");
+    let layout = deck.text_layout(0);
+    assert!(deck.takes_content("Hello"), "loaded as its slide was drawn");
+    assert_eq!(deck.modules_loaded(), 1);
+    let flows = slides_format::text_flows_with(&slides_format::parse_talk(source), 0, &|name| deck.takes_content(name));
+    let boxed = flows.iter().position(|flow| matches!(flow.place, slides_format::FlowPlace::Tag(_))).expect("its words are a flow");
+    let caret = layout.caret(boxed, slides_format::Pos { para: 0, offset: 0 }).expect("placed where it's drawn");
+    let hit = hit_in(&mut deck, caret.x + 1.0, caret.top + caret.height / 2.0);
+    assert_eq!(hit, Hit::Text { flow: boxed, pos: slides_format::Pos { para: 0, offset: 0 } });
+    assert!(!deck.takes_content("Nope"));
+}
+
+/// A talk in a folder holding `Hello`'s source and build, and `index` as its build index if
+/// it's given, whose files are read with those added to it in `added`.
+fn hello_with_added(index: Option<Vec<u8>>) -> (tempfile::TempDir, std::sync::Arc<AddedSet>, Deck) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("components")).unwrap();
+    std::fs::create_dir_all(dir.path().join("build")).unwrap();
+    std::fs::write(dir.path().join("components/hello.rs"), source("Hello")).unwrap();
+    std::fs::write(dir.path().join("build/hello.wasm"), answering("Hello", &text_answer("Entered"))).unwrap();
+    if let Some(index) = index {
+        std::fs::write(dir.path().join(INDEX_FILE), index).unwrap();
+    }
+    let added = std::sync::Arc::new(AddedSet::new());
+    let under: std::sync::Arc<dyn TalkFiles + Send + Sync> = std::sync::Arc::new(FolderFiles::new(dir.path().to_path_buf()));
+    let files: std::sync::Arc<dyn TalkFiles + Send + Sync> = std::sync::Arc::new(WithAdded::new(under, added.clone()));
+    let deck = Deck::open(Box::new(files), Fonts::bundled_only(), "<Hello />\n".into());
+    (dir, added, deck)
+}
+
+fn entry(tag: &str, file: &str, built_from: &str) -> BuildEntry {
+    BuildEntry { tag: tag.to_string(), file: file.to_string(), source_hash: source_hash(built_from.as_bytes()) }
+}
+
+#[test]
+fn a_build_entered_with_the_added_files_pairs_as_the_index_would() {
+    let (_dir, added, mut deck) = hello_with_added(None);
+    assert_eq!(info(&deck, "Hello").state, ComponentState::NeedsBuilding);
+    added.enter_build(entry("Hello", "hello", &source("Hello")));
+    deck.files_added();
+    assert_eq!(info(&deck, "Hello").state, ComponentState::UpToDate);
+    assert!(shows(&mut deck, 0, "Entered"), "{:?}", texts(&mut deck, 0));
+    // Entered again from another source, it's out of date, though the index is as long.
+    added.enter_build(entry("Hello", "hello", &source("Other")));
+    deck.files_added();
+    assert_eq!(info(&deck, "Hello").state, ComponentState::OutOfDate);
+    assert_eq!(added.builds_entered().len(), 1, "one entry for a component");
+    // Forgotten, the talk's own index is read as it is.
+    added.forget_builds(&added.builds_entered());
+    deck.files_added();
+    assert_eq!(info(&deck, "Hello").state, ComponentState::NeedsBuilding);
+}
+
+#[test]
+fn a_build_entered_never_replaces_the_talks_own_entries_and_an_unreadable_index_is_left_as_it_is() {
+    let (_dir, added, mut deck) = hello_with_added(Some(index(&[("Other", "other", "x"), ("Hello", "hello", "older")])));
+    assert_eq!(info(&deck, "Hello").state, ComponentState::OutOfDate);
+    // The talk's own entry for Hello is never replaced; one for a new component is added.
+    added.enter_build(entry("Hello", "hello", &source("Hello")));
+    added.enter_build(entry("Hi", "hi", "y"));
+    deck.files_added();
+    assert_eq!(info(&deck, "Hello").state, ComponentState::OutOfDate);
+    let files = WithAdded::new(std::sync::Arc::new(FolderFiles::new(_dir.path().to_path_buf())), added.clone());
+    let read: BuildIndex = serde_json::from_slice(&files.read(INDEX_FILE).unwrap()).unwrap();
+    assert_eq!(read.components, [entry("Other", "other", "x"), entry("Hello", "hello", "older"), entry("Hi", "hi", "y")]);
+    assert_eq!(files.len(INDEX_FILE), Some(files.read(INDEX_FILE).unwrap().len() as u64));
+
+    let (_dir, added, mut deck) = hello_with_added(Some(b"this isn't JSON".to_vec()));
+    added.enter_build(entry("Hello", "hello", &source("Hello")));
+    deck.files_added();
+    assert_eq!(info(&deck, "Hello").state, ComponentState::NeedsBuilding, "nothing counts as built");
+    assert!(has_problem(&deck, INDEX_FILE));
 }

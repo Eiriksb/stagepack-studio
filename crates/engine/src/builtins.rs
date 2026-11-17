@@ -3,7 +3,7 @@
 
 use toolkit::prelude::*;
 
-const DEFAULT_ICON_SIZE: f32 = 64.0;
+pub(crate) const DEFAULT_ICON_SIZE: f32 = 64.0;
 /// The space a box with a fill or an outline keeps between its edge and its content.
 const DEFAULT_BOX_PADDING: f32 = 24.0;
 
@@ -49,15 +49,26 @@ fn shape_element(
     }
 }
 
+/// The kinds of shape a `Shape` can be. Anything else a talk gives is a rectangle.
+#[derive(Prop, Clone, Copy)]
+enum Kind {
+    Rect,
+    Rounded,
+    Ellipse,
+    Line,
+    Arrow,
+    Callout,
+}
+
 #[component]
-fn Shape(kind: String, fill: Option<String>, outline: Option<String>, outline_width: f32, children: Children) -> Element {
-    let kind = match kind.as_str() {
-        "rounded" => ShapeKind::Rounded,
-        "ellipse" => ShapeKind::Ellipse,
-        "line" => ShapeKind::Line,
-        "arrow" => ShapeKind::Arrow,
-        "callout" => ShapeKind::Callout,
-        _ => ShapeKind::Rect,
+fn Shape(kind: Kind, fill: Option<String>, outline: Option<String>, outline_width: f32, children: Children) -> Element {
+    let kind = match kind {
+        Kind::Rect => ShapeKind::Rect,
+        Kind::Rounded => ShapeKind::Rounded,
+        Kind::Ellipse => ShapeKind::Ellipse,
+        Kind::Line => ShapeKind::Line,
+        Kind::Arrow => ShapeKind::Arrow,
+        Kind::Callout => ShapeKind::Callout,
     };
     shape_element(kind, fill, outline, outline_width, 0.0, 0.0, children.into())
 }

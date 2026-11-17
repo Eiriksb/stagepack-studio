@@ -45,6 +45,8 @@ pub const ALIGN_RIGHT_ID: &str = "align-right";
 
 /// What the alignment tools say when the text is all list items.
 pub const LISTS_STAY_LEFT: &str = "Lists stay at the left for now.";
+/// What the paragraph tools say in a cell of a table, which holds one line of text.
+pub const NOT_IN_A_TABLE: &str = "Not in a table.";
 
 /// The sizes the list offers. Any other from [`MIN_SIZE`] to [`MAX_SIZE`] can be typed in.
 pub const SIZES: [u32; 8] = [18, 24, 32, 40, 48, 64, 80, 96];
@@ -101,6 +103,8 @@ impl Pressed {
 /// What the tools show for the text being typed.
 struct Showing {
     title: bool,
+    /// Whether it's a cell of a table, where the paragraph tools are off.
+    cell: bool,
     bold: Pressed,
     italic: Pressed,
     underline: Pressed,
@@ -178,6 +182,7 @@ fn showing(document: &Entity<Document>, cx: &mut App) -> Option<Showing> {
     let align = document.read(cx).text_align();
     Some(Showing {
         title: editing.is_title(),
+        cell: editing.is_cell(),
         bold: Pressed::of(state.bold),
         italic: Pressed::of(state.italic),
         underline: Pressed::of(state.underline),
@@ -217,7 +222,7 @@ impl<T: PartialEq> SharedOf<T> for Shared<T> {
 }
 
 /// `color` as the colour picker holds it, if it's one written as `#rgb` or `#rrggbb`.
-fn picker_color(color: &str) -> Option<Hsla> {
+pub(crate) fn picker_color(color: &str) -> Option<Hsla> {
     let hex = color.strip_prefix('#')?;
     let hex = match hex.len() {
         3 => hex.chars().flat_map(|c| [c, c]).collect(),
@@ -229,7 +234,7 @@ fn picker_color(color: &str) -> Option<Hsla> {
 }
 
 /// `color` as the talk writes it: `#rrggbb`.
-fn written_color(color: Hsla) -> String {
+pub(crate) fn written_color(color: Hsla) -> String {
     let Rgba { r, g, b, .. } = color.into();
     let byte = |channel: f32| (channel.clamp(0.0, 1.0) * 255.0).round() as u8;
     format!("#{:02x}{:02x}{:02x}", byte(r), byte(g), byte(b))
@@ -342,12 +347,14 @@ impl TextTools {
     }
 
     /// A tool that's on or off, `(id, icon, label)`, showing `pressed`, whose key is `action`'s.
+    /// Off, it says `off` if that's given.
     fn toggle(
         &self,
         (id, icon, label): (&'static str, Icons, &'static str),
         pressed: Pressed,
         action: &dyn Action,
         enabled: bool,
+        off: Option<&'static str>,
         work: impl Fn(&mut SlideEditor, &mut Context<SlideEditor>) + 'static,
     ) -> AnyElement {
         let toggled = match pressed {
@@ -356,7 +363,10 @@ impl TextTools {
             Pressed::Mixed => Toggled::Mixed,
         };
         let button = icon_tool(button_id(id), icon, label)
-            .tooltip_with_action(label, action, Some(EDITOR_CONTEXT))
+            .map(|button| match off.filter(|_| !enabled) {
+                Some(off) => button.tooltip(off),
+                None => button.tooltip_with_action(label, action, Some(EDITOR_CONTEXT)),
+            })
             .selected(pressed == Pressed::On)
             // Half-pressed: outlined, but not filled.
             .when(pressed == Pressed::Mixed, |button| button.outline())
@@ -465,13 +475,13 @@ impl TextTools {
         group(
             "Text",
             vec![
-                self.toggle((BOLD_ID, Icons::Bold, "Bold"), pressed(|s| s.bold), &ToggleBold, editing, |editor, cx| {
+                self.toggle((BOLD_ID, Icons::Bold, "Bold"), pressed(|s| s.bold), &ToggleBold, editing, None, |editor, cx| {
                     editor.format(|edit| edit.toggle(StyleBit::Bold), cx)
                 }),
-                self.toggle((ITALIC_ID, Icons::Italic, "Italic"), pressed(|s| s.italic), &ToggleItalic, editing, |editor, cx| {
+                self.toggle((ITALIC_ID, Icons::Italic, "Italic"), pressed(|s| s.italic), &ToggleItalic, editing, None, |editor, cx| {
                     editor.format(|edit| edit.toggle(StyleBit::Italic), cx)
                 }),
-                self.toggle((UNDERLINE_ID, Icons::Underline, "Underline"), pressed(|s| s.underline), &ToggleUnderline, editing, |editor, cx| {
+                self.toggle((UNDERLINE_ID, Icons::Underline, "Underline"), pressed(|s| s.underline), &ToggleUnderline, editing, None, |editor, cx| {
                     editor.format(|edit| edit.toggle(StyleBit::Underline), cx)
                 }),
                 size_field.into_any_element(),
@@ -499,16 +509,22 @@ impl TextTools {
     }
 
     fn paragraph_group(&self, showing: Option<&Showing>, cx: &App) -> AnyElement {
-        // A title is one paragraph, never a list.
-        let lists = showing.is_some_and(|showing| !showing.title);
+        // A title is one paragraph, never a list, and a cell of a table one line.
+        let cell = showing.is_some_and(|showing| showing.cell);
+        let lists = showing.is_some_and(|showing| !showing.title && !showing.cell);
+        let off = cell.then_some(NOT_IN_A_TABLE);
         let pressed = |get: fn(&Showing) -> Pressed| showing.map_or(Pressed::Off, get);
         let align = showing.and_then(|showing| showing.align);
         // Lists stay at the left, so text that's all list items can't be aligned.
-        let alignable = showing.is_some_and(|showing| !showing.only_lists);
+        let alignable = showing.is_some_and(|showing| !showing.only_lists && !showing.cell);
         let listed = showing.is_some_and(|showing| showing.any_listed);
         let aligner = |this: &Self, id: &'static str, icon: Icons, label: &'static str, to: Align| {
             let on = align == Some(to);
-            let tip = if showing.is_some() && !alignable { LISTS_STAY_LEFT } else { label };
+            let tip = match off {
+                Some(off) => off,
+                None if showing.is_some() && !alignable => LISTS_STAY_LEFT,
+                None => label,
+            };
             icon_tool(id, icon, label)
                 .tooltip(tip)
                 .selected(on)
@@ -519,7 +535,10 @@ impl TextTools {
         };
         let indent = |this: &Self, id: &'static str, icon: Icons, label: &'static str, action: &dyn Action, more: bool| {
             icon_tool(id, icon, label)
-                .tooltip_with_action(label, action, Some(EDITOR_CONTEXT))
+                .map(|button| match off {
+                    Some(off) => button.tooltip(off),
+                    None => button.tooltip_with_action(label, action, Some(EDITOR_CONTEXT)),
+                })
                 .disabled(!lists || !listed)
                 .on_click(this.with_editor(move |editor, cx| {
                     editor.format(if more { TextEdit::indent } else { TextEdit::outdent }, cx)
@@ -527,10 +546,10 @@ impl TextTools {
                 .into_any_element()
         };
         let tools = vec![
-            self.toggle((BULLETS_ID, Icons::List, "Bullets"), pressed(|s| s.bullets), &ToggleBullets, lists, |editor, cx| {
+            self.toggle((BULLETS_ID, Icons::List, "Bullets"), pressed(|s| s.bullets), &ToggleBullets, lists, off, |editor, cx| {
                 editor.toggle_list(false, cx)
             }),
-            self.toggle((NUMBERING_ID, Icons::ListOrdered, "Numbering"), pressed(|s| s.numbering), &ToggleNumbering, lists, |editor, cx| {
+            self.toggle((NUMBERING_ID, Icons::ListOrdered, "Numbering"), pressed(|s| s.numbering), &ToggleNumbering, lists, off, |editor, cx| {
                 editor.toggle_list(true, cx)
             }),
             indent(self, INDENT_LESS_ID, Icons::ListIndentDecrease, "Indent less", &Outdent, false),

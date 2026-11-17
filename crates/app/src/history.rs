@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 
 use slides_format::{Change, SourceEdit};
 
+use crate::selection::SelectMark;
 use crate::text_editing::TextMark;
 
 /// The most steps kept.
@@ -19,6 +20,8 @@ pub struct Step {
     pub current: usize,
     /// Where the step's text was typed, if it was typed on a slide.
     pub mark: Option<TextMark>,
+    /// What the step selects, if it's about a thing on a slide.
+    pub selects: Option<SelectMark>,
 }
 
 struct Entry {
@@ -31,6 +34,8 @@ struct Entry {
     after: usize,
     /// Where its text was typed, if it was typed on a slide.
     mark: Option<TextMark>,
+    /// What it selects once undone or made again, if it's about a thing on a slide.
+    selects: Option<SelectMark>,
 }
 
 impl Entry {
@@ -120,6 +125,7 @@ impl History {
             before,
             after,
             mark: None,
+            selects: None,
         };
         self.bytes += entry.bytes();
         self.undo.push_back(entry);
@@ -188,6 +194,13 @@ impl History {
         }
     }
 
+    /// Notes what the newest step selects once it's undone or made again.
+    pub fn select_mark_last(&mut self, selects: SelectMark) {
+        if let Some(last) = self.undo.back_mut() {
+            last.selects = Some(selects);
+        }
+    }
+
     /// Where the newest step's text was typed, if it was typed on a slide.
     pub fn last_mark(&self) -> Option<&TextMark> {
         self.undo.back().and_then(|entry| entry.mark.as_ref())
@@ -234,10 +247,10 @@ impl History {
         entry.change = change.inverse(source);
         self.bytes += entry.bytes();
         let current = entry.before;
-        let mark = entry.mark.clone();
+        let (mark, selects) = (entry.mark.clone(), entry.selects.clone());
         self.redo.push(entry);
         self.trim();
-        Some(Step { change, current, mark })
+        Some(Step { change, current, mark, selects })
     }
 
     /// Makes the last step undone again. `source` is the talk's text now.
@@ -249,10 +262,10 @@ impl History {
         entry.change = change.inverse(source);
         self.bytes += entry.bytes();
         let current = entry.after;
-        let mark = entry.mark.clone();
+        let (mark, selects) = (entry.mark.clone(), entry.selects.clone());
         self.undo.push_back(entry);
         self.trim();
-        Some(Step { change, current, mark })
+        Some(Step { change, current, mark, selects })
     }
 
     pub fn can_undo(&self) -> bool {
@@ -312,7 +325,7 @@ impl History {
 
 /// The change that turns `from` into `to` with a single edit: what lies between all they
 /// start and end with alike.
-fn one_edit(from: &str, to: &str) -> Change {
+pub(crate) fn one_edit(from: &str, to: &str) -> Change {
     let mut start = from
         .bytes()
         .zip(to.bytes())

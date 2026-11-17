@@ -13,6 +13,9 @@ use gpui_kit::*;
 
 use crate::clipboard_tools::ClipboardTools;
 use crate::document::Document;
+use crate::icon_picker::IconPicker;
+use crate::palette::ComponentList;
+use crate::table_tools::{self, TableGrid};
 use crate::text_tools::TextTools;
 use crate::workspace_view::{
     AddSlide, DeleteSlide, DuplicateSlide, KEY_CONTEXT, NewSlide, Present, Redo, Rehearse, Save,
@@ -124,6 +127,12 @@ pub struct Ribbon {
     clipboard_tools: Entity<ClipboardTools>,
     /// The tools for text being typed, on the Home tab.
     text_tools: Entity<TextTools>,
+    /// What the Insert tab's Icon tool opens.
+    icon_picker: Entity<IconPicker>,
+    /// What the Insert tab's Table tool opens.
+    table_grid: Entity<TableGrid>,
+    /// What the Insert tab's Component tool opens.
+    component_list: Entity<ComponentList>,
     tab: RibbonTab,
     panels: Panels,
     /// How far the row of tools is scrolled.
@@ -131,6 +140,9 @@ pub struct Ribbon {
     /// Whether the row goes on past its left end, and past its right, as last drawn.
     more: (bool, bool),
     _document_changed: Option<Subscription>,
+    _picker_changed: Subscription,
+    _grid_changed: Subscription,
+    _list_changed: Subscription,
 }
 
 impl Ribbon {
@@ -138,26 +150,54 @@ impl Ribbon {
         document: Option<Entity<Document>>,
         clipboard_tools: Entity<ClipboardTools>,
         text_tools: Entity<TextTools>,
+        icon_picker: Entity<IconPicker>,
         panels: Panels,
         cx: &mut Context<Self>,
     ) -> Self {
         let document_changed = document
             .as_ref()
             .map(|document| cx.observe(document, |_, _, cx| cx.notify()));
+        // The picker opens and closes in the tab's drawing.
+        let picker_changed = cx.observe(&icon_picker, |_, _, cx| cx.notify());
+        let table_grid = cx.new(|_| TableGrid::new());
+        let grid_changed = cx.observe(&table_grid, |_, _, cx| cx.notify());
+        let component_list = cx.new(|cx| ComponentList::new(document.clone(), cx));
+        let list_changed = cx.observe(&component_list, |_, _, cx| cx.notify());
         Ribbon {
             document,
             clipboard_tools,
             text_tools,
+            icon_picker,
+            table_grid,
+            component_list,
             tab: RibbonTab::default(),
             panels,
             scroll: ScrollHandle::new(),
             more: (false, false),
             _document_changed: document_changed,
+            _picker_changed: picker_changed,
+            _grid_changed: grid_changed,
+            _list_changed: list_changed,
         }
     }
 
     pub fn text_tools(&self) -> &Entity<TextTools> {
         &self.text_tools
+    }
+
+    /// The picker the Insert tab's Icon tool opens.
+    pub fn icon_picker(&self) -> &Entity<IconPicker> {
+        &self.icon_picker
+    }
+
+    /// The grid of sizes the Insert tab's Table tool opens.
+    pub fn table_grid(&self) -> &Entity<TableGrid> {
+        &self.table_grid
+    }
+
+    /// The list of components the Insert tab's Component tool opens.
+    pub fn component_list(&self) -> &Entity<ComponentList> {
+        &self.component_list
     }
 
     pub fn tab(&self) -> RibbonTab {
@@ -207,6 +247,8 @@ impl Ribbon {
         let unsaved = document.is_some_and(Document::has_unsaved_changes);
         let undo = document.and_then(Document::undo_label);
         let redo = document.and_then(Document::redo_label);
+        // While the caret is in a cell, or a table is selected, its tools come last.
+        let table = document.and_then(Document::table_here);
         let new_slide = DropdownButton::new(NEW_SLIDE_LAYOUTS_ID)
             .button(
                 tool(NEW_SLIDE_ID, Icons::SquarePlus, "New slide")
@@ -250,7 +292,9 @@ impl Ribbon {
                 "Slides",
                 vec![
                     new_slide.into_any_element(),
-                    tool(DUPLICATE_ID, Icons::CopyPlus, "Duplicate")
+                    // "Slide" in both, as a thing on the slide can show as selected while it's the
+                    // slide they act on.
+                    tool(DUPLICATE_ID, Icons::CopyPlus, "Duplicate slide")
                         .tooltip_with_action(
                             "Put a copy of this slide after it",
                             &DuplicateSlide,
@@ -259,7 +303,7 @@ impl Ribbon {
                         .disabled(!has_talk)
                         .on_click(dispatch(DuplicateSlide))
                         .into_any_element(),
-                    tool(DELETE_ID, Icons::Trash, "Delete")
+                    tool(DELETE_ID, Icons::Trash, "Delete slide")
                         .tooltip("Delete this slide")
                         .disabled(!several)
                         .on_click(dispatch(DeleteSlide))
@@ -298,6 +342,9 @@ impl Ribbon {
                 cx,
             ),
         ]
+        .into_iter()
+        .chain(table.map(|table| table_tools::ribbon_group(&table, cx)))
+        .collect()
     }
 
     fn slide_show(&self, cx: &App) -> Vec<AnyElement> {
@@ -476,12 +523,22 @@ pub(crate) fn divider(cx: &App) -> AnyElement {
 }
 
 impl Render for Ribbon {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // What the picker no longer shows, once it's closed, goes from the window.
+        self.icon_picker.update(cx, |picker, _| picker.release(window));
+        if self.tab != RibbonTab::Insert {
+            self.icon_picker.update(cx, |picker, cx| picker.close(cx));
+            self.table_grid.update(cx, |grid, cx| grid.set_open(false, cx));
+            self.component_list.update(cx, |list, cx| list.set_open(false, cx));
+        }
         let groups = match self.tab {
             RibbonTab::Home => self.home(cx),
             RibbonTab::SlideShow => self.slide_show(cx),
             RibbonTab::View => self.view(cx),
-            RibbonTab::Insert | RibbonTab::Animate => Self::on_the_way(cx),
+            RibbonTab::Insert => {
+                crate::insert_tools::insert_tab(self.document.is_some(), &self.icon_picker, &self.table_grid, &self.component_list, cx)
+            }
+            RibbonTab::Animate => Self::on_the_way(cx),
         };
         let mut tools = Vec::with_capacity(groups.len() * 2);
         for (index, group) in groups.into_iter().enumerate() {

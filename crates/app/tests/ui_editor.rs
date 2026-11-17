@@ -13,10 +13,11 @@ use gpui_kit::{
 use slides_engine::{Fonts, pack_folder};
 use slides_format::is_hidden;
 use stagepack_studio::document::Document;
+use stagepack_studio::insert_tools::INSERT_PICTURE_ID;
 use stagepack_studio::notes_panel::{NOTES_CAPTION_ID, NOTES_ID, NOTES_PLACEHOLDER};
 use stagepack_studio::ribbon::{
     DELETE_ID, DUPLICATE_ID, HIDE_ID, MARKDOWN_TOGGLE_ID, NEW_SLIDE_ID, NEW_SLIDE_LAYOUTS_ID,
-    NOTES_TOGGLE_ID, ON_THE_WAY, ON_THE_WAY_ID, PRESENT_ID, REDO_ID, REHEARSE_ID, RIBBON_ID,
+    MORE_RIGHT_ID, NOTES_TOGGLE_ID, ON_THE_WAY, ON_THE_WAY_ID, PRESENT_ID, REDO_ID, REHEARSE_ID, RIBBON_ID,
     SLIDE_LIST_TOGGLE_ID, TAB_ANIMATE_ID, TAB_HOME_ID, TAB_INSERT_ID, TAB_SLIDE_SHOW_ID,
     TAB_VIEW_ID, UNDO_ID,
 };
@@ -77,6 +78,29 @@ fn click(cx: &mut TestAppContext, handle: AnyWindowHandle, id: impl Into<gpui_ki
     })
     .unwrap();
     settle(cx, handle);
+}
+
+/// Scrolls the row of tools by its right arrow until `id` is clear of the arrow, as a person
+/// does in a window too narrow for the Home tab: at 1,280 pixels its History group is past it.
+fn reach(cx: &mut TestAppContext, handle: AnyWindowHandle, id: &'static str) {
+    for _ in 0..20 {
+        let clear = with_window(cx, handle, |window, _| {
+            let arrow = window.try_find(MORE_RIGHT_ID).map(|arrow| arrow.bounds().left());
+            let right = arrow.unwrap_or_else(|| window.find(RIBBON_ID).bounds().right());
+            window.find(id).bounds().right() <= right
+        });
+        if clear {
+            return;
+        }
+        click(cx, handle, MORE_RIGHT_ID);
+    }
+    panic!("{id} can't be reached");
+}
+
+/// Clicks the tool `id`, scrolling the row of tools to it first.
+fn click_tool(cx: &mut TestAppContext, handle: AnyWindowHandle, id: &'static str) {
+    reach(cx, handle, id);
+    click(cx, handle, id);
 }
 
 fn keys(cx: &mut TestAppContext, handle: AnyWindowHandle, keystrokes: &str) {
@@ -218,17 +242,15 @@ fn the_window_has_its_tabs_and_the_home_tab_is_open(cx: &mut TestAppContext) {
                 .all(|pair| pair[0].right() <= pair[1].left()),
             "in a row"
         );
-        for id in [
-            NEW_SLIDE_ID,
-            DUPLICATE_ID,
-            DELETE_ID,
-            HIDE_ID,
-            UNDO_ID,
-            REDO_ID,
-        ] {
+        // At 1,280 pixels the History group is past the right arrow, to be scrolled to.
+        for id in [NEW_SLIDE_ID, DUPLICATE_ID, DELETE_ID, HIDE_ID] {
             assert!(window.find(id).visible(), "{id}");
         }
+        assert!(window.find(MORE_RIGHT_ID).visible(), "an arrow says there's more");
         assert_eq!(window.find(NEW_SLIDE_ID).label(), Some("New slide"));
+        // Each says it acts on the slide, as a thing on it can show as selected.
+        assert_eq!(window.find(DUPLICATE_ID).label(), Some("Duplicate slide"));
+        assert_eq!(window.find(DELETE_ID).label(), Some("Delete slide"));
         assert_eq!(window.find(HIDE_ID).label(), Some("Hide slide"));
         assert!(
             window.find_by_label("Slides").visible(),
@@ -239,25 +261,34 @@ fn the_window_has_its_tabs_and_the_home_tab_is_open(cx: &mut TestAppContext) {
             "the group's caption"
         );
     });
+    for id in [UNDO_ID, REDO_ID] {
+        reach(cx, handle, id);
+        with_window(cx, handle, |window, _| assert!(window.find(id).visible(), "{id}"));
+    }
 }
 
 #[gpui_kit::test]
 fn each_tab_shows_its_own_tools(cx: &mut TestAppContext) {
     let (handle, _) = open(cx, THREE);
-    for tab in [TAB_INSERT_ID, TAB_ANIMATE_ID] {
-        click(cx, handle, tab);
-        with_window(cx, handle, |window, _| {
-            let line = window.find(ON_THE_WAY_ID);
-            assert!(line.visible());
-            assert_eq!(line.label(), Some(ON_THE_WAY));
-            assert_eq!(ON_THE_WAY, "Tools for this tab are on the way.");
-            assert!(
-                window.try_find(NEW_SLIDE_ID).is_none(),
-                "Home's tools are put away"
-            );
-            assert_eq!(window.find(tab).selected(), Some(true));
-        });
-    }
+    click(cx, handle, TAB_INSERT_ID);
+    with_window(cx, handle, |window, _| {
+        assert_eq!(window.find(INSERT_PICTURE_ID).label(), Some("Picture"));
+        assert!(window.try_find(ON_THE_WAY_ID).is_none(), "the Insert tab has its tools");
+        assert!(window.try_find(NEW_SLIDE_ID).is_none(), "Home's tools are put away");
+        assert_eq!(window.find(TAB_INSERT_ID).selected(), Some(true));
+    });
+    click(cx, handle, TAB_ANIMATE_ID);
+    with_window(cx, handle, |window, _| {
+        let line = window.find(ON_THE_WAY_ID);
+        assert!(line.visible());
+        assert_eq!(line.label(), Some(ON_THE_WAY));
+        assert_eq!(ON_THE_WAY, "Tools for this tab are on the way.");
+        assert!(
+            window.try_find(NEW_SLIDE_ID).is_none(),
+            "Home's tools are put away"
+        );
+        assert_eq!(window.find(TAB_ANIMATE_ID).selected(), Some(true));
+    });
     click(cx, handle, TAB_SLIDE_SHOW_ID);
     with_window(cx, handle, |window, _| {
         assert_eq!(window.find(PRESENT_ID).label(), Some("From the start"));
@@ -448,17 +479,11 @@ fn undo_and_redo_are_disabled_until_there_is_something(cx: &mut TestAppContext) 
     assert_eq!(state(cx), (true, true));
     click(cx, handle, NEW_SLIDE_ID);
     assert_eq!(state(cx), (false, true));
-    click(cx, handle, UNDO_ID);
+    click_tool(cx, handle, UNDO_ID);
     assert_eq!(count(cx, &view), 2);
     assert_eq!(state(cx), (true, false));
-    // At its left end: in this window the row of tools runs past the right edge, and the
-    // arrow there, which takes the clicks over what it covers, lies over Redo's right half.
-    cx.update_window(handle, |_, window, cx| {
-        window.render_frame(cx);
-        window.click_at(REDO_ID, gpui_kit::point(gpui_kit::px(4.), gpui_kit::px(8.)), cx);
-    })
-    .unwrap();
-    settle(cx, handle);
+    // In this window the row of tools runs past the right edge, History and all.
+    click_tool(cx, handle, REDO_ID);
     assert_eq!(count(cx, &view), 3);
     assert_eq!(state(cx), (false, true));
 }
@@ -473,7 +498,7 @@ fn undo_names_what_it_will_undo(cx: &mut TestAppContext) {
             Some("Undo Delete slide")
         );
     });
-    click(cx, handle, UNDO_ID);
+    click_tool(cx, handle, UNDO_ID);
     with_window(cx, handle, |window, _| {
         assert_eq!(
             window.find(REDO_ID).description(),
@@ -553,7 +578,7 @@ fn typing_in_notes_changes_the_slides_notes_and_one_undo_takes_it_back(cx: &mut 
         assert_eq!(window.find(UNDO_ID).description(), Some("Undo Edit notes"));
     });
 
-    click(cx, handle, UNDO_ID);
+    click_tool(cx, handle, UNDO_ID);
     assert_eq!(
         notes_of(cx, &view, 0),
         None,
@@ -683,13 +708,14 @@ fn the_view_tab_hides_and_shows_each_panel(cx: &mut TestAppContext) {
         click(cx, handle, toggle);
         assert_eq!(shown(cx, panel), at_first, "{panel}");
     }
-    // With both away, the slide has the room.
+    // With both away, the slide has the room, but for the inspector's, which is always there.
     click(cx, handle, NOTES_TOGGLE_ID);
     click(cx, handle, SLIDE_LIST_TOGGLE_ID);
     with_window(cx, handle, |window, _| {
         let canvas = window.find(CANVAS_ID).bounds();
+        let inspector = window.find(stagepack_studio::inspector::INSPECTOR_ID).bounds();
         assert!(canvas.left() < px(40.), "{canvas:?}");
-        assert!(canvas.right() > px(1240.), "{canvas:?}");
+        assert!(canvas.right() > inspector.left() - px(40.), "{canvas:?} {inspector:?}");
     });
 }
 

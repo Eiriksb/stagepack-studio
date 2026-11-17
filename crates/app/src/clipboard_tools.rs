@@ -1,7 +1,9 @@
 //! The Clipboard group on the Home tab, Paste, Cut and Copy, and the window's side of the
-//! system clipboard. The tools act on what has the keyboard: the text being typed, or else
-//! the current slide. Using one leaves the keyboard where it was. What goes on the clipboard,
+//! system clipboard. The tools act on what has the keyboard: the text being typed, the thing
+//! selected on the slide, or else the current slide. Using one leaves the keyboard where it was. What goes on the clipboard,
 //! and what's taken from it, is [`crate::clipboard`]'s.
+
+use std::path::PathBuf;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::assets::IconName;
@@ -11,7 +13,7 @@ use gpui_kit::*;
 use crate::clipboard::Entry;
 use crate::document::Document;
 use crate::ribbon::group;
-use crate::slide_editor::{EDITOR_CONTEXT, SlideEditor};
+use crate::slide_editor::{EDITOR_CONTEXT, SELECTION_CONTEXT, SlideEditor};
 use crate::slide_strip::STRIP_CONTEXT;
 use crate::workspace_view::{CopyToClipboard, CutToClipboard, PasteFromClipboard};
 
@@ -29,12 +31,31 @@ pub(crate) fn write_clipboard(entry: Entry, cx: &mut App) {
     cx.write_to_clipboard(item);
 }
 
-/// What the system clipboard holds: its text, and its metadata, if it's one piece of text
-/// that has some.
-pub(crate) fn read_clipboard(cx: &App) -> (Option<String>, Option<String>) {
-    cx.read_from_clipboard()
-        .map(|item| (item.text(), item.metadata().cloned()))
-        .unwrap_or_default()
+/// What on the clipboard can be put on the slide, besides text.
+pub(crate) enum ClipboardThing {
+    Picture(Image),
+    Paths(Vec<PathBuf>),
+}
+
+/// The picture on the clipboard `item`, or else the files it names, if it holds either. The
+/// picture's bytes are moved out, not copied.
+pub(crate) fn picture_or_files(item: ClipboardItem) -> Option<ClipboardThing> {
+    let mut paths = None;
+    for entry in item.into_entries() {
+        match entry {
+            ClipboardEntry::Image(image) => return Some(ClipboardThing::Picture(image)),
+            ClipboardEntry::ExternalPaths(found) if paths.is_none() && !found.paths().is_empty() => {
+                paths = Some(ClipboardThing::Paths(found.paths().to_vec()));
+            }
+            _ => {}
+        }
+    }
+    paths
+}
+
+/// Whether the clipboard `item` holds text.
+pub(crate) fn holds_text(item: &ClipboardItem) -> bool {
+    item.entries().iter().any(|entry| matches!(entry, ClipboardEntry::String(_)))
 }
 
 /// What the tools last saw of the text being typed: whether there is any, and whether any of
@@ -128,11 +149,18 @@ impl Render for ClipboardTools {
         // With text being typed, they're for its selection; Cut and Copy need some selected.
         // Otherwise they're for the current slide, which can't be cut if it's the only one.
         // In the notes field, they do what its own keys do, to its selection.
+        // With a thing selected on the slide shown, they're for it.
         let in_notes = self.notes.as_ref().is_some_and(|notes| notes.contains_focused(window, cx));
+        let thing_here = self.document.as_ref().is_some_and(|document| {
+            let document = document.read(cx);
+            document.selected().is_some_and(|selected| selected.slide == document.current())
+        });
         let (copy, cut, context) = if in_notes {
             (has_talk, has_talk, STRIP_CONTEXT)
         } else if seen.typing {
             (seen.selected, seen.selected, EDITOR_CONTEXT)
+        } else if thing_here {
+            (true, true, SELECTION_CONTEXT)
         } else {
             (has_talk, slides.is_some_and(|count| count > 1), STRIP_CONTEXT)
         };

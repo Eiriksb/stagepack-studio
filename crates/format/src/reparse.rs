@@ -2,7 +2,7 @@
 
 use std::ops::Range;
 
-use crate::model::{Attr, Block, Notes, Slide, Tag, Talk};
+use crate::model::{Attr, Block, CellSource, Notes, Slide, Tag, Talk};
 use crate::parse::read_slides;
 use crate::settings::{SettingEntry, Settings};
 use crate::split::{RawSlide, split_slides};
@@ -92,7 +92,19 @@ impl Shift {
                 range: self.range(range),
                 item_ranges: item_ranges.iter().map(|item| self.range(item)).collect(),
             },
-            Block::Table { rows, range } => Block::Table { rows: rows.clone(), range: self.range(range) },
+            Block::Table { rows, cells, rule, range } => Block::Table {
+                rows: rows.clone(),
+                cells: cells
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .map(|cell| CellSource { range: self.range(&cell.range), inline: self.range(&cell.inline), only_text: cell.only_text })
+                            .collect()
+                    })
+                    .collect(),
+                rule: self.range(rule),
+                range: self.range(range),
+            },
             Block::Code { language, code, range } => Block::Code { language: language.clone(), code: code.clone(), range: self.range(range) },
             Block::Picture { src, alt, range } => Block::Picture { src: src.clone(), alt: alt.clone(), range: self.range(range) },
             Block::Region { name, range } => Block::Region { name: name.clone(), range: self.range(range) },

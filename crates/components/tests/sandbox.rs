@@ -151,10 +151,11 @@ fn a_schema_that_never_returns_is_stopped() {
     let started = Instant::now();
     let result = WasmComponent::load(&wat(Wat { schema: Some("(loop br 0) (i64.const 0)"), render: "(i64.const 0)", ..Wat::default() }));
     // Only the clock's interrupt gives this error, so it was stopped and not left to run. The
-    // time includes compiling the module, which a loaded machine can make take seconds, so the
-    // bound is generous: the limit itself is a quarter of a second.
+    // time includes compiling the module, which a loaded machine can make take seconds (44 s
+    // was seen with the whole workspace's tests running), so the bound is generous: the limit
+    // itself is a quarter of a second, and a loop that isn't stopped never returns at all.
     assert_eq!(result.err(), Some(ComponentError::TookTooLong));
-    assert!(started.elapsed() < Duration::from_secs(30), "took {:?}", started.elapsed());
+    assert!(started.elapsed() < Duration::from_secs(120), "took {:?}", started.elapsed());
 }
 
 #[test]

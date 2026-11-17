@@ -243,9 +243,19 @@ impl Ctx<'_> {
                     .children
                     .iter()
                     .map(|item| {
+                        let children = item.children().map_or(&[][..], |children| children);
                         let mut blocks = Vec::new();
-                        for child in item.children().into_iter().flatten() {
+                        for child in children {
                             self.block(child, &mut blocks, &mut None);
+                        }
+                        // An item can't be empty and hold others, so one that's `&nbsp;` with
+                        // items under it holds the no-break space it reads as anywhere else.
+                        let has_items = children.iter().skip(1).any(|child| matches!(child, Node::List(_)));
+                        if let (true, Some(Block::Paragraph { spans, inline, .. })) = (has_items, blocks.first_mut())
+                            && spans.is_empty()
+                            && self.source.get(inline.clone()) == Some(EMPTY_PARAGRAPH)
+                        {
+                            spans.push(Span { text: "\u{a0}".to_string(), style: Style::default() });
                         }
                         blocks
                     })
@@ -253,20 +263,23 @@ impl Ctx<'_> {
                 item_ranges: list.children.iter().map(|item| self.range(item)).collect(),
                 range,
             }),
-            Node::Table(table) => out.push(Block::Table {
-                rows: table
-                    .children
-                    .iter()
-                    .map(|row| {
-                        row.children()
-                            .into_iter()
-                            .flatten()
-                            .map(|cell| self.spans(cell.children().map_or(&[][..], |c| c)))
-                            .collect()
-                    })
-                    .collect(),
-                range,
-            }),
+            Node::Table(table) => {
+                let (mut rows, mut cells) = (Vec::new(), Vec::new());
+                for row in &table.children {
+                    let (mut spans, mut sources) = (Vec::new(), Vec::new());
+                    for cell in row.children().into_iter().flatten() {
+                        let children = cell.children().map_or(&[][..], |children| children);
+                        let range = self.range(cell);
+                        spans.push(self.spans(children));
+                        sources.push(CellSource { inline: self.cell_inline(children, &range), only_text: only_text(children), range });
+                    }
+                    rows.push(spans);
+                    cells.push(sources);
+                }
+                let header_end = table.children.first().map_or(range.start, |row| self.range(row).end);
+                let rule = self.rule(header_end, range.end);
+                out.push(Block::Table { rows, cells, rule, range })
+            }
             Node::Code(code) => out.push(Block::Code {
                 language: code.lang.clone(),
                 code: code.value.clone(),
@@ -324,6 +337,41 @@ impl Ctx<'_> {
                 start..self.range(last).end
             }
             _ => block.end..block.end,
+        }
+    }
+
+    /// The content of a table cell whose bytes are `cell`: as a paragraph's, or for a cell of
+    /// nothing but white space, all of what's between its `|`s, where typed text goes.
+    fn cell_inline(&self, nodes: &[Node], cell: &Range<usize>) -> Range<usize> {
+        if !nodes.is_empty() {
+            return self.inline_range(nodes, cell);
+        }
+        let bytes = self.source.as_bytes();
+        let start = (cell.start + usize::from(bytes.get(cell.start) == Some(&b'|'))).min(cell.end);
+        let end = if cell.end > start && bytes.get(cell.end - 1) == Some(&b'|') { cell.end - 1 } else { cell.end };
+        start..end
+    }
+
+    /// A table's alignment row: the line after its header, which ends at `header_end`, from
+    /// the first `|`, `-` or `:` on it to the last, before `table_end`.
+    fn rule(&self, header_end: usize, table_end: usize) -> Range<usize> {
+        let bytes = self.source.as_bytes();
+        let mut at = header_end;
+        while at < table_end && !matches!(bytes[at], b'\n' | b'\r') {
+            at += 1;
+        }
+        // Past the line ending, `\r\n` or a lone `\n` or `\r`.
+        if at < table_end && bytes[at] == b'\r' {
+            at += 1;
+        }
+        if at < table_end && bytes[at] == b'\n' {
+            at += 1;
+        }
+        let line_end = (at..table_end).find(|&i| matches!(bytes[i], b'\n' | b'\r')).unwrap_or(table_end);
+        let syntax = |i: &usize| matches!(bytes[*i], b'|' | b'-' | b':');
+        match ((at..line_end).find(syntax), (at..line_end).rev().find(syntax)) {
+            (Some(first), Some(last)) => first..last + 1,
+            _ => line_end..line_end,
         }
     }
 

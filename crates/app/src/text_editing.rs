@@ -28,8 +28,38 @@ pub const COULD_NOT_TYPE: &str = "That couldn't be typed here, so nothing was ch
 pub enum FlowKey {
     /// The `nth` run of text in the layout's region `name`.
     Region { name: String, nth: usize },
-    /// The `nth` box of text on the slide.
-    Box { nth: usize },
+    /// The box of text whose tag starts at byte `start` of the talk, which may have no text yet:
+    /// a shape typed on, or a text box just put on the slide. Typing in it changes only what's
+    /// inside the tag, so its start stays where it is; any other change to the talk moves it as
+    /// it moves the thing selected. A box is never named by counting the slide's boxes, as which
+    /// tags are boxes of text changes as the talk's components load.
+    Tag { start: usize },
+    /// A text box that isn't in the talk yet, its top-left corner at (`x`, `y`) of the slide,
+    /// in slide units. The first thing typed in it writes it; till then nothing of it is written.
+    /// `align` is the alignment chosen for it meanwhile, as the box will be written with it:
+    /// `center` or `right`, or nothing for the left.
+    NewBox { x: u32, y: u32, align: Option<&'static str> },
+    /// The cell at `row` and `column` of the `table`th table on the slide whose cells are
+    /// typed in. Typing in a cell changes only that cell's bytes, so its table stays the same
+    /// one of those.
+    Cell { table: usize, row: usize, column: usize },
+}
+
+/// Which of the slide's tables whose cells are typed in each of `flows` is a cell of, if any:
+/// they're counted in the order their cells come.
+fn tables_of(flows: &[TextFlow]) -> impl Iterator<Item = Option<usize>> + '_ {
+    let mut last: Option<&std::ops::Range<usize>> = None;
+    let mut count = 0;
+    flows.iter().map(move |flow| match &flow.place {
+        FlowPlace::Cell { table, .. } => {
+            if last != Some(table) {
+                count += usize::from(last.is_some());
+                last = Some(table);
+            }
+            Some(count)
+        }
+        _ => None,
+    })
 }
 
 impl FlowKey {
@@ -45,29 +75,38 @@ impl FlowKey {
                     .filter(|other| other.place == flow.place)
                     .count(),
             },
-            FlowPlace::Tag(_) => FlowKey::Box {
-                nth: before
-                    .iter()
-                    .filter(|other| matches!(other.place, FlowPlace::Tag(_)))
-                    .count(),
-            },
+            FlowPlace::Tag(range) => FlowKey::Tag { start: range.start },
+            FlowPlace::Cell { row, column, .. } => {
+                FlowKey::Cell { table: tables_of(flows).nth(index).flatten()?, row: *row, column: *column }
+            }
         })
     }
 
     /// Which of `flows` this is, if the slide has it.
     pub fn find(&self, flows: &[TextFlow]) -> Option<usize> {
+        if let FlowKey::Cell { table, row, column } = self {
+            return tables_of(flows).zip(flows).position(|(nth, flow)| {
+                nth == Some(*table) && matches!(flow.place, FlowPlace::Cell { row: r, column: c, .. } if (r, c) == (*row, *column))
+            });
+        }
         let mut seen = 0;
         for (index, flow) in flows.iter().enumerate() {
             let same_kind = match (self, &flow.place) {
                 (FlowKey::Region { name, .. }, FlowPlace::Region(region)) => name == region,
-                (FlowKey::Box { .. }, FlowPlace::Tag(_)) => true,
+                (FlowKey::Tag { start }, FlowPlace::Tag(range)) => {
+                    if range.start == *start {
+                        return Some(index);
+                    }
+                    continue;
+                }
                 _ => false,
             };
             if !same_kind {
                 continue;
             }
             let nth = match self {
-                FlowKey::Region { nth, .. } | FlowKey::Box { nth } => *nth,
+                FlowKey::Region { nth, .. } => *nth,
+                FlowKey::Tag { .. } | FlowKey::NewBox { .. } | FlowKey::Cell { .. } => continue,
             };
             if seen == nth {
                 return Some(index);
@@ -81,8 +120,48 @@ impl FlowKey {
     pub fn region(&self) -> Option<&str> {
         match self {
             FlowKey::Region { name, .. } => Some(name),
-            FlowKey::Box { .. } => None,
+            FlowKey::Tag { .. } | FlowKey::NewBox { .. } | FlowKey::Cell { .. } => None,
         }
+    }
+
+    /// Where the tag this is the box of starts, if it's named by its tag.
+    pub fn tag_start(&self) -> Option<usize> {
+        match self {
+            FlowKey::Tag { start } => Some(*start),
+            _ => None,
+        }
+    }
+
+    /// This key once `change` is made to the talk: a box's tag moved as the thing selected is,
+    /// or `None` if the change took its start away. Other keys name what doesn't move.
+    pub fn moved(&self, change: &slides_format::Change) -> Option<FlowKey> {
+        match self {
+            FlowKey::Tag { start } => {
+                crate::selection::moved(&(*start..*start + 1), change).map(|range| FlowKey::Tag { start: range.start })
+            }
+            other => Some(other.clone()),
+        }
+    }
+
+    /// The alignment chosen for the text box not yet written, if this is one: `None` for the left.
+    pub fn new_box_align(&self) -> Option<&'static str> {
+        match self {
+            FlowKey::NewBox { align, .. } => *align,
+            _ => None,
+        }
+    }
+
+    /// Where the text box not yet written is, if this is one: its top-left corner.
+    pub fn new_box(&self) -> Option<(u32, u32)> {
+        match self {
+            FlowKey::NewBox { x, y, .. } => Some((*x, *y)),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a cell of a table.
+    pub fn is_cell(&self) -> bool {
+        matches!(self, FlowKey::Cell { .. })
     }
 }
 
@@ -95,6 +174,9 @@ pub struct TextMark {
     pub flow: FlowKey,
     pub before: Selection,
     pub after: Option<Selection>,
+    /// Where `after` is, if that's another flow than `flow`: a step that changed a table puts the
+    /// caret in another of its cells.
+    pub flow_after: Option<FlowKey>,
     /// The time of typing the step was made in, from a click on the text until it ended.
     pub(crate) session: u64,
 }
@@ -375,10 +457,42 @@ impl EditingText {
         }
     }
 
+    /// Text started in the box whose tag starts at byte `start` of slide `slide`, a shape or a
+    /// box with nothing in it yet: one empty paragraph, not written until something is typed.
+    pub fn in_empty_tag(slide: usize, start: usize) -> EditingText {
+        EditingText {
+            slide,
+            flow: FlowKey::Tag { start },
+            edit: TextEdit::new(vec![Para {
+                kind: ParaKind::Body,
+                spans: Vec::new(),
+            }]),
+            run: None,
+            session: 0,
+            composing: None,
+        }
+    }
+
+    /// Text started in a text box on slide `slide`, its top-left corner at (`x`, `y`), that isn't
+    /// written yet: one empty paragraph.
+    pub fn in_new_box(slide: usize, x: u32, y: u32) -> EditingText {
+        EditingText { flow: FlowKey::NewBox { x, y, align: None }, ..EditingText::in_empty_tag(slide, 0) }
+    }
+
     /// Whether this is the slide's title, where a paragraph can't be ended.
     pub fn is_title(&self) -> bool {
         self.flow.region() == Some("title")
     }
+
+    /// Whether this is a cell of a table, which holds one line of text.
+    pub fn is_cell(&self) -> bool {
+        self.flow.is_cell()
+    }
+}
+
+/// `text` as one line, for a cell of a table: each new line in it a space.
+pub fn one_line(text: &str) -> String {
+    text.replace("\r\n", " ").replace(['\n', '\r', '\u{2028}', '\u{2029}'], " ")
 }
 
 /// What an operation on the text did.

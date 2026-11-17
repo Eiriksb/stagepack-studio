@@ -1079,3 +1079,176 @@ fn the_recovery_bar_sits_under_the_ribbon_and_leaves_the_slide_its_size(cx: &mut
         "the slide keeps its size"
     );
 }
+
+// Files added to the talk.
+
+fn red_png() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    image::RgbaImage::from_pixel(64, 64, image::Rgba([255, 0, 0, 255]))
+        .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+        .unwrap();
+    bytes
+}
+
+/// Whether the current slide draws with nothing to say and something red on it.
+fn draws_red(doc: &mut Document) -> bool {
+    let index = doc.current();
+    let notices = doc.notices();
+    assert!(notices.is_empty(), "{notices:?}");
+    let thumbnail = doc.thumbnail(index, 480).expect("the slide draws");
+    thumbnail.data().chunks(4).any(|pixel| pixel[0] > 200 && pixel[1] < 40 && pixel[2] < 40)
+}
+
+#[test]
+fn letting_go_removes_kept_files() {
+    let setup = Setup::new(ONE);
+    let base = std::fs::read_to_string(setup.file()).unwrap();
+    let files = vec![("assets/photo.png".to_string(), std::sync::Arc::<[u8]>::from(red_png()))];
+    setup
+        .recovery()
+        .keep_with_files(&setup.place(), &hash_text(&base), EDITED, &files)
+        .unwrap();
+    let kept = setup.kept_folder();
+    assert_eq!(std::fs::read(kept.join("files/assets/photo.png")).unwrap(), red_png());
+    let found = setup.recovery().find(&setup.place()).unwrap();
+    assert_eq!(found.files, files);
+
+    setup.recovery().clear(&setup.place());
+    assert!(!kept.exists());
+    assert!(setup.recovery().find(&setup.place()).is_none());
+    assert_eq!(std::fs::read_dir(&setup.root).unwrap().count(), 0);
+
+    // And a copy let go from another window takes its files too.
+    setup
+        .recovery()
+        .keep_with_files(&setup.place(), &hash_text(&base), EDITED, &files)
+        .unwrap();
+    let found = setup.recovery().find(&setup.place()).unwrap();
+    Recovery::new(setup.root.clone()).discard(&found);
+    assert_eq!(std::fs::read_dir(&setup.root).unwrap().count(), 0);
+}
+
+#[test]
+fn only_plain_kept_files_are_brought_back() {
+    let setup = Setup::new(ONE);
+    let base = std::fs::read_to_string(setup.file()).unwrap();
+    let odd = vec![("../outside.png".to_string(), std::sync::Arc::<[u8]>::from(red_png()))];
+    assert!(setup.recovery().keep_with_files(&setup.place(), &hash_text(&base), EDITED, &odd).is_err());
+    let plain = vec![("assets/photo.png".to_string(), std::sync::Arc::<[u8]>::from(red_png()))];
+    setup
+        .recovery()
+        .keep_with_files(&setup.place(), &hash_text(&base), EDITED, &plain)
+        .unwrap();
+    let kept = setup.kept_folder();
+    std::fs::write(kept.join("files/assets/Not Plain.png"), "x").unwrap();
+    std::fs::write(kept.join("files/notes.txt"), "x").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(setup.file(), kept.join("files/assets/link.png")).unwrap();
+    assert_eq!(setup.recovery().find(&setup.place()).unwrap().files, plain);
+}
+
+#[gpui_kit::test]
+fn a_crash_keeps_an_added_file(cx: &mut TestAppContext) {
+    let setup = Setup::new(ONE);
+    let (handle, view) = open_view(cx, &setup);
+    let talk = document(cx, &view);
+    cx.update(|cx| {
+        talk.update(cx, |document, cx| {
+            let path = document
+                .add_file(stagepack_studio::added_files::FileKind::Picture, "photo", red_png())
+                .unwrap();
+            let end = document.source().len();
+            let change = slides_format::Change::single(slides_format::SourceEdit {
+                range: end..end,
+                text: format!("\n![]({path})\n"),
+            });
+            document.edit("Insert picture", change, 0).unwrap();
+            cx.notify();
+        });
+    });
+    wait(cx, 1_000);
+    let edited = source_of(cx, &view);
+    drop(talk);
+    drop(view);
+    crash(cx, handle);
+    assert!(!setup.folder.join("assets").exists(), "nothing on disk until Save");
+
+    let (handle, view) = open_view(cx, &setup);
+    click(cx, handle, RECOVER_ID);
+
+    assert_eq!(source_of(cx, &view), edited);
+    let talk = document(cx, &view);
+    cx.update(|cx| {
+        talk.update(cx, |document, _| {
+            assert!(document.has_file("assets/photo.png"));
+            assert!(draws_red(document));
+            assert_eq!(document.added_files().len(), 1, "a save writes it");
+        })
+    });
+}
+
+#[test]
+fn a_kept_file_is_judged_by_its_bytes() {
+    let setup = Setup::new(ONE);
+    let base = hash_text(&std::fs::read_to_string(setup.file()).unwrap());
+    let first = vec![("assets/a.png".to_string(), std::sync::Arc::<[u8]>::from(&b"first"[..]))];
+    setup.recovery().keep_with_files(&setup.place(), &base, EDITED, &first).unwrap();
+    let other = vec![("assets/a.png".to_string(), std::sync::Arc::<[u8]>::from(&b"other"[..]))];
+    setup.recovery().keep_with_files(&setup.place(), &base, EDITED, &other).unwrap();
+    assert_eq!(std::fs::read(setup.kept_folder().join("files/assets/a.png")).unwrap(), b"other");
+}
+
+/// Adds the picture `suggested` to the talk in `view`, red, without using it, and returns its path.
+fn add_red(cx: &mut TestAppContext, view: &Entity<WorkspaceView>, suggested: &str) -> String {
+    let talk = document(cx, view);
+    cx.update(|cx| {
+        talk.update(cx, |document, cx| {
+            let path = document
+                .add_file(stagepack_studio::added_files::FileKind::Picture, suggested, red_png())
+                .unwrap();
+            cx.notify();
+            path
+        })
+    })
+}
+
+#[gpui_kit::test]
+fn an_added_file_is_kept_at_once(cx: &mut TestAppContext) {
+    let setup = Setup::new(ONE);
+    let (_handle, view) = open_view(cx, &setup);
+    let path = add_red(cx, &view, "photo");
+    // No time passes: it's written as it's added, though nothing uses it yet.
+    cx.run_until_parked();
+    assert_eq!(std::fs::read(setup.kept_folder().join("files").join(&path)).unwrap(), red_png());
+    assert!(setup.recovery().find(&setup.place()).is_none(), "no changes to offer back");
+}
+
+#[gpui_kit::test]
+fn a_crash_keeps_an_added_file_the_text_named_already(cx: &mut TestAppContext) {
+    let named = "---\ntitle: T\n---\n\n# One\n\n![](assets/late.png)\n";
+    let setup = Setup::new(named);
+    let (handle, view) = open_view(cx, &setup);
+    assert_eq!(add_red(cx, &view, "late"), "assets/late.png");
+    cx.run_until_parked();
+    let talk = document(cx, &view);
+    let unsaved = cx.read(|cx| talk.read(cx).has_unsaved_changes());
+    assert!(unsaved, "a save would write it");
+    let shown = title(cx, handle);
+    assert!(shown.starts_with('•'), "{shown}");
+    drop(talk);
+    wait(cx, 1_000);
+    drop(view);
+    crash(cx, handle);
+
+    let (handle, view) = open_view(cx, &setup);
+    assert_eq!(bar(cx, handle).as_deref(), Some(RECOVERY_OFFER));
+    click(cx, handle, RECOVER_ID);
+    assert_eq!(source_of(cx, &view), named);
+    let talk = document(cx, &view);
+    cx.update(|cx| {
+        talk.update(cx, |document, _| {
+            assert!(draws_red(document));
+            assert!(document.has_unsaved_changes());
+        })
+    });
+}

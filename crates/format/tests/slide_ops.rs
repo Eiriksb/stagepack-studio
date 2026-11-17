@@ -628,7 +628,12 @@ fn without_ranges(blocks: &[Block]) -> Vec<Block> {
                 range: 0..0,
                 item_ranges: vec![0..0; item_ranges.len()],
             },
-            Block::Table { rows, .. } => Block::Table { rows, range: 0..0 },
+            Block::Table { rows, cells, .. } => Block::Table {
+                rows,
+                cells: cells.iter().map(|row| row.iter().map(|cell| CellSource { range: 0..0, inline: 0..0, ..cell.clone() }).collect()).collect(),
+                rule: 0..0,
+                range: 0..0,
+            },
             Block::Code { language, code, .. } => Block::Code { language, code, range: 0..0 },
             Block::Picture { src, alt, .. } => Block::Picture { src, alt, range: 0..0 },
             Block::Region { name, .. } => Block::Region { name, range: 0..0 },

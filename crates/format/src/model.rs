@@ -86,7 +86,10 @@ pub enum Block {
     Paragraph { spans: Vec<Span>, range: Range<usize>, inline: Range<usize>, only_text: bool },
     /// `item_ranges` holds each item's bytes, its marker included, beside `items`.
     List { ordered: bool, items: Vec<Vec<Block>>, range: Range<usize>, item_ranges: Vec<Range<usize>> },
-    Table { rows: Vec<Vec<Vec<Span>>>, range: Range<usize> },
+    /// `rows[0]` is the header. `cells` holds where each cell of `rows` is, beside it, and
+    /// `rule` is the alignment row under the header, from its first `|`, `-` or `:` to its last.
+    /// A row has the cells written in it, more or fewer than the header has.
+    Table { rows: Vec<Vec<Vec<Span>>>, cells: Vec<Vec<CellSource>>, rule: Range<usize>, range: Range<usize> },
     Code { language: Option<String>, code: String, range: Range<usize> },
     Picture { src: String, alt: String, range: Range<usize> },
     Tag(Tag),
@@ -106,6 +109,19 @@ impl Block {
             Block::Tag(tag) => &tag.range,
         }
     }
+}
+
+/// Where one cell of a table is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CellSource {
+    /// The cell's bytes: from the `|` before it, if it has one, to the next `|`, and, for the
+    /// row's last cell, through the `|` after it.
+    pub range: Range<usize>,
+    /// The cell's content, without the spaces around it. For a cell of nothing but white space
+    /// it's all of that white space, between its `|`s: where text typed in it goes.
+    pub inline: Range<usize>,
+    /// Whether the content is text alone, as [`Block::Paragraph`]'s `only_text` says.
+    pub only_text: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]

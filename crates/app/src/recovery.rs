@@ -4,7 +4,8 @@
 //! files are the user's alone.
 //!
 //! Each talk has a folder named for the hash of its path, and each window that keeps a copy of
-//! it has a slot of its own in there: `<root>/<key>/<slot>/slides.md` and `about.json`.
+//! it has a slot of its own in there: `<root>/<key>/<slot>/slides.md` and `about.json`, and the
+//! files added to the talk that the text uses, at `files/<path>`.
 
 use std::collections::BTreeSet;
 use std::io::{self, Read as _, Write as _};
@@ -14,14 +15,22 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use slides_components::BuildEntry;
 use slides_engine::{open_packed, read_talk_text, write_atomically};
 
+use crate::added_files::{FileKind, MAX_ADDED_BYTES, is_added_path};
 use crate::document::{SLIDES_FILE, TalkPlace};
 use crate::permissions::BuildPermissions;
 
 /// The working copies' folder in the app's data folder.
 const FOLDER: &str = "recovery";
 const ABOUT_FILE: &str = "about.json";
+/// The folder in a slot that holds the files added to the talk.
+const FILES_FOLDER: &str = "files";
+/// The file in a slot that holds the builds entered in the talk's index with those files.
+const BUILDS_FILE: &str = "builds.json";
+/// The largest file of builds entered that is read.
+const MAX_BUILDS_BYTES: u64 = 256 * 1024;
 /// How many hex characters name a talk's folder (from the hash of its path) and a slot.
 const KEY_LENGTH: usize = 16;
 /// The largest working copy that is read back.
@@ -47,6 +56,11 @@ struct About {
 #[derive(Debug)]
 pub struct Found {
     pub text: String,
+    /// The files added to the talk that were kept with the text, by their path in the talk.
+    pub files: Vec<(String, Arc<[u8]>)>,
+    /// The builds entered in the talk's index with those files, as a paste entered them. They
+    /// were written by the app, but are read back as untrusted as anything else here.
+    pub builds: Vec<BuildEntry>,
     /// Whether the talk's file still holds the text the edits started from.
     pub base_matches: bool,
     pub when: SystemTime,
@@ -131,13 +145,84 @@ impl Recovery {
     /// Keeps `text` as this slot's working copy of the talk at `place`, whose edits started
     /// from the text with the SHA-256 `base_hash`. Each file is written whole or not at all.
     pub fn keep(&self, place: &TalkPlace, base_hash: &str, text: &str) -> io::Result<()> {
+        self.keep_with_files(place, base_hash, text, &[])
+    }
+
+    /// Keeps `text` as [`Self::keep`] does, with `files`, files added to the talk that the text
+    /// uses, by their path in the talk. They're written first, and one kept already stays as
+    /// it is: a file added to a talk never changes.
+    pub fn keep_with_files(
+        &self,
+        place: &TalkPlace,
+        base_hash: &str,
+        text: &str,
+        files: &[(String, Arc<[u8]>)],
+    ) -> io::Result<()> {
+        self.keep_with_builds(place, base_hash, text, files, &[])
+    }
+
+    /// Keeps `text` and `files` as [`Self::keep_with_files`] does, with `builds`, the builds
+    /// entered in the talk's index with those files, which are written before the text too.
+    pub fn keep_with_builds(
+        &self,
+        place: &TalkPlace,
+        base_hash: &str,
+        text: &str,
+        files: &[(String, Arc<[u8]>)],
+        builds: &[BuildEntry],
+    ) -> io::Result<()> {
+        if let Some((odd, _)) = files.iter().find(|(path, _)| !is_added_path(path)) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{odd:?} isn't a file added to a talk")));
+        }
         if text.len() as u64 > MAX_TEXT_BYTES {
             return Err(io::Error::other(
                 "the talk is too large to keep a working copy of",
             ));
         }
         let talk = canonical(place);
-        let key_folder = self.root.join(key(&talk));
+        let folder = self.slot_folder(&talk)?;
+        let about = About {
+            talk,
+            base_sha256: base_hash.to_string(),
+            kept_at: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs()),
+        };
+        let about = serde_json::to_vec_pretty(&about).map_err(io::Error::other)?;
+        for (path, bytes) in files {
+            keep_file(&folder, path, bytes)?;
+        }
+        let builds_file = folder.join(BUILDS_FILE);
+        if builds.is_empty() {
+            match std::fs::remove_file(&builds_file) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+                _ => {}
+            }
+        } else {
+            write_private(&builds_file, &serde_json::to_vec(builds).map_err(io::Error::other)?)?;
+        }
+        // The text first and what it's about last: stopped between the two, the new text has
+        // the base it had before, which can only make the talk look changed since when it
+        // isn't. The other way round, older text would be taken as made from the file as it is.
+        write_private(&folder.join(SLIDES_FILE), text.as_bytes())?;
+        write_private(&folder.join(ABOUT_FILE), &about)
+    }
+
+    /// Keeps `bytes`, the file added to the talk at `place` whose path in it is `path`, in this
+    /// slot, as it's added. It's found with the next text kept, which brings it back; a slot that
+    /// holds no text yet offers nothing.
+    pub fn keep_file(&self, place: &TalkPlace, path: &str, bytes: &[u8]) -> io::Result<()> {
+        if !is_added_path(path) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{path:?} isn't a file added to a talk")));
+        }
+        let folder = self.slot_folder(&canonical(place))?;
+        keep_file(&folder, path, bytes)
+    }
+
+    /// This slot's folder for the talk at the canonical path `talk`, made if it isn't there, and
+    /// never through a link.
+    fn slot_folder(&self, talk: &Path) -> io::Result<PathBuf> {
+        let key_folder = self.root.join(key(talk));
         let folder = key_folder.join(&self.slot);
         refuse_link(&key_folder)?;
         refuse_link(&folder)?;
@@ -148,19 +233,7 @@ impl Recovery {
         make_private(&self.root)?;
         make_private(&key_folder)?;
         make_private(&folder)?;
-        let about = About {
-            talk,
-            base_sha256: base_hash.to_string(),
-            kept_at: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map_or(0, |since| since.as_secs()),
-        };
-        let about = serde_json::to_vec_pretty(&about).map_err(io::Error::other)?;
-        // The text first and what it's about last: stopped between the two, the new text has
-        // the base it had before, which can only make the talk look changed since when it
-        // isn't. The other way round, older text would be taken as made from the file as it is.
-        write_private(&folder.join(SLIDES_FILE), text.as_bytes())?;
-        write_private(&folder.join(ABOUT_FILE), &about)
+        Ok(folder)
     }
 
     /// Removes this slot's working copy of the talk at `place`, if there is one.
@@ -212,6 +285,8 @@ impl Recovery {
         let base_matches = on_disk(place).is_some_and(|disk| hash_text(&disk) == base);
         Some(Found {
             text,
+            files: kept_files(&slot),
+            builds: kept_builds(&slot),
             base_matches,
             when,
             slot,
@@ -246,6 +321,67 @@ impl Recovery {
             }
         }
     }
+}
+
+/// Keeps `bytes`, the file added to the talk at `path`, in the working copy's `slot`.
+fn keep_file(slot: &Path, path: &str, bytes: &[u8]) -> io::Result<()> {
+    let files = slot.join(FILES_FOLDER);
+    let (folder, _) = path.split_once('/').expect("an added file's path is in a folder");
+    let folder = files.join(folder);
+    for made in [&files, &folder] {
+        refuse_link(made)?;
+        create_private(made)?;
+        refuse_link(made)?;
+        make_private(made)?;
+    }
+    let file = slot.join(FILES_FOLDER).join(path);
+    if read_small(&file, MAX_ADDED_BYTES as u64).is_some_and(|kept| kept == bytes) {
+        return Ok(());
+    }
+    write_private(&file, bytes)
+}
+
+/// The files added to the talk kept in the working copy's `slot`: plain files only, with names a
+/// file added to a talk can have, each no bigger than one can be.
+fn kept_files(slot: &Path) -> Vec<(String, Arc<[u8]>)> {
+    let files = slot.join(FILES_FOLDER);
+    if refuse_link(&files).is_err() {
+        return Vec::new();
+    }
+    let folders: BTreeSet<&str> =
+        [FileKind::Picture, FileKind::Data, FileKind::ComponentSource, FileKind::ComponentBuild].map(FileKind::folder).into();
+    let mut kept = Vec::new();
+    for folder in folders {
+        let folder_path = files.join(folder);
+        if refuse_link(&folder_path).is_err() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(folder_path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(|name| format!("{folder}/{name}")) else {
+                continue;
+            };
+            if !is_added_path(&name) {
+                continue;
+            }
+            // `read_small` reads only a plain file, and not through a link.
+            if let Some(bytes) = read_small(&entry.path(), MAX_ADDED_BYTES as u64) {
+                kept.push((name, Arc::from(bytes)));
+            }
+        }
+    }
+    kept.sort();
+    kept
+}
+
+/// The builds entered kept in the working copy's `slot`, or none if there are none that can be
+/// read.
+fn kept_builds(slot: &Path) -> Vec<BuildEntry> {
+    read_small(&slot.join(BUILDS_FILE), MAX_BUILDS_BYTES)
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
 }
 
 /// The working copies' folders in the talk's folder `key_folder`.

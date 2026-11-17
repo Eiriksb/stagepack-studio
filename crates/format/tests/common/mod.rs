@@ -126,25 +126,59 @@ impl GenTalk {
     }
 }
 
-pub fn block() -> impl Strategy<Value = String> {
-    prop::sample::select(vec![
-        "## A heading".to_string(),
-        "Some *text* with trailing spaces  ".to_string(),
-        "A paragraph\nover two lines.".to_string(),
-        "- one\n- two".to_string(),
-        "1. first\n2. second".to_string(),
-        // Lists as people indent them by hand: four spaces or a tab in, one space in, and
-        // straight under a paragraph's line.
-        "- a\n    - deep\n- b".to_string(),
-        "- a\n\t- deep\n- b".to_string(),
-        "1. a\n    - nested\n    1. one\n2. b".to_string(),
-        " - a\n - b".to_string(),
-        "Intro:\n- a\n- b".to_string(),
-        "```\n---\ncode\n```".to_string(),
-        "~~~md\n---\n~~~".to_string(),
-        "> A quote".to_string(),
-    ])
+/// How many cases a property tries: `PROPTEST_CASES` if it's set, or `default`.
+pub fn cases(default: u32) -> u32 {
+    std::env::var("PROPTEST_CASES").ok().and_then(|cases| cases.parse().ok()).unwrap_or(default)
 }
+
+pub fn block() -> impl Strategy<Value = String> {
+    prop::sample::select(
+        vec![
+            "## A heading".to_string(),
+            "Some *text* with trailing spaces  ".to_string(),
+            "A paragraph\nover two lines.".to_string(),
+            "- one\n- two".to_string(),
+            "1. first\n2. second".to_string(),
+            // Lists as people indent them by hand: four spaces or a tab in, one space in, and
+            // straight under a paragraph's line.
+            "- a\n    - deep\n- b".to_string(),
+            "- a\n\t- deep\n- b".to_string(),
+            "1. a\n    - nested\n    1. one\n2. b".to_string(),
+            " - a\n - b".to_string(),
+            "Intro:\n- a\n- b".to_string(),
+            "- a\n    - b\n        - c\n- d".to_string(),
+            "- a\n    - b\n    - x\n- d".to_string(),
+            "- a\n\t- b\n\t- x\n- d".to_string(),
+            "- &nbsp;\n  - under\n- c".to_string(),
+            "```\n---\ncode\n```".to_string(),
+            "~~~md\n---\n~~~".to_string(),
+            "> A quote".to_string(),
+            // Tables as people write them by hand.
+            "a | b\n--|:-:\nc | `x\\|y`".to_string(),
+            "| **b** | <Text color=\"red\">r</Text> |\n| :-- | --: |\n| \\| | |\n| short |".to_string(),
+            "Intro:\n| a |\n| - |\n| <Icon name=\"x\" /> |".to_string(),
+        ]
+        .into_iter()
+        .chain(TAG_BLOCKS.iter().map(|block| block.to_string()))
+        .collect::<Vec<_>>(),
+    )
+}
+
+/// Tags and other blocks that aren't text, as people write them by hand.
+pub const TAG_BLOCKS: [&str; 12] = [
+    "<Icon name=\"star\" />",
+    "<Box x=\"10\" y=\"20\" w=\"30\">\n\nIn a *box*\n\n</Box>",
+    "<Shape\n  kind=\"circle\"\n  color=\"red\"\n/>",
+    "<Icon name='a \"quoted\" star' size=\"2\" />",
+    "<Icon name=\"first\" flag name=\"second\" />",
+    "<Icon name=\"one\" />\n<Icon name=\"two\" />",
+    "- an item\n\n  <Icon name=\"in-a-list\" />",
+    "<Box>\n\n<Icon name=\"in-a-box\" />\n\n</Box>",
+    "![A cat](cat.png)",
+    "| a | b |\n| --- | --- |\n| 1 | 2 |",
+    "<Chart\tdata=\"x.csv\"   tall >\n\nSome words\n\n</Chart>",
+    "<Region name=\"right\" />",
+];
 
 pub fn slide_settings() -> impl Strategy<Value = Vec<(String, String)>> {
     prop::sample::subsequence(vec![("layout", "section  "), ("hidden", "true"), ("transition", "fade")], 0..=3)
@@ -276,4 +310,147 @@ pub fn typed_notes() -> impl Strategy<Value = String> {
         0..24,
     )
     .prop_map(|parts| parts.concat())
+}
+
+/// A table as someone might write it by hand, with what can be in it.
+#[derive(Clone, Debug)]
+pub struct GenTable {
+    /// What's in each cell, row by row, the header first, with the spaces around it.
+    pub rows: Vec<Vec<String>>,
+    /// Each alignment cell.
+    pub rule: Vec<String>,
+    /// Whether each row, the alignment row last, starts and ends with `|`.
+    pub edges: Vec<(bool, bool)>,
+    /// What starts each line: nothing, or the indent of a list item the table is in.
+    pub in_a_list: bool,
+    /// A paragraph's line straight before the table.
+    pub after_a_paragraph: bool,
+}
+
+/// What marks the generated table: its first header cell holds it.
+pub const TABLE_MARK: &str = "Tq";
+
+impl GenTable {
+    pub fn text(&self) -> String {
+        let indent = if self.in_a_list { "  " } else { "" };
+        let mut lines = Vec::new();
+        if self.in_a_list {
+            lines.push("- item".to_string());
+            lines.push(String::new());
+        }
+        if self.after_a_paragraph {
+            lines.push(format!("{indent}Before the table"));
+        }
+        let line = |cells: &[String], (lead, trail): (bool, bool)| {
+            format!("{indent}{}{}{}", if lead { "|" } else { "" }, cells.join("|"), if trail { "|" } else { "" })
+        };
+        let rule_edges = *self.edges.last().unwrap();
+        for (r, cells) in self.rows.iter().enumerate() {
+            lines.push(line(cells, self.edges[r]));
+            if r == 0 {
+                lines.push(line(&self.rule, rule_edges));
+            }
+        }
+        lines.join("\n")
+    }
+
+    /// The table with every row given the header's cells, and `|` at both ends.
+    pub fn regular(mut self) -> GenTable {
+        let columns = self.rows[0].len();
+        for row in &mut self.rows {
+            row.resize(columns, " ".to_string());
+        }
+        self.edges.fill((true, true));
+        self
+    }
+}
+
+/// What a generated cell can hold.
+pub fn cell_content() -> impl Strategy<Value = String> {
+    prop::sample::select(vec![
+        "a", "two words", "**bold**", "*it*", "<Text color=\"red\">red</Text>", "<Text bold>b</Text> c", "\\|", "x \\| y", "`c\\|d`",
+        "`code`", "", "", "é 🎉", "1. x", "# h", "- l", "a\\\\", "<Icon name=\"star\" />", "[l](http://x)", "[l](a\\|b) x", "<Text color=\"a\\|b\">c</Text>", "&amp;", "{x}",
+    ])
+    .prop_map(str::to_string)
+}
+
+pub fn gen_table() -> impl Strategy<Value = GenTable> {
+    (1..=4usize, 1..=4usize).prop_flat_map(|(columns, body)| {
+        let row = move || {
+            (prop::collection::vec((cell_content(), 0..3usize, 0..3usize), columns..=columns), prop_oneof![4 => Just(0i32), 1 => Just(-1), 1 => Just(1)])
+        };
+        (
+            prop::collection::vec(row(), body + 1),
+            prop::collection::vec(prop::sample::select(vec!["---", " --- ", ":--", " :-: ", "--:", "-", " - "]), columns..=columns),
+            prop::collection::vec((any::<bool>(), any::<bool>()), body + 2),
+            any::<bool>(),
+            any::<bool>(),
+            any::<bool>(),
+        )
+            .prop_map(move |(rows, rule, edges, in_a_list, after_a_paragraph, uneven)| {
+                let mut edges = edges;
+                // One cell needs a `|` to be a table's row at all.
+                for edge in &mut edges {
+                    if columns == 1 && !edge.0 && !edge.1 {
+                        edge.1 = true;
+                    }
+                }
+                let rows: Vec<Vec<String>> = rows
+                    .into_iter()
+                    .enumerate()
+                    .map(|(r, (cells, change))| {
+                        let (lead, trail) = edges[r];
+                        let last = cells.len() - 1;
+                        let mut cells: Vec<String> = cells
+                            .into_iter()
+                            .enumerate()
+                            .map(|(c, (content, before, after))| {
+                                let content = match content.as_str() {
+                                    _ if r == 0 && c == 0 => TABLE_MARK.to_string(),
+                                    // A cell at an edge with no `|` needs something in it.
+                                    "" if (c == 0 && !lead) || (c == last && !trail) => "e".to_string(),
+                                    _ => content,
+                                };
+                                format!("{}{content}{}", " ".repeat(before), " ".repeat(after))
+                            })
+                            .collect();
+                        if uneven && r > 0 {
+                            match change {
+                                -1 if cells.len() > 1 && (trail || lead) => {
+                                    cells.pop();
+                                    if !trail && cells.last().is_some_and(|cell| cell.trim().is_empty()) {
+                                        *cells.last_mut().unwrap() = "e".to_string();
+                                    }
+                                }
+                                1 => cells.push(" more ".to_string()),
+                                _ => {}
+                            }
+                        }
+                        cells
+                    })
+                    .collect();
+                GenTable { rows, rule: rule.into_iter().map(str::to_string).collect(), edges, in_a_list, after_a_paragraph }
+            })
+    })
+}
+
+/// A generated talk with a generated table on one of its slides, and which slide.
+pub fn talk_with_a_table() -> impl Strategy<Value = (String, usize, GenTable)> {
+    talk_with(gen_table().boxed())
+}
+
+/// The same, with a table whose rows all have the header's cells and `|` at both ends.
+pub fn talk_with_a_regular_table() -> impl Strategy<Value = (String, usize, GenTable)> {
+    talk_with(gen_table().prop_map(GenTable::regular).boxed())
+}
+
+fn talk_with(table: BoxedStrategy<GenTable>) -> impl Strategy<Value = (String, usize, GenTable)> {
+    (gen_talk(), any::<prop::sample::Index>(), table, any::<prop::sample::Index>()).prop_map(|(mut talk, slide, table, at)| {
+        let slide = slide.index(talk.slides.len());
+        let own = &mut talk.slides[slide];
+        own.key_values = false;
+        let at = at.index(own.blocks.len() + 1);
+        own.blocks.insert(at, table.text());
+        (talk.text(), slide, table)
+    })
 }

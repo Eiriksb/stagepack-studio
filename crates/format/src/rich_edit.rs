@@ -700,6 +700,19 @@ pub(crate) fn is_dropped(c: char) -> bool {
     c == BYTE_ORDER_MARK || is_bidi_control(c) || (c.is_control() && c != '\t' && c != '\n')
 }
 
+/// Whether `c` draws something: not white space, not a character that draws nothing (zero
+/// width spaces and joiners, the word joiner, a byte order mark, a soft hyphen, the object
+/// replacement character, a variation selector), and not one typing drops. A combining mark
+/// draws, even alone.
+pub fn is_visible_char(c: char) -> bool {
+    !(c.is_whitespace()
+        || is_dropped(c)
+        || matches!(
+            c,
+            '\u{200b}'..='\u{200d}' | '\u{2060}' | '\u{feff}' | '\u{ad}' | '\u{fffc}' | '\u{fe00}'..='\u{fe0f}' | '\u{e0100}'..='\u{e01ef}'
+        ))
+}
+
 /// Whether `c` is a bidirectional embedding, override or isolate: U+202A to U+202E, or U+2066
 /// to U+2069.
 pub fn is_bidi_control(c: char) -> bool {
