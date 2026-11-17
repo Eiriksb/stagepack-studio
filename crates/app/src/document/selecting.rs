@@ -253,8 +253,10 @@ impl Document {
             return Ok(Vec::new());
         };
         let before = self.selection.clone();
-        let change = built(self.talk(), |talk| each_in_turn(talk, &blocks, |talk, block| delete_block(talk, slide, block)))?
-            .ok_or(EditRefused::CouldNotBeRemoved)?;
+        let change = built(self.talk(), |talk| {
+            removed_at_once(talk, slide, &blocks).or_else(|| each_in_turn(talk, &blocks, |talk, block| delete_block(talk, slide, block)))
+        })?
+        .ok_or(EditRefused::CouldNotBeRemoved)?;
         let depth = self.history.depth();
         let changed = self.make(label, change, Holds::Slide(slide), slide, slide, None)?;
         if self.history.depth() > depth {
@@ -319,7 +321,27 @@ impl Document {
             })
             .collect();
         let followed = picked_on(talk, moved, slide_now);
+        let followed = self.without_lost_areas(followed);
         self.set_selection(followed);
+    }
+
+    /// `selection` without the areas its slide's layout no longer has, as once the slide is given
+    /// another layout: nothing, if that leaves nothing.
+    fn without_lost_areas(&mut self, selection: Option<selection::Selection>) -> Option<selection::Selection> {
+        let selection = selection?;
+        if !selection.things.iter().any(|thing| matches!(thing, Thing::Region(_))) {
+            return Some(selection);
+        }
+        let layout = self.text_layout(selection.slide);
+        let things: Vec<Thing> = selection
+            .things
+            .into_iter()
+            .filter(|thing| match thing {
+                Thing::Region(name) => layout.region(name).is_some(),
+                Thing::Block(_) => true,
+            })
+            .collect();
+        (!things.is_empty()).then_some(selection::Selection { slide: selection.slide, things })
     }
 
     /// Lets go of what's selected if text is being typed on its slide outside it: typing in the
@@ -360,18 +382,7 @@ impl Document {
             picked_on(talk, marked.things.into_iter().map(Some).collect(), slide)
         });
         // An area the slide's layout no longer has isn't selected.
-        let selection = selection.and_then(|selection| {
-            let layout = self.text_layout(selection.slide);
-            let things: Vec<Thing> = selection
-                .things
-                .into_iter()
-                .filter(|thing| match thing {
-                    Thing::Region(name) => layout.region(name).is_some(),
-                    Thing::Block(_) => true,
-                })
-                .collect();
-            (!things.is_empty()).then_some(selection::Selection { slide: selection.slide, things })
-        });
+        let selection = self.without_lost_areas(selection);
         if selection != self.selection {
             self.set_selection(selection);
             self.picks += 1;
@@ -416,16 +427,72 @@ pub(super) fn each_in_turn(talk: &Talk, ranges: &[Range<usize>], each: impl Fn(&
     if let [range] = ranges {
         return each(talk, range);
     }
-    let mut ranges: Vec<Range<usize>> = ranges.to_vec();
-    ranges.sort_by_key(|range| std::cmp::Reverse(range.start));
+    let mut left: Vec<Range<usize>> = ranges.to_vec();
+    left.sort_by_key(|range| std::cmp::Reverse(range.start));
     let mut now = talk.clone();
-    let mut left = ranges;
     while !left.is_empty() {
         let range = left.remove(0);
         let change = each(&now, &range)?;
-        left = left.iter().map(|other| selection::moved(other, &change)).collect::<Option<_>>()?;
-        let text = change.apply(&now.source);
-        now = reparse(&now, text);
+        made_in_turn(&mut now, &change, &mut left)?;
     }
     Some(one_edit(&talk.source, &now.source))
+}
+
+/// The one change that takes every one of `blocks`, each written at the top level of slide
+/// `slide` on lines of its own, away at once, each as [`delete_block`] takes it from the slide as
+/// it is, where those edits don't overlap and the slide then reads as exactly its
+/// other blocks: one reading of the
+/// talk, however many there are. Each is worked out on the slide's own text, read alone, as
+/// the slide it is. `None` otherwise, for them to be taken in turn.
+fn removed_at_once(talk: &Talk, slide: usize, blocks: &[Range<usize>]) -> Option<Change> {
+    let top = &talk.slides.get(slide)?.blocks;
+    // Each on lines of its own, so that taking one away never reaches into another's line.
+    let source = talk.source.as_bytes();
+    let own_lines =
+        |block: &Range<usize>| (block.start == 0 || source[block.start - 1] == b'\n') && source.get(block.end).is_none_or(|next| matches!(next, b'\n' | b'\r'));
+    if blocks.len() < 2 || !blocks.iter().all(|block| own_lines(block) && top.iter().any(|written| written.range() == block)) {
+        return None;
+    }
+    let (alone, at) = slide_alone(talk, slide)?;
+    let shifted = |range: &Range<usize>| range.start - at..range.end - at;
+    let mut edits: Vec<SourceEdit> = Vec::new();
+    for block in blocks {
+        let change = delete_block(&alone, 0, &shifted(block))?;
+        edits.extend(change.edits.into_iter().map(|edit| SourceEdit { range: edit.range.start + at..edit.range.end + at, text: edit.text }));
+    }
+    edits.sort_by_key(|edit| (edit.range.start, edit.range.end));
+    if edits.windows(2).any(|pair| pair[0].range.end > pair[1].range.start) {
+        return None;
+    }
+    let change = Change { edits };
+    let after = reparse(talk, change.apply(&talk.source));
+    let texts = |talk: &Talk, blocks: &mut dyn Iterator<Item = Range<usize>>| -> Option<Vec<String>> {
+        blocks.map(|range| talk.source.get(range).map(str::to_string)).collect()
+    };
+    let kept = texts(talk, &mut top.iter().map(|block| block.range().clone()).filter(|range| !blocks.contains(range)))?;
+    let left = texts(&after, &mut after.slides.get(slide)?.blocks.iter().map(|block| block.range().clone()))?;
+    (after.slides.len() == talk.slides.len() && kept == left).then_some(change)
+}
+
+/// Slide `slide` of `talk` read alone from its own text, and how far into the talk's text that
+/// starts, where it reads as the one slide with the same blocks, each that much earlier.
+fn slide_alone(talk: &Talk, slide: usize) -> Option<(Talk, usize)> {
+    let written = talk.slides.get(slide)?;
+    let at = written.range.start;
+    let alone = parse_talk(talk.source.get(written.range.clone())?);
+    let shifted = |range: &Range<usize>| range.start - at..range.end - at;
+    let same = alone.slides.len() == 1
+        && alone.slides[0].error.is_none()
+        && alone.slides[0].blocks.len() == written.blocks.len()
+        && alone.slides[0].blocks.iter().zip(&written.blocks).all(|(alone, written)| *alone.range() == shifted(written.range()));
+    same.then_some((alone, at))
+}
+
+/// Makes `change`, one of several made in turn, to `now`, which is read again, and moves each
+/// of `ranges` along with it. `None` if any of them goes, which leaves `ranges` as they were.
+pub(super) fn made_in_turn(now: &mut Talk, change: &Change, ranges: &mut Vec<Range<usize>>) -> Option<()> {
+    let text = change.apply(&now.source);
+    *now = reparse(now, text);
+    *ranges = ranges.iter().map(|range| selection::moved(range, change)).collect::<Option<_>>()?;
+    Some(())
 }

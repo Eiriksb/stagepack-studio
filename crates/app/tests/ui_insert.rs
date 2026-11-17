@@ -600,28 +600,90 @@ fn the_list_never_has_the_keyboard_while_a_thing_is_selected(cx: &mut TestAppCon
         typing.press(cx, "ctrl-v");
         holds_the_rule(&typing, cx, &format!("{how:?} then a paste"));
         assert_eq!(typing.source(cx).matches("<Shape").count(), 2, "{how:?}: the paste is on the slide");
-        // Two things selected, and an area.
+        // Two things selected, and brought back selected by Undo and Redo pressed in the list.
         let typing = open(cx, TALK);
         select_two_shapes(&typing, cx);
         to_the_list(&typing, cx, how);
         holds_the_rule(&typing, cx, &format!("{how:?} after two things"));
         assert!(bounds_of(&typing, cx, selection_outline_id(0)).is_none(), "{how:?}: no outline");
+        let two = typing.source(cx);
+        // Taken away, and brought back by Undo in the list.
+        select_two_shapes_again(&typing, cx);
+        typing.press(cx, "delete");
+        assert_eq!(typing.source(cx), TALK, "{how:?}: both taken");
+        to_the_list(&typing, cx, how);
         typing.press(cx, "ctrl-z");
-        holds_the_rule(&typing, cx, &format!("{how:?} then Undo of two"));
+        assert_eq!(typing.source(cx), two, "{how:?}: both back");
+        brought_back_on_the_slide(&typing, cx, &format!("{how:?} then Undo of two"), 2);
+        to_the_list(&typing, cx, how);
+        typing.press(cx, "ctrl-shift-z");
+        assert_eq!(typing.source(cx), TALK, "{how:?}: Redo takes them again");
+        holds_the_rule(&typing, cx, &format!("{how:?} then Redo of two"));
+        to_the_list(&typing, cx, how);
+        typing.press(cx, "ctrl-z");
+        brought_back_on_the_slide(&typing, cx, &format!("{how:?} then Undo again"), 2);
+        let slides = typing.slide_count(cx);
+        typing.press(cx, "delete");
+        assert_eq!(typing.slide_count(cx), slides, "{how:?}: Delete takes the things, and the slide stays");
+        assert_eq!(typing.source(cx), TALK, "{how:?}");
+        // An area, and brought back selected by an Undo of its place pressed in the list.
         let typing = open(cx, TALK);
         select_main_text(&typing, cx);
         to_the_list(&typing, cx, how);
         holds_the_rule(&typing, cx, &format!("{how:?} after an area"));
         assert!(bounds_of(&typing, cx, SELECTION_OUTLINE_ID).is_none(), "{how:?}: no outline");
+        select_main_text(&typing, cx);
+        let field = gpui_kit::SharedString::from(stagepack_studio::inspector::field_id("x"));
+        click_on(&typing, cx, field);
+        typing.press(cx, "ctrl-a");
+        typing.type_text(cx, "120");
+        typing.press(cx, "enter");
+        assert!(typing.source(cx).contains("region.body: x=120"), "{how:?}: the area moved");
+        to_the_list(&typing, cx, how);
+        typing.press(cx, "ctrl-z");
+        assert_eq!(typing.source(cx), TALK, "{how:?}: the move undone");
+        brought_back_on_the_slide(&typing, cx, &format!("{how:?} then Undo of an area's move"), 1);
+        let slides = typing.slide_count(cx);
+        typing.press(cx, "delete");
+        assert_eq!(typing.slide_count(cx), slides, "{how:?}: Delete on an area takes no slide");
+        assert_eq!(typing.source(cx), TALK, "{how:?}: nor anything else");
     }
+}
+
+/// After an Undo or a Redo pressed in the list of slides brings `count` things back selected:
+/// the rule holds, they show their outlines, and the slide has the keyboard.
+fn brought_back_on_the_slide(typing: &Typing, cx: &mut TestAppContext, step: &str, count: usize) {
+    holds_the_rule(typing, cx, step);
+    let picked = typing.document(cx).read_with(cx, |document, _| document.selection().map(|selection| selection.things.len()));
+    assert_eq!(picked, Some(count), "{step}: selected again");
+    assert!(bounds_of(typing, cx, SELECTION_OUTLINE_ID).is_some(), "{step}: the outline shows");
+    if count > 1 {
+        assert!(bounds_of(typing, cx, selection_outline_id(0)).is_some(), "{step}: every outline shows");
+    }
+    let editor_has_it = typing.with_window(cx, |window, cx| typing.view.read(cx).slide_editor().read(cx).focus_handle().is_focused(window));
+    assert!(editor_has_it, "{step}: the slide has the keyboard");
+}
+
+/// Selects both shapes `select_two_shapes` put on the first slide, again.
+fn select_two_shapes_again(typing: &Typing, cx: &mut TestAppContext) {
+    let first = thing(typing, cx, "<Shape");
+    let corner = typing.at(cx, first.rect.x + 10., first.rect.y + 10.);
+    typing.click(cx, corner);
+    let shapes: Vec<_> = typing.layout(cx).elements().to_vec();
+    let second = shapes.iter().find(|element| element.source != first.source).expect("the copy").clone();
+    let at = typing.at(cx, second.rect.x + second.rect.w - 10., second.rect.y + second.rect.h - 10.);
+    typing.clicks(cx, at, 1, gpui_kit::Modifiers::shift());
+    let two = typing.document(cx).read_with(cx, |document, _| document.selection().map(|selection| selection.things.len()));
+    assert_eq!(two, Some(2), "both shapes are selected again");
 }
 
 /// Puts a shape on the first slide, and a copy of it beside it, and selects both.
 fn select_two_shapes(typing: &Typing, cx: &mut TestAppContext) {
     insert_shape(typing, cx, "rect");
+    let first = thing(typing, cx, "<Shape");
     typing.press(cx, "ctrl-d");
     // A corner of the first that the copy, 40 down and right, doesn't cover.
-    let corner = typing.at(cx, 730., 390.);
+    let corner = typing.at(cx, first.rect.x + 10., first.rect.y + 10.);
     typing.clicks(cx, corner, 1, gpui_kit::Modifiers::shift());
     let two = typing.document(cx).read_with(cx, |document, _| document.selection().map(|selection| selection.things.len()));
     assert_eq!(two, Some(2), "two things are selected");

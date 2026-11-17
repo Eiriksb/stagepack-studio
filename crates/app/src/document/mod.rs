@@ -63,6 +63,7 @@ pub use open::TalkPlace;
 pub use reading::talk_settings;
 pub use saving::{Reload, UNREADABLE_FILE};
 pub use tables::{Beside, CellMove, TableHere, TableTool};
+use selecting::made_in_turn;
 use tables::tables_on;
 use typing::{HeldColor, flows_in, from_first_visible, joined, new_box_change, tag_starting_at, waits_for_text, write_flow};
 

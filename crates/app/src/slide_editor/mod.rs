@@ -104,9 +104,12 @@ pub struct SlideEditor {
     focus_handle: FocusHandle,
     /// Where the keyboard goes once typing ends: the window's own.
     away: FocusHandle,
-    /// The keyboards of the list of slides and the notes, which the editor takes the keyboard
-    /// from once a thing on the slide shown is selected while one of them has it.
+    /// The keyboard of the list of slides, which the editor takes the keyboard from once a thing
+    /// on the slide shown is selected while the list has it.
     panels: Vec<FocusHandle>,
+    /// The keyboard of the notes, which the editor never takes: while the notes have it, what's
+    /// selected on the slide is let go of instead.
+    notes: Option<FocusHandle>,
     /// What holds the text tools: the keyboard can go there and typing goes on.
     tools: FocusHandle,
     /// What else the keyboard can go to while typing goes on, as the icon picker's search.
@@ -207,6 +210,7 @@ impl SlideEditor {
             focus_handle,
             away,
             panels: Vec::new(),
+            notes: None,
             tools,
             more_tools: Vec::new(),
             caret_on: true,
@@ -239,10 +243,17 @@ impl SlideEditor {
         self.more_tools.push(tools);
     }
 
-    /// Has the editor take the keyboard from a panel, the list of slides or the notes, which
-    /// `panel` is the keyboard of, once a thing on the slide shown is selected while it has it.
+    /// Has the editor take the keyboard from a panel, as the list of slides, which `panel` is
+    /// the keyboard of, once a thing on the slide shown is selected while it has it.
     pub fn take_keyboard_from(&mut self, panel: FocusHandle) {
         self.panels.push(panel);
+    }
+
+    /// Has the editor let go of what's selected on the slide whenever it hears of the talk while
+    /// the notes, which `notes` is the keyboard of, have the keyboard: however they got it, a
+    /// letter typed there never has the slide take the keyboard back, nor Delete act on a thing.
+    pub fn give_way_to_notes(&mut self, notes: FocusHandle) {
+        self.notes = Some(notes);
     }
 
     /// Whether the text tools, or something else that can have the keyboard while typing goes
@@ -271,9 +282,12 @@ impl SlideEditor {
             }
         } else {
             self.stop(cx);
-            if self.selection_here(cx).is_some() {
-                // From the list of slides or the notes too, as by an Undo pressed there: a thing
-                // shown as selected while the list has the keyboard would have Delete take its slide.
+            let notes_have_it = self.notes.as_ref().is_some_and(|notes| notes.contains_focused(window, cx));
+            if notes_have_it {
+                self.deselect(cx);
+            } else if self.selection_here(cx).is_some() {
+                // From the list of slides too, as by an Undo pressed there: a thing shown as
+                // selected while the list has the keyboard would have Delete take its slide.
                 let panel_has_it = self.panels.iter().any(|panel| panel.contains_focused(window, cx));
                 if !focused && (self.away.is_focused(window) || panel_has_it) {
                     self.focus_handle.focus(window, cx);

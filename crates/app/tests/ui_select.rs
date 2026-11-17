@@ -270,9 +270,13 @@ fn tab_goes_to_the_next_thing(cx: &mut TestAppContext) {
     }
     typing.press(cx, "shift-tab");
     assert_eq!(picked(&typing, cx), Some(vec![in_order.last().unwrap().clone()]), "shift-tab goes back round");
-    while picked(&typing, cx) != Some(vec![things[4].clone()]) {
+    for _ in 0..in_order.len() {
+        if picked(&typing, cx) == Some(vec![things[4].clone()]) {
+            break;
+        }
         typing.press(cx, "shift-tab");
     }
+    assert_eq!(picked(&typing, cx), Some(vec![things[4].clone()]), "Shift+Tab reaches the picture");
     assert_eq!(typing.status(cx).as_deref(), Some("Picture selected"));
     typing.press(cx, "shift-tab");
     assert_eq!(picked(&typing, cx), Some(vec![things[3].clone()]));

@@ -341,21 +341,25 @@ impl Document {
     }
 
     /// Puts the things `markdown` holds on the current slide, as one step named `label`, and
-    /// selects them. They must be things, as [`clipboard::some_things`] says, or it's refused,
-    /// with nothing added. Typing ends first, and a new text box waiting for its first letter
-    /// is dropped. `files` are added first, as [`Self::bring_files`] says, and each path in the
+    /// selects them; undone, what was selected before is selected again. They must be things,
+    /// as [`clipboard::some_things`] says, or it's refused, with nothing added. Typing ends
+    /// first, and a new text box waiting for its first letter is dropped. `files` are added first, as [`Self::bring_files`] says, and each path in the
     /// things that had to change is made to name the file as added. Where a thing already has
     /// its corner at exactly a thing's `x` and `y`, it's moved 40 down and right, as often as
     /// it takes. They're written with [`insert_block`], after the slide's content, in order.
     fn put_thing(&mut self, label: &'static str, markdown: &str, files: PastedFiles) -> Result<(Vec<usize>, Brought), EditRefused> {
         let things = guarded(|| clipboard::some_things(markdown))?.ok_or(EditRefused::NotOneThing)?;
         let tidied = self.finish_before_edit()?;
+        // What's selected once the typing is tidied, which an undo selects again.
+        let before = self.selection.clone();
         self.editing = None;
         let (text, brought) = self.bring_files_for(&things.join("\n\n"), files);
-        // Each thing is a block of its own, as it was before its files were named again.
-        let things = guarded(|| clipboard::some_things(&text))?.filter(|renamed| renamed.len() == things.len()).unwrap_or(things);
+        // Each thing is a block of its own, as it was before its files were named again; if
+        // naming them split or joined them, they'd name files other than those added.
+        let renamed = guarded(|| clipboard::some_things(&text))?.filter(|renamed| renamed.len() == things.len());
+        let things = renamed.ok_or(EditRefused::CouldNotBeMade)?;
         let texts: Vec<String> = things.iter().map(|thing| self.stepped_aside(thing)).collect();
-        let changed = self.insert_texts(label, &texts, tidied)?;
+        let changed = self.insert_texts(label, &texts, tidied, before)?;
         let mut brought = brought;
         brought.look_for_lone_builds(self);
         Ok((changed, brought))

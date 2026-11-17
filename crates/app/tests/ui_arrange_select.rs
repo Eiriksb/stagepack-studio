@@ -9,7 +9,7 @@ mod typing;
 use typing::*;
 
 use gpui_kit::test::TestWindowExt;
-use gpui_kit::{Modifiers, Pixels, Point, TestAppContext};
+use gpui_kit::{Focusable as _, Modifiers, Pixels, Point, TestAppContext};
 use slides_engine::ElementBox;
 use stagepack_studio::inspector::{INSPECTOR_HEADING_ID, INSPECTOR_PUT_BACK_ID, field_id};
 use stagepack_studio::notes_panel::NOTES_ID;
@@ -303,9 +303,13 @@ fn tab_reaches_the_areas_after_the_things(cx: &mut TestAppContext) {
     typing.press(cx, "shift-tab");
     assert_eq!(selection(&typing, cx).map(|selection| selection.things), Some(vec![order.last().unwrap().clone()]));
     let title = order.iter().position(|thing| *thing == Thing::Region("title".into())).unwrap();
-    while selection(&typing, cx).map(|selection| selection.things) != Some(vec![order[title].clone()]) {
+    for _ in 0..order.len() {
+        if selection(&typing, cx).map(|selection| selection.things) == Some(vec![order[title].clone()]) {
+            break;
+        }
         typing.press(cx, "shift-tab");
     }
+    assert_eq!(selection(&typing, cx).map(|selection| selection.things), Some(vec![order[title].clone()]), "Shift+Tab reaches the title");
     assert_eq!(typing.status(cx).as_deref(), Some("Title area selected"));
     assert!(outline(&typing, cx).is_some());
     assert_eq!(typing.source(cx), TALK);
@@ -327,6 +331,12 @@ fn delete_on_an_area_says_why_and_changes_nothing(cx: &mut TestAppContext) {
     typing.press(cx, "delete");
     assert!(!typing.source(cx).contains(RECT));
     assert!(typing.source(cx).contains("Some words here"));
+    assert_eq!(
+        selection(&typing, cx).map(|selection| selection.things),
+        Some(vec![Thing::Region("body".into())]),
+        "the area stays selected"
+    );
+    assert!(outline(&typing, cx).is_some());
 }
 
 #[gpui_kit::test]
@@ -456,4 +466,245 @@ fn nothing_redraws_while_two_things_sit_selected(cx: &mut TestAppContext) {
     assert_eq!((editor_count.get(), view_count.get(), canvas_count.get()), (0, 0, 0));
     assert!(outline(&typing, cx).is_some());
     assert!(bounds_of(&typing, cx, SELECTION_OUTLINE_ID).is_some());
+}
+
+#[gpui_kit::test]
+fn undo_of_a_duplicate_or_a_paste_selects_what_was_selected(cx: &mut TestAppContext) {
+    for paste in [false, true] {
+        let typing = open(cx, TALK);
+        let (rect, ellipse) = (of(&typing, cx, RECT), of(&typing, cx, ELLIPSE));
+        select_things(&typing, cx, &[ELLIPSE, RECT]);
+        if paste {
+            typing.press(cx, "ctrl-c");
+            typing.press(cx, "ctrl-v");
+        } else {
+            typing.press(cx, "ctrl-d");
+        }
+        assert_eq!(typing.source(cx).matches("<Shape").count(), 4, "paste {paste}");
+        typing.press(cx, "ctrl-z");
+        assert_eq!(typing.source(cx), TALK, "paste {paste}");
+        let back = Selection { slide: 0, things: vec![Thing::Block(ellipse.clone()), Thing::Block(rect.clone())] };
+        assert_eq!(selection(&typing, cx), Some(back), "paste {paste}: the two picked before, in the order picked");
+        assert!(bounds_of(&typing, cx, selection_outline_id(0)).is_some());
+        typing.press(cx, "ctrl-shift-z");
+        assert_eq!(blocks(&typing, cx).len(), 2, "paste {paste}: Redo selects the copies again");
+        assert!(blocks(&typing, cx).iter().all(|range| range.start > ellipse.end), "paste {paste}");
+    }
+}
+
+#[gpui_kit::test]
+fn an_area_its_layout_no_longer_has_is_let_go_of(cx: &mut TestAppContext) {
+    let columns = TALK.replace("title: T\n", "title: T\nlayout: two-columns\n");
+    for outside in [true, false] {
+        let typing = open(cx, TALK);
+        select_body(&typing, cx);
+        let document = typing.document(cx);
+        if outside {
+            let text = columns.clone();
+            cx.update(|cx| {
+                document.update(cx, |document, cx| {
+                    document.reload(Some(text));
+                    cx.notify();
+                })
+            });
+        } else {
+            let at = TALK.find("title: T\n").unwrap() + "title: T\n".len();
+            let change = slides_format::Change::single(slides_format::SourceEdit { range: at..at, text: "layout: two-columns\n".into() });
+            cx.update(|cx| {
+                document.update(cx, |document, cx| {
+                    document.edit("Change layout", change, 0).expect("made");
+                    cx.notify();
+                })
+            });
+        }
+        typing.settle(cx);
+        assert_eq!(typing.source(cx), columns, "outside {outside}");
+        assert_eq!(selection(&typing, cx), None, "outside {outside}: the main text is no area of two columns");
+        assert!(outline(&typing, cx).is_none(), "outside {outside}");
+        assert_ne!(typing.status(cx).as_deref(), Some("Main text area selected"), "outside {outside}");
+        assert_ne!(label_of(&typing, cx, INSPECTOR_HEADING_ID).as_deref(), Some("Main text area"), "outside {outside}");
+    }
+}
+
+#[gpui_kit::test]
+fn the_notes_given_the_keyboard_without_the_mouse_let_go_and_keep_their_keys(cx: &mut TestAppContext) {
+    for area in [false, true] {
+        let typing = open(cx, TALK);
+        if area {
+            select_body(&typing, cx);
+        } else {
+            select_things(&typing, cx, &[RECT, ELLIPSE]);
+        }
+        let notes = cx.read(|cx| typing.view.read(cx).notes_panel().read(cx).field().focus_handle(cx));
+        typing.with_window(cx, |window, cx| notes.focus(window, cx));
+        typing.settle(cx);
+        typing.type_text(cx, "hi");
+        let notes_have_it = typing.with_window(cx, |window, cx| typing.view.read(cx).notes_panel().read(cx).is_focused(window, cx));
+        assert!(notes_have_it, "area {area}: the letters didn't take the keyboard back for the slide");
+        assert_eq!(selection(&typing, cx), None, "area {area}: nothing on the slide is selected");
+        assert!(outline(&typing, cx).is_none(), "area {area}");
+        for _ in 0..3 {
+            typing.press(cx, "backspace");
+        }
+        typing.press(cx, "delete");
+        let source = typing.source(cx);
+        assert!(source.contains(RECT) && source.contains(ELLIPSE) && source.contains(ICON), "area {area}: nothing on the slide is taken");
+        assert!(source.contains("Some words here"), "area {area}");
+        assert_eq!(cx.read(|cx| typing.view.read(cx).notes_panel().read(cx).text(cx)), "", "area {area}: the keys were the notes'");
+    }
+}
+
+#[gpui_kit::test]
+fn a_press_just_outside_the_frame_beside_a_line_of_text_selects_the_area(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    let body = body_flow(&typing, cx);
+    typing.click_text(cx, body, pos(0, 3));
+    let rect = typing.layout(cx).region("body").expect("the area").rect;
+    let line = typing.point_of(cx, body, pos(0, 0));
+    let edge = typing.at(cx, rect.x, rect.y);
+    // Beside the first line, two pixels outside the left line.
+    let at = gpui_kit::point(edge.x - gpui_kit::px(2.), line.y);
+    typing.click(cx, at);
+    assert_eq!(selection(&typing, cx), Some(Selection { slide: 0, things: vec![Thing::Region("body".into())] }));
+    assert!(typing.editing(cx).is_none());
+}
+
+/// A box with a thing inside it, and a thing beside it.
+const NESTED: &str = "---\ntitle: T\n---\n\n# Nested\n\n\
+<Box x=\"1000\" y=\"300\" w=\"800\" h=\"500\" fill=\"#dbeafe\">\n\n<Icon name=\"arrow-right\" size=\"96\" />\n\nSome words\n\n</Box>\n\n\
+<Shape kind=\"rect\" fill=\"#2563eb\" x=\"1300\" y=\"850\" w=\"200\" h=\"100\" />\n";
+
+#[gpui_kit::test]
+fn a_box_and_what_is_in_it_are_deleted_and_copied_once(cx: &mut TestAppContext) {
+    let typing = open(cx, NESTED);
+    let (outer, inner, shape) = (of(&typing, cx, "<Box"), of(&typing, cx, "<Icon"), of(&typing, cx, RECT));
+    let document = typing.document(cx);
+    cx.update(|cx| {
+        document.update(cx, |document, cx| {
+            for thing in [&inner, &outer, &shape] {
+                assert!(document.select_also(0, Thing::Block(thing.clone())));
+            }
+            cx.notify();
+        })
+    });
+    assert_eq!(blocks(&typing, cx), vec![inner, outer.clone(), shape.clone()]);
+    let copied = document.read_with(cx, |document, _| document.copy_selected()).expect("copied").0;
+    assert_eq!(copied, format!("{}\n\n{}", &NESTED[outer.clone()], &NESTED[shape.clone()]), "the box once, with what's in it");
+    typing.press(cx, "delete");
+    let left = typing.source(cx);
+    assert!(!left.contains("<Box") && !left.contains("<Icon") && !left.contains(RECT), "{left}");
+    assert!(left.contains("# Nested"));
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), NESTED, "one step");
+}
+
+#[gpui_kit::test]
+fn two_things_on_one_line_are_taken_together(cx: &mut TestAppContext) {
+    let talk = "---\ntitle: T\n---\n\n# Line\n\n\
+<Icon name=\"arrow-right\" x=\"1000\" y=\"300\" size=\"96\" /> <Icon name=\"star\" x=\"1300\" y=\"300\" size=\"96\" />\n";
+    let typing = open(cx, talk);
+    let icons: Vec<Range<usize>> = typing.layout(cx).elements().iter().map(|element| element.source.clone()).collect();
+    assert_eq!(icons.len(), 2, "two things");
+    let document = typing.document(cx);
+    cx.update(|cx| {
+        document.update(cx, |document, cx| {
+            assert!(document.select_also(0, Thing::Block(icons[0].clone())));
+            assert!(document.select_also(0, Thing::Block(icons[1].clone())));
+            cx.notify();
+        })
+    });
+    typing.settle(cx);
+    let copied = document.read_with(cx, |document, _| document.copy_selected()).expect("copied").0;
+    assert_eq!(copied, format!("{}\n\n{}", &talk[icons[0].clone()], &talk[icons[1].clone()]));
+    typing.press(cx, "delete");
+    assert_eq!(typing.source(cx), "---\ntitle: T\n---\n\n# Line\n", "both go, with their line");
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), talk, "one step");
+}
+
+#[gpui_kit::test]
+fn several_things_are_followed_through_edits(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    let (rect, ellipse) = (of(&typing, cx, RECT), of(&typing, cx, ELLIPSE));
+    select_things(&typing, cx, &[ELLIPSE, RECT]);
+    let document = typing.document(cx);
+    // From outside, before them both, while nothing is unsaved.
+    let text = TALK.replacen("# Shapes", "# Shapes here", 1);
+    cx.update(|cx| {
+        document.update(cx, |document, cx| {
+            document.reload(Some(text));
+            cx.notify();
+        })
+    });
+    typing.settle(cx);
+    let h = " here".len();
+    let (rect, ellipse) = (rect.start + h..rect.end + h, ellipse.start + h..ellipse.end + h);
+    assert_eq!(blocks(&typing, cx), vec![ellipse.clone(), rect.clone()]);
+    let edit = |cx: &mut TestAppContext, at: usize, text: &str| {
+        let change = slides_format::Change::single(slides_format::SourceEdit { range: at..at, text: text.into() });
+        cx.update(|cx| {
+            document.update(cx, |document, cx| {
+                document.edit("Edit", change, 0).expect("made");
+                cx.notify();
+            })
+        });
+        typing.settle(cx);
+    };
+    // Inside the rectangle's tag: it grows, and the ellipse after it moves along.
+    let attr = " stroke=\"red\"";
+    edit(cx, rect.start + "<Shape".len(), attr);
+    let n = attr.len();
+    let (rect, ellipse) = (rect.start..rect.end + n, ellipse.start + n..ellipse.end + n);
+    assert_eq!(blocks(&typing, cx), vec![ellipse.clone(), rect.clone()]);
+    // Before them both.
+    let words = typing.source(cx).find("Some words").unwrap();
+    edit(cx, words, "More ");
+    let m = "More ".len();
+    assert_eq!(blocks(&typing, cx), vec![ellipse.start + m..ellipse.end + m, rect.start + m..rect.end + m]);
+    assert!(bounds_of(&typing, cx, selection_outline_id(0)).is_some() && outline(&typing, cx).is_some());
+}
+
+#[gpui_kit::test]
+fn every_thing_at_once_writes_what_one_at_a_time_would(cx: &mut TestAppContext) {
+    for talk in [TALK.to_string(), TALK.replace('\n', "\r\n"), extremes()] {
+        let crlf = talk.contains("\r\n");
+        // Every thing at once, by Ctrl+A.
+        let all = open(cx, &talk);
+        let first = all.layout(cx).elements()[0].clone();
+        let at = all.at(cx, first.rect.x + 0.5, first.rect.y + 0.5);
+        all.click(cx, at);
+        all.press(cx, "ctrl-a");
+        all.press(cx, "delete");
+        // One at a time, the last written first.
+        let each = open(cx, &talk);
+        let document = each.document(cx);
+        loop {
+            let last = each.layout(cx).elements().iter().map(|element| element.source.clone()).max_by_key(|range| range.start);
+            let Some(last) = last else { break };
+            cx.update(|cx| {
+                document.update(cx, |document, cx| {
+                    assert!(document.select(0, last));
+                    document.delete_selected().expect("taken");
+                    cx.notify();
+                })
+            });
+        }
+        assert_eq!(all.source(cx), each.source(cx), "crlf {crlf}: deleting");
+        // And copies, by Duplicate: each written after the slide's last block, a blank line
+        // before it, as writing them one at a time does. (Each is moved aside from its own
+        // thing, so the copies keep how the things lay together.)
+        let all = open(cx, &talk);
+        let at = all.at(cx, first.rect.x + 0.5, first.rect.y + 0.5);
+        all.click(cx, at);
+        all.press(cx, "ctrl-a");
+        let last_end = all.layout(cx).elements().iter().map(|element| element.source.end).max().unwrap();
+        all.press(cx, "ctrl-d");
+        let source = all.source(cx);
+        let mut copies = blocks(&all, cx);
+        copies.sort_by_key(|range| range.start);
+        let eol = if crlf { "\r\n" } else { "\n" };
+        let written: Vec<&str> = copies.iter().map(|range| &source[range.clone()]).collect();
+        let expected = format!("{}{eol}{eol}{}{}", &talk[..last_end], written.join(&format!("{eol}{eol}")), &talk[last_end..]);
+        assert_eq!(source, expected, "crlf {crlf}: duplicating");
+    }
 }

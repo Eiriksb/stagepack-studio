@@ -198,3 +198,52 @@ fn a_keystroke_in_a_table_cell_is_quick() {
     assert_eq!(doc.table_at_caret().map(|(_, row, column)| (row, column)), Some((4, 3)));
     report("keystroke typed in a table cell", times);
 }
+
+/// How long one step on every thing of a slide of sixty may take, at the median: a step taken
+/// once, by a key or a tool, not a frame. Taking a tag away is worked out by the format crate a
+/// tag at a time, each reading the slide again, which is most of it.
+const MOST_FOR_SIXTY: Duration = Duration::from_millis(250);
+
+/// Every thing on a slide of sixty selected with Ctrl+A, then deleted, duplicated or pasted as one
+/// step, on a long talk, and undone: each step is worked out a thing at a time.
+#[test]
+#[ignore = "timing; run in release"]
+fn a_step_on_sixty_things_is_quick() {
+    let mut talk = long_talk();
+    talk.push_str("---\n\n# Sixty\n\n");
+    for n in 0..60 {
+        talk.push_str(&format!(
+            "<Shape kind=\"rect\" fill=\"#2563eb\" x=\"{}\" y=\"{}\" w=\"100\" h=\"80\" />\n\n",
+            100 + (n % 10) * 150,
+            200 + (n / 10) * 120
+        ));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("slides.md"), &talk).unwrap();
+    let mut doc = Document::open(dir.path(), Fonts::bundled_only()).unwrap();
+    let slide = doc.slide_count() - 1;
+    doc.go_to(slide);
+    for (what, step) in [
+        ("delete", Document::delete_selected as fn(&mut Document) -> _),
+        ("duplicate", Document::duplicate_selected),
+        ("paste", |doc: &mut Document| {
+            let (text, _) = doc.copy_selected()?;
+            doc.paste_element(&text, Default::default()).map(|(changed, _)| changed)
+        }),
+    ] {
+        let mut times = Vec::new();
+        for _ in 0..10 {
+            assert!(doc.select_all_things());
+            assert_eq!(doc.selection().map(|selection| selection.things.len()), Some(60));
+            let start = Instant::now();
+            step(&mut doc).unwrap();
+            times.push(start.elapsed());
+            doc.undo().unwrap();
+            assert_eq!(doc.source(), talk, "{what}: one step");
+        }
+        times.sort();
+        let median = times[times.len() / 2];
+        println!("median {what} of sixty things on a {SLIDES}-slide talk: {median:?} (slowest {:?})", times.last().unwrap());
+        assert!(median < MOST_FOR_SIXTY, "{what} of sixty things took {median:?}");
+    }
+}

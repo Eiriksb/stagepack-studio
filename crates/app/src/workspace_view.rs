@@ -489,8 +489,8 @@ impl WorkspaceView {
         let inspector = cx.new(|cx| Inspector::new(document.clone(), workspace, cx));
         let notes_focus = notes_panel.read(cx).field().focus_handle(cx);
         // The notes taking the keyboard let go of what's selected on the slide, and end typing
-        // there, as the list of slides does.
-        slide_editor.update(cx, |editor, _| editor.take_keyboard_from(notes_focus.clone()));
+        // there, as the list of slides does; and nothing is selected while they have it.
+        slide_editor.update(cx, |editor, _| editor.give_way_to_notes(notes_focus.clone()));
         let strip = slide_strip.clone();
         let notes_focused = cx.subscribe_in(&notes_panel, window, move |_, _, _: &NotesFocused, window, cx| {
             strip.update(cx, |strip, cx| strip.let_go_of_selection(window, cx));

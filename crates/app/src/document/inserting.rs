@@ -48,12 +48,19 @@ impl Document {
     /// `label`, and selects it. `tidied` says whether finishing the typing first changed the
     /// talk. Undone, it goes and nothing is selected; made again, it's selected again.
     pub(super) fn insert_text(&mut self, label: &'static str, text: &str, tidied: bool) -> Result<Vec<usize>, EditRefused> {
-        self.insert_texts(label, &[text.to_string()], tidied)
+        self.insert_texts(label, &[text.to_string()], tidied, None)
     }
 
     /// Writes `texts`, each one block, at the end of the current slide's content, in order, as
-    /// one step named `label`, and selects them, as [`Self::insert_text`] does one.
-    pub(super) fn insert_texts(&mut self, label: &'static str, texts: &[String], tidied: bool) -> Result<Vec<usize>, EditRefused> {
+    /// one step named `label`, and selects them, as [`Self::insert_text`] does one. Undone,
+    /// `before` is selected again.
+    pub(super) fn insert_texts(
+        &mut self,
+        label: &'static str,
+        texts: &[String],
+        tidied: bool,
+        before: Option<selection::Selection>,
+    ) -> Result<Vec<usize>, EditRefused> {
         let slide = self.current;
         let (change, sources) = built(self.talk(), |talk| inserted(talk, slide, texts))?.ok_or(EditRefused::CouldNotBeMade)?;
         let depth = self.history.depth();
@@ -65,7 +72,7 @@ impl Document {
             && let Some(sources) = sources
             && self.pick(slide, sources.into_iter().map(Thing::Block).collect())
         {
-            self.history.select_mark_last(SelectMark { before: None, after: self.selection.clone() });
+            self.history.select_mark_last(SelectMark { before, after: self.selection.clone() });
         }
         Ok(changed)
     }
@@ -206,9 +213,15 @@ impl Document {
 /// order, as [`insert_block`] writes one, and where each is once it's written, in the talk's
 /// line endings, if that can be found. A single block gets the change [`insert_block`] gives.
 fn inserted(talk: &Talk, slide: usize, texts: &[String]) -> Option<(Change, Option<Vec<Range<usize>>>)> {
+    inserted_at_once(talk, slide, texts).or_else(|| inserted_in_turn(talk, slide, texts))
+}
+
+/// [`inserted`], each block written in turn on the talk as the ones before leave it.
+fn inserted_in_turn(talk: &Talk, slide: usize, texts: &[String]) -> Option<(Change, Option<Vec<Range<usize>>>)> {
     let mut now = talk.clone();
     let mut first = None;
-    let mut sources = Some(Vec::new());
+    let mut sources = Vec::new();
+    let mut found = true;
     for text in texts {
         let change = insert_block(&now, slide, text)?;
         let source = change.edits.first().and_then(|edit| {
@@ -216,15 +229,53 @@ fn inserted(talk: &Talk, slide: usize, texts: &[String]) -> Option<(Change, Opti
             let at = edit.range.start + edit.text.find(&written)?;
             Some(at..at + written.len())
         });
-        sources = sources.and_then(|sources: Vec<Range<usize>>| {
-            let mut moved: Vec<Range<usize>> = sources.iter().map(|other| selection::moved(other, &change)).collect::<Option<_>>()?;
-            moved.push(source?);
-            Some(moved)
-        });
-        let after = change.apply(&now.source);
+        // Each written goes after those before it, which stay where they are.
+        if made_in_turn(&mut now, &change, &mut sources).is_none() {
+            found = false;
+            sources.clear();
+        }
+        match source {
+            Some(source) if found => sources.push(source),
+            _ => found = false,
+        }
         first.get_or_insert(change);
-        now = reparse(&now, after);
     }
     let change = if texts.len() == 1 { first? } else { one_edit(&talk.source, &now.source) };
-    Some((change, sources))
+    Some((change, found.then_some(sources)))
+}
+
+/// [`inserted`] for several blocks: the first written by [`insert_block`], and the others in the
+/// same edit after it, each after a blank line, as it would write each after the one before.
+/// Only where the slide then ends with exactly those blocks, where they were written: one
+/// reading of the talk, however many there are. `None` otherwise, for them to be written in turn.
+fn inserted_at_once(talk: &Talk, slide: usize, texts: &[String]) -> Option<(Change, Option<Vec<Range<usize>>>)> {
+    if texts.len() < 2 {
+        return None;
+    }
+    let first = insert_block(talk, slide, &texts[0])?;
+    let [edit] = first.edits.as_slice() else {
+        return None;
+    };
+    let eol = if edit.text.contains("\r\n") { "\r\n" } else { "\n" };
+    let written: Vec<String> = texts.iter().map(|text| text.replace('\n', eol)).collect();
+    let at = edit.text.find(&written[0])?;
+    let mut text = edit.text[..at].to_string();
+    let mut sources = Vec::with_capacity(texts.len());
+    for (index, block) in written.iter().enumerate() {
+        if index > 0 {
+            text.push_str(eol);
+            text.push_str(eol);
+        }
+        let start = edit.range.start + text.len();
+        sources.push(start..start + block.len());
+        text.push_str(block);
+    }
+    text.push_str(&edit.text[at + written[0].len()..]);
+    let change = Change::single(SourceEdit { range: edit.range.clone(), text });
+    let after = reparse(talk, change.apply(&talk.source));
+    let blocks = &after.slides.get(slide)?.blocks;
+    let ends: Vec<Range<usize>> = blocks.iter().rev().take(texts.len()).rev().map(|block| block.range().clone()).collect();
+    let before = talk.slides.get(slide)?.blocks.len();
+    let exact = after.slides.len() == talk.slides.len() && blocks.len() == before + texts.len() && ends == sources;
+    exact.then_some((change, Some(sources)))
 }
