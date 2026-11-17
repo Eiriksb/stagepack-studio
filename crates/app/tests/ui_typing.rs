@@ -2268,8 +2268,9 @@ mod tools {
 
     #[gpui_kit::test]
     fn in_a_wide_window_nothing_scrolls(cx: &mut TestAppContext) {
+        // The Home tab's tools, Duplicate slide and Delete slide among them, take about 1,410 pixels.
         let typing = open(cx, TWO);
-        typing.resize(cx, 1400., 800.);
+        typing.resize(cx, 1440., 800.);
         typing.select_word(cx, 6);
         assert!(typing.bounds_of(cx, MORE_RIGHT_ID).is_none());
         assert!(typing.bounds_of(cx, MORE_LEFT_ID).is_none());
@@ -2285,7 +2286,7 @@ mod tools {
         // Narrowed, it does; widened again, it doesn't.
         typing.resize(cx, 1024., 600.);
         assert!(typing.bounds_of(cx, MORE_RIGHT_ID).is_some());
-        typing.resize(cx, 1400., 800.);
+        typing.resize(cx, 1440., 800.);
         assert!(typing.bounds_of(cx, MORE_RIGHT_ID).is_none());
     }
 

@@ -292,7 +292,9 @@ impl Ribbon {
                 "Slides",
                 vec![
                     new_slide.into_any_element(),
-                    tool(DUPLICATE_ID, Icons::CopyPlus, "Duplicate")
+                    // "Slide" in both, as a thing on the slide can show as selected while it's the
+                    // slide they act on.
+                    tool(DUPLICATE_ID, Icons::CopyPlus, "Duplicate slide")
                         .tooltip_with_action(
                             "Put a copy of this slide after it",
                             &DuplicateSlide,
@@ -301,7 +303,7 @@ impl Ribbon {
                         .disabled(!has_talk)
                         .on_click(dispatch(DuplicateSlide))
                         .into_any_element(),
-                    tool(DELETE_ID, Icons::Trash, "Delete")
+                    tool(DELETE_ID, Icons::Trash, "Delete slide")
                         .tooltip("Delete this slide")
                         .disabled(!several)
                         .on_click(dispatch(DeleteSlide))

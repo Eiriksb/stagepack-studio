@@ -21,7 +21,7 @@ use stagepack_studio::export::{ExportKind, run_export};
 use stagepack_studio::insert::place_for;
 use stagepack_studio::insert_tools::{INSERT_ICON_ID, INSERT_PICTURE_ID, INSERT_SHAPES_ID, INSERT_TEXT_BOX_ID, shape_id};
 use stagepack_studio::recovery::Recovery;
-use stagepack_studio::ribbon::{MORE_RIGHT_ID, RIBBON_ID, TAB_HOME_ID, TAB_INSERT_ID};
+use stagepack_studio::ribbon::{DELETE_ID, DUPLICATE_ID, MORE_RIGHT_ID, RIBBON_ID, TAB_HOME_ID, TAB_INSERT_ID};
 use stagepack_studio::text_tools::{ALIGN_CENTER_ID, BOLD_ID, BULLETS_ID, NUMBERING_ID};
 use stagepack_studio::inspector::{INSPECTOR_HEADING_ID, INSPECTOR_MESSAGE_ID};
 use stagepack_studio::slide_editor::{NEW_BOX_ID, SELECTION_OUTLINE_ID, SlideEditor};
@@ -631,6 +631,24 @@ fn ctrl_d_duplicates_the_slide_from_the_list_and_the_thing_from_the_slide(cx: &m
     typing.press(cx, "ctrl-d");
     assert_eq!(typing.source(cx).matches("# One").count(), 2, "the slide is duplicated");
     assert_eq!(typing.source(cx).matches("<Shape").count(), 4, "with its shapes");
+}
+
+#[gpui_kit::test]
+fn the_home_tabs_slide_tools_say_they_act_on_the_slide_while_a_thing_is_selected(cx: &mut TestAppContext) {
+    // Found in review: with a shape selected, the bin labelled Delete took the slide.
+    let typing = open(cx, TALK);
+    insert_shape(&typing, cx, "rect");
+    click_on(&typing, cx, TAB_HOME_ID);
+    assert!(selected(&typing, cx).is_some(), "the shape shows as selected");
+    let labels = typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        [DUPLICATE_ID, DELETE_ID].map(|id| window.find(id).label().map(str::to_string))
+    });
+    assert_eq!(labels, [Some("Duplicate slide".to_string()), Some("Delete slide".to_string())]);
+    let with_shape = typing.source(cx);
+    click_on(&typing, cx, DELETE_ID);
+    assert_eq!(typing.slide_count(cx), 1, "the tool takes what it says it takes");
+    assert_ne!(typing.source(cx), with_shape);
 }
 
 /// What's being typed on the slide as the list of slides takes the keyboard.
