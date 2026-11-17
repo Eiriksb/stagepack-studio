@@ -305,8 +305,12 @@ impl SlideEditor {
     }
 
     /// The button is let go of, anywhere: a drag ends, or a press on one of several things
-    /// selected selects it alone.
+    /// selected selects it alone. Another button let go of, as the right one during a drag,
+    /// does nothing.
     pub(super) fn mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.button != MouseButton::Left {
+            return;
+        }
         self.dragging = false;
         if self.drop_drag(event, window, cx) {
             return;

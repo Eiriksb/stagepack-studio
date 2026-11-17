@@ -10,7 +10,7 @@ use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{TestAppContext, px, size};
 use slides_engine::layouts;
 use stagepack_studio::layout_picker::{layout_area_id, layout_tile_id};
-use stagepack_studio::ribbon::{LAYOUT_ID, NEW_SLIDE_LAYOUTS_ID};
+use stagepack_studio::ribbon::{LAYOUT_ID, NEW_SLIDE_CARET_ID, NEW_SLIDE_LAYOUTS_ID};
 use stagepack_studio::selection::Thing;
 use stagepack_studio::slide_strip::strip_row_id;
 
@@ -217,7 +217,7 @@ fn new_slide_from_a_tile_adds_that_layout(cx: &mut TestAppContext) {
     let typing = open_wide(cx, TALK);
     typing.with_window(cx, |window, cx| {
         window.render_frame(cx);
-        window.within(NEW_SLIDE_LAYOUTS_ID).click("popup", cx);
+        window.within(NEW_SLIDE_LAYOUTS_ID).click(NEW_SLIDE_CARET_ID, cx);
     });
     typing.settle(cx);
     assert!(NAMES.iter().all(|(layout, _)| shown(&typing, cx, layout)));
@@ -303,6 +303,20 @@ fn a_selected_area_stays_selected_where_the_new_layout_has_it(cx: &mut TestAppCo
     pick(&typing, cx, "two-columns");
     assert_eq!(layout_of(&typing, cx, 0).as_deref(), Some("two-columns"));
     assert_eq!(picked(&typing, cx), None, "two columns has no area of that name");
+}
+
+#[gpui_kit::test]
+fn undoing_a_layout_change_selects_the_area_again(cx: &mut TestAppContext) {
+    let typing = open_wide(cx, TALK);
+    select_body(&typing, cx);
+    pick(&typing, cx, "two-columns");
+    assert_eq!(picked(&typing, cx), None);
+    typing.press(cx, "ctrl-z");
+    assert_eq!(layout_of(&typing, cx, 0), None);
+    assert_eq!(picked(&typing, cx), Some(vec![Thing::Region("body".to_string())]), "selected again");
+    typing.press(cx, "ctrl-shift-z");
+    assert_eq!(layout_of(&typing, cx, 0).as_deref(), Some("two-columns"));
+    assert_eq!(picked(&typing, cx), None);
 }
 
 #[gpui_kit::test]

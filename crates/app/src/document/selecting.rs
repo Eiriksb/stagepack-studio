@@ -359,7 +359,10 @@ impl Document {
         };
         let anchor = self.selection_slide.take();
         let talk = self.talk();
-        let slide_now = anchor.and_then(|range| selection::moved(&range, change)).and_then(|range| selection::slide_of(talk, &range));
+        // A slide whose settings were written or taken away at its start is found by its end.
+        let slide_now = anchor
+            .and_then(|range| selection::moved(&range, change).or_else(|| selection::moved(&(range.end.saturating_sub(1)..range.end), change)))
+            .and_then(|range| selection::slide_of(talk, &range));
         let moved: Vec<Option<Thing>> = old
             .things
             .into_iter()

@@ -17,8 +17,8 @@ use stagepack_studio::insert_tools::INSERT_PICTURE_ID;
 use stagepack_studio::layout_picker::layout_tile_id;
 use stagepack_studio::notes_panel::{NOTES_CAPTION_ID, NOTES_ID, NOTES_PLACEHOLDER};
 use stagepack_studio::ribbon::{
-    DELETE_ID, DUPLICATE_ID, HIDE_ID, MARKDOWN_TOGGLE_ID, NEW_SLIDE_ID, NEW_SLIDE_LAYOUTS_ID,
-    MORE_RIGHT_ID, NOTES_TOGGLE_ID, ON_THE_WAY_ID, PRESENT_ID, REDO_ID, REHEARSE_ID, RIBBON_ID,
+    DELETE_ID, DUPLICATE_ID, HIDE_ID, MARKDOWN_TOGGLE_ID, NEW_SLIDE_CARET_ID, NEW_SLIDE_ID,
+    NEW_SLIDE_LAYOUTS_ID, MORE_RIGHT_ID, NOTES_TOGGLE_ID, PRESENT_ID, REDO_ID, REHEARSE_ID, RIBBON_ID,
     SLIDE_LIST_TOGGLE_ID, TAB_ANIMATE_ID, TAB_HOME_ID, TAB_INSERT_ID, TAB_SLIDE_SHOW_ID,
     TAB_VIEW_ID, UNDO_ID,
 };
@@ -113,7 +113,7 @@ fn keys(cx: &mut TestAppContext, handle: AnyWindowHandle, keystrokes: &str) {
 fn pick_layout(cx: &mut TestAppContext, handle: AnyWindowHandle, layout: &str) {
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
-        window.within(NEW_SLIDE_LAYOUTS_ID).click("popup", cx);
+        window.within(NEW_SLIDE_LAYOUTS_ID).click(NEW_SLIDE_CARET_ID, cx);
         window.render_frame(cx);
         window.click(layout_tile_id(layout), cx);
     })
@@ -274,14 +274,16 @@ fn each_tab_shows_its_own_tools(cx: &mut TestAppContext) {
     click(cx, handle, TAB_INSERT_ID);
     with_window(cx, handle, |window, _| {
         assert_eq!(window.find(INSERT_PICTURE_ID).label(), Some("Picture"));
-        assert!(window.try_find(ON_THE_WAY_ID).is_none(), "the Insert tab has its tools");
         assert!(window.try_find(NEW_SLIDE_ID).is_none(), "Home's tools are put away");
         assert_eq!(window.find(TAB_INSERT_ID).selected(), Some(true));
     });
     click(cx, handle, TAB_ANIMATE_ID);
     with_window(cx, handle, |window, _| {
-        assert!(window.try_find(ON_THE_WAY_ID).is_none(), "the Animate tab has its tools");
-        assert_eq!(window.find(stagepack_studio::animate_tools::TRANSITION_ALL_ID).label(), Some("Apply to all slides"));
+        use stagepack_studio::animate_tools::{EARLIER_ID, ENTRANCE_ID, LATER_ID, ONE_AT_A_TIME_ID, STEP_LABEL_ID, TRANSITION_ALL_ID, TRANSITION_ID};
+        for tool in [TRANSITION_ID, TRANSITION_ALL_ID, ENTRANCE_ID, EARLIER_ID, LATER_ID, STEP_LABEL_ID, ONE_AT_A_TIME_ID] {
+            assert!(window.try_find(tool).is_some(), "the Animate tab has its {tool}");
+        }
+        assert_eq!(window.find(TRANSITION_ALL_ID).label(), Some("Apply to all slides"));
         assert!(
             window.try_find(NEW_SLIDE_ID).is_none(),
             "Home's tools are put away"
@@ -292,7 +294,6 @@ fn each_tab_shows_its_own_tools(cx: &mut TestAppContext) {
     with_window(cx, handle, |window, _| {
         assert_eq!(window.find(PRESENT_ID).label(), Some("From the start"));
         assert_eq!(window.find(REHEARSE_ID).label(), Some("Rehearse"));
-        assert!(window.try_find(ON_THE_WAY_ID).is_none());
     });
     click(cx, handle, TAB_VIEW_ID);
     with_window(cx, handle, |window, _| {
@@ -390,7 +391,7 @@ fn the_layout_list_adds_a_slide_of_that_layout(cx: &mut TestAppContext) {
     let (handle, view) = open(cx, TWO);
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
-        window.within(NEW_SLIDE_LAYOUTS_ID).click("popup", cx);
+        window.within(NEW_SLIDE_LAYOUTS_ID).click(NEW_SLIDE_CARET_ID, cx);
         window.render_frame(cx);
         for (layout, name) in [
             ("title", "Title"),

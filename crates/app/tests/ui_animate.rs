@@ -15,7 +15,7 @@ use stagepack_studio::animate::Choice;
 use stagepack_studio::animate_tools::{
     ChooseAnimation, ChooseEntrance, ENTRANCE_ID, EARLIER_ID, LATER_ID, ONE_AT_A_TIME_ID, STEP_LABEL_ID, TRANSITION_ALL_ID, TRANSITION_ID,
 };
-use stagepack_studio::ribbon::{ON_THE_WAY_ID, TAB_ANIMATE_ID, TAB_HOME_ID};
+use stagepack_studio::ribbon::{TAB_ANIMATE_ID, TAB_HOME_ID};
 use stagepack_studio::selection::Thing;
 use stagepack_studio::slide_editor::step_badge_id;
 
@@ -145,9 +145,8 @@ fn badges(typing: &Typing, cx: &mut TestAppContext) -> Vec<String> {
 }
 
 #[gpui_kit::test]
-fn the_tab_has_its_tools_and_says_nothing_is_on_the_way(cx: &mut TestAppContext) {
+fn the_tab_has_its_tools(cx: &mut TestAppContext) {
     let typing = open_animate(cx, TALK);
-    assert!(!shown(&typing, cx, ON_THE_WAY_ID));
     for group in ["Transition", "Appear", "Order", "List"] {
         assert!(shown(&typing, cx, &format!("group-{group}")), "{group}");
     }
@@ -452,6 +451,29 @@ fn the_box_being_typed_in_is_the_target(cx: &mut TestAppContext) {
     typing.press(cx, "ctrl-shift-z");
     assert_eq!(typing.source(cx), talk.replace("h=\"400\">", "h=\"400\" click=\"1\" enter=\"fade\">"));
     assert!(selected(&typing, cx).is_some(), "selected after Redo");
+}
+
+#[gpui_kit::test]
+fn the_box_being_typed_in_is_found_again_once_finishing_the_typing_changes_it(cx: &mut TestAppContext) {
+    let talk = "# T\n\n<Text x=\"200\" y=\"300\" w=\"800\" h=\"400\">\n\nHi there\n\n</Text>\n";
+    let typing = open_animate(cx, talk);
+    let flow = (0..typing.flows(cx, 0).len()).find(|&flow| typing.layout(cx).region_of_flow(flow).is_none()).expect("the box's text");
+    typing.double_click_text(cx, flow, pos(0, 2));
+    typing.press(cx, "ctrl-a");
+    // Typed in with nothing selected, and a colour held for the words, which finishing the
+    // typing gives them: the box's tag then ends further on.
+    typing.document(cx).update(cx, |document, cx| {
+        document.deselect();
+        document.hold_color("#dc2626".into());
+        cx.notify();
+    });
+    typing.settle(cx);
+    assert!(typing.editing(cx).is_some() && typing.document(cx).read_with(cx, |document, _| document.selection().is_none()));
+    pick(&typing, cx, ENTRANCE_ID, &ENTRANCES, "Fade in");
+    let source = typing.source(cx);
+    assert!(source.contains("h=\"400\" click=\"1\" enter=\"fade\">"), "{source}");
+    assert!(source.contains("#dc2626"), "the colour is given: {source}");
+    assert_eq!(selected(&typing, cx).map(|(_, range)| source[range].starts_with("<Text")), Some(true), "the box is selected");
 }
 
 #[gpui_kit::test]

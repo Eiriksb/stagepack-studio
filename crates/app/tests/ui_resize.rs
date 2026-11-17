@@ -268,6 +268,27 @@ fn turning_back_to_zero_removes_it(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn an_area_turned_back_upright_stays_selected(cx: &mut TestAppContext) {
+    // A slide with no settings: the turn writes them, and turning back takes them away again.
+    let talk = "# Turned\n\nSome words here\n\n---\n\n# Two\n";
+    let typing = open(cx, talk);
+    typing.document(cx).update(cx, |document, cx| {
+        document.select_region(0, "title");
+        cx.notify();
+    });
+    typing.settle(cx);
+    let title = || Some(Selection { slide: 0, things: vec![Thing::Region("title".to_string())] });
+    let rect = typing.layout(cx).region("title").expect("the title area").rect;
+    let centre = typing.at(cx, rect.x + rect.w / 2., rect.y + rect.h / 2.);
+    turn_to(&typing, cx, centre + point(px(150.), px(0.)), Modifiers::default());
+    assert!(typing.source(cx).contains("region.title: rotate=90"), "{}", typing.source(cx));
+    assert_eq!(selection(&typing, cx), title());
+    turn_to(&typing, cx, centre + point(px(0.), px(-150.)), Modifiers::default());
+    assert_eq!(typing.source(cx), talk, "upright, nothing is written");
+    assert_eq!(selection(&typing, cx), title(), "it stays selected");
+}
+
+#[gpui_kit::test]
 fn a_turned_shape_resizes_from_its_own_corner(cx: &mut TestAppContext) {
     let turned = TALK.replacen("h=\"200\" />", "h=\"200\" rotate=\"37\" />", 1);
     let typing = open(cx, &turned);

@@ -37,8 +37,12 @@ pub const SAVE_ID: &str = "save";
 pub const NEW_SLIDE_ID: &str = "new-slide";
 /// The New slide button and the arrow beside it, which shows the layouts' tiles.
 pub const NEW_SLIDE_LAYOUTS_ID: &str = "new-slide-layouts";
-/// The tool that shows the layouts' tiles, for the slide shown.
+/// The arrow beside New slide, and the tiles it shows.
+pub const NEW_SLIDE_CARET_ID: &str = "popup";
+pub const NEW_SLIDE_TILES_ID: &str = "new-slide-tiles";
+/// The tool that shows the layouts' tiles, for the slide shown, and the tiles it shows.
 pub const LAYOUT_ID: &str = "slide-layout";
+pub const LAYOUT_TILES_ID: &str = "slide-layout-tiles";
 pub const DUPLICATE_ID: &str = "duplicate-slide";
 pub const DELETE_ID: &str = "delete-slide";
 pub const HIDE_ID: &str = "hide-slide";
@@ -51,7 +55,6 @@ pub const SLIDE_LIST_TOGGLE_ID: &str = "toggle-slide-list";
 pub const MARKDOWN_TOGGLE_ID: &str = "toggle-markdown";
 /// The View tab's toggle that shows or hides the form beside the slide.
 pub const TOGGLE_INSPECTOR_ID: &str = "toggle-inspector";
-pub const ON_THE_WAY_ID: &str = "on-the-way";
 /// The row of tools under the tabs, which scrolls sideways when it's wider than the window.
 pub const RIBBON_TOOLS_ID: &str = "ribbon-tools";
 /// The arrows at the row's ends that show there are more tools that way, and scroll to them.
@@ -60,9 +63,6 @@ pub const MORE_RIGHT_ID: &str = "ribbon-more-right";
 
 /// How wide the arrows at the row's cut ends are.
 const MORE_WIDTH: Pixels = px(28.);
-
-/// What a tab whose tools aren't made yet says: every tab has its tools now, and none says it.
-pub const ON_THE_WAY: &str = "Tools for this tab are on the way.";
 
 /// The height of the row of tools under the tabs, the same on every tab.
 const TOOLS_HEIGHT: Pixels = px(64.);
@@ -265,6 +265,7 @@ impl Ribbon {
         let arrange = document.map(Document::arrange_here).unwrap_or_default();
         let new_slide = h_flex()
             .id(NEW_SLIDE_LAYOUTS_ID)
+            .test_support()
             .child(
                 tool(NEW_SLIDE_ID, Icons::SquarePlus, "New slide")
                     .tooltip_with_action("Add a slide after this one", &NewSlide, Some(KEY_CONTEXT))
@@ -272,8 +273,8 @@ impl Ribbon {
                     .on_click(|_, window, cx| window.dispatch_action(NewSlide.boxed_clone(), cx)),
             )
             .child(tiles_tool(
-                "new-slide-tiles",
-                Button::new("popup")
+                NEW_SLIDE_TILES_ID,
+                Button::new(NEW_SLIDE_CARET_ID)
                     .ghost()
                     .small()
                     .dropdown_caret(true)
@@ -285,7 +286,7 @@ impl Ribbon {
                 |layout| AddSlide { layout }.boxed_clone(),
             ));
         let layout = tiles_tool(
-            "slide-layout-tiles",
+            LAYOUT_TILES_ID,
             tool(LAYOUT_ID, Icons::LayoutTemplate, "Layout").tooltip("Change this slide's layout"),
             has_talk,
             document.map(Document::layout_here),

@@ -24,7 +24,14 @@ impl Document {
         let change = self
             .build(|talk| slides_format::set_layout(talk, at, layout))?
             .ok_or(EditRefused::CouldNotBeMade)?;
-        self.make(CHANGE_LAYOUT, change, Holds::Slide(at), at, at, None)
+        // An area selected goes once the new layout has none of its name: Undo selects it again.
+        let before = self.selection.clone().filter(|selection| selection.slide == at);
+        let depth = self.history.depth();
+        let changed = self.make(CHANGE_LAYOUT, change, Holds::Slide(at), at, at, None)?;
+        if before.is_some() && self.history.depth() > depth {
+            self.history.select_mark_last(SelectMark { before, after: self.selection.clone() });
+        }
+        Ok(changed)
     }
 
     /// The engine's name for the layout of the current slide.

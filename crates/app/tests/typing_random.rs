@@ -296,8 +296,9 @@ fn random_typing_keeps_the_text_and_the_talk_together() {
 }
 
 /// Talks with things to arrange: placed things written by hand in every way, things in the
-/// text (a table, a picture, a list), a box holding words, areas placed by a slide's settings,
-/// and steps a person wrote with gaps in them.
+/// text (a table, a picture, a list), a box holding words, a box holding a thing alone, areas
+/// placed by a slide's settings, steps a person wrote with gaps in them, and notes after the
+/// things of a slide.
 const ARRANGED: &[&str] = &[
     "---\ntitle: T\n---\n\n# Shapes\n\nSome words here\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n![A cat](cat.png)\n\n\
 <Shape kind=\"rect\" fill=\"#2563eb\" x=\"200\" y=\"500\" w=\"200\" h=\"200\" />\n\n\
@@ -305,7 +306,7 @@ const ARRANGED: &[&str] = &[
 <Icon name=\"arrow-right\" x=\"1400\" y=\"800\" size=\"96\" />\n\n\
 <Box x=\"900\" y=\"200\" w=\"300\" h=\"200\" rotate=\"37\">\n\nIn a box\n\n</Box>\n\n---\nlayout: two-columns\n---\n\n# Two\n\n- one\n- two\n\n<Region name=\"right\" />\n\nright words\n\n---\n\n# Three\n\n<Shape kind=\"rect\" x='10' y=20 />\n",
     "---\r\nlayout: content\r\nregion.body: y 300   x 100 w 900\r\nregion.title: rotate 10 click 2\r\n---\r\n\r\n# Placed\r\n\r\n- a\r\n- b\r\n- c\r\n\r\n<Shape\r\n  kind=\"ellipse\"\r\n  x=\"1200.5\" y=\"-20\" w=\"3840\" h=\"1\"\r\n/>\r\n\r\n<Icon name=\"star\" x=\"400\" y=\"700\" w=\"120\" click=\"x\" enter=\"fade\" />\r\n\r\n<Shape kind=\"rect\" x=\"0\" y=\"0\" w=\"1920\" h=\"1080\" click=\"9\" />\r\n\r\n---\r\n\r\n# Two\r\n\r\nwords\r\n\r\n<Notes>\r\nsay this\r\n</Notes>\r\n",
-    "# One\n\n<Box x=\"100\" y=\"100\" w=\"400\" h=\"300\">\n\n<Icon name=\"star\" />\n\n</Box>\n\n<Shape kind=\"rect\" x=\"600\" y=\"600\" w=\"300\" h=\"200\" rotate=\"-360\" />\n\n<Shape kind=\"rect\" x=\"600\" y=\"600\" w=\"300\" h=\"200\" rotate=\"359.9\" />\n\n<Shape kind=\"rect\" x=\"600\" y=\"600\" w=\"300\" h=\"200\" rotate=\"90\" />\n\n| x | y |\n| - | - |\n| 1 | 2 |\n\n---\nlayout: blank\ntransition: push\n---\n\n<Shape kind=\"line\" x=\"100\" y=\"500\" w=\"800\" h=\"8\" />\n",
+    "# One\n\n<Box x=\"100\" y=\"100\" w=\"400\" h=\"300\">\n\n<Icon name=\"star\" />\n\n</Box>\n\n<Shape kind=\"rect\" x=\"600\" y=\"600\" w=\"300\" h=\"200\" rotate=\"-360\" />\n\n<Shape kind=\"rect\" x=\"600\" y=\"600\" w=\"300\" h=\"200\" rotate=\"359.9\" />\n\n<Shape kind=\"rect\" x=\"600\" y=\"600\" w=\"300\" h=\"200\" rotate=\"90\" />\n\n| x | y |\n| - | - |\n| 1 | 2 |\n\n<Notes>\nSay this first.\n</Notes>\n\n---\nlayout: blank\ntransition: push\n---\n\n<Shape kind=\"line\" x=\"100\" y=\"500\" w=\"800\" h=\"8\" />\n",
 ];
 
 /// How many steps a run of arranging makes.
@@ -325,9 +326,7 @@ fn things_here(doc: &mut Document) -> Vec<Thing> {
 /// position and size to a whole unit, its turn to a tenth of a degree.
 fn reads_back(doc: &mut Document, asked: &[Placed], ctx: &str) {
     let (now, _) = doc.movable_selected();
-    if now.len() != asked.len() {
-        return;
-    }
+    assert_eq!(now.len(), asked.len(), "{ctx}: {} things were placed, and {} read back\n{}", asked.len(), now.len(), doc.source());
     for ((thing, now), asked) in now.iter().zip(asked) {
         let (a, b) = (now.rect, asked.rect);
         let near = |is: f32, was: f32, by: f32| (is - was).abs() <= by;
@@ -464,7 +463,8 @@ fn arrange_run(talk: &str, seed: u64, steps: usize) {
         };
         match result {
             Ok(changed) => {
-                // Arranging and animating one slide never changes another's bytes.
+                // Arranging, animating or changing the layout of one slide never changes
+                // another's bytes.
                 let one_slide = matches!(choice, 4..=13 | 15..=17);
                 if one_slide {
                     let a = slices(&before_src);
@@ -546,16 +546,54 @@ fn right_click(typing: &typing::Typing, cx: &mut TestAppContext, at: gpui_kit::P
     typing.settle(cx);
 }
 
+/// Clicks the element `id` if it's drawn, and says whether it was.
+fn click_if_shown(typing: &typing::Typing, cx: &mut TestAppContext, id: impl Into<gpui_kit::ElementId>) -> bool {
+    let id = id.into();
+    if typing::bounds_of(typing, cx, id.clone()).is_none() {
+        return false;
+    }
+    typing::click_on(typing, cx, id);
+    true
+}
+
+/// Clicks item `at` of the menu open, if one is, of `count` items; if it's still open after, as
+/// after an item that's off or a line between them, Escape closes it.
+fn pick_from_menu(typing: &typing::Typing, cx: &mut TestAppContext, at: usize, count: usize) {
+    use gpui_kit::test::TestWindowExt as _;
+    let open = |typing: &typing::Typing, cx: &mut TestAppContext| {
+        typing.with_window(cx, |window, cx| {
+            window.render_frame(cx);
+            window.try_find("popup-menu").is_some()
+        })
+    };
+    if !open(typing, cx) {
+        return;
+    }
+    typing.with_window(cx, |window, cx| window.within("popup-menu").click(at % count, cx));
+    typing.settle(cx);
+    if open(typing, cx) {
+        typing.press(cx, "escape");
+    }
+}
+
 fn window_run(cx: &mut TestAppContext, talk: &str, seed: u64) {
+    use stagepack_studio::animate_tools::{EARLIER_ID, ENTRANCE_ID, LATER_ID, ONE_AT_A_TIME_ID, TRANSITION_ID};
+    use stagepack_studio::arrange::Handle;
+    use stagepack_studio::arrange_tools::ARRANGE_ID;
     use stagepack_studio::insert_tools::INSERT_TEXT_BOX_ID;
-    use stagepack_studio::ribbon::TAB_INSERT_ID;
+    use stagepack_studio::layout_picker::layout_tile_id;
+    use stagepack_studio::ribbon::{LAYOUT_ID, TAB_ANIMATE_ID, TAB_HOME_ID, TAB_INSERT_ID, TAB_VIEW_ID, TOGGLE_INSPECTOR_ID};
+    use stagepack_studio::slide_editor::handle_id;
     let typing = typing::open(cx, talk);
+    // The active window, as one being used is: only then does the keyboard going to the list or
+    // the notes let go of what's selected.
+    typing.with_window(cx, |window, _| window.activate_window());
     cx.simulate_window_resize(typing.handle, gpui_kit::size(gpui_kit::px(1800.), gpui_kit::px(900.)));
     typing.settle(cx);
     let original = typing.source(cx);
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     for step in 0..WINDOW_STEPS {
-        let choice = rng.below(22);
+        let choice = rng.below(27);
         let elements = typing.layout(cx).elements().to_vec();
         let element = (!elements.is_empty()).then(|| elements[rng.below(elements.len())].clone());
         let modifiers = [Modifiers::default(), Modifiers::shift(), Modifiers::control()][rng.below(3)];
@@ -611,6 +649,69 @@ fn window_run(cx: &mut TestAppContext, talk: &str, seed: u64) {
                 typing::click_on(&typing, cx, INSERT_TEXT_BOX_ID);
             }
             (17, _) => typing.press(cx, "ctrl-d"),
+            // The Arrange menu, any of its items.
+            (18, _) => {
+                click_if_shown(&typing, cx, TAB_HOME_ID);
+                if click_if_shown(&typing, cx, ARRANGE_ID) {
+                    pick_from_menu(&typing, cx, rng.below(14), 14);
+                }
+            }
+            // The Animate tab: an entrance, a click earlier or later, one at a time, a transition.
+            (19, _) => {
+                click_if_shown(&typing, cx, TAB_ANIMATE_ID);
+                match rng.below(5) {
+                    0 => {
+                        if click_if_shown(&typing, cx, ENTRANCE_ID) {
+                            pick_from_menu(&typing, cx, rng.below(4), 4);
+                        }
+                    }
+                    1 => {
+                        click_if_shown(&typing, cx, EARLIER_ID);
+                    }
+                    2 => {
+                        click_if_shown(&typing, cx, LATER_ID);
+                    }
+                    3 => {
+                        click_if_shown(&typing, cx, ONE_AT_A_TIME_ID);
+                    }
+                    _ => {
+                        if click_if_shown(&typing, cx, TRANSITION_ID) {
+                            pick_from_menu(&typing, cx, rng.below(3), 3);
+                        }
+                    }
+                }
+                if rng.below(2) == 0 {
+                    click_if_shown(&typing, cx, TAB_HOME_ID);
+                }
+            }
+            // A layout's tile.
+            (20, _) => {
+                click_if_shown(&typing, cx, TAB_HOME_ID);
+                if click_if_shown(&typing, cx, LAYOUT_ID) {
+                    let layout = layouts()[rng.below(layouts().len())].name;
+                    if !click_if_shown(&typing, cx, layout_tile_id(layout)) {
+                        typing.press(cx, "escape");
+                    }
+                }
+            }
+            // The form beside the slide, hidden or shown.
+            (21, _) => {
+                click_if_shown(&typing, cx, TAB_VIEW_ID);
+                click_if_shown(&typing, cx, TOGGLE_INSPECTOR_ID);
+                click_if_shown(&typing, cx, TAB_HOME_ID);
+            }
+            // A handle of the thing selected, dragged, with Shift or Ctrl held from the press.
+            (22, _) => {
+                let handle = Handle::ALL[rng.below(Handle::ALL.len())];
+                if let Some(bounds) = typing::bounds_of(&typing, cx, handle_id(handle)) {
+                    let from = bounds.center();
+                    let to = gpui_kit::point(from.x + gpui_kit::px(rng.below(121) as f32 - 60.), from.y + gpui_kit::px(rng.below(121) as f32 - 60.));
+                    typing.mouse_down(cx, from, 1, modifiers);
+                    typing.move_held(cx, gpui_kit::point((from.x + to.x) / 2., (from.y + to.y) / 2.), modifiers);
+                    typing.move_held(cx, to, modifiers);
+                    typing.mouse_up(cx, to, 1, modifiers);
+                }
+            }
             _ => typing.type_text(cx, "b"),
         }
         let held = list_or_notes_have_keyboard(&typing, cx);

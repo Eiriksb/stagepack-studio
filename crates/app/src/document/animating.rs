@@ -159,10 +159,13 @@ impl Document {
         } else {
             // Finishing the typing tidied the talk: what's selected may no longer be what was
             // asked about, and what's typed in is worked out again.
-            if typed.is_none() {
-                return Err(EditRefused::CouldNotBeMade);
-            }
-            self.animation_words(slide, choice, enter, typed.clone())?
+            // A box typed in is looked up again by where its tag starts.
+            let again = match &typed {
+                None => return Err(EditRefused::CouldNotBeMade),
+                Some(Target::Tag(source)) => Some(Target::Tag(self.tag_from(slide, source.start).ok_or(EditRefused::CouldNotBeMade)?)),
+                Some(region) => Some(region.clone()),
+            };
+            self.animation_words(slide, choice, enter, again)?
         };
         let fixed = self.deck.fixed_steps(slide);
         let depth = self.history.depth();

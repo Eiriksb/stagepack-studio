@@ -618,3 +618,29 @@ fn a_press_on_a_neighbouring_areas_offer_is_that_areas(cx: &mut TestAppContext) 
     assert_eq!(editing.flow.region(), Some("right"));
     assert_eq!(typing.source(cx), talk);
 }
+
+#[gpui_kit::test]
+fn the_right_button_let_go_of_during_a_drag_does_not_end_it(cx: &mut TestAppContext) {
+    use gpui_kit::{InputEvent as _, MouseButton, MouseUpEvent};
+    let typing = open(cx, TALK);
+    let from = middle_of(&typing, cx, RECT);
+    let to = from + point(px(90.), px(40.));
+    typing.mouse_down(cx, from, 1, Modifiers::default());
+    typing.move_held(cx, from + point(px(30.), px(10.)), NO_SNAP);
+    typing.move_held(cx, to, NO_SNAP);
+    typing.with_window(cx, |window, cx| {
+        let up = MouseUpEvent { button: MouseButton::Right, position: to, modifiers: NO_SNAP, click_count: 1 };
+        window.dispatch_event(up.to_platform_input(), cx);
+    });
+    typing.settle(cx);
+    assert_eq!(typing.source(cx), TALK, "nothing is written");
+    assert!(placing(&typing, cx), "the drag goes on");
+    // The left button let go of writes it where it is then.
+    let to = to + point(px(20.), px(0.));
+    typing.move_held(cx, to, NO_SNAP);
+    typing.mouse_up(cx, to, 1, NO_SNAP);
+    let (dx, dy) = on_slide(&typing, cx, from, to);
+    let place = format!("x=\"{}\" y=\"{}\"", written(1300., dx), written(300., dy));
+    assert_eq!(typing.source(cx), TALK.replacen(RECT_PLACE, &place, 1));
+    assert_eq!(undo_label(&typing, cx), Some("Move"));
+}
