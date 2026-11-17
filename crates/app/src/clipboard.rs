@@ -421,11 +421,20 @@ fn carried_entry(markdown: &str, files: &[CopiedFile], payload: impl Fn(String, 
     (json.len() <= MAX_METADATA_BYTES).then(|| Entry { text: markdown.to_string(), metadata: Some(json) })
 }
 
-/// `text` as the one thing on a slide it holds, as every thing that's pasted is made: cleaned
-/// as typed text is, it must read, after a break line, as one slide holding exactly one block,
-/// a tag or a table, within [`MAX_SLIDE_BYTES`], with no settings, notes or quote, and nothing
-/// else. What's given is that block's own text, with `\n` line endings.
+/// `text` as the one thing on a slide it holds: see [`some_things`], for exactly one.
 pub fn one_element(text: &str) -> Option<String> {
+    some_things(text).filter(|things| things.len() == 1)?.pop()
+}
+
+/// The most things one paste puts on a slide.
+pub const MAX_PASTED_THINGS: usize = 200;
+
+/// `text` as the things on a slide it holds, as every thing that's pasted is made: cleaned as
+/// typed text is, it must read, after a break line, as one slide holding one block or more, up
+/// to [`MAX_PASTED_THINGS`], each a tag or a table, within [`MAX_SLIDE_BYTES`], with no
+/// settings, notes or quote, and nothing else. What's given is each block's own text, in order,
+/// with `\n` line endings.
+pub fn some_things(text: &str) -> Option<Vec<String>> {
     if text.len() > MAX_SLIDE_BYTES {
         return None;
     }
@@ -434,9 +443,13 @@ pub fn one_element(text: &str) -> Option<String> {
         let talk = parse_talk(&format!("---\n{text}"));
         let [slide] = talk.slides.as_slice() else { return None };
         let alone = slide.settings.is_none() && slide.notes.is_none() && slide.error.is_none() && slide.inline_tags.is_empty() && slide.quotes.is_empty();
-        let [block] = slide.blocks.as_slice() else { return None };
-        let a_thing = matches!(block, Block::Tag(_) | Block::Table { .. });
-        (alone && a_thing && !holds_notes(&talk.source, &slide.blocks)).then(|| block_text(&talk, 0, block.range())).flatten()
+        let things = !slide.blocks.is_empty()
+            && slide.blocks.len() <= MAX_PASTED_THINGS
+            && slide.blocks.iter().all(|block| matches!(block, Block::Tag(_) | Block::Table { .. }));
+        if !alone || !things || holds_notes(&talk.source, &slide.blocks) {
+            return None;
+        }
+        slide.blocks.iter().map(|block| block_text(&talk, 0, block.range())).collect()
     })
     .ok()
     .flatten()

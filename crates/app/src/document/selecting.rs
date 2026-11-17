@@ -1,4 +1,4 @@
-//! The thing selected on a slide: picking it, its settings, and taking it away.
+//! The things selected on a slide: picking them, their settings, and taking them away.
 
 use super::*;
 
@@ -17,37 +17,125 @@ impl Document {
         editing.flow.find(&flows)
     }
 
-    /// The thing selected on a slide, if any. It's the editor's view of the talk, not part of
-    /// it: nothing of it is written, and it's no change to save or undo.
+    /// The one block selected on a slide, if that's all that's selected. It's the editor's view
+    /// of the talk, not part of it: nothing of it is written, and it's no change to save or undo.
     pub fn selected(&self) -> Option<&Selected> {
         self.selected.as_ref()
+    }
+
+    /// Everything selected on a slide, if anything is: its blocks and its layout's areas.
+    pub fn selection(&self) -> Option<&selection::Selection> {
+        self.selection.as_ref()
     }
 
     /// Selects the thing on slide `slide` whose whole source is `source`, which must be one the
     /// slide's layout can pick, and makes `slide` the current one. Any typing ends first. Says
     /// whether there's such a thing.
     pub fn select(&mut self, slide: usize, source: Range<usize>) -> bool {
-        if slide >= self.slide_count() || self.text_layout(slide).element(&source).is_none() {
+        self.pick(slide, vec![Thing::Block(source)])
+    }
+
+    /// Adds `thing` on slide `slide` to what's selected, or takes it away if it's selected
+    /// already; a thing on another slide is selected alone. Says whether there's such a thing.
+    pub fn select_also(&mut self, slide: usize, thing: Thing) -> bool {
+        if !self.can_pick(slide, &thing) {
             return false;
         }
-        // Ending the typing can move the thing, and the selection moves with it.
-        self.selected = Some(Selected { slide, source });
+        let mut things = match &self.selection {
+            Some(selection) if selection.slide == slide => selection.things.clone(),
+            _ => Vec::new(),
+        };
+        match things.iter().position(|picked| *picked == thing) {
+            Some(at) => {
+                things.remove(at);
+            }
+            None => things.push(thing),
+        }
+        if things.is_empty() {
+            self.deselect();
+            return true;
+        }
+        self.pick(slide, things)
+    }
+
+    /// Selects area `region` of slide `slide`'s layout alone. Says whether its layout has one.
+    pub fn select_region(&mut self, slide: usize, region: &str) -> bool {
+        self.pick(slide, vec![Thing::Region(region.to_string())])
+    }
+
+    /// Selects every thing on the current slide, in the order they're written, but none of its
+    /// layout's areas. Says whether there's anything to select.
+    pub fn select_all_things(&mut self) -> bool {
+        let slide = self.current;
+        let things: Vec<Thing> = self.tab_order(slide).into_iter().filter(|thing| matches!(thing, Thing::Block(_))).collect();
+        !things.is_empty() && self.pick(slide, things)
+    }
+
+    /// Every thing on slide `slide` in the order Tab goes through them: its things in the order
+    /// they're written, an outer one before what's in it, and then its layout's areas.
+    pub fn tab_order(&mut self, slide: usize) -> Vec<Thing> {
+        if slide >= self.slide_count() {
+            return Vec::new();
+        }
+        let layout = self.text_layout(slide);
+        let mut blocks: Vec<Range<usize>> = layout.elements().iter().map(|element| element.source.clone()).collect();
+        blocks.sort_by_key(|source| (source.start, std::cmp::Reverse(source.end)));
+        blocks.dedup();
+        let areas = layout.regions().iter().map(|region| Thing::Region(region.name.clone()));
+        blocks.into_iter().map(Thing::Block).chain(areas).collect()
+    }
+
+    /// Whether `thing` is one slide `slide`'s layout can pick.
+    fn can_pick(&mut self, slide: usize, thing: &Thing) -> bool {
+        if slide >= self.slide_count() {
+            return false;
+        }
+        let layout = self.text_layout(slide);
+        match thing {
+            Thing::Block(source) => layout.element(source).is_some(),
+            Thing::Region(name) => layout.region(name).is_some(),
+        }
+    }
+
+    /// Selects `things` on slide `slide`, each of which must be one its layout can pick, and
+    /// makes `slide` the current one. Any typing ends first. Says whether they were selected.
+    pub(super) fn pick(&mut self, slide: usize, mut things: Vec<Thing>) -> bool {
+        let mut seen = Vec::new();
+        things.retain(|thing| !seen.contains(thing) && {
+            seen.push(thing.clone());
+            true
+        });
+        if things.is_empty() || !things.iter().all(|thing| self.can_pick(slide, thing)) {
+            return false;
+        }
+        // Ending the typing can move the things, and the selection moves with them.
+        self.set_selection(Some(selection::Selection { slide, things }));
         self.picks += 1;
         if let Err(refused) = self.end_text() {
             self.say(refused);
         }
-        let Some(slide) = self.selected.as_ref().map(|selected| selected.slide) else {
+        let Some(slide) = self.selection.as_ref().map(|selection| selection.slide) else {
             return false;
         };
         self.go_to(slide);
         true
     }
 
-    /// Lets go of the thing selected, if any.
+    /// Lets go of everything selected, if anything is.
     pub fn deselect(&mut self) {
-        if self.selected.take().is_some() {
+        if self.selection.is_some() {
+            self.set_selection(None);
             self.picks += 1;
         }
+    }
+
+    /// Makes `selection` what's selected, without counting it as a pick.
+    pub(super) fn set_selection(&mut self, selection: Option<selection::Selection>) {
+        self.selected = selection
+            .as_ref()
+            .and_then(|selection| Some(Selected { slide: selection.slide, source: selection.one_block()?.clone() }));
+        self.selection_slide = selection.as_ref().and_then(|selection| Some(self.talk().slides.get(selection.slide)?.range.clone()));
+        self.selection = selection;
     }
 
     /// Changes each time a thing is selected or let go of, but not as the thing selected is
@@ -91,7 +179,7 @@ impl Document {
         let changed = self.make(CHANGE_SETTING, change, Holds::Slide(slide), slide, slide, None)?;
         if selected && self.history.depth() > depth {
             let after = self.selected.as_ref().map(|selected| selected.source.clone());
-            self.history.select_mark_last(SelectMark { before: Some(source), after });
+            self.history.select_mark_last(SelectMark::blocks(slide, Some(source), after));
         }
         Ok(changed)
     }
@@ -102,42 +190,111 @@ impl Document {
         guarded(|| find_tag(self.talk(), selected.slide, &selected.source)).ok().flatten()
     }
 
-    /// Where the thing selected is drawn, if anything is.
+    /// Where the thing selected is drawn, if one block is all that's selected.
     pub fn selected_box(&mut self) -> Option<ElementBox> {
         let selected = self.selected.clone()?;
         self.text_layout(selected.slide).element(&selected.source)
     }
 
-    /// Takes the thing selected away, its own lines and one blank line beside them, as one step
-    /// named "Delete", and returns the slides to show again. Undone, it's selected again. It's
-    /// refused when what's around it would read differently without it.
+    /// Where each thing selected is drawn, in the order they were picked: its rectangle before
+    /// it's turned, and the degrees it's turned by. A thing the layout doesn't draw is left out.
+    pub fn selected_boxes(&mut self) -> Vec<(Thing, Rect, f32)> {
+        let Some(selection) = self.selection.clone() else {
+            return Vec::new();
+        };
+        let layout = self.text_layout(selection.slide);
+        selection
+            .things
+            .into_iter()
+            .filter_map(|thing| {
+                let (rect, rotate) = match &thing {
+                    Thing::Block(source) => layout.element(source).map(|element| (element.rect, element.rotate))?,
+                    Thing::Region(name) => layout.region(name).map(|region| (region.rect, region.rotate))?,
+                };
+                Some((thing, rect, rotate))
+            })
+            .collect()
+    }
+
+    /// The blocks selected, in the order they're written, but none inside another selected:
+    /// what deleting, copying or duplicating the selection acts on. Refused when only areas are
+    /// selected.
+    pub(super) fn selected_blocks(&self) -> Result<Option<SlideBlocks>, EditRefused> {
+        let Some(selection) = &self.selection else {
+            return Ok(None);
+        };
+        let mut blocks: Vec<Range<usize>> = selection.blocks().cloned().collect();
+        if blocks.is_empty() {
+            return Err(EditRefused::AreaStays);
+        }
+        blocks.sort_by_key(|source| (source.start, std::cmp::Reverse(source.end)));
+        let outer = blocks.clone();
+        blocks.retain(|block| !outer.iter().any(|other| other != block && other.start <= block.start && block.end <= other.end));
+        Ok(Some((selection.slide, blocks)))
+    }
+
+    /// Takes the things selected away, each one's own lines and one blank line beside them, as
+    /// one step named "Delete", and returns the slides to show again. Undone, they're selected
+    /// again. It's refused when what's around any of them would read differently without it,
+    /// or when only a layout's areas are selected; the areas among things selected stay.
     pub fn delete_selected(&mut self) -> Result<Vec<usize>, EditRefused> {
         self.remove_selected(DELETE)
     }
 
-    /// Takes the thing selected away, as [`Self::delete_selected`] does, as one step named "Cut".
+    /// Takes the things selected away, as [`Self::delete_selected`] does, as one step named "Cut".
     pub fn cut_selected(&mut self) -> Result<Vec<usize>, EditRefused> {
         self.remove_selected(CUT)
     }
 
     fn remove_selected(&mut self, label: &'static str) -> Result<Vec<usize>, EditRefused> {
-        // Typing is finished first, which can move the thing.
+        // Typing is finished first, which can move the things.
         self.finish_before_edit()?;
-        let Some(Selected { slide, source }) = self.selected.clone() else {
+        let Some((slide, blocks)) = self.selected_blocks()? else {
             return Ok(Vec::new());
         };
-        let change = built(self.talk(), |talk| delete_block(talk, slide, &source))?
+        let before = self.selection.clone();
+        let change = built(self.talk(), |talk| each_in_turn(talk, &blocks, |talk, block| delete_block(talk, slide, block)))?
             .ok_or(EditRefused::CouldNotBeRemoved)?;
         let depth = self.history.depth();
         let changed = self.make(label, change, Holds::Slide(slide), slide, slide, None)?;
         if self.history.depth() > depth {
-            self.history.select_mark_last(SelectMark { before: Some(source), after: None });
+            self.history.select_mark_last(SelectMark { before, after: self.selection.clone() });
         }
         Ok(changed)
     }
 
-    /// Moves the selection along with `change`, just made to the talk's text: to where its
-    /// thing's text went, or away if that went.
+    /// Sets the word `name` on the settings line of area `region` of slide `slide` to `value`,
+    /// or takes it away with `None`, as one step named "Change setting", and returns the slides
+    /// to show again. Only that word's bytes change; a value the same as the one there writes
+    /// nothing and makes no step.
+    pub fn set_region_value(&mut self, slide: usize, region: &str, name: &str, value: Option<&str>) -> Result<Vec<usize>, EditRefused> {
+        self.set_region_values(CHANGE_SETTING, slide, region, &[(name, value)])
+    }
+
+    /// Puts area `region` of slide `slide` back where its layout has it, by taking its place
+    /// and its turn off its settings line, as one step named "Put back". Nothing is written, and
+    /// no step made, when it's there already.
+    pub fn put_back_region(&mut self, slide: usize, region: &str) -> Result<Vec<usize>, EditRefused> {
+        let values = PLACE_WORDS.map(|name| (name, None));
+        self.set_region_values(PUT_BACK, slide, region, &values)
+    }
+
+    fn set_region_values(&mut self, label: &'static str, slide: usize, region: &str, values: &[(&str, Option<&str>)]) -> Result<Vec<usize>, EditRefused> {
+        self.finish_before_edit()?;
+        let edits: Vec<ValueEdit> =
+            values.iter().map(|&(name, value)| ValueEdit { target: Target::Region(region.to_string()), name, value }).collect();
+        let change = built(self.talk(), |talk| set_values(talk, slide, &edits))?.ok_or(EditRefused::CouldNotBeMade)?;
+        let before = self.selection.clone().filter(|selection| selection.slide == slide);
+        let depth = self.history.depth();
+        let changed = self.make(label, change, Holds::Slide(slide), slide, slide, None)?;
+        if before.is_some() && self.history.depth() > depth {
+            self.history.select_mark_last(SelectMark { before, after: self.selection.clone() });
+        }
+        Ok(changed)
+    }
+
+    /// Moves the selection along with `change`, just made to the talk's text: each block to
+    /// where its text went, or away if that went, and each area with its slide.
     pub(super) fn follow(&mut self, change: &Change) {
         // The box being typed in moves as the thing selected does; if it can't be followed,
         // typing there ends.
@@ -147,52 +304,128 @@ impl Document {
                 None => self.editing = None,
             }
         }
-        let Some(selected) = self.selected.take() else {
+        let Some(old) = self.selection.take() else {
             return;
         };
+        let anchor = self.selection_slide.take();
         let talk = self.talk();
-        self.selected = selection::moved(&selected.source, change).and_then(|source| {
-            let slide = selection::slide_of(talk, &source)?;
-            selection::has_block(talk, slide, &source).then_some(Selected { slide, source })
-        });
+        let slide_now = anchor.and_then(|range| selection::moved(&range, change)).and_then(|range| selection::slide_of(talk, &range));
+        let moved: Vec<Option<Thing>> = old
+            .things
+            .into_iter()
+            .map(|thing| match thing {
+                Thing::Block(source) => selection::moved(&source, change).map(Thing::Block),
+                region => Some(region),
+            })
+            .collect();
+        let followed = picked_on(talk, moved, slide_now);
+        self.set_selection(followed);
     }
 
-    /// Lets go of the thing selected if text is being typed on its slide outside it: typing
-    /// in the thing keeps it selected, and typing on another slide leaves it be. Whatever starts
-    /// or brings back typing, a click, an undo or a redo, ends with this.
+    /// Lets go of what's selected if text is being typed on its slide outside it: typing in the
+    /// one block selected keeps it selected, and typing on another slide leaves it be. Whatever
+    /// starts or brings back typing, a click, an undo or a redo, ends with this.
     pub(super) fn keep_selection_with_typing(&mut self) {
-        let (Some(editing), Some(selected)) = (&self.editing, &self.selected) else {
+        let (Some(editing), Some(selection)) = (&self.editing, &self.selection) else {
             return;
         };
-        if editing.slide != selected.slide {
+        if editing.slide != selection.slide {
             return;
         }
-        if editing.flow.tag_start() == Some(selected.source.start) {
+        let Some(source) = selection.one_block().cloned() else {
+            self.set_selection(None);
+            return;
+        };
+        if editing.flow.tag_start() == Some(source.start) {
             return;
         }
         let para = editing.edit.selection.head.para;
         let inside = self
             .text_flow()
-            .is_some_and(|flow| selection::holds_para(&self.text_flows(self.talk(), editing.slide), flow, para, &selected.source));
+            .is_some_and(|flow| selection::holds_para(&self.text_flows(self.talk(), editing.slide), flow, para, &source));
         if !inside {
-            self.selected = None;
+            self.set_selection(None);
         }
     }
 
-    /// Selects what a step of the history marked, once it's undone or made again: the thing at
-    /// `source`, or nothing.
-    pub(super) fn select_marked(&mut self, source: Option<Option<Range<usize>>>) {
-        let Some(source) = source else {
+    /// Selects what a step of the history marked, once it's undone or made again: its things
+    /// that are still there, or nothing.
+    pub(super) fn select_marked(&mut self, marked: Option<Option<selection::Selection>>) {
+        let Some(marked) = marked else {
             return;
         };
         let talk = self.talk();
-        let selected = source.and_then(|source| {
-            let slide = selection::slide_of(talk, &source)?;
-            selection::has_block(talk, slide, &source).then_some(Selected { slide, source })
+        let selection = marked.and_then(|marked| {
+            let slide = (marked.slide < talk.slides.len()).then_some(marked.slide);
+            picked_on(talk, marked.things.into_iter().map(Some).collect(), slide)
         });
-        if selected != self.selected {
-            self.selected = selected;
+        // An area the slide's layout no longer has isn't selected.
+        let selection = selection.and_then(|selection| {
+            let layout = self.text_layout(selection.slide);
+            let things: Vec<Thing> = selection
+                .things
+                .into_iter()
+                .filter(|thing| match thing {
+                    Thing::Region(name) => layout.region(name).is_some(),
+                    Thing::Block(_) => true,
+                })
+                .collect();
+            (!things.is_empty()).then_some(selection::Selection { slide: selection.slide, things })
+        });
+        if selection != self.selection {
+            self.set_selection(selection);
             self.picks += 1;
         }
     }
+}
+
+/// A slide, and blocks on it by their whole source.
+pub(super) type SlideBlocks = (usize, Vec<Range<usize>>);
+
+/// The words of an area's settings line that place and turn it.
+const PLACE_WORDS: [&str; 5] = ["x", "y", "w", "h", "rotate"];
+
+/// What's selected on `talk` of `things`, each as it is now or gone: the blocks still there, on
+/// the slide the first of them is on, and the areas, if that's `slide`, the slide the areas are
+/// on. Nothing if none are left.
+fn picked_on(talk: &Talk, things: Vec<Option<Thing>>, slide: Option<usize>) -> Option<selection::Selection> {
+    let block_slide = |source: &Range<usize>| selection::slide_of(talk, source).filter(|&at| selection::has_block(talk, at, source));
+    let on = things
+        .iter()
+        .flatten()
+        .find_map(|thing| match thing {
+            Thing::Block(source) => block_slide(source),
+            Thing::Region(_) => None,
+        })
+        .or(slide)?;
+    let things: Vec<Thing> = things
+        .into_iter()
+        .flatten()
+        .filter(|thing| match thing {
+            Thing::Block(source) => block_slide(source) == Some(on),
+            Thing::Region(_) => slide == Some(on),
+        })
+        .collect();
+    (!things.is_empty()).then_some(selection::Selection { slide: on, things })
+}
+
+/// The one change that makes `each`, for every range of `ranges`, to `talk`, in turn from the
+/// last written to the first, each worked out on the talk as the ones before it leave it. A
+/// single range gets the change `each` gives for it. `None` if any of them is.
+pub(super) fn each_in_turn(talk: &Talk, ranges: &[Range<usize>], each: impl Fn(&Talk, &Range<usize>) -> Option<Change>) -> Option<Change> {
+    if let [range] = ranges {
+        return each(talk, range);
+    }
+    let mut ranges: Vec<Range<usize>> = ranges.to_vec();
+    ranges.sort_by_key(|range| std::cmp::Reverse(range.start));
+    let mut now = talk.clone();
+    let mut left = ranges;
+    while !left.is_empty() {
+        let range = left.remove(0);
+        let change = each(&now, &range)?;
+        left = left.iter().map(|other| selection::moved(other, &change)).collect::<Option<_>>()?;
+        let text = change.apply(&now.source);
+        now = reparse(&now, text);
+    }
+    Some(one_edit(&talk.source, &now.source))
 }

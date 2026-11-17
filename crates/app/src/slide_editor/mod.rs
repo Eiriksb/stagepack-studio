@@ -22,7 +22,7 @@ use slides_format::{Block, FlowPlace, Motion, Para, ParaKind, Pos, Selection, Sp
 use crate::clipboard::{self, TextPaste};
 use crate::clipboard_tools::write_clipboard;
 use crate::document::{Beside, CellMove, Document, EditRefused};
-use crate::selection::{self, Selected};
+use crate::selection::{self, Thing};
 use crate::slide_canvas::{SLIDE_WIDTH, SlideCanvas, letterbox};
 use crate::insert::TEXT_BOX_SIZE;
 use crate::text_editing::{Composing, EditingText, clean_typed, one_line, utf16_slice};
@@ -49,8 +49,18 @@ pub const CARET_ID: &str = "caret";
 pub const COMPOSITION_ID: &str = "composition";
 /// The dashed line around a new text box that isn't written yet.
 pub const NEW_BOX_ID: &str = "new-text-box";
-/// The outline around the thing selected on the slide.
+/// The outline around the thing selected on the slide, or of several, the one picked last.
 pub const SELECTION_OUTLINE_ID: &str = "selection-outline";
+
+/// The outline around the `n`th thing picked of several selected, but the one picked last.
+pub fn selection_outline_id(n: usize) -> String {
+    format!("selection-outline-{n}")
+}
+
+/// The dashed frame around the area `name` of the slide's layout, while its text is typed.
+pub fn region_frame_id(name: &str) -> String {
+    format!("region-frame-{name}")
+}
 
 /// The key context the editor's keys apply in, while text is being typed.
 pub const EDITOR_CONTEXT: &str = "SlideEditor";
@@ -66,6 +76,8 @@ const TYPING_PAUSE: Duration = Duration::from_secs(2);
 const CARET_WIDTH: f32 = 2.0;
 /// How wide the outline around the thing selected is drawn, in the window's pixels.
 const OUTLINE_WIDTH: f32 = 2.0;
+/// How near the frame of the area being typed in, in the window's pixels, a press picks the area.
+const FRAME_REACH: f32 = 5.0;
 /// How big the text being composed is drawn, to the height of the caret.
 const COMPOSITION_TEXT: f32 = 0.7;
 
@@ -92,8 +104,9 @@ pub struct SlideEditor {
     focus_handle: FocusHandle,
     /// Where the keyboard goes once typing ends: the window's own.
     away: FocusHandle,
-    /// The keyboard of the list of slides, if the editor is to take the keyboard from it.
-    list: Option<FocusHandle>,
+    /// The keyboards of the list of slides and the notes, which the editor takes the keyboard
+    /// from once a thing on the slide shown is selected while one of them has it.
+    panels: Vec<FocusHandle>,
     /// What holds the text tools: the keyboard can go there and typing goes on.
     tools: FocusHandle,
     /// What else the keyboard can go to while typing goes on, as the icon picker's search.
@@ -111,6 +124,9 @@ pub struct SlideEditor {
     wanted_x: Option<f32>,
     /// Whether a press on the text is being dragged, selecting.
     dragging: bool,
+    /// One of several things selected that a press landed on, which is selected alone once the
+    /// button is let go of.
+    pressed: Option<(usize, Thing)>,
     /// What the status line was told of the thing selected on the slide shown, if anything is.
     told: Option<SharedString>,
 
@@ -190,7 +206,7 @@ impl SlideEditor {
             canvas,
             focus_handle,
             away,
-            list: None,
+            panels: Vec::new(),
             tools,
             more_tools: Vec::new(),
             caret_on: true,
@@ -200,6 +216,7 @@ impl SlideEditor {
             pause: None,
             wanted_x: None,
             dragging: false,
+            pressed: None,
             told: None,
             ime_place: None,
             _subscriptions: subscriptions,
@@ -222,10 +239,10 @@ impl SlideEditor {
         self.more_tools.push(tools);
     }
 
-    /// Has the editor take the keyboard from the list of slides, which `list` is the keyboard
-    /// of, once a thing on the slide shown is selected while the list has it.
-    pub fn take_keyboard_from_list(&mut self, list: FocusHandle) {
-        self.list = Some(list);
+    /// Has the editor take the keyboard from a panel, the list of slides or the notes, which
+    /// `panel` is the keyboard of, once a thing on the slide shown is selected while it has it.
+    pub fn take_keyboard_from(&mut self, panel: FocusHandle) {
+        self.panels.push(panel);
     }
 
     /// Whether the text tools, or something else that can have the keyboard while typing goes
@@ -255,10 +272,10 @@ impl SlideEditor {
         } else {
             self.stop(cx);
             if self.selection_here(cx).is_some() {
-                // From the list of slides too, as by an Undo pressed there: a thing shown as
-                // selected while the list has the keyboard would have Delete take its slide.
-                let list_has_it = self.list.as_ref().is_some_and(|list| list.contains_focused(window, cx));
-                if !focused && (self.away.is_focused(window) || list_has_it) {
+                // From the list of slides or the notes too, as by an Undo pressed there: a thing
+                // shown as selected while the list has the keyboard would have Delete take its slide.
+                let panel_has_it = self.panels.iter().any(|panel| panel.contains_focused(window, cx));
+                if !focused && (self.away.is_focused(window) || panel_has_it) {
                     self.focus_handle.focus(window, cx);
                 }
             } else if focused {

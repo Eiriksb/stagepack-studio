@@ -11,19 +11,37 @@ impl Inspector {
             return Err(EditRefused::CouldNotBeMade);
         };
         let (pick, target) = (form.shape.pick, form.target.clone());
-        let made = self
-            .workspace
-            .update(cx, |workspace, cx| workspace.set_attr_from_inspector(pick, &target, name, value, cx))
-            .unwrap_or(Err(EditRefused::CouldNotBeMade));
+        let made = match &target {
+            Subject::Thing(target) => self
+                .workspace
+                .update(cx, |workspace, cx| workspace.set_attr_from_inspector(pick, target, name, value, cx))
+                .unwrap_or(Err(EditRefused::CouldNotBeMade)),
+            Subject::Area { slide, name: area, .. } => self
+                .workspace
+                .update(cx, |workspace, cx| workspace.set_region_value_from_inspector(*slide, area, name, value, cx))
+                .unwrap_or(Err(EditRefused::CouldNotBeMade)),
+            Subject::Several => Err(EditRefused::CouldNotBeMade),
+        };
         // The thing's text has grown or shrunk: the form follows it there at once.
         let moved = self.document.as_ref().and_then(|document| {
             let document = document.read(cx);
             document.selected().filter(|_| document.selection_pick() == pick).cloned()
         });
-        if let (Some(form), Some(moved)) = (&mut self.form, moved) {
-            form.target = moved;
+        if let (Some(form), Some(moved)) = (&mut self.form, moved)
+            && matches!(form.target, Subject::Thing(_))
+        {
+            form.target = Subject::Thing(moved);
         }
         made
+    }
+
+    /// Puts the area the form is for back where its layout has it.
+    pub(super) fn put_area_back(&mut self, cx: &mut Context<Self>) {
+        let Some(Subject::Area { slide, name, .. }) = self.form.as_ref().map(|form| form.target.clone()) else {
+            return;
+        };
+        self.workspace.update(cx, |workspace, cx| workspace.put_back_region_from_inspector(slide, &name, cx)).ok();
+        cx.notify();
     }
 
     /// Writes what text or number field `index` holds, if something's been typed in it. What was
@@ -169,7 +187,9 @@ impl Inspector {
         if held.is_empty() {
             return;
         }
-        let (pick, target, workspace) = (form.shape.pick, form.target, self.workspace.clone());
+        let (pick, Subject::Thing(target), workspace) = (form.shape.pick, form.target, self.workspace.clone()) else {
+            return;
+        };
         cx.defer(move |cx| {
             for (name, color) in held {
                 workspace

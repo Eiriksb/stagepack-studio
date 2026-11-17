@@ -123,6 +123,33 @@ impl WorkspaceView {
         made
     }
 
+    /// Sets the word `name` of area `region` of slide `slide` to `value`, or takes it away, from
+    /// the inspector, and says whether it was set.
+    pub(crate) fn set_region_value_from_inspector(
+        &mut self,
+        slide: usize,
+        region: &str,
+        name: &str,
+        value: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), EditRefused> {
+        let mut made = Err(EditRefused::CouldNotBeMade);
+        self.edit(
+            |document| {
+                let result = document.set_region_value(slide, region, name, value);
+                made = result.as_ref().map(|_| ()).map_err(|refused| *refused);
+                result
+            },
+            cx,
+        );
+        made
+    }
+
+    /// Puts area `region` of slide `slide` back where its layout has it, from the inspector.
+    pub(crate) fn put_back_region_from_inspector(&mut self, slide: usize, region: &str, cx: &mut Context<Self>) {
+        self.edit(|document| document.put_back_region(slide, region), cx);
+    }
+
     /// Whether the inspector shows: whenever a talk is open, so the slide's place never
     /// changes as things are selected and let go of.
     pub(super) fn shows_inspector(&self) -> bool {
@@ -262,7 +289,7 @@ impl WorkspaceView {
         }
         // The thing selected on the slide shown, unless the list of slides has the keyboard.
         let in_list = self.slide_strip.read(cx).focus_handle().contains_focused(window, cx);
-        let thing_here = document.read(cx).selected().is_some_and(|selected| selected.slide == document.read(cx).current());
+        let thing_here = document.read(cx).selection().is_some_and(|selection| selection.slide == document.read(cx).current());
         if thing_here && !in_list {
             if self.copy_thing(cx) && cut {
                 self.edit(Document::cut_selected, cx);
@@ -355,9 +382,12 @@ impl WorkspaceView {
         let Some(document) = self.document.clone() else {
             return false;
         };
-        let Some((text, files)) = document.read(cx).copy_selected() else {
-            self.say(EditRefused::CouldNotBeMade.to_string(), cx);
-            return false;
+        let (text, files) = match document.read(cx).copy_selected() {
+            Ok(copied) => copied,
+            Err(refused) => {
+                self.say(refused.to_string(), cx);
+                return false;
+            }
         };
         let Some(entry) = clipboard::element_entry(&text, &files) else {
             self.say(clipboard::THING_TOO_BIG, cx);

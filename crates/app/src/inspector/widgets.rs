@@ -4,10 +4,10 @@ use super::*;
 
 impl Inspector {
     /// Field `index` as it's drawn: its label, what shows its value, and any problem under it.
-    pub(super) fn field_element(&self, index: usize, field: &Field, tag: Option<&Tag>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn field_element(&self, index: usize, field: &Field, values: &Values, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let attr = field.spec.attr.clone();
         let id = SharedString::from(field_id(&attr));
-        let value = tag.and_then(|tag| tag.attr(&attr)).map(str::to_string);
+        let value = values.get(&attr).map(str::to_string);
         let label = SharedString::from(field.spec.label.clone());
         let control: AnyElement = match &field.widget {
             Widget::Input(input) => {

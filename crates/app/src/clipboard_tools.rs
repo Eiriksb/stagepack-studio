@@ -153,7 +153,7 @@ impl Render for ClipboardTools {
         let in_notes = self.notes.as_ref().is_some_and(|notes| notes.contains_focused(window, cx));
         let thing_here = self.document.as_ref().is_some_and(|document| {
             let document = document.read(cx);
-            document.selected().is_some_and(|selected| selected.slide == document.current())
+            document.selection().is_some_and(|selection| selection.slide == document.current())
         });
         let (copy, cut, context) = if in_notes {
             (has_talk, has_talk, STRIP_CONTEXT)

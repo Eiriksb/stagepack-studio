@@ -31,7 +31,7 @@ use crate::insert_tools::{InsertPicture, InsertShape, InsertTextBox};
 use crate::inspector::{self, Inspector};
 use crate::markdown_panel::MarkdownPanel;
 use crate::notes_panel::{
-    NOTES_HEIGHT, NOTES_MAX_HEIGHT, NOTES_MIN_HEIGHT, NotesEdited, NotesPanel,
+    NOTES_HEIGHT, NOTES_MAX_HEIGHT, NOTES_MIN_HEIGHT, NotesEdited, NotesFocused, NotesPanel,
 };
 use crate::permissions::BuildPermissions;
 use crate::present_view::{self, Presentation, start_show};
@@ -345,6 +345,7 @@ pub struct WorkspaceView {
     _keep_failed: Subscription,
     _icon_picked: Subscription,
     _list_focused: Subscription,
+    _notes_focused: Subscription,
     /// A size chosen from the Insert tab's grid of tables.
     _table_picked: Subscription,
     _component_picked: Subscription,
@@ -474,7 +475,7 @@ impl WorkspaceView {
         // it (at once on a press, and by the keyboard as the window next draws), and a thing
         // selected while the list has it takes the keyboard for the slide.
         let list_focus = slide_strip.read(cx).focus_handle().clone();
-        slide_editor.update(cx, |editor, _| editor.take_keyboard_from_list(list_focus.clone()));
+        slide_editor.update(cx, |editor, _| editor.take_keyboard_from(list_focus.clone()));
         // Typing on the slide ends then too, as Escape ends it: no caret shows, and no new text
         // box waits, while the list has the keyboard.
         let editor = slide_editor.downgrade();
@@ -487,6 +488,13 @@ impl WorkspaceView {
         let workspace = cx.weak_entity();
         let inspector = cx.new(|cx| Inspector::new(document.clone(), workspace, cx));
         let notes_focus = notes_panel.read(cx).field().focus_handle(cx);
+        // The notes taking the keyboard let go of what's selected on the slide, and end typing
+        // there, as the list of slides does.
+        slide_editor.update(cx, |editor, _| editor.take_keyboard_from(notes_focus.clone()));
+        let strip = slide_strip.clone();
+        let notes_focused = cx.subscribe_in(&notes_panel, window, move |_, _, _: &NotesFocused, window, cx| {
+            strip.update(cx, |strip, cx| strip.let_go_of_selection(window, cx));
+        });
         clipboard_tools.update(cx, |tools, cx| tools.follow_notes(notes_focus, window, cx));
         let notes_edited = cx.subscribe_in(
             &notes_panel,
@@ -577,6 +585,7 @@ impl WorkspaceView {
             _keep_failed: keep_failed,
             _icon_picked: icon_picked,
             _list_focused: list_focused,
+            _notes_focused: notes_focused,
             _table_picked: table_picked,
             _component_picked: component_picked,
         };

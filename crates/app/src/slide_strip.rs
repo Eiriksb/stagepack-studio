@@ -203,8 +203,9 @@ impl SlideStrip {
         self.editor = Some(editor);
     }
 
-    /// Lets go of the thing selected on a slide, and ends any typing on it as Escape does, as
-    /// the list takes the keyboard: from here Delete and the clipboard act on whole slides, and
+    /// Lets go of what's selected on a slide, things or areas, and ends any typing on it as
+    /// Escape does, as the list or the notes take the keyboard: from the list Delete and the
+    /// clipboard act on whole slides, and
     /// a thing still shown as selected, a caret still drawn or a new text box still waiting for
     /// its first letter would say otherwise. Typing ends at once, before anything the press
     /// goes on to do, so that nothing resumes it and takes the keyboard back for the slide.
@@ -215,7 +216,7 @@ impl SlideStrip {
         }
         if let Some(document) = &self.document {
             document.update(cx, |document, cx| {
-                if document.selected().is_some() {
+                if document.selection().is_some() {
                     document.deselect();
                     cx.notify();
                 }

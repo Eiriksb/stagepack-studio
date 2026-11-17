@@ -5,8 +5,8 @@ use super::*;
 impl Render for Inspector {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let subject = self.subject(cx);
-        let tag = match subject {
-            Some((shape, target, tag)) => {
+        let values = match subject {
+            Some((shape, target, values)) => {
                 match &mut self.form {
                     Some(form) if form.shape == shape => form.target = target,
                     _ => {
@@ -14,14 +14,14 @@ impl Render for Inspector {
                         self.form = Some(self.build_form(shape, target, window, cx));
                     }
                 }
-                tag
+                values
             }
             None => {
                 self.drop_form(cx);
-                None
+                Values::default()
             }
         };
-        self.follow_talk(tag.as_ref(), window, cx);
+        self.follow_talk(&values, window, cx);
         for image in self.retired.drain(..) {
             window.drop_image(image).ok();
         }
@@ -73,10 +73,21 @@ impl Render for Inspector {
         let mut settings = Vec::new();
         let mut place = Vec::new();
         for (index, field) in form.fields.iter().enumerate() {
-            let element = self.field_element(index, field, tag.as_ref(), window, cx);
+            let element = self.field_element(index, field, &values, window, cx);
             if field.spec.place { place.push(element) } else { settings.push(element) }
         }
         let muted = cx.theme().muted_foreground;
+        // An area moved from where its layout has it can be put back.
+        let put_back = match &form.target {
+            Subject::Area { moved, .. } => Some(
+                Button::new(INSPECTOR_PUT_BACK_ID)
+                    .small()
+                    .label("Put back")
+                    .disabled(!moved)
+                    .on_click(cx.listener(|this, _, _, cx| this.put_area_back(cx))),
+            ),
+            _ => None,
+        };
         panel
             .child(
                 div()
@@ -104,5 +115,6 @@ impl Render for Inspector {
                 this.child(div().pt_2().text_xs().font_weight(FontWeight::SEMIBOLD).child("Place"))
                     .children(place)
             })
+            .children(put_back)
     }
 }

@@ -27,11 +27,11 @@ use gpui_kit::component::input::{
 };
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
-use gpui_kit::component::{ActiveTheme as _, IndexPath, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, IndexPath, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use slides_engine::{ComponentInfo, is_positioned, talk_theme};
-use slides_format::{Block, Span, Tag, find_tag};
+use slides_format::{Block, Span, find_tag, region_value};
 use toolkit::ComponentSchema;
 
 use crate::added_files::{FileKind, NotAdded};
@@ -53,6 +53,8 @@ pub const INSPECTOR_HEADING_ID: &str = "inspector-heading";
 pub const INSPECTOR_MESSAGE_ID: &str = "inspector-message";
 /// The button of a file field, inside the field.
 pub const INSPECTOR_CHOOSE_FILE_ID: &str = "inspector-choose-file";
+/// The button that puts an area selected back where its layout has it.
+pub const INSPECTOR_PUT_BACK_ID: &str = "inspector-put-back";
 
 /// How wide the panel is.
 pub const INSPECTOR_WIDTH: Pixels = px(300.);
@@ -138,10 +140,32 @@ struct Field {
     problem: Option<SharedString>,
 }
 
+/// What a form is for.
+#[derive(Clone, PartialEq)]
+enum Subject {
+    /// A thing on a slide, where it is in the talk now.
+    Thing(Selected),
+    /// An area of slide `slide`'s layout, and whether the slide's settings move it from where
+    /// the layout has it.
+    Area { slide: usize, name: String, moved: bool },
+    /// Several things at once, which the form has no fields for.
+    Several,
+}
+
+/// What the thing a form is for has as each of its fields' attributes, or its area's words.
+#[derive(Default)]
+struct Values(Vec<(String, String)>);
+
+impl Values {
+    fn get(&self, name: &str) -> Option<&str> {
+        self.0.iter().find(|(held, _)| held == name).map(|(_, value)| value.as_str())
+    }
+}
+
 struct Form {
     shape: Shape,
-    /// The thing the form is for, where it is in the talk now.
-    target: Selected,
+    /// What the form is for.
+    target: Subject,
     fields: Vec<Field>,
     _subscriptions: Vec<Subscription>,
 }
@@ -282,11 +306,14 @@ impl Inspector {
         self.form.as_mut()?.fields.iter_mut().find(|field| field.spec.attr == name)
     }
 
-    /// What the thing the form is for has as attribute `name`.
+    /// What the thing the form is for has as attribute `name`, or its area as the word `name`.
     fn talk_attr(&self, name: &str, cx: &App) -> Option<String> {
-        let target = &self.form.as_ref()?.target;
         let document = self.document.as_ref()?.read(cx);
-        find_tag(document.talk(), target.slide, &target.source)?.attr(name).map(str::to_string)
+        match &self.form.as_ref()?.target {
+            Subject::Thing(target) => find_tag(document.talk(), target.slide, &target.source)?.attr(name).map(str::to_string),
+            Subject::Area { slide, name: area, .. } => region_value(document.talk().slides.get(*slide)?, area, name).map(str::to_string),
+            Subject::Several => None,
+        }
     }
 }
 

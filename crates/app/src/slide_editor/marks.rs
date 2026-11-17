@@ -1,5 +1,5 @@
-//! Where the caret, the selection of text and the outline of the thing selected are drawn,
-//! and the drawing of them.
+//! Where the caret, the selection of text, the outlines of the things selected and the frame of
+//! the area typed in are drawn, and the drawing of them.
 
 use super::*;
 
@@ -126,10 +126,11 @@ fn empty_box_caret(element: &ElementBox, shape: bool) -> CaretRect {
     }
 }
 
-/// The corners of the thing selected, `element`, turned with it, in slide units.
-pub(super) fn outline_corners(element: &ElementBox) -> [(f32, f32); 4] {
-    let Rect { x, y, w, h } = element.rect;
-    corners(x, y, w, h, (x + w / 2., y + h / 2.), element.rotate)
+/// The corners of a thing selected at `rect`, turned by `rotate` degrees about its middle, in
+/// slide units.
+pub(super) fn outline_corners(rect: Rect, rotate: f32) -> [(f32, f32); 4] {
+    let Rect { x, y, w, h } = rect;
+    corners(x, y, w, h, (x + w / 2., y + h / 2.), rotate)
 }
 
 /// The box `corners`, in slide units, fit in, in the window, on a slide drawn at `slide`
@@ -150,10 +151,10 @@ pub(super) fn corners_box(corners: &[(f32, f32); 4], slide: Bounds<Pixels>, unit
 /// How long each dash of a new box's line is, and the gap after it, in the window's pixels.
 const DASH: f32 = 6.0;
 
-/// Draws a dashed line around `(x, y, w, h)`, in slide units, on a slide drawn at `slide`.
-pub(super) fn paint_dashed((x, y, w, h): (f32, f32, f32, f32), slide: Bounds<Pixels>, unit: f32, color: Hsla, window: &mut Window) {
+/// Draws a dashed line around the four `corners`, in slide units, on a slide drawn at `slide`.
+pub(super) fn paint_dashed(corners: &[(f32, f32); 4], slide: Bounds<Pixels>, unit: f32, color: Hsla, window: &mut Window) {
     let (dash, thick) = (DASH / unit, OUTLINE_WIDTH / 2. / unit);
-    let edges = [((x, y), (x + w, y)), ((x + w, y), (x + w, y + h)), ((x + w, y + h), (x, y + h)), ((x, y + h), (x, y))];
+    let edges = (0..4).map(|at| (corners[at], corners[(at + 1) % 4]));
     for ((x0, y0), (x1, y1)) in edges {
         let length = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
         if length <= 0. {

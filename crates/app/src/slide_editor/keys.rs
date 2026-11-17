@@ -39,6 +39,7 @@ actions!(
         SelectPreviousThing,
         LetGoOfSelected,
         DuplicateSelected,
+        SelectAllThings,
     ]
 );
 
@@ -97,6 +98,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-x", CutToClipboard, selecting),
         KeyBinding::new("ctrl-v", PasteFromClipboard, selecting),
         KeyBinding::new("ctrl-d", DuplicateSelected, selecting),
+        KeyBinding::new("ctrl-a", SelectAllThings, selecting),
     ]);
     crate::text_tools::bind_keys(cx);
 }

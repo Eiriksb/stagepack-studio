@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use slides_components::{BuildEntry, BuildIndex, Diagnostic, INDEX_FILE, source_hash};
 use slides_engine::{
-    AddedSet, Align, ComponentInfo, ComponentState, Deck, SchemaLoad, ElementBox, FolderFiles, Fonts, Layer, LayerTiming, Moment, PackError, Pixmap,
+    AddedSet, Align, ComponentInfo, ComponentState, Deck, SchemaLoad, ElementBox, Rect, FolderFiles, Fonts, Layer, LayerTiming, Moment, PackError, Pixmap,
     SlideTimeline, TalkFiles, TextLayout, Transition, WithAdded, layout_by_name, open_packed, text_align,
     read_talk_text,
 };
@@ -18,6 +18,7 @@ use slides_format::{
     Change, FlowPlace, TextFlow, MAX_SLIDE_BYTES, Para, Pos, Selection, SourceEdit, Talk, TextEdit, is_visible_char, parse_talk, reparse, set_align,
     Block, NewTag, Tag, block_text, delete_block, find_tag, insert_block, set_tag_attr, set_tag_body, split_slides, storable,
     tag_text, text_flows_with, write_flow_with, write_into_region, MAX_TABLE_COLUMNS, MAX_TABLE_ROWS, new_table, table_size,
+    Target, ValueEdit, set_values,
 };
 use toolkit::{ComponentSchema, Theme};
 
@@ -32,7 +33,7 @@ use crate::present::TalkShape;
 use crate::saving::{SaveJob, SaveTarget, Saved};
 use crate::table_tools::{CLICK_IN_A_CELL, HEADING_ROW_STAYS, LONG_ROW, MOST_COLUMNS, MOST_ROWS, ONE_COLUMN_STAYS};
 use crate::selection::{self, SelectMark};
-pub use crate::selection::Selected;
+pub use crate::selection::{Selected, Thing};
 use crate::text_editing::{
     ALIGN_TEXT, COULD_NOT_TYPE, CUT, Composing, EditingText, FORMAT_TEXT, FlowKey, Kind, PASTE, TYPING, TextMark,
     holds_no_words, holds_something, region_has_text,
@@ -56,7 +57,7 @@ mod typing;
 pub use clipboard::Brought;
 pub use self::core::EditRun;
 use self::core::{Holds, Join, others_alike};
-pub use errors::{EditRefused, InsertFailed, LAYOUT_FAILED, OpenProblem, panic_in_next_change, panic_in_next_layout};
+pub use errors::{AREA_STAYS, EditRefused, InsertFailed, LAYOUT_FAILED, OpenProblem, panic_in_next_change, panic_in_next_layout};
 use errors::{built, guarded, laid_out, read_after, worked_out};
 pub use open::TalkPlace;
 pub use reading::talk_settings;
@@ -92,6 +93,7 @@ const LOAD_CHANGED_FILE: &str = "Load the changed file";
 const DELETE: &str = "Delete";
 const DUPLICATE: &str = "Duplicate";
 const CHANGE_SETTING: &str = "Change setting";
+const PUT_BACK: &str = "Put back";
 const ADD_ROW: &str = "Add row";
 const ADD_COLUMN: &str = "Add column";
 const DELETE_ROW: &str = "Delete row";
@@ -129,8 +131,13 @@ pub struct Document {
     /// The build index the last save wrote into the pack the talk is kept in, when the pack
     /// couldn't be opened again after it: what the next save's index starts from.
     index_kept_in_pack: Option<Vec<u8>>,
-    /// The thing picked on a slide, if any: the editor's view of the talk, not part of it.
+    /// The things picked on a slide, if any: the editor's view of the talk, not part of it.
+    selection: Option<selection::Selection>,
+    /// The one block picked, while that's all that's picked: what [`Self::selected`] gives.
     selected: Option<Selected>,
+    /// Where the slide the things are picked on is in the talk's text, which an area picked is
+    /// followed through an edit by.
+    selection_slide: Option<Range<usize>>,
     /// Counts the times a thing was picked or let go of, rather than followed through an edit.
     picks: u64,
     /// The number the next time of typing on a slide gets.

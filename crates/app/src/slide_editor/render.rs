@@ -12,16 +12,24 @@ impl Render for SlideEditor {
             (cx.theme().foreground, cx.theme().background);
         let caret_on = self.caret_on;
         let outline_color = cx.theme().ring;
-        // The thing selected on the slide shown, drawn around.
-        let outline = self.selection_here(cx).and_then(|_| {
-            let document = self.document.clone()?;
-            document.update(cx, |document, _| document.selected_box())
-        });
-        let outline = outline.as_ref().map(outline_corners);
+        // The things selected on the slide shown, each drawn around.
+        let outlines: Vec<[(f32, f32); 4]> = match (self.selection_here(cx), self.document.clone()) {
+            (Some(_), Some(document)) => document
+                .update(cx, |document, _| document.selected_boxes())
+                .iter()
+                .map(|(_, rect, rotate)| outline_corners(*rect, *rotate))
+                .collect(),
+            _ => Vec::new(),
+        };
         // A new box waiting for its first character: a dashed line around where it'll be.
         let new_box = self.new_box_here(cx);
         let new_box_color = cx.theme().muted_foreground;
-        let selecting = outline.is_some() && !self.is_editing(cx);
+        // The area whose text is being typed: a dashed line around it, a press on which picks it.
+        let frame = self.typed_region(cx).and_then(|(slide, name)| {
+            let area = self.layout(slide, cx)?.region(&name)?.clone();
+            Some((name, outline_corners(area.rect, area.rotate)))
+        });
+        let selecting = !outlines.is_empty() && !self.is_editing(cx);
         let placed = {
             let canvas = self.canvas.read(cx);
             canvas.slide_bounds().zip(canvas.area())
@@ -36,11 +44,23 @@ impl Render for SlideEditor {
             .and_then(|marks| marks.caret)
             .zip(placed)
             .map(|(caret, (slide, area))| in_editor(caret_box(&caret, slide), area));
-        // Where the outline is in the editor, for whoever looks for it.
-        let outline_box = outline.zip(placed).and_then(|(corners, (slide, area))| {
-            let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
-            (unit > 0.0).then(|| in_editor(corners_box(&corners, slide, unit), area))
-        });
+        // Where each outline is in the editor, for whoever looks for it: the one picked last
+        // has the id the editor's one outline always had.
+        let boxed = |corners: &[(f32, f32); 4]| {
+            placed.and_then(|(slide, area)| {
+                let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
+                (unit > 0.0).then(|| in_editor(corners_box(corners, slide, unit), area))
+            })
+        };
+        let outline_boxes: Vec<(SharedString, Bounds<Pixels>)> = outlines
+            .iter()
+            .enumerate()
+            .filter_map(|(at, corners)| {
+                let id = if at + 1 == outlines.len() { SELECTION_OUTLINE_ID.into() } else { selection_outline_id(at).into() };
+                Some((id, boxed(corners)?))
+            })
+            .collect();
+        let frame_box = frame.as_ref().and_then(|(name, corners)| Some((SharedString::from(region_frame_id(name)), boxed(corners)?)));
         // Where the new box is in the editor, for whoever looks for it.
         let new_box_bounds = new_box.zip(placed).and_then(|((x, y, w, h), (slide, area))| {
             let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
@@ -86,9 +106,9 @@ impl Render for SlideEditor {
                             .ok();
                     }
                 });
-                window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                window.on_mouse_event(move |_: &MouseUpEvent, phase, window, cx| {
                     if phase == DispatchPhase::Bubble {
-                        editor.update(cx, |editor, _| editor.dragging = false).ok();
+                        editor.update(cx, |editor, cx| editor.mouse_up(window, cx)).ok();
                     }
                 });
                 let slide = letterbox(area, window.scale_factor());
@@ -97,11 +117,14 @@ impl Render for SlideEditor {
                     return;
                 }
                 window.with_content_mask(Some(ContentMask { bounds: slide }), |window| {
-                    if let Some(corners) = &outline {
+                    if let Some((_, corners)) = &frame {
+                        paint_dashed(corners, slide, unit, new_box_color, window);
+                    }
+                    for corners in &outlines {
                         paint_outline(corners, slide, unit, outline_color, window);
                     }
-                    if let Some(rect) = new_box {
-                        paint_dashed(rect, slide, unit, new_box_color, window);
+                    if let Some((x, y, w, h)) = new_box {
+                        paint_dashed(&[(x, y), (x + w, y), (x + w, y + h), (x, y + h)], slide, unit, new_box_color, window);
                     }
                     let Some(marks) = marks else { return };
                     let SelectionRects {
@@ -224,6 +247,7 @@ impl Render for SlideEditor {
                 this.copy_or_cut_typed(true, cx)
             }))
             .on_action(cx.listener(|this, _: &DuplicateSelected, _, cx| this.duplicate(cx)))
+            .on_action(cx.listener(|this, _: &SelectAllThings, window, cx| this.select_all_things(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleBold, _, cx| {
                 this.format(|edit| edit.toggle(StyleBit::Bold), cx)
             }))
@@ -252,18 +276,16 @@ impl Render for SlideEditor {
                         .h(bounds.size.height),
                 )
             })
-            .when_some(outline_box, |this, outline| {
-                this.child(
-                    div()
-                        .id(SELECTION_OUTLINE_ID)
-                        .test_support()
-                        .absolute()
-                        .left(outline.origin.x)
-                        .top(outline.origin.y)
-                        .w(outline.size.width)
-                        .h(outline.size.height),
-                )
-            })
+            .children(frame_box.into_iter().chain(outline_boxes).map(|(id, bounds)| {
+                div()
+                    .id(id)
+                    .test_support()
+                    .absolute()
+                    .left(bounds.origin.x)
+                    .top(bounds.origin.y)
+                    .w(bounds.size.width)
+                    .h(bounds.size.height)
+            }))
             .when_some(caret_box, |this, caret| {
                 this.child(
                     div()

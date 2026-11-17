@@ -22,6 +22,7 @@ use stagepack_studio::clipboard_tools::{COPY_ID, CUT_ID};
 use stagepack_studio::document::Document;
 use stagepack_studio::insert_tools::InsertTextBox;
 use stagepack_studio::permissions::BuildPermissions;
+use stagepack_studio::selection::Thing;
 use stagepack_studio::slide_strip::strip_row_id;
 
 const SHOWCASE: &str = include_str!("../../../fixtures/showcase/slides.md");
@@ -254,20 +255,27 @@ fn typing_elsewhere_drops_the_selection(cx: &mut TestAppContext) {
 fn tab_goes_to_the_next_thing(cx: &mut TestAppContext) {
     let typing = open(cx, SHOWCASE);
     go_to(&typing, cx, THINGS);
-    let in_order = ["<Box", "<Shape kind=\"ellipse\"", "<Shape kind=\"arrow\"", "<Icon", "<Picture", "| Layout"]
-        .map(|start| thing(&typing, cx, start).source);
+    let things = ["<Box", "<Shape kind=\"ellipse\"", "<Shape kind=\"arrow\"", "<Icon", "<Picture", "| Layout"]
+        .map(|start| Thing::Block(thing(&typing, cx, start).source));
+    // After the things come the layout's areas.
+    let areas: Vec<Thing> = typing.layout(cx).regions().iter().map(|region| Thing::Region(region.name.clone())).collect();
+    let in_order: Vec<Thing> = things.iter().cloned().chain(areas).collect();
     let first = thing(&typing, cx, "<Box");
     let at = middle(&typing, cx, &first);
     typing.click(cx, at);
+    let picked = |typing: &Typing, cx: &TestAppContext| typing.document(cx).read_with(cx, |document, _| document.selection().map(|selection| selection.things.clone()));
     for next in in_order.iter().skip(1).chain([&in_order[0]]) {
         typing.press(cx, "tab");
-        assert_eq!(selected(&typing, cx), Some((THINGS, next.clone())));
+        assert_eq!(picked(&typing, cx), Some(vec![next.clone()]));
     }
     typing.press(cx, "shift-tab");
-    assert_eq!(selected(&typing, cx), Some((THINGS, in_order[5].clone())), "shift-tab goes back round");
-    typing.press(cx, "shift-tab");
-    assert_eq!(selected(&typing, cx), Some((THINGS, in_order[4].clone())));
+    assert_eq!(picked(&typing, cx), Some(vec![in_order.last().unwrap().clone()]), "shift-tab goes back round");
+    while picked(&typing, cx) != Some(vec![things[4].clone()]) {
+        typing.press(cx, "shift-tab");
+    }
     assert_eq!(typing.status(cx).as_deref(), Some("Picture selected"));
+    typing.press(cx, "shift-tab");
+    assert_eq!(picked(&typing, cx), Some(vec![things[3].clone()]));
     assert_eq!(typing.source(cx), SHOWCASE);
 }
 

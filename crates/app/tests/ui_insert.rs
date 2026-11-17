@@ -24,7 +24,8 @@ use stagepack_studio::recovery::Recovery;
 use stagepack_studio::ribbon::{DELETE_ID, DUPLICATE_ID, MORE_RIGHT_ID, RIBBON_ID, TAB_HOME_ID, TAB_INSERT_ID};
 use stagepack_studio::text_tools::{ALIGN_CENTER_ID, BOLD_ID, BULLETS_ID, NUMBERING_ID};
 use stagepack_studio::inspector::{INSPECTOR_HEADING_ID, INSPECTOR_MESSAGE_ID};
-use stagepack_studio::slide_editor::{NEW_BOX_ID, SELECTION_OUTLINE_ID, SlideEditor};
+use stagepack_studio::selection::Thing;
+use stagepack_studio::slide_editor::{NEW_BOX_ID, SELECTION_OUTLINE_ID, SlideEditor, selection_outline_id};
 use stagepack_studio::slide_strip::{STRIP_ID, strip_row_id};
 use stagepack_studio::workspace_view::{DIALOG_FAILED, ExportPdf, ONLY_THE_FIRST, RECOVER_ID};
 use toolkit::ShapeKind;
@@ -477,7 +478,8 @@ fn list_has_keyboard(typing: &Typing, cx: &mut TestAppContext) -> bool {
 /// The rule that keeps Delete from taking a slide while a thing on it shows as selected: never
 /// both at once.
 fn holds_the_rule(typing: &Typing, cx: &mut TestAppContext, step: &str) {
-    let both = list_has_keyboard(typing, cx) && selected(typing, cx).is_some();
+    let picked = typing.document(cx).read_with(cx, |document, _| document.selection().is_some());
+    let both = list_has_keyboard(typing, cx) && picked;
     assert!(!both, "after {step}, the list has the keyboard while a thing is selected");
 }
 
@@ -598,7 +600,42 @@ fn the_list_never_has_the_keyboard_while_a_thing_is_selected(cx: &mut TestAppCon
         typing.press(cx, "ctrl-v");
         holds_the_rule(&typing, cx, &format!("{how:?} then a paste"));
         assert_eq!(typing.source(cx).matches("<Shape").count(), 2, "{how:?}: the paste is on the slide");
+        // Two things selected, and an area.
+        let typing = open(cx, TALK);
+        select_two_shapes(&typing, cx);
+        to_the_list(&typing, cx, how);
+        holds_the_rule(&typing, cx, &format!("{how:?} after two things"));
+        assert!(bounds_of(&typing, cx, selection_outline_id(0)).is_none(), "{how:?}: no outline");
+        typing.press(cx, "ctrl-z");
+        holds_the_rule(&typing, cx, &format!("{how:?} then Undo of two"));
+        let typing = open(cx, TALK);
+        select_main_text(&typing, cx);
+        to_the_list(&typing, cx, how);
+        holds_the_rule(&typing, cx, &format!("{how:?} after an area"));
+        assert!(bounds_of(&typing, cx, SELECTION_OUTLINE_ID).is_none(), "{how:?}: no outline");
     }
+}
+
+/// Puts a shape on the first slide, and a copy of it beside it, and selects both.
+fn select_two_shapes(typing: &Typing, cx: &mut TestAppContext) {
+    insert_shape(typing, cx, "rect");
+    typing.press(cx, "ctrl-d");
+    // A corner of the first that the copy, 40 down and right, doesn't cover.
+    let corner = typing.at(cx, 730., 390.);
+    typing.clicks(cx, corner, 1, gpui_kit::Modifiers::shift());
+    let two = typing.document(cx).read_with(cx, |document, _| document.selection().map(|selection| selection.things.len()));
+    assert_eq!(two, Some(2), "two things are selected");
+}
+
+/// Types in the first slide's main text, and selects its area by a press on its frame.
+fn select_main_text(typing: &Typing, cx: &mut TestAppContext) {
+    let body = typing.flows(cx, 0).len() - 1;
+    typing.click_text(cx, body, pos(0, 2));
+    let rect = typing.layout(cx).region("body").expect("the main text").rect;
+    let at = typing.at(cx, rect.x, rect.y + rect.h / 2.);
+    typing.click(cx, at);
+    let area = typing.document(cx).read_with(cx, |document, _| document.selection().map(|selection| selection.things.clone()));
+    assert_eq!(area, Some(vec![Thing::Region("body".into())]), "the area is selected");
 }
 
 #[gpui_kit::test]
@@ -662,6 +699,10 @@ enum Typed {
     InCell,
     /// A new text box waiting for its first letter.
     PendingBox,
+    /// Nothing typed, and two things selected.
+    TwoSelected,
+    /// Nothing typed, and the main text's area selected.
+    AreaSelected,
 }
 
 const TABLE_TALK: &str = "---\ntitle: T\n---\n\n# One\n\n| a | b |\n| --- | --- |\n| c | d |\n\n---\n\n# Two\n";
@@ -694,9 +735,15 @@ fn start_typing(cx: &mut TestAppContext, typed: Typed) -> Typing {
             typing.type_text(cx, "x");
         }
         Typed::PendingBox => insert_text_box(&typing, cx),
+        Typed::TwoSelected => select_two_shapes(&typing, cx),
+        Typed::AreaSelected => select_main_text(&typing, cx),
     }
-    let started = typing.editing(cx).is_some();
-    assert!(started, "{typed:?}: typing has started");
+    let started = if matches!(typed, Typed::TwoSelected | Typed::AreaSelected) {
+        typing.document(cx).read_with(cx, |document, _| document.selection().is_some())
+    } else {
+        typing.editing(cx).is_some()
+    };
+    assert!(started, "{typed:?}: typing has started, or something is selected");
     typing
 }
 
@@ -717,6 +764,9 @@ fn the_list_taking_the_keyboard_ends(cx: &mut TestAppContext, typed: Typed) {
         assert!(new_box(&typing, cx).is_none(), "{case}: no text box is waiting");
         assert!(bounds_of(&typing, cx, NEW_BOX_ID).is_none(), "{case}: no new box is drawn");
         assert_eq!(selected(&typing, cx), None, "{case}: nothing is selected");
+        let picked = typing.document(cx).read_with(cx, |document, _| document.selection().is_some());
+        assert!(!picked, "{case}: no area or things are selected");
+        assert!(bounds_of(&typing, cx, SELECTION_OUTLINE_ID).is_none(), "{case}: no outline");
         assert_eq!(typing.source(cx), after_escape, "{case}: the talk is as after Escape");
         // Only now that nothing on the slide shows as its target does the key take a slide.
         let slides = typing.slide_count(cx);
@@ -748,6 +798,16 @@ fn the_list_taking_the_keyboard_ends_typing_in_a_cell(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn the_list_taking_the_keyboard_drops_a_pending_text_box(cx: &mut TestAppContext) {
     the_list_taking_the_keyboard_ends(cx, Typed::PendingBox);
+}
+
+#[gpui_kit::test]
+fn the_list_taking_the_keyboard_lets_go_of_two_things(cx: &mut TestAppContext) {
+    the_list_taking_the_keyboard_ends(cx, Typed::TwoSelected);
+}
+
+#[gpui_kit::test]
+fn the_list_taking_the_keyboard_lets_go_of_an_area(cx: &mut TestAppContext) {
+    the_list_taking_the_keyboard_ends(cx, Typed::AreaSelected);
 }
 
 #[gpui_kit::test]

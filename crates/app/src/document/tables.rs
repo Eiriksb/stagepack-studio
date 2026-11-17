@@ -161,9 +161,9 @@ impl Document {
             }
             None => {
                 if let Some(after) = table_starting_at(self.talk(), slide, start) {
-                    self.selected = Some(Selected { slide, source: after.clone() });
+                    self.set_selection(Some(selection::Selection::block(slide, after.clone())));
                     if made {
-                        self.history.select_mark_last(SelectMark { before: Some(table), after: Some(after) });
+                        self.history.select_mark_last(SelectMark::blocks(slide, Some(table), Some(after)));
                     }
                 }
             }

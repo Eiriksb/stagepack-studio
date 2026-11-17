@@ -4,10 +4,13 @@
 use super::*;
 
 impl Inspector {
-    /// What the panel shows for the thing selected on the slide shown, if one is, or else the
-    /// table the caret is in a cell of: the form's shape, the thing, and its tag, if it's one.
-    pub(super) fn subject(&mut self, cx: &mut Context<Self>) -> Option<(Shape, Selected, Option<Tag>)> {
+    /// What the panel shows for what's selected on the slide shown, if anything is, or else the
+    /// table the caret is in a cell of: the form's shape, what it's for, and what that has.
+    pub(super) fn subject(&mut self, cx: &mut Context<Self>) -> Option<(Shape, Subject, Values)> {
         let document = self.document.clone()?;
+        if let Some(subject) = self.several_or_area(&document, cx) {
+            return Some(subject);
+        }
         let (selected, pick, block, heading) = {
             let document = document.read(cx);
             let in_cell = || {
@@ -52,7 +55,35 @@ impl Inspector {
             }
             _ => return None,
         };
-        Some((shape, selected, tag))
+        let values = tag.map_or_else(Values::default, |tag| {
+            Values(shape.specs.iter().filter_map(|spec| Some((spec.attr.clone(), tag.attr(&spec.attr)?.to_string()))).collect())
+        });
+        Some((shape, Subject::Thing(selected), values))
+    }
+
+    /// What the panel shows for several things selected on the slide shown, which is how many,
+    /// or for one area: its name, and the fields that place it.
+    fn several_or_area(&mut self, document: &Entity<Document>, cx: &mut Context<Self>) -> Option<(Shape, Subject, Values)> {
+        let (selection, pick) = {
+            let document = document.read(cx);
+            (document.selection().filter(|selection| selection.slide == document.current())?.clone(), document.selection_pick())
+        };
+        if selection.things.len() > 1 {
+            let heading = format!("{} things selected", selection.things.len());
+            return Some((Shape { pick, tag: None, heading, message: None, specs: Vec::new() }, Subject::Several, Values::default()));
+        }
+        let name = selection.one_region()?.to_string();
+        let slide = selection.slide;
+        let moved = document.update(cx, |document, _| document.text_layout(slide).region(&name).map(|area| area.moved))?;
+        let specs: Vec<Spec> = Spec::place().collect();
+        let values = {
+            let talk = document.read(cx).talk();
+            let settings = talk.slides.get(slide)?;
+            Values(specs.iter().filter_map(|spec| Some((spec.attr.clone(), region_value(settings, &name, &spec.attr)?.to_string()))).collect())
+        };
+        let heading = format!("{} area", selection::area_name(&name));
+        let shape = Shape { pick, tag: None, heading, message: None, specs };
+        Some((shape, Subject::Area { slide, name, moved }, values))
     }
 
     /// The schema of `tag`, the tag of the thing picked `pick`, looked up again only once
@@ -72,7 +103,7 @@ impl Inspector {
     }
 
     /// The form for `shape`: its fields, and what they hear from.
-    pub(super) fn build_form(&mut self, shape: Shape, target: Selected, window: &mut Window, cx: &mut Context<Self>) -> Form {
+    pub(super) fn build_form(&mut self, shape: Shape, target: Subject, window: &mut Window, cx: &mut Context<Self>) -> Form {
         let mut subscriptions = Vec::new();
         let mut fields = Vec::new();
         let tag = shape.tag.clone().unwrap_or_default();
@@ -162,13 +193,13 @@ impl Inspector {
         Form { shape, target, fields, _subscriptions: subscriptions }
     }
 
-    /// Shows in every field what `tag` has, but in a text or number field that has the keyboard.
-    pub(super) fn follow_talk(&mut self, tag: Option<&Tag>, window: &mut Window, cx: &mut Context<Self>) {
+    /// Shows in every field what `values` has, but in a text or number field that has the keyboard.
+    pub(super) fn follow_talk(&mut self, values: &Values, window: &mut Window, cx: &mut Context<Self>) {
         let Some(form) = &mut self.form else {
             return;
         };
         for field in &mut form.fields {
-            let value = tag.and_then(|tag| tag.attr(&field.spec.attr));
+            let value = values.get(&field.spec.attr);
             match &field.widget {
                 Widget::Input(input) => {
                     // What was typed and refused stays, with why, until it's typed in again or

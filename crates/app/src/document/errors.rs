@@ -37,6 +37,8 @@ pub enum EditRefused {
     ComponentNotLoaded,
     /// What was pasted isn't one thing a slide can hold.
     NotOneThing,
+    /// Only a layout's areas are selected, and an area stays where its layout puts it.
+    AreaStays,
 }
 
 impl std::fmt::Display for EditRefused {
@@ -67,6 +69,7 @@ impl std::fmt::Display for EditRefused {
             EditRefused::NeedsACell => CLICK_IN_A_CELL,
             EditRefused::ComponentNotLoaded => "That component couldn't be loaded, so it wasn't added.",
             EditRefused::NotOneThing => clipboard::NOT_ONE_THING,
+            EditRefused::AreaStays => AREA_STAYS,
         })
     }
 }
@@ -92,6 +95,9 @@ impl std::fmt::Display for InsertFailed {
 }
 
 impl std::error::Error for InsertFailed {}
+
+/// What's said when only a layout's areas are selected and Delete, Cut, Copy or Duplicate is asked.
+pub const AREA_STAYS: &str = "A layout's area can't be deleted or copied. Choose another layout to change the areas.";
 
 /// What the window says when the current slide couldn't be laid out for the editor.
 pub const LAYOUT_FAILED: &str =

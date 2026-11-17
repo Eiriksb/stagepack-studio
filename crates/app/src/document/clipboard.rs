@@ -303,52 +303,59 @@ impl Document {
         copied
     }
 
-    /// The text of the thing selected, as a copy of it gives it, and the files it uses, as
-    /// [`Self::files_for_copy`] gives them. `None` with nothing selected.
-    pub fn copy_selected(&self) -> Option<(String, Vec<CopiedFile>)> {
-        let selected = self.selected.as_ref()?;
-        let text = worked_out(|| block_text(self.talk(), selected.slide, &selected.source)).ok().flatten()?;
+    /// The text of the things selected, as a copy of them gives it, in the order they're written
+    /// with a blank line between, and the files they use, as [`Self::files_for_copy`] gives them.
+    /// Refused with nothing selected, or only a layout's areas.
+    pub fn copy_selected(&self) -> Result<(String, Vec<CopiedFile>), EditRefused> {
+        let (slide, blocks) = self.selected_blocks()?.ok_or(EditRefused::CouldNotBeMade)?;
+        let texts = worked_out(|| blocks.iter().map(|block| block_text(self.talk(), slide, block)).collect::<Option<Vec<String>>>())?
+            .ok_or(EditRefused::CouldNotBeMade)?;
+        let text = texts.join("\n\n");
         let files = self.files_for_copy(&text);
-        Some((text, files))
+        Ok((text, files))
     }
 
-    /// Puts the thing `markdown` holds, perhaps from another talk, on the current slide, with
-    /// `files`, the files it uses: see [`Self::put_thing`].
+    /// Puts the things `markdown` holds, perhaps from another talk, on the current slide, with
+    /// `files`, the files they use: see [`Self::put_thing`].
     pub fn paste_element(&mut self, markdown: &str, files: PastedFiles) -> Result<(Vec<usize>, Brought), EditRefused> {
         self.put_thing(PASTE, markdown, files)
     }
 
-    /// Puts a copy of the thing selected on the slide it's on, as a paste of it would, as one
-    /// step named "Duplicate", and selects the copy. The clipboard isn't touched.
+    /// Puts a copy of the things selected on the slide they're on, as a paste of them would, as
+    /// one step named "Duplicate", and selects the copies. The clipboard isn't touched. Refused
+    /// when only a layout's areas are selected.
     pub fn duplicate_selected(&mut self) -> Result<Vec<usize>, EditRefused> {
-        // Typing is finished first, which can move the thing; the slide is drawn again if it did.
+        // Typing is finished first, which can move the things; the slide is drawn again if it did.
         let tidied = self.finish_before_edit()?;
-        let Some(Selected { slide, source }) = self.selected.clone() else {
+        let Some((slide, blocks)) = self.selected_blocks()? else {
             return Ok(if tidied { vec![self.current] } else { Vec::new() });
         };
-        let text = built(self.talk(), |talk| block_text(talk, slide, &source))?.ok_or(EditRefused::CouldNotBeMade)?;
+        let texts = built(self.talk(), |talk| blocks.iter().map(|block| block_text(talk, slide, block)).collect::<Option<Vec<String>>>())?
+            .ok_or(EditRefused::CouldNotBeMade)?;
         self.go_to(slide);
-        let (mut changed, _) = self.put_thing(DUPLICATE, &text, PastedFiles::default())?;
+        let (mut changed, _) = self.put_thing(DUPLICATE, &texts.join("\n\n"), PastedFiles::default())?;
         if tidied && !changed.contains(&slide) {
             changed.push(slide);
         }
         Ok(changed)
     }
 
-    /// Puts the thing `markdown` holds on the current slide, as one step named `label`, and
-    /// selects it. It must be one thing, as [`clipboard::one_element`] says, or it's refused,
+    /// Puts the things `markdown` holds on the current slide, as one step named `label`, and
+    /// selects them. They must be things, as [`clipboard::some_things`] says, or it's refused,
     /// with nothing added. Typing ends first, and a new text box waiting for its first letter
     /// is dropped. `files` are added first, as [`Self::bring_files`] says, and each path in the
-    /// thing that had to change is made to name the file as added. Where a thing already has
-    /// its corner at exactly the thing's `x` and `y`, it's moved 40 down and right, as often as
-    /// it takes. It's written with [`insert_block`], after the slide's content.
+    /// things that had to change is made to name the file as added. Where a thing already has
+    /// its corner at exactly a thing's `x` and `y`, it's moved 40 down and right, as often as
+    /// it takes. They're written with [`insert_block`], after the slide's content, in order.
     fn put_thing(&mut self, label: &'static str, markdown: &str, files: PastedFiles) -> Result<(Vec<usize>, Brought), EditRefused> {
-        let text = guarded(|| clipboard::one_element(markdown))?.ok_or(EditRefused::NotOneThing)?;
+        let things = guarded(|| clipboard::some_things(markdown))?.ok_or(EditRefused::NotOneThing)?;
         let tidied = self.finish_before_edit()?;
         self.editing = None;
-        let (text, brought) = self.bring_files_for(&text, files);
-        let text = self.stepped_aside(&text);
-        let changed = self.insert_text(label, &text, tidied)?;
+        let (text, brought) = self.bring_files_for(&things.join("\n\n"), files);
+        // Each thing is a block of its own, as it was before its files were named again.
+        let things = guarded(|| clipboard::some_things(&text))?.filter(|renamed| renamed.len() == things.len()).unwrap_or(things);
+        let texts: Vec<String> = things.iter().map(|thing| self.stepped_aside(thing)).collect();
+        let changed = self.insert_texts(label, &texts, tidied)?;
         let mut brought = brought;
         brought.look_for_lone_builds(self);
         Ok((changed, brought))
