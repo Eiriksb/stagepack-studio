@@ -91,7 +91,7 @@ At 1,280 pixels the Home tab shows *Paste*, *Cut* and *Copy*; *Undo* and *Redo*;
 
 ### What looks wrong and wasn't changed
 
-- **Shift held before pressing the turn handle doesn't turn.** With Shift or Ctrl down, a press adds or takes away the thing under the pointer, before any handle: on the empty slide it let go of the selection, and where the handle lay over the picture, it added the picture and then dragged both. Shift pressed after the press steps by 15 degrees, as the plan has it.
+- **Shift held before pressing the turn handle didn't turn.** (Fixed after the final review, in 8f73dbe: Shift held first and a press right on a handle now takes the handle.) With Shift or Ctrl down, a press adds or takes away the thing under the pointer, before any handle: on the empty slide it let go of the selection, and where the handle lay over the picture, it added the picture and then dragged both. Shift pressed after the press steps by 15 degrees, as the plan has it.
 - **A layout change leaves an area's animation behind.** The main text was shown one at a time as `region.body`; *Two columns* names its main area `left`, so the text went there and the setting no longer reached it: the badge went, and the show had all three paragraphs at the start. Changing back brings it again. The plan keeps such lines on purpose.
 - **A step badge on a turned thing sits off the thing**, at the corner of the upright box the thing covers. The badge on an area covers the first letter or two of its text.
 - **Handles of a thing mostly off the slide are drawn outside it**, over the notes and the status line, while the thing and its outline are cut off at the slide's edge.
@@ -154,3 +154,25 @@ Found in this run and not changed are under *What looks wrong and wasn't changed
 - **A selected area can't be deleted, copied or put in front or behind.**
 - **Notes ending a line in `|` written by hand before a table**, and a quote ending in `|` straight before a table, still make the table read as a paragraph. The fix covers notes typed in the app.
 - **D3's known issues**, in `docs/checks/plan-d3.md`, still stand, but for the notes before a table, fixed here for typed notes.
+
+## The final review
+
+A reviewer read the whole branch at e19f56e in a copy of its own, ran the workspace's tests (2,133 passed, 19 ignored; the count above is one short), the format and app property tests at 4,000 cases and the random session at 300, and probed in a headless window: Ctrl+A and what a box holds, the layout tiles with a thing selected, with the list of slides holding the keyboard and while typing, Delete with the tiles open and after Escape, an area lost to a layout change, Undo from the list bringing back two things, an empty area animated, a lift beside notes in a CRLF talk, and a right button let go of during a drag. It found nothing that loses data, crashes, or edits or deletes the wrong thing, and the keyboard rule held on every new route it tried. It asked for three fixes, and the one fix wave made them:
+
+- **After Ctrl+A on a slide with a lifted table, nothing could be moved, nudged or aligned**, and with the thing inside a box selected, the arrow keys, Align and Animate said *Drag it out of the text first.* A thing inside a selected box is now left to its box, and a thing a box holds alone stands for its box in moving, arranging and animating. (1b9c3a7)
+- **An entrance chosen in an empty area was written, and the next thing animated got a click that showed nothing.** An empty area isn't animated now, and says *Type something in it first.* A click written by hand on one isn't counted. (0b6afc4)
+- **Shift held before a press on a handle let go of the thing.** A press right on a handle with Shift takes the handle. (8f73dbe)
+
+The wave also made a right button let go of during a drag leave the drag alone, made Undo of a layout change select the area again, gave the New slide tools their ids, and widened the random session: its window run now uses the Arrange menu, the Animate tab, the layout tiles, the form's toggle and the handles, and makes its window the active one, without which no focus changes were sent and the list's and the notes' letting go never ran in it. Widened, it found one more thing, fixed with a test: an area turned back upright lost its selection. (094faf5)
+
+At 094faf5, `scripts/cargo-safe.sh test --workspace` passed: 2,147 tests, 0 failed, 19 ignored, and clippy gave no warnings. The random session at 2,000 cases passed in 25 minutes, and the release timing tests passed, with a drag frame at 0.18 ms and a keystroke at 2.7 ms at the median. A second reviewer then checked the wave and found every finding met and nothing new broken. The window wasn't run again after the wave, so its fixes have been seen in tests only.
+
+Known after the final review, and not changed:
+
+- **The Home tab doesn't fit at 1,280 or 1,440 pixels**, as above. It's the owner's to decide.
+- **A layout change leaves an area's animation behind**, and a click written on an empty area can come in with another thing's once something is typed there.
+- **With an empty area and a shape both selected**, every Animate choice but *No animation* is refused for both.
+- **A Shift-click meant to add a small thing lying right under a handle** takes the handle. Ctrl and a click adds it.
+- **Clearing a guide when a drag has nowhere to put its thing** couldn't be reached in a test.
+- The smaller findings are in `docs/superpowers/plans/2026-11-17-native-rust-plan-d4-decisions.md`.
+
