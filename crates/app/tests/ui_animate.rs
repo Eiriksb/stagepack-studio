@@ -13,7 +13,7 @@ use gpui_kit::{ElementId, Modifiers, TestAppContext, px, size};
 use slides_engine::{Enter, Transition};
 use stagepack_studio::animate::Choice;
 use stagepack_studio::animate_tools::{
-    ChooseAnimation, ENTRANCE_ID, EARLIER_ID, LATER_ID, ONE_AT_A_TIME_ID, STEP_LABEL_ID, TRANSITION_ALL_ID, TRANSITION_ID,
+    ChooseAnimation, ChooseEntrance, ENTRANCE_ID, EARLIER_ID, LATER_ID, ONE_AT_A_TIME_ID, STEP_LABEL_ID, TRANSITION_ALL_ID, TRANSITION_ID,
 };
 use stagepack_studio::ribbon::{ON_THE_WAY_ID, TAB_ANIMATE_ID, TAB_HOME_ID};
 use stagepack_studio::selection::Thing;
@@ -29,6 +29,7 @@ const ICON: &str = "<Icon";
 const NOTHING_SELECTED: &str = "Select something on the slide first.";
 const IN_THE_TEXT: &str = "Drag it out of the text first.";
 const TOO_MANY: &str = "This slide has as many clicks as it can have.";
+const TYPE_FIRST: &str = "Type something in it first.";
 
 /// The Appear menu's items, and the Transition menu's.
 const ENTRANCES: [&str; 4] = ["No animation", "Appear", "Fade in", "Fly up"];
@@ -474,16 +475,74 @@ fn a_choice_that_changes_nothing_leaves_the_typing_be(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn an_area_emptied_by_typing_is_still_the_target(cx: &mut TestAppContext) {
+fn an_area_emptied_by_typing_is_not_animated_and_says_why(cx: &mut TestAppContext) {
     let typing = open_animate(cx, TALK);
     go_to(&typing, cx, 1);
     let body = body_flow(&typing, cx, 1);
     typing.click_text(cx, body, pos(0, 2));
     typing.press(cx, "ctrl-a");
     typing.press(cx, "backspace");
+    typing.with_window(cx, |window, cx| window.dispatch_action(Box::new(ChooseEntrance { enter: Some(Enter::Fade) }), cx));
+    typing.settle(cx);
+    assert_eq!(typing.status(cx).as_deref(), Some(TYPE_FIRST));
+    assert!(!typing.source(cx).contains("region.body"), "{}", typing.source(cx));
+}
+
+#[gpui_kit::test]
+fn an_empty_area_is_not_animated_and_says_why(cx: &mut TestAppContext) {
+    let typing = open_animate(cx, TALK);
+    go_to(&typing, cx, 2);
+    let at = typing.placeholder_point(cx, "body");
+    typing.click(cx, at);
+    assert!(typing.editing(cx).is_some(), "typing in the empty area");
+    assert_eq!(label_of(&typing, cx, STEP_LABEL_ID).as_deref(), Some(TYPE_FIRST));
+    assert!(disabled(&typing, cx, ENTRANCE_ID));
+    for action in [
+        Box::new(ChooseEntrance { enter: Some(Enter::Fade) }) as Box<dyn gpui_kit::Action>,
+        Box::new(ChooseAnimation { choice: Choice::Animate }),
+    ] {
+        typing.with_window(cx, |window, cx| window.dispatch_action(action, cx));
+        typing.settle(cx);
+        assert_eq!(typing.status(cx).as_deref(), Some(TYPE_FIRST));
+        assert_eq!(typing.source(cx), TALK);
+    }
+    assert!(typing.document(cx).read_with(cx, |document, _| !document.can_undo()));
+}
+
+/// A talk whose second slide's main area is written as animated, with nothing in it, beside a
+/// shape.
+const STRAY: &str = "---\ntitle: T\n---\n\n# Shapes\n\n---\nregion.body: click=1 enter=fade\n---\n\n# Empty\n\n\
+<Shape kind=\"rect\" fill=\"#2563eb\" x=\"200\" y=\"500\" w=\"200\" h=\"200\" />\n";
+
+#[gpui_kit::test]
+fn a_click_written_on_an_empty_area_is_not_counted(cx: &mut TestAppContext) {
+    let typing = open_animate(cx, STRAY);
+    go_to(&typing, cx, 1);
+    assert_eq!(typing.document(cx).update(cx, |document, _| document.timeline_of(1).steps), 0, "the show gives it no step");
+    assert!(badges(&typing, cx).is_empty(), "no badge says it comes in");
+    click_thing(&typing, cx, RECT, Modifiers::default());
     pick(&typing, cx, ENTRANCE_ID, &ENTRANCES, "Fade in");
-    assert!(typing.source(cx).contains("region.body: click=1 enter=fade"), "{}", typing.source(cx));
-    assert!(!typing.source(cx).contains("Just one paragraph"));
+    assert!(tag_of(&typing, cx, RECT).contains("click=\"1\" enter=\"fade\""), "{}", typing.source(cx));
+    assert_eq!(label_of(&typing, cx, STEP_LABEL_ID).as_deref(), Some("Click 1 of 1"));
+}
+
+#[gpui_kit::test]
+fn no_animation_takes_the_words_away_from_an_empty_area(cx: &mut TestAppContext) {
+    let typing = open_animate(cx, STRAY);
+    go_to(&typing, cx, 1);
+    let at = typing.placeholder_point(cx, "body");
+    typing.click(cx, at);
+    assert!(!disabled(&typing, cx, ENTRANCE_ID), "what's written on it can be taken away");
+    // Anything else is still refused.
+    typing.with_window(cx, |window, cx| window.dispatch_action(Box::new(ChooseEntrance { enter: Some(Enter::FlyUp) }), cx));
+    typing.settle(cx);
+    assert_eq!(typing.status(cx).as_deref(), Some(TYPE_FIRST));
+    assert_eq!(typing.source(cx), STRAY);
+    pick(&typing, cx, ENTRANCE_ID, &ENTRANCES, "No animation");
+    assert!(!typing.source(cx).contains("click=1") && !typing.source(cx).contains("enter=fade"), "{}", typing.source(cx));
+    assert!(typing.source(cx).contains("<Shape kind=\"rect\" fill=\"#2563eb\" x=\"200\" y=\"500\" w=\"200\" h=\"200\" />"));
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), STRAY);
 }
 
 #[gpui_kit::test]

@@ -50,6 +50,9 @@ pub struct StepBadge {
 /// A value to write: on what, its name, and what, or `None` to take it away.
 type Word = (Target, &'static str, Option<String>);
 
+/// The words that animate a thing or an area: the click it comes in on, and how.
+const ANIMATION_WORDS: [&str; 2] = ["click", "enter"];
+
 impl Document {
     /// What the Animate tab's tools are about, on the current slide.
     pub fn animate_here(&mut self) -> AnimateHere {
@@ -62,6 +65,11 @@ impl Document {
             Ok(targets) => targets,
             Err(why) => return AnimateHere { steps, transition, why_not: Some(why), ..AnimateHere::default() },
         };
+        // An area with nothing in it can't be animated; but a click or an entrance written on it
+        // can still be taken away.
+        if self.holds_an_empty_area(slide, &targets) && !targets.iter().any(|target| self.has_animation_words(slide, target)) {
+            return AnimateHere { steps, transition, why_not: Some(EditRefused::EmptyArea), ..AnimateHere::default() };
+        }
         let picked: Vec<&Stepped> = all.iter().filter(|stepped| targets.contains(&stepped.target)).collect();
         let animated = |stepped: &Stepped| stepped.click.is_some() || stepped.each;
         let first = picked.first().and_then(|stepped| stepped.click);
@@ -189,6 +197,9 @@ impl Document {
     /// chosen then coming in as `enter` says, if it says: none where nothing would change.
     fn animation_words(&mut self, slide: usize, choice: Choice, enter: Option<Enter>, typed: Option<Target>) -> Result<Vec<Word>, EditRefused> {
         let targets = self.animate_targets(typed)?;
+        if choice != Choice::Remove && self.holds_an_empty_area(slide, &targets) {
+            return Err(EditRefused::EmptyArea);
+        }
         if let Choice::Each(on) = choice {
             // Only one area is shown a piece at a time, and only one that holds a list.
             let [Target::Region(name)] = targets.as_slice() else {
@@ -219,7 +230,7 @@ impl Document {
                 Choice::Each(on) => word(target, "click", on.then(|| "each".to_string())),
                 // Whatever is written, read or not.
                 Choice::Remove => {
-                    for name in ["click", "enter"] {
+                    for name in ANIMATION_WORDS {
                         if self.written(slide, target, name).is_some() {
                             word(target, name, None);
                         }
@@ -303,6 +314,17 @@ impl Document {
         Ok(things)
     }
 
+    /// Whether any of `targets` is an area of slide `slide` with nothing in it.
+    fn holds_an_empty_area(&mut self, slide: usize, targets: &[Target]) -> bool {
+        let layout = self.text_layout(slide);
+        targets.iter().any(|target| matches!(target, Target::Region(name) if layout.region(name).is_some_and(|region| region.empty)))
+    }
+
+    /// Whether `target` on slide `slide` has a click or an entrance written, read or not.
+    fn has_animation_words(&self, slide: usize, target: &Target) -> bool {
+        ANIMATION_WORDS.iter().any(|name| self.written(slide, target, name).is_some())
+    }
+
     /// Whether area `name` of slide `slide` holds a list, or more than one block.
     fn holds_a_list(&mut self, slide: usize, name: &str) -> bool {
         self.text_layout(slide).region(name).is_some_and(|region| region.is_list)
@@ -310,7 +332,8 @@ impl Document {
 
     /// What each thing with a place of its own and each area of slide `slide` has now, and how
     /// many of its steps are fixed ones. An area is shown a piece at a time as the engine shows
-    /// it, so that its steps are among the fixed ones.
+    /// it, so that its steps are among the fixed ones. A click written on an area with nothing in
+    /// it isn't counted, as the show gives it no step.
     fn stepped(&mut self, slide: usize) -> (Vec<Stepped>, u32) {
         if slide >= self.slide_count() {
             return (Vec::new(), 0);
@@ -322,7 +345,7 @@ impl Document {
             return (Vec::new(), fixed);
         };
         let areas = layout.regions().iter().zip(each).map(|(region, each)| {
-            let value = guarded(|| region_value(written, &region.name, "click")).ok().flatten();
+            let value = (!region.empty).then(|| guarded(|| region_value(written, &region.name, "click")).ok().flatten()).flatten();
             Stepped { target: Target::Region(region.name.clone()), click: value.and_then(read_click), each }
         });
         let things = written.blocks.iter().filter_map(|block| match block {

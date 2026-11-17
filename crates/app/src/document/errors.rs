@@ -57,6 +57,8 @@ pub enum EditRefused {
     TooManySteps,
     /// The area chosen holds one block and no list, so it can't be shown a piece at a time.
     NotAList,
+    /// The area chosen has nothing in it, so nothing it comes in with would show.
+    EmptyArea,
 }
 
 impl std::fmt::Display for EditRefused {
@@ -97,6 +99,7 @@ impl std::fmt::Display for EditRefused {
             EditRefused::NothingToAnimate => "Select something on the slide first.",
             EditRefused::TooManySteps => "This slide has as many clicks as it can have.",
             EditRefused::NotAList => "Select an area that holds a list to show it one item at a time.",
+            EditRefused::EmptyArea => "Type something in it first.",
         })
     }
 }
