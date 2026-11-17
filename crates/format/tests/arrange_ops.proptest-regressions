@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 60a85b7f95399459e87099771b4f4b8407a9556aa397c58705a411fcb8130fe2 # shrinks to source = "# Slide mk0x\n---\nlayout: two-columns\n---\nNote: mk1x\nOther: thing", index = 1, picks = [(12, "x", Remove), (14, "x", Value("10")), (20, "y", Value("10"))]
