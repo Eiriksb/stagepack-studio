@@ -188,8 +188,8 @@ impl SaveJob {
                 }
                 repack_with_slides(file, file, &text, APP_VERSION, &extra()).map_err(|e| failed(file, e))?;
                 // The talk is read from the pack as it's written from now on, so what it holds,
-                // entries and all, is the talk's, as after a save in a folder.
-                if index_written {
+                // files and entries, is the talk's, as after a save in a folder.
+                if index_written || !files_written.is_empty() {
                     reopened = Some(in_pack(file.clone())?.1);
                 }
                 (None, index_notice(file).into_iter().collect())

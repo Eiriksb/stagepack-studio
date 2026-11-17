@@ -737,3 +737,180 @@ fn a_packed_save_never_replaces_a_different_entry() {
     assert!(doc.has_unsaved_changes());
     assert_eq!(doc.added_files().len(), 1);
 }
+
+/// A picture `width` by 6 of the colour `rgba`.
+fn picture(width: u32, rgba: [u8; 4]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    image::RgbaImage::from_pixel(width, 6, image::Rgba(rgba))
+        .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+        .unwrap();
+    bytes
+}
+
+const GREEN: [u8; 4] = [0, 255, 0, 255];
+
+/// Whether the first slide shows something green, and something red.
+fn first_shows(doc: &mut Document) -> (bool, bool) {
+    let thumbnail = doc.thumbnail(0, 480).expect("the slide draws");
+    let near = |a: u8, b: u8| a.abs_diff(b) < 40;
+    let has = |rgb: [u8; 3]| thumbnail.data().chunks(4).any(|pixel| near(pixel[0], rgb[0]) && near(pixel[1], rgb[1]) && near(pixel[2], rgb[2]));
+    (has([0, 255, 0]), has([255, 0, 0]))
+}
+
+/// The box of the first thing on the first slide.
+fn first_box(doc: &mut Document) -> Option<(f32, f32)> {
+    doc.text_layout(0).elements().first().map(|element| (element.rect.w, element.rect.h))
+}
+
+/// Writes `bytes` to `path` as another program would, later than the file was last written.
+fn write_later(path: &Path, bytes: &[u8]) {
+    // A clock that ticks in seconds sees the change.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// What the window does once a save it made is seen in the folder, as the next save after a
+/// picture is replaced on disk: it reads the talk's file again, which holds what's here, and a
+/// picture the talk shows that was replaced is shown as it is now. A talk's own pictures follow
+/// their files by this rule.
+fn after_a_save_is_seen(doc: &mut Document, folder: &Path) {
+    let held = read(&folder.join("slides.md"));
+    assert_eq!(held, doc.source(), "nothing unsaved");
+    doc.reload(Some(held));
+}
+
+#[test]
+fn a_picture_of_the_talk_replaced_on_disk_shows_once_a_save_is_seen() {
+    // The rule a picture added in the session follows once it's saved.
+    let (dir, _) = talk("# One\n\n![](assets/shot.png)\n");
+    std::fs::create_dir(dir.path().join("assets")).unwrap();
+    std::fs::write(dir.path().join("assets/shot.png"), picture(40, [255, 0, 0, 255])).unwrap();
+    let mut doc = open_fresh(dir.path());
+    assert_eq!(first_shows(&mut doc), (false, true));
+    write_later(&dir.path().join("assets/shot.png"), &picture(20, GREEN));
+    after_a_save_is_seen(&mut doc, dir.path());
+    assert_eq!(first_shows(&mut doc), (true, false));
+}
+
+#[test]
+fn a_saved_added_picture_follows_its_file_on_disk() {
+    // Found in review: a picture added in the session and saved was read from memory for good,
+    // so one cropped in an image editor after the save was never seen, nor copied nor exported.
+    let (dir, mut doc) = talk("# One\n");
+    doc.insert_picture("shot.png", picture(40, [255, 0, 0, 255])).unwrap();
+    save(&mut doc);
+    let on_disk = dir.path().join("assets/shot.png");
+    assert!(on_disk.is_file());
+    let cropped = picture(20, GREEN);
+    write_later(&on_disk, &cropped);
+    after_a_save_is_seen(&mut doc, dir.path());
+
+    // What a fresh open of the folder shows.
+    let mut fresh = open_fresh(dir.path());
+    assert_eq!(first_shows(&mut doc), first_shows(&mut fresh), "the slide shows what a fresh open shows");
+    assert_eq!(first_shows(&mut doc), (true, false), "the cropped picture");
+    assert_eq!(first_box(&mut doc), first_box(&mut fresh), "laid out as the picture is now");
+    let text = doc.current_for_copy().unwrap();
+    let carried = doc.files_for_copy(&text).into_iter().find(|file| file.path == "assets/shot.png").map(|file| file.bytes.to_vec());
+    assert_eq!(carried, Some(cropped.clone()), "a copy carries the picture as it is now");
+    assert_eq!(doc.export_input().files.read("assets/shot.png"), Some(cropped.clone()), "and so does an export");
+    assert!(!doc.has_unsaved_changes());
+    // Save As takes it as it is now.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let to = elsewhere.path().join("copy");
+    let saved = doc.save_as_job(SaveTarget::Folder(to.clone())).run().unwrap();
+    doc.saved(saved);
+    assert_eq!(std::fs::read(to.join("assets/shot.png")).unwrap(), cropped);
+}
+
+#[test]
+fn undo_and_redo_across_a_save_read_the_saved_picture() {
+    let (dir, mut doc) = talk("# One\n");
+    doc.insert_picture("shot.png", picture(40, [255, 0, 0, 255])).unwrap();
+    let with_picture = doc.source().to_string();
+    save(&mut doc);
+    doc.undo().unwrap();
+    assert_eq!(doc.source(), "# One\n", "the picture's tag goes");
+    assert!(dir.path().join("assets/shot.png").is_file(), "its file stays in the talk");
+    assert!(doc.added_files().is_empty(), "nothing is waiting to be saved");
+    save(&mut doc);
+    assert_eq!(read(&dir.path().join("slides.md")), "# One\n");
+    // Changed on disk while nothing shows it, then shown again: it's read from the talk's files.
+    let cropped = picture(20, GREEN);
+    write_later(&dir.path().join("assets/shot.png"), &cropped);
+    after_a_save_is_seen(&mut doc, dir.path());
+    doc.redo().unwrap();
+    assert_eq!(doc.source(), with_picture);
+    assert_eq!(first_shows(&mut doc), (true, false), "the picture draws, as it is on disk");
+    assert!(doc.added_files().is_empty(), "the file is the talk's");
+    save(&mut doc);
+    let mut fresh = open_fresh(dir.path());
+    assert_eq!(fresh.source(), with_picture);
+    assert_eq!(first_shows(&mut fresh), (true, false));
+}
+
+#[test]
+fn a_picture_added_and_not_saved_is_still_there_for_redo_after_a_save() {
+    let (dir, mut doc) = talk("# One\n");
+    doc.insert_picture("shot.png", picture(40, [255, 0, 0, 255])).unwrap();
+    doc.undo().unwrap();
+    save(&mut doc);
+    assert!(!dir.path().join("assets/shot.png").exists(), "nothing uses it, so it isn't saved");
+    doc.redo().unwrap();
+    assert_eq!(first_shows(&mut doc), (false, true), "kept in memory, it draws");
+    save(&mut doc);
+    assert_eq!(std::fs::read(dir.path().join("assets/shot.png")).unwrap(), picture(40, [255, 0, 0, 255]));
+}
+
+#[test]
+fn a_saved_added_picture_goes_with_a_save_as_to_the_other_form() {
+    // From a folder to a pack, and from a pack to a folder, after the save that wrote it.
+    let red = picture(40, [255, 0, 0, 255]);
+    let (_dir, mut doc) = talk("# One\n");
+    doc.insert_picture("shot.png", red.clone()).unwrap();
+    save(&mut doc);
+    let elsewhere = tempfile::tempdir().unwrap();
+    let pack = elsewhere.path().join("copy.sptx");
+    let saved = doc.save_as_job(SaveTarget::Packed(pack.clone())).run().unwrap();
+    doc.saved(saved);
+    assert_eq!(file_in(&pack, "assets/shot.png"), Some(red.clone()));
+    assert_eq!(first_shows(&mut doc), (false, true), "read from the pack now");
+    assert_eq!(first_shows(&mut open_fresh(&pack)), (false, true));
+
+    let (_packed_dir, file) = packed_talk("# One\n");
+    let mut doc = Document::open_packed(&file, Fonts::bundled_only()).unwrap();
+    doc.insert_picture("shot.png", red.clone()).unwrap();
+    save(&mut doc);
+    assert_eq!(file_in(&file, "assets/shot.png"), Some(red.clone()), "in the pack");
+    assert_eq!(first_shows(&mut doc), (false, true), "and read from it");
+    doc.undo().unwrap();
+    doc.redo().unwrap();
+    assert_eq!(first_shows(&mut doc), (false, true), "undone and made again, it's still read from it");
+    let folder = elsewhere.path().join("unpacked");
+    let saved = doc.save_as_job(SaveTarget::Folder(folder.clone())).run().unwrap();
+    doc.saved(saved);
+    assert_eq!(std::fs::read(folder.join("assets/shot.png")).unwrap(), red);
+    assert_eq!(first_shows(&mut open_fresh(&folder)), (false, true));
+    // The folder's copy is the one read from now on.
+    write_later(&folder.join("assets/shot.png"), &picture(20, GREEN));
+    after_a_save_is_seen(&mut doc, &folder);
+    assert_eq!(first_shows(&mut doc), (true, false));
+}
+
+#[test]
+fn after_a_save_a_crash_brings_back_no_saved_picture_as_unsaved() {
+    let (dir, mut doc) = talk("# One\n");
+    doc.insert_picture("shot.png", picture(40, [255, 0, 0, 255])).unwrap();
+    save(&mut doc);
+    doc.add_slide("content").unwrap();
+    // What the working copy keeps of the unsaved edits.
+    let (text, files) = (doc.source().to_string(), doc.unsaved_files());
+    assert!(files.is_empty(), "the picture is saved, so nothing of it is kept as unsaved");
+    let cropped = picture(20, GREEN);
+    write_later(&dir.path().join("assets/shot.png"), &cropped);
+    let mut recovered = open_fresh(dir.path());
+    recovered.recover_with_files(text.clone(), files).unwrap();
+    assert_eq!(recovered.source(), text);
+    assert_eq!(first_shows(&mut recovered), (true, false), "the picture is the talk's, as it is on disk");
+    assert!(recovered.added_files().is_empty());
+}

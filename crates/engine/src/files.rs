@@ -166,8 +166,9 @@ impl TalkFiles for std::sync::Arc<dyn TalkFiles + Send + Sync> {
 }
 
 /// Files added to a talk while it's open, by their path in it, kept in memory until they're
-/// saved. Shared between the talk and whatever saves it, and only ever added to: a file once
-/// added keeps its bytes for as long as the set lasts.
+/// saved. Shared between the talk and whatever saves it. A file added keeps its bytes until a
+/// save has written it where the talk is read from and it's released, from when it's read
+/// there, as the talk's own.
 ///
 /// It also holds builds entered in the talk's build index that no save has written yet, as
 /// for a component pasted with its build: the index the talk's files give is the talk's own
@@ -176,8 +177,8 @@ impl TalkFiles for std::sync::Arc<dyn TalkFiles + Send + Sync> {
 #[derive(Default)]
 pub struct AddedSet {
     files: Mutex<BTreeMap<String, Arc<[u8]>>>,
-    /// How many files have been added, so that something holding on to what it read can
-    /// tell when there's more.
+    /// How many files have been added or released, so that something holding on to what it
+    /// read can tell when that's changed.
     added: AtomicU64,
     builds: Mutex<Vec<BuildEntry>>,
     /// Changes each time the builds entered change, so the index they give is read again.
@@ -209,6 +210,20 @@ impl AddedSet {
         true
     }
 
+    /// Lets go of the files added at `paths`, which a save has written where the talk is read
+    /// from: from now on they're read there. Whether any was let go of.
+    pub fn release(&self, paths: &[String]) -> bool {
+        let mut files = self.files();
+        let mut released = false;
+        for path in paths.iter().filter_map(|path| crate::packed::normalise(path)) {
+            released |= files.remove(&path).is_some();
+        }
+        if released {
+            self.added.fetch_add(1, Ordering::SeqCst);
+        }
+        released
+    }
+
     /// The bytes added as `path`.
     pub fn get(&self, path: &str) -> Option<Arc<[u8]>> {
         self.files().get(&crate::packed::normalise(path)?).cloned()
@@ -227,7 +242,7 @@ impl AddedSet {
             .collect()
     }
 
-    /// Changes each time a file is added.
+    /// Changes each time a file is added or released.
     pub fn stamp(&self) -> u64 {
         self.added.load(Ordering::SeqCst)
     }
@@ -319,7 +334,7 @@ impl TalkFiles for WithAdded {
         }
     }
 
-    /// An added file never changes, so its length is its stamp; so is a file of a talk that
+    /// An added file never changes while it's held, so its length is its stamp; so is a file of a talk that
     /// never changes, such as a pack, as nothing under this can say that any more. The build
     /// index, with builds entered in it, changes with them as with its own file.
     fn stamp(&self, path: &str) -> Option<(u64, SystemTime)> {

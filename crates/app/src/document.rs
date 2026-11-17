@@ -3190,8 +3190,7 @@ impl Document {
     /// Takes in a save that worked. The talk is saved if its text is still what was written,
     /// and after a Save As it's kept in the new place from now on.
     pub fn saved(&mut self, saved: Saved) {
-        // Part of the talk now, wherever it's kept. They're still read from memory, as a pack
-        // the talk has open is the one it opened.
+        // Part of the talk now, wherever it's kept.
         for path in &saved.files_written {
             self.pending.remove(path);
         }
@@ -3210,6 +3209,13 @@ impl Document {
             self.files = Arc::new(WithAdded::new(files, self.added.clone()));
             self.deck.set_files(Box::new(self.files.clone()));
             self.components_looked_at();
+        }
+        // Read from where the talk is kept from here on, as its own files are, so that a change
+        // to one there is seen as a change to any other is. One that isn't there to be read, as
+        // in a pack that wasn't opened again, stays in memory.
+        let written: Vec<String> = saved.files_written.iter().filter(|path| self.own_files.len(path).is_some()).cloned().collect();
+        if self.added.release(&written) {
+            self.deck.files_added();
         }
         if self.source() == saved.written {
             self.history.mark_saved();

@@ -169,6 +169,29 @@ fn an_added_file_is_never_replaced() {
 }
 
 #[test]
+fn a_released_file_is_read_from_the_talks_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let (files, added) = with_added(dir.path());
+    assert!(added.add("assets/c.txt", b"added".to_vec().into()));
+    // A save writes it, and another program changes it after.
+    std::fs::create_dir(dir.path().join("assets")).unwrap();
+    std::fs::write(dir.path().join("assets/c.txt"), b"changed on disk").unwrap();
+    assert_eq!(files.read("assets/c.txt"), Some(b"added".to_vec()), "held, it's read from memory");
+    let stamp = added.stamp();
+    assert!(added.release(&["./assets/c.txt".to_string(), "assets/none.txt".to_string()]));
+    assert_ne!(added.stamp(), stamp, "what reads it knows to read it again");
+    assert_eq!(files.read("assets/c.txt"), Some(b"changed on disk".to_vec()));
+    assert_eq!(files.len("assets/c.txt"), Some(15));
+    assert_eq!(added.get("assets/c.txt"), None);
+    assert!(added.names_in("assets").is_empty());
+    let stamp = added.stamp();
+    assert!(!added.release(&["assets/c.txt".to_string()]), "nothing more to let go of");
+    assert_eq!(added.stamp(), stamp);
+    // Its name can be given again.
+    assert!(added.add("assets/c.txt", b"again".to_vec().into()));
+}
+
+#[test]
 fn a_packs_files_keep_one_stamp_under_what_is_added() {
     let dir = tempfile::tempdir().unwrap();
     let talk = dir.path().join("talk");
