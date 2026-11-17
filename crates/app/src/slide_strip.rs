@@ -187,11 +187,16 @@ impl SlideStrip {
         }
     }
 
-    /// Takes the keyboard for the slide in hand, letting go of any thing selected on a slide:
-    /// from here Delete and the clipboard act on whole slides, and a thing still shown as
-    /// selected would say otherwise.
+    /// Takes the keyboard for the slide in hand. A press anywhere on the list has already let
+    /// go of any thing selected on a slide.
     fn take_keyboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle, cx);
+    }
+
+    /// Lets go of the thing selected on a slide, as the list takes the keyboard: from here Delete
+    /// and the clipboard act on whole slides, and a thing still shown as selected would say
+    /// otherwise.
+    pub fn let_go_of_selection(&mut self, cx: &mut Context<Self>) {
         if let Some(document) = &self.document {
             document.update(cx, |document, cx| {
                 if document.selected().is_some() {
@@ -726,6 +731,8 @@ impl Render for SlideStrip {
             .test_support()
             .key_context(STRIP_CONTEXT)
             .track_focus(&self.focus_handle)
+            // Any press on the list gives it the keyboard, on a row, below the rows, or to drag.
+            .on_any_mouse_down(cx.listener(|this, _, _, cx| this.let_go_of_selection(cx)))
             .relative()
             .overflow_hidden()
             .size_full()

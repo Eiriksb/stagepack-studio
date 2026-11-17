@@ -76,7 +76,8 @@ pub const MISSING_BOTH: &str = "Some pictures and components on the pasted slide
 pub const FILES_TOO_LARGE: &str = "The pictures were too large to copy with it.";
 /// What the window says when a pasted component has the name of one every talk has.
 pub const BUILT_IN_NAME: &str = "The pasted component has the name of a built-in one, so it wasn't added.";
-/// What the window says when a pasted component's build came without its source.
+/// What the window says when a pasted component's build came without its source, or a pasted
+/// slide shows a component the talk lacks.
 pub const MISSING_COMPONENT: &str = "A component on the pasted slide isn't in this talk.";
 /// What the window says when a thing from a slide is pasted while text is being typed.
 pub const NOT_INTO_TEXT: &str = "That can't be pasted into text.";

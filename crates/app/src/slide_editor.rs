@@ -186,6 +186,8 @@ pub struct SlideEditor {
     focus_handle: FocusHandle,
     /// Where the keyboard goes once typing ends: the window's own.
     away: FocusHandle,
+    /// The keyboard of the list of slides, if the editor is to take the keyboard from it.
+    list: Option<FocusHandle>,
     /// What holds the text tools: the keyboard can go there and typing goes on.
     tools: FocusHandle,
     /// What else the keyboard can go to while typing goes on, as the icon picker's search.
@@ -282,6 +284,7 @@ impl SlideEditor {
             canvas,
             focus_handle,
             away,
+            list: None,
             tools,
             more_tools: Vec::new(),
             caret_on: true,
@@ -313,6 +316,12 @@ impl SlideEditor {
         self.more_tools.push(tools);
     }
 
+    /// Has the editor take the keyboard from the list of slides, which `list` is the keyboard
+    /// of, once a thing on the slide shown is selected while the list has it.
+    pub fn take_keyboard_from_list(&mut self, list: FocusHandle) {
+        self.list = Some(list);
+    }
+
     /// Whether the text tools, or something else that can have the keyboard while typing goes
     /// on, has it.
     fn tools_have_keyboard(&self, window: &Window, cx: &App) -> bool {
@@ -340,7 +349,10 @@ impl SlideEditor {
         } else {
             self.stop(cx);
             if self.selection_here(cx).is_some() {
-                if !focused && self.away.is_focused(window) {
+                // From the list of slides too, as by an Undo pressed there: a thing shown as
+                // selected while the list has the keyboard would have Delete take its slide.
+                let list_has_it = self.list.as_ref().is_some_and(|list| list.contains_focused(window, cx));
+                if !focused && (self.away.is_focused(window) || list_has_it) {
                     self.focus_handle.focus(window, cx);
                 }
             } else if focused {

@@ -484,6 +484,155 @@ fn a_click_in_the_list_of_slides_lets_go_of_the_thing_selected(cx: &mut TestAppC
     assert_eq!(typing.source(cx), TALK);
 }
 
+fn list_has_keyboard(typing: &Typing, cx: &mut TestAppContext) -> bool {
+    typing.with_window(cx, |window, cx| {
+        let view = typing.view.clone();
+        view.read(cx).slide_strip().read(cx).focus_handle().contains_focused(window, cx)
+    })
+}
+
+/// The rule that keeps Delete from taking a slide while a thing on it shows as selected: never
+/// both at once.
+fn holds_the_rule(typing: &Typing, cx: &mut TestAppContext, step: &str) {
+    let both = list_has_keyboard(typing, cx) && selected(typing, cx).is_some();
+    assert!(!both, "after {step}, the list has the keyboard while a thing is selected");
+}
+
+/// The ways the list of slides gets the keyboard by the mouse.
+#[derive(Clone, Copy, Debug)]
+enum ToTheList {
+    /// A click on the slide's row.
+    Click,
+    /// A press on the slide's row, moved a few pixels before it's let go, which starts a drag.
+    Wobble,
+    /// A press on the empty part of the list, below the rows.
+    BelowTheRows,
+}
+
+fn to_the_list(typing: &Typing, cx: &mut TestAppContext, how: ToTheList) {
+    match how {
+        ToTheList::Click => click_on(typing, cx, strip_row_id(0)),
+        ToTheList::Wobble => {
+            let row = bounds_of(typing, cx, strip_row_id(0)).expect("the first row").center();
+            typing.drag(cx, row, row + gpui_kit::point(px(0.), px(6.)));
+        }
+        ToTheList::BelowTheRows => {
+            let list = bounds_of(typing, cx, STRIP_ID).expect("the list");
+            let last = bounds_of(typing, cx, strip_row_id(1)).expect("the last row");
+            assert!(list.bottom() > last.bottom() + px(40.), "room below the rows");
+            let below = gpui_kit::point(list.center().x, last.bottom() + px(20.));
+            typing.click(cx, below);
+        }
+    }
+    assert!(list_has_keyboard(typing, cx), "{how:?} gives the list the keyboard");
+}
+
+#[gpui_kit::test]
+fn delete_after_undo_in_the_list_takes_the_thing_and_not_the_slide(cx: &mut TestAppContext) {
+    // Found in review: Undo pressed in the list brought a thing back selected while the list
+    // kept the keyboard, and Delete then took the whole slide.
+    let typing = open(cx, TALK);
+    insert_shape(&typing, cx, "rect");
+    let with_shape = typing.source(cx);
+    typing.press(cx, "delete");
+    assert_eq!(typing.source(cx), TALK);
+    keyboard_to_the_slide_list(&typing, cx);
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), with_shape, "the shape is back");
+    assert!(selected(&typing, cx).is_some(), "and selected");
+    holds_the_rule(&typing, cx, "Undo");
+    typing.press(cx, "delete");
+    assert_eq!(typing.source(cx), TALK, "Delete takes the shape, and the slide stays");
+}
+
+#[gpui_kit::test]
+fn delete_after_redo_in_the_list_takes_the_thing_and_not_the_slide(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    insert_shape(&typing, cx, "rect");
+    let with_shape = typing.source(cx);
+    keyboard_to_the_slide_list(&typing, cx);
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), TALK);
+    keyboard_to_the_slide_list(&typing, cx);
+    typing.press(cx, "ctrl-shift-z");
+    assert_eq!(typing.source(cx), with_shape, "the shape is back");
+    holds_the_rule(&typing, cx, "Redo");
+    typing.press(cx, "delete");
+    assert_eq!(typing.source(cx), TALK, "Delete takes the shape, and the slide stays");
+}
+
+#[gpui_kit::test]
+fn a_row_wobbled_or_a_press_below_the_rows_lets_go_of_the_thing(cx: &mut TestAppContext) {
+    // Found in review: a press on a row moved a few pixels starts a drag and drops the click,
+    // and a press below the rows gives the list the keyboard; neither let go of the thing, and
+    // Delete took the slide while the thing showed as selected.
+    for how in [ToTheList::Wobble, ToTheList::BelowTheRows] {
+        let typing = open(cx, TALK);
+        insert_shape(&typing, cx, "rect");
+        to_the_list(&typing, cx, how);
+        holds_the_rule(&typing, cx, &format!("{how:?}"));
+        assert_eq!(selected(&typing, cx), None, "{how:?}");
+        assert!(bounds_of(&typing, cx, SELECTION_OUTLINE_ID).is_none(), "{how:?}: no outline");
+        let shown = typing.source(cx);
+        typing.press(cx, "delete");
+        assert_ne!(typing.source(cx), shown, "{how:?}: Delete in the list takes the slide, as nothing shows selected");
+    }
+}
+
+#[gpui_kit::test]
+fn the_list_never_has_the_keyboard_while_a_thing_is_selected(cx: &mut TestAppContext) {
+    for how in [ToTheList::Click, ToTheList::Wobble, ToTheList::BelowTheRows] {
+        // A thing selected before the list takes the keyboard.
+        let typing = open(cx, TALK);
+        insert_shape(&typing, cx, "rect");
+        holds_the_rule(&typing, cx, "the insert");
+        to_the_list(&typing, cx, how);
+        holds_the_rule(&typing, cx, &format!("{how:?} after a selection"));
+        // A thing selected after: by Undo, by Redo, and by pasting a thing.
+        typing.press(cx, "ctrl-z");
+        holds_the_rule(&typing, cx, &format!("{how:?} then Undo"));
+        to_the_list(&typing, cx, how);
+        typing.press(cx, "ctrl-shift-z");
+        assert!(selected(&typing, cx).is_some(), "{how:?}: Redo selects the shape");
+        holds_the_rule(&typing, cx, &format!("{how:?} then Redo"));
+        typing.press(cx, "ctrl-c");
+        to_the_list(&typing, cx, how);
+        typing.press(cx, "ctrl-v");
+        holds_the_rule(&typing, cx, &format!("{how:?} then a paste"));
+        assert_eq!(typing.source(cx).matches("<Shape").count(), 2, "{how:?}: the paste is on the slide");
+    }
+}
+
+#[gpui_kit::test]
+fn a_thing_pasted_while_the_list_has_the_keyboard_goes_on_the_slide_with_the_keyboard(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    insert_shape(&typing, cx, "rect");
+    typing.press(cx, "ctrl-c");
+    keyboard_to_the_slide_list(&typing, cx);
+    typing.press(cx, "ctrl-v");
+    assert_eq!(typing.source(cx).matches("<Shape").count(), 2, "a second shape on the slide");
+    assert!(selected_text(&typing, cx).is_some_and(|text| text.starts_with("<Shape")), "selected");
+    assert!(!list_has_keyboard(&typing, cx), "the slide has the keyboard");
+    let two = typing.source(cx);
+    typing.press(cx, "delete");
+    assert_eq!(typing.source(cx).matches("<Shape").count(), 1, "Delete takes the pasted shape");
+    assert_ne!(typing.source(cx), two);
+}
+
+#[gpui_kit::test]
+fn ctrl_d_duplicates_the_slide_from_the_list_and_the_thing_from_the_slide(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    insert_shape(&typing, cx, "rect");
+    typing.press(cx, "ctrl-d");
+    assert_eq!(typing.source(cx).matches("<Shape").count(), 2, "the shape is duplicated");
+    assert_eq!(typing.source(cx).matches("# One").count(), 1, "not the slide");
+    keyboard_to_the_slide_list(&typing, cx);
+    assert_eq!(selected(&typing, cx), None, "nothing is selected once the list has the keyboard");
+    typing.press(cx, "ctrl-d");
+    assert_eq!(typing.source(cx).matches("# One").count(), 2, "the slide is duplicated");
+    assert_eq!(typing.source(cx).matches("<Shape").count(), 4, "with its shapes");
+}
+
 #[gpui_kit::test]
 fn a_picture_dropped_while_the_list_of_slides_has_the_keyboard_is_taken_away_by_delete(cx: &mut TestAppContext) {
     let typing = open(cx, TALK);

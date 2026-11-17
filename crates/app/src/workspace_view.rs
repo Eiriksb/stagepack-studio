@@ -344,6 +344,7 @@ pub struct WorkspaceView {
     _working_copies_changed: Subscription,
     _keep_failed: Subscription,
     _icon_picked: Subscription,
+    _list_focused: Subscription,
     /// A size chosen from the Insert tab's grid of tables.
     _table_picked: Subscription,
     _component_picked: Subscription,
@@ -468,6 +469,16 @@ impl WorkspaceView {
             this.keyboard_to_the_slide(window, cx);
         });
         let slide_strip = cx.new(|cx| SlideStrip::new(document.clone(), cx));
+        // A thing is shown as selected only while the list of slides hasn't the keyboard, where
+        // Delete and the clipboard act on whole slides: the list taking the keyboard lets go of
+        // it (at once on a press, and by the keyboard as the window next draws), and a thing
+        // selected while the list has it takes the keyboard for the slide.
+        let list_focus = slide_strip.read(cx).focus_handle().clone();
+        slide_editor.update(cx, |editor, _| editor.take_keyboard_from_list(list_focus.clone()));
+        let strip = slide_strip.clone();
+        let list_focused = cx.on_focus_in(&list_focus, window, move |_, _, cx| {
+            strip.update(cx, |strip, cx| strip.let_go_of_selection(cx));
+        });
         let notes_panel = cx.new(|cx| NotesPanel::new(document.clone(), window, cx));
         let workspace = cx.weak_entity();
         let inspector = cx.new(|cx| Inspector::new(document.clone(), workspace, cx));
@@ -561,6 +572,7 @@ impl WorkspaceView {
             _working_copies_changed: working_copies_changed,
             _keep_failed: keep_failed,
             _icon_picked: icon_picked,
+            _list_focused: list_focused,
             _table_picked: table_picked,
             _component_picked: component_picked,
         };
