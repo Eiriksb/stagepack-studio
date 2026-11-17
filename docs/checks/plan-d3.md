@@ -170,9 +170,10 @@ The wave also made a space typed on a selected shape write nothing, filled the t
 
 At fb65bcc, `scripts/cargo-safe.sh test --workspace` passed: 1,862 tests, 0 failed, 13 ignored, and clippy gave no warnings. The window wasn't run again after the wave, so its fixes have been seen in tests only. A second reviewer then checked the wave and approved it with notes.
 
+One finding that mattered was left by the check of the wave, and the owner asked for it to be fixed before the merge. **A right-click on a slide in the list, with a shape selected or being typed in, left the shape showing as selected while the list had the keyboard**, and Delete or Backspace then took the slide. A row's menu keeps a right press from reaching the list, so the row now lets go of the selection itself (e6ba2a7). The tests of the keyboard rule take a right-click as a fourth way to the list; three of them failed before the fix. A reviewer approved it with notes: a long press on a touch screen opens the menu by another route and isn't covered. At e6ba2a7 the workspace passed again, 1,862 tests, 0 failed, 13 ignored, and clippy gave no warnings. This fix too has been seen in tests only.
+
 Known after the final review, and not changed:
 
-- **A right-click on a slide in the list, with a shape selected or being typed in, leaves the shape showing as selected while the list has the keyboard.** Delete or Backspace then takes the slide. One Undo brings it back. The menu that opens on a right-click stops the press from reaching the rule that lets go. A caret in a slide's own text, or a text box not yet typed in, isn't affected. This is the one finding left that matters, and the fix is small.
 - **Ctrl+D with the keyboard in the notes duplicates the slide** while a thing shows as selected. **Left, Right and the Page keys with a thing selected change the slide**; they don't move the thing.
 - **The Home tab is wider.** At 1,280 pixels Undo and Redo are behind the arrow at the row's end, and the row fits whole from about 1,410.
 - **A slide with sixty things** is at the 8 ms budget for a keystroke. **A hand-written table near 10,000 cells** opens at once and then takes over half a second a key.

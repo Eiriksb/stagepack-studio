@@ -191,8 +191,9 @@ impl SlideStrip {
         }
     }
 
-    /// Takes the keyboard for the slide in hand. A press anywhere on the list has already let
-    /// go of any thing selected on a slide.
+    /// Takes the keyboard for the slide in hand. Whatever calls this has let go of any thing
+    /// selected on a slide: the list does on any press that reaches it, and a row does itself
+    /// on a right press, which its menu keeps from the list.
     fn take_keyboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle, cx);
     }
