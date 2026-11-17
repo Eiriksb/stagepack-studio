@@ -722,3 +722,35 @@ fn a_right_click_off_any_thing_while_typing_does_nothing(cx: &mut TestAppContext
     assert!(slide_has_keyboard(&typing, cx));
     assert_eq!(typing.source(cx), TALK);
 }
+
+#[gpui_kit::test]
+fn arranging_never_reaches_a_slide_not_shown(cx: &mut TestAppContext) {
+    // Found by the random session: an area selected, then the next slide shown with Page Down,
+    // and Align left wrote `region.body: x=0` on the slide shown.
+    for area in [true, false] {
+        let typing = open_wide(cx, TALK);
+        if area {
+            select_body(&typing, cx);
+        } else {
+            click_thing(&typing, cx, RECT, Modifiers::default());
+        }
+        let picked_before = picked(&typing, cx);
+        typing.press(cx, "pagedown");
+        assert_eq!(typing.current(cx), 1, "the next slide is shown");
+        let here = typing.document(cx).read_with(cx, |document, _| document.arrange_menu());
+        assert!(!here.can_align() && here.can == [false; 4], "nothing can be arranged, area {area}");
+        typing.with_window(cx, |window, cx| {
+            window.dispatch_action(Box::new(stagepack_studio::arrange_tools::AlignThings { to: stagepack_studio::arrange::AlignTo::Left }), cx);
+            window.dispatch_action(Box::new(stagepack_studio::arrange_tools::DistributeThings { across: true }), cx);
+            window.dispatch_action(Box::new(ReorderThing { order: slides_format::Order::Front }), cx);
+        });
+        typing.settle(cx);
+        assert_eq!(typing.source(cx), TALK, "nothing is written, area {area}");
+        assert!(!can_undo(&typing, cx));
+        // Back on its slide, it's arranged as before.
+        typing.press(cx, "pageup");
+        assert_eq!(picked(&typing, cx), picked_before, "area {area}: still selected there");
+        arrange(&typing, cx, "Align left");
+        assert_eq!(undo_label(&typing, cx), Some("Align"), "area {area}");
+    }
+}

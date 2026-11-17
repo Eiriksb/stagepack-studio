@@ -81,6 +81,12 @@ fn order_index(order: Order) -> usize {
 const MOVED: f32 = 0.01;
 
 impl Document {
+    /// What's selected, if it's on the slide shown: all that arranging acts on. A selection left
+    /// on another slide is never moved, aligned or reordered from this one, as none of it shows.
+    fn selection_here(&self) -> Option<&selection::Selection> {
+        self.selection.as_ref().filter(|selection| selection.slide == self.current)
+    }
+
     /// Shows each of `places` on the current slide where it says, without writing anything,
     /// until [`Self::drop_preview`] or any edit. Only a thing with a place of its own, or an
     /// area of the slide's layout, is shown moved.
@@ -117,7 +123,7 @@ impl Document {
     /// picked, and whether any selected can't be: one written in the slide's text, with no place
     /// of its own.
     pub fn movable_selected(&mut self) -> (Vec<(Thing, Placed)>, bool) {
-        let Some(selection) = self.selection.clone() else {
+        let Some(selection) = self.selection_here().cloned() else {
             return (Vec::new(), false);
         };
         let layout = self.text_layout(selection.slide);
@@ -210,7 +216,7 @@ impl Document {
     /// where it's drawn there; or why it can't be given a place, as one inside a component can't.
     /// `None` where anything else is selected, or nothing.
     pub fn liftable_selected(&mut self) -> Option<Result<(Thing, Placed), EditRefused>> {
-        let selection = self.selection.clone()?;
+        let selection = self.selection_here().cloned()?;
         let [Thing::Block(source)] = selection.things.as_slice() else {
             return None;
         };
@@ -227,7 +233,7 @@ impl Document {
     /// The box with a place of its own that holds the one thing selected and nothing else, and
     /// where it is: what a drag of that thing moves.
     pub fn holding_box_selected(&mut self) -> Option<(Thing, Placed)> {
-        let selection = self.selection.clone()?;
+        let selection = self.selection_here().cloned()?;
         let held = selection::box_holding(self.talk(), selection.slide, selection.one_block()?)?;
         let element = self.text_layout(selection.slide).element(&held).filter(|element| element.placed)?;
         Some((Thing::Block(held), Placed { rect: element.rect, rotate: element.rotate }))
@@ -249,7 +255,7 @@ impl Document {
         if self.text_version() != version {
             return Err(EditRefused::CouldNotBeMade);
         }
-        let Some(selection) = self.selection.clone() else {
+        let Some(selection) = self.selection_here().cloned() else {
             return Ok(Vec::new());
         };
         let [Thing::Block(source)] = selection.things.as_slice() else {
@@ -279,7 +285,7 @@ impl Document {
 impl Document {
     /// What can be done to arrange what's selected, from the talk as it's written.
     pub fn arrange_here(&self) -> ArrangeHere {
-        let Some(selection) = &self.selection else {
+        let Some(selection) = self.selection_here() else {
             return ArrangeHere::default();
         };
         let Some(slide) = self.talk().slides.get(selection.slide) else {
@@ -323,7 +329,7 @@ impl Document {
     /// it opens.
     pub fn arrange_menu(&self) -> ArrangeHere {
         let mut here = self.arrange_here();
-        if let Some(selection) = &self.selection
+        if let Some(selection) = self.selection_here()
             && let [Thing::Block(source)] = selection.things.as_slice()
         {
             for order in [Order::Forward, Order::Backward, Order::Front, Order::Back] {
@@ -354,7 +360,7 @@ impl Document {
     /// step named "Distribute", and returns the slides to show again. Refused for fewer than
     /// three, or if one of them is written in the slide's text.
     pub fn distribute_things(&mut self, across: bool) -> Result<Vec<usize>, EditRefused> {
-        let count = self.selection.as_ref().map_or(0, |selection| selection.things.len());
+        let count = self.selection_here().map_or(0, |selection| selection.things.len());
         if count == 0 {
             return Ok(Vec::new());
         }
@@ -377,7 +383,7 @@ impl Document {
     /// where it's there already. Refused for several things, an area, or a thing written in
     /// the slide's text.
     pub fn reorder_selected(&mut self, order: Order) -> Result<Vec<usize>, EditRefused> {
-        if self.selection.is_none() {
+        if self.selection_here().is_none() {
             return Ok(Vec::new());
         }
         if let Some(refused) = self.arrange_here().order_refused {
@@ -390,7 +396,7 @@ impl Document {
         if self.text_version() != version {
             return Err(EditRefused::CouldNotBeMade);
         }
-        let Some(selection) = self.selection.clone() else {
+        let Some(selection) = self.selection_here().cloned() else {
             return Ok(Vec::new());
         };
         let [Thing::Block(source)] = selection.things.as_slice() else {
