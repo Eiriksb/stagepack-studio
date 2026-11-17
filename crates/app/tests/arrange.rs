@@ -4,7 +4,7 @@
 use proptest::prelude::*;
 use slides_engine::{CaretRect, Rect};
 use stagepack_studio::arrange::{
-    AlignTo, Handle, MIN_SIZE, Placed, aligned, bounds, distributed, handle_point, holding, kept_move, kept_on_slide, resized, straight, turned_to, whole,
+    AlignTo, Handle, MIN_SIZE, Placed, aligned, bounds, distributed, handle_point, holding, kept_move, kept_on_slide, moved, resized, straight, turned_to, whole,
 };
 
 /// The corners of `placed`, turned about its centre.
@@ -455,9 +455,46 @@ proptest! {
             let covers = bounds(placed);
             if across { (covers.x, covers.x + covers.w) } else { (covers.y, covers.y + covers.h) }
         };
-        let gaps: Vec<f32> = order.windows(2).map(|pair| span(&out[pair[1]]).0 - span(&out[pair[0]]).1).collect();
-        for gap in &gaps {
-            prop_assert!((gap - gaps[0]).abs() <= 0.02, "gaps {gaps:?}");
+        // Where each between the ends goes with the same gap everywhere, and whether that would
+        // leave less of it on the slide than a move keeps: then it's held, as a move would be,
+        // and only then. Overlapping things can make the gap less than nothing, and take a small
+        // one off the slide's edge.
+        let (first_end, last_start) = (span(&things[first]).1, span(&things[last]).0);
+        let between: f32 = order[1..order.len() - 1].iter().map(|&at| span(&things[at]).1 - span(&things[at]).0).sum();
+        let gap = (last_start - first_end - between) / (things.len() - 1) as f32;
+        let mut at = first_end + gap;
+        let mut held = vec![false; things.len()];
+        for &index in &order[1..order.len() - 1] {
+            let (start, end) = span(&things[index]);
+            let by = at - start;
+            let asked = if across { (by, 0.) } else { (0., by) };
+            let kept = kept_move(&things[index..=index], asked);
+            held[index] = (kept.0 - asked.0).abs() > 0.001 || (kept.1 - asked.1).abs() > 0.001;
+            let want = moved(&things[index], kept);
+            if held[index] {
+                // Held only where the gap would take it further off than a move goes, and then
+                // just as far as a move goes: as much of it on the slide as a move keeps.
+                let side = if across { 1920. } else { 1080. };
+                let length = end - start;
+                let left_on = |placed: &Placed| {
+                    let (start, end) = span(placed);
+                    on(start, end - start, side)
+                };
+                let unheld = moved(&things[index], asked);
+                prop_assert!(left_on(&unheld) < length.min(16.), "{index} was held though the gap left it on");
+                prop_assert!((left_on(&want) - length.min(16.)).abs() <= 0.02, "{index} was held further than a move holds it");
+            }
+            prop_assert!((out[index].rect.x - want.rect.x).abs() <= 0.02 && (out[index].rect.y - want.rect.y).abs() <= 0.02, "{index}: {:?}, not {want:?}", out[index]);
+            at += end - start + gap;
+        }
+        // Between two not held, the gap is the same everywhere.
+        let gaps: Vec<f32> = order
+            .windows(2)
+            .filter(|pair| !held[pair[0]] && !held[pair[1]])
+            .map(|pair| span(&out[pair[1]]).0 - span(&out[pair[0]]).1)
+            .collect();
+        for found in &gaps {
+            prop_assert!((found - gap).abs() <= 0.02, "gaps {gaps:?}, not {gap}");
         }
         for (before, after) in things.iter().zip(&out) {
             prop_assert_eq!((after.rect.w, after.rect.h, after.rotate), (before.rect.w, before.rect.h, before.rotate));
@@ -506,4 +543,22 @@ fn a_line_far_off_the_slide_takes_a_thing_only_part_of_the_way() {
     let lined = aligned(&[far, other], AlignTo::Left);
     assert_eq!(lined[0], far, "the far one is on the line already");
     assert_eq!(lined[1].rect.x, -484., "sixteen units of the other stay on");
+}
+
+#[test]
+fn spacing_out_overlapping_things_holds_a_small_one_at_the_slides_edge() {
+    // Found by the property: two tall things turned upside down overlap so much that the gap
+    // is less than nothing, and with the same gap everywhere two small things would go wholly
+    // off the slide's bottom. Each is held with its one unit on, as a move holds it.
+    let dot = |y: f32| Placed { rect: Rect { x: 40., y, w: 1., h: 1. }, rotate: 0. };
+    let tall = |y: f32, h: f32| Placed { rect: Rect { x: 40., y, w: 1., h }, rotate: 180. };
+    let things = [dot(875.15576), tall(375.97754, 431.03207), dot(1012.1295), tall(332.37946, 666.2865), dot(1021.3505)];
+    let out = distributed(&things, false).expect("five");
+    assert_eq!(out[1], things[1], "the first along stays");
+    assert_eq!(out[4], things[4], "and the last");
+    assert!((out[0].rect.y - 1079.).abs() < 0.01 && (out[2].rect.y - 1079.).abs() < 0.01, "both held at the bottom: {out:?}");
+    // The tall one between the ends isn't held: it goes the gap after the first.
+    let first = bounds(&things[1]);
+    let gap = (things[4].rect.y - (first.y + first.h) - 666.2865 - 2.) / 4.;
+    assert!((bounds(&out[3]).y - (first.y + first.h + gap)).abs() < 0.02);
 }
