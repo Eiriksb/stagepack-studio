@@ -62,7 +62,7 @@ The largest stage, and it will be split into several plans when it starts.
 
 - **D1. Slides and safety:** the slide strip, notes panel, undo, Save As, crash recovery (goals 1, 8, 9 in part, 11). File: `2026-11-11-native-rust-plan-d1-slides-safety.md`. It also brings the tool tabs, with Insert and Animate empty until D3 and D4. What ran is in `docs/checks/plan-d1.md`.
 - **D2. Text:** typing on the slide, per-word styling, bullets, copy and paste between talks (goals 2, 9). File: `2026-11-12-native-rust-plan-d2-text.md`. What ran is in `docs/checks/plan-d2.md`.
-- **D3. Insert:** pictures, shapes, icons, tables and the component palette with its forms (goals 3, 4, 6).
+- **D3. Insert:** pictures, shapes, icons, tables and the component palette with its forms (goals 3, 4, 6). File: `2026-11-16-native-rust-plan-d3-insert.md`. What ran is in `docs/checks/plan-d3.md`.
 - **D4. Arrange and animate:** moving regions and boxes, align, distribute, order, snapping, the Animate tab and the layout picker (goals 5, 7).
 - **D5. New presentation:** starter templates (goal 10).
 
