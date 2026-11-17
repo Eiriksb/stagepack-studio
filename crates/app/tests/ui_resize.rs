@@ -533,10 +533,65 @@ fn shift_by_a_handle_adds_the_thing_under_it(cx: &mut TestAppContext) {
     let typing = open(cx, &talk);
     click_thing(&typing, cx, RECT, Modifiers::default());
     let handle = handle_at(&typing, cx, Handle::Right).expect("the handle");
-    let near = handle + point(px(4.), px(0.));
+    // In reach of the handle, but off the square it's drawn as.
+    let near = handle + point(px(5.5), px(0.));
     typing.clicks(cx, near, 1, Modifiers::shift());
     assert_eq!(selection(&typing, cx).map(|selection| selection.things.len()), Some(2), "the ellipse is added");
     assert_eq!(typing.source(cx), talk);
+}
+
+#[gpui_kit::test]
+fn shift_held_before_pressing_a_corner_resizes_keeping_the_shape(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    click_thing(&typing, cx, RECT, Modifiers::default());
+    let from = handle_at(&typing, cx, Handle::BottomRight).expect("the handle");
+    let shift = Modifiers { alt: true, ..Modifiers::shift() };
+    typing.mouse_down(cx, from, 1, shift);
+    typing.move_held(cx, from + point(px(30.), px(5.)), shift);
+    typing.move_held(cx, from + point(px(60.), px(10.)), shift);
+    typing.mouse_up(cx, from + point(px(60.), px(10.)), 1, shift);
+    let (w, h) = (attr(&typing, cx, RECT, "w").expect("w"), attr(&typing, cx, RECT, "h").expect("h"));
+    assert!(w > 200. && w == h, "kept: {w} by {h}");
+    assert_eq!(undo_label(&typing, cx), Some("Resize"));
+    assert_eq!(selection(&typing, cx).map(|selection| selection.things.len()), Some(1), "it stays selected");
+    // A picture, which keeps its shape, is freed.
+    let (typing, talk) = open_picture(cx);
+    click_thing(&typing, cx, "<Picture", Modifiers::default());
+    let from = handle_at(&typing, cx, Handle::BottomRight).expect("the handle");
+    typing.mouse_down(cx, from, 1, shift);
+    typing.move_held(cx, from + point(px(60.), px(10.)), shift);
+    typing.mouse_up(cx, from + point(px(60.), px(10.)), 1, shift);
+    let (dx, dy) = (units(&typing, cx, 60.), units(&typing, cx, 10.));
+    let free = format!("w=\"{}\" h=\"{}\"", written(400., dx), written(300., dy));
+    assert_eq!(typing.source(cx), talk.replacen("w=\"400\" h=\"300\"", &free, 1));
+}
+
+#[gpui_kit::test]
+fn shift_held_before_pressing_the_turn_handle_turns_in_steps_of_fifteen(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    click_thing(&typing, cx, RECT, Modifiers::default());
+    let rect = thing(&typing, cx, RECT);
+    let centre = middle(&typing, cx, &rect);
+    let (sin, cos) = 37f32.to_radians().sin_cos();
+    let towards = centre + point(px(200. * sin), px(-200. * cos));
+    let from = handle_at(&typing, cx, Handle::Turn).expect("the turn handle");
+    typing.mouse_down(cx, from, 1, Modifiers::shift());
+    typing.move_held(cx, towards, Modifiers::shift());
+    typing.mouse_up(cx, towards, 1, Modifiers::shift());
+    assert_eq!(attr(&typing, cx, RECT, "rotate"), Some(30.));
+    assert_eq!(undo_label(&typing, cx), Some("Turn"));
+    assert_eq!(selection(&typing, cx).map(|selection| selection.things.len()), Some(1), "it stays selected");
+}
+
+#[gpui_kit::test]
+fn ctrl_on_a_handle_still_takes_the_thing_away(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    click_thing(&typing, cx, RECT, Modifiers::default());
+    // Right on the handle, just inside the shape.
+    let from = handle_at(&typing, cx, Handle::Right).expect("the handle") - point(px(2.), px(0.));
+    typing.clicks(cx, from, 1, Modifiers::control());
+    assert_eq!(selection(&typing, cx), None, "the shape is taken away");
+    assert_eq!(typing.source(cx), TALK);
 }
 
 #[gpui_kit::test]
