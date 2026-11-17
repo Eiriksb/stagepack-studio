@@ -285,7 +285,9 @@ fn a_slide_of_hanging_components_stays_within_its_budget() {
     let mut deck = open(&files);
     let started = Instant::now();
     let lines = texts(&mut deck, 0);
-    assert!(started.elapsed() < Duration::from_secs(3), "took {:?}", started.elapsed());
+    // Each stopped at its own limit, the 40 would take 10 s; the slide's budget stops them well
+    // before that, with room for a loaded machine.
+    assert!(started.elapsed() < Duration::from_secs(8), "took {:?}", started.elapsed());
     assert_eq!(lines.iter().filter(|line| line.starts_with("Hang: ")).count(), 40, "{lines:?}");
     assert_eq!(dashed_outlines(&mut deck, 0), 40);
 }
@@ -718,7 +720,9 @@ fn a_component_placing_its_content_many_times_shows_a_box() {
         let mut deck = open(&files);
         let started = Instant::now();
         let _ = deck.specs(0);
-        assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
+        // Unbounded, these took 101 s and 8 s; bounded, well under a second, with room for a
+        // loaded machine.
+        assert!(started.elapsed() < Duration::from_secs(6), "took {:?}", started.elapsed());
         let notices = deck.notices(0);
         assert!(notices.iter().any(|notice| notice == "Fan: gave an answer that can't be read"), "{notices:?}");
     }

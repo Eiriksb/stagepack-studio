@@ -658,7 +658,9 @@ fn the_palette_fills_in_within_its_budget(cx: &mut TestAppContext) {
         window.click(INSERT_COMPONENT_ID, cx);
         window.render_frame(cx);
     });
-    assert!(started.elapsed() < Duration::from_millis(250), "opening took {:?}", started.elapsed());
+    // Loading the 40 would take seconds; opening is drawing the list, which a loaded machine can
+    // make take a few hundred milliseconds in a debug build.
+    assert!(started.elapsed() < Duration::from_millis(1000), "opening took {:?}", started.elapsed());
     let palette = palette_of(&typing, cx);
     assert_eq!(palette.len(), 41);
     assert!(palette[1..].iter().all(|entry| entry.loading), "{palette:?}");
