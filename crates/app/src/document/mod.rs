@@ -66,6 +66,7 @@ use errors::{built, guarded, laid_out, read_after, worked_out};
 pub use open::TalkPlace;
 pub use reading::talk_settings;
 pub use saving::{Reload, UNREADABLE_FILE};
+pub use slides::CHANGE_LAYOUT;
 pub use tables::{Beside, CellMove, TableHere, TableTool};
 use selecting::made_in_turn;
 use tables::tables_on;

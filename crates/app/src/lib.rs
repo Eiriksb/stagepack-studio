@@ -17,6 +17,7 @@ pub mod icon_picker;
 pub mod insert;
 pub mod insert_tools;
 pub mod inspector;
+pub mod layout_picker;
 pub mod markdown_panel;
 pub mod notes_panel;
 pub mod palette;

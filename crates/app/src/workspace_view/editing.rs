@@ -7,6 +7,7 @@ use crate::clipboard::{self, AppData, Carried, PastedFiles, SlidePaste, TooLarge
 use crate::clipboard_tools::write_clipboard;
 use crate::document::{Brought, Selected};
 use crate::inspector::INSPECTOR_WIDTH;
+use crate::layout_picker::layout_name;
 
 impl WorkspaceView {
     /// Moves to another slide, unless the notes field has the keyboard: its keys move the caret.
@@ -202,6 +203,18 @@ impl WorkspaceView {
 
     pub(super) fn add_slide(&mut self, layout: &str, cx: &mut Context<Self>) {
         self.edit(|document| document.add_slide(layout), cx);
+    }
+
+    /// Gives the current slide the layout called `layout`, and says so once it has it.
+    pub(super) fn set_layout(&mut self, layout: &'static str, cx: &mut Context<Self>) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        let before = document.read(cx).layout_here();
+        self.edit(|document| document.set_layout(layout), cx);
+        if before != layout && document.read(cx).layout_here() == layout {
+            self.say_for_a_while(format!("Layout changed to {}.", layout_name(layout)), cx);
+        }
     }
 
     pub(super) fn delete_slide(&mut self, cx: &mut Context<Self>) {

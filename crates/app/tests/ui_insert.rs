@@ -1474,6 +1474,9 @@ fn formatting_chosen_for_a_pending_box_is_written_with_it(cx: &mut TestAppContex
         (BOLD_ID, "**x**".to_string()),
     ] {
         let typing = open(cx, TALK);
+        // Wide enough for the Home tab's list tools to show.
+        cx.simulate_window_resize(typing.handle, gpui_kit::size(px(1600.), px(800.)));
+        typing.settle(cx);
         insert_text_box(&typing, cx);
         click_on(&typing, cx, TAB_HOME_ID);
         click_on(&typing, cx, tool);

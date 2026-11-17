@@ -14,6 +14,7 @@ use slides_engine::{Fonts, pack_folder};
 use slides_format::is_hidden;
 use stagepack_studio::document::Document;
 use stagepack_studio::insert_tools::INSERT_PICTURE_ID;
+use stagepack_studio::layout_picker::layout_tile_id;
 use stagepack_studio::notes_panel::{NOTES_CAPTION_ID, NOTES_ID, NOTES_PLACEHOLDER};
 use stagepack_studio::ribbon::{
     DELETE_ID, DUPLICATE_ID, HIDE_ID, MARKDOWN_TOGGLE_ID, NEW_SLIDE_ID, NEW_SLIDE_LAYOUTS_ID,
@@ -108,13 +109,13 @@ fn keys(cx: &mut TestAppContext, handle: AnyWindowHandle, keystrokes: &str) {
     settle(cx, handle);
 }
 
-/// Picks `row` of the New slide button's list of layouts.
-fn pick_layout(cx: &mut TestAppContext, handle: AnyWindowHandle, row: usize) {
+/// Picks the tile of the layout `layout` from the New slide button's arrow.
+fn pick_layout(cx: &mut TestAppContext, handle: AnyWindowHandle, layout: &str) {
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
         window.within(NEW_SLIDE_LAYOUTS_ID).click("popup", cx);
         window.render_frame(cx);
-        window.within("popup-menu").click(row, cx);
+        window.click(layout_tile_id(layout), cx);
     })
     .unwrap();
     settle(cx, handle);
@@ -391,31 +392,32 @@ fn the_layout_list_adds_a_slide_of_that_layout(cx: &mut TestAppContext) {
         window.render_frame(cx);
         window.within(NEW_SLIDE_LAYOUTS_ID).click("popup", cx);
         window.render_frame(cx);
-        let menu = window.within("popup-menu");
-        for name in [
-            "Title",
-            "Title and content",
-            "Section",
-            "Two columns",
-            "Blank",
+        for (layout, name) in [
+            ("title", "Title"),
+            ("content", "Title and content"),
+            ("two-columns", "Two columns"),
+            ("section", "Section"),
+            ("blank", "Blank"),
         ] {
-            assert!(menu.find_by_label(name).visible(), "{name}");
+            let tile = window.find(layout_tile_id(layout));
+            assert!(tile.visible(), "{name}");
+            assert_eq!(tile.label(), Some(name));
         }
         window.press("escape", cx);
     })
     .unwrap();
     settle(cx, handle);
     let expected = [
-        (0, Some("title")),
-        (1, None),
-        (2, Some("section")),
-        (3, Some("two-columns")),
-        (4, Some("blank")),
+        ("title", Some("title")),
+        ("content", None),
+        ("section", Some("section")),
+        ("two-columns", Some("two-columns")),
+        ("blank", Some("blank")),
     ];
-    for (row, layout) in expected {
-        pick_layout(cx, handle, row);
+    for (tile, layout) in expected {
+        pick_layout(cx, handle, tile);
         let at = current(cx, &view);
-        assert_eq!(layout_of(cx, &view, at).as_deref(), layout, "row {row}");
+        assert_eq!(layout_of(cx, &view, at).as_deref(), layout, "{tile}");
     }
     assert_eq!(count(cx, &view), 7);
 }
@@ -1261,8 +1263,8 @@ fn pick_from_rows_menu(cx: &mut TestAppContext, handle: AnyWindowHandle, row: us
     settle(cx, handle);
 }
 
-/// The menu's items, a line between the last two groups.
-const MENU: [&str; 10] = [
+/// The menu's items, a line between each two groups.
+const MENU: [&str; 12] = [
     "New slide",
     "Duplicate",
     "Delete",
@@ -1273,6 +1275,8 @@ const MENU: [&str; 10] = [
     "Cut",
     "Copy",
     "Paste",
+    "",
+    "Layout",
 ];
 
 #[gpui_kit::test]

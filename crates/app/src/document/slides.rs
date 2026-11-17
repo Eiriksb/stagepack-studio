@@ -6,7 +6,47 @@ use super::*;
 /// The layout a slide has when its settings name none.
 const DEFAULT_LAYOUT: &str = "content";
 
+/// What Undo shows for giving a slide another layout.
+pub const CHANGE_LAYOUT: &str = "Change layout";
+
 impl Document {
+    /// Gives the current slide the layout called `layout`, by the engine's name for it, as one
+    /// step named "Change layout", and returns the slides to show again. Text keeps its place
+    /// where the new layout has an area of the same name, and the rest shows in its main area.
+    /// The layout the slide has already makes no step, and leaves the typing be. A name that
+    /// isn't a layout's is refused.
+    pub fn set_layout(&mut self, layout: &str) -> Result<Vec<usize>, EditRefused> {
+        let layout = layout_by_name(layout).ok_or(EditRefused::CouldNotBeMade)?.name;
+        if layout == self.layout_here() {
+            return Ok(Vec::new());
+        }
+        let at = self.current;
+        let change = self
+            .build(|talk| slides_format::set_layout(talk, at, layout))?
+            .ok_or(EditRefused::CouldNotBeMade)?;
+        self.make(CHANGE_LAYOUT, change, Holds::Slide(at), at, at, None)
+    }
+
+    /// The engine's name for the layout of the current slide.
+    pub fn layout_here(&self) -> &'static str {
+        self.layout_of(self.current)
+    }
+
+    /// The engine's name for the layout of slide `slide`: the one its settings name, or the
+    /// default with none. A name that isn't a layout's, which the slide is drawn with the
+    /// default for, gives "", which is no layout's.
+    pub fn layout_of(&self, slide: usize) -> &'static str {
+        let named = self
+            .talk()
+            .slides
+            .get(slide)
+            .and_then(|slide| slide.settings.as_ref())
+            .and_then(|settings| settings.get("layout"))
+            .filter(|name| !name.is_empty())
+            .unwrap_or(DEFAULT_LAYOUT);
+        layout_by_name(named).map_or("", |layout| layout.name)
+    }
+
     /// Adds a slide with the layout called `layout` after the current one, with nothing in
     /// it, so each of its places offers to be typed in, and makes it the current slide. A
     /// name that isn't a layout's is taken as the default one.

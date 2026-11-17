@@ -18,9 +18,10 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use slides_engine::{Pixmap, to_bgra_frame};
+use slides_engine::{Pixmap, layouts, to_bgra_frame};
 
 use crate::document::Document;
+use crate::layout_picker::{SetLayout, layout_name};
 use crate::slide_editor::SlideEditor;
 use crate::workspace_view::{
     CopyToClipboard, CutToClipboard, DeleteSlide, DuplicateSlide, MoveSlideDown, MoveSlideTo,
@@ -572,6 +573,7 @@ impl SlideStrip {
         rows.map(|index| {
             let selected = index == current;
             let hidden = document.is_hidden(index);
+            let layout = document.layout_of(index);
             let number = index + 1;
             let label: SharedString = if hidden {
                 format!("Slide {number}, hidden").into()
@@ -677,7 +679,7 @@ impl SlideStrip {
                                 }),
                         ),
                 )
-                .context_menu(move |menu, _, _| {
+                .context_menu(move |menu, window, cx| {
                     menu.action_context(focus_handle.clone())
                         .menu("New slide", Box::new(NewSlide))
                         .menu("Duplicate", Box::new(DuplicateSlide))
@@ -696,6 +698,17 @@ impl SlideStrip {
                         .menu_with_disabled("Cut", Box::new(CutToClipboard), count < 2)
                         .menu("Copy", Box::new(CopyToClipboard))
                         .menu("Paste", Box::new(PasteFromClipboard))
+                        .separator()
+                        // The slide's own layout ticked.
+                        .submenu("Layout", window, cx, move |menu, _, _| {
+                            layouts().iter().fold(menu, |menu, each| {
+                                menu.menu_with_check(
+                                    layout_name(each.name),
+                                    each.name == layout,
+                                    Box::new(SetLayout { layout: each.name }),
+                                )
+                            })
+                        })
                 })
                 .into_any_element()
         })

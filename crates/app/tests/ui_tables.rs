@@ -474,6 +474,9 @@ fn bold_and_colour_work_in_a_cell(cx: &mut TestAppContext) {
 fn bullets_are_off_in_a_cell(cx: &mut TestAppContext) {
     let source = "# T\n\nWords\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n";
     let typing = open(cx, source);
+    // Wide enough for the Home tab's list tools to show.
+    cx.simulate_window_resize(typing.handle, gpui_kit::size(gpui_kit::px(1600.), gpui_kit::px(800.)));
+    typing.settle(cx);
     click_cell(&typing, cx, 1, 0);
     for tool in [button_id(BULLETS_ID), button_id(NUMBERING_ID)] {
         assert!(disabled(&typing, cx, RIBBON_ID, tool.clone()), "{tool}");

@@ -31,6 +31,7 @@ use crate::export::{self, ExportKind, run_export, stagepack_executable};
 use crate::icon_picker::{self, IconPicked, IconPicker};
 use crate::palette::InsertComponent;
 use crate::insert_tools::{InsertPicture, InsertShape, InsertTextBox};
+use crate::layout_picker::SetLayout;
 use crate::inspector::{self, Inspector};
 use crate::markdown_panel::MarkdownPanel;
 use crate::notes_panel::{
@@ -1393,6 +1394,7 @@ impl Render for WorkspaceView {
                 let order = action.order;
                 this.edit(|document| document.reorder_selected(order), cx)
             }))
+            .on_action(cx.listener(|this, action: &SetLayout, _, cx| this.set_layout(action.layout, cx)))
             .on_action(cx.listener(|this, _: &NewSlide, _, cx| this.add_slide("content", cx)))
             .on_action(cx.listener(|this, action: &AddSlide, _, cx| {
                 this.add_slide(action.layout, cx)

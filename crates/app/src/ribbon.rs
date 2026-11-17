@@ -2,7 +2,8 @@
 //! them, as an office app has them.
 
 use gpui_kit::assets::IconName as Icons;
-use gpui_kit::component::button::{Button, ButtonVariants as _, DropdownButton};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, h_flex,
@@ -16,6 +17,7 @@ use crate::arrange_tools;
 use crate::clipboard_tools::ClipboardTools;
 use crate::document::Document;
 use crate::icon_picker::IconPicker;
+use crate::layout_picker::{SetLayout, layout_tiles};
 use crate::palette::ComponentList;
 use crate::table_tools::{self, TableGrid};
 use crate::text_tools::TextTools;
@@ -33,8 +35,10 @@ pub const TAB_SLIDE_SHOW_ID: &str = "tab-slide-show";
 pub const TAB_VIEW_ID: &str = "tab-view";
 pub const SAVE_ID: &str = "save";
 pub const NEW_SLIDE_ID: &str = "new-slide";
-/// The New slide button and the arrow beside it, which lists the layouts.
+/// The New slide button and the arrow beside it, which shows the layouts' tiles.
 pub const NEW_SLIDE_LAYOUTS_ID: &str = "new-slide-layouts";
+/// The tool that shows the layouts' tiles, for the slide shown.
+pub const LAYOUT_ID: &str = "slide-layout";
 pub const DUPLICATE_ID: &str = "duplicate-slide";
 pub const DELETE_ID: &str = "delete-slide";
 pub const HIDE_ID: &str = "hide-slide";
@@ -59,16 +63,6 @@ const MORE_WIDTH: Pixels = px(28.);
 
 /// What a tab whose tools aren't made yet says: every tab has its tools now, and none says it.
 pub const ON_THE_WAY: &str = "Tools for this tab are on the way.";
-
-/// The layouts the New slide list offers, by the names people know them by, and the engine's
-/// names for them.
-pub const LAYOUTS: [(&str, &str); 5] = [
-    ("Title", "title"),
-    ("Title and content", "content"),
-    ("Section", "section"),
-    ("Two columns", "two-columns"),
-    ("Blank", "blank"),
-];
 
 /// The height of the row of tools under the tabs, the same on every tab.
 const TOOLS_HEIGHT: Pixels = px(64.);
@@ -269,21 +263,34 @@ impl Ribbon {
         // While the caret is in a cell, or a table is selected, its tools come last.
         let table = document.and_then(Document::table_here);
         let arrange = document.map(Document::arrange_here).unwrap_or_default();
-        let new_slide = DropdownButton::new(NEW_SLIDE_LAYOUTS_ID)
-            .button(
+        let new_slide = h_flex()
+            .id(NEW_SLIDE_LAYOUTS_ID)
+            .child(
                 tool(NEW_SLIDE_ID, Icons::SquarePlus, "New slide")
                     .tooltip_with_action("Add a slide after this one", &NewSlide, Some(KEY_CONTEXT))
+                    .disabled(!has_talk)
                     .on_click(|_, window, cx| window.dispatch_action(NewSlide.boxed_clone(), cx)),
             )
-            .ghost()
-            .small()
-            .disabled(!has_talk)
-            .menu_accessibility_label("Choose a layout")
-            .dropdown_menu(|menu, _, _| {
-                LAYOUTS.iter().fold(menu, |menu, &(name, layout)| {
-                    menu.menu(name, Box::new(AddSlide { layout }))
-                })
-            });
+            .child(tiles_tool(
+                "new-slide-tiles",
+                Button::new("popup")
+                    .ghost()
+                    .small()
+                    .dropdown_caret(true)
+                    .accessibility_label("Choose a layout")
+                    .tooltip("Add a slide of a layout you choose"),
+                has_talk,
+                // A slide that isn't there yet has no layout to mark.
+                None,
+                |layout| AddSlide { layout }.boxed_clone(),
+            ));
+        let layout = tiles_tool(
+            "slide-layout-tiles",
+            tool(LAYOUT_ID, Icons::LayoutTemplate, "Layout").tooltip("Change this slide's layout"),
+            has_talk,
+            document.map(Document::layout_here),
+            |layout| SetLayout { layout }.boxed_clone(),
+        );
         // "Slide" in both, so that Show isn't read as starting the show.
         let (hide_label, hide_icon) = if hidden {
             ("Show slide", IconName::Eye)
@@ -336,6 +343,7 @@ impl Ribbon {
                 "Slides",
                 vec![
                     new_slide.into_any_element(),
+                    layout,
                     // "Slide" in both, as a thing on the slide can show as selected while it's the
                     // slide they act on.
                     tool(DUPLICATE_ID, Icons::CopyPlus, "Duplicate slide")
@@ -495,6 +503,39 @@ fn tool(id: &'static str, icon: impl Into<Icon>, label: &'static str) -> Button 
         .small()
         .icon(icon.into())
         .label(label)
+}
+
+/// A tool, `button`, that opens the layouts' tiles under it, the one called `current` marked: a
+/// pick closes them and asks for what `action` makes of the layout picked. A press on it leaves
+/// the keyboard where it was, and it goes back there once the tiles close. Off without a talk.
+fn tiles_tool(
+    id: &'static str,
+    button: Button,
+    has_talk: bool,
+    current: Option<&'static str>,
+    action: fn(&'static str) -> Box<dyn Action>,
+) -> AnyElement {
+    if !has_talk {
+        return button.disabled(true).into_any_element();
+    }
+    div()
+        .capture_any_mouse_down(|_, window, _| window.prevent_default())
+        .child(
+            Popover::new(id)
+                .trigger(button)
+                .content(move |_, _, cx| {
+                    let popover = cx.entity();
+                    layout_tiles(
+                        current,
+                        move |layout, window, cx| {
+                            popover.update(cx, |popover, cx| popover.dismiss(window, cx));
+                            window.dispatch_action(action(layout), cx);
+                        },
+                        cx,
+                    )
+                }),
+        )
+        .into_any_element()
 }
 
 /// What a click on a tool does: what its key does.
