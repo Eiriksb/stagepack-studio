@@ -206,6 +206,62 @@ impl SlideEditor {
         self.tell_selection(cx);
     }
 
+    /// A right press. On a thing, or on an area's frame, it's selected, unless it's one of the
+    /// things selected already, and the slide takes the keyboard, before the thing's menu opens.
+    /// Elsewhere what's selected is let go of, and the menu offers only Paste. On the text being
+    /// typed, anywhere but on a thing while text is typed, or with no talk, the press is left
+    /// be, and no menu opens.
+    pub(super) fn right_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.end_drag(cx);
+        self.dragging = false;
+        self.pressed = None;
+        self.menu_on = None;
+        let under = self.slide_point(event.position, cx).and_then(|point| self.thing_under(point, cx));
+        match under {
+            Some((slide, thing)) => {
+                let selected = self.document.as_ref().is_some_and(|document| {
+                    document.read(cx).selection().is_some_and(|selection| selection.slide == slide && selection.things.contains(&thing))
+                });
+                if selected {
+                    self.focus_handle.focus(window, cx);
+                } else {
+                    self.select_one(slide, thing, window, cx);
+                }
+                self.menu_on = Some(MenuOn::Thing);
+            }
+            None if self.is_editing(cx) || self.document.is_none() => {
+                cx.stop_propagation();
+                return;
+            }
+            None => {
+                self.deselect(cx);
+                self.menu_on = Some(MenuOn::Slide);
+            }
+        }
+        self.tell_selection(cx);
+    }
+
+    /// The thing at `point` of the slide shown that a right press picks, with its slide: a thing,
+    /// a box by its text, a table by a cell, or an area by its frame; but not the text being
+    /// typed, nor the new box waiting for its first letter.
+    fn thing_under(&self, point: (f32, f32), cx: &mut Context<Self>) -> Option<(usize, Thing)> {
+        if self.new_box_here(cx).is_some_and(|(x, y, w, h)| x <= point.0 && point.0 <= x + w && y <= point.1 && point.1 <= y + h) {
+            return None;
+        }
+        if let Some((slide, region)) = self.frame_under(point, cx) {
+            return Some((slide, Thing::Region(region)));
+        }
+        let (slide, hit) = self.hit(point, cx)?;
+        let source = match hit {
+            Hit::Element(element) => element.source,
+            Hit::Text { flow, pos } if !self.editing_flow(slide, flow, cx) => self
+                .box_of_text(slide, flow, pos.para, point, cx)
+                .or_else(|| Some(self.layout(slide, cx)?.element_at(point.0, point.1)?.source))?,
+            _ => return None,
+        };
+        Some((slide, Thing::Block(source)))
+    }
+
     /// A press at `from` on `thing` of slide `slide`. With `adding`, it's added to what's
     /// selected, or taken away; on one of several things selected, they stay selected, as a drag
     /// takes them all, and it's selected alone once the button is let go of without a drag;

@@ -131,6 +131,15 @@ pub enum EditorEvent {
     Unsaid(SharedString),
 }
 
+/// What a right-click opened its menu on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MenuOn {
+    /// A thing, or an area, which is selected.
+    Thing,
+    /// The empty slide, or the desk around it.
+    Slide,
+}
+
 /// Where the caret goes.
 #[derive(Clone, Copy)]
 enum Go {
@@ -180,6 +189,8 @@ pub struct SlideEditor {
     pointer: Option<CursorStyle>,
     /// The handles on the thing selected, as last worked out.
     handles_seen: Option<arranging::HandlesSeen>,
+    /// What the menu a right-click opens is for, once one has.
+    menu_on: Option<MenuOn>,
 
     /// Where the caret and any composition were last drawn, so that the system's input method
     /// is told when they move, and only then.
@@ -282,6 +293,7 @@ impl SlideEditor {
             nudging: None,
             pointer: None,
             handles_seen: None,
+            menu_on: None,
             ime_place: None,
             _subscriptions: subscriptions,
         }

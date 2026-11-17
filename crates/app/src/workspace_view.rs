@@ -19,6 +19,7 @@ use gpui_kit::*;
 use slides_components::{Bundle, Diagnostic};
 use slides_engine::{ComponentState, Fonts};
 
+use crate::arrange_tools::{AlignThings, DistributeThings, ReorderThing};
 use crate::builds::{self, BuildOutcome, Compile};
 use crate::cargo_file::{self, write_cargo_file};
 use crate::clipboard::ClipboardOp;
@@ -155,6 +156,7 @@ actions!(
         MoveSlideDown,
         ToggleNotes,
         ToggleSlideList,
+        ToggleInspector,
         CopyToClipboard,
         CutToClipboard,
         PasteFromClipboard,
@@ -289,8 +291,10 @@ pub struct WorkspaceView {
     show_slide_list: bool,
     notes_panel: Entity<NotesPanel>,
     show_notes: bool,
-    /// The form for the thing selected, always at the right.
+    /// The form for the thing selected, at the right.
     inspector: Entity<Inspector>,
+    /// Whether the form shows, while a talk is open.
+    show_inspector: bool,
     /// How wide the slide list, the slide's column and the Markdown are.
     columns: Entity<ResizableState>,
     focus_handle: FocusHandle,
@@ -445,6 +449,7 @@ impl WorkspaceView {
             notes: true,
             slide_list: true,
             markdown: false,
+            inspector: true,
         };
         let clipboard_tools = cx.new(|cx| ClipboardTools::new(document.clone(), &slide_editor, cx));
         let icon_picker = cx.new(|cx| IconPicker::new(window, cx));
@@ -455,8 +460,9 @@ impl WorkspaceView {
             this.insert_icon(picked.0, cx);
             this.keyboard_to_the_slide(window, cx);
         });
+        let slide_focus = slide_editor.read(cx).focus_handle().clone();
         let ribbon = cx.new(|cx| {
-            Ribbon::new(document.clone(), clipboard_tools.clone(), text_tools, icon_picker, panels, cx)
+            Ribbon::new(document.clone(), clipboard_tools.clone(), text_tools, icon_picker, slide_focus, panels, cx)
         });
         let table_grid = ribbon.read(cx).table_grid().clone();
         let table_picked = cx.subscribe_in(&table_grid, window, |this, _, picked: &InsertTable, window, cx| {
@@ -555,6 +561,7 @@ impl WorkspaceView {
             notes_panel,
             show_notes: panels.notes,
             inspector,
+            show_inspector: panels.inspector,
             columns: cx.new(|_| ResizableState::default()),
             focus_handle,
             watcher: None,
@@ -1345,6 +1352,21 @@ impl Render for WorkspaceView {
             }))
             .on_action(cx.listener(|this, _: &ToggleSlideList, window, cx| {
                 this.toggle_panel(|this| &mut this.show_slide_list, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleInspector, window, cx| {
+                this.toggle_panel(|this| &mut this.show_inspector, window, cx)
+            }))
+            .on_action(cx.listener(|this, action: &AlignThings, _, cx| {
+                let to = action.to;
+                this.edit(|document| document.align_things(to), cx)
+            }))
+            .on_action(cx.listener(|this, action: &DistributeThings, _, cx| {
+                let across = action.across;
+                this.edit(|document| document.distribute_things(across), cx)
+            }))
+            .on_action(cx.listener(|this, action: &ReorderThing, _, cx| {
+                let order = action.order;
+                this.edit(|document| document.reorder_selected(order), cx)
             }))
             .on_action(cx.listener(|this, _: &NewSlide, _, cx| this.add_slide("content", cx)))
             .on_action(cx.listener(|this, action: &AddSlide, _, cx| {

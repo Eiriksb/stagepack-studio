@@ -39,6 +39,14 @@ pub enum EditRefused {
     NotOneThing,
     /// Only a layout's areas are selected, and an area stays where its layout puts it.
     AreaStays,
+    /// Fewer than three things are selected to space out.
+    NeedsThree,
+    /// A thing selected is written in the slide's text, with no place of its own.
+    InTheText,
+    /// A layout's area can't be put in front of or behind anything.
+    AreaOrder,
+    /// Several things are selected, and only one at a time is put in front or behind.
+    OneToOrder,
 }
 
 impl std::fmt::Display for EditRefused {
@@ -70,6 +78,10 @@ impl std::fmt::Display for EditRefused {
             EditRefused::ComponentNotLoaded => "That component couldn't be loaded, so it wasn't added.",
             EditRefused::NotOneThing => clipboard::NOT_ONE_THING,
             EditRefused::AreaStays => AREA_STAYS,
+            EditRefused::NeedsThree => "Select three or more things to space them out.",
+            EditRefused::InTheText => DRAG_OUT_FIRST,
+            EditRefused::AreaOrder => "A layout's area always sits behind the things on the slide.",
+            EditRefused::OneToOrder => "Select one thing to bring it forward or send it back.",
         })
     }
 }

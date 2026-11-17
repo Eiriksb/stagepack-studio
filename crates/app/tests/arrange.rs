@@ -3,7 +3,9 @@
 
 use proptest::prelude::*;
 use slides_engine::{CaretRect, Rect};
-use stagepack_studio::arrange::{Handle, MIN_SIZE, Placed, bounds, handle_point, kept_move, kept_on_slide, resized, straight, turned_to, whole};
+use stagepack_studio::arrange::{
+    AlignTo, Handle, MIN_SIZE, Placed, aligned, bounds, distributed, handle_point, holding, kept_move, kept_on_slide, resized, straight, turned_to, whole,
+};
 
 /// The corners of `placed`, turned about its centre.
 fn corners(placed: &Placed) -> [(f32, f32); 4] {
@@ -345,4 +347,122 @@ fn a_thing_mostly_off_the_slide_cannot_be_resized_off_it() {
     let resized = resized(&start, Handle::Right, (-900., 400.), false);
     assert_eq!(resized.rect.x, -1000.);
     assert!((resized.rect.w - 1016.).abs() < 0.01, "sixteen units stay on: {resized:?}");
+}
+
+/// Every way of aligning.
+const ALIGNS: [AlignTo; 6] = [AlignTo::Left, AlignTo::Centre, AlignTo::Right, AlignTo::Top, AlignTo::Middle, AlignTo::Bottom];
+
+/// The line of `rect` that aligning `to` lines things up on.
+fn line_of(rect: Rect, to: AlignTo) -> f32 {
+    match to {
+        AlignTo::Left => rect.x,
+        AlignTo::Centre => rect.x + rect.w / 2.,
+        AlignTo::Right => rect.x + rect.w,
+        AlignTo::Top => rect.y,
+        AlignTo::Middle => rect.y + rect.h / 2.,
+        AlignTo::Bottom => rect.y + rect.h,
+    }
+}
+
+/// A thing somewhere, at the turns that are hard to get right and at any other.
+fn a_thing() -> impl Strategy<Value = Placed> {
+    let rotate = prop_oneof![Just(0f32), Just(37.), Just(90.), Just(180.), Just(359.9), Just(-360.), -360f32..360.];
+    (rect(), rotate).prop_map(|(rect, rotate)| Placed { rect, rotate })
+}
+
+fn things(least: usize) -> impl Strategy<Value = Vec<Placed>> {
+    proptest::collection::vec(a_thing(), least..6)
+}
+
+fn align_to() -> impl Strategy<Value = AlignTo> {
+    proptest::sample::select(ALIGNS.to_vec())
+}
+
+/// The middle of `placed` along the slide, across or down.
+fn middle_along(placed: &Placed, across: bool) -> f32 {
+    let covers = bounds(placed);
+    if across { covers.x + covers.w / 2. } else { covers.y + covers.h / 2. }
+}
+
+proptest! {
+    #[test]
+    fn aligning_uses_the_turned_bounds(things in things(1), to in align_to()) {
+        let slide = Rect { x: 0., y: 0., w: 1920., h: 1080. };
+        let target = if things.len() == 1 { slide } else { holding(things.iter().copied()).unwrap() };
+        let line = line_of(target, to);
+        for placed in aligned(&things, to) {
+            let at = line_of(bounds(&placed), to);
+            prop_assert!((at - line).abs() <= 0.01, "{at} isn't on {line}: {placed:?}");
+        }
+    }
+
+    #[test]
+    fn aligning_twice_changes_nothing_more(things in things(1), to in align_to()) {
+        let once = aligned(&things, to);
+        let twice = aligned(&once, to);
+        for (a, b) in once.iter().zip(&twice) {
+            prop_assert!((a.rect.x - b.rect.x).abs() <= 0.01 && (a.rect.y - b.rect.y).abs() <= 0.01, "{a:?} became {b:?}");
+        }
+    }
+
+    #[test]
+    fn aligning_keeps_sizes_and_turns(things in things(1), to in align_to()) {
+        let out = aligned(&things, to);
+        prop_assert_eq!(out.len(), things.len());
+        let across = matches!(to, AlignTo::Left | AlignTo::Centre | AlignTo::Right);
+        for (before, after) in things.iter().zip(&out) {
+            prop_assert_eq!((after.rect.w, after.rect.h, after.rotate), (before.rect.w, before.rect.h, before.rotate));
+            if across {
+                prop_assert_eq!(after.rect.y, before.rect.y, "only moved across");
+            } else {
+                prop_assert_eq!(after.rect.x, before.rect.x, "only moved down");
+            }
+        }
+    }
+
+    #[test]
+    fn distributing_makes_the_gaps_equal(things in things(3), across in any::<bool>()) {
+        let out = distributed(&things, across).expect("three or more");
+        prop_assert_eq!(out.len(), things.len());
+        // In their order along the direction, as they were.
+        let mut order: Vec<usize> = (0..things.len()).collect();
+        order.sort_by(|&a, &b| middle_along(&things[a], across).total_cmp(&middle_along(&things[b], across)).then(a.cmp(&b)));
+        let (first, last) = (order[0], order[order.len() - 1]);
+        prop_assert_eq!(out[first], things[first], "the first stays put");
+        prop_assert_eq!(out[last], things[last], "the last stays put");
+        let span = |placed: &Placed| {
+            let covers = bounds(placed);
+            if across { (covers.x, covers.x + covers.w) } else { (covers.y, covers.y + covers.h) }
+        };
+        let gaps: Vec<f32> = order.windows(2).map(|pair| span(&out[pair[1]]).0 - span(&out[pair[0]]).1).collect();
+        for gap in &gaps {
+            prop_assert!((gap - gaps[0]).abs() <= 0.02, "gaps {gaps:?}");
+        }
+        for (before, after) in things.iter().zip(&out) {
+            prop_assert_eq!((after.rect.w, after.rect.h, after.rotate), (before.rect.w, before.rect.h, before.rotate));
+            if across {
+                prop_assert_eq!(after.rect.y, before.rect.y);
+            } else {
+                prop_assert_eq!(after.rect.x, before.rect.x);
+            }
+        }
+    }
+
+    #[test]
+    fn distributing_fewer_than_three_is_none(things in proptest::collection::vec(a_thing(), 0..3), across in any::<bool>()) {
+        prop_assert!(distributed(&things, across).is_none());
+    }
+}
+
+#[test]
+fn one_thing_aligns_to_the_slide_and_several_to_each_other() {
+    let one = Placed { rect: Rect { x: 100., y: 100., w: 200., h: 100. }, rotate: 0. };
+    assert_eq!(aligned(&[one], AlignTo::Right)[0].rect.x, 1720.);
+    assert_eq!(aligned(&[one], AlignTo::Middle)[0].rect.y, 490.);
+    let other = Placed { rect: Rect { x: 500., y: 300., w: 100., h: 100. }, rotate: 0. };
+    let both = aligned(&[one, other], AlignTo::Left);
+    assert_eq!((both[0].rect.x, both[1].rect.x), (100., 100.));
+    // A thing turned a quarter lines up by the box it covers: 100 wide by 200 tall.
+    let turned = Placed { rect: Rect { x: 500., y: 300., w: 200., h: 100. }, rotate: 90. };
+    assert_eq!(aligned(&[turned], AlignTo::Top)[0].rect.y, 50.);
 }

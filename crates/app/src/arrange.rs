@@ -36,6 +36,90 @@ pub fn holding(things: impl IntoIterator<Item = Placed>) -> Option<Rect> {
     Some(Rect { x: left, y: top, w: right - left, h: bottom - top })
 }
 
+/// Which line things are lined up on: an edge or the middle, across or down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlignTo {
+    Left,
+    Centre,
+    Right,
+    Top,
+    Middle,
+    Bottom,
+}
+
+impl AlignTo {
+    /// Whether things lined up on it move across, rather than up or down.
+    fn across(self) -> bool {
+        matches!(self, AlignTo::Left | AlignTo::Centre | AlignTo::Right)
+    }
+
+    /// Where on `rect` this line is, across or down.
+    fn line(self, rect: &Rect) -> f32 {
+        match self {
+            AlignTo::Left => rect.x,
+            AlignTo::Centre => rect.x + rect.w / 2.,
+            AlignTo::Right => rect.x + rect.w,
+            AlignTo::Top => rect.y,
+            AlignTo::Middle => rect.y + rect.h / 2.,
+            AlignTo::Bottom => rect.y + rect.h,
+        }
+    }
+}
+
+/// `things` lined up on the line `to`: one thing on the slide's, several on that of the box
+/// that holds them all. Each moves, across or down only, so that the box it covers as it's
+/// turned meets the line; sizes and turns stay as they were.
+pub fn aligned(things: &[Placed], to: AlignTo) -> Vec<Placed> {
+    let slide = Rect { x: 0., y: 0., w: SLIDE_WIDTH, h: SLIDE_HEIGHT };
+    let target = if things.len() == 1 { Some(slide) } else { holding(things.iter().copied()) };
+    let Some(target) = target else {
+        return things.to_vec();
+    };
+    let line = to.line(&target);
+    things
+        .iter()
+        .map(|placed| {
+            let by = line - to.line(&bounds(placed));
+            moved(placed, if to.across() { (by, 0.) } else { (0., by) })
+        })
+        .collect()
+}
+
+/// `things` spaced out across, or down, with the same gap between the boxes each covers as
+/// it's turned, in their order along that way by their middles. The first and the last stay
+/// where they are, and the others move between them, across or down only. `None` for fewer
+/// than three.
+pub fn distributed(things: &[Placed], across: bool) -> Option<Vec<Placed>> {
+    if things.len() < 3 {
+        return None;
+    }
+    let span = |placed: &Placed| {
+        let covers = bounds(placed);
+        if across { (covers.x, covers.w) } else { (covers.y, covers.h) }
+    };
+    let mut order: Vec<usize> = (0..things.len()).collect();
+    order.sort_by(|&a, &b| {
+        let middle = |at: usize| {
+            let (start, length) = span(&things[at]);
+            start + length / 2.
+        };
+        middle(a).total_cmp(&middle(b)).then(a.cmp(&b))
+    });
+    let (first, last) = (order[0], order[order.len() - 1]);
+    let (first_start, first_length) = span(&things[first]);
+    let between: f32 = order[1..order.len() - 1].iter().map(|&at| span(&things[at]).1).sum();
+    let gap = (span(&things[last]).0 - (first_start + first_length) - between) / (things.len() - 1) as f32;
+    let mut out = things.to_vec();
+    let mut at = first_start + first_length + gap;
+    for &index in &order[1..order.len() - 1] {
+        let (start, length) = span(&things[index]);
+        let by = at - start;
+        out[index] = moved(&things[index], if across { (by, 0.) } else { (0., by) });
+        at += length + gap;
+    }
+    Some(out)
+}
+
 /// `rect` moved, if it has to be, so that at least [`KEPT_ON`] units of it are on the slide
 /// each way, or all of it where it's smaller than that, and held within where the engine can
 /// place a thing.

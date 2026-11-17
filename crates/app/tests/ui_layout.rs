@@ -38,3 +38,21 @@ fn layout_has_a_canvas_under_the_title(cx: &mut TestAppContext) {
     })
     .unwrap();
 }
+
+#[gpui_kit::test]
+fn undo_and_redo_show_at_1280(cx: &mut TestAppContext) {
+    use stagepack_studio::ribbon::{MORE_RIGHT_ID, REDO_ID, RIBBON_ID, UNDO_ID};
+    let handle = open_workspace(cx);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let ribbon = window.find(RIBBON_ID).bounds();
+        // What's under the arrow at the row's right end is behind it.
+        let right = window.try_find(MORE_RIGHT_ID).map_or(ribbon.right(), |arrow| arrow.bounds().left());
+        for tool in [UNDO_ID, REDO_ID] {
+            let bounds = window.find(tool).bounds();
+            assert!(ribbon.left() <= bounds.left() && bounds.right() <= right, "{tool} is cut off: {bounds:?} in {ribbon:?}");
+        }
+    })
+    .unwrap();
+}

@@ -3,6 +3,7 @@
 pub mod added_files;
 pub mod app_assets;
 pub mod arrange;
+pub mod arrange_tools;
 pub mod builds;
 pub mod cargo_file;
 pub mod clipboard;

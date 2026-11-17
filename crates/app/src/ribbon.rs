@@ -11,6 +11,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::arrange_tools;
 use crate::clipboard_tools::ClipboardTools;
 use crate::document::Document;
 use crate::icon_picker::IconPicker;
@@ -19,7 +20,7 @@ use crate::table_tools::{self, TableGrid};
 use crate::text_tools::TextTools;
 use crate::workspace_view::{
     AddSlide, DeleteSlide, DuplicateSlide, KEY_CONTEXT, NewSlide, Present, Redo, Rehearse, Save,
-    ToggleHidden, ToggleMarkdown, ToggleNotes, ToggleSlideList, Undo,
+    ToggleHidden, ToggleInspector, ToggleMarkdown, ToggleNotes, ToggleSlideList, Undo,
 };
 
 pub const RIBBON_ID: &str = "ribbon";
@@ -43,6 +44,8 @@ pub const REHEARSE_ID: &str = "rehearse";
 pub const NOTES_TOGGLE_ID: &str = "toggle-notes";
 pub const SLIDE_LIST_TOGGLE_ID: &str = "toggle-slide-list";
 pub const MARKDOWN_TOGGLE_ID: &str = "toggle-markdown";
+/// The View tab's toggle that shows or hides the form beside the slide.
+pub const TOGGLE_INSPECTOR_ID: &str = "toggle-inspector";
 pub const ON_THE_WAY_ID: &str = "on-the-way";
 /// The row of tools under the tabs, which scrolls sideways when it's wider than the window.
 pub const RIBBON_TOOLS_ID: &str = "ribbon-tools";
@@ -119,6 +122,8 @@ pub struct Panels {
     pub notes: bool,
     pub slide_list: bool,
     pub markdown: bool,
+    /// The form for the thing selected, beside the slide.
+    pub inspector: bool,
 }
 
 pub struct Ribbon {
@@ -133,6 +138,8 @@ pub struct Ribbon {
     table_grid: Entity<TableGrid>,
     /// What the Insert tab's Component tool opens.
     component_list: Entity<ComponentList>,
+    /// The slide's keyboard, which the Arrange menu gives back once it closes.
+    slide_focus: FocusHandle,
     tab: RibbonTab,
     panels: Panels,
     /// How far the row of tools is scrolled.
@@ -151,6 +158,7 @@ impl Ribbon {
         clipboard_tools: Entity<ClipboardTools>,
         text_tools: Entity<TextTools>,
         icon_picker: Entity<IconPicker>,
+        slide_focus: FocusHandle,
         panels: Panels,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -170,6 +178,7 @@ impl Ribbon {
             icon_picker,
             table_grid,
             component_list,
+            slide_focus,
             tab: RibbonTab::default(),
             panels,
             scroll: ScrollHandle::new(),
@@ -249,6 +258,7 @@ impl Ribbon {
         let redo = document.and_then(Document::redo_label);
         // While the caret is in a cell, or a table is selected, its tools come last.
         let table = document.and_then(Document::table_here);
+        let arrange = document.map(Document::arrange_here).unwrap_or_default();
         let new_slide = DropdownButton::new(NEW_SLIDE_LAYOUTS_ID)
             .button(
                 tool(NEW_SLIDE_ID, Icons::SquarePlus, "New slide")
@@ -277,6 +287,30 @@ impl Ribbon {
         };
         vec![
             self.clipboard_tools.clone().into_any_element(),
+            group(
+                "History",
+                vec![
+                    tool(UNDO_ID, IconName::Undo2, "Undo")
+                        .tooltip_with_action(
+                            undo.map_or_else(|| "Undo".to_string(), |step| format!("Undo {step}")),
+                            &Undo,
+                            Some(KEY_CONTEXT),
+                        )
+                        .disabled(undo.is_none())
+                        .on_click(dispatch(Undo))
+                        .into_any_element(),
+                    tool(REDO_ID, IconName::Redo2, "Redo")
+                        .tooltip_with_action(
+                            redo.map_or_else(|| "Redo".to_string(), |step| format!("Redo {step}")),
+                            &Redo,
+                            Some(KEY_CONTEXT),
+                        )
+                        .disabled(redo.is_none())
+                        .on_click(dispatch(Redo))
+                        .into_any_element(),
+                ],
+                cx,
+            ),
             group(
                 "File",
                 vec![
@@ -317,30 +351,7 @@ impl Ribbon {
                 cx,
             ),
             self.text_tools.clone().into_any_element(),
-            group(
-                "History",
-                vec![
-                    tool(UNDO_ID, IconName::Undo2, "Undo")
-                        .tooltip_with_action(
-                            undo.map_or_else(|| "Undo".to_string(), |step| format!("Undo {step}")),
-                            &Undo,
-                            Some(KEY_CONTEXT),
-                        )
-                        .disabled(undo.is_none())
-                        .on_click(dispatch(Undo))
-                        .into_any_element(),
-                    tool(REDO_ID, IconName::Redo2, "Redo")
-                        .tooltip_with_action(
-                            redo.map_or_else(|| "Redo".to_string(), |step| format!("Redo {step}")),
-                            &Redo,
-                            Some(KEY_CONTEXT),
-                        )
-                        .disabled(redo.is_none())
-                        .on_click(dispatch(Redo))
-                        .into_any_element(),
-                ],
-                cx,
-            ),
+            arrange_tools::arrange_group(&arrange, self.slide_focus.clone(), cx),
         ]
         .into_iter()
         .chain(table.map(|table| table_tools::ribbon_group(&table, cx)))
@@ -380,6 +391,7 @@ impl Ribbon {
             notes,
             slide_list,
             markdown,
+            inspector,
         } = self.panels;
         let toggle = |id: &'static str, icon: Icons, label: &'static str, on: bool| {
             tool(id, icon, label).selected(on).toggled(on)
@@ -407,6 +419,10 @@ impl Ribbon {
                         Some(KEY_CONTEXT),
                     )
                     .on_click(dispatch(ToggleMarkdown))
+                    .into_any_element(),
+                toggle(TOGGLE_INSPECTOR_ID, Icons::PanelRight, "Form", inspector)
+                    .tooltip("Show or hide the form for what's selected, beside the slide")
+                    .on_click(dispatch(ToggleInspector))
                     .into_any_element(),
             ],
             cx,

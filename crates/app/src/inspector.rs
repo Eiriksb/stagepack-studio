@@ -244,6 +244,16 @@ impl Inspector {
         }
     }
 
+    /// Whether any of the form's text or number fields has the keyboard.
+    pub fn has_any_keyboard(&self, window: &Window, cx: &App) -> bool {
+        self.form.as_ref().is_some_and(|form| {
+            form.fields.iter().any(|field| match &field.widget {
+                Widget::Input(input) => input.read(cx).focus_handle(cx).is_focused(window),
+                _ => false,
+            })
+        })
+    }
+
     /// Whether the text or number field for attribute `name` has the keyboard.
     pub fn has_keyboard(&self, name: &str, window: &Window, cx: &App) -> bool {
         match self.field(name).map(|field| &field.widget) {

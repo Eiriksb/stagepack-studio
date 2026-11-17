@@ -55,7 +55,7 @@ mod slides;
 mod tables;
 mod typing;
 
-pub use arranging::{MOVE, NUDGE, RESIZE, TURN};
+pub use arranging::{ALIGN, ArrangeHere, DISTRIBUTE, MOVE, NUDGE, ORDER, RESIZE, TURN};
 pub use clipboard::Brought;
 pub use self::core::EditRun;
 use self::core::{Holds, Join, others_alike};

@@ -149,10 +149,10 @@ impl WorkspaceView {
         self.edit(|document| document.put_back_region(slide, region), cx);
     }
 
-    /// Whether the inspector shows: whenever a talk is open, so the slide's place never
-    /// changes as things are selected and let go of.
+    /// Whether the inspector shows: whenever a talk is open, unless it's been hidden, so the
+    /// slide's place never changes as things are selected and let go of.
     pub(super) fn shows_inspector(&self) -> bool {
-        self.document.is_some()
+        self.document.is_some() && self.show_inspector
     }
 
     /// Leaves the talk tidy of what typing on the slide left empty, before it's saved, shown
@@ -475,6 +475,7 @@ impl WorkspaceView {
             notes: self.show_notes,
             slide_list: self.show_slide_list,
             markdown: self.show_markdown,
+            inspector: self.show_inspector,
         }
     }
 
@@ -498,7 +499,8 @@ impl WorkspaceView {
                 .read(cx)
                 .focus_handle()
                 .contains_focused(window, cx);
-        if notes_away || list_away {
+        let form_away = !self.show_inspector && self.inspector.read(cx).has_any_keyboard(window, cx);
+        if notes_away || list_away || form_away {
             self.focus_handle.focus(window, cx);
         }
         cx.notify();

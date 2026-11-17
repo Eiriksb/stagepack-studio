@@ -1,6 +1,9 @@
 //! Drawing the editor: the slide, the marks over it, and the keys and mouse it takes.
 
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu};
+
 use super::*;
+use crate::arrange_tools::{order_items, reason};
 
 /// How many sides the round turn handle is drawn with.
 const HANDLE_ROUND: usize = 16;
@@ -127,6 +130,9 @@ impl Render for SlideEditor {
         let input = (self.is_editing(cx) || self.takes_typing(cx))
             .then(|| (self.focus_handle.clone(), cx.entity()));
         let handle_dragging = self.handle_drag();
+        // The menu a right-click opens is worked out as it opens.
+        let menu_editor = editor.clone();
+        let menu_focus = self.focus_handle.clone();
         let overlay = canvas(
             // What the pointer shows over a handle shows only where nothing lies over the editor.
             |area, window, _| window.insert_hitbox(area, HitboxBehavior::Normal),
@@ -218,6 +224,8 @@ impl Render for SlideEditor {
             .absolute()
             .size_full()
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
+            // Before the menu opens: it keeps the press from going further.
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::right_down))
             .on_action(cx.listener(|this, _: &MoveLeft, _, cx| {
                 this.arrow(Go::By(Motion::Left), Beside::Before, cx)
             }))
@@ -381,5 +389,38 @@ impl Render for SlideEditor {
                         .child(text),
                 )
             })
+            .context_menu(move |menu, _, cx| {
+                let Some(editor) = menu_editor.upgrade() else {
+                    return menu;
+                };
+                editor.read(cx).menu(menu.action_context(menu_focus.clone()), cx)
+            })
+    }
+}
+
+impl SlideEditor {
+    /// The menu a right-click opened, from `menu`: for a thing, what can be done to it, and for
+    /// the slide, Paste. Each item does what its key does, on the slide.
+    fn menu(&self, menu: PopupMenu, cx: &App) -> PopupMenu {
+        let document = match (self.menu_on, &self.document) {
+            (Some(MenuOn::Thing), Some(document)) => document.read(cx),
+            (Some(_), _) => return menu.menu("Paste", Box::new(PasteFromClipboard)),
+            (None, _) => return menu,
+        };
+        let here = document.arrange_here();
+        // An area can't be cut, copied, duplicated or deleted.
+        let areas = document.selection().is_some_and(|selection| selection.blocks().next().is_none());
+        let menu = menu
+            .menu_with_disabled("Cut", Box::new(CutToClipboard), areas)
+            .menu_with_disabled("Copy", Box::new(CopyToClipboard), areas)
+            .menu("Paste", Box::new(PasteFromClipboard))
+            .menu_with_disabled("Duplicate", Box::new(DuplicateSelected), areas)
+            .menu_with_disabled("Delete", Box::new(TakeAwaySelected), areas)
+            .separator();
+        let menu = order_items(menu, &here);
+        match here.order_refused {
+            Some(why) => reason(menu.separator(), why),
+            None => menu,
+        }
     }
 }
