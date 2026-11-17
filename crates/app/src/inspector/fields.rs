@@ -19,8 +19,9 @@ pub const CONTROL: &str = "That can't hold a tab or other control character.";
 /// The furthest from 0 a number with no range of its own is held to.
 pub const NUMBER_LIMIT: f64 = 1_000_000.0;
 
-/// The farthest a thing can be placed from the slide's corner, in slide units, as the engine
-/// holds it.
+/// The farthest a thing can be placed from the slide's corner, in slide units, either way, as
+/// the engine holds it.
+pub const MIN_POSITION: f64 = -3840.0;
 pub const MAX_POSITION: f64 = 7680.0;
 /// The largest a thing can be, as the engine holds it.
 pub const MAX_SIZE: f64 = 3840.0;
@@ -29,8 +30,8 @@ pub const MAX_TURN: f64 = 360.0;
 
 /// The fields that place a thing on the slide: its attribute, its label and what it's held to.
 pub const PLACE: [(&str, &str, (f64, f64)); 5] = [
-    ("x", "Left", (0.0, MAX_POSITION)),
-    ("y", "Top", (0.0, MAX_POSITION)),
+    ("x", "Left", (MIN_POSITION, MAX_POSITION)),
+    ("y", "Top", (MIN_POSITION, MAX_POSITION)),
     ("w", "Width", (1.0, MAX_SIZE)),
     ("h", "Height", (1.0, MAX_SIZE)),
     ("rotate", "Turn", (-MAX_TURN, MAX_TURN)),
@@ -244,9 +245,10 @@ mod tests {
 
     #[test]
     fn numbers_are_held_to_their_range() {
-        let place = Some((0.0, MAX_POSITION));
+        let place = Some((MIN_POSITION, MAX_POSITION));
         assert_eq!(number_typed("9000", false, place, true), Typed::Write(Some("7680".into())));
-        assert_eq!(number_typed(" -5 ", false, place, true), Typed::Write(Some("0".into())));
+        assert_eq!(number_typed(" -5 ", false, place, true), Typed::Write(Some("-5".into())));
+        assert_eq!(number_typed("-9000", false, place, true), Typed::Write(Some("-3840".into())));
         assert_eq!(number_typed("12.5", false, None, false), Typed::Write(Some("12.5".into())));
         assert_eq!(number_typed("100.0", false, None, false), Typed::Write(Some("100".into())));
         assert_eq!(number_typed("-0", false, None, false), Typed::Write(Some("0".into())));

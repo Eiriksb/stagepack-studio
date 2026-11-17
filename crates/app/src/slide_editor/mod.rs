@@ -32,6 +32,7 @@ use crate::text_tools::{
 use crate::workspace_view::{
     CARET_BLINKS_FOR, CopyToClipboard, CutToClipboard, PasteFromClipboard,
 };
+mod arranging;
 mod ime;
 mod keys;
 mod marks;
@@ -40,6 +41,7 @@ mod render;
 mod selecting;
 mod typing;
 
+pub use arranging::Nudge;
 pub use keys::*;
 use marks::{caret_box, caret_corners, corners, corners_box, outline_corners, paint_dashed, paint_outline, paint_polygon, turned};
 
@@ -132,6 +134,10 @@ pub struct SlideEditor {
     pressed: Option<(usize, Thing)>,
     /// What the status line was told of the thing selected on the slide shown, if anything is.
     told: Option<SharedString>,
+    /// A press on things selected, readied to drag them, or dragging them.
+    drag: Option<arranging::Drag>,
+    /// The run of arrow-key moves going on, if one is.
+    nudging: Option<arranging::Nudging>,
 
     /// Where the caret and any composition were last drawn, so that the system's input method
     /// is told when they move, and only then.
@@ -164,6 +170,8 @@ impl SlideEditor {
         let focus_handle = cx.focus_handle();
         let mut subscriptions = vec![
             cx.on_focus_out(&focus_handle, window, |this, _, window, cx| {
+                // A drag ends, writing nothing.
+                this.end_drag(cx);
                 // The keyboard went elsewhere: what was typed is in the talk, and typing ends,
                 // unless it went to the text tools.
                 if !this.tools_have_keyboard(window, cx) {
@@ -176,6 +184,12 @@ impl SlideEditor {
                     && !this.tools_have_keyboard(window, cx)
                 {
                     this.end_editing(false, window, cx)
+                }
+            }),
+            // The window losing the keyboard ends a drag, writing nothing.
+            cx.observe_window_activation(window, |this, window, cx| {
+                if !window.is_window_active() {
+                    this.end_drag(cx);
                 }
             }),
         ];
@@ -222,6 +236,8 @@ impl SlideEditor {
             dragging: false,
             pressed: None,
             told: None,
+            drag: None,
+            nudging: None,
             ime_place: None,
             _subscriptions: subscriptions,
         }
@@ -273,6 +289,8 @@ impl SlideEditor {
     /// selected on the slide shown keeps the keyboard, and takes it from the window, though not
     /// from a panel that has it.
     fn document_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Any edit but the drag's own ends it.
+        self.follow_drag(cx);
         let focused = self.focus_handle.is_focused(window);
         if self.is_editing(cx) {
             // A text tool keeps the keyboard until it's done with it.

@@ -3,9 +3,10 @@
 
 use std::time::{Duration, Instant};
 
-use slides_engine::Fonts;
+use slides_engine::{Fonts, Rect};
 use slides_format::{FlowPlace, Pos, text_flows};
-use stagepack_studio::document::Document;
+use stagepack_studio::arrange::Placed;
+use stagepack_studio::document::{Document, Thing};
 
 const SLIDES: usize = 500;
 const KEYSTROKES: usize = 200;
@@ -199,6 +200,64 @@ fn a_keystroke_in_a_table_cell_is_quick() {
     report("keystroke typed in a table cell", times);
 }
 
+/// How long one frame of a drag may take, at the median, before anything is drawn.
+const MOST_FOR_A_DRAG_FRAME: Duration = Duration::from_millis(6);
+
+/// A long talk with a slide of sixty placed things at its end.
+fn sixty_things() -> String {
+    let mut talk = long_talk();
+    talk.push_str("---\n\n# Sixty\n\n");
+    for n in 0..60 {
+        talk.push_str(&format!(
+            "<Shape kind=\"rect\" fill=\"#2563eb\" x=\"{}\" y=\"{}\" w=\"100\" h=\"80\" />\n\n",
+            100 + (n % 10) * 150,
+            200 + (n / 10) * 120
+        ));
+    }
+    talk
+}
+
+/// Every thing on a slide of sixty dragged: each frame shows them all at their new place, and
+/// the slide's layers and its text's places are worked out again, as the window does before it
+/// draws.
+#[test]
+#[ignore = "timing; run in release"]
+fn a_frame_of_a_drag_on_a_slide_of_sixty_things_is_quick() {
+    let talk = sixty_things();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("slides.md"), &talk).unwrap();
+    let mut doc = Document::open(dir.path(), Fonts::bundled_only()).unwrap();
+    let slide = doc.slide_count() - 1;
+    doc.go_to(slide);
+    assert!(doc.select_all_things());
+    let starts: Vec<(Thing, Placed)> = doc.selected_boxes().into_iter().map(|(thing, rect, rotate)| (thing, Placed { rect, rotate })).collect();
+    assert_eq!(starts.len(), 60);
+    // The window's scale: a slide 1280 pixels wide.
+    let scale = 1280. / 1920.;
+    doc.editor_layers(scale);
+    let mut times = Vec::new();
+    for frame in 1..=200 {
+        let by = frame as f32 * 1.5;
+        let places: Vec<(Thing, Placed)> = starts
+            .iter()
+            .map(|(thing, placed)| (thing.clone(), Placed { rect: Rect { x: placed.rect.x + by, y: placed.rect.y + by / 2., ..placed.rect }, rotate: placed.rotate }))
+            .collect();
+        let start = Instant::now();
+        doc.preview_places(&places);
+        let layers = doc.editor_layers(scale);
+        let layout = doc.text_layout(slide);
+        times.push(start.elapsed());
+        assert!(layers.len() > 60, "frame {frame}: the heading and the sixty");
+        assert_eq!(layout.elements().len(), 60);
+    }
+    doc.drop_preview();
+    assert_eq!(doc.source(), talk, "nothing written");
+    times.sort();
+    let median = times[times.len() / 2];
+    println!("median drag frame of sixty things on a {SLIDES}-slide talk: {median:?} (slowest {:?})", times.last().unwrap());
+    assert!(median < MOST_FOR_A_DRAG_FRAME, "a drag frame took {median:?}");
+}
+
 /// How long one step on every thing of a slide of sixty may take, at the median: a step taken
 /// once, by a key or a tool, not a frame. Taking a tag away is worked out by the format crate a
 /// tag at a time, each reading the slide again, which is most of it.
@@ -209,15 +268,7 @@ const MOST_FOR_SIXTY: Duration = Duration::from_millis(250);
 #[test]
 #[ignore = "timing; run in release"]
 fn a_step_on_sixty_things_is_quick() {
-    let mut talk = long_talk();
-    talk.push_str("---\n\n# Sixty\n\n");
-    for n in 0..60 {
-        talk.push_str(&format!(
-            "<Shape kind=\"rect\" fill=\"#2563eb\" x=\"{}\" y=\"{}\" w=\"100\" h=\"80\" />\n\n",
-            100 + (n % 10) * 150,
-            200 + (n / 10) * 120
-        ));
-    }
+    let talk = sixty_things();
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("slides.md"), &talk).unwrap();
     let mut doc = Document::open(dir.path(), Fonts::bundled_only()).unwrap();

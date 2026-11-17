@@ -246,6 +246,24 @@ impl Typing {
         self.settle(cx);
     }
 
+    /// Moves the pointer to `at` with the button held, as it goes between a press and its
+    /// release.
+    pub fn move_held(&self, cx: &mut TestAppContext, at: Point<Pixels>, modifiers: Modifiers) {
+        self.with_window(cx, |window, cx| {
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: at,
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+        });
+        cx.run_until_parked();
+    }
+
     /// Clicks `count` times in a row at `at`, as a double or triple click does.
     pub fn clicks(
         &self,

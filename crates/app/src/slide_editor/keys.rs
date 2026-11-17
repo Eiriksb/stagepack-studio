@@ -99,6 +99,15 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-v", PasteFromClipboard, selecting),
         KeyBinding::new("ctrl-d", DuplicateSelected, selecting),
         KeyBinding::new("ctrl-a", SelectAllThings, selecting),
+        // Arrow keys move what's selected, a unit at a time, or ten with Shift.
+        KeyBinding::new("left", Nudge { dx: -1.0, dy: 0.0 }, selecting),
+        KeyBinding::new("right", Nudge { dx: 1.0, dy: 0.0 }, selecting),
+        KeyBinding::new("up", Nudge { dx: 0.0, dy: -1.0 }, selecting),
+        KeyBinding::new("down", Nudge { dx: 0.0, dy: 1.0 }, selecting),
+        KeyBinding::new("shift-left", Nudge { dx: -10.0, dy: 0.0 }, selecting),
+        KeyBinding::new("shift-right", Nudge { dx: 10.0, dy: 0.0 }, selecting),
+        KeyBinding::new("shift-up", Nudge { dx: 0.0, dy: -10.0 }, selecting),
+        KeyBinding::new("shift-down", Nudge { dx: 0.0, dy: 10.0 }, selecting),
     ]);
     crate::text_tools::bind_keys(cx);
 }

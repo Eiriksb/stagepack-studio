@@ -1,0 +1,449 @@
+//! Moving things and a layout's areas: dragging them with the mouse, and the arrow keys.
+
+use std::ops::Range;
+
+#[path = "support/typing.rs"]
+mod typing;
+
+use typing::*;
+
+use gpui_kit::{Modifiers, Pixels, Point, TestAppContext, VisualTestContext, point, px};
+use slides_format::number_text;
+use stagepack_studio::inspector::field_id;
+use stagepack_studio::selection::{Selection, Thing};
+
+const TALK: &str = "---\ntitle: T\n---\n\n# Shapes\n\nSome words here\n\n\
+<Shape kind=\"rect\" fill=\"#2563eb\" x=\"1300\" y=\"300\" w=\"200\" h=\"200\" />\n\n\
+<Shape kind=\"ellipse\" fill=\"#2563eb\" x=\"1600\" y=\"300\" w=\"200\" h=\"200\" />\n\n\
+<Icon name=\"arrow-right\" x=\"1400\" y=\"800\" size=\"96\" />\n\n---\n\n# Two\n";
+const RECT: &str = "<Shape kind=\"rect\"";
+const ELLIPSE: &str = "<Shape kind=\"ellipse\"";
+const RECT_PLACE: &str = "x=\"1300\" y=\"300\"";
+const DRAG_OUT_FIRST: &str = "Drag it out of the text first.";
+
+fn selection(typing: &Typing, cx: &TestAppContext) -> Option<Selection> {
+    typing.document(cx).read_with(cx, |document, _| document.selection().cloned())
+}
+
+fn of(typing: &Typing, cx: &mut TestAppContext, start: &str) -> Range<usize> {
+    thing(typing, cx, start).source
+}
+
+fn click_thing(typing: &Typing, cx: &mut TestAppContext, start: &str, modifiers: Modifiers) {
+    let element = thing(typing, cx, start);
+    let at = middle(typing, cx, &element);
+    typing.clicks(cx, at, 1, modifiers);
+}
+
+fn undo_label(typing: &Typing, cx: &TestAppContext) -> Option<&'static str> {
+    typing.document(cx).read_with(cx, |document, _| document.undo_label())
+}
+
+fn can_undo(typing: &Typing, cx: &TestAppContext) -> bool {
+    typing.document(cx).read_with(cx, |document, _| document.can_undo())
+}
+
+fn placing(typing: &Typing, cx: &TestAppContext) -> bool {
+    typing.document(cx).read_with(cx, |document, _| document.placing().is_some())
+}
+
+/// Undoes the last step, as the Undo tool does, wherever the keyboard is.
+fn undo(typing: &Typing, cx: &mut TestAppContext) {
+    typing.document(cx).update(cx, |document, cx| {
+        document.undo().expect("undone");
+        cx.notify();
+    });
+    typing.settle(cx);
+}
+
+/// How far from `from` to `to` is on the slide, in slide units.
+fn on_slide(typing: &Typing, cx: &TestAppContext, from: Point<Pixels>, to: Point<Pixels>) -> (f32, f32) {
+    let unit = f32::from(typing.slide_bounds(cx).size.width) / 1920.;
+    (f32::from(to.x - from.x) / unit, f32::from(to.y - from.y) / unit)
+}
+
+/// `value` moved by `by`, as it's written once let go of: to a whole unit.
+fn written(value: f32, by: f32) -> String {
+    number_text((value + by).round())
+}
+
+/// Presses at `from`, moves through each of `through` with the button held and `modifiers`,
+/// and lets go at the last.
+fn drag_through(typing: &Typing, cx: &mut TestAppContext, from: Point<Pixels>, through: &[Point<Pixels>], modifiers: Modifiers) {
+    typing.mouse_down(cx, from, 1, Modifiers::default());
+    for at in through {
+        typing.move_held(cx, *at, modifiers);
+    }
+    typing.mouse_up(cx, *through.last().unwrap_or(&from), 1, modifiers);
+}
+
+/// The middle of the thing starting with `start`.
+fn middle_of(typing: &Typing, cx: &mut TestAppContext, start: &str) -> Point<Pixels> {
+    let element = thing(typing, cx, start);
+    middle(typing, cx, &element)
+}
+
+/// The flow of the slide's main text.
+fn body_flow(typing: &Typing, cx: &mut TestAppContext) -> usize {
+    let layout = typing.layout(cx);
+    (0..typing.flows(cx, typing.current(cx)).len())
+        .find(|&flow| layout.region_of_flow(flow) == Some("body"))
+        .expect("the main text")
+}
+
+/// A point on the left line of area `name`'s frame, halfway down.
+fn on_frame(typing: &Typing, cx: &mut TestAppContext, name: &str) -> Point<Pixels> {
+    let rect = typing.layout(cx).region(name).expect("the area").rect;
+    typing.at(cx, rect.x, rect.y + rect.h / 2.)
+}
+
+#[gpui_kit::test]
+fn a_drag_moves_a_shape_and_writes_only_x_and_y(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    let from = middle_of(&typing, cx, RECT);
+    let to = from + point(px(90.), px(40.));
+    typing.drag(cx, from, to);
+    let (dx, dy) = on_slide(&typing, cx, from, to);
+    let place = format!("x=\"{}\" y=\"{}\"", written(1300., dx), written(300., dy));
+    assert_eq!(typing.source(cx), TALK.replacen(RECT_PLACE, &place, 1));
+    assert_eq!(selection(&typing, cx).map(|selection| selection.things), Some(vec![Thing::Block(of(&typing, cx, RECT))]), "it stays selected");
+    assert!(!placing(&typing, cx));
+}
+
+#[gpui_kit::test]
+fn a_drag_is_one_undo_step(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    let from = middle_of(&typing, cx, RECT);
+    let to = from + point(px(120.), px(-30.));
+    typing.drag(cx, from, to);
+    assert_ne!(typing.source(cx), TALK);
+    assert_eq!(undo_label(&typing, cx), Some("Move"));
+    undo(&typing, cx);
+    assert_eq!(typing.source(cx), TALK, "one step takes the drag back");
+    assert!(!can_undo(&typing, cx));
+    assert_eq!(selection(&typing, cx).map(|selection| selection.things), Some(vec![Thing::Block(of(&typing, cx, RECT))]), "and selects it again");
+}
+
+#[gpui_kit::test]
+fn a_drag_of_two_things_moves_both_by_the_same_amount(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    click_thing(&typing, cx, RECT, Modifiers::default());
+    click_thing(&typing, cx, ELLIPSE, Modifiers::shift());
+    let from = middle_of(&typing, cx, RECT);
+    let to = from + point(px(60.), px(25.));
+    drag_through(&typing, cx, from, &[from + point(px(20.), px(5.)), to], Modifiers::default());
+    let (dx, dy) = on_slide(&typing, cx, from, to);
+    let expected = TALK
+        .replacen(RECT_PLACE, &format!("x=\"{}\" y=\"{}\"", written(1300., dx), written(300., dy)), 1)
+        .replacen("x=\"1600\" y=\"300\"", &format!("x=\"{}\" y=\"{}\"", written(1600., dx), written(300., dy)), 1);
+    assert_eq!(typing.source(cx), expected);
+    assert_eq!(selection(&typing, cx).map(|selection| selection.things.len()), Some(2), "both stay selected");
+    undo(&typing, cx);
+    assert_eq!(typing.source(cx), TALK, "one step");
+}
+
+#[gpui_kit::test]
+fn a_drag_of_an_area_writes_its_settings_line(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    let body = body_flow(&typing, cx);
+    let area = typing.layout(cx).region("body").expect("the area").rect;
+    // A press on the frame of the area being typed in picks it, and drags it.
+    typing.click_text(cx, body, pos(0, 3));
+    let from = on_frame(&typing, cx, "body");
+    let to = from + point(px(80.), px(0.));
+    typing.drag(cx, from, to);
+    let (dx, _) = on_slide(&typing, cx, from, to);
+    let x = written(area.x, dx);
+    assert_eq!(typing.source(cx), TALK.replace("title: T\n", &format!("title: T\nregion.body: x={x}\n")));
+    assert_eq!(selection(&typing, cx).map(|selection| selection.things), Some(vec![Thing::Region("body".into())]));
+    assert_eq!(undo_label(&typing, cx), Some("Move"));
+    // Selected, it's dragged by its frame again.
+    let from = on_frame(&typing, cx, "body");
+    let to = from + point(px(0.), px(50.));
+    typing.drag(cx, from, to);
+    let (_, dy) = on_slide(&typing, cx, from, to);
+    let y = written(area.y, dy);
+    assert_eq!(typing.source(cx), TALK.replace("title: T\n", &format!("title: T\nregion.body: x={x} y={y}\n")));
+    undo(&typing, cx);
+    undo(&typing, cx);
+    assert_eq!(typing.source(cx), TALK);
+}
+
+#[gpui_kit::test]
+fn shift_keeps_the_move_straight(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    let from = middle_of(&typing, cx, RECT);
+    let through = [from + point(px(20.), px(8.)), from + point(px(100.), px(30.))];
+    drag_through(&typing, cx, from, &through, Modifiers::shift());
+    let (dx, _) = on_slide(&typing, cx, from, through[1]);
+    assert_eq!(typing.source(cx), TALK.replacen(RECT_PLACE, &format!("x=\"{}\" y=\"300\"", written(1300., dx)), 1));
+    // Up and down more than across, it goes up or down.
+    let typing = open(cx, TALK);
+    let through = [from + point(px(10.), px(-90.))];
+    drag_through(&typing, cx, from, &through, Modifiers::shift());
+    let (_, dy) = on_slide(&typing, cx, from, through[0]);
+    assert_eq!(typing.source(cx), TALK.replacen(RECT_PLACE, &format!("x=\"1300\" y=\"{}\"", written(300., dy)), 1));
+}
+
+#[gpui_kit::test]
+fn the_slide_shows_the_thing_under_the_pointer_while_dragging(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    click_thing(&typing, cx, RECT, Modifiers::default());
+    let before = outline(&typing, cx).expect("an outline");
+    let from = middle_of(&typing, cx, RECT);
+    typing.mouse_down(cx, from, 1, Modifiers::default());
+    for step in 1..=4 {
+        let to = from + point(px(25. * step as f32), px(10. * step as f32));
+        typing.move_held(cx, to, Modifiers::default());
+        let now = outline(&typing, cx).expect("an outline");
+        let moved = now.origin - before.origin;
+        assert!((moved.x - px(25. * step as f32)).abs() <= px(1.) && (moved.y - px(10. * step as f32)).abs() <= px(1.), "step {step}: {moved:?}");
+        assert_eq!(now.size, before.size);
+        assert_eq!(typing.source(cx), TALK, "nothing is written while dragging");
+        assert!(placing(&typing, cx));
+        let shown = thing(&typing, cx, RECT).rect;
+        assert!(shown.x > 1300., "the slide shows it moved: {shown:?}");
+    }
+    let to = from + point(px(100.), px(40.));
+    typing.mouse_up(cx, to, 1, Modifiers::default());
+    assert_ne!(typing.source(cx), TALK);
+    assert!(!placing(&typing, cx));
+}
+
+/// Presses on the rectangle and drags it some way, button still down.
+fn press_and_move(typing: &Typing, cx: &mut TestAppContext) -> Point<Pixels> {
+    let from = middle_of(typing, cx, RECT);
+    typing.mouse_down(cx, from, 1, Modifiers::default());
+    let to = from + point(px(70.), px(30.));
+    typing.move_held(cx, from + point(px(20.), px(10.)), Modifiers::default());
+    typing.move_held(cx, to, Modifiers::default());
+    assert!(placing(typing, cx), "dragging");
+    to
+}
+
+/// That nothing was written, no step made, and the slide shows what the talk says.
+fn left_nothing(typing: &Typing, cx: &mut TestAppContext, source: &str, label: Option<&'static str>, what: &str) {
+    assert_eq!(typing.source(cx), source, "{what}: the source is as it was");
+    assert_eq!(undo_label(typing, cx), label, "{what}: no step");
+    assert!(!placing(typing, cx), "{what}: nothing is shown moved");
+    let layout = typing.layout(cx);
+    let source = typing.source(cx);
+    let rect = layout.elements().iter().find(|element| source[element.source.clone()].starts_with(RECT)).expect("the rect").rect;
+    let place: Vec<&str> = source[thing(typing, cx, RECT).source].split('"').collect();
+    assert_eq!(format!("{}", rect.x), place[5], "{what}: the slide shows it where the talk has it");
+}
+
+#[gpui_kit::test]
+fn an_unfinished_drag_leaves_nothing(cx: &mut TestAppContext) {
+    // Escape.
+    let typing = open(cx, TALK);
+    let to = press_and_move(&typing, cx);
+    typing.press(cx, "escape");
+    assert!(!placing(&typing, cx), "escape: put back at once");
+    typing.move_held(cx, to + point(px(30.), px(0.)), Modifiers::default());
+    typing.mouse_up(cx, to, 1, Modifiers::default());
+    left_nothing(&typing, cx, TALK, None, "escape");
+    assert!(selection(&typing, cx).is_some(), "escape: it stays selected");
+
+    // Let go outside the window.
+    let typing = open(cx, TALK);
+    press_and_move(&typing, cx);
+    typing.move_held(cx, point(px(-40.), px(-40.)), Modifiers::default());
+    typing.mouse_up(cx, point(px(-40.), px(-40.)), 1, Modifiers::default());
+    left_nothing(&typing, cx, TALK, None, "outside the window");
+
+    // Let go outside the window, where the window never heard of it.
+    let typing = open(cx, TALK);
+    let to = press_and_move(&typing, cx);
+    typing.with_window(cx, |window, cx| {
+        use gpui_kit::InputEvent as _;
+        window.dispatch_event(gpui_kit::MouseMoveEvent { position: to, pressed_button: None, modifiers: Modifiers::default() }.to_platform_input(), cx);
+    });
+    typing.settle(cx);
+    left_nothing(&typing, cx, TALK, None, "the button let go of unheard");
+
+    // The window deactivated.
+    let typing = open(cx, TALK);
+    typing.with_window(cx, |window, _| window.activate_window());
+    typing.settle(cx);
+    let to = press_and_move(&typing, cx);
+    VisualTestContext::from_window(typing.handle, cx).deactivate_window();
+    typing.settle(cx);
+    assert!(!placing(&typing, cx), "deactivated: put back at once");
+    typing.mouse_up(cx, to, 1, Modifiers::default());
+    left_nothing(&typing, cx, TALK, None, "deactivated");
+
+    // Ctrl+Z with the button down: the undo is made, and the drag ends.
+    let typing = open(cx, TALK);
+    let earlier = middle_of(&typing, cx, ELLIPSE);
+    typing.drag(cx, earlier, earlier + point(px(40.), px(0.)));
+    assert_eq!(undo_label(&typing, cx), Some("Move"));
+    let to = press_and_move(&typing, cx);
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), TALK, "the earlier move is undone");
+    typing.move_held(cx, to + point(px(30.), px(0.)), Modifiers::default());
+    typing.mouse_up(cx, to, 1, Modifiers::default());
+    left_nothing(&typing, cx, TALK, None, "ctrl-z");
+
+    // Page Down with the button down.
+    let typing = open(cx, TALK);
+    let to = press_and_move(&typing, cx);
+    typing.press(cx, "pagedown");
+    assert_eq!(typing.current(cx), 1);
+    assert!(!placing(&typing, cx), "page down: put back at once");
+    typing.move_held(cx, to + point(px(30.), px(0.)), Modifiers::default());
+    typing.mouse_up(cx, to, 1, Modifiers::default());
+    typing.press(cx, "pageup");
+    left_nothing(&typing, cx, TALK, None, "page down");
+
+    // The file changed outside with the button down.
+    let typing = open(cx, TALK);
+    let to = press_and_move(&typing, cx);
+    let outside = TALK.replace("# Two", "# Two, changed");
+    typing.view.update(cx, |view, cx| view.reload_for_test(Some(outside.clone()), cx));
+    typing.settle(cx);
+    assert_eq!(typing.source(cx), outside);
+    typing.move_held(cx, to + point(px(30.), px(0.)), Modifiers::default());
+    typing.mouse_up(cx, to, 1, Modifiers::default());
+    let label = undo_label(&typing, cx);
+    assert_ne!(label, Some("Move"));
+    left_nothing(&typing, cx, &outside, label, "reloaded");
+
+    // A press and a release with no move between.
+    let typing = open(cx, TALK);
+    let from = middle_of(&typing, cx, RECT);
+    typing.mouse_down(cx, from, 1, Modifiers::default());
+    typing.mouse_up(cx, from, 1, Modifiers::default());
+    left_nothing(&typing, cx, TALK, None, "no move");
+    assert_eq!(selection(&typing, cx).map(|selection| selection.things), Some(vec![Thing::Block(of(&typing, cx, RECT))]), "a click selects");
+}
+
+#[gpui_kit::test]
+fn a_small_wobble_is_a_click_and_writes_nothing(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    let from = middle_of(&typing, cx, RECT);
+    drag_through(&typing, cx, from, &[from + point(px(2.), px(2.)), from + point(px(3.), px(0.))], Modifiers::default());
+    left_nothing(&typing, cx, TALK, None, "a wobble");
+    assert_eq!(selection(&typing, cx).map(|selection| selection.things), Some(vec![Thing::Block(of(&typing, cx, RECT))]), "it's a click");
+    // Of one of two selected, a wobble selects it alone, as a click does.
+    click_thing(&typing, cx, ELLIPSE, Modifiers::shift());
+    drag_through(&typing, cx, from, &[from + point(px(0.), px(3.))], Modifiers::default());
+    left_nothing(&typing, cx, TALK, None, "a wobble on two");
+    assert_eq!(selection(&typing, cx).map(|selection| selection.things), Some(vec![Thing::Block(of(&typing, cx, RECT))]));
+}
+
+#[gpui_kit::test]
+fn arrow_keys_nudge_by_one_and_shift_by_ten(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    click_thing(&typing, cx, RECT, Modifiers::default());
+    typing.press(cx, "right");
+    assert_eq!(typing.source(cx), TALK.replacen(RECT_PLACE, "x=\"1301\" y=\"300\"", 1));
+    typing.press(cx, "shift-down");
+    assert_eq!(typing.source(cx), TALK.replacen(RECT_PLACE, "x=\"1301\" y=\"310\"", 1));
+    typing.press(cx, "shift-left");
+    typing.press(cx, "up");
+    assert_eq!(typing.source(cx), TALK.replacen(RECT_PLACE, "x=\"1291\" y=\"309\"", 1));
+    assert_eq!(typing.current(cx), 0, "the slide stays");
+    assert_eq!(undo_label(&typing, cx), Some("Move"));
+    assert!(!placing(&typing, cx));
+}
+
+#[gpui_kit::test]
+fn a_nudge_of_a_thing_in_the_text_says_why_not(cx: &mut TestAppContext) {
+    let talk = "---\ntitle: T\n---\n\n# Shapes\n\n<Shape kind=\"rect\" fill=\"#2563eb\" />\n";
+    let typing = open(cx, talk);
+    click_thing(&typing, cx, RECT, Modifiers::default());
+    assert!(selection(&typing, cx).is_some());
+    typing.press(cx, "right");
+    assert_eq!(typing.source(cx), talk);
+    assert_eq!(typing.status(cx).as_deref(), Some(DRAG_OUT_FIRST));
+    assert_eq!(typing.current(cx), 0);
+}
+
+#[gpui_kit::test]
+fn a_run_of_nudges_is_one_undo_step(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    click_thing(&typing, cx, RECT, Modifiers::default());
+    for _ in 0..3 {
+        typing.press(cx, "right");
+        wait(cx, 500);
+    }
+    typing.press(cx, "shift-down");
+    assert_eq!(typing.source(cx), TALK.replacen(RECT_PLACE, "x=\"1303\" y=\"310\"", 1));
+    undo(&typing, cx);
+    assert_eq!(typing.source(cx), TALK, "one step");
+    assert!(!can_undo(&typing, cx));
+    // A pause between two makes two.
+    typing.press(cx, "right");
+    wait(cx, 1_100);
+    typing.press(cx, "right");
+    undo(&typing, cx);
+    assert_eq!(typing.source(cx), TALK.replacen(RECT_PLACE, "x=\"1301\" y=\"300\"", 1));
+    undo(&typing, cx);
+    assert_eq!(typing.source(cx), TALK);
+}
+
+#[gpui_kit::test]
+fn a_thing_cannot_be_dragged_off_the_slide(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    let from = middle_of(&typing, cx, RECT);
+    let slide = typing.slide_bounds(cx);
+    // Far past the slide's left and bottom, still in the window.
+    let to = point(px(2.), px(798.));
+    assert!(to.x < slide.origin.x && to.y > slide.origin.y + slide.size.height);
+    typing.drag(cx, from, to);
+    assert_eq!(typing.source(cx), TALK.replacen(RECT_PLACE, "x=\"-184\" y=\"1064\"", 1), "sixteen units stay on");
+    // Nudged on, it stays.
+    typing.press(cx, "shift-left");
+    typing.press(cx, "down");
+    assert_eq!(typing.source(cx), TALK.replacen(RECT_PLACE, "x=\"-184\" y=\"1064\"", 1));
+}
+
+#[gpui_kit::test]
+fn a_negative_left_can_be_typed_in_the_form(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    click_thing(&typing, cx, RECT, Modifiers::default());
+    for (typed, kept) in [("-50", "-50"), ("-9000", "-3840")] {
+        click_on(&typing, cx, gpui_kit::SharedString::from(field_id("x")));
+        typing.press(cx, "ctrl-a");
+        typing.type_text(cx, typed);
+        typing.press(cx, "enter");
+        assert_eq!(typing.source(cx), TALK.replacen(RECT_PLACE, &format!("x=\"{kept}\" y=\"300\""), 1));
+    }
+}
+
+#[gpui_kit::test]
+fn left_and_right_change_the_slide_only_when_nothing_is_selected(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    typing.press(cx, "right");
+    assert_eq!(typing.current(cx), 1, "nothing selected: on to the next slide");
+    typing.press(cx, "left");
+    assert_eq!(typing.current(cx), 0);
+    click_thing(&typing, cx, RECT, Modifiers::default());
+    typing.press(cx, "right");
+    typing.press(cx, "left");
+    typing.press(cx, "left");
+    assert_eq!(typing.current(cx), 0, "selected: the thing moves, not the slide");
+    assert_eq!(typing.source(cx), TALK.replacen(RECT_PLACE, "x=\"1299\" y=\"300\"", 1));
+    typing.press(cx, "escape");
+    assert!(selection(&typing, cx).is_none());
+    typing.press(cx, "right");
+    assert_eq!(typing.current(cx), 1, "let go of: the slides again");
+}
+
+#[gpui_kit::test]
+fn nothing_redraws_after_a_drag_ends(cx: &mut TestAppContext) {
+    let typing = open(cx, TALK);
+    let from = middle_of(&typing, cx, RECT);
+    typing.drag(cx, from, from + point(px(50.), px(20.)));
+    assert_ne!(typing.source(cx), TALK);
+    typing.press(cx, "right");
+    let editor = cx.read(|cx| typing.view.read(cx).slide_editor().clone());
+    let canvas = cx.read(|cx| typing.view.read(cx).slide_canvas().clone());
+    let (editor_count, _a) = redraws(cx, &editor);
+    let (view_count, _b) = redraws(cx, &typing.view);
+    let (canvas_count, _c) = redraws(cx, &canvas);
+    wait(cx, 20_000);
+    assert_eq!((editor_count.get(), view_count.get(), canvas_count.get()), (0, 0, 0));
+    assert!(outline(&typing, cx).is_some());
+}

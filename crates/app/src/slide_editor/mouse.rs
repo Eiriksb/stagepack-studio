@@ -51,6 +51,7 @@ impl SlideEditor {
     pub(super) fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // A colour held for the selection goes to it before the click moves it.
         self.give_held_color(cx);
+        self.end_drag(cx);
         self.dragging = false;
         self.pressed = None;
         let Some(point) = self.slide_point(event.position, cx) else {
@@ -68,9 +69,9 @@ impl SlideEditor {
         // Shift or Ctrl adds a thing to what's selected, or takes it away.
         let adding = event.modifiers.shift || event.modifiers.control;
         if let Some((slide, region)) = self.frame_under(point, cx) {
-            // On the frame of the area being typed in: the area.
+            // On the frame of the area being typed in, or of one selected: the area.
             cx.stop_propagation();
-            self.press_thing(slide, Thing::Region(region), adding, window, cx);
+            self.press_thing(slide, Thing::Region(region), adding, event.position, window, cx);
             return;
         }
         let Some((slide, mut hit)) = self.hit(point, cx) else {
@@ -90,7 +91,7 @@ impl SlideEditor {
             };
             if let Some(source) = thing {
                 cx.stop_propagation();
-                self.press_thing(slide, Thing::Block(source), true, window, cx);
+                self.press_thing(slide, Thing::Block(source), true, event.position, window, cx);
                 return;
             }
         }
@@ -114,7 +115,7 @@ impl SlideEditor {
                     .box_of_text(slide, flow, pos.para, point, cx)
                     .filter(|source| starts && event.click_count == 1 && !self.is_selected(slide, source, cx));
                 if let Some(source) = pick {
-                    self.press_thing(slide, Thing::Block(source), false, window, cx);
+                    self.press_thing(slide, Thing::Block(source), false, event.position, window, cx);
                     return;
                 }
                 self.wanted_x = None;
@@ -155,7 +156,7 @@ impl SlideEditor {
             Hit::Element(element) => {
                 cx.stop_propagation();
                 let reason = self.cell_reason(slide, &element.source, point, cx);
-                self.press_thing(slide, Thing::Block(element.source), false, window, cx);
+                self.press_thing(slide, Thing::Block(element.source), false, event.position, window, cx);
                 if let Some(reason) = reason {
                     cx.emit(EditorEvent::Said(reason.into()));
                 }
@@ -183,11 +184,12 @@ impl SlideEditor {
         self.tell_selection(cx);
     }
 
-    /// A press on `thing` of slide `slide`. With `adding`, it's added to what's selected, or
-    /// taken away; on one of several things selected, they stay selected, as a drag would take
-    /// them all, and it's selected alone once the button is let go of; otherwise it's selected
-    /// alone at once.
-    fn press_thing(&mut self, slide: usize, thing: Thing, adding: bool, window: &mut Window, cx: &mut Context<Self>) {
+    /// A press at `from` on `thing` of slide `slide`. With `adding`, it's added to what's
+    /// selected, or taken away; on one of several things selected, they stay selected, as a drag
+    /// takes them all, and it's selected alone once the button is let go of without a drag;
+    /// otherwise it's selected alone at once. Left selected, it's ready to be dragged.
+    fn press_thing(&mut self, slide: usize, thing: Thing, adding: bool, from: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let pressed = thing.clone();
         if adding {
             self.select_also(slide, thing, window, cx);
         } else if self.is_among_selected(slide, &thing, cx) {
@@ -196,24 +198,40 @@ impl SlideEditor {
         } else {
             self.select_one(slide, thing, window, cx);
         }
+        self.ready_drag(&pressed, from, cx);
     }
 
-    /// The button is let go of, anywhere: a press on one of several things selected selects it
-    /// alone.
-    pub(super) fn mouse_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// The button is let go of, anywhere: a drag ends, or a press on one of several things
+    /// selected selects it alone.
+    pub(super) fn mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.dragging = false;
+        if self.drop_drag(event, window, cx) {
+            return;
+        }
         if let Some((slide, thing)) = self.pressed.take() {
             self.select_one(slide, thing, window, cx);
         }
     }
 
-    /// The area being typed in, with its slide, if (`x`, `y`) of the slide is within
-    /// [`FRAME_REACH`] window pixels of its frame, and on no text: neither its own nor another
-    /// thing's.
-    fn frame_under(&self, (x, y): (f32, f32), cx: &mut Context<Self>) -> Option<(usize, String)> {
-        let (slide, region) = self.typed_region(cx)?;
+    /// The area being typed in, or an area selected on the slide shown, with its slide, if
+    /// `point` of the slide is on its frame.
+    fn frame_under(&self, point: (f32, f32), cx: &mut Context<Self>) -> Option<(usize, String)> {
+        let selected = self.selection_here(cx).into_iter().flat_map(|selection| {
+            let slide = selection.slide;
+            selection.things.into_iter().filter_map(move |thing| match thing {
+                Thing::Region(name) => Some((slide, name)),
+                Thing::Block(_) => None,
+            })
+        });
+        let areas: Vec<(usize, String)> = self.typed_region(cx).into_iter().chain(selected).collect();
+        areas.into_iter().find(|(slide, region)| self.on_frame(*slide, region, point, cx).is_some())
+    }
+
+    /// Something if (`x`, `y`) of slide `slide` is within [`FRAME_REACH`] window pixels of the
+    /// frame of area `region`, and on no text: neither its own nor another thing's.
+    fn on_frame(&self, slide: usize, region: &str, (x, y): (f32, f32), cx: &mut Context<Self>) -> Option<()> {
         let layout = self.layout(slide, cx)?;
-        let area = layout.region(&region)?;
+        let area = layout.region(region)?;
         let unit = f32::from(self.canvas.read(cx).slide_bounds()?.size.width) / SLIDE_WIDTH;
         if unit <= 0.0 {
             return None;
@@ -232,13 +250,13 @@ impl SlideEditor {
             return None;
         }
         let other = match layout.hit(x, y) {
-            Some(Hit::Text { flow, .. }) => layout.region_of_flow(flow) != Some(region.as_str()),
+            Some(Hit::Text { flow, .. }) => layout.region_of_flow(flow) != Some(region),
             Some(Hit::Element(_)) => true,
             _ => false,
         };
         // On a line of the area's own text, as at the start of a line that touches the frame,
         // the press types.
-        let on_text = layout.paras().iter().filter(|placed| layout.region_of_flow(placed.flow) == Some(region.as_str())).any(|placed| {
+        let on_text = layout.paras().iter().filter(|placed| layout.region_of_flow(placed.flow) == Some(region)).any(|placed| {
             let Some(caret) = layout.caret(placed.flow, Pos { para: 0, offset: 0 }) else {
                 return false;
             };
@@ -246,7 +264,7 @@ impl SlideEditor {
             let Rect { x: left, y: top, w, h } = placed.rect;
             left <= px && px <= left + w && top <= py && py <= top + h
         });
-        (!other && !on_text).then_some((slide, region))
+        (!other && !on_text).then_some(())
     }
 
     /// The area of the slide shown whose text is being typed, if it's in one.
@@ -257,6 +275,10 @@ impl SlideEditor {
     }
 
     pub(super) fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.drag.is_some() {
+            self.drag_to(event, cx);
+            return;
+        }
         if !self.dragging || event.pressed_button != Some(MouseButton::Left) {
             return;
         }

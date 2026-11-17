@@ -106,9 +106,9 @@ impl Render for SlideEditor {
                             .ok();
                     }
                 });
-                window.on_mouse_event(move |_: &MouseUpEvent, phase, window, cx| {
+                window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
                     if phase == DispatchPhase::Bubble {
-                        editor.update(cx, |editor, cx| editor.mouse_up(window, cx)).ok();
+                        editor.update(cx, |editor, cx| editor.mouse_up(event, window, cx)).ok();
                     }
                 });
                 let slide = letterbox(area, window.scale_factor());
@@ -240,6 +240,7 @@ impl Render for SlideEditor {
                 this.select_along(true, window, cx)
             }))
             .on_action(cx.listener(|this, _: &LetGoOfSelected, _, cx| this.let_go(cx)))
+            .on_action(cx.listener(|this, nudge: &Nudge, _, cx| this.nudge((nudge.dx, nudge.dy), cx)))
             .on_action(cx.listener(|this, _: &CopyToClipboard, _, cx| {
                 this.copy_or_cut_typed(false, cx)
             }))
