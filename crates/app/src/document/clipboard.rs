@@ -343,10 +343,11 @@ impl Document {
     /// Puts the things `markdown` holds on the current slide, as one step named `label`, and
     /// selects them; undone, what was selected before is selected again. They must be things,
     /// as [`clipboard::some_things`] says, or it's refused, with nothing added. Typing ends
-    /// first, and a new text box waiting for its first letter is dropped. `files` are added first, as [`Self::bring_files`] says, and each path in the
-    /// things that had to change is made to name the file as added. Where a thing already has
-    /// its corner at exactly a thing's `x` and `y`, it's moved 40 down and right, as often as
-    /// it takes. They're written with [`insert_block`], after the slide's content, in order.
+    /// first, and a new text box waiting for its first letter is dropped. `files` are added
+    /// first, as [`Self::bring_files`] says, and each path in the things that had to change is
+    /// made to name the file as added. Where a thing already has its corner at exactly one of
+    /// their `x` and `y`, they're all moved 40 down and right together, as often as it takes.
+    /// They're written with [`insert_block`], after the slide's content, in order.
     fn put_thing(&mut self, label: &'static str, markdown: &str, files: PastedFiles) -> Result<(Vec<usize>, Brought), EditRefused> {
         let things = guarded(|| clipboard::some_things(markdown))?.ok_or(EditRefused::NotOneThing)?;
         let tidied = self.finish_before_edit()?;
@@ -358,37 +359,54 @@ impl Document {
         // naming them split or joined them, they'd name files other than those added.
         let renamed = guarded(|| clipboard::some_things(&text))?.filter(|renamed| renamed.len() == things.len());
         let things = renamed.ok_or(EditRefused::CouldNotBeMade)?;
-        let texts: Vec<String> = things.iter().map(|thing| self.stepped_aside(thing)).collect();
+        let texts = self.stepped_aside(&things);
         let changed = self.insert_texts(label, &texts, tidied, before)?;
         let mut brought = brought;
         brought.look_for_lone_builds(self);
         Ok((changed, brought))
     }
 
-    /// `text`, one tag, with its `x` and `y` moved aside from the corners of the things on the
-    /// current slide, as [`insert::step_aside`] moves them. As it is if it has no place written
-    /// as numbers, or nothing is there.
-    fn stepped_aside(&mut self, text: &str) -> String {
+    /// `texts`, each one tag, moved aside from the corners of the things on the current slide,
+    /// all by the same amount, as [`insert::step_aside_together`] works it out from those with a
+    /// place written as numbers, so that things put together keep how they lay. Each is as it
+    /// is if it has no place written as numbers, or nothing is in the way.
+    fn stepped_aside(&mut self, texts: &[String]) -> Vec<String> {
         let layout = self.text_layout(self.current);
         let taken: Vec<(f32, f32)> = layout.elements().iter().map(|element| (element.rect.x, element.rect.y)).collect();
         let first_tag = |talk: &Talk| match talk.slides.first()?.blocks.first()? {
             Block::Tag(tag) => Some(tag.clone()),
             _ => None,
         };
-        let moved = guarded(|| {
-            let talk = parse_talk(text);
-            let tag = first_tag(&talk)?;
-            let place = |name: &str| tag.attrs.iter().find(|attr| attr.name == name)?.value.trim().parse::<f32>().ok().filter(|at| at.is_finite());
-            let at = (place("x")?, place("y")?);
-            let to = insert::step_aside(at, &taken);
-            if to == at {
-                return None;
-            }
-            let text = set_tag_attr(&talk, 0, &tag.range, "x", Some(&insert::whole(to.0)))?.apply(text);
-            let talk = parse_talk(&text);
-            let tag = first_tag(&talk)?;
-            Some(set_tag_attr(&talk, 0, &tag.range, "y", Some(&insert::whole(to.1)))?.apply(&text))
-        });
-        moved.ok().flatten().unwrap_or_else(|| text.to_string())
+        let place_of = |text: &str| {
+            guarded(|| {
+                let talk = parse_talk(text);
+                let tag = first_tag(&talk)?;
+                let place = |name: &str| tag.attrs.iter().find(|attr| attr.name == name)?.value.trim().parse::<f32>().ok().filter(|at| at.is_finite());
+                Some((place("x")?, place("y")?))
+            })
+            .ok()
+            .flatten()
+        };
+        let places: Vec<Option<(f32, f32)>> = texts.iter().map(|text| place_of(text)).collect();
+        let placed: Vec<(f32, f32)> = places.iter().flatten().copied().collect();
+        let step = insert::step_aside_together(&placed, &taken);
+        texts
+            .iter()
+            .zip(places)
+            .map(|(text, place)| {
+                let Some((x, y)) = place.filter(|_| step != 0.0) else {
+                    return text.clone();
+                };
+                let moved = guarded(|| {
+                    let talk = parse_talk(text);
+                    let tag = first_tag(&talk)?;
+                    let text = set_tag_attr(&talk, 0, &tag.range, "x", Some(&insert::whole(x + step)))?.apply(text);
+                    let talk = parse_talk(&text);
+                    let tag = first_tag(&talk)?;
+                    Some(set_tag_attr(&talk, 0, &tag.range, "y", Some(&insert::whole(y + step)))?.apply(&text))
+                });
+                moved.ok().flatten().unwrap_or_else(|| text.clone())
+            })
+            .collect()
     }
 }

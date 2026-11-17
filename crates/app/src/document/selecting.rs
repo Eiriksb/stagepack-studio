@@ -439,18 +439,26 @@ pub(super) fn each_in_turn(talk: &Talk, ranges: &[Range<usize>], each: impl Fn(&
 }
 
 /// The one change that takes every one of `blocks`, each written at the top level of slide
-/// `slide` on lines of its own, away at once, each as [`delete_block`] takes it from the slide as
-/// it is, where those edits don't overlap and the slide then reads as exactly its
-/// other blocks: one reading of the
-/// talk, however many there are. Each is worked out on the slide's own text, read alone, as
-/// the slide it is. `None` otherwise, for them to be taken in turn.
+/// `slide` on lines of its own with a blank line after it, away at once, each as
+/// [`delete_block`] takes it from the slide as it is, where those edits don't overlap and the
+/// slide then reads as exactly its other blocks: one reading of the talk, however many there
+/// are. Each is worked out on the slide's own text, read alone, as the slide it is. `None`
+/// otherwise, for them to be taken in turn.
 fn removed_at_once(talk: &Talk, slide: usize, blocks: &[Range<usize>]) -> Option<Change> {
     let top = &talk.slides.get(slide)?.blocks;
-    // Each on lines of its own, so that taking one away never reaches into another's line.
+    // Each on lines of its own with a blank line after it, so that the blank line taking it
+    // away takes is its own, and never one a block beside it would take too.
     let source = talk.source.as_bytes();
     let own_lines =
         |block: &Range<usize>| (block.start == 0 || source[block.start - 1] == b'\n') && source.get(block.end).is_none_or(|next| matches!(next, b'\n' | b'\r'));
-    if blocks.len() < 2 || !blocks.iter().all(|block| own_lines(block) && top.iter().any(|written| written.range() == block)) {
+    let blank_after = |block: &Range<usize>| {
+        let rest = &talk.source[block.end..];
+        let Some(rest) = rest.strip_prefix("\r\n").or_else(|| rest.strip_prefix('\n')) else {
+            return false;
+        };
+        rest.find('\n').is_some_and(|end| rest[..end].trim().is_empty())
+    };
+    if blocks.len() < 2 || !blocks.iter().all(|block| own_lines(block) && blank_after(block) && top.iter().any(|written| written.range() == block)) {
         return None;
     }
     let (alone, at) = slide_alone(talk, slide)?;

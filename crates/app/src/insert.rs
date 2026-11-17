@@ -45,15 +45,25 @@ pub fn place_for(size: (f32, f32), taken: &[(f32, f32)]) -> (f32, f32) {
 
 /// `at`, a top-left corner in slide units, moved 40 down and right for each time that exact
 /// place is in `taken`, the top-left corners of the things on the slide, at most ten times.
-pub fn step_aside(mut at: (f32, f32), taken: &[(f32, f32)]) -> (f32, f32) {
+pub fn step_aside(at: (f32, f32), taken: &[(f32, f32)]) -> (f32, f32) {
+    let step = step_aside_together(&[at], taken);
+    (at.0 + step, at.1 + step)
+}
+
+/// How far down and right, the same for all of them, things put on a slide at the top-left
+/// corners `at` are moved so that none lands exactly on one of `taken`, the corners of the
+/// things there: the fewest steps of 40 that does it, at most ten. Moved together, things put
+/// together keep how they lay.
+pub fn step_aside_together(at: &[(f32, f32)], taken: &[(f32, f32)]) -> f32 {
     let is_taken = |(x, y): (f32, f32)| taken.iter().any(|&(tx, ty)| (tx - x).abs() < 0.5 && (ty - y).abs() < 0.5);
+    let mut step = 0.0;
     for _ in 0..MOST_STEPS {
-        if !is_taken(at) {
+        if !at.iter().any(|&(x, y)| is_taken((x + step, y + step))) {
             break;
         }
-        at = (at.0 + STEP, at.1 + STEP);
+        step += STEP;
     }
-    at
+    step
 }
 
 /// Whether a shape of kind `kind` is a line, with no inside to fill.

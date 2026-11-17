@@ -535,9 +535,14 @@ fn the_notes_given_the_keyboard_without_the_mouse_let_go_and_keep_their_keys(cx:
         } else {
             select_things(&typing, cx, &[RECT, ELLIPSE]);
         }
+        // The window is in front, as it is when someone moves the keyboard with Tab or a shortcut.
+        typing.with_window(cx, |window, _| window.activate_window());
+        typing.settle(cx);
         let notes = cx.read(|cx| typing.view.read(cx).notes_panel().read(cx).field().focus_handle(cx));
         typing.with_window(cx, |window, cx| notes.focus(window, cx));
         typing.settle(cx);
+        assert_eq!(selection(&typing, cx), None, "area {area}: let go of as soon as the notes have the keyboard");
+        assert!(outline(&typing, cx).is_none(), "area {area}: no outline before anything is typed");
         typing.type_text(cx, "hi");
         let notes_have_it = typing.with_window(cx, |window, cx| typing.view.read(cx).notes_panel().read(cx).is_focused(window, cx));
         assert!(notes_have_it, "area {area}: the letters didn't take the keyboard back for the slide");
@@ -706,5 +711,44 @@ fn every_thing_at_once_writes_what_one_at_a_time_would(cx: &mut TestAppContext) 
         let written: Vec<&str> = copies.iter().map(|range| &source[range.clone()]).collect();
         let expected = format!("{}{eol}{eol}{}{}", &talk[..last_end], written.join(&format!("{eol}{eol}")), &talk[last_end..]);
         assert_eq!(source, expected, "crlf {crlf}: duplicating");
+    }
+}
+
+#[gpui_kit::test]
+fn copies_of_a_chain_keep_how_the_things_lay(cx: &mut TestAppContext) {
+    // B sits where a copy of A moved one step would: both copies go two steps, together.
+    let talk = "---\ntitle: T\n---\n\n# Chain\n\n\
+<Shape kind=\"rect\" fill=\"#2563eb\" x=\"1100\" y=\"300\" w=\"200\" h=\"200\" />\n\n\
+<Shape kind=\"ellipse\" fill=\"#2563eb\" x=\"1140\" y=\"340\" w=\"200\" h=\"200\" />\n";
+    for paste in [false, true] {
+        let typing = open(cx, talk);
+        let document = typing.document(cx);
+        let (a, b) = (of(&typing, cx, RECT), of(&typing, cx, ELLIPSE));
+        cx.update(|cx| {
+            document.update(cx, |document, cx| {
+                assert!(document.select_also(0, Thing::Block(a.clone())));
+                assert!(document.select_also(0, Thing::Block(b.clone())));
+                cx.notify();
+            })
+        });
+        typing.settle(cx);
+        if paste {
+            typing.press(cx, "ctrl-c");
+            typing.press(cx, "ctrl-v");
+        } else {
+            typing.press(cx, "ctrl-d");
+        }
+        let source = typing.source(cx);
+        let mut copies = blocks(&typing, cx);
+        copies.sort_by_key(|range| range.start);
+        let written: Vec<&str> = copies.iter().map(|range| &source[range.clone()]).collect();
+        assert_eq!(
+            written,
+            [
+                "<Shape kind=\"rect\" fill=\"#2563eb\" x=\"1180\" y=\"380\" w=\"200\" h=\"200\" />",
+                "<Shape kind=\"ellipse\" fill=\"#2563eb\" x=\"1220\" y=\"420\" w=\"200\" h=\"200\" />",
+            ],
+            "paste {paste}: both two steps along, still 40 apart"
+        );
     }
 }
