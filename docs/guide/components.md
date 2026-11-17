@@ -80,7 +80,7 @@ For a fixed list of choices, write an `enum` above the component with `#[derive(
 
 Once the component is built, it's in the list under *Component* on the Insert tab. Putting it on a slide writes its tag with a starting value for every argument it must have, selects it, and shows its form in the panel at the right of the window. Selecting it later shows the same form. Each argument is one field, under a label, in the order the arguments are written:
 
-- **Text** (`String`): a box to type in. What's typed is written when the field is left or Enter is pressed, and Escape puts back what was there. Quotes, `<`, `&` and new lines are written so they read back as typed; a value holding both kinds of quote can't be written, and the field says so.
+- **Text** (`String`): a box to type in. What's typed is written when the field is left or Enter is pressed, and Escape puts back what was there. Quotes, `<` and `&` are written so they read back as typed. A value holding both kinds of quote mark, or a new line, can't be written, and the field says so.
 - **Whole number** (`u32`, `i32`) and **number** (`f32`): a box with − and + beside it, and the Up and Down keys step it. A comma is taken as the decimal mark, so `1,5` is 1.5. Text that isn't a number, or a fraction in a whole number, is refused with a sentence under the field.
 - **Yes or no** (`bool`): a checkbox, written at once.
 - **Colour** (`Color`): a swatch that opens a palette and sliders, written at once.
