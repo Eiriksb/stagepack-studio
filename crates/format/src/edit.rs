@@ -224,17 +224,25 @@ pub(crate) fn eol_in(text: &str) -> &'static str {
 /// Sets `key` in the slide's settings block to `value`, adding the entry or
 /// the whole block when it is missing.
 pub fn set_setting(source: &str, slide: &Slide, key: &str, value: &str) -> SourceEdit {
+    if let Some(entry) = slide.settings.as_ref().and_then(|settings| settings.entries.iter().find(|e| e.key == key)) {
+        let r = entry.value_range.clone();
+        let text = if r.is_empty() { format!(" {value}") } else { value.to_string() };
+        return SourceEdit { range: r, text };
+    }
+    add_settings(source, slide, &[(key, value)])
+}
+
+/// The edit that adds a `key: value` line for each of `lines`, in order, at the end of the
+/// slide's settings block, or adds the block holding them when it has none. The keys are
+/// ones the block hasn't got.
+pub(crate) fn add_settings(source: &str, slide: &Slide, lines: &[(&str, &str)]) -> SourceEdit {
+    let written = |eol: &str| lines.iter().map(|(key, value)| format!("{key}: {value}{eol}")).collect::<String>();
     if let Some(settings) = &slide.settings {
-        if let Some(entry) = settings.entries.iter().find(|e| e.key == key) {
-            let r = entry.value_range.clone();
-            let text = if r.is_empty() { format!(" {value}") } else { value.to_string() };
-            return SourceEdit { range: r, text };
-        }
         let block = &source[settings.range.clone()];
         let eol = eol_in(block);
         let body = block.trim_end_matches(['\r', '\n']);
         let close = settings.range.start + body.rfind('\n').map_or(0, |i| i + 1);
-        return SourceEdit { range: close..close, text: format!("{key}: {value}{eol}") };
+        return SourceEdit { range: close..close, text: written(eol) };
     }
 
     let start = slide.range.start;
@@ -245,14 +253,10 @@ pub fn set_setting(source: &str, slide: &Slide, key: &str, value: &str) -> Sourc
         // A bare rule: the settings go straight after it.
         let had_eol = source[..first_end].ends_with('\n');
         let eol = if had_eol { eol_in(&source[start..first_end]) } else { eol_in(source) };
-        let text = if had_eol {
-            format!("{key}: {value}{eol}---{eol}")
-        } else {
-            format!("{eol}{key}: {value}{eol}---")
-        };
+        let text = if had_eol { format!("{}---{eol}", written(eol)) } else { format!("{eol}{}---", written(eol)) };
         return SourceEdit { range: first_end..first_end, text };
     }
     let eol = eol_in(source);
     let at = start + bom;
-    SourceEdit { range: at..at, text: format!("---{eol}{key}: {value}{eol}---{eol}") }
+    SourceEdit { range: at..at, text: format!("---{eol}{}---{eol}", written(eol)) }
 }

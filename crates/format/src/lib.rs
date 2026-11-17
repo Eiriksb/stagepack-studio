@@ -1,5 +1,6 @@
 //! The talk file format: Markdown in, a model with exact byte positions out.
 
+mod arrange_ops;
 mod attrs;
 mod edit;
 mod element_ops;
@@ -15,6 +16,7 @@ mod slide_ops;
 mod split;
 mod table_ops;
 
+pub use arrange_ops::{Order, Target, ValueEdit, can_reorder, lift, number_text, region_value, reorder, set_layout, set_transition, set_values};
 pub use edit::{Change, SourceEdit, set_attr, set_setting};
 pub use element_ops::{NewTag, block_text, delete_block, find_tag, insert_block, insert_block_in_region, set_tag_attr, set_tag_body, tag_text};
 pub use model::{Attr, Block, CellSource, Notes, Slide, SlideError, Span, Style, Tag, Talk};

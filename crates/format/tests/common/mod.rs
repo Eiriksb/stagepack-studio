@@ -235,6 +235,63 @@ pub fn gen_talk() -> impl Strategy<Value = GenTalk> {
     )
 }
 
+/// Words a person might write on a `region.<name>` line.
+pub const REGION_WORDS: [&str; 15] = [
+    "x=10", "y=20.5", "w=500", "h=-3", "rotate=3", "click=each", "click=2", "enter=fly-up", "align=center", "x=abc", "x=7", "foo=bar",
+    "bare", "enter=zoom", "click=zz",
+];
+
+/// Placed tags as people write them by hand.
+pub const PLACED: [&str; 8] = [
+    "<Box x=\"10\" y=\"20\" w=\"100\" h=\"50\">\n\nPlaced *text*\n\n</Box>",
+    "<Icon name=\"p1\" x='5' y='6' />",
+    "<Icon name=\"p2\" x=7 w=8 />",
+    "<Shape kind=\"square\" x=\"1.5\" y=\"-20\" w=\"30\" h=\"40\" />",
+    "<Icon name=\"p3\" x=\"1\" x=\"2\" y=\"3\" />",
+    "<Icon name=\"p4\" x=\"abc\" y=\"4\" />",
+    "<Icon name=\"p5\" w=\"12\" />",
+    "<Shape\n  kind=\"circle\"\n  x=\"40\"\n  y=\"50\"\n/>",
+];
+
+/// A `region.<name>` settings line: its key and its words, apart by spaces or tabs.
+pub fn region_line() -> impl Strategy<Value = (String, String)> {
+    (
+        prop::sample::select(vec!["title", "body", "left", "right"]),
+        prop::collection::vec((prop::sample::select(REGION_WORDS.to_vec()), prop::sample::select(vec![" ", "\t", "  "])), 0..5),
+    )
+        .prop_map(|(region, words)| {
+            let mut value = String::new();
+            for (i, (word, gap)) in words.into_iter().enumerate() {
+                if i > 0 {
+                    value.push_str(gap);
+                }
+                value.push_str(word);
+            }
+            (format!("region.{region}"), value)
+        })
+}
+
+/// [`gen_talk`]'s talk with `region.<name>` lines and placed tags on its slides, and on some
+/// talks two columns for every slide with a layout of its own.
+pub fn arranged_talk() -> impl Strategy<Value = String> {
+    (
+        gen_talk(),
+        prop::collection::vec((prop::collection::vec(region_line(), 0..3), prop::collection::vec((prop::sample::select(PLACED.to_vec()), 0..4usize), 0..4)), 8),
+        any::<bool>(),
+    )
+        .prop_map(|(mut talk, extras, two_columns)| {
+            for (slide, (lines, placed)) in talk.slides.iter_mut().zip(extras) {
+                slide.settings.extend(lines);
+                for (tag, at) in placed {
+                    let at = at % (slide.blocks.len() + 1);
+                    slide.blocks.insert(at, tag.to_string());
+                }
+            }
+            let source = talk.text();
+            if two_columns { source.replace("layout: section  ", "layout: two-columns") } else { source }
+        })
+}
+
 #[derive(Clone, Debug)]
 pub enum Op {
     /// After which slide, and whether the new one is of `key: value` lines only.

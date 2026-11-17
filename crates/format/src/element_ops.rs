@@ -122,7 +122,7 @@ fn one_line_ending(text: &str) -> String {
 }
 
 /// What `make` gives, or `None` if it panics.
-fn guarded<T>(make: impl FnOnce() -> Option<T>) -> Option<T> {
+pub(crate) fn guarded<T>(make: impl FnOnce() -> Option<T>) -> Option<T> {
     catch_unwind(AssertUnwindSafe(make)).ok().flatten()
 }
 
@@ -131,7 +131,7 @@ fn is_tag_name(name: &str) -> bool {
     chars.next().is_some_and(|first| first.is_ascii_uppercase()) && chars.all(|c| c.is_ascii_alphanumeric())
 }
 
-fn is_attr_name(name: &str) -> bool {
+pub(crate) fn is_attr_name(name: &str) -> bool {
     let mut chars = name.chars();
     chars.next().is_some_and(|first| first.is_ascii_lowercase()) && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
@@ -152,7 +152,7 @@ fn find_block<'a>(blocks: &'a [Block], range: &Range<usize>) -> Option<&'a Block
 
 /// Calls `change` on the block at exactly `range` among `blocks`, at any depth, with the list
 /// that holds it and its place there. Whether there was one.
-fn with_block(blocks: &mut Vec<Block>, range: &Range<usize>, change: &mut impl FnMut(&mut Vec<Block>, usize)) -> bool {
+pub(crate) fn with_block(blocks: &mut Vec<Block>, range: &Range<usize>, change: &mut impl FnMut(&mut Vec<Block>, usize)) -> bool {
     if let Some(at) = blocks.iter().position(|block| block.range() == range) {
         change(blocks, at);
         return true;
@@ -165,27 +165,27 @@ fn with_block(blocks: &mut Vec<Block>, range: &Range<usize>, change: &mut impl F
 }
 
 /// The start of the line `at` is in.
-fn line_start(source: &str, at: usize) -> usize {
+pub(crate) fn line_start(source: &str, at: usize) -> usize {
     source[..at].rfind('\n').map_or(0, |i| i + 1)
 }
 
 /// Just past the line ending of the line `at` is in, or the end of the text.
-fn line_end(source: &str, at: usize) -> usize {
+pub(crate) fn line_end(source: &str, at: usize) -> usize {
     source[at..].find('\n').map_or(source.len(), |i| at + i + 1)
 }
 
-fn is_blank(line: &str) -> bool {
+pub(crate) fn is_blank(line: &str) -> bool {
     line.trim().is_empty()
 }
 
 /// The length of the line ending `text` ends with.
-fn ending_len(text: &str) -> usize {
+pub(crate) fn ending_len(text: &str) -> usize {
     if text.ends_with("\r\n") { 2 } else { usize::from(text.ends_with('\n')) }
 }
 
 /// Whether slide `index` of `after`, `talk` changed, reads as `blocks` with nothing else
 /// about it changed: the same number of slides, the same notes, and no error.
-fn reads_as(talk: &Talk, after: &Talk, index: usize, blocks: &[Block]) -> bool {
+pub(crate) fn reads_as(talk: &Talk, after: &Talk, index: usize, blocks: &[Block]) -> bool {
     let (Some(old), Some(new)) = (talk.slides.get(index), after.slides.get(index)) else { return false };
     after.slides.len() == talk.slides.len()
         && new.error.is_none()
@@ -200,7 +200,7 @@ fn settings_of(slide: &Slide) -> Option<Vec<(&str, &str)>> {
 }
 
 /// A readable slide of the talk, by index.
-fn readable(talk: &Talk, index: usize) -> Option<&Slide> {
+pub(crate) fn readable(talk: &Talk, index: usize) -> Option<&Slide> {
     talk.slides.get(index).filter(|slide| slide.error.is_none())
 }
 
@@ -308,7 +308,7 @@ fn after_block(source: &str, slide: &Slide, end: usize, text: &str, eol: &str) -
 
 /// `end`, the end of a block's range, moved back over the line endings and spaces it ends
 /// with: the `markdown` crate takes the blank lines after a list into the list.
-fn content_end(source: &str, end: usize) -> usize {
+pub(crate) fn content_end(source: &str, end: usize) -> usize {
     source[..end].trim_end_matches([' ', '\t', '\r', '\n']).len()
 }
 
