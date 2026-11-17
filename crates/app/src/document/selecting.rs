@@ -244,6 +244,12 @@ impl Document {
         let Some(selection) = self.selection.clone() else {
             return Vec::new();
         };
+        self.boxes_of(selection)
+    }
+
+    /// Where each thing of `selection` is drawn, as [`Self::selected_boxes`] says of what's
+    /// selected.
+    pub(super) fn boxes_of(&mut self, selection: selection::Selection) -> Vec<(Thing, Rect, f32)> {
         let layout = self.text_layout(selection.slide);
         selection
             .things

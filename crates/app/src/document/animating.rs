@@ -273,15 +273,17 @@ impl Document {
         })
     }
 
-    /// The things and areas the Animate tab acts on: those selected on the current slide, or
-    /// with nothing selected, `typed`, what's typed in.
+    /// The things and areas the Animate tab acts on: those selected on the current slide, as
+    /// arranging takes them, or with nothing selected, `typed`, what's typed in.
     fn animate_targets(&self, typed: Option<Target>) -> Result<Vec<Target>, EditRefused> {
         let slide = self.current;
         let Some(written) = self.talk().slides.get(slide) else {
             return Err(EditRefused::NothingToAnimate);
         };
         let placed = |source: &Range<usize>| written.blocks.iter().any(|block| matches!(block, Block::Tag(tag) if is_positioned(tag) && tag.range == *source));
-        let things: Vec<Target> = match self.selection.as_ref().filter(|selection| selection.slide == slide && !selection.things.is_empty()) {
+        // A thing inside another selected goes with that, and one a box with a place holds
+        // alone comes in with the box.
+        let things: Vec<Target> = match self.arranged_here().filter(|selection| !selection.things.is_empty()) {
             Some(selection) => selection
                 .things
                 .iter()

@@ -623,3 +623,174 @@ fn several_selected_with_one_in_the_text_are_refused(cx: &mut TestAppContext) {
     assert!(bounds_of(&typing, cx, LIFT_OUTLINE_ID).is_none());
     assert_eq!(typing.status(cx).as_deref(), Some(DRAG_OUT_FIRST));
 }
+
+/// A table moved out of the text, in its box, and a shape beside it.
+const BOXED_TABLE: &str = "---\ntitle: T\n---\n\n# Things\n\n<Shape kind=\"rect\" fill=\"#2563eb\" x=\"1200\" y=\"300\" w=\"200\" h=\"200\" />\n\n\
+<Box x=\"200\" y=\"500\" w=\"400\" h=\"300\">\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n</Box>\n";
+/// A box holding an icon alone, and a shape after it.
+const ICON_BOX_AND_SHAPE: &str = "---\ntitle: T\n---\n\n# Things\n\n<Box x=\"200\" y=\"500\" w=\"400\" h=\"300\">\n\n<Icon name=\"star\" size=\"96\" />\n\n</Box>\n\n\
+<Shape kind=\"rect\" fill=\"#2563eb\" x=\"1200\" y=\"300\" w=\"200\" h=\"200\" />\n";
+const ICON: &str = "<Icon name=\"star\" size=\"96\" />";
+/// Where the Arrange menu has "Bring to front" and "Align left", and the thing's menu has
+/// "Bring to front".
+const ARRANGE_TO_FRONT: usize = 0;
+const ARRANGE_ALIGN_LEFT: usize = 5;
+const MENU_TO_FRONT: usize = 6;
+
+/// The talk `source` in a window wide enough that the Home tab's tools all show.
+fn open_wide(cx: &mut TestAppContext, source: &str) -> Typing {
+    let typing = open(cx, source);
+    cx.simulate_window_resize(typing.handle, gpui_kit::size(px(1800.), px(900.)));
+    typing.settle(cx);
+    typing
+}
+
+/// Picks item `at` of the menu the tool `tool` opens.
+fn pick_from(typing: &Typing, cx: &mut TestAppContext, tool: &str, at: usize) {
+    use gpui_kit::test::TestWindowExt as _;
+    click_on(typing, cx, tool.to_string());
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        window.within("popup-menu").click(at, cx);
+    });
+    typing.settle(cx);
+}
+
+/// The value `name` written on the tag of the talk that starts with `start`.
+fn written(source: &str, start: &str, name: &str) -> Option<String> {
+    let tag = &source[source.find(start)?..];
+    let tag = &tag[..tag.find('>')?];
+    let from = tag.find(&format!(" {name}=\""))? + name.len() + 3;
+    tag[from..].split('"').next().map(str::to_string)
+}
+
+#[gpui_kit::test]
+fn every_thing_selected_with_a_lifted_table_moves_the_box_and_the_others(cx: &mut TestAppContext) {
+    use stagepack_studio::arrange_tools::ARRANGE_ID;
+    let typing = open_wide(cx, BOXED_TABLE);
+    let shape = middle_of(&typing, cx, "<Shape");
+    typing.click(cx, shape);
+    typing.press(cx, "ctrl-a");
+    assert_eq!(selection(&typing, cx).map(|things| things.len()), Some(3), "the shape, the box and the table in it");
+    // Nudged: the box and the shape go, the table with its box.
+    typing.press(cx, "right");
+    let source = typing.source(cx);
+    assert_eq!(source, BOXED_TABLE.replacen("x=\"1200\"", "x=\"1201\"", 1).replacen("<Box x=\"200\"", "<Box x=\"201\"", 1));
+    assert_ne!(typing.status(cx).as_deref(), Some(DRAG_OUT_FIRST));
+    assert_eq!(selection(&typing, cx).map(|things| things.len()), Some(3), "all stay selected");
+    // Dragged by the shape: all go as far.
+    let to = shape + point(px(80.), px(40.));
+    drag_through(&typing, cx, shape, &[shape + point(px(20.), px(10.)), to], NO_SNAP);
+    let (dx, dy) = on_slide(&typing, cx, shape, to);
+    let source = typing.source(cx);
+    assert_eq!(written(&source, "<Shape", "x"), Some(whole(1201. + dx)), "{source}");
+    assert_eq!(written(&source, "<Shape", "y"), Some(whole(300. + dy)));
+    assert_eq!(written(&source, "<Box", "x"), Some(whole(201. + dx)), "{source}");
+    assert_eq!(written(&source, "<Box", "y"), Some(whole(500. + dy)));
+    assert!(source.contains(&format!("\n\n{TABLE}\n</Box>\n")), "the table's bytes are as they were: {source}");
+    assert_eq!(undo_label(&typing, cx), Some("Move"));
+    // Aligned left, to each other.
+    pick_from(&typing, cx, ARRANGE_ID, ARRANGE_ALIGN_LEFT);
+    let source = typing.source(cx);
+    assert_eq!(written(&source, "<Shape", "x"), Some(whole(201. + dx)), "{source}");
+    assert_eq!(written(&source, "<Box", "x"), Some(whole(201. + dx)));
+    assert_eq!(undo_label(&typing, cx), Some("Align"));
+    assert!(source.contains(&format!("\n\n{TABLE}\n</Box>\n")));
+    for _ in 0..3 {
+        undo(&typing, cx);
+    }
+    assert_eq!(typing.source(cx), BOXED_TABLE, "each was one step");
+}
+
+/// Selects what `ICON_BOX_AND_SHAPE`'s box holds, with a press on it and another.
+fn select_the_icon(typing: &Typing, cx: &mut TestAppContext) {
+    let at = middle_of(typing, cx, "<Icon");
+    typing.click(cx, at);
+    typing.click(cx, at);
+    assert_eq!(selection(typing, cx), Some(vec![Thing::Block(thing(typing, cx, "<Icon").source)]));
+}
+
+#[gpui_kit::test]
+fn with_what_a_box_holds_selected_the_keys_align_order_and_animate_act_on_the_box(cx: &mut TestAppContext) {
+    use stagepack_studio::animate_tools::ENTRANCE_ID;
+    use stagepack_studio::arrange_tools::ARRANGE_ID;
+    use stagepack_studio::ribbon::TAB_ANIMATE_ID;
+    let typing = open_wide(cx, ICON_BOX_AND_SHAPE);
+    select_the_icon(&typing, cx);
+    typing.press(cx, "right");
+    assert_eq!(typing.source(cx), ICON_BOX_AND_SHAPE.replacen("<Box x=\"200\"", "<Box x=\"201\"", 1));
+    assert_eq!(selection(&typing, cx), Some(vec![Thing::Block(thing(&typing, cx, "<Icon").source)]), "what it holds stays selected");
+    // One thing aligns to the slide: the box goes to its left edge.
+    pick_from(&typing, cx, ARRANGE_ID, ARRANGE_ALIGN_LEFT);
+    assert_eq!(typing.source(cx), ICON_BOX_AND_SHAPE.replacen("<Box x=\"200\"", "<Box x=\"0\"", 1));
+    assert_eq!(undo_label(&typing, cx), Some("Align"));
+    // In front of the shape: the box's lines go after the shape's, what it holds with them.
+    pick_from(&typing, cx, ARRANGE_ID, ARRANGE_TO_FRONT);
+    let source = typing.source(cx);
+    assert!(source.find("<Shape").unwrap() < source.find("<Box").unwrap(), "{source}");
+    assert!(source.contains(&format!("\n\n{ICON}\n\n</Box>\n")), "{source}");
+    assert_eq!(undo_label(&typing, cx), Some("Change order"));
+    assert_eq!(selection(&typing, cx), Some(vec![Thing::Block(thing(&typing, cx, "<Icon").source)]), "what it holds stays selected");
+    // And it comes in with the box.
+    click_on(&typing, cx, TAB_ANIMATE_ID);
+    pick_from(&typing, cx, ENTRANCE_ID, 2);
+    let source = typing.source(cx);
+    assert_eq!(written(&source, "<Box", "click").as_deref(), Some("1"), "{source}");
+    assert_eq!(written(&source, "<Box", "enter").as_deref(), Some("fade"));
+    assert!(source.contains(&format!("\n\n{ICON}\n\n</Box>\n")), "what it holds is as it was: {source}");
+    for _ in 0..4 {
+        undo(&typing, cx);
+    }
+    assert_eq!(typing.source(cx), ICON_BOX_AND_SHAPE);
+}
+
+#[gpui_kit::test]
+fn what_a_box_holds_and_another_thing_picked_with_shift_or_ctrl_move_with_the_box(cx: &mut TestAppContext) {
+    for modifiers in [Modifiers::shift(), Modifiers::control()] {
+        let typing = open_wide(cx, ICON_BOX_AND_SHAPE);
+        select_the_icon(&typing, cx);
+        let shape = middle_of(&typing, cx, "<Shape");
+        typing.clicks(cx, shape, 1, modifiers);
+        assert_eq!(selection(&typing, cx).map(|things| things.len()), Some(2), "{modifiers:?}");
+        typing.press(cx, "right");
+        assert_eq!(
+            typing.source(cx),
+            ICON_BOX_AND_SHAPE.replacen("<Box x=\"200\"", "<Box x=\"201\"", 1).replacen("x=\"1200\"", "x=\"1201\"", 1),
+            "{modifiers:?}"
+        );
+    }
+    // From the shape, Shift and a press on what the box holds adds the box, as what moves.
+    let typing = open_wide(cx, ICON_BOX_AND_SHAPE);
+    let shape = middle_of(&typing, cx, "<Shape");
+    typing.click(cx, shape);
+    let icon = middle_of(&typing, cx, "<Icon");
+    typing.clicks(cx, icon, 1, Modifiers::shift());
+    let boxed = thing(&typing, cx, "<Box").source;
+    assert_eq!(selection(&typing, cx), Some(vec![Thing::Block(thing(&typing, cx, "<Shape").source), Thing::Block(boxed)]));
+}
+
+#[gpui_kit::test]
+fn the_menu_a_right_click_on_what_a_box_holds_opens_orders_the_box(cx: &mut TestAppContext) {
+    use gpui_kit::test::TestWindowExt as _;
+    use gpui_kit::{InputEvent as _, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
+    let typing = open_wide(cx, ICON_BOX_AND_SHAPE);
+    select_the_icon(&typing, cx);
+    let at = middle_of(&typing, cx, "<Icon");
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        let modifiers = Modifiers::default();
+        window.dispatch_event(MouseMoveEvent { position: at, pressed_button: None, modifiers }.to_platform_input(), cx);
+        window.dispatch_event(MouseDownEvent { button: MouseButton::Right, position: at, modifiers, click_count: 1, first_mouse: false }.to_platform_input(), cx);
+        window.dispatch_event(MouseUpEvent { button: MouseButton::Right, position: at, modifiers, click_count: 1 }.to_platform_input(), cx);
+    });
+    typing.settle(cx);
+    assert_eq!(selection(&typing, cx), Some(vec![Thing::Block(thing(&typing, cx, "<Icon").source)]), "it stays selected");
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        window.within("popup-menu").click(MENU_TO_FRONT, cx);
+    });
+    typing.settle(cx);
+    let source = typing.source(cx);
+    assert!(source.find("<Shape").unwrap() < source.find("<Box").unwrap(), "the box is put in front: {source}");
+    assert!(source.contains(&format!("\n\n{ICON}\n\n</Box>\n")));
+}

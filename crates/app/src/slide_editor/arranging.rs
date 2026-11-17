@@ -174,12 +174,10 @@ impl SlideEditor {
         };
         let (things, lifting, refused, version, pick) = document.update(cx, |document, _| {
             // One thing written in the text is lifted out of it; with others, nothing is moved.
-            let (things, left_out) = document.movable_selected();
             // What a box holds alone moves with the box.
+            let (things, left_out) = document.movable_selected();
             let (things, lifting, refused) = if !left_out {
                 (things, false, None)
-            } else if let Some(held) = document.holding_box_selected() {
-                (vec![held], false, None)
             } else {
                 match document.liftable_selected() {
                     Some(Ok(one)) => (vec![one], true, None),
@@ -276,7 +274,9 @@ impl SlideEditor {
     fn work_out_handles(&self, layout: &TextLayout, unit: f32, cx: &mut Context<Self>) -> Option<Handles> {
         let document = self.document.clone()?;
         let (things, left_out) = document.update(cx, |document, _| document.movable_selected());
-        let (thing, placed) = things.into_iter().next().filter(|_| !left_out)?;
+        // What a box holds, selected alone, has no handles: the box's would show on another.
+        let selection = self.selection_here(cx)?;
+        let (thing, placed) = things.into_iter().next().filter(|(thing, _)| !left_out && selection.things.contains(thing))?;
         let keeps_shape = match &thing {
             Thing::Block(source) => layout.element(source)?.keeps_shape,
             Thing::Region(_) => false,

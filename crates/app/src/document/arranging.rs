@@ -22,7 +22,8 @@ pub const MOVE_OUT: &str = "Move out of the text";
 /// What can be done to arrange what's selected, for the tools that do it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct ArrangeHere {
-    /// How many things are selected, areas among them.
+    /// How many things arranging acts on, areas among them: those selected, as
+    /// [`Document::movable_selected`] takes them.
     pub count: usize,
     /// How many of them have a place of their own: a thing with one, or an area.
     pub placed: usize,
@@ -87,6 +88,28 @@ impl Document {
         self.selection.as_ref().filter(|selection| selection.slide == self.current)
     }
 
+    /// What arranging and animating act on of what's selected on the slide shown, in the order
+    /// it was picked: each thing but one inside another selected, as Delete takes them; and for a
+    /// thing a box with a place of its own holds alone, the box, which is what moves it. `None`
+    /// with nothing selected here.
+    pub(super) fn arranged_here(&self) -> Option<selection::Selection> {
+        let selection = self.selection_here()?;
+        let blocks: Vec<&Range<usize>> = selection.blocks().collect();
+        let inside = |source: &Range<usize>| blocks.iter().any(|other| *other != source && other.start <= source.start && source.end <= other.end);
+        let mut things: Vec<Thing> = Vec::new();
+        for thing in &selection.things {
+            let thing = match thing {
+                Thing::Block(source) if inside(source) => continue,
+                Thing::Block(source) => Thing::Block(selection::box_holding(self.talk(), selection.slide, source).unwrap_or_else(|| source.clone())),
+                Thing::Region(name) => Thing::Region(name.clone()),
+            };
+            if !things.contains(&thing) {
+                things.push(thing);
+            }
+        }
+        Some(selection::Selection { slide: selection.slide, things })
+    }
+
     /// Shows each of `places` on the current slide where it says, without writing anything,
     /// until [`Self::drop_preview`] or any edit. Only a thing with a place of its own, or an
     /// area of the slide's layout, is shown moved.
@@ -121,13 +144,14 @@ impl Document {
 
     /// Where each thing selected that can be moved as it's written is, in the order they were
     /// picked, and whether any selected can't be: one written in the slide's text, with no place
-    /// of its own.
+    /// of its own. A thing inside another selected goes with that, and one a box with a place
+    /// holds alone is moved by the box.
     pub fn movable_selected(&mut self) -> (Vec<(Thing, Placed)>, bool) {
-        let Some(selection) = self.selection_here().cloned() else {
+        let Some(arranged) = self.arranged_here() else {
             return (Vec::new(), false);
         };
-        let layout = self.text_layout(selection.slide);
-        let boxes = self.selected_boxes();
+        let layout = self.text_layout(arranged.slide);
+        let boxes = self.boxes_of(arranged);
         let all = boxes.len();
         let movable: Vec<(Thing, Placed)> = boxes
             .into_iter()
@@ -285,7 +309,7 @@ impl Document {
 impl Document {
     /// What can be done to arrange what's selected, from the talk as it's written.
     pub fn arrange_here(&self) -> ArrangeHere {
-        let Some(selection) = self.selection_here() else {
+        let Some(selection) = self.arranged_here() else {
             return ArrangeHere::default();
         };
         let Some(slide) = self.talk().slides.get(selection.slide) else {
@@ -329,7 +353,7 @@ impl Document {
     /// it opens.
     pub fn arrange_menu(&self) -> ArrangeHere {
         let mut here = self.arrange_here();
-        if let Some(selection) = self.selection_here()
+        if let Some(selection) = self.arranged_here()
             && let [Thing::Block(source)] = selection.things.as_slice()
         {
             for order in [Order::Forward, Order::Backward, Order::Front, Order::Back] {
@@ -360,7 +384,7 @@ impl Document {
     /// step named "Distribute", and returns the slides to show again. Refused for fewer than
     /// three, or if one of them is written in the slide's text.
     pub fn distribute_things(&mut self, across: bool) -> Result<Vec<usize>, EditRefused> {
-        let count = self.selection_here().map_or(0, |selection| selection.things.len());
+        let count = self.arranged_here().map_or(0, |selection| selection.things.len());
         if count == 0 {
             return Ok(Vec::new());
         }
@@ -396,10 +420,10 @@ impl Document {
         if self.text_version() != version {
             return Err(EditRefused::CouldNotBeMade);
         }
-        let Some(selection) = self.selection_here().cloned() else {
+        let (Some(selection), Some(arranged)) = (self.selection_here().cloned(), self.arranged_here()) else {
             return Ok(Vec::new());
         };
-        let [Thing::Block(source)] = selection.things.as_slice() else {
+        let [Thing::Block(source)] = arranged.things.as_slice() else {
             return Err(EditRefused::CouldNotBeMade);
         };
         let slide = selection.slide;
@@ -422,7 +446,20 @@ impl Document {
             let moved = self.talk().slides.get(slide).and_then(|written| {
                 written.blocks.iter().map(|block| block.range().clone()).find(|range| !others.contains(range))
             });
-            let after = moved.map(|range| selection::Selection { slide, things: vec![Thing::Block(range)] });
+            // What's selected went with it, its bytes as they were: the box, or what it holds.
+            let after = moved.map(|range| {
+                let things = selection
+                    .things
+                    .iter()
+                    .map(|thing| match thing {
+                        Thing::Block(inner) if source.start <= inner.start && inner.end <= source.end => {
+                            Thing::Block(inner.start - source.start + range.start..inner.end - source.start + range.start)
+                        }
+                        other => other.clone(),
+                    })
+                    .collect();
+                selection::Selection { slide, things }
+            });
             self.set_selection(after.clone());
             self.history.select_mark_last(SelectMark { before: Some(selection), after });
         }
