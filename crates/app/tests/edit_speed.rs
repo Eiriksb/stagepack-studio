@@ -5,8 +5,9 @@ use std::time::{Duration, Instant};
 
 use slides_engine::{Fonts, Rect};
 use slides_format::{FlowPlace, Pos, text_flows};
-use stagepack_studio::arrange::Placed;
+use stagepack_studio::arrange::{Placed, bounds};
 use stagepack_studio::document::{Document, Thing};
+use stagepack_studio::snap::snap_move;
 
 const SLIDES: usize = 500;
 const KEYSTROKES: usize = 200;
@@ -217,9 +218,9 @@ fn sixty_things() -> String {
     talk
 }
 
-/// Every thing on a slide of sixty dragged: each frame shows them all at their new place, and
-/// the slide's layers and its text's places are worked out again, as the window does before it
-/// draws.
+/// Every thing on a slide of sixty dragged: each frame snaps the box holding them all to sixty
+/// others, shows them all at their new place, and the slide's layers and its text's places are
+/// worked out again, as the window does before it draws.
 #[test]
 #[ignore = "timing; run in release"]
 fn a_frame_of_a_drag_on_a_slide_of_sixty_things_is_quick() {
@@ -235,14 +236,28 @@ fn a_frame_of_a_drag_on_a_slide_of_sixty_things_is_quick() {
     // The window's scale: a slide 1280 pixels wide.
     let scale = 1280. / 1920.;
     doc.editor_layers(scale);
+    // What's dragged snaps to the things it isn't: here, sixty more, as many lines as the sixty
+    // have. They're out of reach, as every line is looked at all the same: frames held on one
+    // line would show the same place, which isn't shown again, and time nothing.
+    let others: Vec<Rect> = starts.iter().map(|(_, placed)| Rect { x: placed.rect.x + 5000., y: placed.rect.y + 5000., ..bounds(placed) }).collect();
+    let within = 6. / scale;
     let mut times = Vec::new();
     for frame in 1..=200 {
         let by = frame as f32 * 1.5;
+        let start = Instant::now();
+        let covers: Vec<Rect> = starts.iter().map(|(_, placed)| bounds(&Placed { rect: Rect { x: placed.rect.x + by, y: placed.rect.y + by / 2., ..placed.rect }, rotate: placed.rotate })).collect();
+        let left = covers.iter().map(|rect| rect.x).fold(f32::INFINITY, f32::min);
+        let top = covers.iter().map(|rect| rect.y).fold(f32::INFINITY, f32::min);
+        let right = covers.iter().map(|rect| rect.x + rect.w).fold(f32::NEG_INFINITY, f32::max);
+        let bottom = covers.iter().map(|rect| rect.y + rect.h).fold(f32::NEG_INFINITY, f32::max);
+        let snapped = snap_move(Rect { x: left, y: top, w: right - left, h: bottom - top }, &others, within);
         let places: Vec<(Thing, Placed)> = starts
             .iter()
-            .map(|(thing, placed)| (thing.clone(), Placed { rect: Rect { x: placed.rect.x + by, y: placed.rect.y + by / 2., ..placed.rect }, rotate: placed.rotate }))
+            .map(|(thing, placed)| {
+                let rect = Rect { x: placed.rect.x + by + snapped.dx, y: placed.rect.y + by / 2. + snapped.dy, ..placed.rect };
+                (thing.clone(), Placed { rect, rotate: placed.rotate })
+            })
             .collect();
-        let start = Instant::now();
         doc.preview_places(&places);
         let layers = doc.editor_layers(scale);
         let layout = doc.text_layout(slide);

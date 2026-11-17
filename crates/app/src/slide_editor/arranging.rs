@@ -1,12 +1,14 @@
 //! Moving the things selected on the slide shown: dragging them with the mouse, and the arrow
 //! keys; and resizing and turning one by its handles. While they're dragged the slide shows them
 //! where the pointer has them, and nothing is written until the button is let go of; the
-//! geometry is [`crate::arrange`]'s.
+//! geometry is [`crate::arrange`]'s. A thing moved or resized snaps to the slide and to the
+//! things around it, as [`crate::snap`] has it, unless Alt is held; the arrow keys never snap.
 
 use super::*;
 use crate::arrange::{self, Handle, MOVE_STARTS, Placed};
 use crate::document::{DRAG_OUT_FIRST, EditRun, MOVE, NUDGE, RESIZE, TURN};
 use crate::history::RunId;
+use crate::snap::{self, Guide};
 
 /// Moves the things selected by `dx` across and `dy` down, in slide units.
 #[derive(Clone, PartialEq, Debug, Action)]
@@ -15,6 +17,9 @@ pub struct Nudge {
     pub dx: f32,
     pub dy: f32,
 }
+
+/// Where a drag has what it drags, each thing's place, and the lines it snapped to there.
+type Dragged = (Vec<(Thing, Placed)>, Vec<Guide>);
 
 /// How long the arrow keys can stop for and their moves still be one step to undo.
 const NUDGE_PAUSE: Duration = Duration::from_secs(1);
@@ -49,6 +54,12 @@ pub(super) struct Drag {
     /// pointer does, and whether the thing keeps its proportions as a corner is dragged.
     held_at: (f32, f32),
     keeps_shape: bool,
+    /// The boxes on the slide that what's dragged snaps to, in slide units: every thing with a
+    /// place of its own and every area with something in it, as they covered the slide when
+    /// pressed, but what's dragged.
+    others: Vec<Rect>,
+    /// The lines what's dragged snapped to where the pointer last had it.
+    guides: Vec<Guide>,
 }
 
 /// The handles on the one thing selected on the slide shown: what it is, where it is, whether
@@ -158,7 +169,36 @@ impl SlideEditor {
         });
         let grip = Grip::Move;
         let (held_at, keeps_shape) = (pressed_at, false);
-        self.drag = Some(Drag { slide: selection.slide, version, pick, things, from, pressed_at, begun: false, grip, held_at, keeps_shape });
+        let others = self.snap_targets(selection.slide, &things, cx);
+        let guides = Vec::new();
+        self.drag = Some(Drag { slide: selection.slide, version, pick, things, from, pressed_at, begun: false, grip, held_at, keeps_shape, others, guides });
+    }
+
+    /// The boxes on slide `slide` that `things` dragged snap to: the box each thing with a place
+    /// of its own covers, and each area with something in it, but those dragged. A thing in the
+    /// slide's text, as a picture in an area, isn't one: it goes with what it's in.
+    fn snap_targets(&self, slide: usize, things: &[(Thing, Placed)], cx: &mut Context<Self>) -> Vec<Rect> {
+        let Some(layout) = self.layout(slide, cx).filter(|_| !things.is_empty()) else {
+            return Vec::new();
+        };
+        let dragged = |thing: Thing| things.iter().any(|(dragged, _)| *dragged == thing);
+        let covers = |rect: Rect, rotate: f32| arrange::bounds(&Placed { rect, rotate });
+        let elements = layout
+            .elements()
+            .iter()
+            .filter(|element| element.placed && !dragged(Thing::Block(element.source.clone())))
+            .map(|element| covers(element.rect, element.rotate));
+        let areas = layout
+            .regions()
+            .iter()
+            .filter(|region| !region.empty && !dragged(Thing::Region(region.name.clone())))
+            .map(|region| covers(region.rect, region.rotate));
+        elements.chain(areas).collect()
+    }
+
+    /// The lines what's dragged snaps to where the pointer has it, while the button is down.
+    pub(super) fn guides(&self) -> &[Guide] {
+        self.drag.as_ref().map_or(&[], |drag| &drag.guides)
     }
 
     /// The handles on what's selected on the slide shown, if they show: with one thing or area
@@ -219,6 +259,8 @@ impl SlideEditor {
             return;
         };
         let (version, pick) = document.read_with(cx, |document, _| (document.text_version(), document.selection_pick()));
+        let things = vec![(handles.thing, handles.placed)];
+        let others = self.snap_targets(selection.slide, &things, cx);
         // The pointer has hold of the corner or side itself, and the turn handle where it's drawn.
         let held_at = match handle {
             Handle::Turn => handles.spots.iter().find(|(spot, _)| *spot == Handle::Turn).map_or(pressed_at, |(_, at)| *at),
@@ -229,13 +271,15 @@ impl SlideEditor {
             slide: selection.slide,
             version,
             pick,
-            things: vec![(handles.thing, handles.placed)],
+            things,
             from,
             pressed_at,
             begun: false,
             grip: Grip::Handle(handle),
             held_at,
             keeps_shape: handles.keeps_shape,
+            others,
+            guides: Vec::new(),
         });
     }
 
@@ -304,9 +348,12 @@ impl SlideEditor {
                 return;
             }
         }
-        let Some(places) = self.dragged_to(event.position, event.modifiers, cx) else {
+        let Some((places, guides)) = self.dragged_to(event.position, event.modifiers, cx) else {
             return;
         };
+        if let Some(drag) = &mut self.drag {
+            drag.guides = guides;
+        }
         if let Some(document) = &self.document {
             document.update(cx, |document, _| document.preview_places(&places));
         }
@@ -314,14 +361,17 @@ impl SlideEditor {
         cx.notify();
     }
 
-    /// Where what's dragged goes with the pointer at `position`, held with `modifiers`.
-    fn dragged_to(&self, position: Point<Pixels>, modifiers: Modifiers, cx: &App) -> Option<Vec<(Thing, Placed)>> {
+    /// Where what's dragged goes with the pointer at `position`, held with `modifiers`, and the
+    /// lines it snaps to there: within [`SNAP_PIXELS`] of the window, unless Alt is held.
+    fn dragged_to(&self, position: Point<Pixels>, modifiers: Modifiers, cx: &App) -> Option<Dragged> {
         let drag = self.drag.as_ref().filter(|drag| !drag.things.is_empty())?;
         let pointer = self.slide_units(position, cx)?;
+        let unit = self.canvas.read(cx).slide_bounds().map(|slide| f32::from(slide.size.width) / SLIDE_WIDTH);
+        let within = unit.filter(|unit| *unit > 0. && !modifiers.alt).map(|unit| SNAP_PIXELS / unit);
         Some(match drag.grip {
-            Grip::Move => moved_to(drag, pointer, modifiers),
-            Grip::Handle(Handle::Turn) => turned_to(drag, pointer, modifiers),
-            Grip::Handle(handle) => resized_to(drag, handle, pointer, modifiers),
+            Grip::Move => moved_to(drag, pointer, modifiers, within),
+            Grip::Handle(Handle::Turn) => (turned_to(drag, pointer, modifiers), Vec::new()),
+            Grip::Handle(handle) => resized_to(drag, handle, pointer, modifiers, within),
         })
     }
 
@@ -337,7 +387,7 @@ impl SlideEditor {
             return false;
         }
         let inside = Bounds { origin: Point::default(), size: window.viewport_size() }.contains(&event.position);
-        let places = (inside && self.drag_holds(cx)).then(|| self.dragged_to(event.position, event.modifiers, cx)).flatten();
+        let places = (inside && self.drag_holds(cx)).then(|| self.dragged_to(event.position, event.modifiers, cx)).flatten().map(|(places, _)| places);
         let label = match self.drag.take().map(|drag| drag.grip) {
             Some(Grip::Handle(Handle::Turn)) => TURN,
             Some(Grip::Handle(_)) => RESIZE,
@@ -432,26 +482,120 @@ impl SlideEditor {
     }
 }
 
-/// Where a move takes what's dragged with the pointer at `pointer` of the slide: as far as the
-/// pointer has gone since the press, kept to one direction with Shift, and on the slide.
-fn moved_to(drag: &Drag, pointer: (f32, f32), modifiers: Modifiers) -> Vec<(Thing, Placed)> {
-    let by = (pointer.0 - drag.pressed_at.0, pointer.1 - drag.pressed_at.1);
-    let by = if modifiers.shift { arrange::straight(by) } else { by };
+/// Where a move takes what's dragged with the pointer at `pointer` of the slide, and the lines
+/// it snaps to there: as far as the pointer has gone since the press, kept to one direction with
+/// Shift, then snapped, the box that holds all of it, within `within` slide units, if given, in
+/// the directions it can still go, and then kept on the slide, which a snap never undoes.
+fn moved_to(drag: &Drag, pointer: (f32, f32), modifiers: Modifiers, within: Option<f32>) -> Dragged {
+    let pointed = (pointer.0 - drag.pressed_at.0, pointer.1 - drag.pressed_at.1);
+    // Which ways it can go: kept straight, only the way the pointer goes further.
+    let (across, down) = match modifiers.shift {
+        true => (pointed.0.abs() >= pointed.1.abs(), pointed.0.abs() < pointed.1.abs()),
+        false => (true, true),
+    };
+    let mut by = if modifiers.shift { arrange::straight(pointed) } else { pointed };
     let starts: Vec<Placed> = drag.things.iter().map(|(_, placed)| *placed).collect();
-    let by = arrange::kept_move(&starts, by);
-    drag.things.iter().map(|(thing, placed)| (thing.clone(), arrange::moved(placed, by))).collect()
+    let mut guides = Vec::new();
+    if let Some((within, held)) = within.zip(holding(&starts, by)) {
+        let snapped = snap::snap_move(held, &drag.others, within);
+        if across {
+            by.0 += snapped.dx;
+        }
+        if down {
+            by.1 += snapped.dy;
+        }
+        guides = snapped.guides.into_iter().filter(|guide| if guide.vertical { across } else { down }).collect();
+    }
+    let kept = arrange::kept_move(&starts, by);
+    // Held back to keep it on the slide, it isn't on the line any more.
+    guides.retain(|guide| if guide.vertical { (kept.0 - by.0).abs() <= 0.001 } else { (kept.1 - by.1).abs() <= 0.001 });
+    (drag.things.iter().map(|(thing, placed)| (thing.clone(), arrange::moved(placed, kept))).collect(), guides)
 }
 
-/// Where `handle` dragged to `pointer` of the slide takes what's dragged: a corner keeps the
-/// shape of a thing that keeps its shape, and Shift does the opposite.
-/// It's shown as it'll be written, its sides and place to whole units.
-fn resized_to(drag: &Drag, handle: Handle, pointer: (f32, f32), modifiers: Modifiers) -> Vec<(Thing, Placed)> {
-    let to = held_to(drag, pointer);
+/// The box that holds all of `things`, as they cover the slide, moved by `by`.
+fn holding(things: &[Placed], by: (f32, f32)) -> Option<Rect> {
+    let covers = things.iter().map(|placed| arrange::bounds(&arrange::moved(placed, by)));
+    let (left, top, right, bottom) = covers.fold(None, |held: Option<(f32, f32, f32, f32)>, rect| {
+        let (left, top, right, bottom) = held.unwrap_or((rect.x, rect.y, rect.x + rect.w, rect.y + rect.h));
+        Some((left.min(rect.x), top.min(rect.y), right.max(rect.x + rect.w), bottom.max(rect.y + rect.h)))
+    })?;
+    Some(Rect { x: left, y: top, w: right - left, h: bottom - top })
+}
+
+/// Where `handle` dragged to `pointer` of the slide takes what's dragged, and the lines it snaps
+/// to there: a corner keeps the shape of a thing that keeps its shape, and Shift does the
+/// opposite. The sides the handle moves snap, within `within` slide units, if given, for a thing
+/// that isn't turned; where a corner keeps the shape, only the side that goes the furthest
+/// snaps, and the other follows it. Then the least and most it can be, and keeping it on the
+/// slide, which a snap never undoes. It's shown as it'll be written, its sides and place to
+/// whole units.
+fn resized_to(drag: &Drag, handle: Handle, pointer: (f32, f32), modifiers: Modifiers, within: Option<f32>) -> Dragged {
+    let mut to = held_to(drag, pointer);
     let keep_shape = drag.keeps_shape != modifiers.shift;
-    drag.things
+    let mut guides = Vec::new();
+    let snapping = match drag.things.as_slice() {
+        [(_, start)] if start.rotate == 0. => within.map(|within| (start, within)),
+        _ => None,
+    };
+    // Which way the handle is, across and down, from the corner or side across from it.
+    let mut ways = None;
+    if let Some((start, within)) = snapping {
+        // The corner or side across from the handle, which stays.
+        let held = arrange::handle_point(start, handle, 0.);
+        let Rect { x, y, w, h } = start.rect;
+        let anchor = (2. * x + w - held.0, 2. * y + h - held.1);
+        let (sideways, upright) = (!matches!(handle, Handle::Top | Handle::Bottom), !matches!(handle, Handle::Left | Handle::Right));
+        let snap_x = sideways.then(|| snap::snap_edge(to.0, true, &drag.others, within)).flatten();
+        let snap_y = upright.then(|| snap::snap_edge(to.1, false, &drag.others, within)).flatten();
+        let (way_x, way_y) = (if held.0 >= anchor.0 { 1. } else { -1. }, if held.1 >= anchor.1 { 1. } else { -1. });
+        if keep_shape && sideways && upright && w > 0. && h > 0. {
+            // The size goes as far as the pointer goes furthest, so that way snaps.
+            let (far_x, far_y) = ((to.0 - anchor.0) * way_x / w, (to.1 - anchor.1) * way_y / h);
+            if far_x >= far_y {
+                if let Some((shift, guide)) = snap_x {
+                    to.0 += shift;
+                    to.1 = anchor.1 + way_y * (to.0 - anchor.0) * way_x / w * h;
+                    guides.push(guide);
+                }
+            } else if let Some((shift, guide)) = snap_y {
+                to.1 += shift;
+                to.0 = anchor.0 + way_x * (to.1 - anchor.1) * way_y / h * w;
+                guides.push(guide);
+            }
+        } else {
+            for (shift, guide) in snap_x.into_iter().chain(snap_y) {
+                if guide.vertical {
+                    to.0 += shift;
+                } else {
+                    to.1 += shift;
+                }
+                guides.push(guide);
+            }
+        }
+        ways = Some((way_x, way_y));
+    }
+    let places: Vec<(Thing, Placed)> = drag
+        .things
         .iter()
         .map(|(thing, placed)| (thing.clone(), arrange::whole(placed, &arrange::resized(placed, handle, to, keep_shape), handle)))
-        .collect()
+        .collect();
+    // A guide stays only where the side it's for is on it as shown, to the whole unit it's
+    // written to, and runs the length of the thing too.
+    match (ways, places.first()) {
+        (Some((way_x, way_y)), Some((_, shown))) => {
+            let Rect { x, y, w, h } = shown.rect;
+            guides.retain_mut(|guide| {
+                let (side, start, length) = match guide.vertical {
+                    true => (if way_x > 0. { x + w } else { x }, y, h),
+                    false => (if way_y > 0. { y + h } else { y }, x, w),
+                };
+                (guide.from, guide.to) = (guide.from.min(start), guide.to.max(start + length));
+                (side - guide.at).abs() <= 0.51
+            });
+        }
+        _ => guides.clear(),
+    }
+    (places, guides)
 }
 
 /// Where the turn handle dragged to `pointer` of the slide turns what's dragged: in whole

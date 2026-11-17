@@ -33,6 +33,8 @@ impl Render for SlideEditor {
             Some((name, outline_corners(area.rect, area.rotate)))
         });
         let selecting = !outlines.is_empty() && !self.is_editing(cx);
+        // The lines what's dragged snaps to, while the button is down.
+        let guides = self.guides().to_vec();
         // The handles on the one thing selected, and what the pointer shows over them.
         let handles = self.handles(cx).map(|handles| (handles.spots, handles.rotate()));
         if handles.is_none() && !self.handle_drag() {
@@ -81,6 +83,17 @@ impl Render for SlideEditor {
                 let middle = slide.origin + point(px(x * unit), px(y * unit));
                 let bounds = Bounds { origin: middle - point(px(half), px(half)), size: size(px(HANDLE_SIZE), px(HANDLE_SIZE)) };
                 Some((SharedString::from(handle_id(handle)), in_editor(bounds, area)))
+            })
+            .collect();
+        // Where each guide is in the editor, for whoever looks for it: the first has an id of its own.
+        let guide_boxes: Vec<(SharedString, Bounds<Pixels>)> = guides
+            .iter()
+            .enumerate()
+            .filter_map(|(at, guide)| {
+                let (slide, area) = placed?;
+                let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
+                let id = if at == 0 { SNAP_GUIDE_ID.into() } else { snap_guide_id(at).into() };
+                (unit > 0.0).then(|| (id, in_editor(guide_bounds(guide, slide, unit), area)))
             })
             .collect();
         let frame_box = frame.as_ref().and_then(|(name, corners)| Some((SharedString::from(region_frame_id(name)), boxed(corners)?)));
@@ -147,6 +160,9 @@ impl Render for SlideEditor {
                     }
                     for corners in &outlines {
                         paint_outline(corners, slide, unit, outline_color, window);
+                    }
+                    for guide in &guides {
+                        window.paint_quad(fill(guide_bounds(guide, slide, unit), outline_color));
                     }
                     if let Some((x, y, w, h)) = new_box {
                         paint_dashed(&[(x, y), (x + w, y), (x + w, y + h), (x, y + h)], slide, unit, new_box_color, window);
@@ -321,7 +337,7 @@ impl Render for SlideEditor {
                         .h(bounds.size.height),
                 )
             })
-            .children(frame_box.into_iter().chain(outline_boxes).chain(handle_boxes).map(|(id, bounds)| {
+            .children(frame_box.into_iter().chain(outline_boxes).chain(handle_boxes).chain(guide_boxes).map(|(id, bounds)| {
                 div()
                     .id(id)
                     .test_support()

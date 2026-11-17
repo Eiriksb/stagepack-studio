@@ -44,7 +44,7 @@ mod typing;
 
 pub use arranging::Nudge;
 pub use keys::*;
-use marks::{caret_box, caret_corners, corners, corners_box, outline_corners, paint_dashed, paint_outline, paint_polygon, turned};
+use marks::{caret_box, caret_corners, corners, corners_box, guide_bounds, outline_corners, paint_dashed, paint_outline, paint_polygon, turned};
 
 pub const SLIDE_EDITOR_ID: &str = "slide-editor";
 pub const CARET_ID: &str = "caret";
@@ -76,6 +76,14 @@ pub fn handle_id(handle: Handle) -> String {
     format!("handle-{name}")
 }
 
+/// The guide line drawn while a thing dragged snaps to a line, or of several, the first.
+pub const SNAP_GUIDE_ID: &str = "snap-guide";
+
+/// The `n`th of several guide lines, but the first.
+pub fn snap_guide_id(n: usize) -> String {
+    format!("snap-guide-{n}")
+}
+
 /// The dashed frame around the area `name` of the slide's layout, while its text is typed.
 pub fn region_frame_id(name: &str) -> String {
     format!("region-frame-{name}")
@@ -105,6 +113,11 @@ const HANDLE_REACH: f32 = 6.0;
 const TURN_GAP: f32 = 24.0;
 /// How far apart, in the window's pixels, a thing's corner handles are at least drawn.
 const HANDLES_APART: f32 = 24.0;
+/// How near, in the window's pixels, a thing dragged snaps to a line of the slide or of
+/// another thing.
+pub const SNAP_PIXELS: f32 = 6.0;
+/// How wide a guide line is drawn, in the window's pixels.
+const GUIDE_WIDTH: f32 = 1.0;
 /// How big the text being composed is drawn, to the height of the caret.
 const COMPOSITION_TEXT: f32 = 0.7;
 

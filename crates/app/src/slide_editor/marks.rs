@@ -1,7 +1,8 @@
-//! Where the caret, the selection of text, the outlines of the things selected and the frame of
-//! the area typed in are drawn, and the drawing of them.
+//! Where the caret, the selection of text, the outlines of the things selected, the frame of
+//! the area typed in and the guides a thing dragged snaps to are drawn, and the drawing of them.
 
 use super::*;
+use crate::snap::Guide;
 pub(super) use crate::arrange::{corners, turned};
 
 /// What's drawn over the slide for the text being typed, in slide units.
@@ -128,6 +129,18 @@ pub(super) fn corners_box(corners: &[(f32, f32); 4], slide: Bounds<Pixels>, unit
         origin: slide.origin + point(px(left * unit), px(top * unit)),
         size: size(px((right - left) * unit), px((bottom - top) * unit)),
     }
+}
+
+/// Where `guide` is drawn in the window, on a slide drawn at `slide`, `unit` window pixels to a
+/// slide unit: [`GUIDE_WIDTH`] wide, and kept on the slide, as one along its edge.
+pub(super) fn guide_bounds(guide: &Guide, slide: Bounds<Pixels>, unit: f32) -> Bounds<Pixels> {
+    let (across, down) = (f32::from(slide.size.width), f32::from(slide.size.height));
+    let (side, length) = if guide.vertical { (across, down) } else { (down, across) };
+    let at = (guide.at * unit - GUIDE_WIDTH / 2.).min(side - GUIDE_WIDTH).max(0.);
+    let (from, to) = ((guide.from * unit).max(0.), (guide.to * unit).min(length));
+    let long = (to - from).max(0.);
+    let (origin, extent) = if guide.vertical { (point(px(at), px(from)), size(px(GUIDE_WIDTH), px(long))) } else { (point(px(from), px(at)), size(px(long), px(GUIDE_WIDTH))) };
+    Bounds { origin: slide.origin + origin, size: extent }
 }
 
 /// How long each dash of a new box's line is, and the gap after it, in the window's pixels.

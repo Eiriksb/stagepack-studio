@@ -20,6 +20,9 @@ const TALK: &str = "---\ntitle: T\n---\n\n# Shapes\n\nSome words here\n\n\
 const RECT: &str = "<Shape kind=\"rect\"";
 const ELLIPSE: &str = "<Shape kind=\"ellipse\"";
 const RECT_SIZE: &str = "x=\"1300\" y=\"300\" w=\"200\" h=\"200\"";
+/// Held while dragging where a test is about what a resize writes, not about snapping: the
+/// things here have lines within a snap of where some drags end.
+const NO_SNAP: Modifiers = Modifiers { alt: true, shift: false, control: false, platform: false, function: false };
 
 fn selection(typing: &Typing, cx: &TestAppContext) -> Option<Selection> {
     typing.document(cx).read_with(cx, |document, _| document.selection().cloned())
@@ -131,7 +134,7 @@ fn dragging_a_corner_resizes_and_writes_what_changed(cx: &mut TestAppContext) {
     let (top, corner) = (handle_at(&typing, cx, Handle::Top).expect("top"), handle_at(&typing, cx, Handle::Turn).expect("turn"));
     assert!((top.y - corner.y - px(24.)).abs() <= px(0.5) && (top.x - corner.x).abs() <= px(0.5), "the turn handle is 24 pixels above");
     let by = point(px(40.), px(20.));
-    drag_handle(&typing, cx, Handle::BottomRight, by, Modifiers::default());
+    drag_handle(&typing, cx, Handle::BottomRight, by, NO_SNAP);
     let (dx, dy) = (units(&typing, cx, 40.), units(&typing, cx, 20.));
     let place = format!("x=\"1300\" y=\"300\" w=\"{}\" h=\"{}\"", written(200., dx), written(200., dy));
     assert_eq!(typing.source(cx), TALK.replacen(RECT_SIZE, &place, 1));
@@ -139,7 +142,7 @@ fn dragging_a_corner_resizes_and_writes_what_changed(cx: &mut TestAppContext) {
     assert!(!placing(&typing, cx));
     // An edge writes only its own side; the left one moves the left too.
     undo(&typing, cx);
-    drag_handle(&typing, cx, Handle::Left, point(px(-30.), px(15.)), Modifiers::default());
+    drag_handle(&typing, cx, Handle::Left, point(px(-30.), px(15.)), NO_SNAP);
     let dx = units(&typing, cx, 30.);
     let place = format!("x=\"{}\" y=\"300\" w=\"{}\" h=\"200\"", written(1300., -dx), written(200., dx));
     assert_eq!(typing.source(cx), TALK.replacen(RECT_SIZE, &place, 1));

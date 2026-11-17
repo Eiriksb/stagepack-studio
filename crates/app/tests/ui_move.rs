@@ -20,6 +20,9 @@ const RECT: &str = "<Shape kind=\"rect\"";
 const ELLIPSE: &str = "<Shape kind=\"ellipse\"";
 const RECT_PLACE: &str = "x=\"1300\" y=\"300\"";
 const DRAG_OUT_FIRST: &str = "Drag it out of the text first.";
+/// Held while dragging where a test is about what a drag writes or shows, not about snapping:
+/// the things and areas here have lines within a snap of where some drags end.
+const NO_SNAP: Modifiers = Modifiers { alt: true, shift: false, control: false, platform: false, function: false };
 
 fn selection(typing: &Typing, cx: &TestAppContext) -> Option<Selection> {
     typing.document(cx).read_with(cx, |document, _| document.selection().cloned())
@@ -103,7 +106,7 @@ fn a_drag_moves_a_shape_and_writes_only_x_and_y(cx: &mut TestAppContext) {
     let typing = open(cx, TALK);
     let from = middle_of(&typing, cx, RECT);
     let to = from + point(px(90.), px(40.));
-    typing.drag(cx, from, to);
+    drag_through(&typing, cx, from, &[to], NO_SNAP);
     let (dx, dy) = on_slide(&typing, cx, from, to);
     let place = format!("x=\"{}\" y=\"{}\"", written(1300., dx), written(300., dy));
     assert_eq!(typing.source(cx), TALK.replacen(RECT_PLACE, &place, 1));
@@ -132,7 +135,7 @@ fn a_drag_of_two_things_moves_both_by_the_same_amount(cx: &mut TestAppContext) {
     click_thing(&typing, cx, ELLIPSE, Modifiers::shift());
     let from = middle_of(&typing, cx, RECT);
     let to = from + point(px(60.), px(25.));
-    drag_through(&typing, cx, from, &[from + point(px(20.), px(5.)), to], Modifiers::default());
+    drag_through(&typing, cx, from, &[from + point(px(20.), px(5.)), to], NO_SNAP);
     let (dx, dy) = on_slide(&typing, cx, from, to);
     let expected = TALK
         .replacen(RECT_PLACE, &format!("x=\"{}\" y=\"{}\"", written(1300., dx), written(300., dy)), 1)
@@ -175,13 +178,13 @@ fn shift_keeps_the_move_straight(cx: &mut TestAppContext) {
     let typing = open(cx, TALK);
     let from = middle_of(&typing, cx, RECT);
     let through = [from + point(px(20.), px(8.)), from + point(px(100.), px(30.))];
-    drag_through(&typing, cx, from, &through, Modifiers::shift());
+    drag_through(&typing, cx, from, &through, Modifiers { shift: true, ..NO_SNAP });
     let (dx, _) = on_slide(&typing, cx, from, through[1]);
     assert_eq!(typing.source(cx), TALK.replacen(RECT_PLACE, &format!("x=\"{}\" y=\"300\"", written(1300., dx)), 1));
     // Up and down more than across, it goes up or down.
     let typing = open(cx, TALK);
     let through = [from + point(px(10.), px(-90.))];
-    drag_through(&typing, cx, from, &through, Modifiers::shift());
+    drag_through(&typing, cx, from, &through, Modifiers { shift: true, ..NO_SNAP });
     let (_, dy) = on_slide(&typing, cx, from, through[0]);
     assert_eq!(typing.source(cx), TALK.replacen(RECT_PLACE, &format!("x=\"1300\" y=\"{}\"", written(300., dy)), 1));
 }
@@ -195,7 +198,7 @@ fn the_slide_shows_the_thing_under_the_pointer_while_dragging(cx: &mut TestAppCo
     typing.mouse_down(cx, from, 1, Modifiers::default());
     for step in 1..=4 {
         let to = from + point(px(25. * step as f32), px(10. * step as f32));
-        typing.move_held(cx, to, Modifiers::default());
+        typing.move_held(cx, to, NO_SNAP);
         let now = outline(&typing, cx).expect("an outline");
         let moved = now.origin - before.origin;
         assert!((moved.x - px(25. * step as f32)).abs() <= px(1.) && (moved.y - px(10. * step as f32)).abs() <= px(1.), "step {step}: {moved:?}");
@@ -206,7 +209,7 @@ fn the_slide_shows_the_thing_under_the_pointer_while_dragging(cx: &mut TestAppCo
         assert!(shown.x > 1300., "the slide shows it moved: {shown:?}");
     }
     let to = from + point(px(100.), px(40.));
-    typing.mouse_up(cx, to, 1, Modifiers::default());
+    typing.mouse_up(cx, to, 1, NO_SNAP);
     assert_ne!(typing.source(cx), TALK);
     assert!(!placing(&typing, cx));
 }
@@ -551,7 +554,7 @@ fn a_turned_thing_is_moved_without_writing_its_turn(cx: &mut TestAppContext) {
     let typing = open(cx, &talk);
     let from = middle_of(&typing, cx, RECT);
     let to = from + point(px(60.), px(30.));
-    typing.drag(cx, from, to);
+    drag_through(&typing, cx, from, &[to], NO_SNAP);
     let (dx, dy) = on_slide(&typing, cx, from, to);
     let place = format!("x=\"{}\" y=\"{}\"", written(1300., dx), written(300., dy));
     assert_eq!(typing.source(cx), talk.replacen(RECT_PLACE, &place, 1));
@@ -563,7 +566,7 @@ fn a_move_straight_down_keeps_a_hand_written_left(cx: &mut TestAppContext) {
     let typing = open(cx, &talk);
     let from = middle_of(&typing, cx, RECT);
     let to = from + point(px(0.), px(50.));
-    typing.drag(cx, from, to);
+    drag_through(&typing, cx, from, &[to], NO_SNAP);
     let (_, dy) = on_slide(&typing, cx, from, to);
     assert_eq!(typing.source(cx), talk.replacen("y=\"300\"", &format!("y=\"{}\"", written(300., dy)), 1), "x's bytes stay");
 }
@@ -576,7 +579,7 @@ fn a_thing_with_a_left_but_no_top_gains_one(cx: &mut TestAppContext) {
     assert!(rect.placed, "a left alone places it");
     let from = middle(&typing, cx, &rect);
     let to = from + point(px(40.), px(40.));
-    typing.drag(cx, from, to);
+    drag_through(&typing, cx, from, &[to], NO_SNAP);
     let (dx, dy) = on_slide(&typing, cx, from, to);
     let written_now = typing.source(cx);
     let tag = &written_now[thing(&typing, cx, RECT).source];
