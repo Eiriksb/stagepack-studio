@@ -74,6 +74,9 @@ impl From<String> for SaveError {
     }
 }
 
+/// What a save says when the pack it saved in place in couldn't be opened again afterwards.
+pub const NOT_READ_BACK: &str = "The talk was saved, but couldn't be read back. Close it and open it again to be sure of it.";
+
 /// The talk's files, as a job hands them over from its own thread.
 pub(crate) type SharedFiles = Arc<dyn TalkFiles + Send + Sync>;
 
@@ -90,6 +93,9 @@ pub struct Saved {
     pub(crate) builds_written: Vec<BuildEntry>,
     /// The pack the talk was saved in place in, opened again, to read the talk from now on.
     pub(crate) reopened: Option<SharedFiles>,
+    /// The build index written into the pack the talk was saved in place in, when the pack
+    /// couldn't be opened again: what the pack's index is now, for the next save to start from.
+    pub(crate) index_kept_in_pack: Option<Vec<u8>>,
     notices: Vec<String>,
 }
 
@@ -133,6 +139,16 @@ impl SaveJob {
     /// in words for the person saving, and leaves what was there as it was: a folder may have
     /// some of those files in it, which nothing uses until a save writes its text.
     pub fn run(self) -> Result<Saved, SaveError> {
+        self.run_reading_back_with(|file| in_pack(file.to_path_buf()).map(|(_, files)| files))
+    }
+
+    /// [`Self::run`], opening the pack saved in place in again with `read_back`, as a test can
+    /// make fail.
+    #[doc(hidden)]
+    pub fn run_reading_back_with(
+        self,
+        read_back: impl FnOnce(&Path) -> Result<Arc<dyn TalkFiles + Send + Sync>, String>,
+    ) -> Result<Saved, SaveError> {
         let SaveJob {
             text,
             on_disk,
@@ -144,6 +160,7 @@ impl SaveJob {
         } = self;
         let mut builds_written = Vec::new();
         let mut reopened = None;
+        let mut index_kept_in_pack = None;
         let files_written: Vec<String> = added.iter().map(|(path, _)| path.clone()).collect();
         let index_kept = |place: &Path| failed(&place.join(INDEX_FILE), "it can't be read, so a pasted component needs building.");
         // The merged index goes with the files, in place of the talk's own.
@@ -189,10 +206,19 @@ impl SaveJob {
                 repack_with_slides(file, file, &text, APP_VERSION, &extra()).map_err(|e| failed(file, e))?;
                 // The talk is read from the pack as it's written from now on, so what it holds,
                 // files and entries, is the talk's, as after a save in a folder.
+                // If it can't be read back, the save has still been made: that's said, the talk
+                // goes on being read as it was, and the next save starts from the index written.
+                let mut notices: Vec<String> = index_notice(file).into_iter().collect();
                 if index_written || !files_written.is_empty() {
-                    reopened = Some(in_pack(file.clone())?.1);
+                    match read_back(file) {
+                        Ok(files) => reopened = Some(files),
+                        Err(_) => {
+                            notices.push(NOT_READ_BACK.to_string());
+                            index_kept_in_pack = index.clone().filter(|_| index_written);
+                        }
+                    }
                 }
-                (None, index_notice(file).into_iter().collect())
+                (None, notices)
             }
             (TalkPlace::Folder(folder), Some(SaveTarget::Folder(to))) => {
                 let report = copy_talk_folder(folder, &to, &text, &extra()).map_err(|e| failed(&to, e))?;
@@ -239,6 +265,7 @@ impl SaveJob {
             files_written,
             builds_written,
             reopened,
+            index_kept_in_pack,
             notices,
         })
     }

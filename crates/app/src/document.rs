@@ -420,6 +420,9 @@ pub struct Document {
     editing: Option<EditingText>,
     /// A colour chosen for the selection of the text being typed, not yet given to it.
     held_color: Option<HeldColor>,
+    /// The build index the last save wrote into the pack the talk is kept in, when the pack
+    /// couldn't be opened again after it: what the next save's index starts from.
+    index_kept_in_pack: Option<Vec<u8>>,
     /// The thing picked on a slide, if any: the editor's view of the talk, not part of it.
     selected: Option<Selected>,
     /// Counts the times a thing was picked or let go of, rather than followed through an edit.
@@ -531,6 +534,7 @@ impl Document {
             typing_notes: None,
             editing: None,
             held_color: None,
+            index_kept_in_pack: None,
             selected: None,
             picks: 0,
             next_session: 0,
@@ -3175,8 +3179,10 @@ impl Document {
     fn index_for_save(&self) -> (Vec<BuildEntry>, Option<Vec<u8>>) {
         let writing: BTreeSet<String> = self.added_files().into_iter().map(|(path, _)| path).collect();
         let own = &*self.own_files;
-        let index = match own.len(INDEX_FILE) {
-            None if own.read(INDEX_FILE).is_none() => Some(BuildIndex { format: 1, components: Vec::new() }),
+        let index = match (&self.index_kept_in_pack, own.len(INDEX_FILE)) {
+            // What the last save wrote into a pack it couldn't read back: the pack's index now.
+            (Some(kept), _) => serde_json::from_slice::<BuildIndex>(kept).ok(),
+            (None, None) if own.read(INDEX_FILE).is_none() => Some(BuildIndex { format: 1, components: Vec::new() }),
             _ => added_files::build_index(own),
         };
         let builds: Vec<BuildEntry> = self
@@ -3205,6 +3211,14 @@ impl Document {
         }
         // In the index where the talk is kept now, which is read as it is from here on.
         self.added.forget_builds(&saved.builds_written);
+        // What the talk is read from now gives its index, unless the pack saved in was not read
+        // back, when the next save starts from what was written in it.
+        if saved.reopened.is_some() || saved.moved_to.is_some() {
+            self.index_kept_in_pack = None;
+        }
+        if let Some(index) = saved.index_kept_in_pack {
+            self.index_kept_in_pack = Some(index);
+        }
         if let Some(files) = saved.reopened {
             self.own_files = files.clone();
             self.files = Arc::new(WithAdded::new(files, self.added.clone()));

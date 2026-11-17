@@ -1273,13 +1273,54 @@ fn saves_only_add_entries(packed: bool, steps: &[Step]) -> Result<(), proptest::
 fn any_run_of_pastes_deletes_undos_and_saves_only_ever_adds_index_entries() {
     use proptest::prelude::*;
     use proptest::test_runner::{Config, TestRunner};
-    // The run that once lost an entry, then others.
-    let known = [Step::Paste(0), Step::Save, Step::Delete(0), Step::Paste(1), Step::Save];
+    // The run that once lost an entry, and runs with an undo or a redo across a save, then others.
+    let known: [&[Step]; 3] = [
+        &[Step::Paste(0), Step::Save, Step::Delete(0), Step::Paste(1), Step::Save],
+        &[Step::Paste(0), Step::Delete(0), Step::Save, Step::Undo, Step::Save],
+        &[Step::Paste(0), Step::Save, Step::Undo, Step::Save, Step::Redo, Step::Save],
+    ];
     for packed in [false, true] {
-        saves_only_add_entries(packed, &known).unwrap_or_else(|failure| panic!("packed {packed}: {failure}"));
+        for steps in known {
+            saves_only_add_entries(packed, steps).unwrap_or_else(|failure| panic!("packed {packed}: {failure}"));
+        }
         let mut runner = TestRunner::new(Config { cases: 4, ..Config::default() });
         runner
             .run(&prop::collection::vec(step(), 1..8), |steps| saves_only_add_entries(packed, &steps))
             .unwrap_or_else(|failure| panic!("packed {packed}: {failure}"));
+    }
+}
+
+#[test]
+fn a_pack_saved_but_not_read_back_is_saved_and_keeps_its_entries() {
+    // From review: once the pack was written, a failure to open it again failed the save, and
+    // a later save started from the index before it and lost an entry.
+    let (_dir, file, mut talk) = into_talk(true);
+    for name in ["Alpha", "Beta"] {
+        let (markdown, files) = component_named(name);
+        talk.paste_element(&markdown, files).unwrap();
+    }
+    let saved = talk
+        .save_job()
+        .run_reading_back_with(|_| Err("it couldn't be read".to_string()))
+        .unwrap_or_else(|error| panic!("the save was made: {error}"));
+    assert_eq!(saved.notices(), [stagepack_studio::saving::NOT_READ_BACK]);
+    talk.saved(saved);
+    assert!(!talk.has_unsaved_changes(), "it's saved");
+    for name in ["Alpha", "Beta"] {
+        assert_eq!(state_in(&talk, name), Some(ComponentState::UpToDate), "{name} as it was");
+    }
+    // Beta is taken off the slide, Gamma pasted, and the talk saved again, read back this time:
+    // the index written is the one in the pack with Gamma's entry added.
+    let start = talk.source().find("<Beta").unwrap();
+    let end = start + talk.source()[start..].find("/>").unwrap() + 2;
+    assert!(talk.select(0, start..end));
+    talk.delete_selected().unwrap();
+    let (markdown, files) = component_named("Gamma");
+    talk.paste_element(&markdown, files).unwrap();
+    assert!(save_document(&mut talk, None).is_empty());
+    let fresh = reopen(&file);
+    assert_eq!(fresh.source(), talk.source());
+    for name in ["Alpha", "Beta", "Gamma"] {
+        assert_eq!(state_in(&fresh, name), Some(ComponentState::UpToDate), "{name}'s entry is kept");
     }
 }
