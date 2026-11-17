@@ -28,6 +28,11 @@ const MAX_PIXELS: u64 = 64_000_000;
 /// and that sum has to fit in an `i32`.
 const MAX_OFFSET: f32 = 1_000_000_000.0;
 
+/// A device pixel position, held to where a layer can sit.
+pub(crate) fn device_offset(at: f32) -> i32 {
+    at.clamp(-MAX_OFFSET, MAX_OFFSET) as i32
+}
+
 /// `(left, top, right, bottom)` of the box around the rect and everything drawn, before
 /// rotation, with the rect's top-left corner as the origin.
 fn extent(spec: &LayerSpec) -> (f32, f32, f32, f32) {
@@ -128,8 +133,8 @@ pub fn render_layer(spec: &LayerSpec, scale: f32, fonts: &mut Fonts) -> Layer {
     }
     Layer {
         pixmap: Arc::new(pixmap),
-        x: min_x.clamp(-MAX_OFFSET, MAX_OFFSET) as i32,
-        y: min_y.clamp(-MAX_OFFSET, MAX_OFFSET) as i32,
+        x: device_offset(min_x),
+        y: device_offset(min_y),
     }
 }
 

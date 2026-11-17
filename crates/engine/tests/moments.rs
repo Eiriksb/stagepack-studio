@@ -273,3 +273,10 @@ fn timings_at_a_moment_match_its_layers() {
     assert_eq!(clicks(&later).last(), Some(&Some(3)), "a piece more, and a click more for the last");
     assert_eq!(clicks(&start), clicks(&d.timeline(0).layers), "the start is the timeline's");
 }
+
+#[test]
+fn fixed_steps_counts_a_component_that_steps() {
+    assert_eq!(deck("<Count />\n").fixed_steps(0), 3);
+    assert_eq!(deck("---\nregion.body: click=each\n---\n\n# T\n\n- one\n- two\n\n<Count x=\"0\" y=\"0\" w=\"99\" h=\"99\" />\n").fixed_steps(0), 3);
+    assert_eq!(deck("<Rows />\n").fixed_steps(0), 0);
+}

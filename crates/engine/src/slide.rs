@@ -179,13 +179,13 @@ pub(crate) fn layout_slide_placed(talk: &Talk, index: usize, env: &mut LayoutEnv
     let contents = assign_blocks(slide, layout, &mut notices);
 
     for (region, blocks) in layout.regions.iter().zip(&contents) {
-        let (rect, rotate) = placement(slide, region);
+        let (rect, rotate, moved) = placement(slide, region);
         let (rect, rotate) = region_placing(placing, region.name).map_or((rect, rotate), |placing| placed_at(rect, rotate, placing));
         regions.push(RegionBox {
             name: region.name.to_string(),
             rect,
             rotate,
-            moved: region_moved(slide, region),
+            moved,
             empty: blocks.is_empty(),
             is_list: blocks.len() > 1 || blocks.iter().any(|block| matches!(block, Block::List { .. })),
         });
@@ -540,10 +540,11 @@ fn region_line<'a>(slide: &'a Slide, region: &RegionDef) -> &'a str {
 
 /// Where a region sits on this slide: the layout's place, changed by any `region.<name>`
 /// settings line. A value that isn't a finite number is ignored, and the rest are held
-/// within the limits above.
-fn placement(slide: &Slide, region: &RegionDef) -> (Rect, f32) {
+/// within the limits above. Whether the line places or turns it, with a word read for that.
+fn placement(slide: &Slide, region: &RegionDef) -> (Rect, f32, bool) {
     let mut rect = region.rect;
     let mut rotate = 0.0;
+    let mut moved = false;
     let line = region_line(slide, region);
     for pair in line.split_whitespace() {
         let Some((name, value)) = pair.split_once('=') else {
@@ -559,20 +560,11 @@ fn placement(slide: &Slide, region: &RegionDef) -> (Rect, f32) {
             "h" => rect.h = value.clamp(0.0, MAX_SIZE),
             "rotate" => rotate = value.clamp(-MAX_ROTATION, MAX_ROTATION),
             // `click` says when a region appears, not where it sits.
-            _ => {}
+            _ => continue,
         }
+        moved = true;
     }
-    (rect, rotate)
-}
-
-/// Whether the slide's `region.<name>` settings line places or turns a region: whether it has
-/// a word for its place or turn that the engine reads.
-fn region_moved(slide: &Slide, region: &RegionDef) -> bool {
-    region_line(slide, region).split_whitespace().any(|pair| {
-        pair.split_once('=').is_some_and(|(name, value)| {
-            ["x", "y", "w", "h", "rotate"].contains(&name) && value.parse::<f32>().is_ok_and(f32::is_finite)
-        })
-    })
+    (rect, rotate, moved)
 }
 
 fn background(theme: &Theme) -> LayerSpec {
@@ -619,7 +611,8 @@ mod region_words {
             let value = |name: &str| region_value(slide, "body", name);
             let number = |name: &str, default: f32| value(name).map_or(default, |value| value.parse::<f32>().expect("a number"));
 
-            let (rect, rotate) = placement(slide, region);
+            let (rect, rotate, moved) = placement(slide, region);
+            prop_assert_eq!(moved, ["x", "y", "w", "h", "rotate"].iter().any(|name| value(name).is_some()));
             prop_assert_eq!(rect.x, number("x", region.rect.x));
             prop_assert_eq!(rect.y, number("y", region.rect.y));
             prop_assert_eq!(rect.w, number("w", region.rect.w));

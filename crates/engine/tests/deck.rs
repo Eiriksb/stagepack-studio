@@ -885,3 +885,77 @@ proptest! {
         d.editor_layers(0, 0.1);
     }
 }
+
+#[test]
+fn a_one_at_a_time_area_only_moved_is_laid_out_as_written() {
+    let talk = |line: &str| format!("---\nregion.body: {line}\n---\n\n# Title\n\n- one\n- two\n- three\n");
+    let mut d = deck(&talk("click=each"));
+    let region = d.text_layout(0).region("body").unwrap().rect;
+    d.set_placing(0, vec![place(slides_format::Target::Region("body".into()), region.x + 60.0, region.y + 40.0, region.w, region.h)]);
+    let placed = d.text_layout(0);
+    let mut fresh = deck(&talk(&format!("click=each x={} y={}", region.x + 60.0, region.y + 40.0)));
+    let written = fresh.text_layout(0);
+    assert_eq!(placed.regions().iter().map(|region| region.rect).collect::<Vec<_>>(), written.regions().iter().map(|region| region.rect).collect::<Vec<_>>());
+    assert_eq!(placed.paras(), written.paras());
+    assert_eq!(placed.elements(), written.elements());
+    for y in (0..1080).step_by(8) {
+        for x in (0..1920).step_by(16) {
+            let point = (x as f32, y as f32);
+            assert_eq!(placed.hit(point.0, point.1), written.hit(point.0, point.1), "{point:?}");
+        }
+    }
+}
+
+#[test]
+fn many_small_moves_end_where_one_large_move_ends() {
+    let target = |d: &Deck| slides_format::Target::Tag(top_block(d, "<Box x=\"100\""));
+    // Nothing drawn at this scale before the placing, so every picture shown is one drawn with it.
+    let mut small = deck(PLACED_TALK);
+    let red = top_block(&small, "<Box x=\"100\"");
+    let layer = layer_of(&mut small, &red);
+    for step in 0..=20 {
+        small.set_placing(0, vec![place(target(&small), 100.0 + 0.45 * step as f32, 600.0 + 0.45 * step as f32, 300.0, 200.0)]);
+        small.layers(0, SCALE);
+    }
+    let mut large = deck(PLACED_TALK);
+    large.set_placing(0, vec![place(target(&large), 100.0, 600.0, 300.0, 200.0)]);
+    large.layers(0, SCALE);
+    large.set_placing(0, vec![place(target(&large), 109.0, 609.0, 300.0, 200.0)]);
+    let (small, large) = (small.layers(0, SCALE), large.layers(0, SCALE));
+    assert_eq!((small[layer].x, small[layer].y), (large[layer].x, large[layer].y));
+
+    // A thing made bigger and then only moved under one drag is shown from where it was drawn.
+    let mut d = deck(PLACED_TALK);
+    d.set_placing(0, vec![place(target(&d), 100.0, 600.0, 320.0, 200.0)]);
+    let drawn = d.layers(0, SCALE)[layer].clone();
+    for step in 1..=20 {
+        d.set_placing(0, vec![place(target(&d), 100.0 + 0.45 * step as f32, 600.0, 320.0, 200.0)]);
+        d.layers(0, SCALE);
+    }
+    let moved = d.layers(0, SCALE)[layer].clone();
+    assert!(Arc::ptr_eq(&drawn.pixmap, &moved.pixmap));
+    assert_eq!(moved.x, drawn.x + (9.0 * SCALE).round() as i32);
+}
+
+#[test]
+fn a_placing_on_one_slide_leaves_the_others_alone() {
+    let mut d = deck(PLACED_TALK);
+    let mut fresh = deck(PLACED_TALK);
+    let red = top_block(&d, "<Box x=\"100\"");
+    d.set_placing(0, vec![place(slides_format::Target::Tag(red), 500.0, 300.0, 300.0, 200.0)]);
+    let rects = |d: &mut Deck| d.specs(1).iter().map(|spec| spec.rect).collect::<Vec<_>>();
+    assert_eq!(rects(&mut d), rects(&mut fresh));
+    assert!(same_pixels(&d.editor_layers(1, SCALE), &fresh.editor_layers(1, SCALE)));
+    assert_eq!(*d.text_layout(1), *fresh.text_layout(1));
+    assert_eq!(d.placing().map(|(slide, _)| slide), Some(0), "asking for another slide keeps it");
+}
+
+#[test]
+fn a_thumbnail_first_drawn_under_a_placing_shows_the_source() {
+    let mut d = deck(PLACED_TALK);
+    let red = top_block(&d, "<Box x=\"100\"");
+    d.set_placing(0, vec![place(slides_format::Target::Tag(red), 500.0, 300.0, 300.0, 200.0)]);
+    d.layers(0, SCALE);
+    let thumbnail = d.thumbnail(0, 320).unwrap();
+    assert_eq!(thumbnail.data(), deck(PLACED_TALK).thumbnail(0, 320).unwrap().data());
+}
