@@ -108,6 +108,15 @@ fn code_lines(source: &str) -> Option<Vec<bool>> {
 }
 
 #[test]
+fn a_fence_opened_as_far_in_as_a_nested_or_wide_item_allows_ends_with_it() {
+    // An item whose words start four columns in opens its fence there; a rule at the left edge
+    // ends the item, and the fence with it.
+    for source in ["- a\n  - b\n\n    ```\n---\nb", "10. a\n\n    ```\n    x\n---\nb"] {
+        assert_eq!(split_slides(source).len(), 2, "{source:?}");
+    }
+}
+
+#[test]
 fn a_fence_in_a_list_item_closes_as_far_in_as_the_item_allows() {
     for source in ["- a\n\n  ```\n  x\n    ```\n---\nb", "1. a\n   ```\n   x\n     ```\n---\nb", "- a\n  ```\n  x\n\t```\n---\nb"] {
         assert_eq!(split_slides(source).len(), 2, "{source:?}");
