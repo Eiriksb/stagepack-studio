@@ -67,8 +67,10 @@ pub const TOO_LARGE: &str = "That's too much to paste at once, so nothing was pa
 pub const NO_SLIDE: &str = "There's no slide on the clipboard to paste.";
 /// What the window says when a slide is too big to copy.
 pub const SLIDE_TOO_BIG: &str = "This slide is too big to copy, so it wasn't copied.";
-/// What the window says once a pasted slide shows a picture or a component the talk lacks.
+/// What the window says once a pasted slide shows a picture the talk lacks.
 pub const MISSING_PICTURES: &str = "Some pictures on the pasted slide aren't in this talk.";
+/// What the window says once a pasted slide shows both a picture and a component the talk lacks.
+pub const MISSING_BOTH: &str = "Some pictures and components on the pasted slide aren't in this talk.";
 
 /// What the window says when the files a copied thing or slide uses were too big to go with it.
 pub const FILES_TOO_LARGE: &str = "The pictures were too large to copy with it.";
@@ -100,14 +102,18 @@ pub fn missing_components(notices: &[String]) -> Vec<&str> {
     notices.iter().filter_map(|notice| notice.strip_prefix(COMPONENT_NOTICE)).map(str::trim).collect()
 }
 
-/// Whether `notices`, a slide's, say it shows a picture or a component the talk lacks: a
-/// component it doesn't have, or a picture it can't show whose file isn't there, as `has_file`
-/// says. A picture whose file is there, but can't be read as one, or is too big, isn't missing.
-pub fn shows_something_missing(notices: &[String], has_file: impl Fn(&str) -> bool) -> bool {
-    notices.iter().any(|notice| {
-        notice.starts_with(COMPONENT_NOTICE)
-            || notice.strip_prefix(PICTURE_NOTICE).is_some_and(|path| !has_file(path))
-    })
+/// What to say of what `notices`, a slide's, say it shows that the talk lacks, if anything: a
+/// picture it can't show whose file isn't there, as `has_file` says, a component it doesn't have,
+/// or both. A picture whose file is there, but can't be read as one, or is too big, isn't missing.
+pub fn said_of_missing(notices: &[String], has_file: impl Fn(&str) -> bool) -> Option<&'static str> {
+    let component = notices.iter().any(|notice| notice.starts_with(COMPONENT_NOTICE));
+    let picture = notices.iter().any(|notice| notice.strip_prefix(PICTURE_NOTICE).is_some_and(|path| !has_file(path)));
+    match (picture, component) {
+        (true, true) => Some(MISSING_BOTH),
+        (true, false) => Some(MISSING_PICTURES),
+        (false, true) => Some(MISSING_COMPONENT),
+        (false, false) => None,
+    }
 }
 
 /// Which clipboard command.

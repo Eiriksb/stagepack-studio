@@ -399,9 +399,9 @@ impl WorkspaceView {
         let notices = document.update(cx, |document, _| document.notices());
         let missing = {
             let document = document.read(cx);
-            clipboard::shows_something_missing(&notices, |path| document.has_file(path))
+            clipboard::said_of_missing(&notices, |path| document.has_file(path))
         };
-        let said = brought.said().or_else(|| missing.then(|| clipboard::MISSING_PICTURES.to_string()));
+        let said = brought.said().or_else(|| missing.map(str::to_string));
         if let Some(said) = said {
             cx.spawn(async move |this, cx| {
                 this.update(cx, |this, cx| this.say(said, cx)).ok();

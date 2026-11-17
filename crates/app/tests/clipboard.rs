@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use slides_engine::{Fonts, Pixmap};
 use slides_format::{MAX_LEVEL, MAX_SLIDE_BYTES, Para, ParaKind, Pos, Span, Style, TextFlow, is_hidden, parse_talk, storable, text_flows};
 use stagepack_studio::clipboard::{
-    self, APP_KEY, AppData, Carried, CopiedFile, MAX_BYTES, MAX_CLIPBOARD_FILES_BYTES, MAX_PARAS, MAX_SPANS, MISSING_PICTURES,
+    self, APP_KEY, AppData, Carried, CopiedFile, MAX_BYTES, MAX_CLIPBOARD_FILES_BYTES, MAX_PARAS, MAX_SPANS, MISSING_BOTH, MISSING_COMPONENT, MISSING_PICTURES,
     NO_SLIDE, TOO_LARGE, SlidePaste, TextPaste, decode_paras, encode_paras, read_app_data, text_entry, text_to_paste,
 };
 use stagepack_studio::clipboard_tools::{COPY_ID, CUT_ID, PASTE_ID};
@@ -704,7 +704,7 @@ fn a_pasted_slide_brings_its_picture_and_says_what_it_cannot(cx: &mut TestAppCon
     let from = open_in(
         cx,
         folder,
-        "# One\n\n![A chart](assets/chart.png)\n\n---\n\n# Two\n\n<Gauge />\n\n---\n\n# Three\n\n---\n\n# Four\n\n![Gone](assets/gone.png)\n",
+        "# One\n\n![A chart](assets/chart.png)\n\n---\n\n# Two\n\n<Gauge />\n\n---\n\n# Three\n\n---\n\n# Four\n\n![Gone](assets/gone.png)\n\n---\n\n# Five\n\n<Gauge />\n\n![Gone](assets/gone.png)\n",
     );
     let into = open(cx, "# A\n");
     from.click(cx, strip_row_id(0));
@@ -716,17 +716,19 @@ fn a_pasted_slide_brings_its_picture_and_says_what_it_cannot(cx: &mut TestAppCon
     assert!(into.document(cx).read_with(cx, |document, _| document.has_file("assets/chart.png")));
     assert!(into.document(cx).update(cx, |document, _| document.notices()).is_empty());
 
-    // A component the talk lacks, or a picture the talk it came from lacks, says so, and a slide
-    // that has all it uses says nothing, each pasted into a talk of its own, whose status line
-    // says nothing yet.
-    for (row, says) in [(1, true), (2, false), (3, true)] {
+    // A component the talk lacks, or a picture the talk it came from lacks, says so, in words
+    // about what it lacks, and a slide that has all it uses says nothing, each pasted into a talk
+    // of its own, whose status line says nothing yet. Seen in the window: a component the talk
+    // lacked was said to be pictures.
+    let says = [(1, Some(MISSING_COMPONENT)), (2, None), (3, Some(MISSING_PICTURES)), (4, Some(MISSING_BOTH))];
+    for (row, said) in says {
         let into = open(cx, "# A\n");
         from.click(cx, strip_row_id(row));
         from.press(cx, "ctrl-c");
         into.click(cx, strip_row_id(0));
         into.press(cx, "ctrl-v");
         assert_eq!(into.count(cx), 2);
-        assert_eq!(into.status(cx).as_deref() == Some(MISSING_PICTURES), says, "row {row}");
+        assert_eq!(into.status(cx).as_deref(), said, "row {row}");
     }
     // Where the talk has a different file by the picture's name, it comes under another, which
     // the pasted slide names.
@@ -747,7 +749,7 @@ fn a_pasted_slide_brings_its_picture_and_says_what_it_cannot(cx: &mut TestAppCon
     from.click(cx, strip_row_id(0));
     from.press(cx, "ctrl-c");
     from.press(cx, "ctrl-v");
-    assert_eq!(from.count(cx), 5);
+    assert_eq!(from.count(cx), 6);
     assert_eq!(from.status(cx), None);
     assert!(from.document(cx).read_with(cx, |document, _| document.unsaved_files().is_empty()));
 }
