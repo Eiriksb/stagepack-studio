@@ -208,15 +208,15 @@ impl Drop for Playing {
 /// inside decoding is caught and called damage.
 fn run(shared: &Shared, mut reader: Box<dyn ReadSeek>, index: Arc<Index>, start: usize, first: usize, looped: bool) {
     let result = catch_unwind(AssertUnwindSafe(|| decode_all(shared, &mut *reader, &index, start, first, looped)));
-    drop(reader);
-    let mut state = shared.lock();
-    state.done = true;
-    state.failed = match result {
+    // Why it stopped is said before the file is let go of, so that whatever sees it let go of
+    // knows already whether it failed.
+    shared.lock().failed = match result {
         Ok(Ok(())) => None,
         Ok(Err(why)) => Some(why),
         Err(_) => Some(CantPlay::Damaged),
     };
-    drop(state);
+    drop(reader);
+    shared.lock().done = true;
     shared.finished.notify_all();
 }
 

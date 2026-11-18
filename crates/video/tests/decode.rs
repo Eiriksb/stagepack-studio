@@ -424,3 +424,57 @@ fn decoding_1080p_takes() {
     let at = |p: f64| times[((times.len() - 1) as f64 * p).round() as usize];
     println!("1920 by 1080, 300 frames: decode median {:?}, 99th percentile {:?}", at(0.5), at(0.99));
 }
+
+/// A file whose reading fails once `failing` is set, and that says when it's let go of.
+struct FailingFile {
+    inner: std::io::Cursor<Vec<u8>>,
+    failing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl std::io::Read for FailingFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(std::io::Error::other("the disk went away"));
+        }
+        self.inner.read(buf)
+    }
+}
+
+impl std::io::Seek for FailingFile {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(to)
+    }
+}
+
+impl Drop for FailingFile {
+    fn drop(&mut self) {
+        self.dropped.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Closing a file can take a moment.
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_video_failing_part_way_says_why_before_it_lets_go_of_the_file() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    for _ in 0..5 {
+        let (failing, dropped) = (std::sync::Arc::new(AtomicBool::new(false)), std::sync::Arc::new(AtomicBool::new(false)));
+        let file = FailingFile { inner: std::io::Cursor::new(coloured_video(64, 48, 300, 30)), failing: failing.clone(), dropped: dropped.clone() };
+        let mut playing = open(Box::new(file)).unwrap().play(0.0, false);
+        assert!(next_frame(&mut playing, 0.0).is_some(), "it plays");
+        failing.store(true, Ordering::SeqCst);
+        let mut at = 0.0;
+        let let_go = wait_for(Duration::from_secs(5), || {
+            at += 1.0 / 30.0;
+            playing.frame_for(at);
+            // Seen let go of, the file's thread has said why it stopped already.
+            if dropped.load(Ordering::SeqCst) {
+                assert_eq!(playing.failed(), Some(CantPlay::CouldNotRead), "let go of the file before saying why");
+                return true;
+            }
+            false
+        });
+        assert!(let_go, "the thread let go of the file");
+    }
+}
