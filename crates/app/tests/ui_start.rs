@@ -296,6 +296,15 @@ fn the_start_screen_shows_five_templates_and_two_ways_to_open(cx: &mut TestAppCo
 }
 
 #[gpui_kit::test]
+fn the_tiles_line_up_at_the_top(cx: &mut TestAppContext) {
+    // A line under a tile that takes two lines, as some do, doesn't push the others down.
+    let (typing, _places, _root) = open_start(cx);
+    let tops: Vec<f32> =
+        templates().iter().map(|each| f32::from(bounds_of(&typing, cx, template_tile_id(each.id)).unwrap().top())).collect();
+    assert!(tops.iter().all(|top| (top - tops[0]).abs() < 0.5), "every tile starts at the same height: {tops:?}");
+}
+
+#[gpui_kit::test]
 fn the_first_tile_has_the_keyboard_and_enter_makes_it(cx: &mut TestAppContext) {
     let (typing, _places, _root) = open_start(cx);
     assert!(has_keyboard(&typing, cx, template_tile_id("light")));

@@ -386,7 +386,8 @@ impl Render for StartScreen {
                     .py_8()
                     .gap_4()
                     .child(heading("start-new", "New presentation"))
-                    .child(h_flex().gap_2().children(tiles))
+                    // Lined up at the top, as a line under a tile can take two lines.
+                    .child(h_flex().gap_2().items_start().children(tiles))
                     .child(
                         h_flex()
                             .gap_2()
