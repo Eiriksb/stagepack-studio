@@ -12,12 +12,18 @@ impl Render for SlideEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = cx.entity().downgrade();
         let marks = self.marks(cx);
-        let caret_color = cx.theme().caret;
+        // Each mark over the slide in the window theme's colour for it, or, where that doesn't
+        // stand out from the slide's background, one that does.
+        let background = match &self.document {
+            Some(document) => document.read(cx).theme().background,
+            None => toolkit::Theme::default().background,
+        };
+        let caret_color = standing_out_on(cx.theme().caret, background);
         let selection_color = cx.theme().selection.opacity(0.6);
         let (composition_color, composition_background) =
             (cx.theme().foreground, cx.theme().background);
         let caret_on = self.caret_on;
-        let outline_color = cx.theme().ring;
+        let outline_color = standing_out_on(cx.theme().ring, background);
         // The things selected on the slide shown, each drawn around.
         let outlines: Vec<[(f32, f32); 4]> = match (self.selection_here(cx), self.document.clone()) {
             (Some(_), Some(document)) => document
@@ -29,7 +35,7 @@ impl Render for SlideEditor {
         };
         // A new box waiting for its first character: a dashed line around where it'll be.
         let new_box = self.new_box_here(cx);
-        let new_box_color = cx.theme().muted_foreground;
+        let new_box_color = standing_out_on(cx.theme().muted_foreground, background);
         // The area whose text is being typed: a dashed line around it, a press on which picks it.
         let frame = self.typed_region(cx).and_then(|(slide, name)| {
             let area = self.layout(slide, cx)?.region(&name)?.clone();
@@ -118,7 +124,19 @@ impl Render for SlideEditor {
             }
             _ => Vec::new(),
         };
-        let (badge_color, badge_text) = (cx.theme().primary, cx.theme().primary_foreground);
+        let badge_color = standing_out_on(cx.theme().primary, background);
+        let badge_text = standing_out_on(cx.theme().primary_foreground, shown_on(badge_color, background));
+        // What each mark drawn this time is drawn in, as it shows on the slide.
+        let shown = |drawn: bool, color: Hsla| drawn.then(|| shown_on(color, background));
+        let painted = &mut self.painted;
+        let caret_drawn = caret_on && marks.as_ref().is_some_and(|marks| marks.caret.is_some());
+        painted.caret = shown(caret_drawn, caret_color).or(painted.caret);
+        painted.frame = shown(frame.is_some() || new_box.is_some(), new_box_color).or(painted.frame);
+        painted.outline = shown(!outlines.is_empty() || lift_outline.is_some(), outline_color).or(painted.outline);
+        painted.handles = shown(handles.is_some(), outline_color).or(painted.handles);
+        painted.guides = shown(!guides.is_empty(), outline_color).or(painted.guides);
+        painted.badge = shown(!badges.is_empty(), badge_color).or(painted.badge);
+        painted.badge_words = shown(!badges.is_empty(), badge_text).or(painted.badge_words);
         let lift_box = lift_outline.as_ref().and_then(|corners| Some((SharedString::from(LIFT_OUTLINE_ID), boxed(corners)?)));
         let frame_box = frame.as_ref().and_then(|(name, corners)| Some((SharedString::from(region_frame_id(name)), boxed(corners)?)));
         // Where the new box is in the editor, for whoever looks for it.

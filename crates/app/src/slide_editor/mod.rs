@@ -44,7 +44,8 @@ mod typing;
 
 pub use arranging::Nudge;
 pub use keys::*;
-use marks::{caret_box, caret_corners, corners, corners_box, guide_bounds, outline_corners, paint_dashed, paint_outline, paint_polygon, turned};
+pub use marks::MarkColors;
+use marks::{shown_on, standing_out_on, caret_box, caret_corners, corners, corners_box, guide_bounds, outline_corners, paint_dashed, paint_outline, paint_polygon, turned};
 
 pub const SLIDE_EDITOR_ID: &str = "slide-editor";
 pub const CARET_ID: &str = "caret";
@@ -202,6 +203,8 @@ pub struct SlideEditor {
     menu_on: Option<MenuOn>,
     /// Whether the step each thing animated comes in on is shown, as it is on the Animate tab.
     show_steps: bool,
+    /// The colours the marks over the slide were last drawn in.
+    painted: MarkColors,
 
     /// Where the caret and any composition were last drawn, so that the system's input method
     /// is told when they move, and only then.
@@ -306,6 +309,7 @@ impl SlideEditor {
             handles_seen: None,
             menu_on: None,
             show_steps: false,
+            painted: MarkColors::default(),
             ime_place: None,
             _subscriptions: subscriptions,
         }
@@ -315,6 +319,11 @@ impl SlideEditor {
     /// resizes, or that it turns.
     pub fn pointer(&self) -> Option<CursorStyle> {
         self.pointer
+    }
+
+    /// The colours the marks over the slide were last drawn in, as each showed on the slide.
+    pub fn mark_colors(&self) -> MarkColors {
+        self.painted
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {

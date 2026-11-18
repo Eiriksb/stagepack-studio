@@ -7155,6 +7155,7 @@ dependencies = [
  "gpui-kit",
  "image",
  "libc",
+ "miniz_oxide 0.8.9",
  "notify",
  "proptest",
  "serde",

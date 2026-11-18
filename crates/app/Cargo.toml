@@ -31,6 +31,7 @@ libc = "0.2"
 [dev-dependencies]
 gpui-kit = { version = "=0.9.0", features = ["test-support"] }
 image = "0.25"
+miniz_oxide = "=0.8.9"
 proptest = "=1.12.0"
 tempfile = "3"
 wat = "=1"
