@@ -4,7 +4,7 @@
 use toolkit::{PropField, PropKind};
 
 /// A built-in component's settings, by argument, in the order they're shown, with their labels.
-const BUILT_INS: [(&str, &[(&str, &str)]); 5] = [
+const BUILT_INS: [(&str, &[(&str, &str)]); 6] = [
     ("Shape", &[("kind", "Shape"), ("fill", "Fill"), ("outline", "Outline"), ("outline-width", "Outline width")]),
     (
         "Box",
@@ -18,6 +18,7 @@ const BUILT_INS: [(&str, &[(&str, &str)]); 5] = [
     ),
     ("Icon", &[("name", "Icon"), ("size", "Size"), ("color", "Colour")]),
     ("Picture", &[("src", "Picture")]),
+    ("Video", &[("loop", "Loop"), ("poster", "Still picture")]),
     (
         "Chart",
         &[
@@ -30,6 +31,10 @@ const BUILT_INS: [(&str, &[(&str, &str)]); 5] = [
         ],
     ),
 ];
+
+/// The built-ins' arguments the form leaves out: `(tag, argument)`. A video's file is named
+/// above its fields, and a new one is put on the slide from the Insert tab.
+const LEFT_OUT: [(&str, &str); 1] = [("Video", "src")];
 
 /// The built-ins' arguments that are colours, though they take them as text, so that one the
 /// toolkit can't read is no colour rather than black: `(tag, argument)`.
@@ -69,11 +74,39 @@ pub fn ordered(tag: &str, props: &[PropField]) -> Vec<(PropField, String)> {
         })
         .collect();
     for prop in props {
-        if !known.iter().any(|(name, _)| *name == prop.name) {
+        if !known.iter().any(|(name, _)| *name == prop.name) && !LEFT_OUT.contains(&(tag, prop.name.as_str())) {
             ordered.push((prop.clone(), plain(&prop.name)));
         }
     }
     ordered
+}
+
+/// Whether `value`, what `tag` has as a yes-or-no setting, says yes. A video's `loop` says yes
+/// written bare, or as `true`, `yes` or `1`, as the engine reads it; anything else's only as `true`.
+pub fn says_yes(tag: &str, value: Option<&str>) -> bool {
+    match value {
+        Some(value) if tag == "Video" => matches!(value.trim().to_ascii_lowercase().as_str(), "" | "true" | "yes" | "1"),
+        value => value == Some("true"),
+    }
+}
+
+/// What the form says of a video `seconds` long and `size` pixels big, as its pictures are
+/// shown: "14 seconds, 1120 by 630".
+pub fn video_facts(seconds: f64, size: (u32, u32)) -> String {
+    format!("{}, {} by {}", length(seconds), size.0, size.1)
+}
+
+/// `seconds` as words, to the nearest second: "2 minutes 5 seconds", or "Under a second".
+fn length(seconds: f64) -> String {
+    let whole = if seconds.is_finite() { seconds.max(0.0).round() as u64 } else { 0 };
+    if whole == 0 {
+        return "Under a second".to_string();
+    }
+    let counted = |count: u64, one: &str| if count == 1 { format!("1 {one}") } else { format!("{count} {one}s") };
+    let (hours, minutes, seconds) = (whole / 3600, whole / 60 % 60, whole % 60);
+    let parts = [(hours, "hour"), (minutes, "minute"), (seconds, "second")];
+    let said: Vec<String> = parts.iter().filter(|(count, _)| *count > 0).map(|(count, one)| counted(*count, one)).collect();
+    said.join(" ")
 }
 
 /// What value `value` of `tag`'s choice `argument` is called.
@@ -120,6 +153,30 @@ mod tests {
         assert_eq!(kinds, [PropKind::Text, PropKind::Color]);
         let own = [PropField::new("fill", PropKind::Text, true)];
         assert_eq!(ordered("Score", &own)[0].0.kind, PropKind::Text, "a talk's own says what it takes");
+    }
+
+    #[test]
+    fn a_videos_form_names_its_still_and_leaves_its_file_out() {
+        let props = [
+            PropField::new("src", PropKind::File(vec!["mp4".into()]), false),
+            PropField::new("poster", PropKind::File(vec!["png".into()]), true),
+            PropField::new("loop", PropKind::Flag, true),
+        ];
+        let labels: Vec<String> = ordered("Video", &props).into_iter().map(|(_, label)| label).collect();
+        assert_eq!(labels, ["Loop", "Still picture"]);
+    }
+
+    #[test]
+    fn a_videos_loop_says_yes_as_the_engine_reads_it() {
+        for yes in ["", "true", "yes", "YES", "1"] {
+            assert!(says_yes("Video", Some(yes)), "{yes}");
+        }
+        for no in ["false", "no", "0", "sometimes"] {
+            assert!(!says_yes("Video", Some(no)), "{no}");
+        }
+        assert!(!says_yes("Video", None));
+        assert!(says_yes("Chart", Some("true")));
+        assert!(!says_yes("Chart", Some("yes")), "a component's own say");
     }
 
     #[test]

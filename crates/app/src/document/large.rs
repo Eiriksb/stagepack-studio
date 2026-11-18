@@ -51,6 +51,72 @@ pub(crate) struct LargeHome {
     stills_waiting: Vec<StillJob>,
     /// What a talk's file is read from, as things are now, for what reads off the window's thread.
     opening: Arc<Mutex<Opening>>,
+    /// What's known of each video, by its path, and the version of its file it was read from.
+    facts: BTreeMap<String, (Option<FileStamp>, Facts)>,
+}
+
+/// A file's length and when it was last changed, which tell a new version of it.
+type FileStamp = (u64, std::time::SystemTime);
+
+/// What's known of a video's facts.
+enum Facts {
+    /// They're being read.
+    Reading,
+    /// They couldn't be read yet: while a save replaced the pack, or before a video a pack holds
+    /// compressed is unpacked to play.
+    Waiting,
+    Known(Result<VideoFacts, slides_video::CantPlay>),
+}
+
+/// What the form says of a video: how long it is, in seconds, and its size, in pixels, as it's shown.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VideoFacts {
+    pub seconds: f64,
+    pub size: (u32, u32),
+}
+
+/// A video's facts, to be read off the window's thread, as the whole of its index is read:
+/// see [`Document::video_facts_to_read`].
+pub struct FactsToRead {
+    path: String,
+    version: Option<FileStamp>,
+    open: Option<LargeOpen>,
+}
+
+/// What came of reading a video's facts, for [`Document::take_video_facts`] to take in.
+pub struct FactsRead {
+    path: String,
+    version: Option<FileStamp>,
+    /// `None` if they couldn't be read yet.
+    read: Option<Result<VideoFacts, slides_video::CantPlay>>,
+}
+
+impl FactsToRead {
+    /// Reads them, held among the talk's readers. A video a pack holds compressed is read only
+    /// once it's been unpacked to play, never unpacked just for this.
+    pub fn read(self) -> FactsRead {
+        let read = match self.open.map(LargeOpen::open_for_still) {
+            None | Some(Err(NotOpened::Unreadable)) => Some(Err(slides_video::CantPlay::CouldNotRead)),
+            Some(Err(NotOpened::Saving | NotOpened::NotUnpacked)) => None,
+            Some(Ok(reader)) => {
+                let watch = reader.watch();
+                match facts_of(reader) {
+                    // A save let go of its file: they're read again after it.
+                    Err(_) if watch.is_let_go() => None,
+                    read => Some(read),
+                }
+            }
+        };
+        FactsRead { path: self.path, version: self.version, read }
+    }
+}
+
+/// The facts of the video `reader` reads: its size from its headers, and its length from its
+/// index, which is read whole.
+fn facts_of(mut reader: HeldReader) -> Result<VideoFacts, slides_video::CantPlay> {
+    let size = slides_video::video_size(&mut reader);
+    let info = slides_video::open(Box::new(reader))?.info();
+    Ok(VideoFacts { seconds: info.seconds, size: size.unwrap_or((info.width, info.height)) })
 }
 
 /// What a talk's file is opened from: see [`LargeOpen`].
@@ -410,11 +476,62 @@ impl Document {
         self.large.stills_waiting.push(job);
     }
 
-    /// Gives again the stills that couldn't be made yet, telling what makes them.
+    /// Gives again the stills that couldn't be made yet, telling what makes them, and lets the
+    /// videos' facts that couldn't be read yet be read.
     pub fn try_waiting_stills_again(&mut self) {
+        self.read_waiting_facts_again();
         if !self.large.stills_waiting.is_empty() {
             self.ask_for_stills();
         }
+    }
+
+    /// What's known of the video at `path`, a file of the talk's, as its file is now: its facts,
+    /// or why it can't be played. `None` until they've been read, with
+    /// [`Self::video_facts_to_read`].
+    pub fn video_facts(&self, path: &str) -> Option<Result<VideoFacts, slides_video::CantPlay>> {
+        let key = slides_engine::normalise(path).unwrap_or_else(|| path.to_string());
+        match self.large.facts.get(&key)? {
+            (version, Facts::Known(known)) if *version == self.file_stamp(&key) => Some(*known),
+            _ => None,
+        }
+    }
+
+    /// The facts of the video at `path` to be read, on another thread, if they're neither known
+    /// for its file as it is now nor being read or waiting to be: they're read once a version.
+    pub fn video_facts_to_read(&mut self, path: &str) -> Option<FactsToRead> {
+        let key = slides_engine::normalise(path).unwrap_or_else(|| path.to_string());
+        let version = self.file_stamp(&key);
+        let asked = self.large.facts.get(&key).is_some_and(|(held, facts)| match facts {
+            Facts::Reading | Facts::Waiting => true,
+            Facts::Known(_) => *held == version,
+        });
+        if asked {
+            return None;
+        }
+        self.large.facts.insert(key.clone(), (version, Facts::Reading));
+        let open = self.open_large(&key);
+        Some(FactsToRead { path: key, version, open })
+    }
+
+    /// Takes in a video's facts, read off the window's thread, and says whether they're known
+    /// now. Those that couldn't be read yet wait for a save to end, or the video to be played.
+    pub fn take_video_facts(&mut self, read: FactsRead) -> bool {
+        let FactsRead { path, version, read } = read;
+        let known = read.is_some();
+        let facts = read.map_or(Facts::Waiting, Facts::Known);
+        self.large.facts.insert(path, (version, facts));
+        known
+    }
+
+    /// Lets the videos' facts that waited be read again.
+    fn read_waiting_facts_again(&mut self) {
+        self.large.facts.retain(|_, (_, facts)| !matches!(facts, Facts::Waiting));
+    }
+
+    /// The length and last change of the talk's file at `path`, found without reading it, or
+    /// its length alone.
+    fn file_stamp(&self, path: &str) -> Option<FileStamp> {
+        self.files.stamp(path).or_else(|| self.files.len(path).map(|len| (len, std::time::SystemTime::UNIX_EPOCH)))
     }
 
     /// Tells what makes the stills to look for any wanted.
@@ -663,6 +780,7 @@ impl Document {
     /// opened again, and the stills that waited for it are made.
     pub fn pack_save_ended(&mut self) {
         self.large.readers.save_ended();
+        self.read_waiting_facts_again();
         // Those wanted meanwhile, as well as those that waited.
         self.ask_for_stills();
     }

@@ -39,7 +39,7 @@ impl Inspector {
                     .into_any_element()
             }
             Widget::Flag => {
-                let checked = value.as_deref() == Some("true");
+                let checked = labels::says_yes(self.form_tag(), value.as_deref());
                 Checkbox::new(id.clone())
                     .checked(checked)
                     .accessibility_label(label.clone())

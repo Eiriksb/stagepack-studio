@@ -179,6 +179,13 @@ impl Document {
         Ok(())
     }
 
+    /// Puts the video `name`, a file of the talk's, `size` pixels big, on the current slide as
+    /// [`Self::insert_sized`] does, as one step named "Insert video": its own shape, made smaller
+    /// to fit in 960 by 540.
+    pub fn insert_video(&mut self, name: String, size: (u32, u32)) -> Result<Vec<usize>, EditRefused> {
+        self.insert_sized(INSERT_VIDEO, "Video", &[("src", &name)], insert::video_size(size), None)
+    }
+
     /// Puts a table of `columns` columns and `rows` rows under its heading row, every cell empty,
     /// at the end of the current slide's content, as one step named "Insert table", and starts
     /// typing in its first heading cell. Typing on the slide ends first, and nothing stays

@@ -10,6 +10,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use slides_engine::{Deck, Fonts, TalkFiles, write_atomically};
+use slides_format::Block;
 use slides_pdf::write_pdf;
 use slides_pptx::{PptxOutput, write_pptx};
 
@@ -81,14 +82,16 @@ fn make(input: ExportInput, kind: ExportKind) -> Result<(Vec<u8>, Vec<String>), 
     let mut deck = Deck::open(Box::new(files.clone()), fonts, source);
     match kind {
         ExportKind::PowerPoint => {
-            let PptxOutput { bytes, notices } = write_pptx(&mut deck, &files)?;
+            let PptxOutput { bytes, mut notices } = write_pptx(&mut deck, &files)?;
+            let every: Vec<usize> = (0..deck.slide_count()).collect();
+            notices.extend(videos_as_pictures(videos_on(&deck, &every)));
             Ok((bytes, notices))
         }
         ExportKind::Pdf => {
             let bytes = write_pdf(&mut deck)?;
-            let notices = deck
-                .shown_slides()
-                .to_vec()
+            let shown = deck.shown_slides().to_vec();
+            let videos = videos_on(&deck, &shown);
+            let mut notices: Vec<String> = shown
                 .into_iter()
                 .flat_map(|index| {
                     deck.notices_whole(index)
@@ -96,8 +99,34 @@ fn make(input: ExportInput, kind: ExportKind) -> Result<(Vec<u8>, Vec<String>), 
                         .map(move |notice| format!("Slide {}: {notice}", index + 1))
                 })
                 .collect();
+            notices.extend(videos_as_pictures(videos));
             Ok((bytes, notices))
         }
+    }
+}
+
+/// How many videos slides `slides` of `deck`'s talk hold, placed or in the text.
+fn videos_on(deck: &Deck, slides: &[usize]) -> usize {
+    fn count(blocks: &[Block]) -> usize {
+        blocks
+            .iter()
+            .map(|block| match block {
+                Block::Tag(tag) => usize::from(tag.name == "Video") + count(&tag.children),
+                _ => 0,
+            })
+            .sum()
+    }
+    let talk = deck.talk();
+    slides.iter().filter_map(|index| talk.slides.get(*index)).map(|slide| count(&slide.blocks)).sum()
+}
+
+/// What an export says of the `videos` it holds, which PowerPoint and PDF get as their stills:
+/// nothing, if there are none.
+fn videos_as_pictures(videos: usize) -> Option<String> {
+    match videos {
+        0 => None,
+        1 => Some("1 video was exported as a picture.".to_string()),
+        videos => Some(format!("{videos} videos were exported as pictures.")),
     }
 }
 

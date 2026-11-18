@@ -15,6 +15,8 @@ pub const SHAPE_SIZE: (f32, f32) = (480.0, 320.0);
 pub const LINE_SIZE: (f32, f32) = (480.0, 120.0);
 /// The size of a new text box.
 pub const TEXT_BOX_SIZE: (f32, f32) = (640.0, 200.0);
+/// The most room a new video takes: it's its own size, made smaller to fit in this.
+pub const VIDEO_ROOM: (f32, f32) = (960.0, 540.0);
 /// How thick a new line or arrow is drawn.
 const LINE_WIDTH: &str = "6";
 
@@ -25,12 +27,24 @@ pub const INSERT_TEXT_BOX: &str = "Insert text box";
 pub const INSERT_ICON: &str = "Insert icon";
 pub const INSERT_TABLE: &str = "Insert table";
 pub const INSERT_COMPONENT: &str = "Insert component";
+pub const INSERT_VIDEO: &str = "Insert video";
 
 /// How big a new icon is, as its `size` is written: its width and its height.
 pub const ICON_SIZE: &str = "128";
 
 /// The kinds of shape the Shapes list offers, by the talk's names for them.
 pub const SHAPE_KINDS: [&str; 6] = ["rect", "rounded", "ellipse", "line", "arrow", "callout"];
+
+/// How big a new video `size` pixels big is put on a slide, in slide units: its own size, its
+/// shape kept, made smaller to fit in [`VIDEO_ROOM`]. One with no size is the room itself.
+pub fn video_size(size: (u32, u32)) -> (f32, f32) {
+    let (w, h) = (size.0 as f32, size.1 as f32);
+    if w <= 0.0 || h <= 0.0 {
+        return VIDEO_ROOM;
+    }
+    let scale = (VIDEO_ROOM.0 / w).min(VIDEO_ROOM.1 / h).min(1.0);
+    (w * scale, h * scale)
+}
 
 /// The top-left corner, in slide units, of a new thing of `size`: centred on the slide, moved
 /// 40 down and right for each time that exact place is in `taken`, the top-left corners of the

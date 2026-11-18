@@ -42,9 +42,10 @@ use crate::table_tools;
 use crate::text_tools::written_color;
 use crate::workspace_view::WorkspaceView;
 use colors::color_of;
-use fields::{Choice, Kind, Spec, Typed, file_name, number_typed, stepped, text_typed};
+use fields::{Choice, FIRST_FRAME, Kind, Spec, Typed, file_name, number_typed, stepped, text_typed};
 
 pub use fields::{BOTH_QUOTES, NOT_A_NUMBER, NOT_WHOLE};
+pub use labels::video_facts;
 
 pub const INSPECTOR_ID: &str = "inspector";
 /// What names the thing selected, at the top of the panel.
@@ -53,6 +54,10 @@ pub const INSPECTOR_HEADING_ID: &str = "inspector-heading";
 pub const INSPECTOR_MESSAGE_ID: &str = "inspector-message";
 /// The button of a file field, inside the field.
 pub const INSPECTOR_CHOOSE_FILE_ID: &str = "inspector-choose-file";
+/// The line saying how long a video selected is and how big, read off the window's thread.
+pub const INSPECTOR_VIDEO_FACTS_ID: &str = "inspector-video-facts";
+/// The sentence saying why a video selected can't be played, if it can't.
+pub const INSPECTOR_VIDEO_PROBLEM_ID: &str = "inspector-video-problem";
 /// The button that puts an area selected back where its layout has it.
 pub const INSPECTOR_PUT_BACK_ID: &str = "inspector-put-back";
 
@@ -176,6 +181,8 @@ struct LookedUp {
     tag: String,
     components: Vec<ComponentInfo>,
     schema: Option<ComponentSchema>,
+    /// The talk's pictures, for a video's still.
+    pictures: Vec<String>,
 }
 
 pub struct Inspector {
@@ -213,7 +220,7 @@ impl Inspector {
         let field = self.field(name)?;
         Some(match &field.widget {
             Widget::Input(input) => input.read(cx).value().to_string(),
-            Widget::Flag => (self.talk_attr(name, cx).as_deref() == Some("true")).to_string(),
+            Widget::Flag => labels::says_yes(self.form_tag(), self.talk_attr(name, cx).as_deref()).to_string(),
             Widget::Color { picker, .. } => picker.read(cx).value().map(written_color).unwrap_or_default(),
             Widget::Choice { select, choices } => {
                 let value = select.read(cx).selected_value().cloned();
@@ -270,13 +277,16 @@ impl Inspector {
     }
 
     /// Writes `value`, one of the choices of the choice field for attribute `name`, as picking it
-    /// from the field's list does.
+    /// from the field's list does. For a video's still, `value` is one of the talk's pictures, or
+    /// empty for its first frame, which takes the still away.
     pub fn choose(&mut self, name: &str, value: &str, _window: &mut Window, cx: &mut Context<Self>) {
-        let known = self
-            .field(name)
-            .is_some_and(|field| matches!(&field.spec.kind, Kind::Choice(options) if options.iter().any(|option| option == value)));
+        let known = self.field(name).is_some_and(|field| match &field.spec.kind {
+            Kind::Choice(options) => options.iter().any(|option| option == value),
+            Kind::Still(pictures) => value.is_empty() || pictures.iter().any(|picture| picture == value),
+            _ => false,
+        });
         if known {
-            self.write(name, Some(value), cx).ok();
+            self.write(name, (!value.is_empty()).then_some(value), cx).ok();
             cx.notify();
         }
     }
@@ -313,6 +323,51 @@ impl Inspector {
             field.problem = problem;
         }
         cx.notify();
+    }
+
+    /// What the form says of the video it's for, if it's for one: how long it is and how big,
+    /// once that's been read, and why it can't be played, if it can't. What's known is read off
+    /// the window's thread, once for each version of its file, and the panel is drawn again once
+    /// it's there.
+    fn video_said(&mut self, cx: &mut Context<Self>) -> (Option<String>, Option<String>) {
+        let (Some(form), Some(document)) = (&self.form, self.document.clone()) else {
+            return (None, None);
+        };
+        let Subject::Thing(target) = &form.target else {
+            return (None, None);
+        };
+        let target = target.clone();
+        if form.shape.tag.as_deref() != Some("Video") {
+            return (None, None);
+        }
+        let Some(src) = self.talk_attr("src", cx) else {
+            return (None, None);
+        };
+        let (known, to_read, problem) = document.update(cx, |document, _| {
+            let known = document.video_facts(&src);
+            let to_read = if known.is_none() { document.video_facts_to_read(&src) } else { None };
+            let problem = if target.slide == document.current() { document.video_problem(&target.source) } else { None };
+            (known, to_read, problem)
+        });
+        if let Some(to_read) = to_read {
+            let document = document.downgrade();
+            cx.spawn(async move |this, cx| {
+                let read = cx.background_spawn(async move { to_read.read() }).await;
+                let known = document.update(cx, |document, _| document.take_video_facts(read)).unwrap_or(false);
+                if known {
+                    this.update(cx, |_, cx| cx.notify()).ok();
+                }
+            })
+            .detach();
+        }
+        let facts = known.and_then(Result::ok).map(|facts| labels::video_facts(facts.seconds, facts.size));
+        let problem = problem.or_else(|| known.and_then(Result::err).map(|why| why.to_string()));
+        (facts, problem)
+    }
+
+    /// The tag of the thing the form is for, if it's one.
+    fn form_tag(&self) -> &str {
+        self.form.as_ref().and_then(|form| form.shape.tag.as_deref()).unwrap_or_default()
     }
 
     fn field(&self, name: &str) -> Option<&Field> {

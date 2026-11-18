@@ -50,6 +50,9 @@ impl Inspector {
                 if shape.message.is_none() && is_positioned(&tag) {
                     shape.specs.extend(Spec::place());
                 }
+                if tag.name == "Video" && shape.message.is_none() {
+                    self.video_form(&mut shape, &tag);
+                }
                 shape.tag = Some(tag.name.clone());
                 Some(tag)
             }
@@ -59,6 +62,22 @@ impl Inspector {
             Values(shape.specs.iter().filter_map(|spec| Some((spec.attr.clone(), tag.attr(&spec.attr)?.to_string()))).collect())
         });
         Some((shape, Subject::Thing(selected), values))
+    }
+
+    /// A video's form, from what its component's arguments gave: its still is chosen from the
+    /// talk's pictures, or its first frame, and its file is named above its fields.
+    fn video_form(&self, shape: &mut Shape, tag: &slides_format::Tag) {
+        let mut pictures = self.looked_up.as_ref().map(|looked_up| looked_up.pictures.clone()).unwrap_or_default();
+        // One written by hand that isn't among them is still shown, as it's named.
+        if let Some(poster) = tag.attr("poster").filter(|poster| !poster.trim().is_empty() && !pictures.iter().any(|picture| picture == poster)) {
+            pictures.push(poster.to_string());
+        }
+        for spec in &mut shape.specs {
+            if spec.attr == "poster" {
+                spec.kind = Kind::Still(pictures.clone());
+            }
+        }
+        shape.message = Some(file_name(tag.attr("src").unwrap_or_default().trim()).to_string());
     }
 
     /// What the panel shows for several things selected on the slide shown, which is how many,
@@ -98,7 +117,9 @@ impl Inspector {
             return looked_up.schema.clone();
         }
         let schema = document.update(cx, |document, _| document.schema_of_selected());
-        self.looked_up = Some(LookedUp { pick, tag: tag.to_string(), components, schema: schema.clone() });
+        // What a video's still can be, looked for in the talk's folder once a pick.
+        let pictures = if tag == "Video" { document.read(cx).picture_files() } else { Vec::new() };
+        self.looked_up = Some(LookedUp { pick, tag: tag.to_string(), components, schema: schema.clone(), pictures });
         schema
     }
 
@@ -175,6 +196,21 @@ impl Inspector {
                     }));
                     Widget::Choice { select, choices }
                 }
+                Kind::Still(pictures) => {
+                    let first = Choice { value: String::new(), title: FIRST_FRAME.into() };
+                    let choices: Vec<Choice> = std::iter::once(first)
+                        .chain(pictures.iter().map(|path| Choice { value: path.clone(), title: file_name(path).to_string().into() }))
+                        .collect();
+                    let select = cx.new(|cx| SelectState::new(choices.clone(), None, window, cx));
+                    let attr = spec.attr.clone();
+                    subscriptions.push(cx.subscribe_in(&select, window, move |this, _, event: &SelectEvent<Vec<Choice>>, window, cx| {
+                        let SelectEvent::Confirm(Some(value)) = event else {
+                            return;
+                        };
+                        this.choose(&attr, value, window, cx);
+                    }));
+                    Widget::Choice { select, choices }
+                }
                 Kind::File(_) => Widget::File,
                 Kind::Icon => {
                     let picker = cx.new(|cx| IconPicker::new(window, cx));
@@ -230,6 +266,8 @@ impl Inspector {
                     }
                 }
                 Widget::Choice { select, choices } => {
+                    // A video with no still of its own shows its first frame.
+                    let value = if matches!(field.spec.kind, Kind::Still(_)) { Some(value.unwrap_or_default()) } else { value };
                     // An unknown value of a choice that has to be given draws as its first.
                     let at = value
                         .and_then(|value| choices.iter().position(|choice| choice.value == value))

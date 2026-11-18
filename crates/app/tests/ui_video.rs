@@ -1215,3 +1215,473 @@ fn a_video_coded_taller_than_it_is_shown_lays_out_at_its_shown_size_from_the_sta
     let video = document.videos_here().pop().unwrap();
     assert_eq!((video.on.rect.w, video.on.rect.h), (WIDTH as f32, HEIGHT as f32));
 }
+
+// Putting a video on a slide: from the Insert tab, a drop or a paste, and its form.
+
+const PLAIN_TALK: &str = "# One\n\nSome words\n\n---\n\n# Two\n";
+const NOT_A_VIDEO: &str = "This file isn't a video.";
+/// The video [`clip`] makes, as it's put in the middle of the slide at its own size.
+const INSERTED: &str = "<Video src=\"assets/clip.mp4\" x=\"928\" y=\"522\" w=\"64\" h=\"36\" />";
+
+/// What [`PLAIN_TALK`] says once `inserted` is put after its first slide's content.
+fn with_inserted(inserted: &str) -> String {
+    PLAIN_TALK.replacen("Some words", &format!("Some words\n\n{inserted}"), 1)
+}
+
+/// A folder talk of `source` in a window that keeps its working copies under `root`, so that a
+/// video can be copied in.
+fn copying_editor(cx: &mut TestAppContext, source: &str, root: &std::path::Path) -> Typing {
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::write(folder.path().join("slides.md"), source).unwrap();
+    open_folder(cx, folder, Some(stagepack_studio::recovery::Recovery::new(root.join("recovery"))))
+}
+
+/// A file named `name` holding `bytes` in `dir`, outside any talk.
+fn outside(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+/// Hands `paths` to the window as the Video tool's dialog would, and lets the copies run.
+fn choose_videos(typing: &Typing, cx: &mut TestAppContext, paths: Vec<std::path::PathBuf>) {
+    let view = typing.view.clone();
+    cx.update(|cx| view.update(cx, |view, cx| view.chosen_videos(paths, cx)));
+    cx.run_until_parked();
+    typing.settle(cx);
+}
+
+/// Drops `paths` from outside the app on the middle of the slide, and lets the copies run.
+fn drop_on_slide(typing: &Typing, cx: &mut TestAppContext, paths: &[std::path::PathBuf]) {
+    use gpui_kit::InputEvent as _;
+    let at = typing.at(cx, 960., 540.);
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        let paths = gpui_kit::ExternalPaths(paths.iter().cloned().collect());
+        window.dispatch_event(gpui_kit::FileDropEvent::Entered { position: at, paths }.to_platform_input(), cx);
+        window.dispatch_event(gpui_kit::FileDropEvent::Pending { position: at }.to_platform_input(), cx);
+        window.dispatch_event(gpui_kit::FileDropEvent::Submit { position: at }.to_platform_input(), cx);
+        window.render_frame(cx);
+    });
+    cx.run_until_parked();
+    typing.settle(cx);
+}
+
+fn selected_text(typing: &Typing, cx: &TestAppContext) -> Option<String> {
+    let source = typing.source(cx);
+    selected(typing, cx).map(|(_, range)| source[range].to_string())
+}
+
+fn can_undo(typing: &Typing, cx: &TestAppContext) -> bool {
+    typing.document(cx).read_with(cx, |document, _| document.can_undo())
+}
+
+/// Every file under `root`, by its path.
+fn files_under(root: &std::path::Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut folders = vec![root.to_path_buf()];
+    while let Some(folder) = folders.pop() {
+        for entry in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                folders.push(path);
+            } else {
+                found.push(path.display().to_string());
+            }
+        }
+    }
+    found
+}
+
+fn png(width: u32, height: u32, rgba: [u8; 4]) -> Vec<u8> {
+    let picture = image::RgbaImage::from_pixel(width, height, image::Rgba(rgba));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(picture).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+    bytes.into_inner()
+}
+
+#[gpui_kit::test]
+fn the_insert_tab_has_video(cx: &mut TestAppContext) {
+    let typing = open(cx, PLAIN_TALK);
+    click_on(&typing, cx, stagepack_studio::ribbon::TAB_INSERT_ID);
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        let video = window.find(stagepack_studio::insert_tools::INSERT_VIDEO_ID);
+        assert_eq!(video.label(), Some("Video"));
+        assert!(video.visible());
+    });
+}
+
+#[gpui_kit::test]
+fn a_chosen_video_is_copied_in_and_put_on_the_slide_selected(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let work = tempfile::tempdir().unwrap();
+    let typing = copying_editor(cx, PLAIN_TALK, work.path());
+    let from = outside(work.path(), "Clip.MP4", &clip(3, 10));
+    choose_videos(&typing, cx, vec![from]);
+    assert_eq!(typing.source(cx), with_inserted(INSERTED));
+    assert_eq!(selected_text(&typing, cx).as_deref(), Some(INSERTED));
+    assert_eq!(typing.status(cx).as_deref(), Some("Video selected"));
+    assert!(typing.document(cx).read_with(cx, |document, _| document.has_file("assets/clip.mp4")));
+
+    // One step, which Undo takes away.
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), PLAIN_TALK);
+    assert!(!can_undo(&typing, cx), "it was one step");
+    // A save after that doesn't write the file.
+    typing.press(cx, "ctrl-s");
+    wait(cx, 500);
+    let folder = typing.file.parent().unwrap().to_path_buf();
+    assert!(!folder.join("assets/clip.mp4").exists(), "{:?}", files_under(&folder));
+    assert_eq!(std::fs::read_to_string(folder.join("slides.md")).unwrap(), PLAIN_TALK);
+}
+
+#[gpui_kit::test]
+fn a_dropped_video_is_inserted_among_dropped_pictures(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let work = tempfile::tempdir().unwrap();
+    let typing = copying_editor(cx, PLAIN_TALK, work.path());
+    let red = outside(work.path(), "red.png", &png(100, 100, [255, 0, 0, 255]));
+    let video = outside(work.path(), "clip.mp4", &clip(3, 10));
+    let blue = outside(work.path(), "blue.png", &png(100, 100, [0, 0, 255, 255]));
+    drop_on_slide(&typing, cx, &[red, video.clone(), blue]);
+    let source = typing.source(cx);
+    assert_eq!(source.matches("<Picture").count(), 2, "{source}");
+    assert_eq!(source.matches("<Video src=\"assets/clip.mp4\"").count(), 1, "{source}");
+    // Each its own step.
+    for _ in 0..3 {
+        typing.press(cx, "ctrl-z");
+    }
+    assert_eq!(typing.source(cx), PLAIN_TALK);
+    assert!(!can_undo(&typing, cx));
+
+    // Its path pasted is a drop.
+    typing.press(cx, "ctrl-y");
+    cx.write_to_clipboard(gpui_kit::ClipboardItem {
+        entries: vec![gpui_kit::ClipboardEntry::ExternalPaths(gpui_kit::ExternalPaths([video].into_iter().collect()))],
+    });
+    click_on(&typing, cx, stagepack_studio::clipboard_tools::PASTE_ID);
+    cx.run_until_parked();
+    typing.settle(cx);
+    assert_eq!(typing.source(cx).matches("<Video").count(), 1, "{}", typing.source(cx));
+}
+
+#[gpui_kit::test]
+fn a_cancelled_copy_inserts_nothing(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let work = tempfile::tempdir().unwrap();
+    let typing = copying_editor(cx, PLAIN_TALK, work.path());
+    let from = outside(work.path(), "clip.mp4", &clip(3, 10));
+    let view = typing.view.clone();
+    cx.update(|cx| view.update(cx, |view, cx| view.chosen_videos(vec![from], cx)));
+    let label = typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        let label = window.find(workspace_view::PROGRESS_ID).label().map(str::to_string);
+        window.click(workspace_view::CANCEL_PROGRESS_ID, cx);
+        label
+    });
+    assert_eq!(label.as_deref(), Some("Copying video… 0%"));
+    cx.run_until_parked();
+    typing.settle(cx);
+    assert_eq!(typing.source(cx), PLAIN_TALK);
+    assert!(!can_undo(&typing, cx));
+    assert_eq!(typing.status(cx).as_deref(), Some("The copy was cancelled, so nothing was added."));
+    let root = work.path().join("recovery");
+    assert!(files_under(&root).iter().all(|name| !name.ends_with(".mp4")), "{:?}", files_under(&root));
+}
+
+#[gpui_kit::test]
+fn a_file_that_is_not_a_video_says_so_and_inserts_nothing(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let work = tempfile::tempdir().unwrap();
+    let typing = copying_editor(cx, PLAIN_TALK, work.path());
+    let root = work.path().join("recovery");
+    // Words, under a video's name.
+    let words = outside(work.path(), "words.mp4", b"these are words, not pictures");
+    choose_videos(&typing, cx, vec![words.clone()]);
+    assert_eq!(typing.source(cx), PLAIN_TALK);
+    assert_eq!(typing.status(cx).as_deref(), Some(NOT_A_VIDEO));
+    assert!(files_under(&root).iter().all(|name| !name.ends_with(".mp4")), "{:?}", files_under(&root));
+    // Nothing at all.
+    let empty = outside(work.path(), "empty.mov", b"");
+    choose_videos(&typing, cx, vec![empty]);
+    assert_eq!(typing.status(cx).as_deref(), Some(NOT_A_VIDEO));
+    // Another kind of file, chosen for a video.
+    let notes = outside(work.path(), "notes.txt", b"words");
+    choose_videos(&typing, cx, vec![notes.clone()]);
+    assert_eq!(typing.status(cx).as_deref(), Some(NOT_A_VIDEO));
+    // Dropped, as any file that isn't a picture or a video.
+    drop_on_slide(&typing, cx, &[notes]);
+    assert_eq!(typing.status(cx).as_deref(), Some("Only pictures and videos can be dropped on a slide."));
+    drop_on_slide(&typing, cx, &[words]);
+    assert_eq!(typing.status(cx).as_deref(), Some(NOT_A_VIDEO));
+    assert_eq!(typing.source(cx), PLAIN_TALK);
+    assert!(!can_undo(&typing, cx));
+}
+
+/// The inspector of `typing`'s window.
+fn inspector(typing: &Typing, cx: &TestAppContext) -> Entity<stagepack_studio::inspector::Inspector> {
+    cx.read(|cx| typing.view.read(cx).inspector().clone())
+}
+
+/// The words of the element `id`, if it's there.
+fn label_of(typing: &Typing, cx: &mut TestAppContext, id: &str) -> Option<String> {
+    let id = gpui_kit::SharedString::from(id.to_string());
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        window.try_find(id).and_then(|found| found.label().map(str::to_string))
+    })
+}
+
+/// Waits for the form's line of facts, read off the window's thread, to say something.
+fn facts(typing: &Typing, cx: &mut TestAppContext) -> String {
+    use stagepack_studio::inspector::INSPECTOR_VIDEO_FACTS_ID;
+    let mut said = None;
+    until(cx, typing.handle, "the video's facts", |cx| {
+        said = typing.with_window(cx, |window, cx| {
+            window.render_frame(cx);
+            window.try_find(INSPECTOR_VIDEO_FACTS_ID).and_then(|found| found.label().map(str::to_string))
+        });
+        said.is_some()
+    });
+    said.unwrap()
+}
+
+fn shown(typing: &Typing, cx: &mut TestAppContext, name: &str) -> Option<String> {
+    typing.settle(cx);
+    let inspector = inspector(typing, cx);
+    cx.read(|cx| inspector.read(cx).shown(name, cx))
+}
+
+/// The video's tag, as the talk has it now.
+fn video_tag(typing: &Typing, cx: &mut TestAppContext) -> String {
+    let source = typing.source(cx);
+    let at = source.find("<Video").unwrap();
+    let end = at + source[at..].find("/>").unwrap() + 2;
+    source[at..end].to_string()
+}
+
+#[gpui_kit::test]
+fn the_form_says_how_long_and_how_big_and_sets_loop_and_the_still(cx: &mut TestAppContext) {
+    use stagepack_studio::inspector::{INSPECTOR_MESSAGE_ID, INSPECTOR_VIDEO_PROBLEM_ID, field_id};
+    let _alone = alone();
+    // Fourteen seconds, a picture a second, 1120 by 630.
+    let video = slides_video::make_test_video(1120, 630, 14, 1, |at| COLOURS[at as usize % COLOURS.len()].repeat(1120 * 630));
+    let folder = talk_folder(&talk(), &video);
+    std::fs::write(folder.path().join("assets/poster.png"), png(16, 9, [0, 200, 0, 255])).unwrap();
+    let typing = open_folder(cx, folder, None);
+    stills_made(&typing, cx);
+    select_video(&typing, cx);
+    assert_eq!(facts(&typing, cx), "14 seconds, 1120 by 630");
+    assert_eq!(label_of(&typing, cx, INSPECTOR_MESSAGE_ID).as_deref(), Some("clip.mp4"), "its file, by its name");
+    assert_eq!(label_of(&typing, cx, INSPECTOR_VIDEO_PROBLEM_ID), None, "it plays");
+    let form = inspector(&typing, cx);
+    let labels = cx.read(|cx| form.read(cx).labels());
+    assert_eq!(labels, ["Loop", "Still picture", "Left", "Top", "Width", "Height", "Turn"]);
+
+    // Loop, ticked and unticked.
+    assert_eq!(shown(&typing, cx, "loop").as_deref(), Some("false"));
+    click_on(&typing, cx, gpui_kit::SharedString::from(field_id("loop")));
+    assert!(video_tag(&typing, cx).contains("loop=\"true\""), "{}", video_tag(&typing, cx));
+    assert_eq!(shown(&typing, cx, "loop").as_deref(), Some("true"));
+    click_on(&typing, cx, gpui_kit::SharedString::from(field_id("loop")));
+    assert!(!video_tag(&typing, cx).contains("loop=\"true\""), "{}", video_tag(&typing, cx));
+
+    // The still: its first frame, or a picture of the talk's.
+    assert_eq!(shown(&typing, cx, "poster").as_deref(), Some("First frame"));
+    let choose = |typing: &Typing, cx: &mut TestAppContext, value: &str| {
+        let inspector = inspector(typing, cx);
+        typing.with_window(cx, |window, cx| inspector.update(cx, |inspector, cx| inspector.choose("poster", value, window, cx)));
+        typing.settle(cx);
+    };
+    choose(&typing, cx, "assets/poster.png");
+    assert!(video_tag(&typing, cx).contains("poster=\"assets/poster.png\""), "{}", video_tag(&typing, cx));
+    assert_eq!(shown(&typing, cx, "poster").as_deref(), Some("poster.png"));
+    choose(&typing, cx, "");
+    assert!(!video_tag(&typing, cx).contains("poster"), "{}", video_tag(&typing, cx));
+    assert_eq!(shown(&typing, cx, "poster").as_deref(), Some("First frame"));
+    // A file that's no picture of the talk's is no choice.
+    choose(&typing, cx, "assets/clip.mp4");
+    assert!(!video_tag(&typing, cx).contains("poster"), "{}", video_tag(&typing, cx));
+    // The facts were read once.
+    assert_eq!(facts(&typing, cx), "14 seconds, 1120 by 630");
+}
+
+#[test]
+fn a_videos_length_and_size_read_as_words() {
+    use stagepack_studio::inspector::video_facts;
+    assert_eq!(video_facts(14.0, (1120, 630)), "14 seconds, 1120 by 630");
+    assert_eq!(video_facts(1.2, (64, 36)), "1 second, 64 by 36");
+    assert_eq!(video_facts(0.3, (64, 36)), "Under a second, 64 by 36");
+    assert_eq!(video_facts(59.6, (64, 36)), "1 minute, 64 by 36");
+    assert_eq!(video_facts(125.0, (64, 36)), "2 minutes 5 seconds, 64 by 36");
+    assert_eq!(video_facts(3661.0, (1920, 1080)), "1 hour 1 minute 1 second, 1920 by 1080");
+}
+
+/// Whether `after` differs from `before` only in what was at `range`, give or take the blank
+/// lines around it.
+fn only_its_bytes(before: &str, after: &str, range: &std::ops::Range<usize>) -> bool {
+    let (head, tail) = (before[..range.start].trim_end(), before[range.end..].trim_start());
+    after.starts_with(head) && after.ends_with(tail) && after.len() >= head.len() + tail.len()
+}
+
+#[gpui_kit::test]
+fn a_hand_written_video_reads_or_says_why(cx: &mut TestAppContext) {
+    use stagepack_studio::inspector::INSPECTOR_VIDEO_PROBLEM_ID;
+    let _alone = alone();
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::create_dir(folder.path().join("assets")).unwrap();
+    std::fs::write(folder.path().join("assets/clip.mp4"), clip(3, 10)).unwrap();
+    std::fs::write(folder.path().join("assets/words.mp4"), b"these are words, not pictures").unwrap();
+    // A video lying beside the talk, which it can't reach.
+    let beside = tempfile::tempdir().unwrap();
+    std::fs::write(beside.path().join("outside.mp4"), clip(3, 10)).unwrap();
+    let outside = format!("../{}/outside.mp4", beside.path().file_name().unwrap().to_string_lossy());
+    assert!(folder.path().join(&outside).exists());
+    let cases: Vec<(String, Option<&str>)> = vec![
+        ("<Video src=\"assets/clip.mp4\" />".to_string(), None),
+        ("<Video src=\"assets/clip.mp4\" x=\"100\" y=\"100\" />".to_string(), None),
+        ("<Video src=\"assets/gone.mp4\" x=\"100\" y=\"100\" w=\"640\" h=\"360\" />".to_string(), Some("This video couldn't be read.")),
+        (format!("<Video src=\"{outside}\" x=\"100\" y=\"100\" w=\"640\" h=\"360\" />"), Some("This video couldn't be read.")),
+        ("<Video src=\"assets/words.mp4\" x=\"100\" y=\"100\" w=\"640\" h=\"360\" />".to_string(), Some(NOT_A_VIDEO)),
+        (
+            "<Video src=\"assets/clip.mp4\" poster=\"assets/words.mp4\" x=\"100\" y=\"100\" w=\"640\" h=\"360\" />".to_string(),
+            Some("The picture named to show for this video can't be shown, so its first picture shows instead."),
+        ),
+        ("<Video src=\"assets/clip.mp4\" loop=\"no\" x=\"100\" y=\"100\" w=\"640\" h=\"360\" />".to_string(), None),
+    ];
+    let slides: Vec<String> = cases.iter().enumerate().map(|(at, (tag, _))| format!("# Case {at}\n\n{tag}\n\nAfter\n")).collect();
+    std::fs::write(folder.path().join("slides.md"), slides.join("\n---\n\n")).unwrap();
+    let typing = open_folder(cx, folder, None);
+    stills_made(&typing, cx);
+    for (at, (tag, why)) in cases.iter().enumerate() {
+        go_to_slide(&typing, cx, at);
+        let notices = label_of(&typing, cx, workspace_view::NOTICES_ID).unwrap_or_default();
+        match why {
+            Some(why) => assert!(notices.contains(why), "case {at}: {notices:?}"),
+            None => assert!(!notices.contains("can't"), "case {at}: {notices:?}"),
+        }
+        // Drawn: the still, or a panel.
+        let video = thing(&typing, cx, "<Video");
+        assert!(video.rect.w > 0. && video.rect.h > 0., "case {at}: {:?}", video.rect);
+        let placed = tag.contains(" x=");
+        let at_in = if placed { (video.rect.x + video.rect.w / 5., video.rect.y + video.rect.h / 5.) } else { (video.rect.x + video.rect.w / 2., video.rect.y + video.rect.h / 2.) };
+        let point = typing.at(cx, at_in.0, at_in.1);
+        typing.click(cx, point);
+        assert_eq!(selected(&typing, cx).map(|(_, source)| source), Some(video.source.clone()), "case {at}");
+        let status = typing.status(cx).unwrap_or_default();
+        assert!(status.starts_with("Video selected"), "case {at}: {status}");
+        let problem = label_of(&typing, cx, INSPECTOR_VIDEO_PROBLEM_ID);
+        if matches!(why, Some(why) if why.starts_with("This")) {
+            assert_eq!(problem.as_deref(), *why, "case {at}: the form says why too");
+        }
+        let before = typing.source(cx);
+        if placed {
+            typing.press(cx, "right");
+            let after = typing.source(cx);
+            assert_ne!(after, before, "case {at}: moved");
+            assert!(only_its_bytes(&before, &after, &video.source), "case {at}: {after}");
+            typing.press(cx, "ctrl-z");
+            assert_eq!(typing.source(cx), before, "case {at}");
+            let point = typing.at(cx, at_in.0, at_in.1);
+            typing.click(cx, point);
+        }
+        typing.press(cx, "delete");
+        let after = typing.source(cx);
+        assert!(only_its_bytes(&before, &after, &video.source), "case {at}: {after}");
+        assert_eq!(after.matches("<Video").count(), cases.len() - 1, "case {at}");
+        typing.press(cx, "ctrl-z");
+        assert_eq!(typing.source(cx), before, "case {at}");
+    }
+    // A loop of no is unticked.
+    select_video(&typing, cx);
+    assert_eq!(shown(&typing, cx, "loop").as_deref(), Some("false"));
+}
+
+/// Goes to slide `index`, from wherever the window is.
+fn go_to_slide(typing: &Typing, cx: &mut TestAppContext, index: usize) {
+    while typing.current(cx) < index {
+        typing.press(cx, "pagedown");
+    }
+    while typing.current(cx) > index {
+        typing.press(cx, "pageup");
+    }
+    assert_eq!(typing.current(cx), index);
+}
+
+/// Every word the window shows that a person reads: what each thing is called, the status
+/// line, the notices, and what the form's fields show.
+fn words_shown(typing: &Typing, cx: &mut TestAppContext) -> Vec<String> {
+    use gpui_kit::test::TestQueryExt as _;
+    let mut words: Vec<String> = typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        window
+            .elements()
+            .into_iter()
+            .filter(|element| !format!("{:?}", element.path()).contains(workspace_view::MARKDOWN_ID))
+            .filter_map(|element| element.label().map(str::to_string))
+            .collect()
+    });
+    let inspector = inspector(typing, cx);
+    let fields = cx.read(|cx| {
+        let inspector = inspector.read(cx);
+        ["loop", "poster", "src"].iter().filter_map(|name| inspector.shown(name, cx)).chain(inspector.labels()).collect::<Vec<_>>()
+    });
+    words.extend(fields);
+    words
+}
+
+/// Whether `words` show code: a tag, a folder of the talk's, a video's file name other than
+/// as the form names its file, or a codec's name without the plain words beside it.
+fn shows_code(words: &str, file_name: bool) -> bool {
+    let codec = ["H.264", "H.265", "HEVC", "avc1", "hvc1"].iter().any(|name| words.contains(name));
+    words.contains('<')
+        || words.contains("assets/")
+        || (words.to_ascii_lowercase().contains(".mp4") && !file_name)
+        || (codec && !words.contains("An MP4 made with the usual settings (H.264) can."))
+}
+
+#[gpui_kit::test]
+fn nothing_about_a_video_shows_code(cx: &mut TestAppContext) {
+    use stagepack_studio::inspector::INSPECTOR_MESSAGE_ID;
+    let _alone = alone();
+    let work = tempfile::tempdir().unwrap();
+    let typing = copying_editor(cx, PLAIN_TALK, work.path());
+    let from = outside(work.path(), "clip.mp4", &clip(3, 10));
+    choose_videos(&typing, cx, vec![from]);
+    stills_made(&typing, cx);
+    facts(&typing, cx);
+    let message = label_of(&typing, cx, INSPECTOR_MESSAGE_ID);
+    assert_eq!(message.as_deref(), Some("clip.mp4"));
+    let shown = words_shown(&typing, cx);
+    for said in ["Video selected", "Under a second, 64 by 36", "clip.mp4", "Loop", "Still picture", "First frame"] {
+        assert!(shown.iter().any(|words| words == said), "{said:?} among {shown:?}");
+    }
+    for words in shown {
+        let file_name = Some(&words) == message.as_ref() && !words.contains('/');
+        assert!(!shows_code(&words, file_name), "{words:?}");
+    }
+
+    // One that isn't a video, and one of a kind that isn't played.
+    let mut other_kind = clip(3, 10);
+    // The kind of its pictures' description, which comes just before their configuration.
+    let config = other_kind.windows(4).position(|kind| kind == b"avcC").unwrap();
+    let at = other_kind[..config].windows(4).rposition(|kind| kind == b"avc1").unwrap();
+    other_kind[at..at + 4].copy_from_slice(b"hvc1");
+    for (bytes, why) in [
+        (b"these are words, not pictures".to_vec(), NOT_A_VIDEO),
+        (other_kind, "This kind of video can't be played here. An MP4 made with the usual settings (H.264) can."),
+    ] {
+        let typing = editor(cx, &talk(), &bytes);
+        select_video(&typing, cx);
+        let message = label_of(&typing, cx, INSPECTOR_MESSAGE_ID);
+        let shown = words_shown(&typing, cx);
+        assert!(shown.iter().any(|words| words.contains(why)), "{why:?} among {shown:?}");
+        for words in shown {
+            let file_name = Some(&words) == message.as_ref() && !words.contains('/');
+            assert!(!shows_code(&words, file_name), "{words:?}");
+        }
+    }
+    assert!(!shows_code("This kind of video can't be played here. An MP4 made with the usual settings (H.264) can.", false));
+    assert!(shows_code("Only H.264 plays", false));
+}

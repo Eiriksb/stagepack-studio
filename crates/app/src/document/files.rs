@@ -8,6 +8,19 @@ impl Document {
         self.files.len(path).is_some()
     }
 
+    /// The talk's pictures, by their paths, in name order: those a video's still can be.
+    pub fn picture_files(&self) -> Vec<String> {
+        let pictures = FileKind::Picture.extensions();
+        self.files
+            .names_in(FileKind::Picture.folder())
+            .into_iter()
+            .filter(|path| {
+                let extension = path.rsplit_once('.').map(|(_, extension)| extension.to_ascii_lowercase());
+                extension.is_some_and(|extension| pictures.contains(&extension.as_str()))
+            })
+            .collect()
+    }
+
     /// Adds `bytes` to the talk as a file of `kind`, named as like `suggested` as is safe, and
     /// returns its path in the talk, as the text names it. A file the talk has with the same
     /// bytes, saved or added, is that file. A name it has already is numbered, but a component's

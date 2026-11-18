@@ -26,7 +26,7 @@ use crate::added_files::{self, FileKind, MAX_ADDED_BYTES, NotAdded, Placed, talk
 use crate::clipboard::{CopiedFile, MAX_CLIPBOARD_FILES, MAX_CLIPBOARD_FILES_BYTES, PastedFile, PastedFiles};
 use crate::export::ExportInput;
 use crate::history::{History, RunId, one_edit};
-use crate::insert::{self, INSERT_COMPONENT, INSERT_PICTURE, INSERT_SHAPE, INSERT_TABLE, INSERT_TEXT_BOX, TEXT_BOX_SIZE};
+use crate::insert::{self, INSERT_COMPONENT, INSERT_PICTURE, INSERT_SHAPE, INSERT_TABLE, INSERT_TEXT_BOX, INSERT_VIDEO, TEXT_BOX_SIZE};
 use crate::palette::{self, COMPONENT_SIZE, LISTED_BUILT_INS};
 pub use crate::palette::PaletteEntry;
 use crate::present::TalkShape;
@@ -63,7 +63,7 @@ pub use arranging::{ALIGN, ArrangeHere, DISTRIBUTE, MOVE, MOVE_OUT, NUDGE, ORDER
 pub use clipboard::Brought;
 pub use self::core::EditRun;
 use self::core::{Holds, Join, others_alike};
-pub use large::{CopiedIn, LargeCopy, LargeKeep, LargeOpen};
+pub use large::{CopiedIn, FactsRead, FactsToRead, LargeCopy, LargeKeep, LargeOpen, VideoFacts};
 pub use errors::{AREA_STAYS, DRAG_OUT_FIRST, EditRefused, InsertFailed, LAYOUT_FAILED, OpenProblem, panic_in_next_change, panic_in_next_layout};
 use errors::{built, guarded, laid_out, read_after, worked_out};
 pub use open::{TalkPlace, UNTITLED_NAME, UntitledId};

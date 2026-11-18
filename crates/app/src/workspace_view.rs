@@ -31,7 +31,7 @@ use crate::document::{Document, EditRefused, OpenProblem, Reload, SLIDES_FILE, T
 use crate::export::{self, ExportKind, stagepack_executable};
 use crate::icon_picker::{self, IconPicked, IconPicker};
 use crate::palette::InsertComponent;
-use crate::insert_tools::{InsertPicture, InsertShape, InsertTextBox};
+use crate::insert_tools::{InsertPicture, InsertShape, InsertTextBox, InsertVideo};
 use crate::layout_picker::SetLayout;
 use crate::inspector::{self, Inspector};
 use crate::markdown_panel::MarkdownPanel;
@@ -1801,6 +1801,7 @@ impl Render for WorkspaceView {
                 this.clipboard(ClipboardOp::Paste, window, cx)
             }))
             .on_action(cx.listener(|this, _: &InsertPicture, window, cx| this.ask_for_pictures(window, cx)))
+            .on_action(cx.listener(|this, _: &InsertVideo, window, cx| this.ask_for_videos(window, cx)))
             .on_action(cx.listener(|this, action: &InsertShape, window, cx| {
                 this.insert_shape(action.kind, cx);
                 this.keyboard_to_the_slide(window, cx);
