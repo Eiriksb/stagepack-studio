@@ -13,6 +13,7 @@ use typing::*;
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{AnyWindowHandle, AppContext as _, TestAppContext, VisualTestContext};
 use slides_engine::{Fonts, TalkFiles as _, open_packed};
+use stagepack_studio::added_files::FileKind;
 use stagepack_studio::builds::Compile;
 use stagepack_studio::clipboard::{self, AppData, CopiedFile, PastedFiles};
 use stagepack_studio::document::{Document, TalkPlace, UntitledId};
@@ -541,6 +542,91 @@ fn closing_with_dont_save_discards_the_copy(cx: &mut TestAppContext) {
     assert!(recovery.find(&untitled).is_none());
     assert_eq!(recovery.untitled(), (Vec::new(), 0));
     assert!(!places.recovery.exists() || std::fs::read_dir(&places.recovery).unwrap().count() == 0, "nothing left behind");
+}
+
+#[gpui_kit::test]
+fn a_picture_undone_before_its_copy_is_kept_leaves_nothing_behind(cx: &mut TestAppContext) {
+    // Closed once the pause is over, and closed within it.
+    for waits in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let places = UntitledPlaces::under(root.path());
+        let typing = open_untitled_under(cx, "light", 1, root.path());
+        let photo = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/showcase/assets/photo.png")).unwrap();
+        let document = typing.document(cx);
+        document.update(cx, |document, cx| {
+            let path = document.add_file(FileKind::Picture, "photo.png", photo).unwrap();
+            document.insert_tag("Insert picture", "Picture", &[("src", &path)], None).unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        // The picture is kept the moment it's added, before any text is.
+        let slots = || -> Vec<PathBuf> {
+            std::fs::read_dir(&places.recovery)
+                .map(|keys| keys.flatten().flat_map(|key| std::fs::read_dir(key.path()).into_iter().flatten().flatten()).map(|slot| slot.path()).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(slots().len(), 1, "waits {waits}: the picture's slot");
+        assert!(!slots()[0].join("slides.md").exists(), "waits {waits}: no text kept yet");
+        // Undone within the pause before the text would be kept.
+        document.update(cx, |document, cx| {
+            document.undo().unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(!document.read_with(cx, |document, _| document.has_unsaved_changes()));
+        if waits {
+            wait(cx, KEEP_PAUSE);
+        }
+
+        assert!(closes_without_asking(cx, typing.handle), "waits {waits}");
+        drop(typing);
+        cx.run_until_parked();
+        assert_eq!(slots(), Vec::<PathBuf>::new(), "waits {waits}: nothing left behind");
+        assert_eq!(Recovery::new(places.recovery.clone()).untitled(), (Vec::new(), 0));
+    }
+}
+
+#[gpui_kit::test]
+fn the_templates_picture_taken_away_before_the_first_save_comes_back_with_undo(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let places = UntitledPlaces::under(root.path());
+    let typing = open_untitled_under(cx, "tour", 1, root.path());
+    let document = typing.document(cx);
+    document.update(cx, |document, cx| {
+        let at = document.source().find("<Picture src=\"assets/photo.png\"").unwrap();
+        let end = at + document.source()[at..].find("/>").unwrap() + 2;
+        assert!((0..document.slide_count()).any(|slide| document.select(slide, at..end)));
+        document.delete_selected().unwrap();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let folder = places.documents.join("Tour");
+    first_save(&typing, cx, SAVE_AS_FOLDER_ID, &folder);
+    assert!(!folder.join("assets/photo.png").exists(), "the text didn't use it");
+    let recovery = Recovery::new(places.recovery.clone());
+    // The picture the save didn't write isn't kept on its own, with nothing unsaved.
+    let nothing_kept = || !places.recovery.exists() || std::fs::read_dir(&places.recovery).unwrap().count() == 0;
+    cx.run_until_parked();
+    assert!(nothing_kept(), "not even for a moment");
+    wait(cx, KEEP_PAUSE);
+    assert!(nothing_kept());
+
+    // Undone, it's unsaved again, kept with its picture, and the next save writes it.
+    document.update(cx, |document, cx| {
+        document.undo().unwrap();
+        cx.notify();
+    });
+    wait(cx, KEEP_PAUSE);
+    let now = place(&typing, cx);
+    let found = recovery.find(&now).expect("a copy of the undo");
+    assert!(found.files.iter().any(|(path, _)| path == "assets/photo.png"), "with the template's picture");
+    typing.press(cx, "ctrl-s");
+    cx.run_until_parked();
+    assert!(folder.join("assets/photo.png").is_file(), "written by the next save");
+    assert_eq!(std::fs::read_to_string(folder.join("slides.md")).unwrap(), typing.source(cx));
+    wait(cx, KEEP_PAUSE);
+    assert!(recovery.find(&now).is_none());
+    assert!(closes_without_asking(cx, typing.handle));
 }
 
 #[gpui_kit::test]

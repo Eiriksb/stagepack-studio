@@ -1799,6 +1799,59 @@ fn a_copy_another_running_app_holds_is_left_alone() {
 }
 
 #[test]
+fn a_slot_holding_only_files_is_not_counted_and_is_swept() {
+    let (_dir, root) = scratch_root();
+    let talk = tempfile::tempdir().unwrap();
+    let picture = red_png();
+    let (untitled, folder) = (TalkPlace::Untitled(UntitledId::random()), TalkPlace::Folder(talk.path().to_path_buf()));
+    // A picture kept as it was added, and no text after it, for a new presentation and for a
+    // talk with a place: each in a slot of its own that no window holds.
+    for place in [&untitled, &folder] {
+        Recovery::new(root.clone()).keep_file(place, "assets/photo.png", &picture).unwrap();
+    }
+    let left: Vec<PathBuf> = kept_folders(&root);
+    assert_eq!(left.len(), 2);
+    assert!(left.iter().all(|slot| !slot.join("about.json").exists() && !slot.join("slides.md").exists()));
+    // The same, held by a window here and by one in another running copy of the app.
+    let app = Recovery::new(root.clone());
+    let window = app.for_another_window();
+    let held_here = TalkPlace::Untitled(UntitledId::random());
+    window.keep_file(&held_here, "assets/photo.png", &picture).unwrap();
+    let held_elsewhere = TalkPlace::Untitled(UntitledId::random());
+    Recovery::new(root.clone()).keep_file(&held_elsewhere, "assets/photo.png", &picture).unwrap();
+    let elsewhere_slot = kept_folders(&root).into_iter().find(|slot| !left.contains(slot) && !slot.join("held").exists()).unwrap();
+    let other_app = hold_from_another_app(&elsewhere_slot);
+    // A copy whose about file is gone but whose text is there still counts, as it holds text.
+    let spoilt = UntitledId::random();
+    Recovery::new(root.clone()).keep_untitled(spoilt, "Untitled presentation", "# Text\n", &[], &[]).unwrap();
+    let spoilt_slot = untitled_slot(&root, spoilt);
+    std::fs::remove_file(spoilt_slot.join("about.json")).unwrap();
+
+    // Nothing was ever kept in those holding only files, so they're not counted as unreadable.
+    assert_eq!(app.untitled(), (Vec::new(), 1), "only the copy with text is counted");
+
+    // At launch they go, whatever their age, but those held stay, as does the copy with text.
+    app.sweep(KEEP_FOR);
+    for slot in &left {
+        assert!(!slot.exists(), "{slot:?}");
+        assert!(!slot.parent().unwrap().exists(), "its talk's folder goes too");
+    }
+    assert!(elsewhere_slot.join("files/assets/photo.png").is_file(), "held by another app");
+    let window_slots: Vec<PathBuf> =
+        kept_folders(&root).into_iter().filter(|slot| *slot != elsewhere_slot && *slot != spoilt_slot).collect();
+    assert_eq!(window_slots.len(), 1, "held by a window here");
+    assert!(window_slots[0].join("files/assets/photo.png").is_file());
+    assert!(spoilt_slot.join("slides.md").is_file(), "its text is kept for its time");
+    assert!(talk.path().read_dir().unwrap().next().is_none(), "nothing in the talk's own folder is touched");
+
+    // Once they're let go, they go too.
+    drop(other_app);
+    drop(window);
+    app.sweep(KEEP_FOR);
+    assert_eq!(kept_folders(&root), vec![spoilt_slot]);
+}
+
+#[test]
 fn a_copy_with_a_time_ahead_of_the_clock_is_still_swept() {
     let (_dir, root) = scratch_root();
     let recovery = Recovery::new(root.clone());

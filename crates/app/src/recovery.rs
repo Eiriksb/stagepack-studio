@@ -502,7 +502,8 @@ impl Recovery {
                 continue;
             };
             for slot in slots {
-                if is_held(&slot, &live) {
+                // One holding neither was never kept in: there's nothing in it to read.
+                if is_held(&slot, &live) || holds_no_copy(&slot) {
                     continue;
                 }
                 match untitled_about(&slot, &key_name) {
@@ -571,7 +572,9 @@ impl Recovery {
     }
 
     /// Removes the working copies kept longer ago than `older_than`, but those an open window
-    /// holds. One whose about file can't be read goes by when its folder last changed.
+    /// holds. One whose about file can't be read goes by when its folder last changed. A slot
+    /// that holds neither text nor an about file goes whatever its age: it holds only files
+    /// kept as they were added, which nothing can bring back without the text that uses them.
     pub fn sweep(&self, older_than: Duration) {
         let Ok(entries) = std::fs::read_dir(&self.root) else {
             return;
@@ -591,7 +594,9 @@ impl Recovery {
                 let kept = read_about(&slot)
                     .and_then(|(about, _)| kept_at(&about, &slot))
                     .or_else(|| changed_at(&slot));
-                if kept.is_some_and(is_old) && !is_held(&slot, &live_slots().clone()) {
+                let goes = holds_no_copy(&slot) || kept.is_some_and(is_old);
+                // Looked at again just before it goes, as a window may have come to hold it.
+                if goes && !is_held(&slot, &live_slots().clone()) {
                     remove_slot(&slot);
                 }
             }
@@ -624,6 +629,15 @@ impl std::fmt::Display for NotTaken {
 /// running copy of it.
 fn is_held(slot: &Path, live: &BTreeSet<String>) -> bool {
     slot_name(slot).is_some_and(|name| live.contains(name)) || locked_elsewhere(slot)
+}
+
+/// Whether nothing is at the names of a working copy's text and about file in `slot`: no copy
+/// was ever kept in it, only files added to the talk as they were added. Anything at either
+/// name, a link or a folder too, is a copy, if one that can't be read.
+fn holds_no_copy(slot: &Path) -> bool {
+    [SLIDES_FILE, ABOUT_FILE].iter().all(|name| {
+        std::fs::symlink_metadata(slot.join(name)).is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+    })
 }
 
 /// The newest working copy of the talk at `place` that can be read, among `slots`.

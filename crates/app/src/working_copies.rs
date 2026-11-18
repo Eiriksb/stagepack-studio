@@ -384,13 +384,16 @@ impl WorkingCopies {
     }
 
     /// What brings the working copy in line with the talk: one while it has unsaved changes,
-    /// and none once it hasn't.
+    /// and none once it hasn't, nor any file kept as it was added.
     fn job(&mut self, cx: &App) -> Option<Job> {
         let recovery = self.recovery.clone()?;
         let document = self.document.as_ref()?.read(cx);
         let place = document.place().clone();
         if !document.has_unsaved_changes() {
-            self.kept.take()?;
+            // A file added and undone before any text was kept has a slot of its own to go too.
+            if self.kept.take().is_none() && self.files_kept.is_empty() {
+                return None;
+            }
             self.files_kept.clear();
             return Some(Job::Clear {
                 recovery,
@@ -431,6 +434,11 @@ impl WorkingCopies {
     /// copy and the one it brought back go. Anything edited since is kept again.
     pub fn saved(&mut self, place: TalkPlace, cx: &mut Context<Self>) {
         self.clear(place, cx);
+        // A file the save didn't write, as the text doesn't use it, is the talk's still, but it
+        // isn't kept until a text that uses it is: as a new presentation's own picture is.
+        if let Some(document) = &self.document {
+            self.files_seen = document.read(cx).files_added_stamp();
+        }
     }
 
     /// The talk's unsaved changes at `place` are let go, so this window's copy and the one it
@@ -458,9 +466,10 @@ impl WorkingCopies {
         );
     }
 
-    /// Whether this window's copy is there, as last written.
+    /// Whether this window's copy is there, as last written, or any file added to the talk was
+    /// kept in its slot as it was added: either way the slot has to go once nothing is unsaved.
     pub fn holds_a_copy(&self) -> bool {
-        self.kept.is_some()
+        self.kept.is_some() || !self.files_kept.is_empty()
     }
 
     /// Whether any change to the working copies has been asked for, which a window that
