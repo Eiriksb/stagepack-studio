@@ -2,16 +2,19 @@
 //! talk uses. A packed file is untrusted input, so it is checked when it opens (names, sizes,
 //! count) and read in bounded pieces afterwards.
 
-use crate::files::{FolderFiles, MAX_FILE_BYTES, TalkFiles};
+use crate::files::{FolderFiles, MAX_FILE_BYTES, MAX_LARGE_FILE, ReadSeek, TalkFiles, is_large_kind};
 use crate::MAX_INDEX_BYTES;
 use slides_components::{BuildIndex, INDEX_FILE};
 use slides_format::{Block, Talk, parse_talk};
-use std::collections::{BTreeSet, HashMap};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
-use std::io::{Read, Write};
-use std::path::Path;
-use std::sync::Mutex;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter};
 
@@ -59,6 +62,8 @@ pub enum PackError {
     InsideTheTalk,
     /// A file was to be added to a talk that has a different one by that name.
     NameTaken(String),
+    /// A write was asked to stop before it was done, and what it had written was taken away.
+    Stopped,
     Io(std::io::Error),
 }
 
@@ -76,6 +81,7 @@ impl fmt::Display for PackError {
             PackError::Corrupt(what) => write!(f, "This file is damaged or isn't a talk: {what}."),
             PackError::InsideTheTalk => write!(f, "A talk can't be saved inside its own folder. Choose a place outside it."),
             PackError::NameTaken(_) => write!(f, "This talk already has a different file with that name."),
+            PackError::Stopped => write!(f, "It was stopped before it was done, and nothing was changed."),
             PackError::Io(e) => write!(f, "The file couldn't be read or written: {e}."),
         }
     }
@@ -85,6 +91,9 @@ impl std::error::Error for PackError {}
 
 impl From<std::io::Error> for PackError {
     fn from(e: std::io::Error) -> PackError {
+        if is_stop(&e) {
+            return PackError::Stopped;
+        }
         PackError::Io(e)
     }
 }
@@ -92,6 +101,9 @@ impl From<std::io::Error> for PackError {
 /// An error from reading the pack: bad data inside the file is damage, anything else is the disk.
 fn read_error(e: std::io::Error) -> PackError {
     use std::io::ErrorKind::{InvalidData, InvalidInput, UnexpectedEof};
+    if is_stop(&e) {
+        return PackError::Stopped;
+    }
     match e.kind() {
         InvalidData | InvalidInput | UnexpectedEof => PackError::Corrupt(e.to_string()),
         _ => PackError::Io(e),
@@ -167,11 +179,101 @@ pub fn normalise(path: &str) -> Option<String> {
 /// A file to add to a talk as it's written: its path in the talk, and its bytes.
 pub type NewFile = (String, Vec<u8>);
 
+/// Where the bytes of a file to add to a talk come from: held, or a file on disk, which is copied
+/// a piece at a time as the talk is written and never read whole.
+#[derive(Clone, Debug)]
+pub enum FileSource {
+    Bytes(Vec<u8>),
+    At(PathBuf),
+}
+
+/// A file to add to a talk as it's written: its path in the talk, and where its bytes come from.
+pub type NewFileFrom = (String, FileSource);
+
+/// A file to add as it's given, before it's been looked at.
+#[derive(Clone, Copy)]
+enum Given<'a> {
+    Bytes(&'a [u8]),
+    At(&'a Path),
+}
+
+fn given_from(files: &[NewFileFrom]) -> Vec<(&str, Given<'_>)> {
+    files
+        .iter()
+        .map(|(name, source)| match source {
+            FileSource::Bytes(bytes) => (name.as_str(), Given::Bytes(bytes)),
+            FileSource::At(path) => (name.as_str(), Given::At(path)),
+        })
+        .collect()
+}
+
+fn given_bytes(files: &[NewFile]) -> Vec<(&str, Given<'_>)> {
+    files.iter().map(|(name, bytes)| (name.as_str(), Given::Bytes(bytes))).collect()
+}
+
+/// Where the bytes of an entry come from as it's written.
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    Bytes(&'a [u8]),
+    /// A file on disk, with its length and modified time when it was looked at. If either has
+    /// changed by the time it's been copied, or it's gone, it isn't the file that was meant, and
+    /// the copy fails.
+    At(&'a Path, u64, Option<SystemTime>),
+}
+
+impl Source<'_> {
+    fn len(&self) -> u64 {
+        match self {
+            Source::Bytes(bytes) => bytes.len() as u64,
+            Source::At(_, len, _) => *len,
+        }
+    }
+
+    /// Its bytes, read from the start.
+    fn reader(&self) -> std::io::Result<Box<dyn Read + '_>> {
+        Ok(match *self {
+            Source::Bytes(bytes) => Box::new(bytes),
+            Source::At(path, _, _) => Box::new(File::open(path)?),
+        })
+    }
+}
+
+/// The regular file at `path`, looked at to be copied.
+fn on_disk(path: &Path) -> Result<Source<'_>, PackError> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(PackError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} isn't a regular file", path.display()),
+        )));
+    }
+    Ok(Source::At(path, metadata.len(), metadata.modified().ok()))
+}
+
+fn look(given: Given<'_>) -> Result<Source<'_>, PackError> {
+    match given {
+        Given::Bytes(bytes) => Ok(Source::Bytes(bytes)),
+        Given::At(path) => on_disk(path),
+    }
+}
+
+/// A file to add, looked at and checked.
+struct Added<'a> {
+    name: &'a str,
+    source: Source<'a>,
+}
+
+/// The most a file called `name` can hold, where other files can hold `entry_bytes`.
+fn limit_for(name: &str, entry_bytes: u64) -> u64 {
+    if is_large_kind(name) { MAX_LARGE_FILE } else { entry_bytes }
+}
+
 /// The files of `extra` that a talk holding the files `names` doesn't have yet, each checked
 /// to be a file a talk can hold, in a folder that's packed. One the talk has with the same bytes,
-/// as `read` gives them, is left out. One it has with other bytes, or under a name only the case
+/// as `same` tells, is left out. One it has with other bytes, or under a name only the case
 /// of its letters tells apart from one it has, is refused rather than written over, and so is
-/// one named twice in `extra` with different bytes.
+/// one named twice in `extra` with different bytes. A file of a large kind can hold up to
+/// [`MAX_LARGE_FILE`], any other `entry_bytes`.
 ///
 /// The one exception is the talk's build index, [`INDEX_FILE`]: the app keeps it, merging the
 /// builds a paste brings into the talk's own, so `extra` may hold it once, in place of the
@@ -179,49 +281,75 @@ pub type NewFile = (String, Vec<u8>);
 /// others, and [`replaces_index`] says whether the talk's own is to be left out.
 fn new_files<'a>(
     names: &[String],
-    read: impl Fn(&str) -> Result<Vec<u8>, PackError>,
-    extra: &'a [NewFile],
+    same: impl Fn(&str, Source<'_>) -> Result<bool, PackError>,
+    extra: &[(&'a str, Given<'a>)],
     entry_bytes: u64,
-) -> Result<Vec<&'a NewFile>, PackError> {
-    let mut new: Vec<&NewFile> = Vec::new();
-    let mut indexes = extra.iter().filter(|(name, _)| name == INDEX_FILE);
-    if let Some(index) = indexes.next() {
-        let (name, bytes) = index;
-        let readable = bytes.len() as u64 <= MAX_INDEX_BYTES && serde_json::from_slice::<BuildIndex>(bytes).is_ok();
+) -> Result<Vec<Added<'a>>, PackError> {
+    let mut new: Vec<Added> = Vec::new();
+    let mut indexes = extra.iter().filter(|(name, _)| *name == INDEX_FILE);
+    if let Some(&(name, given)) = indexes.next() {
+        let source = look(given)?;
+        let readable = source.len() <= MAX_INDEX_BYTES
+            && match given {
+                Given::Bytes(bytes) => serde_json::from_slice::<BuildIndex>(bytes).is_ok(),
+                Given::At(path) => read_limited(path, MAX_INDEX_BYTES).is_ok_and(|bytes| serde_json::from_slice::<BuildIndex>(&bytes).is_ok()),
+            };
         if indexes.next().is_some() || !readable {
-            return Err(PackError::UnsafeName(name.clone()));
+            return Err(PackError::UnsafeName(name.to_string()));
         }
         // Only the index itself: a file whose name differs from it but for case is another.
         if names.iter().any(|other| other != INDEX_FILE && other.eq_ignore_ascii_case(INDEX_FILE)) {
-            return Err(PackError::NameTaken(name.clone()));
+            return Err(PackError::NameTaken(name.to_string()));
         }
-        new.push(index);
+        new.push(Added { name, source });
     }
-    for file in extra.iter().filter(|(name, _)| name != INDEX_FILE) {
-        let (name, bytes) = file;
+    for &(name, given) in extra.iter().filter(|(name, _)| *name != INDEX_FILE) {
         let in_a_folder = name.split_once('/').is_some_and(|(folder, _)| PACKED_FOLDERS.contains(&folder));
-        if !(in_a_folder && safe_name(name) && !name.ends_with('/') && normalise(name).as_ref() == Some(name)) {
-            return Err(PackError::UnsafeName(name.clone()));
+        if !(in_a_folder && safe_name(name) && !name.ends_with('/') && normalise(name).as_deref() == Some(name)) {
+            return Err(PackError::UnsafeName(name.to_string()));
         }
-        if bytes.len() as u64 > entry_bytes {
-            return Err(PackError::TooLarge(format!("{name} is bigger than {entry_bytes} bytes")));
+        let source = look(given)?;
+        let limit = limit_for(name, entry_bytes);
+        if source.len() > limit {
+            return Err(PackError::TooLarge(format!("{name} is bigger than {limit} bytes")));
         }
         let alike = |other: &str| other.eq_ignore_ascii_case(name);
         if let Some(there) = names.iter().find(|other| alike(other)) {
-            if there == name && read(there)? == *bytes {
+            if there == name && same(there, source)? {
                 continue;
             }
-            return Err(PackError::NameTaken(name.clone()));
+            return Err(PackError::NameTaken(name.to_string()));
         }
-        if let Some((earlier, earlier_bytes)) = new.iter().copied().find(|(other, _)| alike(other)) {
-            if earlier == name && earlier_bytes == bytes {
+        if let Some(earlier) = new.iter().find(|earlier| alike(earlier.name)) {
+            if earlier.name == name && same_content(&mut *earlier.source.reader()?, earlier.source.len(), source)? {
                 continue;
             }
-            return Err(PackError::NameTaken(name.clone()));
+            return Err(PackError::NameTaken(name.to_string()));
         }
-        new.push(file);
+        new.push(Added { name, source });
     }
     Ok(new)
+}
+
+/// Whether `held`, which says it holds `len` bytes, holds what `source` does, compared a piece at
+/// a time. What can't be read of `held` is damage, as it is in a pack.
+fn same_content(held: &mut dyn Read, len: u64, source: Source<'_>) -> Result<bool, PackError> {
+    if len != source.len() {
+        return Ok(false);
+    }
+    let mut other = source.reader()?;
+    let (mut a, mut b) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
+    let mut left = len;
+    while left > 0 {
+        let n = left.min(a.len() as u64) as usize;
+        held.read_exact(&mut a[..n]).map_err(read_error)?;
+        if other.read_exact(&mut b[..n]).is_err() || a[..n] != b[..n] {
+            return Ok(false);
+        }
+        left -= n as u64;
+    }
+    // Neither holds more.
+    Ok(held.read(&mut [0]).map_err(read_error)? == 0 && other.read(&mut [0])? == 0)
 }
 
 /// The bytes of the file at `path`, if it holds no more than `limit`.
@@ -229,13 +357,18 @@ fn read_limited(path: &Path, limit: u64) -> Result<Vec<u8>, PackError> {
     read_sized(File::open(path)?, limit, &path.display().to_string())
 }
 
-/// How an entry called `name` is written: pictures and fonts as they are, anything else compressed.
-fn entry_options(name: &str) -> SimpleFileOptions {
+/// From this size on an entry is written in the zip's large-file form, which an entry of 4 GB or
+/// more needs, so that nothing near the edge is written in the other.
+const LARGE_FORM_FROM: u64 = 0xFFFF_FFFF - 64 * 1024 * 1024;
+
+/// How an entry called `name`, of `len` bytes, is written: pictures, fonts and the large kinds as
+/// they are, anything else compressed.
+fn entry_options(name: &str, len: u64) -> SimpleFileOptions {
     let extension = name
         .rsplit_once('.')
         .map(|(_, e)| e.to_ascii_lowercase())
         .unwrap_or_default();
-    let method = if STORED_EXTENSIONS.contains(&extension.as_str()) {
+    let method = if STORED_EXTENSIONS.contains(&extension.as_str()) || is_large_kind(name) {
         CompressionMethod::Stored
     } else {
         CompressionMethod::Deflated
@@ -244,14 +377,74 @@ fn entry_options(name: &str) -> SimpleFileOptions {
         .compression_method(method)
         .last_modified_time(DateTime::default())
         .unix_permissions(0o644)
+        .large_file(len >= LARGE_FORM_FROM)
+}
+
+/// `buf.len()` bytes of `file` from `offset` on, or as many as there are, read without moving
+/// anything another reader of the same file depends on.
+fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_at(file, buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::FileExt::seek_read(file, buf, offset)
+    }
+}
+
+/// A part of a pack's file, read by place, so that any number of these can read the one file at
+/// once, each from where it is. The whole file is one too, for reading the pack's own index.
+struct PackReader {
+    file: Arc<File>,
+    start: u64,
+    len: u64,
+    at: u64,
+}
+
+impl PackReader {
+    fn new(file: Arc<File>, start: u64, len: u64) -> PackReader {
+        PackReader { file, start, len, at: 0 }
+    }
+}
+
+impl Read for PackReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.at >= self.len || buf.is_empty() {
+            return Ok(0);
+        }
+        let want = (self.len - self.at).min(buf.len() as u64) as usize;
+        // A file cut short under it reads as ending early, which whatever reads it then finds.
+        let n = read_at(&self.file, &mut buf[..want], self.start + self.at)?;
+        self.at += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for PackReader {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        let at = match to {
+            SeekFrom::Start(at) => Some(at),
+            SeekFrom::End(by) => self.len.checked_add_signed(by),
+            SeekFrom::Current(by) => self.at.checked_add_signed(by),
+        };
+        self.at = at.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "a place before the start"))?;
+        Ok(self.at)
+    }
 }
 
 /// A packed talk, read on demand.
 pub struct PackedFiles {
-    zip: Mutex<ZipArchive<File>>,
+    zip: Mutex<ZipArchive<PackReader>>,
+    /// The pack's file, as it was opened, for reading entries in place.
+    pack: Arc<File>,
+    pack_len: u64,
     /// File name to its place in the zip.
     index: HashMap<String, usize>,
     directories: Vec<String>,
+    /// The files of a large kind stored as they are, which are held to the pack's own length
+    /// rather than to its limits.
+    in_place: HashSet<String>,
     entry_bytes: u64,
     total_bytes: u64,
 }
@@ -277,7 +470,9 @@ pub fn open_packed(path: &Path) -> Result<PackedFiles, PackError> {
 }
 
 pub fn open_packed_limited(path: &Path, limits: PackLimits) -> Result<PackedFiles, PackError> {
-    let mut zip = ZipArchive::new(File::open(path)?)?;
+    let pack = Arc::new(File::open(path)?);
+    let pack_len = pack.metadata()?.len();
+    let mut zip = ZipArchive::new(PackReader::new(pack.clone(), 0, pack_len))?;
     // First, so that one of these gets its own message and not a complaint about what's in it.
     if zip.index_for_name(STAGEPACK_MANIFEST).is_some() && zip.index_for_name(MANIFEST_NAME).is_none() {
         return Err(PackError::SlidevTalk);
@@ -294,6 +489,7 @@ pub fn open_packed_limited(path: &Path, limits: PackLimits) -> Result<PackedFile
     // Every name is checked before any entry is read.
     let mut index = HashMap::new();
     let mut directories = Vec::new();
+    let mut in_place = HashSet::new();
     let mut total = 0u64;
     for i in 0..zip.len() {
         let entry = zip.by_index_data(i)?;
@@ -308,13 +504,21 @@ pub fn open_packed_limited(path: &Path, limits: PackLimits) -> Result<PackedFile
         if name == MANIFEST_NAME && entry.size() > MANIFEST_LIMIT {
             return Err(PackError::Corrupt("talk.json is too large".into()));
         }
-        if entry.size() > limits.entry_bytes {
-            return Err(PackError::TooLarge(format!(
-                "{name} is bigger than {} bytes",
-                limits.entry_bytes
-            )));
+        // A large file stored as it is can't hold more than the pack does, as is checked below,
+        // so it isn't counted with the rest. Compressed, it could say anything, so it is.
+        let stored_large = is_large_kind(&name) && entry.compression() == CompressionMethod::Stored;
+        let limit = if stored_large { MAX_LARGE_FILE } else { limits.entry_bytes };
+        if entry.size() > limit {
+            return Err(PackError::TooLarge(format!("{name} is bigger than {limit} bytes")));
         }
-        total = total.saturating_add(entry.size());
+        if stored_large {
+            if entry.size() != entry.compressed_size() || entry.encrypted() {
+                return Err(PackError::Corrupt(format!("{name} isn't stored as it says")));
+            }
+            in_place.insert(name.clone());
+        } else {
+            total = total.saturating_add(entry.size());
+        }
         if total > limits.total_bytes {
             return Err(PackError::TooLarge(format!(
                 "it holds more than {} bytes",
@@ -322,6 +526,11 @@ pub fn open_packed_limited(path: &Path, limits: PackLimits) -> Result<PackedFile
             )));
         }
         index.insert(name, i);
+    }
+    // What each entry says it holds is held to the pack's own length: no entry runs into another,
+    // or into the index at the end, or past the end of the file.
+    if zip.has_overlapping_entries()? {
+        return Err(PackError::Corrupt("a file in it says it holds more than there is".into()));
     }
     let Some(&manifest_at) = index.get(MANIFEST_NAME) else {
         return Err(PackError::NotATalk);
@@ -353,8 +562,11 @@ pub fn open_packed_limited(path: &Path, limits: PackLimits) -> Result<PackedFile
     }
     Ok(PackedFiles {
         zip: Mutex::new(zip),
+        pack,
+        pack_len,
         index,
         directories,
+        in_place,
         entry_bytes: limits.entry_bytes,
         total_bytes: limits.total_bytes,
     })
@@ -376,12 +588,16 @@ impl PackedFiles {
         names
     }
 
+    fn zip(&self) -> std::sync::MutexGuard<'_, ZipArchive<PackReader>> {
+        self.zip.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// `path` as it is in the pack, read with the limits of the pack.
     fn read_checked(&self, path: &str) -> Result<Option<Vec<u8>>, PackError> {
         let Some(&i) = self.index.get(path) else {
             return Ok(None);
         };
-        let mut zip = self.zip.lock().unwrap_or_else(|e| e.into_inner());
+        let mut zip = self.zip();
         let entry = zip.by_index(i)?;
         let size = entry.size();
         if size > self.entry_bytes {
@@ -392,6 +608,20 @@ impl PackedFiles {
         }
         read_sized(entry, size, path).map(Some)
     }
+
+    /// Whether the pack's file `path` holds what `source` does, compared a piece at a time.
+    fn holds(&self, path: &str, source: Source<'_>) -> Result<bool, PackError> {
+        let &i = self.index.get(path).ok_or_else(|| PackError::Corrupt(format!("{path} is missing")))?;
+        let mut zip = self.zip();
+        let mut entry = zip.by_index(i)?;
+        let size = entry.size();
+        same_content(&mut entry, size, source)
+    }
+
+    /// Whether what `name` holds counts toward the pack's total.
+    fn counted(&self, name: &str) -> bool {
+        !self.in_place.contains(name)
+    }
 }
 
 impl TalkFiles for PackedFiles {
@@ -399,10 +629,29 @@ impl TalkFiles for PackedFiles {
         self.read_checked(&normalise(path)?).ok().flatten()
     }
 
+    /// An entry stored as it is, read where it lies in the pack, by its own reader. A compressed
+    /// one can't be read so, and gives `None`. The checksum isn't asked, as it's only known once
+    /// the whole entry has been read.
+    fn open(&self, path: &str) -> Option<Box<dyn ReadSeek>> {
+        let &i = self.index.get(&normalise(path)?)?;
+        let (start, len) = {
+            let mut zip = self.zip();
+            let entry = zip.by_index_raw(i).ok()?;
+            let stored = entry.compression() == CompressionMethod::Stored && !entry.encrypted();
+            if !stored || entry.size() != entry.compressed_size() {
+                return None;
+            }
+            (entry.data_start()?, entry.compressed_size())
+        };
+        // Held to the file as it is, whatever the entry says.
+        let end = start.checked_add(len)?;
+        (end <= self.pack_len).then(|| Box::new(PackReader::new(self.pack.clone(), start, len)) as Box<dyn ReadSeek>)
+    }
+
     /// The size the entry states, which was held to the pack's limits when it opened.
     fn len(&self, path: &str) -> Option<u64> {
         let &i = self.index.get(&normalise(path)?)?;
-        let zip = self.zip.lock().unwrap_or_else(|e| e.into_inner());
+        let zip = self.zip();
         let size = zip.by_index_data(i).ok()?.size();
         Some(size)
     }
@@ -540,37 +789,26 @@ fn manifest_for(app_version: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// Holds what goes in from a folder to the limits of a pack: how many files, and how big each
-/// is and all are. `slides`, if given, is what `slides.md` will hold in place of the file.
-fn check_sizes(
-    files: &[(String, std::path::PathBuf)],
-    slides: Option<&str>,
-    extra: &[&NewFile],
-    limits: PackLimits,
-) -> Result<(), PackError> {
-    if files.len() + extra.len() + 1 > limits.entries {
+/// Holds what goes in to the limits of a pack: how many files, and how big each is and all are.
+/// `own` is the talk's own files, with `slides.md` as it will be, and `extra` what's added. A file
+/// of a large kind can hold up to [`MAX_LARGE_FILE`], and as it's stored as it is, it isn't counted
+/// with the rest.
+fn check_sizes(own: &[(&str, Source<'_>)], extra: &[Added<'_>], limits: PackLimits) -> Result<(), PackError> {
+    if own.len() + extra.len() + 1 > limits.entries {
         return Err(PackError::TooLarge(format!(
             "it would hold more than {} files",
             limits.entries
         )));
     }
     let mut total = 0u64;
-    let sizes = files.iter().map(|(name, path)| {
-        let size = match slides {
-            Some(slides) if name == SLIDES_NAME => slides.len() as u64,
-            _ => std::fs::metadata(path)?.len(),
-        };
-        Ok::<_, PackError>((name, size))
-    });
-    let extra_sizes = extra.iter().map(|(name, bytes)| Ok((name, bytes.len() as u64)));
-    for sized in sizes.chain(extra_sizes) {
-        let (name, size) = sized?;
-        total = total.saturating_add(size);
-        if size > limits.entry_bytes {
-            return Err(PackError::TooLarge(format!(
-                "{name} is bigger than {} bytes",
-                limits.entry_bytes
-            )));
+    let sizes = own.iter().map(|(name, source)| (*name, source.len()));
+    for (name, size) in sizes.chain(extra.iter().map(|added| (added.name, added.source.len()))) {
+        let limit = limit_for(name, limits.entry_bytes);
+        if size > limit {
+            return Err(PackError::TooLarge(format!("{name} is bigger than {limit} bytes")));
+        }
+        if !is_large_kind(name) {
+            total = total.saturating_add(size);
         }
         if total > limits.total_bytes {
             return Err(PackError::TooLarge(format!(
@@ -583,33 +821,164 @@ fn check_sizes(
 }
 
 /// Whether `extra`, as [`new_files`] gives it, replaces the talk's own build index.
-fn replaces_index(extra: &[&NewFile]) -> bool {
-    extra.iter().any(|(name, _)| name == INDEX_FILE)
+fn replaces_index(extra: &[Added<'_>]) -> bool {
+    extra.iter().any(|added| added.name == INDEX_FILE)
 }
 
-/// `files`, without the talk's own build index if `extra` replaces it.
-fn without_replaced_index(files: &[(String, std::path::PathBuf)], extra: &[&NewFile]) -> Vec<(String, std::path::PathBuf)> {
-    files.iter().filter(|(name, _)| !replaces_index(extra) || name != INDEX_FILE).cloned().collect()
+/// The files of the talk in a folder, as `collect` found them, each looked at to be copied, with
+/// `slides` as its `slides.md` if given, and without its own build index if `extra` replaces it.
+fn own_files<'a>(
+    found: &'a [(String, PathBuf)],
+    slides: Option<&'a str>,
+    extra: &[Added<'_>],
+) -> Result<Vec<(&'a str, Source<'a>)>, PackError> {
+    found
+        .iter()
+        .filter(|(name, _)| !replaces_index(extra) || name != INDEX_FILE)
+        .map(|(name, path)| match slides {
+            Some(slides) if name == SLIDES_NAME => Ok((name.as_str(), Source::Bytes(slides.as_bytes()))),
+            _ => Ok((name.as_str(), on_disk(path)?)),
+        })
+        .collect()
 }
 
-/// The files of `extra` that the talk whose files are `files` doesn't have yet, as [`new_files`]
+/// The files of `extra` that the talk whose files are `found` doesn't have yet, as [`new_files`]
 /// finds them.
 fn new_folder_files<'a>(
-    files: &[(String, std::path::PathBuf)],
-    extra: &'a [NewFile],
+    found: &[(String, PathBuf)],
+    extra: &[(&'a str, Given<'a>)],
     limits: PackLimits,
-) -> Result<Vec<&'a NewFile>, PackError> {
-    let names: Vec<String> = files.iter().map(|(name, _)| name.clone()).collect();
-    let read = |name: &str| {
-        let (_, path) = files.iter().find(|(there, _)| there == name).expect("a name from the list");
-        read_limited(path, limits.entry_bytes)
+) -> Result<Vec<Added<'a>>, PackError> {
+    let names: Vec<String> = found.iter().map(|(name, _)| name.clone()).collect();
+    let same = |name: &str, source: Source<'_>| {
+        let (_, path) = found.iter().find(|(there, _)| there == name).expect("a name from the list");
+        let mut file = File::open(path)?;
+        let len = file.metadata()?.len();
+        same_content(&mut file, len, source)
     };
-    new_files(&names, read, extra, limits.entry_bytes)
+    new_files(&names, same, extra, limits.entry_bytes)
+}
+
+/// Bytes are copied this many at a time at most, so that a stop asked for is seen soon and
+/// nothing large is ever held.
+const PIECE: usize = 1024 * 1024;
+
+/// Stands for a stop that was asked for, while it's passed along as an error of the disk.
+#[derive(Debug)]
+struct StopAsked;
+
+impl fmt::Display for StopAsked {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "it was stopped")
+    }
+}
+
+impl std::error::Error for StopAsked {}
+
+fn is_stop(e: &std::io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<StopAsked>())
+}
+
+/// The error for `what`, a file on disk, which changed or went while it was copied.
+fn changed(what: &str) -> PackError {
+    PackError::Io(std::io::Error::other(format!("{what} changed while it was copied")))
+}
+
+/// How far a write has got, told as it goes, and whether it's been asked to stop.
+struct Moving<'a> {
+    progress: &'a dyn Fn(u64, u64),
+    stop: &'a AtomicBool,
+    done: u64,
+    total: u64,
+    piece: Vec<u8>,
+}
+
+impl<'a> Moving<'a> {
+    fn new(progress: &'a dyn Fn(u64, u64), stop: &'a AtomicBool, total: u64) -> Moving<'a> {
+        Moving { progress, stop, done: 0, total, piece: Vec::new() }
+    }
+
+    fn check(&self) -> Result<(), PackError> {
+        if self.stop.load(Ordering::SeqCst) { Err(PackError::Stopped) } else { Ok(()) }
+    }
+
+    fn moved(&mut self, bytes: u64) {
+        self.done = self.done.saturating_add(bytes);
+        (self.progress)(self.done, self.total);
+    }
+
+    /// Copies what `from` holds, which is to be `len` bytes, to `to`, a piece at a time. If it
+    /// holds more or less, nothing more is written and it's an error: damage in a pack, if
+    /// `from_pack`, and otherwise a file that changed while it was copied.
+    fn copy(&mut self, from: &mut dyn Read, to: &mut dyn Write, len: u64, what: &str, from_pack: bool) -> Result<(), PackError> {
+        if self.piece.is_empty() {
+            self.piece = vec![0; PIECE];
+        }
+        let mut copied = 0u64;
+        loop {
+            self.check()?;
+            // One more than is left, to find one that holds more.
+            let want = (len - copied).saturating_add(1).min(PIECE as u64) as usize;
+            let n = match from.read(&mut self.piece[..want]) {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if from_pack => return Err(read_error(e)),
+                Err(e) => return Err(e.into()),
+            };
+            if n == 0 {
+                break;
+            }
+            copied += n as u64;
+            if copied > len {
+                break;
+            }
+            to.write_all(&self.piece[..n])?;
+            self.moved(n as u64);
+        }
+        match (copied == len, from_pack) {
+            (true, _) => Ok(()),
+            (false, true) => Err(PackError::Corrupt(format!("{what} doesn't hold what it says"))),
+            (false, false) => Err(changed(what)),
+        }
+    }
+
+    /// Copies `source`, the bytes of `what`, to `to`, a piece at a time.
+    fn copy_source(&mut self, source: Source<'_>, to: &mut dyn Write, what: &str) -> Result<(), PackError> {
+        match source {
+            Source::Bytes(mut bytes) => self.copy(&mut bytes, to, source.len(), what, false),
+            Source::At(path, len, modified) => {
+                let mut file = File::open(path).map_err(|_| changed(what))?;
+                self.copy(&mut file, to, len, what, false)?;
+                // Gone, or changed in place, since it was looked at, it isn't what was meant.
+                let now = std::fs::metadata(path).map_err(|_| changed(what))?;
+                if now.len() != len || now.modified().ok() != modified {
+                    return Err(changed(what));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Writes `entries` into the file `out` as a pack, in their order, each as [`entry_options`] has it.
+fn write_entries(out: &mut File, entries: &[(&str, Source<'_>)], moving: &mut Moving<'_>) -> Result<(), PackError> {
+    let mut zip = ZipWriter::new(out);
+    for &(name, source) in entries {
+        moving.check()?;
+        zip.start_file(name, entry_options(name, source.len())).map_err(io_other)?;
+        moving.copy_source(source, &mut zip, name)?;
+    }
+    zip.finish().map_err(io_other)?;
+    Ok(())
+}
+
+fn total_of(entries: &[(&str, Source<'_>)]) -> u64 {
+    entries.iter().map(|(_, source)| source.len()).sum()
 }
 
 /// Packs the talk in `folder` into the file `out`, replacing it only if packing succeeds.
 pub fn pack_folder(folder: &Path, out: &Path, app_version: &str) -> Result<PackReport, PackError> {
-    pack(folder, out, None, app_version, &[])
+    pack(folder, out, None, app_version, &[], &|_, _| {}, &AtomicBool::new(false))
 }
 
 /// Packs the talk in `folder` into the file `out` as [`pack_folder`] does, with `slides` as its
@@ -622,14 +991,22 @@ pub fn pack_folder_with_slides(
     app_version: &str,
     extra: &[NewFile],
 ) -> Result<PackReport, PackError> {
-    pack(folder, out, Some(slides), app_version, extra)
+    pack(folder, out, Some(slides), app_version, &given_bytes(extra), &|_, _| {}, &AtomicBool::new(false))
 }
 
-/// What an entry of a pack being made holds.
-enum Content<'a> {
-    File(&'a Path),
-    Bytes(&'a [u8]),
-    Manifest,
+/// Packs the talk in `folder` as [`pack_folder_with_slides`] does, with the files of `extra` taken
+/// from where they're given. Every file is copied a piece at a time, telling `progress` the bytes
+/// done and the bytes in all as it goes; if `stop` is set, it stops, and `out` is as it was.
+pub fn pack_folder_with_slides_from(
+    folder: &Path,
+    out: &Path,
+    slides: &str,
+    app_version: &str,
+    extra: &[NewFileFrom],
+    progress: &dyn Fn(u64, u64),
+    stop: &AtomicBool,
+) -> Result<PackReport, PackError> {
+    pack(folder, out, Some(slides), app_version, &given_from(extra), progress, stop)
 }
 
 fn pack(
@@ -637,13 +1014,16 @@ fn pack(
     out: &Path,
     slides: Option<&str>,
     app_version: &str,
-    extra: &[NewFile],
+    extra: &[(&str, Given<'_>)],
+    progress: &dyn Fn(u64, u64),
+    stop: &AtomicBool,
 ) -> Result<PackReport, PackError> {
     let mut skipped = Vec::new();
-    let files = collect(folder, &mut skipped)?;
+    let found = collect(folder, &mut skipped)?;
     let limits = PackLimits::default();
-    let extra = new_folder_files(&files, extra, limits)?;
-    check_sizes(&without_replaced_index(&files, &extra), slides, &extra, limits)?;
+    let extra = new_folder_files(&found, extra, limits)?;
+    let own = own_files(&found, slides, &extra)?;
+    check_sizes(&own, &extra, limits)?;
     let manifest = manifest_for(app_version);
     // Read once, so that what's packed and what's reported come from the same text.
     let source = match slides {
@@ -651,48 +1031,22 @@ fn pack(
         None => std::fs::read_to_string(folder.join(SLIDES_NAME)).unwrap_or_default(),
     };
 
-    let own_index = !replaces_index(&extra);
-    let mut entries: Vec<(&str, Content)> = files
-        .iter()
-        .filter(|(name, _)| own_index || name != INDEX_FILE)
-        .map(|(name, path)| match slides {
-            Some(slides) if name == SLIDES_NAME => (name.as_str(), Content::Bytes(slides.as_bytes())),
-            _ => (name.as_str(), Content::File(path)),
-        })
-        .chain(extra.iter().map(|(name, bytes)| (name.as_str(), Content::Bytes(bytes))))
-        .collect();
-    entries.push((MANIFEST_NAME, Content::Manifest));
+    let mut entries: Vec<(&str, Source)> = own;
+    entries.extend(extra.iter().map(|added| (added.name, added.source)));
+    entries.push((MANIFEST_NAME, Source::Bytes(&manifest)));
     entries.sort_by_key(|(name, _)| *name);
 
-    write_atomically(out, |file| {
-        let mut zip = ZipWriter::new(file);
-        for (name, content) in &entries {
-            zip.start_file(*name, entry_options(name)).map_err(io_other)?;
-            match content {
-                Content::Manifest => zip.write_all(&manifest)?,
-                Content::Bytes(bytes) => zip.write_all(bytes)?,
-                Content::File(path) => {
-                    // Bounded, in case the file grows while it is read.
-                    let mut reader = File::open(path)?.take(limits.entry_bytes + 1);
-                    let copied = std::io::copy(&mut reader, &mut zip)?;
-                    if copied > limits.entry_bytes {
-                        return Err(std::io::Error::other(format!("{name} is too large")));
-                    }
-                }
-            }
-        }
-        zip.finish().map_err(io_other)?;
-        Ok(())
-    })?;
+    let mut moving = Moving::new(progress, stop, total_of(&entries));
+    atomically(out, |file| write_entries(file, &entries, &mut moving))?;
     Ok(PackReport { skipped, outside_pictures: pictures_outside(folder, &source) })
 }
 
 /// The files of `files`, which a talk made whole from them holds besides `slides.md`, checked as
 /// a pack and a copy of a folder check theirs: each a file a talk can hold, none twice, and all
 /// within the limits.
-fn whole_talk_files<'a>(slides: &str, files: &'a [NewFile], limits: PackLimits) -> Result<Vec<&'a NewFile>, PackError> {
-    let files = new_files(&[], |name| Err(PackError::Corrupt(format!("{name} is missing"))), files, limits.entry_bytes)?;
-    check_sizes(&[], Some(slides), &files, limits)?;
+fn whole_talk_files<'a>(files: &[(&'a str, Given<'a>)], limits: PackLimits) -> Result<Vec<Added<'a>>, PackError> {
+    let files = new_files(&[], |name, _| Err(PackError::Corrupt(format!("{name} is missing"))), files, limits.entry_bytes)?;
+    check_sizes(&[], &files, limits)?;
     Ok(files)
 }
 
@@ -702,23 +1056,39 @@ fn whole_talk_files<'a>(slides: &str, files: &'a [NewFile], limits: PackLimits) 
 /// `out` is replaced only by a whole pack. Each of `files` must be one a pack can hold, as
 /// [`repack_with_slides`] asks of the files it adds.
 pub fn pack_new(out: &Path, slides: &str, app_version: &str, files: &[NewFile]) -> Result<(), PackError> {
-    let limits = PackLimits::default();
-    let files = whole_talk_files(slides, files, limits)?;
+    pack_new_given(out, slides, app_version, &given_bytes(files), &|_, _| {}, &AtomicBool::new(false))
+}
+
+/// Writes a talk as a pack as [`pack_new`] does, with `files` taken from where they're given,
+/// a piece at a time, telling `progress` the bytes done and the bytes in all as it goes. If `stop`
+/// is set, it stops, and `out` is as it was.
+pub fn pack_new_from(
+    out: &Path,
+    slides: &str,
+    app_version: &str,
+    files: &[NewFileFrom],
+    progress: &dyn Fn(u64, u64),
+    stop: &AtomicBool,
+) -> Result<(), PackError> {
+    pack_new_given(out, slides, app_version, &given_from(files), progress, stop)
+}
+
+fn pack_new_given(
+    out: &Path,
+    slides: &str,
+    app_version: &str,
+    files: &[(&str, Given<'_>)],
+    progress: &dyn Fn(u64, u64),
+    stop: &AtomicBool,
+) -> Result<(), PackError> {
+    let files = whole_talk_files(files, PackLimits::default())?;
     let manifest = manifest_for(app_version);
-    let mut entries: Vec<(&str, &[u8])> = files.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())).collect();
-    entries.push((SLIDES_NAME, slides.as_bytes()));
-    entries.push((MANIFEST_NAME, &manifest));
+    let mut entries: Vec<(&str, Source)> = files.iter().map(|added| (added.name, added.source)).collect();
+    entries.push((SLIDES_NAME, Source::Bytes(slides.as_bytes())));
+    entries.push((MANIFEST_NAME, Source::Bytes(&manifest)));
     entries.sort_by_key(|(name, _)| *name);
-    write_atomically(out, |file| {
-        let mut zip = ZipWriter::new(file);
-        for (name, bytes) in &entries {
-            zip.start_file(*name, entry_options(name)).map_err(io_other)?;
-            zip.write_all(bytes)?;
-        }
-        zip.finish().map_err(io_other)?;
-        Ok(())
-    })?;
-    Ok(())
+    let mut moving = Moving::new(progress, stop, total_of(&entries));
+    atomically(out, |file| write_entries(file, &entries, &mut moving))
 }
 
 /// Writes a talk, made of `slides` and `files`, as the folder `to`, which must be missing or
@@ -726,19 +1096,43 @@ pub fn pack_new(out: &Path, slides: &str, app_version: &str, files: &[NewFile]) 
 /// has no talk in it. Each of `files` must be one a pack can hold, as for [`pack_new`]. A
 /// failure leaves `to` as it was found.
 pub fn write_new_folder(to: &Path, slides: &str, files: &[NewFile]) -> Result<(), PackError> {
-    let files = whole_talk_files(slides, files, PackLimits::default())?;
+    write_new_folder_given(to, slides, &given_bytes(files), &|_, _| {}, &AtomicBool::new(false))
+}
+
+/// Writes a talk as the folder `to` as [`write_new_folder`] does, with `files` taken from where
+/// they're given, a piece at a time, telling `progress` the bytes done and the bytes in all as it
+/// goes. If `stop` is set, it stops, and `to` is as it was found.
+pub fn write_new_folder_from(
+    to: &Path,
+    slides: &str,
+    files: &[NewFileFrom],
+    progress: &dyn Fn(u64, u64),
+    stop: &AtomicBool,
+) -> Result<(), PackError> {
+    write_new_folder_given(to, slides, &given_from(files), progress, stop)
+}
+
+fn write_new_folder_given(
+    to: &Path,
+    slides: &str,
+    files: &[(&str, Given<'_>)],
+    progress: &dyn Fn(u64, u64),
+    stop: &AtomicBool,
+) -> Result<(), PackError> {
+    let files = whole_talk_files(files, PackLimits::default())?;
     let existed = missing_or_empty(to)?;
+    let total = files.iter().map(|added| added.source.len()).sum::<u64>() + slides.len() as u64;
+    let mut moving = Moving::new(progress, stop, total);
     let result = (|| {
         std::fs::create_dir_all(to)?;
-        for (name, bytes) in files.iter().copied() {
-            let target = target_in(to, name)?;
+        for added in &files {
+            let target = target_in(to, added.name)?;
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            write_new_atomically(&target, bytes)?;
+            new_atomically(&target, |file| moving.copy_source(added.source, file, added.name))?;
         }
-        write_new_atomically(&target_in(to, SLIDES_NAME)?, slides.as_bytes())?;
-        Ok(())
+        new_atomically(&target_in(to, SLIDES_NAME)?, |file| moving.copy_source(Source::Bytes(slides.as_bytes()), file, SLIDES_NAME))
     })();
     if result.is_err() {
         clear_away(to, existed);
@@ -749,17 +1143,38 @@ pub fn write_new_folder(to: &Path, slides: &str, files: &[NewFile]) -> Result<()
 /// Unpacks a packed talk into `folder`, which must be missing or empty. `talk.json` isn't
 /// written, since packing makes a new one. A failure leaves `folder` as it was.
 pub fn unpack_to_folder(packed: &Path, folder: &Path) -> Result<(), PackError> {
-    unpack(packed, folder, None, &[])
+    unpack(packed, folder, None, &[], &|_, _| {}, &AtomicBool::new(false))
 }
 
 /// Unpacks a packed talk into `folder` as [`unpack_to_folder`] does, with `slides` as its
 /// `slides.md` in place of the one in the pack, and the files of `extra` as well, as
 /// [`repack_with_slides`] adds them.
 pub fn unpack_with_slides(packed: &Path, folder: &Path, slides: &str, extra: &[NewFile]) -> Result<(), PackError> {
-    unpack(packed, folder, Some(slides), extra)
+    unpack(packed, folder, Some(slides), &given_bytes(extra), &|_, _| {}, &AtomicBool::new(false))
 }
 
-fn unpack(packed: &Path, folder: &Path, slides: Option<&str>, extra: &[NewFile]) -> Result<(), PackError> {
+/// Unpacks a packed talk as [`unpack_with_slides`] does, with the files of `extra` taken from where
+/// they're given. Every file is copied a piece at a time, telling `progress` the bytes done and
+/// the bytes in all as it goes; if `stop` is set, it stops, and `folder` is as it was.
+pub fn unpack_with_slides_from(
+    packed: &Path,
+    folder: &Path,
+    slides: &str,
+    extra: &[NewFileFrom],
+    progress: &dyn Fn(u64, u64),
+    stop: &AtomicBool,
+) -> Result<(), PackError> {
+    unpack(packed, folder, Some(slides), &given_from(extra), progress, stop)
+}
+
+fn unpack(
+    packed: &Path,
+    folder: &Path,
+    slides: Option<&str>,
+    extra: &[(&str, Given<'_>)],
+    progress: &dyn Fn(u64, u64),
+    stop: &AtomicBool,
+) -> Result<(), PackError> {
     let files = open_packed(packed)?;
     // Only what a talk is made of is written: not `.git/config` and the like.
     let under_a_folder =
@@ -779,10 +1194,10 @@ fn unpack(packed: &Path, folder: &Path, slides: Option<&str>, extra: &[NewFile])
             files.entry_bytes
         )));
     }
-    let read = |name: &str| files.read_checked(name)?.ok_or_else(|| PackError::Corrupt(format!("{name} is missing")));
-    let extra = new_files(&files.names(), read, extra, files.entry_bytes)?;
+    let extra = new_files(&files.names(), |name, source| files.holds(name, source), extra, files.entry_bytes)?;
     let existed = missing_or_empty(folder)?;
-    let result = unpack_into(&files, folder, slides, &extra);
+    let mut moving = Moving::new(progress, stop, 0);
+    let result = unpack_into(&files, folder, slides, &extra, &mut moving);
     if result.is_err() {
         clear_away(folder, existed);
     }
@@ -836,54 +1251,77 @@ fn target_in(folder: &Path, name: &str) -> Result<std::path::PathBuf, PackError>
         .ok_or_else(|| PackError::UnsafeName(name.to_string()))
 }
 
-/// Writes `bytes` as the new file `target`, making the folders it's in.
-fn write_new(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// The new file `target`, made with the folders it's in, to be written.
+fn create_new(target: &Path) -> std::io::Result<File> {
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut file = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(target)?;
-    file.write_all(bytes)
+        .open(target)
 }
 
 /// `slides.md` is written last, so that a folder cut short has no talk in it rather than a
-/// talk missing some of its files.
-fn unpack_into(files: &PackedFiles, folder: &Path, slides: Option<&str>, extra: &[&NewFile]) -> Result<(), PackError> {
+/// talk missing some of its files. Every file is copied from the pack a piece at a time.
+fn unpack_into(
+    files: &PackedFiles,
+    folder: &Path,
+    slides: Option<&str>,
+    extra: &[Added<'_>],
+    moving: &mut Moving<'_>,
+) -> Result<(), PackError> {
+    let own_index = !replaces_index(extra);
+    let mut names = files.names();
+    names.retain(|name| name != MANIFEST_NAME && name != SLIDES_NAME && (own_index || name != INDEX_FILE));
+    let slides_len = match slides {
+        Some(slides) => slides.len() as u64,
+        None => files.len(SLIDES_NAME).unwrap_or(0),
+    };
+    // What's written is held to the pack's total, all but the large files stored as they are.
+    let held: u64 = names.iter().filter(|name| files.counted(name)).filter_map(|name| files.len(name)).sum();
+    let added: u64 = extra.iter().filter(|added| !is_large_kind(added.name)).map(|added| added.source.len()).sum();
+    if held.saturating_add(added).saturating_add(slides_len) > files.total_bytes {
+        return Err(PackError::TooLarge(format!(
+            "it holds more than {} bytes",
+            files.total_bytes
+        )));
+    }
+    let every: u64 = names.iter().filter_map(|name| files.len(name)).sum();
+    moving.total = every + extra.iter().map(|added| added.source.len()).sum::<u64>() + slides_len;
+
     std::fs::create_dir_all(folder)?;
     for directory in &files.directories {
         std::fs::create_dir_all(target_in(folder, directory)?)?;
     }
-    let mut written = 0u64;
-    let mut write = |name: &str, bytes: &[u8]| {
-        written = written.saturating_add(bytes.len() as u64);
-        if written > files.total_bytes {
-            return Err(PackError::TooLarge(format!(
-                "it holds more than {} bytes",
-                files.total_bytes
-            )));
-        }
-        write_new(&target_in(folder, name)?, bytes).map_err(PackError::from)
-    };
-    let read = |name: &str| {
-        files
-            .read_checked(name)?
-            .ok_or_else(|| PackError::Corrupt(format!("{name} is missing")))
-    };
-    let own_index = !replaces_index(extra);
-    let mut names = files.names();
-    names.retain(|name| name != MANIFEST_NAME && name != SLIDES_NAME && (own_index || name != INDEX_FILE));
-    for name in names {
-        write(&name, &read(&name)?)?;
+    for name in &names {
+        unpack_entry(files, folder, name, moving)?;
     }
-    for (name, bytes) in extra {
-        write(name, bytes)?;
+    for added in extra {
+        let mut file = create_new(&target_in(folder, added.name)?)?;
+        moving.copy_source(added.source, &mut file, added.name)?;
     }
     match slides {
-        Some(slides) => write(SLIDES_NAME, slides.as_bytes()),
-        None => write(SLIDES_NAME, &read(SLIDES_NAME)?),
+        Some(slides) => {
+            let mut file = create_new(&target_in(folder, SLIDES_NAME)?)?;
+            moving.copy_source(Source::Bytes(slides.as_bytes()), &mut file, SLIDES_NAME)
+        }
+        None => unpack_entry(files, folder, SLIDES_NAME, moving),
     }
+}
+
+/// Writes the pack's file `name` as the new file of that name in `folder`, a piece at a time.
+fn unpack_entry(files: &PackedFiles, folder: &Path, name: &str, moving: &mut Moving<'_>) -> Result<(), PackError> {
+    let &i = files.index.get(name).ok_or_else(|| PackError::Corrupt(format!("{name} is missing")))?;
+    let mut zip = files.zip();
+    let mut entry = zip.by_index(i)?;
+    let size = entry.size();
+    let limit = if files.counted(name) { files.entry_bytes } else { MAX_LARGE_FILE };
+    if size > limit {
+        return Err(PackError::TooLarge(format!("{name} is bigger than {limit} bytes")));
+    }
+    let mut file = create_new(&target_in(folder, name)?)?;
+    moving.copy(&mut entry, &mut file, size, name, true)
 }
 
 /// Copies the packed talk `packed` into the file `out`, with `slides` as its `slides.md` and a
@@ -901,6 +1339,62 @@ pub fn repack_with_slides(
     app_version: &str,
     extra: &[NewFile],
 ) -> Result<(), PackError> {
+    repack(packed, out, slides, app_version, &given_bytes(extra), &|_, _| {}, &AtomicBool::new(false))
+}
+
+/// Copies a packed talk as [`repack_with_slides`] does, with the files of `extra` taken from where
+/// they're given. Every entry is copied a piece at a time, telling `progress` the bytes done and
+/// the bytes in all as it goes; if `stop` is set, it stops, and `out` is as it was.
+pub fn repack_with_slides_from(
+    packed: &Path,
+    out: &Path,
+    slides: &str,
+    app_version: &str,
+    extra: &[NewFileFrom],
+    progress: &dyn Fn(u64, u64),
+    stop: &AtomicBool,
+) -> Result<(), PackError> {
+    repack(packed, out, slides, app_version, &given_from(extra), progress, stop)
+}
+
+/// The pack being copied from, read through this so that while `counting`, the copy can be
+/// stopped and tell how far it's got.
+struct Watched<'a, 'm> {
+    inner: PackReader,
+    counting: &'a Cell<bool>,
+    moving: &'a RefCell<Moving<'m>>,
+}
+
+impl Read for Watched<'_, '_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if !self.counting.get() {
+            return self.inner.read(buf);
+        }
+        if self.moving.borrow().check().is_err() {
+            return Err(std::io::Error::other(StopAsked));
+        }
+        let want = buf.len().min(PIECE);
+        let n = self.inner.read(&mut buf[..want])?;
+        self.moving.borrow_mut().moved(n as u64);
+        Ok(n)
+    }
+}
+
+impl Seek for Watched<'_, '_> {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(to)
+    }
+}
+
+fn repack(
+    packed: &Path,
+    out: &Path,
+    slides: &str,
+    app_version: &str,
+    extra: &[(&str, Given<'_>)],
+    progress: &dyn Fn(u64, u64),
+    stop: &AtomicBool,
+) -> Result<(), PackError> {
     let files = open_packed(packed)?;
     if slides.len() as u64 > files.entry_bytes {
         return Err(PackError::TooLarge(format!(
@@ -909,8 +1403,7 @@ pub fn repack_with_slides(
         )));
     }
     let names = files.names();
-    let read = |name: &str| files.read_checked(name)?.ok_or_else(|| PackError::Corrupt(format!("{name} is missing")));
-    let extra = new_files(&names, read, extra, files.entry_bytes)?;
+    let extra = new_files(&names, |name, source| files.holds(name, source), extra, files.entry_bytes)?;
     if !extra.is_empty() {
         let limits = PackLimits::default();
         // The index that's replaced isn't kept, so it isn't counted.
@@ -918,20 +1411,38 @@ pub fn repack_with_slides(
         if names.len() + files.directories.len() + extra.len() > limits.entries {
             return Err(PackError::TooLarge(format!("it would hold more than {} files", limits.entries)));
         }
-        let held: u64 = names.iter().filter(|name| *name != SLIDES_NAME).filter_map(|name| files.len(name)).sum();
-        let added: u64 = extra.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+        let held: u64 = names.iter().filter(|name| *name != SLIDES_NAME && files.counted(name)).filter_map(|name| files.len(name)).sum();
+        let added: u64 = extra.iter().filter(|added| !is_large_kind(added.name)).map(|added| added.source.len()).sum();
         if held.saturating_add(added).saturating_add(slides.len() as u64) > files.total_bytes {
             return Err(PackError::TooLarge(format!("it would hold more than {} bytes", files.total_bytes)));
         }
     }
     let manifest = manifest_for(app_version);
     let own_index = !replaces_index(&extra);
-    write_atomically(out, move |file| {
-        let mut zip = files.zip.into_inner().unwrap_or_else(|e| e.into_inner());
+    let copied = |name: &str| name != SLIDES_NAME && name != MANIFEST_NAME && (own_index || name != INDEX_FILE);
+    let total = {
+        let zip = files.zip();
+        let mut total = 0u64;
+        for i in 0..zip.len() {
+            let entry = zip.by_index_data(i)?;
+            if copied(&entry.name()?) {
+                total = total.saturating_add(entry.compressed_size());
+            }
+        }
+        total + slides.len() as u64 + manifest.len() as u64 + extra.iter().map(|added| added.source.len()).sum::<u64>()
+    };
+    atomically(out, move |file| {
+        let PackedFiles { zip, pack, pack_len, .. } = files;
+        // Read again through a reader of its own, which can be stopped.
+        drop(zip);
+        let moving = RefCell::new(Moving::new(progress, stop, total));
+        let counting = Cell::new(false);
+        let mut zip = ZipArchive::new(Watched { inner: PackReader::new(pack, 0, pack_len), counting: &counting, moving: &moving })?;
         let mut writer = ZipWriter::new(file);
         for i in 0..zip.len() {
-            let entry = zip.by_index_raw(i).map_err(io_other)?;
-            let name = entry.name().map_err(io_other)?.to_string();
+            moving.borrow().check()?;
+            let entry = zip.by_index_raw(i)?;
+            let name = entry.name()?.to_string();
             if !own_index && name == INDEX_FILE {
                 continue;
             }
@@ -948,22 +1459,33 @@ pub fn repack_with_slides(
                         .last_modified_time(DateTime::default())
                         .unix_permissions(0o644);
                     writer.start_file(name.as_str(), options).map_err(io_other)?;
-                    writer.write_all(bytes)?;
+                    moving.borrow_mut().copy_source(Source::Bytes(bytes), &mut writer, &name)?;
                 }
-                None => writer.raw_copy_file(entry).map_err(io_other)?,
+                None => {
+                    let len = entry.compressed_size();
+                    let before = moving.borrow().done;
+                    counting.set(true);
+                    let raw = writer.raw_copy_file(entry);
+                    counting.set(false);
+                    raw?;
+                    // An entry cut short by the end of the file isn't copied as if it were whole.
+                    if moving.borrow().done - before != len {
+                        return Err(PackError::Corrupt(format!("{name} doesn't hold what it says")));
+                    }
+                }
             }
         }
-        for (name, bytes) in &extra {
-            writer.start_file(name.as_str(), entry_options(name)).map_err(io_other)?;
-            writer.write_all(bytes)?;
+        for added in &extra {
+            moving.borrow().check()?;
+            writer.start_file(added.name, entry_options(added.name, added.source.len())).map_err(io_other)?;
+            moving.borrow_mut().copy_source(added.source, &mut writer, added.name)?;
         }
         writer.finish().map_err(io_other)?;
         // The pack is let go of here, before the copy takes its place: Windows won't replace
         // a file that's open.
         drop(zip);
         Ok(())
-    })?;
-    Ok(())
+    })
 }
 
 /// Copies the talk in `from` into the folder `to`, which must be missing or empty, with
@@ -972,17 +1494,45 @@ pub fn repack_with_slides(
 /// written as well, as [`repack_with_slides`] adds them. `from` isn't touched, and a failure
 /// leaves `to` as it was.
 pub fn copy_talk_folder(from: &Path, to: &Path, slides: &str, extra: &[NewFile]) -> Result<PackReport, PackError> {
+    copy_talk(from, to, slides, &given_bytes(extra), &|_, _| {}, &AtomicBool::new(false))
+}
+
+/// Copies the talk in `from` as [`copy_talk_folder`] does, with the files of `extra` taken from
+/// where they're given. Every file is copied a piece at a time, telling `progress` the bytes done
+/// and the bytes in all as it goes; if `stop` is set, it stops, and `to` is as it was.
+pub fn copy_talk_folder_from(
+    from: &Path,
+    to: &Path,
+    slides: &str,
+    extra: &[NewFileFrom],
+    progress: &dyn Fn(u64, u64),
+    stop: &AtomicBool,
+) -> Result<PackReport, PackError> {
+    copy_talk(from, to, slides, &given_from(extra), progress, stop)
+}
+
+fn copy_talk(
+    from: &Path,
+    to: &Path,
+    slides: &str,
+    extra: &[(&str, Given<'_>)],
+    progress: &dyn Fn(u64, u64),
+    stop: &AtomicBool,
+) -> Result<PackReport, PackError> {
     if lies_within(to, from) {
         // A copy in the talk's own folders would travel in every pack made from it.
         return Err(PackError::InsideTheTalk);
     }
     let mut skipped = Vec::new();
-    let files = collect(from, &mut skipped)?;
+    let found = collect(from, &mut skipped)?;
     let limits = PackLimits::default();
-    let extra = new_folder_files(&files, extra, limits)?;
-    check_sizes(&without_replaced_index(&files, &extra), Some(slides), &extra, limits)?;
+    let extra = new_folder_files(&found, extra, limits)?;
+    let own = own_files(&found, Some(slides), &extra)?;
+    check_sizes(&own, &extra, limits)?;
     let existed = missing_or_empty(to)?;
-    let result = copy_into(&files, to, slides, &extra, limits);
+    let total = total_of(&own) + extra.iter().map(|added| added.source.len()).sum::<u64>();
+    let mut moving = Moving::new(progress, stop, total);
+    let result = copy_into(&own, to, slides, &extra, &mut moving);
     if result.is_err() {
         clear_away(to, existed);
     }
@@ -1032,42 +1582,22 @@ pub fn lies_within(path: &Path, folder: &Path) -> bool {
     full.starts_with(&folder)
 }
 
-/// `slides.md` is written last, as in [`unpack_into`].
+/// `slides.md` is written last, as in [`unpack_into`]. `own` holds it as it's to be.
 fn copy_into(
-    files: &[(String, std::path::PathBuf)],
+    own: &[(&str, Source<'_>)],
     to: &Path,
     slides: &str,
-    extra: &[&NewFile],
-    limits: PackLimits,
+    extra: &[Added<'_>],
+    moving: &mut Moving<'_>,
 ) -> Result<(), PackError> {
     std::fs::create_dir_all(to)?;
-    let own_index = !replaces_index(extra);
-    for (name, path) in files {
-        if name == SLIDES_NAME || (!own_index && name == INDEX_FILE) {
-            continue;
-        }
-        let target = target_in(to, name)?;
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&target)?;
-        // Bounded, in case the file grows while it is read.
-        let mut reader = File::open(path)?.take(limits.entry_bytes + 1);
-        if std::io::copy(&mut reader, &mut file)? > limits.entry_bytes {
-            return Err(PackError::TooLarge(format!(
-                "{name} is bigger than {} bytes",
-                limits.entry_bytes
-            )));
-        }
+    let files = own.iter().copied().filter(|(name, _)| *name != SLIDES_NAME);
+    for (name, source) in files.chain(extra.iter().map(|added| (added.name, added.source))) {
+        let mut file = create_new(&target_in(to, name)?)?;
+        moving.copy_source(source, &mut file, name)?;
     }
-    for (name, bytes) in extra {
-        write_new(&target_in(to, name)?, bytes)?;
-    }
-    write_new(&target_in(to, SLIDES_NAME)?, slides.as_bytes())?;
-    Ok(())
+    let mut file = create_new(&target_in(to, SLIDES_NAME)?)?;
+    moving.copy_source(Source::Bytes(slides.as_bytes()), &mut file, SLIDES_NAME)
 }
 
 /// Writes `out` by way of a temporary file beside it, so a failure never leaves a half-written
@@ -1076,12 +1606,17 @@ pub fn write_atomically(
     out: &Path,
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
+    atomically(out, write)
+}
+
+/// [`write_atomically`], for a `write` whose errors are of any kind the disk's can be made into.
+fn atomically<E: From<std::io::Error>>(out: &Path, write: impl FnOnce(&mut File) -> Result<(), E>) -> Result<(), E> {
     let name = out
         .file_name()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?
         .to_string_lossy();
     let (mut file, temp) = create_temp(out, &name)?;
-    let result = (|| {
+    let result = (|| -> Result<(), E> {
         write(&mut file)?;
         // A file being replaced keeps its permissions. Where they can't be set, the new content
         // still matters more.
@@ -1111,13 +1646,18 @@ pub fn write_atomically(
 /// leaves a half-written file there. Whatever is at `out` already is never replaced: that's an
 /// error of the kind `AlreadyExists`.
 pub fn write_new_atomically(out: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    new_atomically(out, |file| file.write_all(bytes))
+}
+
+/// [`write_new_atomically`], with what's written written by `write`.
+fn new_atomically<E: From<std::io::Error>>(out: &Path, write: impl FnOnce(&mut File) -> Result<(), E>) -> Result<(), E> {
     let name = out
         .file_name()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?
         .to_string_lossy();
     let (mut file, temp) = create_temp(out, &name)?;
-    let result = (|| {
-        file.write_all(bytes)?;
+    let result = (|| -> Result<(), E> {
+        write(&mut file)?;
         file.sync_all()?;
         drop(file);
         place_without_replacing(&temp, out)?;

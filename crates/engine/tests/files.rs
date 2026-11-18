@@ -268,3 +268,100 @@ fn a_path_that_leaves_the_talk_is_dropped() {
     assert_eq!(files.names_in("assets"), vec!["assets/fine.png".to_string()]);
     assert_eq!(files.read("assets/fine.png"), Some(b"ok".to_vec()));
 }
+
+// ---- Plan G1: read in pieces ----
+
+fn read_all(mut reader: Box<dyn ReadSeek>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut reader, &mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn a_folders_file_opens_and_seeks() {
+    use std::io::{Read, Seek, SeekFrom};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("assets")).unwrap();
+    let bytes: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(dir.path().join("assets/clip.mp4"), &bytes).unwrap();
+    let files = FolderFiles::new(dir.path().into());
+    let mut reader = files.open("assets/clip.mp4").unwrap();
+    reader.seek(SeekFrom::Start(9_000)).unwrap();
+    let mut piece = [0u8; 100];
+    reader.read_exact(&mut piece).unwrap();
+    assert_eq!(&piece[..], &bytes[9_000..9_100]);
+    assert_eq!(reader.seek(SeekFrom::End(0)).unwrap(), 10_000);
+    assert_eq!(read_all(files.open("./assets/clip.mp4").unwrap()), bytes);
+    let at = files.lies_at("assets/clip.mp4").unwrap();
+    assert_eq!(at, dir.path().join("assets/clip.mp4").canonicalize().unwrap());
+}
+
+#[test]
+fn open_refuses_what_read_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("secret.mp4"), b"no").unwrap();
+    let talk = dir.path().join("talk");
+    std::fs::create_dir_all(talk.join("assets")).unwrap();
+    let files = FolderFiles::new(talk.clone());
+    let mut refused = vec!["../secret.mp4", "assets", "assets/missing.mp4", "a\\b", "C:\\x"];
+    let absolute = dir.path().join("secret.mp4").to_str().unwrap().to_string();
+    refused.push(&absolute);
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(dir.path().join("secret.mp4"), talk.join("assets/link.mp4")).unwrap();
+        refused.push("assets/link.mp4");
+        assert!(std::process::Command::new("mkfifo").arg(talk.join("assets/pipe.mp4")).status().unwrap().success());
+        refused.push("assets/pipe.mp4");
+    }
+    for name in refused {
+        assert_eq!(files.read(name), None, "{name}");
+        // Asked on a thread of its own: opening a named pipe would wait for a writer.
+        let (done, finished) = std::sync::mpsc::channel();
+        let talk = talk.clone();
+        let asked = name.to_string();
+        std::thread::spawn(move || {
+            let files = FolderFiles::new(talk);
+            let _ = done.send((files.open(&asked).is_none(), files.lies_at(&asked).is_none()));
+        });
+        let answer = finished.recv_timeout(std::time::Duration::from_secs(5)).expect("the open came back");
+        assert_eq!(answer, (true, true), "{name}");
+    }
+}
+
+#[test]
+fn the_default_open_reads_the_whole_file() {
+    use std::io::{Read, Seek, SeekFrom};
+    let files = held(&[("assets/clip.mp4", &b"abcdefgh"[..])]);
+    let mut reader = files.open("assets/clip.mp4").unwrap();
+    reader.seek(SeekFrom::Start(5)).unwrap();
+    let mut rest = Vec::new();
+    reader.read_to_end(&mut rest).unwrap();
+    assert_eq!(rest, b"fgh");
+    assert!(files.open("assets/missing.mp4").is_none());
+    assert_eq!(files.lies_at("assets/clip.mp4"), None);
+
+    // What's added is read first, and what's under it lies where it lies.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("assets")).unwrap();
+    std::fs::write(dir.path().join("assets/own.mp4"), b"own").unwrap();
+    let (files, added) = with_added(dir.path());
+    added.add("assets/new.mp4", std::sync::Arc::from(&b"new"[..]));
+    assert_eq!(read_all(files.open("assets/new.mp4").unwrap()), b"new");
+    assert_eq!(files.lies_at("assets/new.mp4"), None);
+    assert_eq!(read_all(files.open("assets/own.mp4").unwrap()), b"own");
+    assert!(files.lies_at("assets/own.mp4").is_some());
+    let shared: std::sync::Arc<dyn TalkFiles + Send + Sync> = std::sync::Arc::new(files);
+    assert_eq!(read_all(shared.open("assets/own.mp4").unwrap()), b"own");
+    assert!(shared.lies_at("assets/own.mp4").is_some());
+}
+
+#[test]
+fn large_kinds_are_told_by_their_ending() {
+    for name in ["assets/a.mp4", "assets/a.M4V", "assets/deeper/a.Mov", "assets/a.glb", "assets/a.PLY", "./assets/a.mp4"] {
+        assert!(is_large_kind(name), "{name}");
+    }
+    for name in ["a.mp4", "components/a.mp4", "build/a.glb", "assets/a.png", "assets/a.mp4.txt", "assets/mp4", "../assets/a.mp4"] {
+        assert!(!is_large_kind(name), "{name}");
+    }
+    assert_eq!(MAX_LARGE_FILE, 4 * 1024 * 1024 * 1024);
+}

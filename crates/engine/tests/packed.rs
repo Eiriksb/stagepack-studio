@@ -1333,3 +1333,529 @@ mod alike {
         }
     }
 }
+
+// ---- Plan G1: large files, read in place and moved as files ----
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+const CLIP: &str = "assets/clip.mp4";
+const CLIP_SLIDES: &str = "# Clip\n";
+
+/// Writes `len` made-up bytes to `path`, a piece at a time.
+fn made_up_file(path: &Path, len: u64, seed: u64) {
+    let mut file = std::fs::File::create(path).unwrap();
+    let mut state = seed | 1;
+    let mut piece = vec![0u8; 1 << 20];
+    let mut left = len;
+    while left > 0 {
+        for byte in piece.iter_mut() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = state as u8;
+        }
+        let n = left.min(piece.len() as u64) as usize;
+        file.write_all(&piece[..n]).unwrap();
+        left -= n as u64;
+    }
+}
+
+/// Whether two readers give the same bytes, compared a piece at a time.
+fn same_bytes(mut a: impl std::io::Read, mut b: impl std::io::Read) -> bool {
+    let (mut x, mut y) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
+    loop {
+        let n = fill(&mut a, &mut x);
+        let m = fill(&mut b, &mut y);
+        if n != m || x[..n] != y[..m] {
+            return false;
+        }
+        if n == 0 {
+            return true;
+        }
+    }
+}
+
+fn fill(reader: &mut impl std::io::Read, buf: &mut [u8]) -> usize {
+    let mut got = 0;
+    while got < buf.len() {
+        match reader.read(&mut buf[got..]).unwrap() {
+            0 => break,
+            n => got += n,
+        }
+    }
+    got
+}
+
+fn no_progress(_: u64, _: u64) {}
+
+fn never() -> AtomicBool {
+    AtomicBool::new(false)
+}
+
+/// The file names in `dir` that a write left behind as temporary files.
+fn temps_in(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".tmp"))
+        .collect()
+}
+
+/// What each of the six ways of writing a talk writes, in the order they're chained.
+const OUTPUTS: [&str; 6] = ["a", "a.sptx", "b.sptx", "b", "c", "c.sptx"];
+
+/// Runs the `i`th of the six ways of writing a talk in `work`, each from what the one before it
+/// wrote (as `OUTPUTS` names it), with the first two given `src` as the clip. The later four carry
+/// the clip from the talk they're given, and `extra` as well. What it wrote is `out`.
+fn write_step(
+    i: usize,
+    work: &Path,
+    src: &Path,
+    out: &Path,
+    extra: &[NewFileFrom],
+    progress: &dyn Fn(u64, u64),
+    stop: &AtomicBool,
+) -> Result<(), PackError> {
+    let at = |name: &str| work.join(name);
+    let given = [(CLIP.to_string(), FileSource::At(src.to_path_buf()))];
+    match i {
+        0 => write_new_folder_from(out, CLIP_SLIDES, &given, progress, stop),
+        1 => pack_new_from(out, CLIP_SLIDES, "0.1.0", &given, progress, stop),
+        2 => repack_with_slides_from(&at("a.sptx"), out, CLIP_SLIDES, "0.1.0", extra, progress, stop),
+        3 => unpack_with_slides_from(&at("b.sptx"), out, CLIP_SLIDES, extra, progress, stop),
+        4 => copy_talk_folder_from(&at("b"), out, CLIP_SLIDES, extra, progress, stop).map(drop),
+        5 => pack_folder_with_slides_from(&at("c"), out, CLIP_SLIDES, "0.1.0", extra, progress, stop).map(drop),
+        _ => unreachable!(),
+    }
+}
+
+/// The clip as `out`, a folder or a pack, holds it.
+fn clip_in(out: &Path, name: &str) -> Box<dyn ReadSeek> {
+    if out.extension().is_some_and(|e| e == "sptx") {
+        open_packed(out).unwrap().open(name).expect("a stored clip opens in place")
+    } else {
+        Box::new(std::fs::File::open(out.join(name)).unwrap())
+    }
+}
+
+/// A peak and the resident size now, in bytes, from `/proc/self/status`.
+#[cfg(target_os = "linux")]
+fn memory() -> (u64, u64) {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let field = |name: &str| {
+        let line = status.lines().find(|line| line.starts_with(name)).unwrap();
+        line.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() * 1024
+    };
+    (field("VmHWM:"), field("VmRSS:"))
+}
+
+/// Free space under `dir` in bytes, as `df` tells it, if it can.
+fn free_disk(dir: &Path) -> Option<u64> {
+    let out = std::process::Command::new("df").args(["-k", "--output=avail"]).arg(dir).output().ok()?;
+    String::from_utf8(out.stdout).ok()?.lines().nth(1)?.trim().parse::<u64>().ok().map(|k| k * 1024)
+}
+
+/// Run alone, in release, as it writes about 2 GB under a temp folder it removes:
+/// `scripts/cargo-safe.sh test --release -p slides-engine --test packed -- --ignored a_large_file --nocapture`
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "writes about 2 GB; run on its own"]
+fn a_large_file_never_passes_through_memory() {
+    const LEN: u64 = 300 * 1024 * 1024;
+    let work = tempfile::tempdir().unwrap();
+    let free = free_disk(work.path()).expect("free disk can be told");
+    assert!(free > 4 * 1024 * 1024 * 1024, "not enough free disk to run: {free} bytes");
+    let src = work.path().join("source.mp4");
+    made_up_file(&src, LEN, 0x5eed);
+    for (i, name) in OUTPUTS.iter().enumerate() {
+        let out = work.path().join(name);
+        // The peak is reset where the system allows it; where it doesn't, the peak only stays where
+        // it was, and what's measured below is still at least what this step grew by.
+        let _ = std::fs::write("/proc/self/clear_refs", "5");
+        let (_, before) = memory();
+        write_step(i, work.path(), &src, &out, &[], &no_progress, &never()).unwrap();
+        let (peak, _) = memory();
+        let grew = peak.saturating_sub(before);
+        eprintln!("{name}: peak resident grew by {:.1} MB", grew as f64 / 1e6);
+        assert!(grew < 64 * 1024 * 1024, "{name} grew by {grew} bytes");
+        assert!(same_bytes(clip_in(&out, CLIP), std::fs::File::open(&src).unwrap()), "{name}");
+    }
+}
+
+#[test]
+fn a_stopped_copy_leaves_nothing() {
+    let work = tempfile::tempdir().unwrap();
+    let src = work.path().join("source.mp4");
+    made_up_file(&src, 3 << 20, 7);
+    let more = work.path().join("more.mp4");
+    made_up_file(&more, 3 << 20, 8);
+    for (i, name) in OUTPUTS.iter().enumerate() {
+        write_step(i, work.path(), &src, &work.path().join(name), &[], &no_progress, &never()).unwrap();
+    }
+    for i in 0..OUTPUTS.len() {
+        for given in [false, true] {
+            let extra = [(format!("assets/more{i}.mp4"), FileSource::At(more.clone()))];
+            let extra: &[NewFileFrom] = if given { &extra } else { &[] };
+            let out = work.path().join(format!("stopped-{i}"));
+            let stop = never();
+            let progress = |_: u64, _: u64| stop.store(true, Ordering::SeqCst);
+            let result = write_step(i, work.path(), &src, &out, extra, &progress, &stop);
+            assert!(matches!(result, Err(PackError::Stopped)), "{i}: {result:?}");
+            assert!(!out.exists(), "{i}: nothing is left where it was writing");
+            assert!(temps_in(work.path()).is_empty(), "{i}: no temporary file is left");
+        }
+    }
+    // Stopped over an old pack, the old pack is as it was.
+    let old = std::fs::read(work.path().join("a.sptx")).unwrap();
+    let stop = never();
+    let progress = |_: u64, _: u64| stop.store(true, Ordering::SeqCst);
+    let out = work.path().join("a.sptx");
+    let given = [(CLIP.to_string(), FileSource::At(more.clone()))];
+    assert!(matches!(pack_new_from(&out, CLIP_SLIDES, "0.1.0", &given, &progress, &stop), Err(PackError::Stopped)));
+    assert_eq!(std::fs::read(&out).unwrap(), old);
+}
+
+#[test]
+fn progress_reaches_the_whole() {
+    let work = tempfile::tempdir().unwrap();
+    let src = work.path().join("source.mp4");
+    made_up_file(&src, 5 << 20, 9);
+    let more = work.path().join("more.mp4");
+    made_up_file(&more, (2 << 20) + 17, 10);
+    for (i, name) in OUTPUTS.iter().enumerate() {
+        let told = std::cell::RefCell::new(Vec::new());
+        let progress = |done: u64, all: u64| told.borrow_mut().push((done, all));
+        let extra = [(format!("assets/more{i}.mp4"), FileSource::At(more.clone()))];
+        let out = work.path().join(name);
+        write_step(i, work.path(), &src, &out, &extra[..(i >= 2) as usize], &progress, &never()).unwrap();
+        let told = told.into_inner();
+        let &(last, all) = told.last().expect("progress was told");
+        assert_eq!(last, all, "{name}");
+        assert!(all >= 5 << 20, "{name}: {all}");
+        assert!(told.len() >= 5, "{name}: told in pieces of a megabyte at most");
+        assert!(told.windows(2).all(|w| w[0].0 <= w[1].0 && w[0].1 == w[1].1), "{name}");
+        assert!(told.windows(2).all(|w| w[1].0 - w[0].0 <= 1 << 20), "{name}: pieces of a megabyte at most");
+        assert!(same_bytes(clip_in(&out, CLIP), std::fs::File::open(&src).unwrap()), "{name}");
+        if i >= 2 {
+            let name = format!("assets/more{i}.mp4");
+            assert!(same_bytes(clip_in(&out, &name), std::fs::File::open(&more).unwrap()), "{name}");
+        }
+    }
+}
+
+#[test]
+fn a_stored_entry_is_read_in_place() {
+    use proptest::prelude::*;
+    use std::io::{Read, Seek, SeekFrom};
+    let work = tempfile::tempdir().unwrap();
+    let src = work.path().join("source.mp4");
+    made_up_file(&src, 3 * 1024 * 1024 + 333, 11);
+    let bytes = std::fs::read(&src).unwrap();
+    let out = work.path().join("t.sptx");
+    let given = [
+        ("assets/a.png".to_string(), FileSource::Bytes(b"\x89PNG not really".to_vec())),
+        (CLIP.to_string(), FileSource::At(src.clone())),
+    ];
+    pack_new_from(&out, CLIP_SLIDES, "0.1.0", &given, &no_progress, &never()).unwrap();
+    let packed = open_packed(&out).unwrap();
+    let mut png = Vec::new();
+    packed.open("assets/a.png").unwrap().read_to_end(&mut png).unwrap();
+    assert_eq!(png, b"\x89PNG not really");
+    assert_eq!(packed.len(CLIP), Some(bytes.len() as u64));
+    let len = bytes.len() as u64;
+    let mut runner = proptest::test_runner::TestRunner::default();
+    runner
+        .run(&(0..len + 10, 0..3_000_000usize), |(at, want)| {
+            let mut reader = packed.open(CLIP).unwrap();
+            prop_assert_eq!(reader.seek(SeekFrom::Start(at)).unwrap(), at);
+            let mut got = vec![0u8; want];
+            let n = fill(&mut reader, &mut got);
+            let from = at.min(len) as usize;
+            let to = (at + want as u64).min(len) as usize;
+            prop_assert_eq!(&got[..n], &bytes[from..to]);
+            prop_assert_eq!(reader.seek(SeekFrom::End(-1)).unwrap(), len - 1);
+            Ok(())
+        })
+        .unwrap();
+    // Read from several threads at once, each with its own reader.
+    let packed = std::sync::Arc::new(packed);
+    let threads: Vec<_> = (0..4u64)
+        .map(|t| {
+            let packed = packed.clone();
+            let bytes = bytes.clone();
+            std::thread::spawn(move || {
+                for k in 0..20u64 {
+                    let at = (t * 977_131 + k * 104_729) % len;
+                    let mut reader = packed.open(CLIP).unwrap();
+                    reader.seek(SeekFrom::Start(at)).unwrap();
+                    let mut got = vec![0u8; 4096];
+                    let n = fill(&mut reader, &mut got);
+                    assert_eq!(&got[..n], &bytes[at as usize..(at as usize + 4096).min(bytes.len())]);
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+}
+
+#[test]
+fn a_compressed_entry_gives_none() {
+    let dir = talk_folder();
+    let out = dir.path().join("talk.sptx");
+    pack_folder(dir.path(), &out, "0.1.0").unwrap();
+    let packed = open_packed(&out).unwrap();
+    assert!(packed.open("components/c.rs").is_none());
+    assert!(packed.open("slides.md").is_none());
+    assert!(packed.open("assets/missing.png").is_none());
+    assert!(packed.open("../assets/a.png").is_none());
+    assert!(packed.open("assets/a.png").is_some());
+    assert_eq!(packed.lies_at("assets/a.png"), None);
+    assert_eq!(packed.read("components/c.rs").unwrap(), b"fn main() {}");
+}
+
+#[test]
+fn a_video_is_stored_and_a_picture_compressed_as_before() {
+    let work = tempfile::tempdir().unwrap();
+    let out = work.path().join("t.sptx");
+    let text = "compressible ".repeat(100).into_bytes();
+    let given: Vec<NewFileFrom> = ["assets/clip.mp4", "assets/model.GLB", "assets/a.svg", "assets/a.png", "components/x.mp4", "components/c.rs"]
+        .iter()
+        .map(|name| (name.to_string(), FileSource::Bytes(text.clone())))
+        .collect();
+    pack_new_from(&out, CLIP_SLIDES, "0.1.0", &given, &no_progress, &never()).unwrap();
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(&out).unwrap()).unwrap();
+    let method = |zip: &mut zip::ZipArchive<std::fs::File>, name: &str| zip.by_name(name).unwrap().compression();
+    use zip::CompressionMethod::{Deflated, Stored};
+    for (name, expected) in [
+        ("assets/clip.mp4", Stored),
+        ("assets/model.GLB", Stored),
+        ("assets/a.png", Stored),
+        ("assets/a.svg", Deflated),
+        ("components/x.mp4", Deflated),
+        ("components/c.rs", Deflated),
+        ("slides.md", Deflated),
+        ("talk.json", Deflated),
+    ] {
+        assert_eq!(method(&mut zip, name), expected, "{name}");
+    }
+    // The old form writes the same.
+    let old = work.path().join("old.sptx");
+    let given: Vec<NewFile> = given.iter().map(|(name, _)| (name.clone(), text.clone())).collect();
+    pack_new(&old, CLIP_SLIDES, "0.1.0", &given).unwrap();
+    assert_eq!(std::fs::read(&old).unwrap(), std::fs::read(&out).unwrap());
+}
+
+/// A change made to a file while it's copied.
+type Change = dyn Fn(&Path);
+
+#[test]
+fn a_source_that_shrinks_or_goes_while_copied_fails_whole() {
+    let work = tempfile::tempdir().unwrap();
+    let src = work.path().join("source.mp4");
+    let out = work.path().join("t.sptx");
+    made_up_file(&src, 3 << 20, 12);
+    pack_new_from(&out, CLIP_SLIDES, "0.1.0", &[], &no_progress, &never()).unwrap();
+    let old = std::fs::read(&out).unwrap();
+    let changes: [(&str, &Change); 3] = [
+        ("shrinks", &|p| std::fs::OpenOptions::new().write(true).open(p).unwrap().set_len(3 << 19).unwrap()),
+        ("grows", &|p| std::fs::OpenOptions::new().append(true).open(p).unwrap().write_all(b"more").unwrap()),
+        ("goes", &|p| std::fs::remove_file(p).unwrap()),
+    ];
+    for (what, change) in changes {
+        let changed = std::cell::Cell::new(false);
+        let progress = |_: u64, _: u64| {
+            if !changed.replace(true) {
+                change(&src);
+            }
+        };
+        let given = [(CLIP.to_string(), FileSource::At(src.clone()))];
+        let result = pack_new_from(&out, CLIP_SLIDES, "0.1.0", &given, &progress, &never());
+        assert!(matches!(result, Err(PackError::Io(_))), "pack, {what}: {result:?}");
+        assert_eq!(std::fs::read(&out).unwrap(), old, "pack, {what}");
+        made_up_file(&src, 3 << 20, 12);
+
+        changed.set(false);
+        let folder = work.path().join("folder");
+        let result = write_new_folder_from(&folder, CLIP_SLIDES, &given, &progress, &never());
+        assert!(matches!(result, Err(PackError::Io(_))), "folder, {what}: {result:?}");
+        assert!(!folder.exists(), "folder, {what}");
+        made_up_file(&src, 3 << 20, 12);
+
+        // A large file the talk has, changed while it's carried to the copy.
+        let talk = work.path().join("talk");
+        write_new_folder_from(&talk, CLIP_SLIDES, &given, &no_progress, &never()).unwrap();
+        changed.set(false);
+        let progress = |_: u64, _: u64| {
+            if !changed.replace(true) {
+                change(&talk.join(CLIP));
+            }
+        };
+        let copy = work.path().join("copy");
+        let result = copy_talk_folder_from(&talk, &copy, CLIP_SLIDES, &[], &progress, &never()).map(drop);
+        assert!(matches!(result, Err(PackError::Io(_))), "copy, {what}: {result:?}");
+        assert!(!copy.exists(), "copy, {what}");
+        changed.set(false);
+        std::fs::remove_dir_all(&talk).unwrap();
+        write_new_folder_from(&talk, CLIP_SLIDES, &given, &no_progress, &never()).unwrap();
+        let result = pack_folder_with_slides_from(&talk, &out, CLIP_SLIDES, "0.1.0", &[], &progress, &never()).map(drop);
+        assert!(matches!(result, Err(PackError::Io(_))), "pack a folder, {what}: {result:?}");
+        assert_eq!(std::fs::read(&out).unwrap(), old, "pack a folder, {what}");
+        std::fs::remove_dir_all(&talk).unwrap();
+        assert!(temps_in(work.path()).is_empty(), "{what}");
+    }
+}
+
+#[test]
+fn a_file_over_four_gigabytes_is_refused_before_anything_is_written() {
+    let work = tempfile::tempdir().unwrap();
+    let small = work.path().join("small.mp4");
+    made_up_file(&small, 1000, 13);
+    for (i, name) in OUTPUTS.iter().enumerate() {
+        write_step(i, work.path(), &small, &work.path().join(name), &[], &no_progress, &never()).unwrap();
+    }
+    // Sparse, so the test costs no disk.
+    let huge = work.path().join("huge.mp4");
+    std::fs::File::create(&huge).unwrap().set_len(MAX_LARGE_FILE + 1).unwrap();
+    let big_picture = work.path().join("big.png");
+    std::fs::File::create(&big_picture).unwrap().set_len(MAX_FILE_BYTES + 1).unwrap();
+    let written = std::cell::Cell::new(0u64);
+    let progress = |done: u64, _: u64| written.set(done);
+    for (name, path) in [("assets/huge.mp4", &huge), ("assets/big.png", &big_picture)] {
+        let extra = [(name.to_string(), FileSource::At(path.clone()))];
+        for i in 0..OUTPUTS.len() {
+            let out = work.path().join(format!("refused-{i}"));
+            let result = match i {
+                0 => write_new_folder_from(&out, CLIP_SLIDES, &extra, &progress, &never()),
+                1 => pack_new_from(&out, CLIP_SLIDES, "0.1.0", &extra, &progress, &never()),
+                _ => write_step(i, work.path(), &small, &out, &extra, &progress, &never()),
+            };
+            assert!(matches!(result, Err(PackError::TooLarge(_))), "{name}, {i}: {result:?}");
+            assert!(!out.exists(), "{name}, {i}");
+            assert_eq!(written.get(), 0, "{name}, {i}: nothing was written");
+        }
+    }
+    // One the talk has already is refused as well.
+    let talk = work.path().join("b");
+    std::fs::rename(&huge, talk.join("assets/huge.mp4")).unwrap();
+    let copy = work.path().join("copy");
+    assert!(matches!(copy_talk_folder_from(&talk, &copy, CLIP_SLIDES, &[], &progress, &never()), Err(PackError::TooLarge(_))));
+    assert!(!copy.exists());
+    let packed = work.path().join("packed.sptx");
+    assert!(matches!(pack_folder_with_slides_from(&talk, &packed, CLIP_SLIDES, "0.1.0", &[], &progress, &never()), Err(PackError::TooLarge(_))));
+    assert!(!packed.exists());
+    assert_eq!(written.get(), 0);
+    assert!(temps_in(work.path()).is_empty());
+}
+
+#[test]
+fn an_entry_that_claims_more_than_the_pack_holds_is_refused() {
+    let work = tempfile::tempdir().unwrap();
+    let path = work.path().join("t.sptx");
+    let given = [
+        (CLIP.to_string(), FileSource::Bytes(vec![7u8; 1000])),
+        ("assets/a.png".to_string(), FileSource::Bytes(vec![8u8; 1000])),
+    ];
+    pack_new_from(&path, CLIP_SLIDES, "0.1.0", &given, &no_progress, &never()).unwrap();
+    let base = Zipped(work, path);
+    assert!(open_packed(&base).is_ok());
+    for (name, claim) in [(CLIP, 3_000_000_000u32), (CLIP, 2000), ("assets/a.png", 100 << 20), ("assets/a.png", 1001)] {
+        let lying = patched(&base, |b| {
+            let (local, central) = headers(b, name);
+            for at in [local + 18, local + 22, central + 20, central + 24] {
+                put_u32(b, at, claim);
+            }
+        });
+        assert!(is_corrupt(open_packed(&lying)), "{name} claiming {claim}");
+    }
+}
+
+fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
+}
+
+/// The files the fixtures were packed from, by the code before plan G1.
+fn fixture_files() -> Vec<NewFile> {
+    let clip: Vec<u8> = (0..20_000u32).map(|i| (i.wrapping_mul(2654435761) >> 24) as u8).collect();
+    vec![
+        ("assets/a.png".to_string(), b"\x89PNG not really".to_vec()),
+        ("assets/clip.mp4".to_string(), clip),
+        ("components/c.rs".to_string(), b"fn main() {}".to_vec()),
+    ]
+}
+
+#[test]
+fn packs_made_before_still_open() {
+    let files = fixture_files();
+    // One made before, with its video compressed, opens and reads as it did.
+    let packed = open_packed(&fixture("made-before-with-a-video.sptx")).unwrap();
+    assert_eq!(packed.slides().unwrap(), "# One\n\n---\n\n# Two\n");
+    for (name, bytes) in &files {
+        assert_eq!(packed.read(name).as_ref(), Some(bytes), "{name}");
+    }
+    assert!(packed.open("assets/clip.mp4").is_none(), "a compressed video isn't read in place");
+    assert!(packed.open("assets/a.png").is_some());
+    // And is carried on as it was.
+    let work = tempfile::tempdir().unwrap();
+    let again = work.path().join("again.sptx");
+    repack_with_slides_from(&fixture("made-before-with-a-video.sptx"), &again, "# Again\n", "0.1.0", &[], &no_progress, &never()).unwrap();
+    assert_eq!(open_packed(&again).unwrap().read("assets/clip.mp4").as_ref(), Some(&files[1].1));
+    let unpacked = work.path().join("unpacked");
+    unpack_with_slides_from(&fixture("made-before-with-a-video.sptx"), &unpacked, "# Again\n", &[], &no_progress, &never()).unwrap();
+    assert_eq!(std::fs::read(unpacked.join("assets/clip.mp4")).unwrap(), files[1].1);
+
+    // One made now, without a video, has the same bytes as one made before.
+    let plain = work.path().join("plain.sptx");
+    let given: Vec<NewFileFrom> = [&files[0], &files[2]].iter().map(|(name, bytes)| (name.clone(), FileSource::Bytes(bytes.clone()))).collect();
+    pack_new_from(&plain, "# One\n\n---\n\n# Two\n", "0.1.0", &given, &no_progress, &never()).unwrap();
+    assert_eq!(std::fs::read(&plain).unwrap(), std::fs::read(fixture("made-before.sptx")).unwrap());
+    // One made now with a video is a plain zip, read the way the code before read every entry.
+    let with_video = work.path().join("video.sptx");
+    let given: Vec<NewFileFrom> = files.iter().map(|(name, bytes)| (name.clone(), FileSource::Bytes(bytes.clone()))).collect();
+    pack_new_from(&with_video, "# One\n", "0.1.0", &given, &no_progress, &never()).unwrap();
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(&with_video).unwrap()).unwrap();
+    for (name, bytes) in &files {
+        let mut read = Vec::new();
+        std::io::Read::read_to_end(&mut zip.by_name(name).unwrap(), &mut read).unwrap();
+        assert_eq!(&read, bytes, "{name}");
+    }
+}
+
+/// Writes 4 GB: run on its own, as `a_large_file_never_passes_through_memory` is.
+#[test]
+#[ignore = "writes 4 GB; run on its own"]
+fn a_four_gigabyte_video_is_packed_in_the_large_form() {
+    use std::io::{Read, Seek, SeekFrom};
+    let work = tempfile::tempdir().unwrap();
+    assert!(free_disk(work.path()).expect("free disk can be told") > 10 * 1024 * 1024 * 1024);
+    // Sparse, with a few bytes at its end to find again.
+    let src = work.path().join("huge.mp4");
+    let mut file = std::fs::File::create(&src).unwrap();
+    file.set_len(MAX_LARGE_FILE).unwrap();
+    file.seek(SeekFrom::End(-5)).unwrap();
+    file.write_all(b"end!!").unwrap();
+    drop(file);
+    let out = work.path().join("t.sptx");
+    let given = [(CLIP.to_string(), FileSource::At(src.clone())), ("assets/after.png".to_string(), FileSource::Bytes(b"after".to_vec()))];
+    pack_new_from(&out, CLIP_SLIDES, "0.1.0", &given, &no_progress, &never()).unwrap();
+    std::fs::remove_file(&src).unwrap();
+    let packed = open_packed(&out).unwrap();
+    assert_eq!(packed.len(CLIP), Some(MAX_LARGE_FILE));
+    let mut reader = packed.open(CLIP).unwrap();
+    reader.seek(SeekFrom::End(-5)).unwrap();
+    let mut end = Vec::new();
+    reader.read_to_end(&mut end).unwrap();
+    assert_eq!(end, b"end!!");
+    assert_eq!(packed.read("assets/after.png").unwrap(), b"after");
+    let again = work.path().join("again.sptx");
+    repack_with_slides_from(&out, &again, "# Again\n", "0.1.0", &[], &no_progress, &never()).unwrap();
+    std::fs::remove_file(&out).unwrap();
+    let packed = open_packed(&again).unwrap();
+    let mut reader = packed.open(CLIP).unwrap();
+    reader.seek(SeekFrom::End(-5)).unwrap();
+    let mut end = Vec::new();
+    reader.read_to_end(&mut end).unwrap();
+    assert_eq!(end, b"end!!");
+    assert_eq!(packed.read("assets/after.png").unwrap(), b"after");
+}

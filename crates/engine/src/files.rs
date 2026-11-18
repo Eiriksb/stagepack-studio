@@ -1,7 +1,7 @@
 //! Reading the files that belong to a talk.
 
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Cursor, Read, Seek};
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,10 +15,45 @@ use crate::MAX_INDEX_BYTES;
 /// The biggest file a talk can use. Pictures and fonts are read whole, into memory.
 pub const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
+/// The biggest file of a large kind, such as a video, a talk can hold. These are never read
+/// whole: they're opened and read in pieces, and moved as files.
+pub const MAX_LARGE_FILE: u64 = 4 * 1024 * 1024 * 1024;
+
+/// The endings of the kinds of file that can be large, in `assets/`.
+const LARGE_KINDS: [&str; 5] = ["mp4", "m4v", "mov", "glb", "ply"];
+
+/// Whether `path` is a file of a kind that can be large, a video or a model, which is opened
+/// rather than read and stored in a pack as it is: told by its ending, in `assets/`.
+pub fn is_large_kind(path: &str) -> bool {
+    let Some(path) = crate::packed::normalise(path) else {
+        return false;
+    };
+    let Some(ending) = path.strip_prefix("assets/").and_then(|rest| rest.rsplit_once('.')).map(|(_, ending)| ending) else {
+        return false;
+    };
+    LARGE_KINDS.iter().any(|kind| ending.eq_ignore_ascii_case(kind))
+}
+
+/// Something a talk's file can be read from in pieces, from anywhere in it.
+pub trait ReadSeek: Read + Seek + Send {}
+
+impl<T: Read + Seek + Send> ReadSeek for T {}
+
 /// Where a talk's pictures and fonts come from.
 pub trait TalkFiles {
     /// The bytes of `path`, relative to the talk, or `None` if it can't be read.
     fn read(&self, path: &str) -> Option<Vec<u8>>;
+
+    /// `path`, to be read in pieces, or `None` if it can't be. Unless the files say otherwise,
+    /// it's read whole first, so this is for what [`TalkFiles::read`] would read too.
+    fn open(&self, path: &str) -> Option<Box<dyn ReadSeek>> {
+        self.read(path).map(|bytes| Box::new(Cursor::new(bytes)) as Box<dyn ReadSeek>)
+    }
+
+    /// The file on disk `path` can be read from directly, when there is one.
+    fn lies_at(&self, _path: &str) -> Option<PathBuf> {
+        None
+    }
 
     /// The length and modified time of `path`, for telling whether it has changed without
     /// reading it, or `None` if there's no such thing to go by.
@@ -116,6 +151,19 @@ impl TalkFiles for FolderFiles {
         read_bounded(&self.resolve(path)?).ok()
     }
 
+    /// The file itself, if it's a regular file: never a folder or a named pipe, which would wait
+    /// for a writer.
+    fn open(&self, path: &str) -> Option<Box<dyn ReadSeek>> {
+        let file = File::open(self.lies_at(path)?).ok()?;
+        // Asked again of what was opened, in case something else was put there in between.
+        file.metadata().ok()?.is_file().then(|| Box::new(file) as Box<dyn ReadSeek>)
+    }
+
+    fn lies_at(&self, path: &str) -> Option<PathBuf> {
+        let file = self.resolve(path)?;
+        std::fs::metadata(&file).ok()?.is_file().then_some(file)
+    }
+
     fn stamp(&self, path: &str) -> Option<(u64, SystemTime)> {
         let metadata = std::fs::metadata(self.resolve(path)?).ok()?;
         Some((metadata.len(), metadata.modified().ok()?))
@@ -146,6 +194,14 @@ impl TalkFiles for FolderFiles {
 impl TalkFiles for std::sync::Arc<dyn TalkFiles + Send + Sync> {
     fn read(&self, path: &str) -> Option<Vec<u8>> {
         (**self).read(path)
+    }
+
+    fn open(&self, path: &str) -> Option<Box<dyn ReadSeek>> {
+        (**self).open(path)
+    }
+
+    fn lies_at(&self, path: &str) -> Option<PathBuf> {
+        (**self).lies_at(path)
     }
 
     fn stamp(&self, path: &str) -> Option<(u64, SystemTime)> {
@@ -381,6 +437,25 @@ impl TalkFiles for WithAdded {
             Some(bytes) => Some(bytes.to_vec()),
             None => self.under.read(path),
         }
+    }
+
+    fn open(&self, path: &str) -> Option<Box<dyn ReadSeek>> {
+        if let Some(index) = self.entered_index(path) {
+            return Some(Box::new(Cursor::new(index)));
+        }
+        match self.added.get(path) {
+            Some(bytes) => Some(Box::new(Cursor::new(bytes))),
+            None => self.under.open(path),
+        }
+    }
+
+    /// What's added is held in memory, and the build index with builds entered in it is made
+    /// when it's read, so neither lies anywhere.
+    fn lies_at(&self, path: &str) -> Option<PathBuf> {
+        if self.entered_index(path).is_some() || self.added.get(path).is_some() {
+            return None;
+        }
+        self.under.lies_at(path)
     }
 
     /// An added file never changes while it's held, so its length is its stamp; so is a file of a talk that
