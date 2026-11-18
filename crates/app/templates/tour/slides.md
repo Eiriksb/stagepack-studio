@@ -55,7 +55,9 @@ Click a cell to type in it.
 
 # A chart
 
-<Chart kind="bar" labels="Spring, Summer, Autumn, Winter" values="4, 7, 5, 2" x="360" y="240" w="1200" h="720" />
+Click the chart, then change its numbers in the panel beside the slide.
+
+<Chart kind="bar" labels="Spring, Summer, Autumn, Winter" values="4, 7, 5, 2" x="360" y="360" w="1200" h="640" />
 
 ---
 layout: section

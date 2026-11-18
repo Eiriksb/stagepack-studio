@@ -13,7 +13,7 @@ use typing::*;
 
 use gpui_kit::{Modifiers, Pixels, Point, TestAppContext, point, px};
 use slides_engine::{Deck, DisplayItem, Fonts, LayerSpec, Pixmap, TalkFiles};
-use slides_format::{Block, LAYOUT_NAMES, parse_talk};
+use slides_format::{Block, DEFAULT_LAYOUT, LAYOUT_NAMES, layout_names, parse_talk};
 use stagepack_studio::export::{ExportInput, ExportKind, run_export};
 use stagepack_studio::ribbon::TAB_ANIMATE_ID;
 use stagepack_studio::slide_editor::{MarkColors, step_badge_id};
@@ -449,6 +449,25 @@ fn assert_golden(name: &str, pixmap: &Pixmap) {
         let out = out.join(format!("{name}.png"));
         std::fs::write(&out, &actual).unwrap();
         panic!("golden {name} differs; actual written to {}", out.display());
+    }
+}
+
+#[test]
+fn no_offer_to_add_text_lies_under_a_thing_on_the_tour() {
+    let tour = template("tour").unwrap();
+    let talk = parse_talk(tour.slides);
+    let mut deck = deck_of(tour);
+    for index in 0..deck.slide_count() {
+        let layout = deck.text_layout(index);
+        let name = talk.slides[index].settings.as_ref().and_then(|settings| settings.get("layout")).unwrap_or(DEFAULT_LAYOUT);
+        for region in layout_names(name).expect("a layout the app has").regions {
+            let Some((offer, _)) = layout.placeholder(region) else { continue };
+            for element in layout.elements() {
+                let thing = element.rect;
+                let apart = offer.x + offer.w <= thing.x || thing.x + thing.w <= offer.x || offer.y + offer.h <= thing.y || thing.y + thing.h <= offer.y;
+                assert!(apart, "slide {}: the words offering to add text in {region} lie under a thing at {thing:?}", index + 1);
+            }
+        }
     }
 }
 
