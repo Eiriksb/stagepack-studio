@@ -106,6 +106,30 @@ pub fn open_untitled_talk(cx: &mut TestAppContext, talk: Document, root: &std::p
     })
 }
 
+/// Shows the new presentation `id` brought back from `found`, its working copy from last
+/// time, numbered `number`, in a window set up as [`open_untitled_under`] sets it up, its
+/// working copies under `root` too.
+pub fn open_brought_back(
+    cx: &mut TestAppContext,
+    id: UntitledId,
+    found: stagepack_studio::recovery::Found,
+    number: usize,
+    root: &std::path::Path,
+) -> Typing {
+    let places = UntitledPlaces::under(root);
+    let scratch = tempfile::tempdir().unwrap();
+    let file = scratch.path().join("no file yet");
+    open_built(cx, scratch, file, move |window, cx| {
+        let recovery = Recovery::new(places.recovery);
+        let mut view = WorkspaceView::bring_back_untitled(id, found, number, Fonts::bundled_only(), recovery, window, cx)
+            .expect("it's brought back");
+        view.set_permissions_for_test(BuildPermissions::load(places.permissions));
+        view.set_documents_folder_for_test(places.documents);
+        view.set_no_watching_for_test();
+        view
+    })
+}
+
 /// Shows `talk` in a window, set up by `set_up` before anything is drawn.
 fn open_document(
     cx: &mut TestAppContext,
@@ -113,6 +137,20 @@ fn open_document(
     folder: tempfile::TempDir,
     file: PathBuf,
     set_up: impl FnOnce(&mut WorkspaceView, &mut gpui_kit::Context<WorkspaceView>) + 'static,
+) -> Typing {
+    open_built(cx, folder, file, move |window, cx| {
+        let mut view = WorkspaceView::open_with(talk, window, cx);
+        set_up(&mut view, cx);
+        view
+    })
+}
+
+/// Shows the window `build` makes.
+fn open_built(
+    cx: &mut TestAppContext,
+    folder: tempfile::TempDir,
+    file: PathBuf,
+    build: impl FnOnce(&mut Window, &mut gpui_kit::Context<WorkspaceView>) -> WorkspaceView + 'static,
 ) -> Typing {
     let (handle, view) = cx.update(|cx: &mut App| {
         gpui_kit::init(cx);
@@ -127,13 +165,7 @@ fn open_document(
                 ..Default::default()
             },
             cx,
-            |window, cx| {
-                cx.new(|cx| {
-                    let mut view = WorkspaceView::open_with(talk, window, cx);
-                    set_up(&mut view, cx);
-                    view
-                })
-            },
+            |window, cx| cx.new(|cx| build(window, cx)),
         )
         .expect("open test window")
     });

@@ -27,7 +27,7 @@ use crate::builds::{self, BuildOutcome, Compile};
 use crate::cargo_file::{self, write_cargo_file};
 use crate::clipboard::ClipboardOp;
 use crate::clipboard_tools::ClipboardTools;
-use crate::document::{Document, EditRefused, OpenProblem, Reload, SLIDES_FILE, TalkPlace, UNREADABLE_FILE};
+use crate::document::{Document, EditRefused, OpenProblem, Reload, SLIDES_FILE, TalkPlace, UNREADABLE_FILE, UntitledId};
 use crate::export::{self, ExportKind, run_export, stagepack_executable};
 use crate::icon_picker::{self, IconPicked, IconPicker};
 use crate::palette::InsertComponent;
@@ -40,7 +40,7 @@ use crate::notes_panel::{
 };
 use crate::permissions::BuildPermissions;
 use crate::present_view::{self, Presentation, start_show};
-use crate::recovery::Recovery;
+use crate::recovery::{Found, Recovery};
 use crate::ribbon::{Panels, Ribbon, RibbonTab};
 use crate::save_flow::{CloseAnswer, Effect, SaveFlow, SaveOutcome};
 use crate::saving::{SaveError, SaveJob, SaveTarget, Saved};
@@ -397,6 +397,28 @@ impl WorkspaceView {
     /// Shows a talk that is already open.
     pub fn open_with(document: Document, window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self::build(Some(document), None, window, cx)
+    }
+
+    /// A window on the new presentation `id`, brought back from `found`, its working copy from
+    /// last time, taken with [`Recovery::take_untitled`], and numbered `number` among those
+    /// open. It's kept in `recovery` from the start as this window's own, and last time's copy
+    /// goes only once it is, so a crash before anything is edited loses nothing.
+    pub fn bring_back_untitled(
+        id: UntitledId,
+        found: Found,
+        number: usize,
+        fonts: Fonts,
+        recovery: Recovery,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Self, String> {
+        let mut document =
+            Document::untitled_with(id, found.text.clone(), found.files.clone(), found.builds.clone(), fonts)?;
+        document.set_untitled_number(number);
+        let view = Self::build(Some(document), None, window, cx);
+        view.working_copies
+            .update(cx, |copies, cx| copies.use_recovery_bringing_back(recovery, found, cx));
+        Ok(view)
     }
 
     /// Says that `file` is one of Stagepack's Slidev talks, and offers to open it in

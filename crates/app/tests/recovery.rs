@@ -9,7 +9,7 @@ use gpui_kit::{
 use slides_engine::Fonts;
 use stagepack_studio::document::{Document, TalkPlace, UntitledId};
 use stagepack_studio::notes_panel::NOTES_ID;
-use stagepack_studio::recovery::{KEEP_FOR, Recovery, hash_text};
+use stagepack_studio::recovery::{KEEP_FOR, NotTaken, Recovery, hash_text};
 use stagepack_studio::saving::SaveTarget;
 use stagepack_studio::ribbon::{HIDE_ID, NEW_SLIDE_ID, RIBBON_ID};
 use stagepack_studio::workspace_view::{
@@ -1330,8 +1330,9 @@ fn an_untitled_copy_is_kept_listed_taken_and_discarded() {
 
     recovery.discard_untitled(id);
     assert_eq!(recovery.untitled(), (Vec::new(), 0));
-    assert!(recovery.take_untitled(id).is_none());
-    assert!(recovery.take_untitled(UntitledId::random()).is_none());
+    assert_eq!(recovery.take_untitled(id).unwrap_err(), NotTaken::Gone);
+    assert_eq!(recovery.take_untitled(UntitledId::random()).unwrap_err(), NotTaken::Gone);
+    assert_eq!(NotTaken::Gone.to_string(), "This presentation isn't kept any more.");
     assert!(setup.recovery().find(&setup.place()).is_some(), "the other talk's copy stays");
 
     // Kept with no name of its own, as any talk's is, it's called what a new one is.
@@ -1433,9 +1434,10 @@ fn a_recovery_folder_in_any_state_is_listed_or_skipped() {
         ("a name no window could show", true, 0, Box::new(|slot: &Path| {
             let about = slot.join("about.json");
             let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(&about).unwrap()).unwrap();
-            json["untitled"]["name"] = format!("Odd\u{7}\n{}", "x".repeat(10_000)).into();
+            json["untitled"]["name"] = format!("Odd\u{7}\n\u{202e}\u{200b}\u{feff}\u{2066}{}", "x".repeat(10_000)).into();
             std::fs::write(&about, json.to_string()).unwrap()
         })),
+        ("a time far ahead of the clock", true, 0, Box::new(|slot: &Path| set_kept_at(slot, now_secs() + 10 * 365 * 24 * 60 * 60))),
         ("text too large to bring back", false, 1, Box::new(|slot: &Path| {
             // Sparse, so it takes no room.
             let file = std::fs::OpenOptions::new().write(true).open(slot.join("slides.md")).unwrap();
@@ -1456,11 +1458,16 @@ fn a_recovery_folder_in_any_state_is_listed_or_skipped() {
         let (listed, skipped) = recovery.untitled();
         assert_eq!(listed.iter().any(|copy| copy.id == id), listed_it, "{what}: {listed:?}");
         assert_eq!(skipped, skips, "{what}");
-        assert_eq!(recovery.take_untitled(id).is_some(), listed_it, "{what}");
+        assert_eq!(recovery.take_untitled(id).is_ok(), listed_it, "{what}");
         if listed_it {
             let copy = listed.iter().find(|copy| copy.id == id).unwrap();
-            assert!(copy.name.chars().count() <= 100 && !copy.name.chars().any(char::is_control), "{what}");
+            assert!(copy.name.chars().count() <= 80 && !copy.name.chars().any(char::is_control), "{what}");
+            assert!(!copy.name.contains(['\u{202e}', '\u{200b}', '\u{feff}', '\u{2066}']), "{what}: {:?}", copy.name);
             assert!(copy.first_words.chars().count() <= 60, "{what}");
+            assert!(copy.when <= SystemTime::now() + Duration::from_secs(60), "{what}: no time ahead of the clock");
+            let whole = std::fs::read_to_string(untitled_slot(&root, id).join("slides.md")).unwrap();
+            assert_eq!(recovery.take_untitled(id).unwrap().text, whole, "{what}: it comes back whole");
+            assert_eq!(copy.slides_at_least, whole.len() > 1024 * 1024, "{what}");
         }
     }
 
@@ -1527,10 +1534,52 @@ fn links_and_locked_folders() {
         }
         let (listed, _) = recovery.untitled();
         assert!(listed.is_empty(), "{linked}: {listed:?}");
-        assert!(recovery.take_untitled(id).is_none(), "{linked}");
+        assert!(recovery.take_untitled(id).is_err(), "{linked}");
         recovery.discard_untitled(id);
         recovery.sweep(Duration::ZERO);
         assert!(outside.path().join("slides.md").is_file(), "{linked}: nothing outside is removed");
+        match linked {
+            "slot" => assert!(outside.path().join("moved-slot/slides.md").is_file(), "the slot linked to stays"),
+            "key" => assert!(outside.path().join("moved-key").read_dir().unwrap().count() == 1, "the folder linked to stays"),
+            "about.json" => assert!(outside.path().join("about.json").is_file()),
+            _ => {}
+        }
+    }
+
+    // Text that's a pipe, a socket or a folder is never read, and nothing waits on it.
+    for odd in ["pipe", "socket", "folder"] {
+        let (_dir, root) = scratch_root();
+        let recovery = Recovery::new(root.clone());
+        let id = UntitledId::random();
+        let files = vec![("assets/photo.png".to_string(), std::sync::Arc::<[u8]>::from(red_png()))];
+        recovery.keep_untitled(id, "Untitled presentation", "# Hello\n", &files, &[]).unwrap();
+        let slot = untitled_slot(&root, id);
+        let text = slot.join("slides.md");
+        let picture = slot.join("files/assets/photo.png");
+        std::fs::remove_file(&text).unwrap();
+        std::fs::remove_file(&picture).unwrap();
+        let _socket = match odd {
+            "pipe" => {
+                for at in [&text, &picture] {
+                    let name = std::ffi::CString::new(at.as_os_str().as_encoded_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                }
+                None
+            }
+            "socket" => Some([std::os::unix::net::UnixListener::bind(&text).unwrap(), std::os::unix::net::UnixListener::bind(&picture).unwrap()]),
+            _ => {
+                std::fs::create_dir(&text).unwrap();
+                std::fs::create_dir(&picture).unwrap();
+                None
+            }
+        };
+        let (listed, skipped) = recovery.untitled();
+        assert_eq!((listed.len(), skipped), (0, 1), "{odd}");
+        assert_eq!(recovery.take_untitled(id).unwrap_err(), NotTaken::Unreadable, "{odd}");
+        // With its text back, the picture that isn't a file is left out.
+        std::fs::remove_file(&text).or_else(|_| std::fs::remove_dir(&text)).unwrap();
+        std::fs::write(&text, "# Hello\n").unwrap();
+        assert!(recovery.take_untitled(id).unwrap().files.is_empty(), "{odd}");
     }
 
     // A folder that can't be read is skipped, and the others listed.
@@ -1568,10 +1617,11 @@ fn a_copy_held_by_a_live_window_is_not_listed() {
     window.keep_untitled(id, "Untitled presentation", "# Mine\n", &[], &[]).unwrap();
 
     assert_eq!(app.untitled(), (Vec::new(), 0), "held, so not left over from a crash");
-    assert!(app.take_untitled(id).is_none());
+    assert_eq!(app.take_untitled(id).unwrap_err(), NotTaken::Held);
+    assert_eq!(window.untitled(), (Vec::new(), 0), "not even by the window holding it");
     let another = app.for_another_window();
     assert_eq!(another.untitled(), (Vec::new(), 0));
-    assert!(another.take_untitled(id).is_none());
+    assert_eq!(another.take_untitled(id).unwrap_err(), NotTaken::Held);
     app.discard_untitled(id);
     another.discard_untitled(id);
     assert!(window.find(&TalkPlace::Untitled(id)).is_some(), "nobody else lets it go");
@@ -1677,4 +1727,89 @@ fn a_crash_before_the_first_save_brings_it_back(cx: &mut TestAppContext) {
     let pack = slides_engine::open_packed(&packed).unwrap();
     assert_eq!(pack.slides().unwrap().as_bytes(), edited.as_bytes());
     assert_eq!(slides_engine::TalkFiles::read(&pack, &picture).as_deref(), Some(red_png().as_slice()));
+}
+
+/// Holds `slot` as a window in another running copy of the app does: its `held` file locked,
+/// through a file opened apart from any this app has, which conflicts with them as another
+/// app's would. Closing it is that app stopping.
+fn hold_from_another_app(slot: &Path) -> std::fs::File {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(slot.join("held"))
+        .unwrap();
+    file.lock().unwrap();
+    file
+}
+
+#[test]
+fn a_copy_another_running_app_holds_is_left_alone() {
+    let (_dir, root) = scratch_root();
+    let app = Recovery::new(root.clone());
+    let window = app.for_another_window();
+    assert!(!root.exists(), "opening a window writes nothing");
+
+    // A window holds its slot with a lock others see.
+    let id = UntitledId::random();
+    window.keep_untitled(id, "Untitled presentation", "# Theirs\n", &[], &[]).unwrap();
+    let slot = untitled_slot(&root, id);
+    let looking = std::fs::File::open(slot.join("held")).unwrap();
+    assert!(matches!(looking.try_lock_shared(), Err(std::fs::TryLockError::WouldBlock)), "locked while it's open");
+    drop(looking);
+    // Cleared and kept again, it's held again.
+    window.clear(&TalkPlace::Untitled(id));
+    window.keep_untitled(id, "Untitled presentation", "# Theirs\n", &[], &[]).unwrap();
+    let looking = std::fs::File::open(untitled_slot(&root, id).join("held")).unwrap();
+    assert!(matches!(looking.try_lock_shared(), Err(std::fs::TryLockError::WouldBlock)));
+    drop(looking);
+    drop(window);
+    let looking = std::fs::File::open(slot.join("held")).unwrap();
+    looking.try_lock_shared().expect("let go with the window, as a crash lets it go");
+    drop(looking);
+
+    // Held by another app: not listed, taken, discarded or swept.
+    let other_app = hold_from_another_app(&slot);
+    assert_eq!(app.untitled(), (Vec::new(), 0));
+    assert_eq!(app.take_untitled(id).unwrap_err(), NotTaken::Held);
+    assert_eq!(app.for_another_window().take_untitled(id).unwrap_err(), NotTaken::Held);
+    app.discard_untitled(id);
+    app.sweep(Duration::ZERO);
+    let found = app.find(&TalkPlace::Untitled(id)).expect("there to be seen");
+    app.discard(&found);
+    assert!(slot.join("slides.md").is_file(), "all of it left alone");
+
+    // Once that app has stopped, it's listed and can be brought back.
+    drop(other_app);
+    let (listed, skipped) = app.untitled();
+    assert_eq!((listed.len(), skipped), (1, 0));
+    assert_eq!(app.take_untitled(id).unwrap().text, "# Theirs\n");
+
+    // The same goes for a talk with a place.
+    let setup = Setup::new(ONE);
+    keep(&setup, EDITED);
+    let other_app = hold_from_another_app(&setup.kept_folder());
+    let window = setup.recovery().for_another_window();
+    assert!(window.find(&setup.place()).is_none(), "not offered to a window here");
+    setup.recovery().sweep(Duration::ZERO);
+    assert!(setup.kept_folder().join("slides.md").is_file());
+    drop(other_app);
+    assert_eq!(window.find(&setup.place()).unwrap().text, EDITED);
+}
+
+#[test]
+fn a_copy_with_a_time_ahead_of_the_clock_is_still_swept() {
+    let (_dir, root) = scratch_root();
+    let recovery = Recovery::new(root.clone());
+    let id = UntitledId::random();
+    recovery.keep_untitled(id, "Untitled presentation", "# Ahead\n", &[], &[]).unwrap();
+    let slot = untitled_slot(&root, id);
+    set_kept_at(&slot, now_secs() + 10 * 365 * 24 * 60 * 60);
+    recovery.sweep(KEEP_FOR);
+    assert!(slot.is_dir(), "it goes by when its folder changed, which is now");
+    let long_ago = SystemTime::now() - KEEP_FOR - Duration::from_secs(60 * 60);
+    std::fs::File::open(&slot).unwrap().set_modified(long_ago).unwrap();
+    recovery.sweep(KEEP_FOR);
+    assert!(!slot.exists());
 }

@@ -8,6 +8,11 @@
 //! files added to the talk that the text uses, at `files/<path>`. A new presentation that was
 //! never saved has no path, so its folder is named for its id, and its about file says it's
 //! untitled, which is how [`Recovery::untitled`] finds it.
+//!
+//! A window holds its slot while it's open: within the app through a set of the live slots, and
+//! against any other running copy of the app through a lock on the file `held` in each of its
+//! slot's folders. The system lets the lock go when the app stops, however it stops, so the
+//! copies of an app that crashed are found at the next start.
 
 use std::collections::BTreeSet;
 use std::io::{self, Read as _, Write as _};
@@ -31,6 +36,8 @@ const ABOUT_FILE: &str = "about.json";
 const FILES_FOLDER: &str = "files";
 /// The file in a slot that holds the builds entered in the talk's index with those files.
 const BUILDS_FILE: &str = "builds.json";
+/// The file in a slot that the window keeping it holds a lock on while it's open.
+const HELD_FILE: &str = "held";
 /// The largest file of builds entered that is read.
 const MAX_BUILDS_BYTES: u64 = 256 * 1024;
 /// How many hex characters name a talk's folder (from the hash of its path) and a slot.
@@ -47,7 +54,7 @@ const MAX_LISTED: usize = 100;
 /// The most characters of a listed presentation's first words.
 const FIRST_WORDS_CHARS: usize = 60;
 /// The most characters of a listed presentation's name.
-const NAME_CHARS: usize = 100;
+const NAME_CHARS: usize = 80;
 
 /// How long a working copy is kept for a talk that isn't opened again.
 pub const KEEP_FOR: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -83,8 +90,12 @@ pub struct UntitledCopy {
     /// What it was called when it was kept.
     pub name: String,
     pub when: SystemTime,
-    /// How many slides it has.
+    /// How many slides it has, or, if [`Self::slides_at_least`], how many are in the start of
+    /// it that's read to list it.
     pub slides: usize,
+    /// Whether its text is longer than is read to list it, so it may have more slides than
+    /// [`Self::slides`].
+    pub slides_at_least: bool,
     /// The first line of text on its first slide, as it reads, 60 characters at most, or empty
     /// if it has none.
     pub first_words: String,
@@ -106,6 +117,13 @@ pub struct Found {
     slot: PathBuf,
 }
 
+impl Found {
+    /// Whether `other` is this same copy, in the same slot.
+    pub fn is_same_copy(&self, other: &Found) -> bool {
+        self.slot == other.slot
+    }
+}
+
 /// Where the working copies are kept.
 #[derive(Clone, Debug)]
 pub struct Recovery {
@@ -120,21 +138,100 @@ pub struct Recovery {
 /// over from a crash, so another window is never offered one, and never lets one go.
 static LIVE_SLOTS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
-/// A slot among the live ones, until the last copy of the [`Recovery`] holding it goes.
+/// A slot among the live ones, until the last copy of the [`Recovery`] holding it goes, with
+/// the locked `held` file of each of its folders made so far.
 #[derive(Debug)]
-struct LiveSlot(String);
+struct LiveSlot {
+    name: String,
+    held: Mutex<Vec<(PathBuf, std::fs::File)>>,
+}
 
 impl LiveSlot {
     fn new(slot: &str) -> LiveSlot {
         live_slots().insert(slot.to_string());
-        LiveSlot(slot.to_string())
+        LiveSlot {
+            name: slot.to_string(),
+            held: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn held(&self) -> std::sync::MutexGuard<'_, Vec<(PathBuf, std::fs::File)>> {
+        self.held.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Holds `folder`, one of this slot's, against other running copies of the app: its `held`
+    /// file is made if it isn't there and locked for as long as this is live. A system that
+    /// can't lock files keeps the copy all the same.
+    fn hold(&self, folder: &Path) -> io::Result<()> {
+        let path = folder.join(HELD_FILE);
+        let mut held = self.held();
+        if held.iter().any(|(at, file)| at == folder && is_same_file(&path, file)) {
+            return Ok(());
+        }
+        // Gone with the folder, if it was there: it's made again.
+        held.retain(|(at, _)| at != folder);
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        no_follow(&mut options);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options.open(&path)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::other("something other than a file is where a working copy's lock would go"));
+        }
+        // Another copy of the app only ever holds it shared for a moment, to look.
+        match file.lock() {
+            Ok(()) => held.push((folder.to_path_buf(), file)),
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    /// Lets go of `folder`, as it's about to be removed: a file held open can't be removed on
+    /// every system.
+    fn let_go(&self, folder: &Path) {
+        self.held().retain(|(at, _)| at != folder);
     }
 }
 
 impl Drop for LiveSlot {
     fn drop(&mut self) {
-        live_slots().remove(&self.0);
+        live_slots().remove(&self.name);
     }
+}
+
+/// Whether the file at `path` is `file`, as far as the system can tell.
+fn is_same_file(path: &Path, file: &std::fs::File) -> bool {
+    let (Ok(there), Ok(open)) = (std::fs::symlink_metadata(path), file.metadata()) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        there.dev() == open.dev() && there.ino() == open.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        there.is_file() && open.is_file()
+    }
+}
+
+/// Whether a window in another running copy of the app holds the slot `slot`: its `held` file
+/// is locked.
+fn locked_elsewhere(slot: &Path) -> bool {
+    let Some(file) = open_plain(&slot.join(HELD_FILE)) else {
+        return false;
+    };
+    matches!(file.try_lock_shared(), Err(std::fs::TryLockError::WouldBlock))
+}
+
+/// The name of the slot `slot`, if it has one that can be read.
+fn slot_name(slot: &Path) -> Option<&str> {
+    slot.file_name().and_then(|name| name.to_str())
 }
 
 fn live_slots() -> std::sync::MutexGuard<'static, BTreeSet<String>> {
@@ -306,85 +403,71 @@ impl Recovery {
         make_private(&self.root)?;
         make_private(&key_folder)?;
         make_private(&folder)?;
+        if let Some(live) = &self.live {
+            live.hold(&folder)?;
+        }
         Ok(folder)
     }
 
     /// Removes this slot's working copy of the talk at `place`, if there is one.
     pub fn clear(&self, place: &TalkPlace) {
         let key_folder = self.root.join(key(&canonical(place)));
-        remove_slot(&key_folder.join(&self.slot));
+        let folder = key_folder.join(&self.slot);
+        if let Some(live) = &self.live {
+            live.let_go(&folder);
+        }
+        remove_slot(&folder);
     }
 
-    /// Removes `found`, a working copy found with [`Self::find`], whichever slot it's in.
+    /// Removes `found`, a working copy found with [`Self::find`], whichever slot it's in, unless
+    /// another window has come to hold it since.
     pub fn discard(&self, found: &Found) {
-        remove_slot(&found.slot);
+        if !self.held_by_another(&found.slot, &live_slots().clone()) {
+            remove_slot(&found.slot);
+        }
+    }
+
+    /// Whether a window other than this one holds `slot`, among the slots `live` in this app or
+    /// in another running copy of it.
+    fn held_by_another(&self, slot: &Path, live: &BTreeSet<String>) -> bool {
+        let name = slot_name(slot);
+        if self.live.is_some() && name == Some(self.slot.as_str()) {
+            return false;
+        }
+        name.is_some_and(|name| live.contains(name)) || locked_elsewhere(slot)
     }
 
     /// The newest working copy of the talk at `place` that can be read, in any slot. For a
     /// window's own, that's in any slot but those other open windows hold.
     pub fn find(&self, place: &TalkPlace) -> Option<Found> {
-        let others_live = match &self.live {
-            Some(_) => self.held_by_others(),
-            None => BTreeSet::new(),
-        };
-        self.newest(place, &others_live)
-    }
-
-    /// The slots other open windows hold.
-    fn held_by_others(&self) -> BTreeSet<String> {
-        live_slots()
-            .iter()
-            .filter(|slot| **slot != self.slot)
-            .cloned()
-            .collect()
-    }
-
-    /// The newest working copy of the talk at `place` that can be read, in any slot but those in
-    /// `others_live`.
-    fn newest(&self, place: &TalkPlace, others_live: &BTreeSet<String>) -> Option<Found> {
-        let talk = canonical(place);
-        let key_folder = self.root.join(key(&talk));
-        if refuse_link(&key_folder).is_err() {
-            return None;
-        }
-        let newest = slots(&key_folder)
+        let key_folder = self.key_folder(place)?;
+        let live = live_slots().clone();
+        let slots = slots(&key_folder)
             .into_iter()
-            .filter(|slot| {
-                slot.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_none_or(|name| !others_live.contains(name))
-            })
-            .filter_map(|slot| {
-                let (about, written) = read_about(&slot)?;
-                (about.talk == talk && says_it_is(&about, place)).then_some((about, written, slot))
-            })
-            .filter_map(|(about, written, slot)| {
-                let when = kept_at(&about)?;
-                let text =
-                    String::from_utf8(read_small(&slot.join(SLIDES_FILE), MAX_TEXT_BYTES)?).ok()?;
-                Some((when, written, about.base_sha256, text, slot))
-            })
-            .max_by_key(|(when, written, ..)| (*when, *written))?;
-        let (when, _, base, text, slot) = newest;
-        let base_matches = on_disk(place).is_some_and(|disk| hash_text(&disk) == base);
-        Some(Found {
-            text,
-            files: kept_files(&slot),
-            builds: kept_builds(&slot),
-            base_matches,
-            when,
-            slot,
-        })
+            .filter(|slot| self.live.is_none() || !self.held_by_another(slot, &live))
+            .collect();
+        newest_of(place, slots)
+    }
+
+    /// The folder the talk at `place` has its working copies in, unless it's a link.
+    fn key_folder(&self, place: &TalkPlace) -> Option<PathBuf> {
+        let key_folder = self.root.join(key(&canonical(place)));
+        refuse_link(&key_folder).is_ok().then_some(key_folder)
     }
 
     /// The working copies of new presentations that were never saved, left over from last time:
-    /// each one that can be read and no open window holds, newest first, [`MAX_LISTED`] at
-    /// most, and how many more there are that couldn't be read. Only what's in the working
-    /// copies' folder is read, never through a link, and of each copy's text no more than
-    /// [`MAX_LISTED_TEXT_BYTES`]. It's quick, and can be asked from any thread while windows
-    /// keep their copies.
+    /// each one that can be read and no open window holds, this one's or another's, in this app
+    /// or another running copy of it, newest first, [`MAX_LISTED`] at most. Only what's in the
+    /// working copies' folder is read, never through a link, and of each copy's text no more
+    /// than [`MAX_LISTED_TEXT_BYTES`]. It's quick, and can be asked from any thread while
+    /// windows keep their copies.
+    ///
+    /// With them comes how many were skipped, as they couldn't be read: a slot no window holds
+    /// whose about file can't be read, so that it can't say what it's a copy of; one whose
+    /// about file says it's a new presentation's but doesn't hold together, or whose text can't
+    /// be brought back; and a talk's folder that can't be looked in.
     pub fn untitled(&self) -> (Vec<UntitledCopy>, usize) {
-        let held = self.held_by_others();
+        let live = live_slots().clone();
         let Ok(entries) = std::fs::read_dir(&self.root) else {
             return (Vec::new(), 0);
         };
@@ -403,11 +486,7 @@ impl Recovery {
                 continue;
             };
             for slot in slots {
-                let held_here = slot
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| held.contains(name));
-                if held_here {
+                if is_held(&slot, &live) {
                     continue;
                 }
                 match untitled_about(&slot, &key_name) {
@@ -437,34 +516,46 @@ impl Recovery {
     }
 
     /// The newest working copy of the new presentation `id`, to bring it back with
-    /// [`Document::untitled_with`], unless it's gone or an open window holds it. It stays where
-    /// it is until the window that brings it back keeps its own, or lets it go.
+    /// [`Document::untitled_with`] and [`WorkspaceView::bring_back_untitled`], unless it's gone,
+    /// an open window holds it, or it can't be read. It stays where it is until the window that
+    /// brings it back has kept its own.
     ///
     /// [`Document::untitled_with`]: crate::document::Document::untitled_with
-    pub fn take_untitled(&self, id: UntitledId) -> Option<Found> {
-        self.newest(&TalkPlace::Untitled(id), &self.held_by_others())
+    /// [`WorkspaceView::bring_back_untitled`]: crate::workspace_view::WorkspaceView::bring_back_untitled
+    pub fn take_untitled(&self, id: UntitledId) -> Result<Found, NotTaken> {
+        let place = TalkPlace::Untitled(id);
+        let key_folder = self.key_folder(&place).ok_or(NotTaken::Gone)?;
+        let live = live_slots().clone();
+        let (held, free): (Vec<PathBuf>, Vec<PathBuf>) =
+            slots(&key_folder).into_iter().partition(|slot| self.held_by_another(slot, &live));
+        let any_free = !free.is_empty();
+        match newest_of(&place, free) {
+            Some(found) => Ok(found),
+            None if !held.is_empty() => Err(NotTaken::Held),
+            None if any_free => Err(NotTaken::Unreadable),
+            None => Err(NotTaken::Gone),
+        }
     }
 
-    /// Removes the working copies of the new presentation `id`, but those an open window holds.
+    /// Removes the working copies of the new presentation `id` that say they're its, but those
+    /// an open window holds.
     pub fn discard_untitled(&self, id: UntitledId) {
-        let key_folder = self.root.join(key(&canonical(&TalkPlace::Untitled(id))));
-        if refuse_link(&key_folder).is_err() {
+        let place = TalkPlace::Untitled(id);
+        let Some(key_folder) = self.key_folder(&place) else {
             return;
-        }
-        let held = self.held_by_others();
+        };
+        let talk = canonical(&place);
         for slot in slots(&key_folder) {
-            let held_here = slot
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| held.contains(name));
-            if !held_here {
+            let its = read_about(&slot).is_some_and(|(about, _)| about.talk == talk && says_it_is(&about, &place));
+            // Looked at again just before it goes, as a window may have come to hold it.
+            if its && !is_held(&slot, &live_slots().clone()) {
                 remove_slot(&slot);
             }
         }
     }
 
-    /// Removes the working copies kept longer ago than `older_than`. One whose about file
-    /// can't be read goes by when its folder last changed.
+    /// Removes the working copies kept longer ago than `older_than`, but those an open window
+    /// holds. One whose about file can't be read goes by when its folder last changed.
     pub fn sweep(&self, older_than: Duration) {
         let Ok(entries) = std::fs::read_dir(&self.root) else {
             return;
@@ -478,19 +569,72 @@ impl Recovery {
                 continue;
             }
             for slot in slots(&entry.path()) {
+                if is_held(&slot, &live_slots().clone()) {
+                    continue;
+                }
                 let kept = read_about(&slot)
-                    .and_then(|(about, _)| kept_at(&about))
-                    .or_else(|| {
-                        std::fs::metadata(&slot)
-                            .and_then(|meta| meta.modified())
-                            .ok()
-                    });
-                if kept.is_some_and(is_old) {
+                    .and_then(|(about, _)| kept_at(&about, &slot))
+                    .or_else(|| changed_at(&slot));
+                if kept.is_some_and(is_old) && !is_held(&slot, &live_slots().clone()) {
                     remove_slot(&slot);
                 }
             }
         }
     }
+}
+
+/// Why a new presentation's working copy wasn't taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotTaken {
+    /// It isn't there any more.
+    Gone,
+    /// An open window has it, in this app or another running copy of it.
+    Held,
+    /// It's there, but can't be read.
+    Unreadable,
+}
+
+impl std::fmt::Display for NotTaken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            NotTaken::Gone => "This presentation isn't kept any more.",
+            NotTaken::Held => "This presentation is open in another window.",
+            NotTaken::Unreadable => "This presentation's kept copy couldn't be read.",
+        })
+    }
+}
+
+/// Whether an open window holds `slot`, among the slots `live` in this app or in another
+/// running copy of it.
+fn is_held(slot: &Path, live: &BTreeSet<String>) -> bool {
+    slot_name(slot).is_some_and(|name| live.contains(name)) || locked_elsewhere(slot)
+}
+
+/// The newest working copy of the talk at `place` that can be read, among `slots`.
+fn newest_of(place: &TalkPlace, slots: Vec<PathBuf>) -> Option<Found> {
+    let talk = canonical(place);
+    let newest = slots
+        .into_iter()
+        .filter_map(|slot| {
+            let (about, written) = read_about(&slot)?;
+            (about.talk == talk && says_it_is(&about, place)).then_some((about, written, slot))
+        })
+        .filter_map(|(about, written, slot)| {
+            let when = kept_at(&about, &slot)?;
+            let text = String::from_utf8(read_small(&slot.join(SLIDES_FILE), MAX_TEXT_BYTES)?).ok()?;
+            Some((when, written, about.base_sha256, text, slot))
+        })
+        .max_by_key(|(when, written, ..)| (*when, *written))?;
+    let (when, _, base, text, slot) = newest;
+    let base_matches = on_disk(place).is_some_and(|disk| hash_text(&disk) == base);
+    Some(Found {
+        text,
+        files: kept_files(&slot),
+        builds: kept_builds(&slot),
+        base_matches,
+        when,
+        slot,
+    })
 }
 
 /// Keeps `bytes`, the file added to the talk at `path`, in the working copy's `slot`.
@@ -595,7 +739,7 @@ fn untitled_about(slot: &Path, key_name: &str) -> Option<Option<UntitledFound>> 
     if about.talk != talk || key(&talk) != key_name {
         return None;
     }
-    let name: String = untitled.name.chars().filter(|c| !c.is_control()).take(NAME_CHARS).collect();
+    let name: String = untitled.name.chars().filter(|c| !c.is_control() && !is_invisible(*c)).take(NAME_CHARS).collect();
     let name = match name.trim() {
         "" => UNTITLED_NAME.to_string(),
         name => name.to_string(),
@@ -603,10 +747,16 @@ fn untitled_about(slot: &Path, key_name: &str) -> Option<Option<UntitledFound>> 
     Some(Some(UntitledFound {
         id,
         name,
-        when: kept_at(&about)?,
+        when: kept_at(&about, slot)?,
         written,
         slot: slot.to_path_buf(),
     }))
+}
+
+/// Whether `c` is drawn as nothing but changes how the text around it reads: a mark that only
+/// orders or joins the letters around it.
+fn is_invisible(c: char) -> bool {
+    matches!(c, '\u{ad}' | '\u{61c}' | '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}')
 }
 
 /// Whether `about` says it's a copy of the talk at `place` as its kind of place has it: a new
@@ -633,7 +783,8 @@ fn listed_copy(found: UntitledFound) -> Option<UntitledCopy> {
         return None;
     }
     let mut bytes = read_start(&file, MAX_LISTED_TEXT_BYTES)?;
-    if bytes.len() as u64 == MAX_LISTED_TEXT_BYTES && meta.len() > MAX_LISTED_TEXT_BYTES {
+    let longer = meta.len() > MAX_LISTED_TEXT_BYTES;
+    if longer {
         // Only its start is read: up to the last whole line in that.
         let end = bytes.iter().rposition(|byte| *byte == b'\n').map_or(0, |at| at + 1);
         bytes.truncate(end);
@@ -649,6 +800,7 @@ fn listed_copy(found: UntitledFound) -> Option<UntitledCopy> {
         name: found.name,
         when: found.when,
         slides,
+        slides_at_least: longer,
         first_words,
     })
 }
@@ -673,15 +825,30 @@ fn first_words(talk: &slides_format::Talk) -> String {
 fn read_about(slot: &Path) -> Option<(About, SystemTime)> {
     let file = slot.join(ABOUT_FILE);
     let about = serde_json::from_slice(&read_small(&file, MAX_ABOUT_BYTES)?).ok()?;
-    let written = std::fs::metadata(&file)
+    let written = std::fs::symlink_metadata(&file)
         .and_then(|meta| meta.modified())
         .unwrap_or(SystemTime::UNIX_EPOCH);
     Some((about, written))
 }
 
-/// When the copy was kept, unless it says a time no clock can hold.
-fn kept_at(about: &About) -> Option<SystemTime> {
-    SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(about.kept_at))
+/// How far ahead of the clock a copy's time can be and still be taken as when it was kept.
+const CLOCK_SLIP: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// When the copy in `slot` was kept, unless it says a time no clock can hold. A time further
+/// ahead than a clock that was set wrong explains is when its folder last changed instead, so
+/// that it neither stays first in the list nor is kept for ever.
+fn kept_at(about: &About, slot: &Path) -> Option<SystemTime> {
+    let kept = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(about.kept_at))?;
+    let latest = SystemTime::now().checked_add(CLOCK_SLIP)?;
+    if kept > latest {
+        return changed_at(slot);
+    }
+    Some(kept)
+}
+
+/// When the folder `slot` last changed.
+fn changed_at(slot: &Path) -> Option<SystemTime> {
+    std::fs::symlink_metadata(slot).and_then(|meta| meta.modified()).ok()
 }
 
 /// Removes the working copy in `slot`, and its talk's folder once that's empty. A link is
@@ -752,27 +919,45 @@ fn on_disk(place: &TalkPlace) -> Option<String> {
 
 /// The bytes of the plain file at `path`, unless it holds more than `most`.
 fn read_small(path: &Path, most: u64) -> Option<Vec<u8>> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
-    if !meta.is_file() || meta.len() > most {
+    let file = open_plain(path)?;
+    if file.metadata().ok()?.len() > most {
         return None;
     }
     let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(most + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
+    file.take(most + 1).read_to_end(&mut bytes).ok()?;
     (bytes.len() as u64 <= most).then_some(bytes)
 }
 
 /// The first `most` bytes of the plain file at `path`, or all of it if it holds fewer.
 fn read_start(path: &Path, most: u64) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    open_plain(path)?.take(most).read_to_end(&mut bytes).ok()?;
+    Some(bytes)
+}
+
+/// The plain file at `path`, opened to read, unless it's a link or anything but a file. Where
+/// the system allows, a link put there after it's looked at isn't followed either, and nothing
+/// waits on what's at the other end of a pipe.
+fn open_plain(path: &Path) -> Option<std::fs::File> {
     if !std::fs::symlink_metadata(path).ok()?.is_file() {
         return None;
     }
-    let mut bytes = Vec::new();
-    std::fs::File::open(path).ok()?.take(most).read_to_end(&mut bytes).ok()?;
-    Some(bytes)
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    no_follow(&mut options);
+    let file = options.open(path).ok()?;
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
+/// Opens a file with `options` without following a link, where the system allows.
+fn no_follow(options: &mut std::fs::OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(not(unix))]
+    let _ = options;
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {

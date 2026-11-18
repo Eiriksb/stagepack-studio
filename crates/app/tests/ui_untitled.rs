@@ -17,7 +17,7 @@ use stagepack_studio::builds::Compile;
 use stagepack_studio::clipboard::{self, AppData, CopiedFile, PastedFiles};
 use stagepack_studio::document::{Document, TalkPlace, UntitledId};
 use stagepack_studio::permissions::BuildPermissions;
-use stagepack_studio::recovery::Recovery;
+use stagepack_studio::recovery::{NotTaken, Recovery};
 use stagepack_studio::ribbon::SAVE_ID;
 use stagepack_studio::workspace_view::{
     BUILD_ALWAYS_ID, CLOSE_DONT_SAVE_ID, CLOSE_SAVE_ID, ExportPdf, ExportPowerPoint, SAVE_AS_CANCEL_ID, SAVE_AS_FOLDER_ID,
@@ -486,7 +486,7 @@ fn an_untitled_talk_keeps_its_copy_as_it_is_edited(cx: &mut TestAppContext) {
     let edited = typing.source(cx);
     assert_eq!(recovery.find(&untitled).expect("a copy of the edits").text, edited);
     assert_eq!(recovery.untitled(), (Vec::new(), 0), "the window holds it, so it isn't listed");
-    assert!(recovery.take_untitled(id).is_none());
+    assert_eq!(recovery.take_untitled(id).unwrap_err(), NotTaken::Held);
 
     crash(cx, typing);
     let (listed, skipped) = recovery.untitled();
@@ -518,7 +518,7 @@ fn the_first_save_clears_the_untitled_copy(cx: &mut TestAppContext) {
     assert!(recovery.find(&untitled).is_none(), "the save holds it now");
     crash(cx, typing);
     assert_eq!(recovery.untitled(), (Vec::new(), 0));
-    assert!(recovery.take_untitled(id).is_none());
+    assert_eq!(recovery.take_untitled(id).unwrap_err(), NotTaken::Gone);
 }
 
 #[gpui_kit::test]
@@ -541,4 +541,46 @@ fn closing_with_dont_save_discards_the_copy(cx: &mut TestAppContext) {
     assert!(recovery.find(&untitled).is_none());
     assert_eq!(recovery.untitled(), (Vec::new(), 0));
     assert!(!places.recovery.exists() || std::fs::read_dir(&places.recovery).unwrap().count() == 0, "nothing left behind");
+}
+
+#[gpui_kit::test]
+fn a_talk_brought_back_is_kept_before_its_old_copy_goes(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let places = UntitledPlaces::under(root.path());
+    let recovery = Recovery::new(places.recovery.clone());
+    let typing = open_untitled_under(cx, "tour", 1, root.path());
+    let TalkPlace::Untitled(id) = place(&typing, cx) else { panic!("untitled") };
+    add_slide(&typing, cx);
+    wait(cx, KEEP_PAUSE);
+    let edited = typing.source(cx);
+    crash(cx, typing);
+
+    // Brought back, and gone again with nothing edited.
+    let found = recovery.take_untitled(id).unwrap();
+    let typing = open_brought_back(cx, id, found, 2, root.path());
+    assert_eq!(typing.source(cx), edited);
+    assert_eq!(title(&typing, cx), "• Untitled presentation 2 · 1 / 9");
+    wait(cx, KEEP_PAUSE);
+    crash(cx, typing);
+    let (listed, skipped) = recovery.untitled();
+    assert_eq!((listed.len(), skipped), (1, 0), "{listed:?}");
+    assert_eq!(listed[0].id, id);
+    assert_eq!(listed[0].name, "Untitled presentation 2");
+    let found = recovery.take_untitled(id).unwrap();
+    assert_eq!(found.text.as_bytes(), edited.as_bytes());
+    assert!(found.files.iter().any(|(path, _)| path == "assets/photo.png"), "with its picture");
+
+    // Brought back and edited: one copy, under the same id, the old one gone.
+    let typing = open_brought_back(cx, id, found, 1, root.path());
+    add_slide(&typing, cx);
+    wait(cx, KEEP_PAUSE);
+    let edited = typing.source(cx);
+    crash(cx, typing);
+    assert_eq!(std::fs::read_dir(&places.recovery).unwrap().count(), 1, "one talk's folder");
+    let slots = std::fs::read_dir(&places.recovery).unwrap().next().unwrap().unwrap().path();
+    assert_eq!(std::fs::read_dir(&slots).unwrap().count(), 1, "one copy in it");
+    let (listed, _) = recovery.untitled();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, id);
+    assert_eq!(recovery.take_untitled(id).unwrap().text, edited);
 }

@@ -222,12 +222,25 @@ impl WorkingCopies {
         .detach();
     }
 
+    /// Keeps working copies in `recovery` as [`Self::use_recovery`] does, for a talk made from
+    /// `found`, a copy from last time: it's this window's own from the start, so it's kept
+    /// again here straight away, and last time's goes only once it is. Nothing is offered.
+    pub fn use_recovery_bringing_back(&mut self, recovery: Recovery, found: Found, cx: &mut Context<Self>) {
+        self.recovery = Some(recovery.for_another_window());
+        self.brought_back(found, cx);
+    }
+
     fn offer(&mut self, found: Option<Found>, cx: &mut Context<Self>) {
         let (Some(found), Some(document), Some(recovery)) =
             (found, &self.document, self.recovery.clone())
         else {
             return;
         };
+        let adopted = self.adopted.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref().is_some_and(|adopted| adopted.is_same_copy(&found));
+        if adopted {
+            // Brought back already, and let go only once it's kept here.
+            return;
+        }
         let document = document.read(cx);
         let files = document.export_input().files;
         let has_them = found.files.iter().all(|(path, bytes)| files.read(path).is_some_and(|held| *held == **bytes));
