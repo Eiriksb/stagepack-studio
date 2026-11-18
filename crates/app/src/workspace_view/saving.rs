@@ -40,9 +40,12 @@ impl WorkspaceView {
         let text = std::mem::take(&mut found.text);
         let files = found.files.clone();
         let builds = found.builds.clone();
+        let large = found.large.clone();
         let recovered = document.update(cx, |document, cx| {
             let recovered = document.recover_with_builds(text.clone(), files, builds);
             if recovered.is_ok() {
+                // Taken into this window's own working copy, whatever becomes of last time's.
+                document.bring_back_large(large);
                 // A show of the talk has to know.
                 cx.notify();
             }
@@ -275,13 +278,36 @@ impl WorkspaceView {
         .detach();
     }
 
-    /// Runs `job`, which saves to the place called `name`, on a background task.
+    /// Runs `job`, which saves to the place called `name`, on a background task. One that moves a
+    /// large file shows how far it's got on the status line, with a Cancel. One that replaces the
+    /// talk's pack lets go of every reader of it first, as nothing may hold it open meanwhile.
     fn run_save(&mut self, job: SaveJob, name: String, cx: &mut Context<Self>) {
-        self.say(format!("{} {name}…", SAVING.doing), cx);
+        if job.replaces_the_pack()
+            && let Some(document) = &self.document
+        {
+            document.read(cx).let_go_of_readers();
+        }
+        let meter = job.moves_large().then(|| self.start_progress(format!("{} {name}", SAVING.doing), cx));
+        if meter.is_none() {
+            self.say(format!("{} {name}…", SAVING.doing), cx);
+        }
+        let running = meter.clone();
         cx.spawn(async move |this, cx| {
-            let outcome = cx.background_spawn(async move { job.run() }).await;
-            this.update(cx, |this, cx| this.finish_save(outcome, name, cx))
-                .ok();
+            let outcome = cx
+                .background_spawn(async move {
+                    match running {
+                        Some(meter) => job.run_with(&|done, total| meter.tell(done, total), meter.stop()),
+                        None => job.run(),
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Some(meter) = &meter {
+                    this.end_progress(meter, cx);
+                }
+                this.finish_save(outcome, name, cx)
+            })
+            .ok();
         })
         .detach();
     }

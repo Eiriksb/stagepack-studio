@@ -74,6 +74,7 @@ impl Document {
             self.files_to_write(),
             self.index_for_save(),
         )
+        .moving_large(self.moves_large())
     }
 
     /// A save of the talk as it is now, somewhere new. For an untitled talk that's its first
@@ -87,6 +88,7 @@ impl Document {
             self.files_to_write(),
             self.index_for_save(),
         )
+        .moving_large(self.moves_large())
     }
 
     /// The builds entered in the talk's index with the files added to it, of builds its text

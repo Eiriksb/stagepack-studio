@@ -4,11 +4,12 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use slides_engine::{
-    FolderFiles, MemoryFiles, NewFile, PackError, TalkFiles, copy_talk_folder, lies_within, open_packed,
-    pack_folder_with_slides, pack_new, read_talk_text, repack_with_slides, unpack_with_slides,
-    write_atomically, write_new_atomically, write_new_folder,
+    AddedFile, FileSource, FolderFiles, MemoryFiles, NewFileFrom, PackError, TalkFiles, copy_talk_folder_from, lies_within,
+    open_packed, pack_folder_with_slides_from, pack_new_from, read_talk_text, repack_with_slides_from, unpack_with_slides_from,
+    write_atomically, write_new_atomically, write_new_folder_from,
 };
 
 use slides_components::{BuildEntry, INDEX_FILE};
@@ -37,14 +38,16 @@ pub struct SaveJob {
     to: Option<SaveTarget>,
     /// The files to write besides the text, by their path in the talk: those added to it that the
     /// text uses and aren't saved yet, and for an untitled talk the files it was made with that
-    /// the text uses.
-    added: Vec<(String, Arc<[u8]>)>,
+    /// the text uses. A large file is given by where it lies, and copied from there.
+    added: Vec<(String, AddedFile)>,
     /// The builds entered in the talk's index, of builds the text uses, that no save has
     /// written into the index on disk.
     builds: Vec<BuildEntry>,
     /// The talk's build index with `builds` entered in it, for a save to anywhere but its own
     /// folder, which takes it in place of the talk's; `None` if the talk's own can't be read.
     index: Option<Vec<u8>>,
+    /// Whether it moves a large file, which can take a while.
+    moves_large: bool,
 }
 
 /// Why a save didn't write anything.
@@ -122,7 +125,7 @@ impl SaveJob {
         on_disk: String,
         from: TalkPlace,
         to: Option<SaveTarget>,
-        added: Vec<(String, Arc<[u8]>)>,
+        added: Vec<(String, AddedFile)>,
         (builds, index): (Vec<BuildEntry>, Option<Vec<u8>>),
     ) -> SaveJob {
         SaveJob {
@@ -133,6 +136,28 @@ impl SaveJob {
             added,
             builds,
             index,
+            moves_large: false,
+        }
+    }
+
+    /// The job, saying whether it moves a large file.
+    pub(crate) fn moving_large(mut self, moves_large: bool) -> SaveJob {
+        self.moves_large = moves_large;
+        self
+    }
+
+    /// Whether it moves a large file, such as a video, which can take a while: the window shows
+    /// how far it's got, and can stop it.
+    pub fn moves_large(&self) -> bool {
+        self.moves_large
+    }
+
+    /// Whether it replaces the pack the talk is kept in, which nothing may hold open meanwhile.
+    pub fn replaces_the_pack(&self) -> bool {
+        match (&self.from, &self.to) {
+            (TalkPlace::Packed(_), None) => true,
+            (TalkPlace::Packed(file), Some(SaveTarget::Packed(out))) => file == out,
+            _ => false,
         }
     }
 
@@ -144,7 +169,15 @@ impl SaveJob {
     /// in words for the person saving, and leaves what was there as it was: a folder may have
     /// some of those files in it, which nothing uses until a save writes its text.
     pub fn run(self) -> Result<Saved, SaveError> {
-        self.run_reading_back_with(|file| in_pack(file.to_path_buf()).map(|(_, files)| files))
+        self.run_with(&|_, _| {}, &AtomicBool::new(false))
+    }
+
+    /// [`Self::run`], copying every file a piece at a time, telling `progress` the bytes done and
+    /// the bytes in all as it goes, and stopping if `stop` is set, which fails the save and
+    /// leaves everything as it was, as any failure does. Every byte done, the files are still
+    /// made safe on the disk and put in place.
+    pub fn run_with(self, progress: &dyn Fn(u64, u64), stop: &AtomicBool) -> Result<Saved, SaveError> {
+        self.run_all(|file| in_pack(file.to_path_buf()).map(|(_, files)| files), progress, stop)
     }
 
     /// [`Self::run`], opening the pack saved in place in, or a new presentation's first pack,
@@ -154,6 +187,15 @@ impl SaveJob {
         self,
         read_back: impl FnOnce(&Path) -> Result<Arc<dyn TalkFiles + Send + Sync>, String>,
     ) -> Result<Saved, SaveError> {
+        self.run_all(read_back, &|_, _| {}, &AtomicBool::new(false))
+    }
+
+    fn run_all(
+        self,
+        read_back: impl FnOnce(&Path) -> Result<Arc<dyn TalkFiles + Send + Sync>, String>,
+        progress: &dyn Fn(u64, u64),
+        stop: &AtomicBool,
+    ) -> Result<Saved, SaveError> {
         let SaveJob {
             text,
             on_disk,
@@ -162,6 +204,7 @@ impl SaveJob {
             added,
             builds,
             index,
+            moves_large: _,
         } = self;
         let mut builds_written = Vec::new();
         let mut reopened = None;
@@ -170,9 +213,16 @@ impl SaveJob {
         let index_kept = |place: &Path| failed(&place.join(INDEX_FILE), "it can't be read, so a pasted component needs building.");
         // The merged index goes with the files, in place of the talk's own.
         let index_written = !builds.is_empty() && index.is_some();
-        let extra = || -> Vec<NewFile> {
-            let index = index.iter().filter(|_| !builds.is_empty()).map(|index| (INDEX_FILE.to_string(), index.clone()));
-            added.iter().map(|(path, bytes)| (path.clone(), bytes.to_vec())).chain(index).collect()
+        let extra = || -> Vec<NewFileFrom> {
+            let index = index.iter().filter(|_| !builds.is_empty()).map(|index| (INDEX_FILE.to_string(), FileSource::Bytes(index.clone())));
+            let added = added.iter().map(|(path, file)| {
+                let source = match file {
+                    AddedFile::Bytes(bytes) => FileSource::Bytes(bytes.to_vec()),
+                    AddedFile::At(at, _) => FileSource::At(at.clone()),
+                };
+                (path.clone(), source)
+            });
+            added.chain(index).collect()
         };
         let index_notice = |place: &Path| (!builds.is_empty() && index.is_none()).then(|| index_kept(place));
         if let (TalkPlace::Folder(folder), Some(SaveTarget::Folder(to) | SaveTarget::Packed(to))) =
@@ -194,8 +244,18 @@ impl SaveJob {
                     changed_outside(found, &on_disk, &text)?;
                 }
                 // Before the text, so that a talk cut short never names a file it hasn't got.
-                for (path, bytes) in &added {
-                    write_added(folder, path, bytes)?;
+                let total = added.iter().map(|(_, file)| file.len()).sum::<u64>();
+                let mut done = 0;
+                for (path, file) in &added {
+                    match file {
+                        AddedFile::Bytes(bytes) => write_added(folder, path, bytes)?,
+                        AddedFile::At(at, _) => {
+                            let told = crate::large_files::Told { progress, before: done, total };
+                            write_added_from(folder, path, at, &told, stop)?;
+                        }
+                    }
+                    done += file.len();
+                    progress(done, total);
                 }
                 let entered = builds::merge_into_index(folder, &builds, Unreadable::Keep).map_err(|e| failed(&folder.join(INDEX_FILE), e))?;
                 let notices = entered.is_none().then(|| index_kept(folder)).into_iter().collect();
@@ -208,25 +268,24 @@ impl SaveJob {
                 if let Ok(found) = open_packed(file).and_then(|packed| packed.slides()) {
                     changed_outside(found, &on_disk, &text)?;
                 }
-                repack_with_slides(file, file, &text, APP_VERSION, &extra()).map_err(|e| failed(file, e))?;
+                repack_with_slides_from(file, file, &text, APP_VERSION, &extra(), progress, stop).map_err(|e| failed(file, e))?;
                 // The talk is read from the pack as it's written from now on, so what it holds,
-                // files and entries, is the talk's, as after a save in a folder.
+                // files and entries, is the talk's, as after a save in a folder, and nothing goes
+                // on holding the pack it replaced, which would keep that pack's disk space.
                 // If it can't be read back, the save has still been made: that's said, the talk
                 // goes on being read as it was, and the next save starts from the index written.
                 let mut notices: Vec<String> = index_notice(file).into_iter().collect();
-                if index_written || !files_written.is_empty() {
-                    match read_back(file) {
-                        Ok(files) => reopened = Some(files),
-                        Err(_) => {
-                            notices.push(NOT_READ_BACK.to_string());
-                            index_kept_in_pack = index.clone().filter(|_| index_written);
-                        }
+                match read_back(file) {
+                    Ok(files) => reopened = Some(files),
+                    Err(_) => {
+                        notices.push(NOT_READ_BACK.to_string());
+                        index_kept_in_pack = index.clone().filter(|_| index_written);
                     }
                 }
                 (None, notices)
             }
             (TalkPlace::Folder(folder), Some(SaveTarget::Folder(to))) => {
-                let report = copy_talk_folder(folder, &to, &text, &extra()).map_err(|e| failed(&to, e))?;
+                let report = copy_talk_folder_from(folder, &to, &text, &extra(), progress, stop).map_err(|e| failed(&to, e))?;
                 let left_out = report.skipped.into_iter().map(|name| format!("{name} was left out"));
                 let outside = report
                     .outside_pictures
@@ -236,7 +295,7 @@ impl SaveJob {
                 (Some(in_folder(to)), left_out.chain(outside).chain(kept).collect())
             }
             (TalkPlace::Folder(folder), Some(SaveTarget::Packed(out))) => {
-                let report = pack_folder_with_slides(folder, &out, &text, APP_VERSION, &extra())
+                let report = pack_folder_with_slides_from(folder, &out, &text, APP_VERSION, &extra(), progress, stop)
                     .map_err(|e| failed(&out, e))?;
                 let left_out = report.skipped.into_iter().map(|name| format!("{name} was left out"));
                 let outside = report
@@ -251,12 +310,12 @@ impl SaveJob {
                 (Some(in_pack(out)?), notices)
             }
             (TalkPlace::Packed(file), Some(SaveTarget::Packed(out))) => {
-                repack_with_slides(file, &out, &text, APP_VERSION, &extra()).map_err(|e| failed(&out, e))?;
+                repack_with_slides_from(file, &out, &text, APP_VERSION, &extra(), progress, stop).map_err(|e| failed(&out, e))?;
                 let kept = index_notice(&out).into_iter().collect();
                 (Some(in_pack(out)?), kept)
             }
             (TalkPlace::Packed(file), Some(SaveTarget::Folder(to))) => {
-                unpack_with_slides(file, &to, &text, &extra()).map_err(|e| failed(&to, e))?;
+                unpack_with_slides_from(file, &to, &text, &extra(), progress, stop).map_err(|e| failed(&to, e))?;
                 let kept = index_notice(&to).into_iter().collect();
                 (Some(in_folder(to)), kept)
             }
@@ -265,12 +324,12 @@ impl SaveJob {
             // A first save: everything is in memory, so all of it is written, fresh. A failure
             // leaves nothing at the target, and the talk as it was.
             (TalkPlace::Untitled(_), Some(SaveTarget::Folder(to))) => {
-                write_new_folder(&to, &text, &extra()).map_err(|e| failed(&to, e))?;
+                write_new_folder_from(&to, &text, &extra(), progress, stop).map_err(|e| failed(&to, e))?;
                 let kept = index_notice(&to).into_iter().collect();
                 (Some(in_folder(to)), kept)
             }
             (TalkPlace::Untitled(_), Some(SaveTarget::Packed(out))) => {
-                pack_new(&out, &text, APP_VERSION, &extra()).map_err(|e| failed(&out, e))?;
+                pack_new_from(&out, &text, APP_VERSION, &extra(), progress, stop).map_err(|e| failed(&out, e))?;
                 let mut notices: Vec<String> = index_notice(&out).into_iter().collect();
                 // Written, whether or not it can be opened again. If it can't, that's said, and
                 // the talk goes on being read from what was written, held here, as a pack saved
@@ -280,7 +339,14 @@ impl SaveJob {
                     Err(_) => {
                         notices.push(NOT_READ_BACK.to_string());
                         index_kept_in_pack = index.clone().filter(|_| index_written);
-                        let held = extra().into_iter().map(|(path, bytes)| (path, Arc::from(bytes))).collect();
+                        // Those held in memory: a large file stays where it lies, as one added.
+                        let held = extra()
+                            .into_iter()
+                            .filter_map(|(path, source)| match source {
+                                FileSource::Bytes(bytes) => Some((path, Arc::from(bytes))),
+                                FileSource::At(_) => None,
+                            })
+                            .collect();
                         let written: SharedFiles = Arc::new(MemoryFiles::new(held));
                         written
                     }
@@ -360,6 +426,71 @@ fn write_added(folder: &Path, path: &str, bytes: &[u8]) -> Result<(), String> {
         },
         Err(error) => Err(failed(&target, error)),
     }
+}
+
+/// Writes the large file lying at `at`, added to the talk, at `path` in its `folder`, as
+/// [`write_added`] writes one held: copied a piece at a time, telling `told` as it goes and
+/// stopping if `stop` is set, by way of a file beside it, never written over one that's there,
+/// and failing if it changes while it's copied.
+fn write_added_from(folder: &Path, path: &str, at: &Path, told: &crate::large_files::Told<'_>, stop: &AtomicBool) -> Result<(), String> {
+    let Some((place, name)) = path.split_once('/').filter(|_| is_added_path(path)) else {
+        return Err(failed(folder, NotAdded::NameTaken));
+    };
+    let place = folder.join(place);
+    match std::fs::symlink_metadata(&place) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Err(failed(&place, "something that isn't a folder is where its files go.")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&place).map_err(|e| failed(&place, e))?
+        }
+        Err(error) => return Err(failed(&place, error)),
+    }
+    let target = place.join(name);
+    let source = crate::large_files::LargeSource::File(at.to_path_buf());
+    let looked = source.look().map_err(|why| failed(&target, why))?;
+    if holds_file(&target, at, looked.len).map_err(|e| failed(&target, e))? {
+        return Ok(());
+    }
+    match crate::large_files::copy_to(&source, looked, &target, told, stop) {
+        Ok(_) => Ok(()),
+        // Put there since it was looked at.
+        Err(NotAdded::NameTaken) => match holds_file(&target, at, looked.len) {
+            Ok(true) => Ok(()),
+            _ => Err(failed(folder, NotAdded::NameTaken)),
+        },
+        Err(NotAdded::Cancelled) => Err(failed(&target, PackError::Stopped)),
+        Err(why) => Err(failed(&target, why)),
+    }
+}
+
+/// Whether `target` is a file holding what the file at `at`, of `len` bytes, holds, compared a
+/// piece at a time: `false` if nothing is there, and an error if something else is.
+fn holds_file(target: &Path, at: &Path, len: u64) -> Result<bool, NotAdded> {
+    use std::io::Read as _;
+    let meta = match std::fs::symlink_metadata(target) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(NotAdded::Unreadable),
+    };
+    if !meta.is_file() || meta.len() != len {
+        return Err(NotAdded::NameTaken);
+    }
+    let (mut there, mut ours) = (
+        std::fs::File::open(target).map_err(|_| NotAdded::Unreadable)?,
+        std::fs::File::open(at).map_err(|_| NotAdded::Unreadable)?,
+    );
+    let (mut a, mut b) = (vec![0u8; 1024 * 1024], vec![0u8; 1024 * 1024]);
+    let mut left = len;
+    while left > 0 {
+        let n = left.min(a.len() as u64) as usize;
+        there.read_exact(&mut a[..n]).map_err(|_| NotAdded::Unreadable)?;
+        ours.read_exact(&mut b[..n]).map_err(|_| NotAdded::Unreadable)?;
+        if a[..n] != b[..n] {
+            return Err(NotAdded::NameTaken);
+        }
+        left -= n as u64;
+    }
+    Ok(true)
 }
 
 /// Whether `target` is a file holding `bytes`: `false` if nothing is there, and an error if

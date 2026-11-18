@@ -618,6 +618,24 @@ impl PackedFiles {
         same_content(&mut entry, size, source)
     }
 
+    /// Copies the pack's file `path` to `to` a piece at a time, unpacking it if it's compressed,
+    /// telling `progress` the bytes done and the bytes in all as it goes, and stopping if `stop`
+    /// is set. A file of a large kind can hold up to [`MAX_LARGE_FILE`], any other what the pack
+    /// allows; one that holds more or less than it says is damage, and nothing more is written.
+    pub fn copy_entry(&self, path: &str, to: &mut dyn Write, progress: &dyn Fn(u64, u64), stop: &AtomicBool) -> Result<(), PackError> {
+        let path = normalise(path).ok_or_else(|| PackError::UnsafeName(path.to_string()))?;
+        let &i = self.index.get(&path).ok_or_else(|| PackError::Corrupt(format!("{path} is missing")))?;
+        let mut zip = self.zip();
+        let mut entry = zip.by_index(i)?;
+        let size = entry.size();
+        let limit = if is_large_kind(&path) { MAX_LARGE_FILE } else { self.entry_bytes };
+        if size > limit {
+            return Err(PackError::TooLarge(format!("{path} is bigger than {limit} bytes")));
+        }
+        let mut moving = Moving::new(progress, stop, size);
+        moving.copy(&mut entry, to, size, &path, true)
+    }
+
     /// Whether what `name` holds counts toward the pack's total.
     fn counted(&self, name: &str) -> bool {
         !self.in_place.contains(name)
@@ -1647,6 +1665,13 @@ fn atomically<E: From<std::io::Error>>(out: &Path, write: impl FnOnce(&mut File)
 /// error of the kind `AlreadyExists`.
 pub fn write_new_atomically(out: &Path, bytes: &[u8]) -> std::io::Result<()> {
     new_atomically(out, |file| file.write_all(bytes))
+}
+
+/// Writes the new file `out` by way of a temporary file beside it, as [`write_new_atomically`]
+/// does, with what's in it written by `write`, a piece at a time if it likes. A failure, or a
+/// stop, leaves nothing at `out`, and whatever is there already is never replaced.
+pub fn write_new_atomically_with(out: &Path, write: impl FnOnce(&mut File) -> Result<(), PackError>) -> Result<(), PackError> {
+    new_atomically(out, write)
 }
 
 /// [`write_new_atomically`], with what's written written by `write`.

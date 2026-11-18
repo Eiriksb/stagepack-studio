@@ -219,6 +219,7 @@ impl Document {
             palette: Vec::new(),
             palette_given_up: BTreeSet::new(),
             palette_longest_step: Duration::ZERO,
+            large: Default::default(),
         };
         document.components_looked_at();
         Ok(document)

@@ -270,10 +270,11 @@ impl TalkFiles for MemoryFiles {
     }
 }
 
-/// Files added to a talk while it's open, by their path in it, kept in memory until they're
-/// saved. Shared between the talk and whatever saves it. A file added keeps its bytes until a
-/// save has written it where the talk is read from and it's released, from when it's read
-/// there, as the talk's own.
+/// Files added to a talk while it's open, by their path in it, kept until they're saved. Shared
+/// between the talk and whatever saves it. A file added keeps its bytes, or the file on disk it
+/// lies in, until a save has written it where the talk is read from and it's released, from when
+/// it's read there, as the talk's own. A large file, such as a video, is never held in memory: it
+/// lies in a file of its own, and is opened there.
 ///
 /// It also holds builds entered in the talk's build index that no save has written yet, as
 /// for a component pasted with its build: the index the talk's files give is the talk's own
@@ -281,7 +282,7 @@ impl TalkFiles for MemoryFiles {
 /// for, which is never replaced.
 #[derive(Default)]
 pub struct AddedSet {
-    files: Mutex<BTreeMap<String, Arc<[u8]>>>,
+    files: Mutex<BTreeMap<String, AddedFile>>,
     /// How many files have been added or released, so that something holding on to what it
     /// read can tell when that's changed.
     added: AtomicU64,
@@ -290,12 +291,34 @@ pub struct AddedSet {
     builds_changed: AtomicU64,
 }
 
+/// A file added to a talk: its bytes, held, or the file on disk it lies in, with its length.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AddedFile {
+    Bytes(Arc<[u8]>),
+    At(PathBuf, u64),
+}
+
+impl AddedFile {
+    /// How many bytes it holds.
+    pub fn len(&self) -> u64 {
+        match self {
+            AddedFile::Bytes(bytes) => bytes.len() as u64,
+            AddedFile::At(_, len) => *len,
+        }
+    }
+
+    /// Whether it holds nothing.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 impl AddedSet {
     pub fn new() -> AddedSet {
         AddedSet::default()
     }
 
-    fn files(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Arc<[u8]>>> {
+    fn files(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, AddedFile>> {
         // A map is whole even if a thread panicked holding it.
         self.files.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -303,6 +326,17 @@ impl AddedSet {
     /// Adds `bytes` as the file at `path`, unless there's one there already, which is kept:
     /// whether it was added.
     pub fn add(&self, path: &str, bytes: Arc<[u8]>) -> bool {
+        self.add_file(path, AddedFile::Bytes(bytes))
+    }
+
+    /// Adds the file on disk at `file`, which holds `len` bytes, as the file at `path`, unless
+    /// there's one there already, which is kept: whether it was added. It's read where it lies,
+    /// in pieces, and never whole.
+    pub fn add_at(&self, path: &str, file: PathBuf, len: u64) -> bool {
+        self.add_file(path, AddedFile::At(file, len))
+    }
+
+    fn add_file(&self, path: &str, file: AddedFile) -> bool {
         let Some(path) = crate::packed::normalise(path) else {
             return false;
         };
@@ -310,7 +344,7 @@ impl AddedSet {
         if files.contains_key(&path) {
             return false;
         }
-        files.insert(path, bytes);
+        files.insert(path, file);
         self.added.fetch_add(1, Ordering::SeqCst);
         true
     }
@@ -329,9 +363,36 @@ impl AddedSet {
         released
     }
 
-    /// The bytes added as `path`.
+    /// The bytes added as `path`, if they're held. A file that lies on disk has none here.
     pub fn get(&self, path: &str) -> Option<Arc<[u8]>> {
+        match self.file(path)? {
+            AddedFile::Bytes(bytes) => Some(bytes),
+            AddedFile::At(..) => None,
+        }
+    }
+
+    /// The file added as `path`, held or on disk.
+    pub fn file(&self, path: &str) -> Option<AddedFile> {
         self.files().get(&crate::packed::normalise(path)?).cloned()
+    }
+
+    /// Where on disk the file added as `path` lies, if it lies anywhere.
+    pub fn lies_at(&self, path: &str) -> Option<PathBuf> {
+        match self.file(path)? {
+            AddedFile::At(file, _) => Some(file),
+            AddedFile::Bytes(_) => None,
+        }
+    }
+
+    /// Every file on disk a file added lies in.
+    pub fn files_on_disk(&self) -> Vec<PathBuf> {
+        self.files()
+            .values()
+            .filter_map(|file| match file {
+                AddedFile::At(file, _) => Some(file.clone()),
+                AddedFile::Bytes(_) => None,
+            })
+            .collect()
     }
 
     /// The files added directly in `folder`, in name order.
@@ -429,12 +490,14 @@ impl WithAdded {
 }
 
 impl TalkFiles for WithAdded {
+    /// A file added that lies on disk is never read whole: it's opened.
     fn read(&self, path: &str) -> Option<Vec<u8>> {
         if let Some(index) = self.entered_index(path) {
             return Some(index);
         }
-        match self.added.get(path) {
-            Some(bytes) => Some(bytes.to_vec()),
+        match self.added.file(path) {
+            Some(AddedFile::Bytes(bytes)) => Some(bytes.to_vec()),
+            Some(AddedFile::At(..)) => None,
             None => self.under.read(path),
         }
     }
@@ -443,19 +506,27 @@ impl TalkFiles for WithAdded {
         if let Some(index) = self.entered_index(path) {
             return Some(Box::new(Cursor::new(index)));
         }
-        match self.added.get(path) {
-            Some(bytes) => Some(Box::new(Cursor::new(bytes))),
+        match self.added.file(path) {
+            Some(AddedFile::Bytes(bytes)) => Some(Box::new(Cursor::new(bytes))),
+            Some(AddedFile::At(file, _)) => {
+                let file = File::open(file).ok()?;
+                file.metadata().ok()?.is_file().then(|| Box::new(file) as Box<dyn ReadSeek>)
+            }
             None => self.under.open(path),
         }
     }
 
-    /// What's added is held in memory, and the build index with builds entered in it is made
-    /// when it's read, so neither lies anywhere.
+    /// What's added is held in memory, or lies in a file of its own, and the build index with
+    /// builds entered in it is made when it's read, so lies nowhere.
     fn lies_at(&self, path: &str) -> Option<PathBuf> {
-        if self.entered_index(path).is_some() || self.added.get(path).is_some() {
+        if self.entered_index(path).is_some() {
             return None;
         }
-        self.under.lies_at(path)
+        match self.added.file(path) {
+            Some(AddedFile::At(file, _)) => Some(file),
+            Some(AddedFile::Bytes(_)) => None,
+            None => self.under.lies_at(path),
+        }
     }
 
     /// An added file never changes while it's held, so its length is its stamp; so is a file of a talk that
@@ -468,8 +539,8 @@ impl TalkFiles for WithAdded {
             let at = own.map_or(SystemTime::UNIX_EPOCH, |(_, at)| at) + changed;
             return Some((index.len() as u64, at));
         }
-        if let Some(bytes) = self.added.get(path) {
-            return Some((bytes.len() as u64, SystemTime::UNIX_EPOCH));
+        if let Some(file) = self.added.file(path) {
+            return Some((file.len(), SystemTime::UNIX_EPOCH));
         }
         if self.under.never_changes() {
             return self.under.len(path).map(|len| (len, SystemTime::UNIX_EPOCH));
@@ -481,8 +552,8 @@ impl TalkFiles for WithAdded {
         if let Some(index) = self.entered_index(path) {
             return Some(index.len() as u64);
         }
-        match self.added.get(path) {
-            Some(bytes) => Some(bytes.len() as u64),
+        match self.added.file(path) {
+            Some(file) => Some(file.len()),
             None => self.under.len(path),
         }
     }

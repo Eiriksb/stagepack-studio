@@ -12,9 +12,10 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::*;
 use slides_components::BuildEntry;
+use slides_engine::AddedFile;
 
 use crate::added_files::is_added_path;
-use crate::document::{Document, TalkPlace};
+use crate::document::{Document, LargeKeep, TalkPlace};
 use crate::recovery::{Found, Recovery, hash_text};
 
 /// How long after the last edit the working copy of unsaved changes is brought up to date.
@@ -68,17 +69,22 @@ enum Job {
         name: String,
         on_disk: String,
         text: String,
-        /// The files added to the talk that the text uses and no save has written.
-        files: Vec<(String, Arc<[u8]>)>,
+        /// The files added to the talk that the text uses and no save has written, held or, for
+        /// a large file, by where it lies.
+        files: Vec<(String, AddedFile)>,
         /// The builds entered in its index with them.
         builds: Vec<BuildEntry>,
         adopted: Adopted,
     },
-    /// Removes this window's copy, and the adopted one too if `adopted` is given.
+    /// Removes this window's copy, and the adopted one too if `adopted` is given, but for the
+    /// large files `keep` says the talk still holds, which are the only copies there are. The
+    /// copies of the places in `also`, where the talk was kept before, are cleared the same way.
     Clear {
         recovery: Recovery,
         place: TalkPlace,
         adopted: Option<Adopted>,
+        keep: Option<LargeKeep>,
+        also: Vec<TalkPlace>,
     },
     /// Keeps a file added to the talk, as it's added. Made only if no clear has been asked for
     /// since it was: a save has written it then, or the text doesn't use it yet, and the next
@@ -87,7 +93,7 @@ enum Job {
         recovery: Recovery,
         place: TalkPlace,
         path: String,
-        bytes: Arc<[u8]>,
+        file: AddedFile,
     },
     /// Removes a copy from last time.
     Discard(Recovery, Found),
@@ -111,9 +117,10 @@ impl Job {
             } => {
                 if clears.load(Ordering::SeqCst) == at {
                     let kept = match &place {
-                        TalkPlace::Untitled(id) => recovery.keep_untitled(*id, &name, &text, &files, &builds),
+                        // No file holds anything of it, so there's no text it started from.
+                        TalkPlace::Untitled(_) => recovery.keep_from(&place, Some(&name), &hash_text(""), &text, &files, &builds),
                         TalkPlace::Folder(_) | TalkPlace::Packed(_) => {
-                            recovery.keep_with_builds(&place, &hash_text(&on_disk), &text, &files, &builds)
+                            recovery.keep_from(&place, None, &hash_text(&on_disk), &text, &files, &builds)
                         }
                     };
                     kept.map_err(|_| ())?;
@@ -127,8 +134,16 @@ impl Job {
                 recovery,
                 place,
                 adopted,
+                keep,
+                also,
             } => {
-                recovery.clear(&place);
+                // What the talk holds is looked at now, not when this was asked for: a file may
+                // have been added since.
+                let keeps = keep.map(|keep| keep.keeper());
+                let keeps = |file: &std::path::Path| keeps.as_ref().is_some_and(|keeps| keeps(file));
+                for place in also.iter().chain([&place]) {
+                    recovery.clear_keeping(place, &keeps);
+                }
                 if let Some(adopted) = adopted.as_ref().and_then(take_adopted) {
                     recovery.discard(&adopted);
                 }
@@ -143,10 +158,10 @@ impl Job {
                 recovery,
                 place,
                 path,
-                bytes,
+                file,
             } => {
                 if clears.load(Ordering::SeqCst) == at {
-                    recovery.keep_file(&place, &path, &bytes).map_err(|_| ())?;
+                    recovery.keep_added(&place, &path, &file).map_err(|_| ())?;
                 }
             }
             Job::Discard(recovery, found) => recovery.discard(&found),
@@ -182,6 +197,9 @@ pub struct WorkingCopies {
     files_seen: u64,
     /// The files added to the talk that this window's copy holds, or is about to.
     files_kept: BTreeSet<String>,
+    /// The places the talk was kept in before, whose slots may still hold a large file of the
+    /// talk's, cleared again with each clear.
+    left_in: Vec<TalkPlace>,
 }
 
 impl EventEmitter<KeepFailed> for WorkingCopies {}
@@ -202,6 +220,7 @@ impl WorkingCopies {
             closing: false,
             files_seen: 0,
             files_kept: BTreeSet::new(),
+            left_in: Vec::new(),
         }
     }
 
@@ -215,9 +234,12 @@ impl WorkingCopies {
     pub fn use_recovery(&mut self, recovery: Recovery, cx: &mut Context<Self>) {
         let recovery = recovery.for_another_window();
         self.recovery = Some(recovery.clone());
-        let Some(document) = &self.document else {
+        let Some(document) = self.document.clone() else {
             return;
         };
+        // A large file added is copied into this window's own slot.
+        let kept_in = recovery.clone();
+        document.update(cx, |document, _| document.keep_large_files_in(kept_in));
         let place = document.read(cx).place().clone();
         cx.spawn(async move |this, cx| {
             let found = cx
@@ -232,7 +254,16 @@ impl WorkingCopies {
     /// `found`, a copy from last time: it's this window's own from the start, so it's kept
     /// again here straight away, and last time's goes only once it is. Nothing is offered.
     pub fn use_recovery_bringing_back(&mut self, recovery: Recovery, found: Found, cx: &mut Context<Self>) {
-        self.recovery = Some(recovery.for_another_window());
+        let recovery = recovery.for_another_window();
+        self.recovery = Some(recovery.clone());
+        if let Some(document) = self.document.clone() {
+            // Its large files are taken into this window's slot first, so they're its own.
+            let large = found.large.clone();
+            document.update(cx, |document, _| {
+                document.keep_large_files_in(recovery);
+                document.bring_back_large(large);
+            });
+        }
         self.brought_back(found, cx);
     }
 
@@ -250,6 +281,12 @@ impl WorkingCopies {
         let document = document.read(cx);
         let files = document.export_input().files;
         let has_them = found.files.iter().all(|(path, bytes)| files.read(path).is_some_and(|held| *held == **bytes));
+        // A large file is never read to tell: one that lies where the copy's does, or is as long.
+        let has_large = found.large.iter().all(|(path, at)| {
+            files.lies_at(path).is_some_and(|lies| lies == *at)
+                || std::fs::metadata(at).is_ok_and(|meta| files.len(path) == Some(meta.len()))
+        });
+        let has_them = has_them && has_large;
         if found.text == document.source() && has_them {
             // Nothing in it that isn't here.
             self.enqueue(Job::Discard(recovery, found), cx);
@@ -327,11 +364,11 @@ impl WorkingCopies {
         }
         self.files_seen = stamp;
         let place = document.place().clone();
-        let new: Vec<(String, Arc<[u8]>)> =
-            document.unsaved_files().into_iter().filter(|(path, _)| !self.files_kept.contains(path)).collect();
-        for (path, bytes) in new {
+        let new: Vec<(String, AddedFile)> =
+            document.unsaved_added().into_iter().filter(|(path, _)| !self.files_kept.contains(path)).collect();
+        for (path, file) in new {
             self.files_kept.insert(path.clone());
-            let job = Job::KeepFile { recovery: recovery.clone(), place: place.clone(), path, bytes };
+            let job = Job::KeepFile { recovery: recovery.clone(), place: place.clone(), path, file };
             self.enqueue(job, cx);
         }
     }
@@ -405,11 +442,13 @@ impl WorkingCopies {
                 recovery,
                 place,
                 adopted: None,
+                keep: Some(document.large_keep()),
+                also: self.left_in.clone(),
             });
         }
         // What a save would write, an untitled talk's own files among them, but only those a
         // working copy can hold.
-        let files: Vec<(String, Arc<[u8]>)> =
+        let files: Vec<(String, AddedFile)> =
             document.files_to_write().into_iter().filter(|(path, _)| is_added_path(path)).collect();
         let kept = Kept {
             place: place.clone(),
@@ -462,11 +501,20 @@ impl WorkingCopies {
         let Some(recovery) = self.recovery.clone() else {
             return;
         };
+        let keep = self.document.as_ref().map(|document| document.read(cx).large_keep());
+        let also = self.left_in.iter().filter(|kept| **kept != place).cloned().collect();
+        // A large file of the talk's that no save has written stays in this slot, and it may be
+        // kept somewhere else from now on, after a Save As: this slot is cleared again later.
+        if !self.left_in.contains(&place) {
+            self.left_in.push(place.clone());
+        }
         self.enqueue(
             Job::Clear {
                 recovery,
                 place,
                 adopted: Some(self.adopted.clone()),
+                keep,
+                also,
             },
             cx,
         );

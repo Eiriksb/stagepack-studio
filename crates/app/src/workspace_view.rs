@@ -99,6 +99,13 @@ pub const CLOSE_CANCEL_ID: &str = "close-cancel";
 pub const RECOVERY_ID: &str = "recovery";
 pub const RECOVER_ID: &str = "recover";
 pub const DISCARD_RECOVERY_ID: &str = "discard-recovery";
+/// The status line while a large file is copied in, saved or pasted: a bar, and how far it's got.
+pub const PROGRESS_ID: &str = "progress";
+/// The status line's Cancel, which stops what it shows the progress of.
+pub const CANCEL_PROGRESS_ID: &str = "cancel-progress";
+/// The answers to a paste that asks before copying large files into the talk.
+pub const COPY_LARGE_ID: &str = "copy-large";
+pub const DONT_COPY_LARGE_ID: &str = "dont-copy-large";
 
 /// The key context of the window's content, where its shortcuts apply.
 pub const KEY_CONTEXT: &str = "Workspace";
@@ -278,6 +285,40 @@ const EXPORTING: Wording = Wording {
     doing: "Exporting",
     done: "Exported",
 };
+/// How far work that moves a large file has got, shared with the background task doing it.
+#[derive(Default)]
+pub(crate) struct Meter {
+    done: std::sync::atomic::AtomicU64,
+    total: std::sync::atomic::AtomicU64,
+    stop: std::sync::atomic::AtomicBool,
+}
+
+impl Meter {
+    /// Takes in how far it's got: `done` bytes of `total`.
+    pub(crate) fn tell(&self, done: u64, total: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.total.store(total, Relaxed);
+        self.done.store(done, Relaxed);
+    }
+
+    /// What's set to stop it.
+    pub(crate) fn stop(&self) -> &std::sync::atomic::AtomicBool {
+        &self.stop
+    }
+}
+
+/// Work that moves a large file, while the status line shows how far it's got.
+struct Progressing {
+    /// What it's doing, such as *Copying video*.
+    doing: SharedString,
+    meter: std::sync::Arc<Meter>,
+    /// Draws the line again while it goes on.
+    _ticker: Task<()>,
+}
+
+/// How often the status line is drawn again while it shows how far work has got.
+const PROGRESS_TICK: Duration = Duration::from_millis(100);
+
 /// A file this app can't show but an installed Stagepack can.
 struct StagepackOffer {
     file: PathBuf,
@@ -300,6 +341,8 @@ pub struct WorkspaceView {
     notices: Vec<String>,
     /// What came of the last thing asked of the File or Export menu.
     status: Option<SharedString>,
+    /// Work that moves a large file, while it goes on.
+    progressing: Option<Progressing>,
     /// The wait before a status that only stays a while goes, while it's showing.
     status_fading: Option<Task<()>>,
     markdown_panel: Entity<MarkdownPanel>,
@@ -595,6 +638,7 @@ impl WorkspaceView {
             slide_editor,
             notices,
             status: None,
+            progressing: None,
             status_fading: None,
             markdown_panel,
             show_markdown: panels.markdown,
@@ -1029,6 +1073,72 @@ impl WorkspaceView {
             self.status_fading = None;
             cx.notify();
         }
+    }
+
+    /// Shows how far work that moves a large file has got on the status line, `doing` it, with a
+    /// Cancel, until [`Self::end_progress`]. What it gives is told how far it's got, and says when
+    /// to stop.
+    pub(crate) fn start_progress(&mut self, doing: impl Into<SharedString>, cx: &mut Context<Self>) -> std::sync::Arc<Meter> {
+        let meter = std::sync::Arc::new(Meter::default());
+        let ticker = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(PROGRESS_TICK).await;
+                let going = this.update(cx, |this, cx| {
+                    cx.notify();
+                    this.progressing.is_some()
+                });
+                if !matches!(going, Ok(true)) {
+                    break;
+                }
+            }
+        });
+        self.progressing = Some(Progressing { doing: doing.into(), meter: meter.clone(), _ticker: ticker });
+        cx.notify();
+        meter
+    }
+
+    /// The work `meter` is told of is done: the status line no longer shows it.
+    pub(crate) fn end_progress(&mut self, meter: &std::sync::Arc<Meter>, cx: &mut Context<Self>) {
+        if self.progressing.as_ref().is_some_and(|progressing| std::sync::Arc::ptr_eq(&progressing.meter, meter)) {
+            self.progressing = None;
+            cx.notify();
+        }
+    }
+
+    /// The status line while work that moves a large file goes on: what it's doing, how far it's
+    /// got as a bar and in words, and a Cancel.
+    fn progress_line(&self, progressing: &Progressing, cx: &Context<Self>) -> impl IntoElement + use<> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (done, total) = (progressing.meter.done.load(Relaxed), progressing.meter.total.load(Relaxed));
+        let words: SharedString = crate::large_files::progress_words(&progressing.doing, done, total).into();
+        let fraction = if total == 0 { 0.0 } else { (done as f64 / total as f64).clamp(0.0, 1.0) as f32 };
+        let meter = progressing.meter.clone();
+        h_flex()
+            .id(PROGRESS_ID)
+            .test_support()
+            .aria_label(words.clone())
+            .w_full()
+            .gap_2()
+            .px_2()
+            .items_center()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(
+                div()
+                    .w(px(160.))
+                    .h(px(6.))
+                    .rounded_full()
+                    .bg(cx.theme().secondary)
+                    .child(div().h_full().rounded_full().bg(cx.theme().primary).w(relative(fraction))),
+            )
+            .child(div().truncate().child(words))
+            .child(
+                Button::new(CANCEL_PROGRESS_ID)
+                    .xsmall()
+                    .ghost()
+                    .label("Cancel")
+                    .on_click(move |_, _, _| meter.stop.store(true, std::sync::atomic::Ordering::SeqCst)),
+            )
     }
 
     /// Puts `status` on the status line until [`STATUS_FADE`] has passed, or the next edit.
@@ -1565,12 +1675,13 @@ impl Render for WorkspaceView {
                     muted_text,
                 ))
             })
-            .map(|this| match self.status.clone() {
-                Some(status) => this.child(footer_line(STATUS_ID, status, muted_text)),
+            .map(|this| match (&self.progressing, self.status.clone()) {
+                (Some(progressing), _) => this.child(self.progress_line(progressing, cx)),
+                (None, Some(status)) => this.child(footer_line(STATUS_ID, status, muted_text)),
                 // The line keeps its room with nothing on it, so the slide stays put as what's
                 // said comes and goes, as it does with each click that selects a thing.
-                None if self.document.is_some() => this.child(blank_footer_line()),
-                None => this,
+                (None, None) if self.document.is_some() => this.child(blank_footer_line()),
+                (None, None) => this,
             })
             .into_any_element()
     }

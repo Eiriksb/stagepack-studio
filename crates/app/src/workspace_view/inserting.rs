@@ -2,10 +2,12 @@
 //! on the slide or pasted, shapes and text boxes from the Insert tab.
 
 use super::*;
-use crate::added_files::{MAX_ADDED_BYTES, NotAdded};
+use crate::added_files::{FileKind, MAX_ADDED_BYTES, NotAdded};
+use crate::clipboard::{LargeCopied, PastedFiles};
 use crate::clipboard_tools::ClipboardThing;
-use crate::document::InsertFailed;
+use crate::document::{InsertFailed, LargeCopy};
 use crate::insert::{ICON_SIZE, INSERT_ICON};
+use crate::large_files::{LargeSource, ask_before_copying, ask_to_copy};
 
 /// What the window says when a file that isn't a picture is dropped on the slide.
 pub const ONLY_PICTURES: &str = "Only pictures can be dropped on a slide.";
@@ -17,6 +19,18 @@ pub const MOST_DROPPED: usize = 20;
 pub const ONLY_THE_FIRST: &str = "Only the first 20 pictures were added.";
 /// What a picture pasted from the clipboard is named, as like as is safe.
 const PASTED_PICTURE: &str = "pasted-picture.png";
+/// What the status line says while a video is copied into the talk.
+const COPYING_VIDEO: &str = "Copying video";
+
+/// What pastes, once the large files a paste carries are copied in, or not.
+type Paste = Box<dyn FnOnce(&mut WorkspaceView, PastedFiles, &mut Context<WorkspaceView>)>;
+
+/// A paste waiting to be told whether to copy the large files it carries into the talk.
+struct WaitingPaste {
+    copies: Vec<(usize, LargeCopy)>,
+    files: PastedFiles,
+    paste: Paste,
+}
 
 impl WorkspaceView {
     /// Asks for pictures in the system's dialog, and puts each on the slide.
@@ -124,6 +138,179 @@ impl WorkspaceView {
         if let Some(why) = not_a_file {
             self.say(not_added(why, dropped), cx);
         }
+    }
+
+    /// Copies the large file at `path`, of `kind`, such as a video, into the talk on a background
+    /// task, the status line showing how far it's got, with a Cancel, and then hands its path in
+    /// the talk to `then`. Why it wasn't copied is said instead, and a copy cancelled or refused
+    /// leaves nothing.
+    pub fn copy_in_large_file(
+        &mut self,
+        kind: FileKind,
+        path: PathBuf,
+        then: impl FnOnce(&mut Self, String, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        let suggested = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+        let copy = match document.read(cx).large_copy(kind, &suggested, LargeSource::File(path), None) {
+            Ok(copy) => copy,
+            Err(why) => return self.say(why.to_string(), cx),
+        };
+        let meter = self.start_progress(COPYING_VIDEO, cx);
+        let running = meter.clone();
+        cx.spawn(async move |this, cx| {
+            let copied = cx.background_spawn(async move { copy.run(&|done, total| running.tell(done, total), running.stop()) }).await;
+            this.update(cx, |this, cx| {
+                this.end_progress(&meter, cx);
+                let taken = document.update(cx, |document, cx| {
+                    let taken = document.take_large_copy(copied);
+                    cx.notify();
+                    taken
+                });
+                match taken {
+                    Ok(path) => then(this, path, cx),
+                    Err(why) => this.say(why.to_string(), cx),
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Copies the large files `files` carries that `markdown`, a pasted thing's or slide's, uses
+    /// into the talk first, then pastes with `paste`, each marked with what became of it. One
+    /// that's gone, or changed, since it was copied isn't copied. More than
+    /// [`ask_before_copying`] is copied only once whoever pasted says to; told not to, the paste
+    /// goes on without them. Cancelled while they're copied, nothing is pasted, and nothing is
+    /// left.
+    pub(super) fn bring_large_first(
+        &mut self,
+        markdown: &str,
+        mut files: PastedFiles,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        paste: impl FnOnce(&mut Self, PastedFiles, &mut Context<Self>) + 'static,
+    ) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        let mut copies = Vec::new();
+        for at in document.read(cx).large_to_bring(markdown, &files) {
+            match document.read(cx).large_copy_for_paste(&files.large[at]) {
+                Ok(copy) => copies.push((at, copy)),
+                // Nowhere to keep it: left out, as if told not to copy it.
+                Err(NotAdded::NowhereToKeep) => files.large[at].copied = LargeCopied::Declined,
+                Err(_) => files.large[at].copied = LargeCopied::Gone,
+            }
+        }
+        if copies.is_empty() {
+            return paste(self, files, cx);
+        }
+        let bytes: u64 = copies.iter().map(|(_, copy)| copy.len()).sum();
+        let waiting = WaitingPaste { copies, files, paste: Box::new(paste) };
+        if bytes <= ask_before_copying() {
+            return self.copy_large_then(waiting, cx);
+        }
+        if window.has_active_dialog(cx) {
+            // Nothing is asked while another question is up, so nothing is pasted.
+            return;
+        }
+        let asked = ask_to_copy(waiting.copies.len(), bytes);
+        let waiting = std::rc::Rc::new(std::cell::RefCell::new(Some(waiting)));
+        let view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let answer = |copy: bool| {
+                let (view, waiting) = (view.clone(), waiting.clone());
+                move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                    window.close_dialog(cx);
+                    let Some(mut waiting) = waiting.borrow_mut().take() else { return };
+                    view.update(cx, |view, cx| {
+                        if copy {
+                            view.copy_large_then(waiting, cx);
+                        } else {
+                            for (at, _) in std::mem::take(&mut waiting.copies) {
+                                waiting.files.large[at].copied = LargeCopied::Declined;
+                            }
+                            (waiting.paste)(view, waiting.files, cx);
+                        }
+                    })
+                    .ok();
+                }
+            };
+            let cancelled = waiting.clone();
+            dialog
+                .title("Copy the video?")
+                // Escape, a click beside it, or its close button: nothing is pasted.
+                .on_cancel(move |_, _, _| {
+                    cancelled.borrow_mut().take();
+                    true
+                })
+                .child(asked.clone())
+                .footer(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(Button::new(DONT_COPY_LARGE_ID).ghost().label("Don't copy").on_click(answer(false)))
+                        .child(Button::new(COPY_LARGE_ID).primary().label("Copy").on_click(answer(true))),
+                )
+        });
+    }
+
+    /// Copies the large files `waiting` holds into the talk on a background task, the status line
+    /// showing how far it's got, with a Cancel, then pastes as it says.
+    fn copy_large_then(&mut self, waiting: WaitingPaste, cx: &mut Context<Self>) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        let WaitingPaste { copies, mut files, paste } = waiting;
+        let meter = self.start_progress(COPYING_VIDEO, cx);
+        let running = meter.clone();
+        cx.spawn(async move |this, cx| {
+            let copied = cx
+                .background_spawn(async move {
+                    let total: u64 = copies.iter().map(|(_, copy)| copy.len()).sum();
+                    let mut before = 0u64;
+                    let mut copied = Vec::new();
+                    for (at, copy) in copies {
+                        let len = copy.len();
+                        // A copy that hashes first counts its bytes twice: told as a share of its own.
+                        let told = |done: u64, of: u64| {
+                            let share = (u128::from(done) * u128::from(len)).checked_div(u128::from(of)).unwrap_or(0) as u64;
+                            running.tell(before + share, total);
+                        };
+                        let one = copy.run(&told, running.stop());
+                        before += len;
+                        let cancelled = one.refused() == Some(NotAdded::Cancelled);
+                        copied.push((at, one));
+                        if cancelled {
+                            break;
+                        }
+                    }
+                    copied
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.end_progress(&meter, cx);
+                if copied.iter().any(|(_, one)| one.refused() == Some(NotAdded::Cancelled)) {
+                    // Dropped, what was copied goes with it.
+                    drop(copied);
+                    return this.say(NotAdded::Cancelled.to_string(), cx);
+                }
+                for (at, one) in copied {
+                    let taken = document.update(cx, |document, _| document.take_large_copy(one));
+                    files.large[at].copied = match taken {
+                        Ok(path) => LargeCopied::To(path),
+                        Err(_) => LargeCopied::Gone,
+                    };
+                }
+                paste(this, files, cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Gives the slide the keyboard once a thing just put on it is selected there, from

@@ -333,7 +333,10 @@ impl WorkspaceView {
             if typing && document.read(cx).new_box().is_none() {
                 return self.say(clipboard::NOT_INTO_TEXT, cx);
             }
-            self.paste_element(carried, cx);
+            let markdown = carried.markdown;
+            self.bring_large_first(&markdown.clone(), carried.files, window, cx, move |this, files, cx| {
+                this.paste_element(Carried { markdown, files }, cx);
+            });
             return self.keyboard_to_the_slide(window, cx);
         }
         let thing_first = if typing {
@@ -356,7 +359,7 @@ impl WorkspaceView {
             });
             return;
         }
-        self.paste_slide(plain, data, cx);
+        self.paste_slide(plain, data, window, cx);
     }
 
     /// Puts the current slide's own text on the clipboard, and says whether it did.
@@ -369,7 +372,8 @@ impl WorkspaceView {
             return false;
         };
         let files = document.read(cx).files_for_copy(&text);
-        let Some(entry) = clipboard::slide_entry_with(&text, &files) else {
+        let large = document.read(cx).large_for_copy(&text);
+        let Some(entry) = clipboard::slide_entry_with_large(&text, &files, &large) else {
             self.say(clipboard::SLIDE_TOO_BIG, cx);
             return false;
         };
@@ -401,7 +405,8 @@ impl WorkspaceView {
                 return false;
             }
         };
-        let Some(entry) = clipboard::element_entry(&text, &files) else {
+        let large = document.read(cx).large_for_copy(&text);
+        let Some(entry) = clipboard::element_entry_with_large(&text, &files, &large) else {
             self.say(clipboard::THING_TOO_BIG, cx);
             return false;
         };
@@ -454,10 +459,10 @@ impl WorkspaceView {
 
     /// Pastes the slide on the clipboard after the current one, with the files it brings. If it
     /// shows a picture or a component this talk lacks, that's said, once.
-    fn paste_slide(&mut self, plain: Option<String>, data: AppData, cx: &mut Context<Self>) {
-        let Some(document) = self.document.clone() else {
+    fn paste_slide(&mut self, plain: Option<String>, data: AppData, window: &mut Window, cx: &mut Context<Self>) {
+        if self.document.is_none() {
             return;
-        };
+        }
         let (paste, files) = match data {
             AppData::Slide(carried) => (Ok(clipboard::carried_slide(&carried.markdown)), carried.files),
             _ => (clipboard::slide_to_paste(plain.as_deref(), None), PastedFiles::default()),
@@ -467,6 +472,16 @@ impl WorkspaceView {
             Ok(SlidePaste::NoSlide) => return self.say(clipboard::NO_SLIDE, cx),
             Ok(SlidePaste::NotOneSlide) => return self.say(EditRefused::WouldChangeTheSlides.to_string(), cx),
             Err(TooLarge) => return self.say(clipboard::TOO_LARGE, cx),
+        };
+        // Its large files are copied in first.
+        let slide = markdown.clone();
+        self.bring_large_first(&slide, files, window, cx, move |this, files, cx| this.paste_slide_now(markdown, files, cx));
+    }
+
+    /// Pastes the slide `markdown` after the current one, with `files`, the files it brings.
+    fn paste_slide_now(&mut self, markdown: String, files: PastedFiles, cx: &mut Context<Self>) {
+        let Some(document) = self.document.clone() else {
+            return;
         };
         let before = document.read(cx).slide_count();
         let mut brought = None;

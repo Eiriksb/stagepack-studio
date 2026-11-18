@@ -16,6 +16,7 @@ pub mod history;
 pub mod icon_picker;
 pub mod insert;
 pub mod insert_tools;
+pub mod large_files;
 pub mod inspector;
 pub mod layout_picker;
 pub mod markdown_panel;
