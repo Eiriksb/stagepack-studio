@@ -435,3 +435,69 @@ fn each_refusal_reads_in_plain_words() {
         "This kind of video can't be played here. An MP4 made with the usual settings (H.264) can."
     );
 }
+
+/// A file that counts the bytes read from it.
+struct CountedFile {
+    inner: std::io::Cursor<Vec<u8>>,
+    read: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl std::io::Read for CountedFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.read.fetch_add(read as u64, std::sync::atomic::Ordering::SeqCst);
+        Ok(read)
+    }
+}
+
+impl std::io::Seek for CountedFile {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(to)
+    }
+}
+
+fn size_and_read(bytes: Vec<u8>) -> (Result<(u32, u32), CantPlay>, u64) {
+    let read = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut file = CountedFile { inner: std::io::Cursor::new(bytes), read: read.clone() };
+    (video_size(&mut file), read.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+#[test]
+fn a_videos_size_is_read_from_its_headers_alone() {
+    // A long one, whose tables of pictures are far larger than its headers.
+    let video = coloured_video(64, 48, 3000, 30);
+    for bytes in [video.clone(), index_first(&video)] {
+        let (size, read) = size_and_read(bytes);
+        assert_eq!(size, Ok((64, 48)));
+        assert!(read < 4096, "{read} bytes read");
+    }
+    assert_eq!(size_and_read(b"just words".to_vec()).0, Err(CantPlay::NotAVideo));
+}
+
+#[test]
+fn finding_a_videos_size_never_reads_more_than_its_limit() {
+    // A file of nothing but tiny boxes before its index.
+    let video = small().to_vec();
+    let mut crafted = Vec::new();
+    for _ in 0..100_000 {
+        crafted.extend_from_slice(&[0, 0, 0, 8, b'f', b'r', b'e', b'e']);
+    }
+    crafted.extend_from_slice(&video);
+    let (size, read) = size_and_read(crafted);
+    assert!(size.is_err());
+    assert!(read <= MOST_READ, "{read} bytes read");
+}
+
+proptest! {
+    #[test]
+    fn any_bytes_give_a_size_or_say_why(bytes in proptest::collection::vec(any::<u8>(), 0..2048)) {
+        let (_, read) = size_and_read(bytes);
+        prop_assert!(read <= MOST_READ);
+    }
+
+    #[test]
+    fn a_damaged_video_gives_a_size_or_says_why(damage in damage()) {
+        let (_, read) = size_and_read(damaged(&damage, false));
+        prop_assert!(read <= MOST_READ);
+    }
+}

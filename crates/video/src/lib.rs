@@ -9,6 +9,7 @@ mod decode;
 #[cfg(feature = "make")]
 mod make;
 mod open;
+mod size;
 mod sps;
 
 use std::fmt;
@@ -18,6 +19,7 @@ pub use decode::Playing;
 #[cfg(feature = "make")]
 pub use make::{MadeColours, make_test_video, make_test_video_in};
 pub use open::{Video, open};
+pub use size::{MOST_READ, video_size};
 
 /// Something a video can be read from in pieces, from anywhere in it.
 pub trait ReadSeek: Read + Seek + Send {}
