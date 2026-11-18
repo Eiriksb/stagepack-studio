@@ -231,3 +231,40 @@ fn the_engine_tells_a_picture_from_its_bytes() {
     assert_eq!(picture_format(b""), None);
     assert_eq!(picture_format(&png[..png.len() / 2]), None);
 }
+
+fn held(files: &[(&str, &[u8])]) -> MemoryFiles {
+    MemoryFiles::new(files.iter().map(|(name, bytes)| (name.to_string(), std::sync::Arc::from(*bytes))).collect())
+}
+
+#[test]
+fn memory_files_read_what_they_were_given() {
+    let files = held(&[("assets/a.png", b"abc"), ("components/c.rs", b"fn main() {}")]);
+    assert_eq!(files.read("assets/a.png"), Some(b"abc".to_vec()));
+    assert_eq!(files.read("./assets/a.png"), Some(b"abc".to_vec()));
+    assert_eq!(files.len("assets/a.png"), Some(3));
+    assert_eq!(files.read("assets/missing.png"), None);
+    assert_eq!(files.len("assets/missing.png"), None);
+    assert!(files.never_changes());
+}
+
+#[test]
+fn names_in_lists_a_folder() {
+    let files = held(&[("assets/b.png", b"1"), ("assets/a.png", b"2"), ("assets/deeper/c.png", b"3"), ("build/x.wasm", b"4")]);
+    assert_eq!(files.names_in("assets"), vec!["assets/a.png".to_string(), "assets/b.png".to_string()]);
+    assert_eq!(files.names_in("assets/"), files.names_in("assets"));
+    assert_eq!(files.names_in("assets/deeper"), vec!["assets/deeper/c.png".to_string()]);
+    assert!(files.names_in("nothing").is_empty());
+}
+
+#[test]
+fn a_path_that_leaves_the_talk_is_dropped() {
+    let bad = ["../x", "/etc/x", "a/../../x", "a/../x", "C:\\x", "a\\b", "assets/a\0b", "", "assets/"];
+    let mut given: Vec<(String, std::sync::Arc<[u8]>)> = bad.iter().map(|name| (name.to_string(), std::sync::Arc::from(&b"x"[..]))).collect();
+    given.push(("assets/fine.png".to_string(), std::sync::Arc::from(&b"ok"[..])));
+    let files = MemoryFiles::new(given);
+    for name in bad {
+        assert_eq!(files.read(name), None, "{name:?}");
+    }
+    assert_eq!(files.names_in("assets"), vec!["assets/fine.png".to_string()]);
+    assert_eq!(files.read("assets/fine.png"), Some(b"ok".to_vec()));
+}

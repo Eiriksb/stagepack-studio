@@ -1,5 +1,7 @@
 //! The layouts a slide can name, and the regions each one has.
 
+use slides_format::LAYOUT_NAMES;
+
 use crate::{Align, Rect};
 
 /// A named place on the slide, and how text in it looks.
@@ -35,36 +37,37 @@ const fn subtitle(x: f32, y: f32, w: f32, h: f32) -> RegionDef {
     RegionDef { name: "body", rect: Rect { x, y, w, h }, size: 44.0, bold: false, align: Align::Center }
 }
 
-/// In the order `layouts` gives them.
+/// In the order `layouts` gives them. Their names, and the names of their regions, are the
+/// format crate's list; a test holds the two together.
 static LAYOUTS: [LayoutDef; 5] = [
     LayoutDef {
-        name: "title",
+        name: LAYOUT_NAMES[0].name,
         regions: &[big_title(160.0, 340.0, 1600.0, 220.0), subtitle(160.0, 580.0, 1600.0, 180.0)],
-        main: "body",
+        main: LAYOUT_NAMES[0].main,
     },
     LayoutDef {
-        name: "content",
+        name: LAYOUT_NAMES[1].name,
         regions: &[title(100.0, 60.0, 1720.0, 140.0), body("body", 100.0, 220.0, 1720.0, 780.0)],
-        main: "body",
+        main: LAYOUT_NAMES[1].main,
     },
     LayoutDef {
-        name: "two-columns",
+        name: LAYOUT_NAMES[2].name,
         regions: &[
             title(100.0, 60.0, 1720.0, 140.0),
             body("left", 100.0, 220.0, 840.0, 780.0),
             body("right", 980.0, 220.0, 840.0, 780.0),
         ],
-        main: "left",
+        main: LAYOUT_NAMES[2].main,
     },
     LayoutDef {
-        name: "section",
+        name: LAYOUT_NAMES[3].name,
         regions: &[big_title(160.0, 420.0, 1600.0, 240.0), subtitle(160.0, 680.0, 1600.0, 200.0)],
-        main: "body",
+        main: LAYOUT_NAMES[3].main,
     },
     LayoutDef {
-        name: "blank",
+        name: LAYOUT_NAMES[4].name,
         regions: &[body("body", 0.0, 0.0, 1920.0, 1080.0)],
-        main: "body",
+        main: LAYOUT_NAMES[4].main,
     },
 ];
 

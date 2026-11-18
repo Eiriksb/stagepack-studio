@@ -346,3 +346,20 @@ fn with_the_list_holding_the_keyboard_nothing_becomes_selected(cx: &mut TestAppC
     assert_eq!(picked(&typing, cx), None);
     assert!(typing.editing(cx).is_none());
 }
+
+/// A name a person reads: words, with no hyphen and a capital to begin.
+fn is_plain(words: &str) -> bool {
+    !words.is_empty() && !words.contains('-') && words.chars().next().is_some_and(|first| !first.is_lowercase())
+}
+
+#[test]
+fn every_layout_and_area_has_a_plain_name() {
+    for layout in &slides_format::LAYOUT_NAMES {
+        let name = stagepack_studio::layout_picker::layout_name(layout.name);
+        assert!(is_plain(name), "{} is called {name}", layout.name);
+        for region in layout.regions {
+            let area = stagepack_studio::selection::area_name(region);
+            assert!(is_plain(&area), "{region} is called {area}");
+        }
+    }
+}

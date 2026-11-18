@@ -1,6 +1,9 @@
 //! Where the caret, the selection of text, the outlines of the things selected, the frame of
 //! the area typed in and the guides a thing dragged snaps to are drawn, and the drawing of them.
 
+use slides_engine::standing_out;
+use toolkit::Color;
+
 use super::*;
 use crate::snap::Guide;
 pub(super) use crate::arrange::{corners, turned};
@@ -64,6 +67,43 @@ impl SlideEditor {
         };
         Some(Marks { caret, selection })
     }
+}
+
+/// The colours the marks over the slide were last drawn in, as each showed on the slide's
+/// background, for whoever checks that they stand out from it. One not drawn since the editor
+/// was made has none.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MarkColors {
+    pub caret: Option<Color>,
+    /// The dashed frame of the area being typed in, and of a new box.
+    pub frame: Option<Color>,
+    /// The outline of what's selected, and the dashed one of a thing lifted out of the text.
+    pub outline: Option<Color>,
+    /// The line around each handle.
+    pub handles: Option<Color>,
+    pub guides: Option<Color>,
+    /// A step badge, and the words on it.
+    pub badge: Option<Color>,
+    pub badge_words: Option<Color>,
+}
+
+/// `color` as it shows drawn over `background`.
+pub(super) fn shown_on(color: Hsla, background: Color) -> Color {
+    let Rgba { r, g, b, a } = color.to_rgb();
+    let over = |value: f32, under: u8| (value * a * 255. + f32::from(under) * (1. - a)).round().clamp(0., 255.) as u8;
+    Color::rgb(over(r, background.r), over(g, background.g), over(b, background.b))
+}
+
+/// `color`, the window theme's for a mark, if it stands out from `background`, the slide's,
+/// or else the near black or near white that stands out more: the window's theme knows
+/// nothing of the talk's colours.
+pub(super) fn standing_out_on(color: Hsla, background: Color) -> Hsla {
+    let shown = shown_on(color, background);
+    let chosen = standing_out(shown, background);
+    if chosen == shown {
+        return color;
+    }
+    Rgba { r: f32::from(chosen.r) / 255., g: f32::from(chosen.g) / 255., b: f32::from(chosen.b) / 255., a: 1. }.into()
 }
 
 /// The caret's corners, `unit` window pixels to a slide unit.

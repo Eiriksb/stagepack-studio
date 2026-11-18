@@ -1,6 +1,6 @@
 //! Puts a parsed slide's content into the regions of its layout.
 
-use slides_format::{Block, FlowPlace, Slide, Tag, Talk, Target};
+use slides_format::{Block, DEFAULT_LAYOUT, FlowPlace, Slide, Tag, Talk, Target};
 use tiny_skia::PathBuilder;
 use toolkit::{Color, Registry, Theme};
 
@@ -19,7 +19,6 @@ use crate::{
 /// How wide and high a slide is, in slide units.
 pub const SLIDE_WIDTH: f32 = 1920.0;
 pub const SLIDE_HEIGHT: f32 = 1080.0;
-const DEFAULT_LAYOUT: &str = "content";
 
 /// The attributes that place a component, which it doesn't see as props.
 pub const PLACEMENT_ATTRS: [&str; 8] = ["x", "y", "w", "h", "rotate", "click", "enter", "align"];
@@ -436,6 +435,57 @@ pub fn text_align(talk: &Talk, index: usize, place: &FlowPlace) -> Option<Align>
     }
 }
 
+/// How much what the editor draws over a slide, as the offer in an empty region, the caret or
+/// a selection's outline, stands out from the slide's background at least: the contrast WCAG
+/// asks of what has to be seen but isn't text to read.
+pub const MARKS_STAND_OUT: f32 = 3.0;
+
+/// The contrast of `a` with `b`, as WCAG works it out from their relative luminance: from 1,
+/// for two colours the same, to 21, for black and white, whichever way round. Each is taken
+/// as it is drawn on its own, whatever its alpha.
+pub fn contrast(a: Color, b: Color) -> f32 {
+    let luminance = |color: Color| {
+        let channel = |value: u8| {
+            let value = f32::from(value) / 255.0;
+            if value <= 0.03928 { value / 12.92 } else { ((value + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b)
+    };
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+/// `color`, if it stands out from `background` as [`MARKS_STAND_OUT`] says, or else `color`
+/// taken toward whichever of a near black and a near white stands out more, only as far as it
+/// takes to stand out: all the way, that's enough on any background.
+pub fn standing_out(color: Color, background: Color) -> Color {
+    const DARK: Color = Color::rgb(0x0a, 0x0a, 0x0a);
+    const LIGHT: Color = Color::rgb(0xfa, 0xfa, 0xfa);
+    /// How many steps there are from the colour to the extreme.
+    const STEPS: u16 = 255;
+    if contrast(color, background) >= MARKS_STAND_OUT {
+        return color;
+    }
+    let extreme = if contrast(DARK, background) >= contrast(LIGHT, background) { DARK } else { LIGHT };
+    let toward = |steps: u16| {
+        let channel = |from: u8, to: u8| ((u16::from(from) * (STEPS - steps) + u16::from(to) * steps + STEPS / 2) / STEPS) as u8;
+        Color { r: channel(color.r, extreme.r), g: channel(color.g, extreme.g), b: channel(color.b, extreme.b), a: color.a }
+    };
+    (1..=STEPS).map(toward).find(|stepped| contrast(*stepped, background) >= MARKS_STAND_OUT).unwrap_or(extreme)
+}
+
+/// The colour of the editor's offer in an empty region: the theme's text colour faded toward
+/// its background, as far as it still stands out from it, two fifths of the text at the
+/// least; and where even the text doesn't stand out, what [`standing_out`] gives.
+pub fn placeholder_color(theme: &Theme) -> Color {
+    let (text, back) = (theme.text, theme.background);
+    let mix = |fifths: u16| {
+        let channel = |text: u8, background: u8| ((u16::from(text) * fifths + u16::from(background) * (5 - fifths)) / 5) as u8;
+        Color { r: channel(text.r, back.r), g: channel(text.g, back.g), b: channel(text.b, back.b), a: text.a }
+    };
+    (2..=5).map(mix).find(|muted| contrast(*muted, back) >= MARKS_STAND_OUT).unwrap_or_else(|| standing_out(text, back))
+}
+
 /// What the editor shows in an empty region: a dashed outline, and an offer in a muted tint
 /// of the text colour to start the title or the text there.
 pub(crate) fn empty_region_layer(region: &EmptyRegion, theme: &Theme, fonts: &mut Fonts) -> LayerSpec {
@@ -443,9 +493,7 @@ pub(crate) fn empty_region_layer(region: &EmptyRegion, theme: &Theme, fonts: &mu
     const DASH_GAP: f32 = 10.0;
     const OUTLINE: f32 = 2.0;
     const OUTSIDE: f32 = 8.0;
-    let mix = |text: u8, background: u8| ((u16::from(text) * 2 + u16::from(background) * 3) / 5) as u8;
-    let (text, back) = (theme.text, theme.background);
-    let muted = Color { r: mix(text.r, back.r), g: mix(text.g, back.g), b: mix(text.b, back.b), a: text.a };
+    let muted = placeholder_color(theme);
     let Rect { w, h, .. } = region.rect;
     let mut items = Vec::new();
     let mut outline = PathBuilder::new();

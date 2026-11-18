@@ -32,27 +32,59 @@ impl Document {
         &self.place
     }
 
+    /// Whether this talk has no place yet: a new presentation, not saved.
+    pub fn is_untitled(&self) -> bool {
+        matches!(self.place, TalkPlace::Untitled(_))
+    }
+
+    /// Numbers an untitled talk among those open: from 2 up, it's called *Untitled presentation
+    /// 2* and so on, and 1 or less is the name alone.
+    pub fn set_untitled_number(&mut self, number: usize) {
+        if !self.is_untitled() {
+            return;
+        }
+        self.place_name = match number {
+            0 | 1 => self.place.name(),
+            number => format!("{} {number}", self.place.name()),
+        };
+    }
+
+    /// The number of an untitled talk among those open, as [`Self::set_untitled_number`] gave
+    /// it, 1 for one called by the name alone. A talk with a place has none.
+    pub fn untitled_number(&self) -> Option<usize> {
+        if !self.is_untitled() {
+            return None;
+        }
+        let name = self.place.name();
+        match self.place_name.strip_prefix(name.as_str()) {
+            Some("") => Some(1),
+            Some(rest) => rest.strip_prefix(' ')?.parse().ok(),
+            None => None,
+        }
+    }
+
     /// A save of the talk as it is now, where it's kept: for a folder, only its `slides.md` and
-    /// the files added that it uses.
+    /// the files added that it uses. An untitled talk is kept nowhere, so its job fails.
     pub fn save_job(&self) -> SaveJob {
         SaveJob::new(
             self.source().to_string(),
             self.on_disk.clone(),
             self.place.clone(),
             None,
-            self.added_files(),
+            self.files_to_write(),
             self.index_for_save(),
         )
     }
 
-    /// A save of the talk as it is now, somewhere new.
+    /// A save of the talk as it is now, somewhere new. For an untitled talk that's its first
+    /// save, which writes it all: the text, and every file it uses.
     pub fn save_as_job(&self, target: SaveTarget) -> SaveJob {
         SaveJob::new(
             self.source().to_string(),
             self.on_disk.clone(),
             self.place.clone(),
             Some(target),
-            self.added_files(),
+            self.files_to_write(),
             self.index_for_save(),
         )
     }
@@ -76,7 +108,7 @@ impl Document {
     /// whose files this save doesn't write stays to be entered. `None` for the index if the
     /// talk's own can't be read, which a save leaves as it is.
     fn index_for_save(&self) -> (Vec<BuildEntry>, Option<Vec<u8>>) {
-        let writing: BTreeSet<String> = self.added_files().into_iter().map(|(path, _)| path).collect();
+        let writing: BTreeSet<String> = self.files_to_write().into_iter().map(|(path, _)| path).collect();
         let own = &*self.own_files;
         let index = match (&self.index_kept_in_pack, own.len(INDEX_FILE)) {
             // What the last save wrote into a pack it couldn't read back: the pack's index now.
@@ -127,6 +159,14 @@ impl Document {
         if let Some((place, files)) = saved.moved_to {
             self.place_name = place.name();
             self.place = place;
+            // Those written are read from where they were written from now on. One the text
+            // didn't use at this save wasn't written, and is kept as a file added, as Undo may
+            // bring back the text that uses it, and the save after that writes it.
+            for (path, bytes) in std::mem::take(&mut self.untitled_files) {
+                if !saved.files_written.contains(&path) && self.added.add(&path, bytes) {
+                    self.pending.insert(path);
+                }
+            }
             self.own_files = files.clone();
             self.files = Arc::new(WithAdded::new(files, self.added.clone()));
             self.deck.set_files(Box::new(self.files.clone()));

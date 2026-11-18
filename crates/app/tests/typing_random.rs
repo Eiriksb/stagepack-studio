@@ -5,7 +5,9 @@
 //! as the place asked for, and undoing everything gives back the talk as it was opened. And
 //! random runs of presses, clicks and keys in the window, after each of which nothing on the
 //! slide is selected, typed in or waiting while the list of slides or the notes have the
-//! keyboard.
+//! keyboard. Half of those runs start on the start screen with a template picked at random and
+//! save the new presentation for the first time at a random step; what's saved, opened again at
+//! the end, has the text the window has.
 //!
 //! Each talk runs with a few seeds; `SEEDS=n` runs seed `n` alone, and `SEEDS=a..b` a range.
 //! `PROPTEST_CASES=n` runs the arranging with `n` seeds in all, spread over its talks.
@@ -576,7 +578,90 @@ fn pick_from_menu(typing: &typing::Typing, cx: &mut TestAppContext, at: usize, c
     }
 }
 
-fn window_run(cx: &mut TestAppContext, talk: &str, seed: u64) {
+/// What a run in the window starts from.
+#[derive(Clone, Copy)]
+enum Start<'a> {
+    /// A talk opened from its folder.
+    Talk(&'a str),
+    /// The start screen, a template picked at random on it, and a first save at a random step.
+    StartScreen,
+}
+
+/// Where a new presentation made in a run is first saved: as a packed file or a folder.
+struct FirstSave {
+    at: usize,
+    packed: bool,
+    to: std::path::PathBuf,
+}
+
+/// A start window whose working copies, Documents folder and build permissions are all under
+/// `root`, never the app's own.
+fn open_start_window(cx: &mut TestAppContext, root: &std::path::Path) -> typing::Typing {
+    use gpui_kit::{App, AppContext as _, Bounds, Point, WindowBounds, WindowOptions, px, size};
+    use stagepack_studio::permissions::BuildPermissions;
+    use stagepack_studio::recovery::Recovery;
+    use stagepack_studio::workspace_view::{self, WorkspaceView};
+    let places = typing::UntitledPlaces::under(root);
+    let scratch = tempfile::tempdir().unwrap();
+    let file = scratch.path().join("no file yet");
+    let (handle, view) = cx.update(|cx: &mut App| {
+        gpui_kit::init(cx);
+        workspace_view::init(cx);
+        let bounds = Bounds { origin: Point::default(), size: size(px(1280.), px(800.)) };
+        gpui_kit::open_window(WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() }, cx, |window, cx| {
+            cx.new(|cx| {
+                let mut view = WorkspaceView::for_start(Some(Recovery::new(places.recovery)), window, cx);
+                view.set_permissions_for_test(BuildPermissions::load(places.permissions));
+                view.set_documents_folder_for_test(places.documents);
+                view.set_no_watching_for_test();
+                view
+            })
+        })
+        .expect("open test window")
+    });
+    let typing = typing::Typing { _folder: scratch, file, handle, view };
+    typing.settle(cx);
+    typing
+}
+
+/// Saves the untitled talk for the first time, with Ctrl+S, in the form and at the place `save`
+/// says, and checks it's no longer untitled.
+fn first_save(typing: &typing::Typing, cx: &mut TestAppContext, save: &FirstSave, seed: u64) {
+    use stagepack_studio::workspace_view::{SAVE_AS_FOLDER_ID, SAVE_AS_PACKED_ID};
+    // Whatever menu a step left open goes first.
+    typing.press(cx, "escape");
+    typing.press(cx, "ctrl-s");
+    let form = if save.packed { SAVE_AS_PACKED_ID } else { SAVE_AS_FOLDER_ID };
+    assert!(click_if_shown(typing, cx, form), "seed {seed} step {}: Ctrl+S on an untitled talk asks which form", save.at);
+    cx.run_until_parked();
+    assert!(cx.did_prompt_for_new_path(), "seed {seed} step {}: a Save dialog is showing", save.at);
+    let to = save.to.clone();
+    cx.simulate_new_path_selection(move |_| Some(to));
+    cx.run_until_parked();
+    typing.settle(cx);
+    let (untitled, unsaved) = typing.document(cx).read_with(cx, |document, _| (document.is_untitled(), document.has_unsaved_changes()));
+    assert!(!untitled && !unsaved, "seed {seed} step {}: the first save to {:?} didn't take: {:?}", save.at, save.to, typing.status(cx));
+}
+
+/// Saves the talk where it was first saved, if it has changed since, and checks that what's
+/// written there, opened again, has the text the window has.
+fn saved_reads_as_the_window(typing: &typing::Typing, cx: &mut TestAppContext, save: &FirstSave, seed: u64) {
+    if typing.document(cx).read_with(cx, |document, _| document.has_unsaved_changes()) {
+        typing.press(cx, "ctrl-s");
+        cx.run_until_parked();
+        typing.settle(cx);
+    }
+    let shown = typing.source(cx);
+    let opened = if save.packed {
+        Document::open_packed(&save.to, Fonts::bundled_only()).map_err(|problem| format!("{problem:?}"))
+    } else {
+        Document::open(&save.to, Fonts::bundled_only())
+    }
+    .unwrap_or_else(|problem| panic!("seed {seed}: the saved talk can't be opened again: {problem}"));
+    assert_eq!(opened.source(), shown, "seed {seed}: the talk saved at {:?} doesn't have the text the window has", save.to);
+}
+
+fn window_run(cx: &mut TestAppContext, start: Start, seed: u64) {
     use stagepack_studio::animate_tools::{EARLIER_ID, ENTRANCE_ID, LATER_ID, ONE_AT_A_TIME_ID, TRANSITION_ID};
     use stagepack_studio::arrange::Handle;
     use stagepack_studio::arrange_tools::ARRANGE_ID;
@@ -584,15 +669,41 @@ fn window_run(cx: &mut TestAppContext, talk: &str, seed: u64) {
     use stagepack_studio::layout_picker::layout_tile_id;
     use stagepack_studio::ribbon::{LAYOUT_ID, TAB_ANIMATE_ID, TAB_HOME_ID, TAB_INSERT_ID, TAB_VIEW_ID, TOGGLE_INSPECTOR_ID};
     use stagepack_studio::slide_editor::handle_id;
-    let typing = typing::open(cx, talk);
+    use stagepack_studio::start_screen::template_tile_id;
+    use stagepack_studio::templates::templates;
+    // The scratch folder a new presentation keeps all it keeps in, and is saved to.
+    let root = tempfile::tempdir().unwrap();
+    let (typing, mut first_save_due) = match start {
+        Start::Talk(talk) => (typing::open(cx, talk), None),
+        Start::StartScreen => {
+            // Its own generator, so that the steps a seed makes are those a talk's run makes.
+            let mut pick = Rng(seed.wrapping_mul(0xD6E8_FEB8_6659_FD93) | 1);
+            let typing = open_start_window(cx, root.path());
+            let template = templates()[pick.below(templates().len())].id;
+            typing::click_on(&typing, cx, template_tile_id(template));
+            assert!(
+                typing.view.read_with(cx, |view, _| view.document().is_some()),
+                "seed {seed}: picking {template} on the start screen made no talk"
+            );
+            let packed = pick.below(2) == 0;
+            let to = if packed { root.path().join("Documents").join("Saved.sptx") } else { root.path().join("Saved talk") };
+            (typing, Some(FirstSave { at: pick.below(WINDOW_STEPS), packed, to }))
+        }
+    };
     // The active window, as one being used is: only then does the keyboard going to the list or
     // the notes let go of what's selected.
     typing.with_window(cx, |window, _| window.activate_window());
     cx.simulate_window_resize(typing.handle, gpui_kit::size(gpui_kit::px(1800.), gpui_kit::px(900.)));
     typing.settle(cx);
     let original = typing.source(cx);
+    let mut saved = None;
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     for step in 0..WINDOW_STEPS {
+        if first_save_due.as_ref().is_some_and(|save| save.at == step) {
+            let save = first_save_due.take().unwrap();
+            first_save(&typing, cx, &save, seed);
+            saved = Some(save);
+        }
         let choice = rng.below(27);
         let elements = typing.layout(cx).elements().to_vec();
         let element = (!elements.is_empty()).then(|| elements[rng.below(elements.len())].clone());
@@ -733,6 +844,9 @@ fn window_run(cx: &mut TestAppContext, talk: &str, seed: u64) {
         );
     }
     typing.press(cx, "escape");
+    if let Some(save) = &saved {
+        saved_reads_as_the_window(&typing, cx, save, seed);
+    }
     let document = typing.document(cx);
     let back = document.update(cx, |document, _| {
         document.end_text().ok();
@@ -752,9 +866,11 @@ const IN_THE_WINDOW: &[&str] = &[
 
 #[gpui_kit::test]
 fn random_presses_keep_the_slide_free_while_the_list_or_notes_have_the_keyboard(cx: &mut TestAppContext) {
-    for (t, talk) in IN_THE_WINDOW.iter().enumerate() {
+    // Half the runs open a talk, and half start on the start screen with a template.
+    let starts: Vec<Start> = IN_THE_WINDOW.iter().map(|talk| Start::Talk(talk)).chain([Start::StartScreen, Start::StartScreen]).collect();
+    for (t, start) in starts.into_iter().enumerate() {
         for seed in seeds() {
-            window_run(cx, talk, seed * 31 + t as u64 + 1);
+            window_run(cx, start, seed * 31 + t as u64 + 1);
         }
     }
 }

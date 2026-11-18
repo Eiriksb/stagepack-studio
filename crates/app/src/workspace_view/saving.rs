@@ -20,6 +20,7 @@ impl WorkspaceView {
     /// Keeps working copies of unsaved changes in `recovery`, in a slot of this window's own,
     /// and offers back the newest one left there for this talk, if any.
     pub(super) fn use_recovery(&mut self, recovery: Recovery, cx: &mut Context<Self>) {
+        self.recovery = Some(recovery.clone());
         self.working_copies
             .update(cx, |copies, cx| copies.use_recovery(recovery, cx));
     }
@@ -102,17 +103,31 @@ impl WorkspaceView {
             Effect::Say(said) => self.say(said, cx),
             // Only events that come with a read or a window give these, and what took them
             // in follows them itself.
-            Effect::TakeRead | Effect::AskAboutOutsideChange | Effect::AskBeforeClosing => {}
+            Effect::TakeRead | Effect::AskAboutOutsideChange | Effect::AskBeforeClosing | Effect::AskWhereToSave => {}
         }
     }
 
-    /// Saves the talk where it's kept, on a background task.
-    pub(super) fn save(&mut self, cx: &mut Context<Self>) {
-        if self.document.is_none() {
+    /// Saves the talk where it's kept, on a background task. An untitled talk is kept nowhere
+    /// yet, so this is Save As for it.
+    pub(super) fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(document) = &self.document else {
             return;
-        }
-        for effect in self.save_flow.ask_save() {
-            self.follow(effect, cx);
+        };
+        let effects = if document.read(cx).is_untitled() {
+            self.save_flow.ask_save_untitled()
+        } else {
+            self.save_flow.ask_save()
+        };
+        self.follow_in(effects, window, cx);
+    }
+
+    /// Follows `effects`, asking where to save in `window` if one says to.
+    fn follow_in(&mut self, effects: Vec<Effect>, window: &mut Window, cx: &mut Context<Self>) {
+        for effect in effects {
+            match effect {
+                Effect::AskWhereToSave => self.ask_to_save_as(window, cx),
+                effect => self.follow(effect, cx),
+            }
         }
     }
 
@@ -128,9 +143,15 @@ impl WorkspaceView {
         self.run_save(job, name, cx);
     }
 
-    /// Asks which form to save the talk in, then where.
+    /// Asks which form to save the talk in, then where. While another dialog is showing, nothing
+    /// is asked.
     pub(super) fn ask_to_save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.document.is_none() || window.has_active_dialog(cx) {
+        if self.document.is_none() {
+            return;
+        }
+        if window.has_active_dialog(cx) {
+            // Nothing is asked, so nothing waits on an answer.
+            self.place_not_chosen(cx);
             return;
         }
         let view = cx.weak_entity();
@@ -142,8 +163,15 @@ impl WorkspaceView {
                     view.update(cx, |view, cx| view.save_as(kind, cx)).ok();
                 }
             };
+            let not_chosen = view.clone();
+            let cancelled = view.clone();
             dialog
                 .title("Save as")
+                // Escape, a click beside it, or its close button.
+                .on_cancel(move |_, _, cx| {
+                    not_chosen.update(cx, |view, cx| view.place_not_chosen(cx)).ok();
+                    true
+                })
                 .child("Keep the talk as a folder of files, or pack it into one file to send.")
                 .footer(
                     h_flex()
@@ -153,7 +181,10 @@ impl WorkspaceView {
                             Button::new(SAVE_AS_CANCEL_ID)
                                 .ghost()
                                 .label("Cancel")
-                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    cancelled.update(cx, |view, cx| view.place_not_chosen(cx)).ok();
+                                }),
                         )
                         .child(
                             Button::new(SAVE_AS_FOLDER_ID)
@@ -170,29 +201,53 @@ impl WorkspaceView {
         });
     }
 
+    /// No place to save the talk in was chosen: whatever was waiting on one is let go.
+    fn place_not_chosen(&mut self, cx: &mut Context<Self>) {
+        for effect in self.save_flow.place_not_chosen() {
+            self.follow(effect, cx);
+        }
+    }
+
+    /// The folder the Save As dialog starts in, and the name it suggests, for the talk saved as
+    /// a packed file if `packed`, or a folder: beside the talk, or for an untitled one in the
+    /// Documents folder, under the talk's name. For tests, which can't see what the dialog is
+    /// given.
+    #[doc(hidden)]
+    pub fn save_as_suggestion(&self, packed: bool, cx: &App) -> (PathBuf, String) {
+        let Some(document) = &self.document else {
+            return (PathBuf::new(), String::new());
+        };
+        let document = document.read(cx);
+        let stem = export::file_stem_for(&document.name());
+        let suggested = if packed { format!("{stem}.{PACKED_EXTENSION}") } else { stem };
+        (self.save_folder(document), suggested)
+    }
+
     /// Asks where to save the talk as `kind`, then saves it there on a background task. From
     /// then on the talk is kept there.
     fn save_as(&mut self, kind: SaveKind, cx: &mut Context<Self>) {
         self.settle_typing(cx);
-        let Some(document) = &self.document else {
+        if self.document.is_none() {
             return;
-        };
-        let document = document.read(cx);
-        let stem = export::file_stem_for(&document.name());
-        let suggested = match kind {
-            SaveKind::Folder => stem,
-            SaveKind::Packed => format!("{stem}.{PACKED_EXTENSION}"),
-        };
-        let chosen = cx.prompt_for_new_path(document.place().directory(), Some(&suggested));
+        }
+        let (folder, suggested) = self.save_as_suggestion(matches!(kind, SaveKind::Packed), cx);
+        let chosen = cx.prompt_for_new_path(&folder, Some(&suggested));
         cx.spawn(async move |this, cx| {
             let out = match chosen.await {
                 Ok(Ok(Some(out))) => out,
                 Ok(Err(error)) => {
                     let problem = format!("Could not show the Save dialog: {error}");
-                    this.update(cx, |this, cx| this.say(problem, cx)).ok();
+                    this.update(cx, |this, cx| {
+                        this.say(problem, cx);
+                        this.place_not_chosen(cx);
+                    })
+                    .ok();
                     return;
                 }
-                _ => return,
+                _ => {
+                    this.update(cx, |this, cx| this.place_not_chosen(cx)).ok();
+                    return;
+                }
             };
             this.update(cx, |this, cx| {
                 // Typing may have gone on while the dialog was up.
@@ -200,7 +255,8 @@ impl WorkspaceView {
                 let Some(document) = this.document.clone() else {
                     return;
                 };
-                for effect in this.save_flow.ask_save_as() {
+                let first = document.read(cx).is_untitled();
+                for effect in this.save_flow.place_chosen(first) {
                     let Effect::StartSave = effect else {
                         this.follow(effect, cx);
                         continue;
@@ -249,6 +305,9 @@ impl WorkspaceView {
                 };
                 let moved = saved.moved();
                 let saved_from = document.read(cx).place().clone();
+                let first = matches!(saved_from, TalkPlace::Untitled(_));
+                // Made here, and nothing in it came from anyone else's code.
+                let made_here = first && !document.read(cx).holds_component_source();
                 document.update(cx, |document, cx| {
                     document.saved(saved);
                     cx.notify();
@@ -257,7 +316,7 @@ impl WorkspaceView {
                 self.working_copies
                     .update(cx, |copies, cx| copies.saved(saved_from, cx));
                 if moved {
-                    self.moved(cx);
+                    self.moved(first, made_here, cx);
                 }
                 self.say_for_a_while(said, cx);
                 (SaveOutcome::Saved, None)
@@ -278,22 +337,28 @@ impl WorkspaceView {
         }
     }
 
-    /// Follows the talk to where Save As put it: its folder is the one watched and built.
-    fn moved(&mut self, cx: &mut Context<Self>) {
+    /// Follows the talk to where Save As put it: its folder is the one watched and built. After
+    /// its `first` save its saves are followed as an opened folder's are. A folder of a talk
+    /// `made_here`, holding no component source at all, is always built from then on, as the
+    /// design has it for talks made in the app. One holding any, pasted or brought back, came
+    /// partly from someone else, so nothing is built without a yes: its bar asks, as for any
+    /// folder opened.
+    fn moved(&mut self, first: bool, made_here: bool, cx: &mut Context<Self>) {
         let Some(document) = &self.document else {
             return;
         };
-        self.talk_folder = match document.read(cx).place() {
-            TalkPlace::Folder(folder) => Some(folder.clone()),
-            TalkPlace::Packed(_) => None,
-        };
+        self.talk_folder = talk_folder_of(document.read(cx).place());
+        if made_here && let (Some(folder), Some(permissions)) = (&self.talk_folder, &mut self.permissions) {
+            // If it can't be written down, the bar offers it, as for any folder.
+            permissions.set_always(folder).ok();
+        }
         self.always_build = self.is_always_built();
         self.build_problems.clear();
         self.pending_reload = None;
         self.pending_components = None;
         let watched = self.followed.take().is_some() | self.watcher.take().is_some();
         let tried_to_watch = self.watch_problem.take().is_some();
-        let followed = self.opened_from_path || watched || tried_to_watch;
+        let followed = first || self.opened_from_path || watched || tried_to_watch;
         if followed && let Some(folder) = self.talk_folder.clone() {
             self.follow_saves(folder, cx);
         }
@@ -381,11 +446,16 @@ impl WorkspaceView {
         true
     }
 
-    /// Takes in the answer to the dialog asking before the window closes.
-    fn answer_close(&mut self, answer: CloseAnswer, cx: &mut Context<Self>) {
-        for effect in self.save_flow.answer_close(answer) {
-            self.follow(effect, cx);
-        }
+    /// Takes in the answer to the dialog asking before the window closes. For an untitled talk,
+    /// Save asks where first.
+    fn answer_close(&mut self, answer: CloseAnswer, window: &mut Window, cx: &mut Context<Self>) {
+        let untitled = self.document.as_ref().is_some_and(|document| document.read(cx).is_untitled());
+        let effects = if untitled {
+            self.save_flow.answer_close_untitled(answer)
+        } else {
+            self.save_flow.answer_close(answer)
+        };
+        self.follow_in(effects, window, cx);
     }
 
     fn ask_before_closing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -395,7 +465,7 @@ impl WorkspaceView {
                 let view = view.clone();
                 move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
                     window.close_dialog(cx);
-                    view.update(cx, |view, cx| view.answer_close(answer, cx))
+                    view.update(cx, |view, cx| view.answer_close(answer, window, cx))
                         .ok();
                 }
             };
@@ -512,8 +582,11 @@ impl WorkspaceView {
 
 /// What to call the place a talk is saved to: the name of its folder or file.
 fn place_label(place: &TalkPlace) -> String {
-    let (TalkPlace::Folder(path) | TalkPlace::Packed(path)) = place;
-    file_label(path)
+    match place {
+        TalkPlace::Folder(path) | TalkPlace::Packed(path) => file_label(path),
+        // Never saved where it is: it's saved as, to a place of its own.
+        TalkPlace::Untitled(_) => place.name(),
+    }
 }
 
 fn file_label(path: &Path) -> String {

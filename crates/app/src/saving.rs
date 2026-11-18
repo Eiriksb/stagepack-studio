@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use slides_engine::{
-    FolderFiles, NewFile, PackError, TalkFiles, copy_talk_folder, lies_within, open_packed,
-    pack_folder_with_slides, read_talk_text, repack_with_slides, unpack_with_slides,
-    write_atomically, write_new_atomically,
+    FolderFiles, MemoryFiles, NewFile, PackError, TalkFiles, copy_talk_folder, lies_within, open_packed,
+    pack_folder_with_slides, pack_new, read_talk_text, repack_with_slides, unpack_with_slides,
+    write_atomically, write_new_atomically, write_new_folder,
 };
 
 use slides_components::{BuildEntry, INDEX_FILE};
@@ -35,7 +35,9 @@ pub struct SaveJob {
     on_disk: String,
     from: TalkPlace,
     to: Option<SaveTarget>,
-    /// The files added to the talk that the text uses and aren't saved yet, by their path in it.
+    /// The files to write besides the text, by their path in the talk: those added to it that the
+    /// text uses and aren't saved yet, and for an untitled talk the files it was made with that
+    /// the text uses.
     added: Vec<(String, Arc<[u8]>)>,
     /// The builds entered in the talk's index, of builds the text uses, that no save has
     /// written into the index on disk.
@@ -73,6 +75,9 @@ impl From<String> for SaveError {
         SaveError::Failed(problem)
     }
 }
+
+/// What a save of an untitled talk to where it's kept says: it's kept nowhere yet.
+pub const NO_PLACE_YET: &str = "This presentation hasn't been saved anywhere yet, so it needs Save As.";
 
 /// What a save says when the pack it saved in place in couldn't be opened again afterwards.
 pub const NOT_READ_BACK: &str = "The talk was saved, but couldn't be read back. Close it and open it again to be sure of it.";
@@ -142,8 +147,8 @@ impl SaveJob {
         self.run_reading_back_with(|file| in_pack(file.to_path_buf()).map(|(_, files)| files))
     }
 
-    /// [`Self::run`], opening the pack saved in place in again with `read_back`, as a test can
-    /// make fail.
+    /// [`Self::run`], opening the pack saved in place in, or a new presentation's first pack,
+    /// again with `read_back`, as a test can make fail.
     #[doc(hidden)]
     pub fn run_reading_back_with(
         self,
@@ -254,6 +259,33 @@ impl SaveJob {
                 unpack_with_slides(file, &to, &text, &extra()).map_err(|e| failed(&to, e))?;
                 let kept = index_notice(&to).into_iter().collect();
                 (Some(in_folder(to)), kept)
+            }
+            // Never asked for by the window, which asks where first.
+            (TalkPlace::Untitled(_), None) => return Err(SaveError::Failed(NO_PLACE_YET.to_string())),
+            // A first save: everything is in memory, so all of it is written, fresh. A failure
+            // leaves nothing at the target, and the talk as it was.
+            (TalkPlace::Untitled(_), Some(SaveTarget::Folder(to))) => {
+                write_new_folder(&to, &text, &extra()).map_err(|e| failed(&to, e))?;
+                let kept = index_notice(&to).into_iter().collect();
+                (Some(in_folder(to)), kept)
+            }
+            (TalkPlace::Untitled(_), Some(SaveTarget::Packed(out))) => {
+                pack_new(&out, &text, APP_VERSION, &extra()).map_err(|e| failed(&out, e))?;
+                let mut notices: Vec<String> = index_notice(&out).into_iter().collect();
+                // Written, whether or not it can be opened again. If it can't, that's said, and
+                // the talk goes on being read from what was written, held here, as a pack saved
+                // in place does; the next save starts from the index written.
+                let files = match read_back(&out) {
+                    Ok(files) => files,
+                    Err(_) => {
+                        notices.push(NOT_READ_BACK.to_string());
+                        index_kept_in_pack = index.clone().filter(|_| index_written);
+                        let held = extra().into_iter().map(|(path, bytes)| (path, Arc::from(bytes))).collect();
+                        let written: SharedFiles = Arc::new(MemoryFiles::new(held));
+                        written
+                    }
+                };
+                (Some((TalkPlace::Packed(out), files)), notices)
             }
         };
         if (moved_to.is_some() || reopened.is_some()) && index_written {

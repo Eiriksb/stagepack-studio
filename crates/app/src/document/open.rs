@@ -4,29 +4,81 @@ use super::*;
 
 /// Where a talk is kept: what saving it works from. It can be handed to a background task, as a
 /// [`Document`] can't.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TalkPlace {
     Folder(PathBuf),
     Packed(PathBuf),
+    /// Nowhere yet: a new presentation, held in memory until its first save gives it a place.
+    Untitled(UntitledId),
 }
 
+/// What tells one untitled talk from another, wherever it's kept meanwhile: random, and written
+/// as 32 hex digits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UntitledId(pub u128);
+
+impl UntitledId {
+    /// An id no other untitled talk has.
+    pub fn random() -> UntitledId {
+        use std::hash::{BuildHasher as _, Hasher as _};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // Each hasher is keyed afresh; the count and the time keep two made at once apart.
+        static MADE: AtomicU64 = AtomicU64::new(0);
+        let half = |salt: u64| {
+            let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+            hasher.write_u64(salt);
+            hasher.write_u64(MADE.fetch_add(1, Ordering::Relaxed));
+            hasher.write_u32(std::process::id());
+            if let Ok(since) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                hasher.write_u128(since.as_nanos());
+            }
+            hasher.finish()
+        };
+        UntitledId((u128::from(half(1)) << 64) | u128::from(half(2)))
+    }
+}
+
+impl std::fmt::Display for UntitledId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:032x}", self.0)
+    }
+}
+
+/// What an untitled talk is called until it's saved.
+pub const UNTITLED_NAME: &str = "Untitled presentation";
+
 impl TalkPlace {
-    /// The folder this talk sits in, where anything saved from it starts out.
-    pub fn directory(&self) -> &Path {
-        let (TalkPlace::Folder(path) | TalkPlace::Packed(path)) = self;
-        path.parent().unwrap_or(path)
+    /// The folder this talk sits in, where anything saved from it starts out. An untitled talk
+    /// sits in none, so it's the Documents folder, or else the home folder, or else the current
+    /// one.
+    pub fn directory(&self) -> PathBuf {
+        match self {
+            TalkPlace::Folder(path) | TalkPlace::Packed(path) => path.parent().unwrap_or(path).to_path_buf(),
+            TalkPlace::Untitled(_) => documents_folder(),
+        }
     }
 
     /// What to call a talk with no title setting.
-    pub(crate) fn name(&self) -> String {
+    pub fn name(&self) -> String {
         match self {
             TalkPlace::Folder(folder) => folder_name(folder),
             TalkPlace::Packed(file) => file.file_stem().map_or_else(
                 || file.display().to_string(),
                 |stem| stem.to_string_lossy().into_owned(),
             ),
+            TalkPlace::Untitled(_) => UNTITLED_NAME.to_string(),
         }
     }
+}
+
+/// The person's Documents folder, or else their home folder, or else the current one: where a
+/// talk with no place of its own is first saved.
+fn documents_folder() -> PathBuf {
+    dirs::document_dir()
+        .filter(|folder| folder.is_dir())
+        .or_else(|| dirs::home_dir().filter(|folder| folder.is_dir()))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 impl Document {
@@ -86,6 +138,43 @@ impl Document {
         })
     }
 
+    /// A new presentation made from `template`: its text, over its files held in memory. It's
+    /// untitled until its first save, and has nothing unsaved until it's edited.
+    pub fn new_untitled(template: &Template, id: UntitledId, fonts: Fonts) -> Result<Document, String> {
+        let files = template.files.iter().map(|(path, bytes)| (path.to_string(), Arc::from(*bytes))).collect();
+        Document::untitled(id, template.slides.to_string(), files, fonts)
+    }
+
+    /// An untitled talk brought back from its working copy: `text`, with `files` and `builds`,
+    /// the files added to it and the builds entered with them, taken back as
+    /// [`Self::recover_with_builds`] takes them. Nothing of it is saved anywhere, so it has
+    /// unsaved changes from the start.
+    pub fn untitled_with(
+        id: UntitledId,
+        text: String,
+        files: Vec<(String, Arc<[u8]>)>,
+        builds: Vec<BuildEntry>,
+        fonts: Fonts,
+    ) -> Result<Document, String> {
+        let mut document = Document::untitled(id, text.clone(), Vec::new(), fonts)?;
+        document.recover_with_builds(text, files, builds).map_err(|refused| refused.to_string())?;
+        document.history.forget_saved();
+        Ok(document)
+    }
+
+    /// An untitled talk of `source`, over `files` held in memory.
+    fn untitled(id: UntitledId, source: String, files: Vec<(String, Arc<[u8]>)>, fonts: Fonts) -> Result<Document, String> {
+        let memory = MemoryFiles::new(files.clone());
+        let names = memory.names_in(FONTS_FOLDER).into_iter().filter(|name| is_talk_font(name)).collect();
+        let talk_fonts = read_talk_fonts(names, &memory);
+        let memory: Arc<dyn TalkFiles + Send + Sync> = Arc::new(memory);
+        let mut document = Document::new(TalkPlace::Untitled(id), memory.clone(), talk_fonts, source, fonts)
+            .map_err(|_| "The presentation couldn't be made: something in it can't be read.".to_string())?;
+        // Only those the files hold: one whose name no talk could have is left out of both.
+        document.untitled_files = files.into_iter().filter(|(path, _)| memory.len(path).is_some()).collect();
+        Ok(document)
+    }
+
     fn new(
         place: TalkPlace,
         files: Arc<dyn TalkFiles + Send + Sync>,
@@ -102,6 +191,7 @@ impl Document {
         let files: Arc<dyn TalkFiles + Send + Sync> = Arc::new(WithAdded::new(files, added.clone()));
         let mut document = Document {
             own_files,
+            untitled_files: Vec::new(),
             on_disk: source,
             outside: None,
             deck: Deck::open_parsed(Box::new(files.clone()), fonts, talk),

@@ -35,6 +35,11 @@ impl BuildPermissions {
         }
     }
 
+    /// The file these permissions are kept in.
+    pub fn file(&self) -> &Path {
+        &self.file
+    }
+
     /// Where the app keeps its permissions: in its own data folder, if the system has one.
     pub fn default_file() -> Option<PathBuf> {
         Some(BuildPermissions::app_folder()?.join(FILE_NAME))

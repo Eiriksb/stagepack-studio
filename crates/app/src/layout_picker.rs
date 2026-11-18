@@ -8,6 +8,7 @@ use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use slides_engine::{LayoutDef, layouts};
+use slides_format::LAYOUT_NAMES;
 
 /// Gives the slide shown the layout called `layout`, by the engine's name for it.
 #[derive(Clone, PartialEq, Debug, Action)]
@@ -39,14 +40,9 @@ pub fn layout_area_id(layout: &str, index: usize) -> SharedString {
 /// The name people know the layout called `layout` by. A name that isn't a layout's is given
 /// back as it is.
 pub fn layout_name(layout: &str) -> &str {
-    match layout {
-        "title" => "Title",
-        "content" => "Title and content",
-        "two-columns" => "Two columns",
-        "section" => "Section",
-        "blank" => "Blank",
-        other => other,
-    }
+    // In the order of the format crate's list.
+    const WORDS: [&str; 5] = ["Title", "Title and content", "Two columns", "Section", "Blank"];
+    LAYOUT_NAMES.iter().position(|each| each.name == layout).map_or(layout, |at| WORDS[at])
 }
 
 /// A tile for each layout, in the engine's order, the one called `current` marked. A click on

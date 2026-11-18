@@ -10,6 +10,7 @@ use crate::element_ops::{
     NewTag, attr_edits, content_end, delete_block, ending_len, guarded, insert_block, is_attr_name, is_blank, line_end, line_start, readable,
     reads_as, set_attr_read, tag_text, top_tag, with_block,
 };
+use crate::layouts::DEFAULT_LAYOUT;
 use crate::model::{Attr, Block, Slide, Tag, Talk};
 use crate::reparse::reparse;
 use crate::rich::{is_positioned, layout_of};
@@ -112,9 +113,6 @@ pub fn number_text(value: f32) -> String {
     }
     if tenths % 10.0 == 0.0 { format!("{:.0}", tenths / 10.0) } else { format!("{:.1}", tenths / 10.0) }
 }
-
-/// The layout a slide has without a `layout:` setting.
-const DEFAULT_LAYOUT: &str = "content";
 
 fn no_change() -> Change {
     Change { edits: Vec::new() }

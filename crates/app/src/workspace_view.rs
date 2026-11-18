@@ -18,6 +18,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use slides_components::{Bundle, Diagnostic};
 use slides_engine::{ComponentState, Fonts};
+use slides_format::DEFAULT_LAYOUT;
 
 use crate::animate::Choice;
 use crate::animate_tools::{ChooseAnimation, ChooseEntrance, ChooseTransition};
@@ -26,7 +27,7 @@ use crate::builds::{self, BuildOutcome, Compile};
 use crate::cargo_file::{self, write_cargo_file};
 use crate::clipboard::ClipboardOp;
 use crate::clipboard_tools::ClipboardTools;
-use crate::document::{Document, EditRefused, OpenProblem, Reload, SLIDES_FILE, TalkPlace, UNREADABLE_FILE};
+use crate::document::{Document, EditRefused, OpenProblem, Reload, SLIDES_FILE, TalkPlace, UNREADABLE_FILE, UntitledId};
 use crate::export::{self, ExportKind, run_export, stagepack_executable};
 use crate::icon_picker::{self, IconPicked, IconPicker};
 use crate::palette::InsertComponent;
@@ -39,7 +40,7 @@ use crate::notes_panel::{
 };
 use crate::permissions::BuildPermissions;
 use crate::present_view::{self, Presentation, start_show};
-use crate::recovery::Recovery;
+use crate::recovery::{Found, NotTaken, Recovery};
 use crate::ribbon::{Panels, Ribbon, RibbonTab};
 use crate::save_flow::{CloseAnswer, Effect, SaveFlow, SaveOutcome};
 use crate::saving::{SaveError, SaveJob, SaveTarget, Saved};
@@ -49,6 +50,8 @@ use crate::table_tools::{
     InsertTable, TableColumnLeft, TableColumnRight, TableDeleteColumn, TableDeleteRow, TableRowAbove, TableRowBelow,
 };
 use crate::text_tools::TextTools;
+use crate::start_screen::{self, StartEvent, StartScreen};
+use crate::templates;
 use crate::slide_strip::{
     self, STRIP_CONTEXT, STRIP_MAX_WIDTH, STRIP_MIN_WIDTH, STRIP_WIDTH, SlideStrip,
 };
@@ -58,8 +61,10 @@ use crate::working_copies::{KEEP_FAILED, KeepFailed, WorkingCopies};
 mod editing;
 mod inserting;
 mod saving;
+mod starting;
 
 pub use inserting::{DIALOG_FAILED, ONLY_PICTURES, ONLY_THE_FIRST};
+pub use starting::{open_start_window, open_untitled_ids, refresh_start_screens};
 
 pub const CANVAS_ID: &str = "canvas";
 pub const TITLE_ID: &str = "title";
@@ -140,6 +145,7 @@ actions!(
         NextSlide,
         PreviousSlide,
         ToggleMarkdown,
+        NewPresentation,
         OpenFolder,
         OpenPacked,
         Save,
@@ -228,6 +234,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-c", CopyToClipboard, Some(STRIP_CONTEXT)),
         KeyBinding::new("ctrl-x", CutToClipboard, Some(STRIP_CONTEXT)),
         KeyBinding::new("ctrl-v", PasteFromClipboard, Some(STRIP_CONTEXT)),
+        KeyBinding::new("ctrl-n", NewPresentation, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-o", OpenPacked, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-shift-o", OpenFolder, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-s", Save, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-shift-s", SaveAs, Some(KEY_CONTEXT)),
         KeyBinding::new("f5", Present, Some(KEY_CONTEXT)),
@@ -238,6 +247,7 @@ pub fn bind_keys(cx: &mut App) {
     inspector::bind_keys(cx);
     icon_picker::bind_keys(cx);
     present_view::bind_keys(cx);
+    start_screen::bind_keys(cx);
 }
 
 /// Opens the talk at `path`, a folder or a packed file, in a window of its own. Its unsaved
@@ -278,6 +288,11 @@ pub struct WorkspaceView {
     document: Option<Entity<Document>>,
     /// Why no talk is showing, when one was asked for.
     problem: Option<SharedString>,
+    /// What the window shows while it has no talk, if it was opened to start from.
+    start_screen: Option<Entity<StartScreen>>,
+    /// Where working copies are kept, as the window was given it, for whatever is opened from
+    /// it.
+    recovery: Option<Recovery>,
     stagepack_offer: Option<StagepackOffer>,
     slide_canvas: Entity<SlideCanvas>,
     /// The slide as it's typed on, over the canvas.
@@ -330,6 +345,10 @@ pub struct WorkspaceView {
     permissions: Option<BuildPermissions>,
     /// Whether this talk's folder is one of them.
     always_build: bool,
+    /// Where an untitled talk is first saved, in place of the person's Documents folder.
+    documents: Option<PathBuf>,
+    /// Where Stagepack is, if anywhere, in place of where it's installed.
+    stagepack: Option<Option<PathBuf>>,
     /// Whether a build is running.
     building: bool,
     /// Whether another build was asked for while one ran.
@@ -358,42 +377,54 @@ pub struct WorkspaceView {
     /// The slide shows the steps things come in on while the Animate tab is open.
     _tab_changed: Subscription,
     _component_picked: Subscription,
+    _start_asked: Option<Subscription>,
 }
 
 impl WorkspaceView {
     /// Opens the talk at `path`, a folder or a packed file. A folder's saves are followed, as
-    /// nothing edits a packed file in place. If it can't be opened, the window says why.
+    /// nothing edits a packed file in place. If it can't be opened, the window says why, in the
+    /// start screen's plain words.
     pub fn open(path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let fonts = Fonts::with_system_fallback();
-        if path.is_dir() {
-            return match Document::open(&path, fonts) {
-                Ok(document) => {
-                    let mut view = Self::open_with(document, window, cx);
-                    view.opened_from_path = true;
-                    view.follow_saves(path, cx);
-                    view
-                }
-                Err(problem) => Self::build(None, Some(problem.into()), window, cx),
-            };
-        }
-        match Document::open_packed(&path, fonts) {
+        match read_talk(&path, Fonts::with_system_fallback()) {
             Ok(document) => {
                 let mut view = Self::open_with(document, window, cx);
                 view.opened_from_path = true;
+                if path.is_dir() {
+                    view.follow_saves(path, cx);
+                }
                 view
             }
-            Err(OpenProblem::SlidevTalk) => {
-                let stagepack =
-                    stagepack_executable(|name| std::env::var(name).ok(), Path::is_file);
-                Self::for_slidev_talk(path, stagepack, window, cx)
-            }
-            Err(OpenProblem::Other(problem)) => Self::build(None, Some(problem.into()), window, cx),
+            Err(OpenProblem::SlidevTalk) => Self::for_slidev_talk(path, installed_stagepack(), window, cx),
+            Err(OpenProblem::Other(_)) => Self::build(None, Some(starting::start_problem(&path).into()), window, cx),
         }
     }
 
     /// Shows a talk that is already open.
     pub fn open_with(document: Document, window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self::build(Some(document), None, window, cx)
+    }
+
+    /// A window on the new presentation `id`, brought back from `found`, its working copy from
+    /// last time, taken with [`Recovery::take_untitled`], and numbered `number` among those
+    /// open. It's kept in `recovery` from the start as this window's own, and last time's copy
+    /// goes only once it is, so a crash before anything is edited loses nothing.
+    pub fn bring_back_untitled(
+        id: UntitledId,
+        found: Found,
+        number: usize,
+        fonts: Fonts,
+        recovery: Recovery,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Self, String> {
+        let mut document =
+            Document::untitled_with(id, found.text.clone(), found.files.clone(), found.builds.clone(), fonts)?;
+        document.set_untitled_number(number);
+        let mut view = Self::build(Some(document), None, window, cx);
+        view.recovery = Some(recovery.clone());
+        view.working_copies
+            .update(cx, |copies, cx| copies.use_recovery_bringing_back(recovery, found, cx));
+        Ok(view)
     }
 
     /// Says that `file` is one of Stagepack's Slidev talks, and offers to open it in
@@ -552,14 +583,13 @@ impl WorkspaceView {
             .unwrap_or_default();
         let talk_folder = document
             .as_ref()
-            .and_then(|document| match document.read(cx).place() {
-                TalkPlace::Folder(folder) => Some(folder.clone()),
-                TalkPlace::Packed(_) => None,
-            });
+            .and_then(|document| talk_folder_of(document.read(cx).place()));
         let permissions = BuildPermissions::default_file().map(BuildPermissions::load);
         let mut view = Self {
             document,
             problem,
+            start_screen: None,
+            recovery: None,
             stagepack_offer: None,
             slide_canvas,
             slide_editor,
@@ -589,6 +619,8 @@ impl WorkspaceView {
             bundle: Bundle::find(),
             editor_projects: cargo_file::default_projects_root(),
             permissions,
+            documents: None,
+            stagepack: None,
             always_build: false,
             building: false,
             build_again: false,
@@ -609,6 +641,7 @@ impl WorkspaceView {
             _table_picked: table_picked,
             _tab_changed: tab_changed,
             _component_picked: component_picked,
+            _start_asked: None,
         };
         view.always_build = view.is_always_built();
         view
@@ -637,6 +670,26 @@ impl WorkspaceView {
     pub fn set_permissions_for_test(&mut self, permissions: BuildPermissions) {
         self.permissions = Some(permissions);
         self.always_build = self.is_always_built();
+    }
+
+    /// Saves an untitled talk, and anything made from it, in `folder` first, in place of the
+    /// person's Documents folder.
+    pub fn set_documents_folder_for_test(&mut self, folder: PathBuf) {
+        self.documents = Some(folder);
+    }
+
+    /// The folder anything saved from `document` starts out in: the one its talk sits in, or
+    /// for an untitled talk the Documents folder.
+    fn save_folder(&self, document: &Document) -> PathBuf {
+        if let (TalkPlace::Untitled(_), Some(documents)) = (document.place(), &self.documents) {
+            return documents.clone();
+        }
+        document.place().directory()
+    }
+
+    /// Takes Stagepack to be at `stagepack`, or nowhere, in place of where it's installed.
+    pub fn set_stagepack_for_test(&mut self, stagepack: Option<PathBuf>) {
+        self.stagepack = Some(stagepack);
     }
 
     /// Follows a folder's saves without watching it for real, so a test can see which folder
@@ -996,26 +1049,33 @@ impl WorkspaceView {
         }
     }
 
-    /// Asks which talk to open, and opens it in a window of its own.
-    fn ask_to_open(&mut self, directories: bool, cx: &mut Context<Self>) {
+    /// Asks which talk to open, and opens it: in this window from the start screen, and in one
+    /// of its own from a window with a talk.
+    fn ask_to_open(&mut self, directories: bool, window: &mut Window, cx: &mut Context<Self>) {
         let chosen = cx.prompt_for_paths(PathPromptOptions {
             files: !directories,
             directories,
             multiple: false,
             prompt: Some("Open".into()),
         });
-        let recovery = self.working_copies.read(cx).recovery().cloned();
-        cx.spawn(async move |this, cx| {
-            let opened = match chosen.await {
-                Ok(Ok(Some(mut paths))) if !paths.is_empty() => cx
-                    .update(|cx| open_talk_window(paths.remove(0), recovery, cx))
-                    .map_err(|error| format!("Could not open a window for that talk: {error}")),
-                Ok(Err(error)) => Err(format!("Could not show the Open dialog: {error}")),
-                _ => Ok(()),
+        cx.spawn_in(window, async move |this, cx| {
+            let path = match chosen.await {
+                Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
+                Ok(Err(error)) => {
+                    let problem = format!("Could not show the Open dialog: {error}");
+                    this.update(cx, |this, cx| this.say_on_start(problem, false, cx)).ok();
+                    return;
+                }
+                _ => return,
             };
-            if let Err(problem) = opened {
-                this.update(cx, |this, cx| this.say(problem, cx)).ok();
-            }
+            this.update_in(cx, |this, window, cx| {
+                if this.shows_start_screen() {
+                    this.open_here(path, window, cx);
+                } else if let Err(error) = open_talk_window(path, this.recovery.clone(), cx) {
+                    this.say(format!("Could not open a window for that talk: {error}"), cx);
+                }
+            })
+            .ok();
         })
         .detach();
     }
@@ -1039,7 +1099,7 @@ impl WorkspaceView {
         let document = document.read(cx);
         let stem = export::file_stem_for(&document.name());
         let suggested = extension.map_or_else(|| stem.clone(), |ext| format!("{stem}.{ext}"));
-        let chosen = cx.prompt_for_new_path(document.place().directory(), Some(&suggested));
+        let chosen = cx.prompt_for_new_path(&self.save_folder(document), Some(&suggested));
         cx.spawn(async move |this, cx| {
             let out = match chosen.await {
                 Ok(Ok(Some(out))) => out,
@@ -1115,6 +1175,28 @@ impl WorkspaceView {
     }
 }
 
+/// Reads the talk at `path`, a folder or a packed file.
+fn read_talk(path: &Path, fonts: Fonts) -> Result<Document, OpenProblem> {
+    if path.is_dir() {
+        Document::open(path, fonts).map_err(OpenProblem::Other)
+    } else {
+        Document::open_packed(path, fonts)
+    }
+}
+
+/// Where Stagepack is installed, if it is.
+fn installed_stagepack() -> Option<PathBuf> {
+    stagepack_executable(|name| std::env::var(name).ok(), Path::is_file)
+}
+
+/// The folder of the talk at `place`, if it's kept in one: the folder that's watched and built.
+fn talk_folder_of(place: &TalkPlace) -> Option<PathBuf> {
+    match place {
+        TalkPlace::Folder(folder) => Some(folder.clone()),
+        TalkPlace::Packed(_) | TalkPlace::Untitled(_) => None,
+    }
+}
+
 /// The File menu. `packed` says which form the open talk is in, and is `None` with no talk.
 /// `for_code_editor` says whether it offers to set a folder talk up for a code editor.
 fn file_menu(packed: Option<bool>, for_code_editor: bool) -> impl IntoElement {
@@ -1125,7 +1207,9 @@ fn file_menu(packed: Option<bool>, for_code_editor: bool) -> impl IntoElement {
         .dropdown_menu(move |menu, _, _| {
             let no_talk = packed.is_none();
             // The system's Open dialog picks files or folders, never both at once.
-            menu.menu("Open talk folder…", Box::new(OpenFolder))
+            menu.menu("New presentation…", Box::new(NewPresentation))
+                .separator()
+                .menu("Open talk folder…", Box::new(OpenFolder))
                 .menu("Open talk file…", Box::new(OpenPacked))
                 .separator()
                 .menu_with_disabled("Save", Box::new(Save), no_talk)
@@ -1275,6 +1359,9 @@ impl WorkspaceView {
 
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(start) = self.start_screen().cloned() {
+            return self.render_start(start, cx).into_any_element();
+        }
         let build_bar = self.build_bar(cx);
         // The bars that need an answer.
         let bars: Vec<AnyElement> = self
@@ -1395,7 +1482,7 @@ impl Render for WorkspaceView {
                 this.edit(|document| document.reorder_selected(order), cx)
             }))
             .on_action(cx.listener(|this, action: &SetLayout, _, cx| this.set_layout(action.layout, cx)))
-            .on_action(cx.listener(|this, _: &NewSlide, _, cx| this.add_slide("content", cx)))
+            .on_action(cx.listener(|this, _: &NewSlide, _, cx| this.add_slide(DEFAULT_LAYOUT, cx)))
             .on_action(cx.listener(|this, action: &AddSlide, _, cx| {
                 this.add_slide(action.layout, cx)
             }))
@@ -1432,9 +1519,10 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &TableDeleteColumn, _, cx| this.edit(Document::remove_column, cx)))
             .on_action(cx.listener(|this, _: &Undo, _, cx| this.step_history(Document::undo, cx)))
             .on_action(cx.listener(|this, _: &Redo, _, cx| this.step_history(Document::redo, cx)))
-            .on_action(cx.listener(|this, _: &OpenFolder, _, cx| this.ask_to_open(true, cx)))
-            .on_action(cx.listener(|this, _: &OpenPacked, _, cx| this.ask_to_open(false, cx)))
-            .on_action(cx.listener(|this, _: &Save, _, cx| this.save(cx)))
+            .on_action(cx.listener(|this, _: &NewPresentation, _, cx| this.new_presentation(cx)))
+            .on_action(cx.listener(|this, _: &OpenFolder, window, cx| this.ask_to_open(true, window, cx)))
+            .on_action(cx.listener(|this, _: &OpenPacked, window, cx| this.ask_to_open(false, window, cx)))
+            .on_action(cx.listener(|this, _: &Save, window, cx| this.save(window, cx)))
             .on_action(cx.listener(|this, _: &SaveAs, window, cx| this.ask_to_save_as(window, cx)))
             .on_action(
                 cx.listener(|this, _: &SetUpForCodeEditor, _, cx| this.set_up_for_code_editor(cx)),
@@ -1453,7 +1541,7 @@ impl Render for WorkspaceView {
                     h_flex()
                         .gap_1()
                         .items_center()
-                        .child(file_menu(packed, self.bundle.is_some()))
+                        .child(file_menu(packed, self.bundle.is_some() && self.talk_folder.is_some()))
                         .child(export_menu(packed.is_some()))
                         .child(
                             div()
@@ -1484,5 +1572,6 @@ impl Render for WorkspaceView {
                 None if self.document.is_some() => this.child(blank_footer_line()),
                 None => this,
             })
+            .into_any_element()
     }
 }

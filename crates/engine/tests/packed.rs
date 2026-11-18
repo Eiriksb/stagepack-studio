@@ -1155,3 +1155,181 @@ fn the_index_replaced_is_not_counted_against_a_packs_limits() {
     repack_with_slides(&out, &out, "# B\n", "0.1.0", &[new_file("build/index.json", &an_index("Again"))]).unwrap();
     assert_eq!(open_packed(&out).unwrap().read("build/index.json").unwrap(), an_index("Again"));
 }
+
+fn new_files() -> Vec<NewFile> {
+    vec![
+        ("assets/a.png".to_string(), b"\x89PNG not really".to_vec()),
+        ("components/c.rs".to_string(), b"fn main() {}".to_vec()),
+        ("build/c.wasm".to_string(), b"\0asm\x01\0\0\0".to_vec()),
+    ]
+}
+
+fn names_in_folder(folder: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    fn walk(dir: &Path, prefix: &str, names: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = format!("{prefix}{}", entry.file_name().to_string_lossy());
+            if entry.file_type().unwrap().is_dir() {
+                walk(&entry.path(), &format!("{name}/"), names);
+            } else {
+                names.push(name);
+            }
+        }
+    }
+    walk(folder, "", &mut names);
+    names.sort();
+    names
+}
+
+#[test]
+fn a_new_pack_opens_and_reads_back_every_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("new.sptx");
+    pack_new(&out, "# One\n", "0.1.0", &new_files()).unwrap();
+    let packed = open_packed(&out).unwrap();
+    assert_eq!(packed.slides().unwrap(), "# One\n");
+    for (name, bytes) in new_files() {
+        assert_eq!(packed.read(&name), Some(bytes), "{name}");
+    }
+    assert_eq!(packed.read("talk.json"), Some(MANIFEST.to_vec()));
+    assert_eq!(packed.names(), ["assets/a.png", "build/c.wasm", "components/c.rs", "slides.md", "talk.json"]);
+    let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(left, ["new.sptx"]);
+}
+
+#[test]
+fn a_new_folder_has_slides_and_every_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let to = dir.path().join("talk");
+    write_new_folder(&to, "# One\n", &new_files()).unwrap();
+    assert_eq!(std::fs::read_to_string(to.join("slides.md")).unwrap(), "# One\n");
+    for (name, bytes) in new_files() {
+        assert_eq!(std::fs::read(to.join(&name)).unwrap(), bytes, "{name}");
+    }
+    assert_eq!(names_in_folder(&to), ["assets/a.png", "build/c.wasm", "components/c.rs", "slides.md"]);
+    // An empty folder that's there already is used.
+    let empty = dir.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    write_new_folder(&empty, "# One\n", &[]).unwrap();
+    assert_eq!(names_in_folder(&empty), ["slides.md"]);
+}
+
+#[test]
+fn a_new_folder_in_a_folder_that_is_not_empty_is_refused_and_nothing_is_written() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("mine.txt"), "mine").unwrap();
+    assert!(write_new_folder(dir.path(), "# One\n", &new_files()).is_err());
+    assert_eq!(names_in_folder(dir.path()), ["mine.txt"]);
+    assert_eq!(std::fs::read_to_string(dir.path().join("mine.txt")).unwrap(), "mine");
+}
+
+#[test]
+fn a_new_folder_that_fails_half_way_leaves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    // A file whose parent is a file can't be written, but is a name a talk could hold.
+    let files = vec![("assets/a".to_string(), b"one".to_vec()), ("assets/a/b".to_string(), b"two".to_vec())];
+    let to = dir.path().join("talk");
+    assert!(write_new_folder(&to, "# One\n", &files).is_err());
+    assert!(!to.exists());
+    // And in a folder that was there, empty, it is left empty.
+    let empty = dir.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    assert!(write_new_folder(&empty, "# One\n", &files).is_err());
+    assert!(empty.is_dir());
+    assert!(names_in_folder(&empty).is_empty());
+}
+
+#[test]
+fn a_file_path_that_leaves_the_folder_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    for bad in ["../x", "assets/../../x", "/etc/x", "assets/../x", "C:\\x", "assets/a\0b", "slides.md", "notes.txt", "assets/.hidden"] {
+        let files = vec![(bad.to_string(), b"x".to_vec())];
+        let to = dir.path().join("talk");
+        assert!(matches!(write_new_folder(&to, "# One\n", &files), Err(PackError::UnsafeName(_))), "{bad:?}");
+        assert!(!to.exists(), "{bad:?}");
+        let out = dir.path().join("t.sptx");
+        assert!(matches!(pack_new(&out, "# One\n", "0.1.0", &files), Err(PackError::UnsafeName(_))), "{bad:?}");
+        assert!(!out.exists(), "{bad:?}");
+    }
+    assert!(!dir.path().join("x").exists());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn a_new_pack_over_an_existing_file_replaces_it_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("t.sptx");
+    std::fs::write(&out, "old contents").unwrap();
+    pack_new(&out, "# New\n", "0.1.0", &new_files()).unwrap();
+    assert_eq!(open_packed(&out).unwrap().slides().unwrap(), "# New\n");
+    // A write that fails leaves what was there, and no temporary file.
+    let bad = vec![("../x".to_string(), b"x".to_vec())];
+    assert!(pack_new(&out, "# Newer\n", "0.1.0", &bad).is_err());
+    assert_eq!(open_packed(&out).unwrap().slides().unwrap(), "# New\n");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn a_new_pack_is_the_pack_of_a_folder_that_holds_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("talk");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(folder.join("slides.md"), "ignored").unwrap();
+    let mut files = new_files();
+    files.push(("build/index.json".to_string(), an_index("New")));
+    let (a, b) = (dir.path().join("a.sptx"), dir.path().join("b.sptx"));
+    pack_folder_with_slides(&folder, &a, "# One\n", "0.1.0", &files).unwrap();
+    pack_new(&b, "# One\n", "0.1.0", &files).unwrap();
+    let (a, b) = (open_packed(&a).unwrap(), open_packed(&b).unwrap());
+    assert_eq!(a.names(), b.names());
+    for name in a.names() {
+        assert_eq!(a.read(&name), b.read(&name), "{name}");
+    }
+}
+
+mod alike {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(24))]
+        #[test]
+        fn a_pack_and_a_folder_of_the_same_talk_read_alike(
+            text in ".{0,200}",
+            files in proptest::collection::vec(
+                (prop_oneof![Just("assets"), Just("components"), Just("build")], "[a-z]{1,8}", proptest::collection::vec(any::<u8>(), 0..64)),
+                0..=8,
+            ),
+        ) {
+            // Names that only differ by case, or repeat with other bytes, aren't one talk's, and
+            // nor are the names a system keeps for its devices, which no talk can hold.
+            const RESERVED: [&str; 22] = [
+                "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+                "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+            ];
+            let mut given: Vec<NewFile> = Vec::new();
+            for (folder, name, bytes) in files {
+                let path = format!("{folder}/{name}.bin");
+                let reserved = RESERVED.contains(&name.to_ascii_lowercase().as_str());
+                if !reserved && !given.iter().any(|(other, _)| other.eq_ignore_ascii_case(&path)) {
+                    given.push((path, bytes));
+                }
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let (pack, folder) = (dir.path().join("t.sptx"), dir.path().join("talk"));
+            pack_new(&pack, &text, "0.1.0", &given).unwrap();
+            write_new_folder(&folder, &text, &given).unwrap();
+            let packed = open_packed(&pack).unwrap();
+            let on_disk = FolderFiles::new(folder.clone());
+            prop_assert_eq!(packed.slides().unwrap(), text.clone());
+            prop_assert_eq!(on_disk.read("slides.md"), Some(text.into_bytes()));
+            for (name, bytes) in &given {
+                prop_assert_eq!(packed.read(name), Some(bytes.clone()));
+                prop_assert_eq!(on_disk.read(name), Some(bytes.clone()));
+            }
+            prop_assert_eq!(names_in_folder(&folder).len(), given.len() + 1);
+            prop_assert_eq!(packed.names().len(), given.len() + 2);
+        }
+    }
+}

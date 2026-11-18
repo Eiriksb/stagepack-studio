@@ -1,6 +1,6 @@
 //! The window's saving, as a table of what happens and what it should lead to.
 
-use stagepack_studio::save_flow::{CloseAnswer, Effect, STILL_SAVING, SaveFlow, SaveOutcome};
+use stagepack_studio::save_flow::{CloseAnswer, Effect, NOT_SAVED_STILL_OPEN, STILL_SAVING, SaveFlow, SaveOutcome};
 use stagepack_studio::saving::SaveError;
 
 /// Something that happens to the window's saving.
@@ -16,6 +16,16 @@ enum Event {
     Answer(CloseAnswer),
     /// A read of the talk's file comes in.
     Read,
+    /// Save is asked for on an untitled talk.
+    SaveUntitled,
+    /// The close dialog is answered for an untitled talk.
+    AnswerUntitled(CloseAnswer),
+    /// A place to save in is chosen, for a talk's first save or not.
+    Chosen {
+        first: bool,
+    },
+    /// No place to save in was chosen.
+    NotChosen,
     /// The running save is done, and the talk has changes unsaved after it or not.
     Finished {
         outcome: SaveOutcome,
@@ -47,6 +57,10 @@ fn check(name: &str, steps: &[(Event, Vec<Effect>)]) {
             CloseAsked { unsaved } => flow.ask_close(unsaved),
             Answer(answer) => flow.answer_close(answer),
             Read => flow.read_arrived(),
+            SaveUntitled => flow.ask_save_untitled(),
+            AnswerUntitled(answer) => flow.answer_close_untitled(answer),
+            Chosen { first } => flow.place_chosen(first),
+            NotChosen => flow.place_not_chosen(),
             Finished { outcome, unsaved } => flow.finished(outcome, unsaved),
         };
         assert_eq!(&effects, expected, "{name}, step {at}: {event:?}");
@@ -243,6 +257,175 @@ fn a_failed_save_while_closing_keeps_the_window_open() {
             (Save, vec![StartSave]),
             (Save, vec![]),
             (failed(), vec![Say("The disk is full.".into()), StartSave]),
+        ],
+    );
+}
+
+fn failed() -> Event {
+    Finished {
+        outcome: SaveOutcome::Failed("The disk is full.".into()),
+        unsaved: true,
+    }
+}
+
+fn not_saved() -> Effect {
+    Say(NOT_SAVED_STILL_OPEN.to_string())
+}
+
+#[test]
+fn save_on_an_untitled_talk_asks_where_first() {
+    check(
+        "save",
+        &[
+            (SaveUntitled, vec![AskWhereToSave]),
+            // Asked again while it's being chosen, as with Ctrl+S while the file dialog is up,
+            // it's asked once.
+            (SaveUntitled, vec![]),
+            (NotChosen, vec![]),
+            (SaveUntitled, vec![AskWhereToSave]),
+            (Chosen { first: true }, vec![StartSave]),
+            (saved(false), vec![]),
+        ],
+    );
+    check(
+        "save as, from the menu",
+        &[
+            (Chosen { first: true }, vec![StartSave]),
+            (saved(false), vec![]),
+            (NotChosen, vec![]),
+        ],
+    );
+}
+
+#[test]
+fn closing_an_untitled_talk_with_save_closes_once_its_first_save_is_done() {
+    check(
+        "chosen and saved",
+        &[
+            (CloseAsked { unsaved: true }, vec![AskBeforeClosing]),
+            (AnswerUntitled(CloseAnswer::Save), vec![AskWhereToSave]),
+            (Chosen { first: true }, vec![StartSave]),
+            (saved(false), vec![Close]),
+        ],
+    );
+    check(
+        "edited while it saved",
+        &[
+            (CloseAsked { unsaved: true }, vec![AskBeforeClosing]),
+            (AnswerUntitled(CloseAnswer::Save), vec![AskWhereToSave]),
+            (Chosen { first: true }, vec![StartSave]),
+            (saved(true), vec![StartSave]),
+            (saved(false), vec![Close]),
+        ],
+    );
+    check(
+        "no place chosen",
+        &[
+            (CloseAsked { unsaved: true }, vec![AskBeforeClosing]),
+            (AnswerUntitled(CloseAnswer::Save), vec![AskWhereToSave]),
+            (NotChosen, vec![not_saved()]),
+            // Nothing closes the window but a new answer.
+            (SaveUntitled, vec![AskWhereToSave]),
+            (Chosen { first: true }, vec![StartSave]),
+            (saved(false), vec![]),
+        ],
+    );
+    check(
+        "don't save, and cancel",
+        &[
+            (CloseAsked { unsaved: true }, vec![AskBeforeClosing]),
+            (AnswerUntitled(CloseAnswer::Cancel), vec![]),
+            (CloseAsked { unsaved: true }, vec![AskBeforeClosing]),
+            (AnswerUntitled(CloseAnswer::DontSave), vec![LetGo, Close]),
+        ],
+    );
+    check(
+        "asked while its first save runs",
+        &[
+            (SaveUntitled, vec![AskWhereToSave]),
+            (Chosen { first: true }, vec![StartSave]),
+            (CloseAsked { unsaved: true }, vec![AskBeforeClosing]),
+            (AnswerUntitled(CloseAnswer::Save), vec![]),
+            (saved(false), vec![Close]),
+        ],
+    );
+}
+
+#[test]
+fn closing_with_nothing_unsaved_while_a_save_runs_waits_for_it() {
+    check(
+        "a save",
+        &[
+            (Save, vec![StartSave]),
+            (CloseAsked { unsaved: false }, vec![]),
+            (saved(false), vec![Close]),
+        ],
+    );
+    check(
+        "a first save",
+        &[
+            (SaveUntitled, vec![AskWhereToSave]),
+            (Chosen { first: true }, vec![StartSave]),
+            (CloseAsked { unsaved: false }, vec![]),
+            (saved(false), vec![Close]),
+        ],
+    );
+    check(
+        "one that fails",
+        &[
+            (Chosen { first: true }, vec![StartSave]),
+            (CloseAsked { unsaved: false }, vec![]),
+            (failed(), vec![Say("The disk is full.".into())]),
+            (CloseAsked { unsaved: false }, vec![Close]),
+        ],
+    );
+}
+
+#[test]
+fn closing_while_a_place_is_chosen_asks_once() {
+    check(
+        "close and save, then save again",
+        &[
+            (CloseAsked { unsaved: true }, vec![AskBeforeClosing]),
+            (AnswerUntitled(CloseAnswer::Save), vec![AskWhereToSave]),
+            (SaveUntitled, vec![]),
+            (AnswerUntitled(CloseAnswer::Save), vec![]),
+            (Chosen { first: true }, vec![StartSave]),
+            (saved(false), vec![Close]),
+        ],
+    );
+}
+
+#[test]
+fn a_first_save_that_fails_starts_nothing_after_it() {
+    check(
+        "asked again while it ran",
+        &[
+            (SaveUntitled, vec![AskWhereToSave]),
+            (Chosen { first: true }, vec![StartSave]),
+            (SaveUntitled, vec![]),
+            // Still untitled: there's nowhere to save it but where a person chooses.
+            (failed(), vec![Say("The disk is full.".into())]),
+            (SaveUntitled, vec![AskWhereToSave]),
+        ],
+    );
+    check(
+        "while closing",
+        &[
+            (CloseAsked { unsaved: true }, vec![AskBeforeClosing]),
+            (AnswerUntitled(CloseAnswer::Save), vec![AskWhereToSave]),
+            (Chosen { first: true }, vec![StartSave]),
+            (failed(), vec![Say("The disk is full.".into())]),
+            (CloseAsked { unsaved: true }, vec![AskBeforeClosing]),
+        ],
+    );
+    check(
+        "worked, with edits made while it ran",
+        &[
+            (Chosen { first: true }, vec![StartSave]),
+            (SaveUntitled, vec![]),
+            (saved(true), vec![StartSave]),
+            (saved(false), vec![]),
         ],
     );
 }

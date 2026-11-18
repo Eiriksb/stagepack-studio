@@ -6,7 +6,6 @@
 //! [`settled`]: WorkingCopies::settled
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -14,6 +13,7 @@ use std::time::{Duration, Instant};
 use gpui_kit::*;
 use slides_components::BuildEntry;
 
+use crate::added_files::is_added_path;
 use crate::document::{Document, TalkPlace};
 use crate::recovery::{Found, Recovery, hash_text};
 
@@ -35,7 +35,9 @@ pub struct KeepFailed;
 /// The working copy last written for the talk, so the same one isn't written again.
 #[derive(PartialEq)]
 struct Kept {
-    place: PathBuf,
+    place: TalkPlace,
+    /// What the talk is called, which an untitled one's copy says.
+    name: String,
     text: String,
     on_disk: String,
     /// The files added to the talk that the text uses, by their path in it.
@@ -62,6 +64,8 @@ enum Job {
     Keep {
         recovery: Recovery,
         place: TalkPlace,
+        /// What the talk is called.
+        name: String,
         on_disk: String,
         text: String,
         /// The files added to the talk that the text uses and no save has written.
@@ -98,6 +102,7 @@ impl Job {
             Job::Keep {
                 recovery,
                 place,
+                name,
                 on_disk,
                 text,
                 files,
@@ -105,9 +110,13 @@ impl Job {
                 adopted,
             } => {
                 if clears.load(Ordering::SeqCst) == at {
-                    recovery
-                        .keep_with_builds(&place, &hash_text(&on_disk), &text, &files, &builds)
-                        .map_err(|_| ())?;
+                    let kept = match &place {
+                        TalkPlace::Untitled(id) => recovery.keep_untitled(*id, &name, &text, &files, &builds),
+                        TalkPlace::Folder(_) | TalkPlace::Packed(_) => {
+                            recovery.keep_with_builds(&place, &hash_text(&on_disk), &text, &files, &builds)
+                        }
+                    };
+                    kept.map_err(|_| ())?;
                 }
                 // Kept, or overtaken by a clear: either way it's no longer needed.
                 if let Some(adopted) = take_adopted(&adopted) {
@@ -122,6 +131,12 @@ impl Job {
                 recovery.clear(&place);
                 if let Some(adopted) = adopted.as_ref().and_then(take_adopted) {
                     recovery.discard(&adopted);
+                }
+                // A new presentation's id is its own: any other copy of it that no window holds
+                // is an older one, as a crash leaves while one is brought back, which would be
+                // offered again.
+                if let TalkPlace::Untitled(id) = place {
+                    recovery.discard_untitled(id);
                 }
             }
             Job::KeepFile {
@@ -213,12 +228,25 @@ impl WorkingCopies {
         .detach();
     }
 
+    /// Keeps working copies in `recovery` as [`Self::use_recovery`] does, for a talk made from
+    /// `found`, a copy from last time: it's this window's own from the start, so it's kept
+    /// again here straight away, and last time's goes only once it is. Nothing is offered.
+    pub fn use_recovery_bringing_back(&mut self, recovery: Recovery, found: Found, cx: &mut Context<Self>) {
+        self.recovery = Some(recovery.for_another_window());
+        self.brought_back(found, cx);
+    }
+
     fn offer(&mut self, found: Option<Found>, cx: &mut Context<Self>) {
         let (Some(found), Some(document), Some(recovery)) =
             (found, &self.document, self.recovery.clone())
         else {
             return;
         };
+        let adopted = self.adopted.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref().is_some_and(|adopted| adopted.is_same_copy(&found));
+        if adopted {
+            // Brought back already, and let go only once it's kept here.
+            return;
+        }
         let document = document.read(cx);
         let files = document.export_input().files;
         let has_them = found.files.iter().all(|(path, bytes)| files.read(path).is_some_and(|held| *held == **bytes));
@@ -362,13 +390,16 @@ impl WorkingCopies {
     }
 
     /// What brings the working copy in line with the talk: one while it has unsaved changes,
-    /// and none once it hasn't.
+    /// and none once it hasn't, nor any file kept as it was added.
     fn job(&mut self, cx: &App) -> Option<Job> {
         let recovery = self.recovery.clone()?;
         let document = self.document.as_ref()?.read(cx);
         let place = document.place().clone();
         if !document.has_unsaved_changes() {
-            self.kept.take()?;
+            // A file added and undone before any text was kept has a slot of its own to go too.
+            if self.kept.take().is_none() && self.files_kept.is_empty() {
+                return None;
+            }
             self.files_kept.clear();
             return Some(Job::Clear {
                 recovery,
@@ -376,10 +407,13 @@ impl WorkingCopies {
                 adopted: None,
             });
         }
-        let (TalkPlace::Folder(path) | TalkPlace::Packed(path)) = &place;
-        let files = document.added_files();
+        // What a save would write, an untitled talk's own files among them, but only those a
+        // working copy can hold.
+        let files: Vec<(String, Arc<[u8]>)> =
+            document.files_to_write().into_iter().filter(|(path, _)| is_added_path(path)).collect();
         let kept = Kept {
-            place: path.clone(),
+            place: place.clone(),
+            name: document.name(),
             text: document.source().to_string(),
             on_disk: document.stamp_on_disk().to_string(),
             files: files.iter().map(|(path, _)| path.clone()).collect(),
@@ -391,6 +425,7 @@ impl WorkingCopies {
         let job = Job::Keep {
             recovery,
             place,
+            name: kept.name.clone(),
             on_disk: kept.on_disk.clone(),
             text: kept.text.clone(),
             files,
@@ -405,6 +440,11 @@ impl WorkingCopies {
     /// copy and the one it brought back go. Anything edited since is kept again.
     pub fn saved(&mut self, place: TalkPlace, cx: &mut Context<Self>) {
         self.clear(place, cx);
+        // A file the save didn't write, as the text doesn't use it, is the talk's still, but it
+        // isn't kept until a text that uses it is: as a new presentation's own picture is.
+        if let Some(document) = &self.document {
+            self.files_seen = document.read(cx).files_added_stamp();
+        }
     }
 
     /// The talk's unsaved changes at `place` are let go, so this window's copy and the one it
@@ -432,9 +472,10 @@ impl WorkingCopies {
         );
     }
 
-    /// Whether this window's copy is there, as last written.
+    /// Whether this window's copy is there, as last written, or any file added to the talk was
+    /// kept in its slot as it was added: either way the slot has to go once nothing is unsaved.
     pub fn holds_a_copy(&self) -> bool {
-        self.kept.is_some()
+        self.kept.is_some() || !self.files_kept.is_empty()
     }
 
     /// Whether any change to the working copies has been asked for, which a window that

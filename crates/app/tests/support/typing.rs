@@ -18,7 +18,8 @@ use gpui_kit::{
 };
 use slides_engine::{ElementBox, Fonts, TextLayout};
 use slides_format::{Pos, Selection, TextFlow, text_flows};
-use stagepack_studio::document::Document;
+use stagepack_studio::document::{Document, UntitledId};
+use stagepack_studio::permissions::BuildPermissions;
 use stagepack_studio::recovery::Recovery;
 use stagepack_studio::slide_editor::{CARET_ID, SELECTION_OUTLINE_ID};
 use stagepack_studio::text_editing::EditingText;
@@ -45,6 +46,112 @@ pub fn open_with(cx: &mut TestAppContext, source: &str, recovery: Option<Recover
 pub fn open_folder(cx: &mut TestAppContext, folder: tempfile::TempDir, recovery: Option<Recovery>) -> Typing {
     let file = folder.path().join("slides.md");
     let talk = Document::open(folder.path(), Fonts::bundled_only()).unwrap();
+    open_document(cx, talk, folder, file, move |view, cx| {
+        if let Some(recovery) = recovery {
+            view.set_recovery_for_test(recovery, cx);
+        }
+    })
+}
+
+/// Where the window of an untitled talk keeps what a test looks at, all in a scratch folder:
+/// the folder standing in for Documents, the working copies, and the build permissions.
+pub struct UntitledPlaces {
+    pub documents: PathBuf,
+    pub recovery: PathBuf,
+    pub permissions: PathBuf,
+}
+
+impl UntitledPlaces {
+    pub fn under(root: &std::path::Path) -> UntitledPlaces {
+        let documents = root.join("Documents");
+        std::fs::create_dir_all(&documents).unwrap();
+        UntitledPlaces {
+            documents,
+            recovery: root.join("recovery"),
+            permissions: root.join("build-permissions.json"),
+        }
+    }
+}
+
+/// Opens a new, untitled talk made from the template `template` in a window, with everything
+/// it keeps in a scratch folder of its own: see [`open_untitled_under`].
+pub fn open_untitled(cx: &mut TestAppContext, template: &str) -> (Typing, UntitledPlaces) {
+    let root = tempfile::tempdir().unwrap();
+    let places = UntitledPlaces::under(root.path());
+    let typing = open_untitled_under(cx, template, 1, root.path());
+    let typing = Typing { _folder: root, ..typing };
+    (typing, places)
+}
+
+/// Opens a new, untitled talk made from the template `template`, numbered `number` among those
+/// open, in a window whose Documents folder, working copies and build permissions are those of
+/// [`UntitledPlaces::under`] `root`. Its saves are followed without watching for real.
+pub fn open_untitled_under(cx: &mut TestAppContext, template: &str, number: usize, root: &std::path::Path) -> Typing {
+    let template = stagepack_studio::templates::template(template).expect("a template");
+    let mut talk = Document::new_untitled(template, UntitledId::random(), Fonts::bundled_only()).unwrap();
+    talk.set_untitled_number(number);
+    open_untitled_talk(cx, talk, root)
+}
+
+/// Shows `talk`, an untitled one, in a window set up as [`open_untitled_under`] sets it up.
+pub fn open_untitled_talk(cx: &mut TestAppContext, talk: Document, root: &std::path::Path) -> Typing {
+    let places = UntitledPlaces::under(root);
+    let scratch = tempfile::tempdir().unwrap();
+    let file = scratch.path().join("no file yet");
+    open_document(cx, talk, scratch, file, move |view, cx| {
+        view.set_recovery_for_test(Recovery::new(places.recovery), cx);
+        view.set_permissions_for_test(BuildPermissions::load(places.permissions));
+        view.set_documents_folder_for_test(places.documents);
+        view.set_no_watching_for_test();
+    })
+}
+
+/// Shows the new presentation `id` brought back from `found`, its working copy from last
+/// time, numbered `number`, in a window set up as [`open_untitled_under`] sets it up, its
+/// working copies under `root` too.
+pub fn open_brought_back(
+    cx: &mut TestAppContext,
+    id: UntitledId,
+    found: stagepack_studio::recovery::Found,
+    number: usize,
+    root: &std::path::Path,
+) -> Typing {
+    let places = UntitledPlaces::under(root);
+    let scratch = tempfile::tempdir().unwrap();
+    let file = scratch.path().join("no file yet");
+    open_built(cx, scratch, file, move |window, cx| {
+        let recovery = Recovery::new(places.recovery);
+        let mut view = WorkspaceView::bring_back_untitled(id, found, number, Fonts::bundled_only(), recovery, window, cx)
+            .expect("it's brought back");
+        view.set_permissions_for_test(BuildPermissions::load(places.permissions));
+        view.set_documents_folder_for_test(places.documents);
+        view.set_no_watching_for_test();
+        view
+    })
+}
+
+/// Shows `talk` in a window, set up by `set_up` before anything is drawn.
+fn open_document(
+    cx: &mut TestAppContext,
+    talk: Document,
+    folder: tempfile::TempDir,
+    file: PathBuf,
+    set_up: impl FnOnce(&mut WorkspaceView, &mut gpui_kit::Context<WorkspaceView>) + 'static,
+) -> Typing {
+    open_built(cx, folder, file, move |window, cx| {
+        let mut view = WorkspaceView::open_with(talk, window, cx);
+        set_up(&mut view, cx);
+        view
+    })
+}
+
+/// Shows the window `build` makes.
+fn open_built(
+    cx: &mut TestAppContext,
+    folder: tempfile::TempDir,
+    file: PathBuf,
+    build: impl FnOnce(&mut Window, &mut gpui_kit::Context<WorkspaceView>) -> WorkspaceView + 'static,
+) -> Typing {
     let (handle, view) = cx.update(|cx: &mut App| {
         gpui_kit::init(cx);
         workspace_view::init(cx);
@@ -58,15 +165,7 @@ pub fn open_folder(cx: &mut TestAppContext, folder: tempfile::TempDir, recovery:
                 ..Default::default()
             },
             cx,
-            |window, cx| {
-                cx.new(|cx| {
-                    let mut view = WorkspaceView::open_with(talk, window, cx);
-                    if let Some(recovery) = recovery {
-                        view.set_recovery_for_test(recovery, cx);
-                    }
-                    view
-                })
-            },
+            |window, cx| cx.new(|cx| build(window, cx)),
         )
         .expect("open test window")
     });

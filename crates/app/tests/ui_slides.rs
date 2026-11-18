@@ -539,12 +539,7 @@ fn a_folder_that_cannot_be_opened_says_why(cx: &mut TestAppContext) {
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
         let problem = window.find(PROBLEM_ID);
-        assert!(
-            problem
-                .label()
-                .is_some_and(|label| label.contains("slides.md")),
-            "{problem:?}"
-        );
+        assert_eq!(problem.label(), Some("That folder has no presentation in it."), "{problem:?}");
     })
     .unwrap();
 }
@@ -944,12 +939,7 @@ fn opening_a_folder_gives_it_a_window_of_its_own(cx: &mut TestAppContext) {
     cx.update_window(opened, |_, window, cx| {
         window.render_frame(cx);
         let problem = window.find(PROBLEM_ID);
-        assert!(
-            problem
-                .label()
-                .is_some_and(|label| label.contains("slides.md")),
-            "{problem:?}"
-        );
+        assert_eq!(problem.label(), Some("That folder has no presentation in it."), "{problem:?}");
     })
     .unwrap();
 }
@@ -2086,6 +2076,7 @@ fn saved_goes_from_the_status_line_after_five_seconds_or_at_the_next_edit(
 #[gpui_kit::test]
 fn the_file_menu_names_both_ways_to_open_a_talk(cx: &mut TestAppContext) {
     let handle = open_talk(cx, "# One\n");
+    assert!(file_menu_has(cx, handle, "New presentation…"));
     assert!(file_menu_has(cx, handle, "Open talk folder…"));
     assert!(file_menu_has(cx, handle, "Open talk file…"));
     assert!(!file_menu_has(cx, handle, "Open folder…"));
