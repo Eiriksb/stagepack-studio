@@ -520,6 +520,14 @@ pub struct Readers {
     saving_now: Arc<AtomicBool>,
     /// How many files were refused as a save ran, for tests.
     refused: AtomicU64,
+    /// What a test runs each time a file has been opened, before it's held.
+    opened_hook: Mutex<Option<OpenedHook>>,
+}
+
+type OpenedHook = Box<dyn Fn() + Send + Sync>;
+
+fn lock_hook(hook: &Mutex<Option<OpenedHook>>) -> std::sync::MutexGuard<'_, Option<OpenedHook>> {
+    hook.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl Readers {
@@ -544,16 +552,29 @@ impl Readers {
             gate.opening += 1;
         }
         let opened = open();
+        if let Some(hook) = lock_hook(&self.opened_hook).as_ref() {
+            hook();
+        }
+        // Held, or refused, before it stops counting as being opened: a save beginning now finds
+        // it held and lets go of it, or waits for this, and never misses it.
         let mut gate = self.gate();
-        gate.opening -= 1;
-        self.changed.notify_all();
-        if gate.saving {
+        let held = if gate.saving {
             // The file is let go of at once, unread.
             self.refused.fetch_add(1, Ordering::SeqCst);
-            return Err(NotOpened::Saving);
-        }
+            Err(NotOpened::Saving)
+        } else {
+            opened.map(|reader| self.hold(reader))
+        };
+        gate.opening -= 1;
         drop(gate);
-        opened.map(|reader| self.hold(reader))
+        self.changed.notify_all();
+        held
+    }
+
+    /// Has `hook` run each time a file has been opened, before it's held, for tests.
+    #[doc(hidden)]
+    pub fn when_opened_for_test(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *lock_hook(&self.opened_hook) = Some(Box::new(hook));
     }
 
     /// Runs `work`, which reads the talk's files, once no save replacing the pack is running, and
@@ -617,11 +638,24 @@ impl Readers {
     /// Waits until nothing is being opened: what was being opened as the save began is let go of
     /// as soon as it is. For the save's own work, before it replaces the pack, never for the
     /// window's thread.
-    pub(crate) fn wait_for_opens(&self) {
+    /// Stops waiting if `stop`, the save's own Cancel, is set.
+    pub(crate) fn wait_for_opens(&self, stop: &AtomicBool) {
         let mut gate = self.gate();
-        while gate.opening > 0 {
-            gate = self.changed.wait(gate).unwrap_or_else(|poisoned| poisoned.into_inner());
+        while gate.opening > 0 && !stop.load(Ordering::SeqCst) {
+            gate = self.changed.wait_timeout(gate, std::time::Duration::from_millis(50)).unwrap_or_else(|poisoned| poisoned.into_inner()).0;
         }
+    }
+
+    /// [`Self::begin_saving`], for tests.
+    #[doc(hidden)]
+    pub fn begin_saving_for_test(&self) -> usize {
+        self.begin_saving()
+    }
+
+    /// [`Self::wait_for_opens`], never stopped, for tests.
+    #[doc(hidden)]
+    pub fn wait_for_opens_for_test(&self) {
+        self.wait_for_opens(&AtomicBool::new(false));
     }
 
     /// How many files are being opened now, for tests.

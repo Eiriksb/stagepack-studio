@@ -972,6 +972,7 @@ fn a_turned_full_size_video_costs_the_window_little(cx: &mut TestAppContext) {
 
 #[test]
 fn a_save_letting_go_while_a_video_is_read_waits_for_it_rather_than_failing() {
+    let _alone = alone();
     use stagepack_studio::video_player::{Making, Unopened, make_still_from, play_from};
     let work = tempfile::tempdir().unwrap();
     let (mut document, _) = packed(&talk(), &clip(30, 10), work.path());
@@ -1038,6 +1039,7 @@ fn a_save_that_fails_or_is_cancelled_leaves_the_video_playing(cx: &mut TestAppCo
 
 #[test]
 fn a_save_beginning_while_a_video_is_unpacked_does_not_wait_for_it() {
+    let _alone = alone();
     use std::io::Write as _;
     let work = tempfile::tempdir().unwrap();
     // A pack from another program, its video compressed, large enough to take a while to unpack.
@@ -1086,6 +1088,7 @@ fn a_save_beginning_while_a_video_is_unpacked_does_not_wait_for_it() {
 
 #[test]
 fn an_export_waits_for_a_save_replacing_the_pack() {
+    let _alone = alone();
     let work = tempfile::tempdir().unwrap();
     let (document, _) = packed(&talk(), &clip(3, 10), work.path());
     let readers = document.readers();
@@ -1126,4 +1129,89 @@ fn a_turned_video_opened_again_after_a_save_goes_on_playing(cx: &mut TestAppCont
         seen.dedup();
         seen.len() >= 4
     });
+}
+
+// What the third review found.
+
+#[test]
+fn a_save_beginning_as_a_file_is_opened_never_misses_it() {
+    let _alone = alone();
+    let work = tempfile::tempdir().unwrap();
+    let (mut document, _) = packed(&talk(), &clip(3, 10), work.path());
+    let readers = document.readers();
+    let waited = std::sync::Arc::new(std::sync::Mutex::new(None));
+    {
+        // The file is open, and not yet held, as the save begins.
+        let (readers, waited) = (readers.clone(), waited.clone());
+        let hooked = readers.clone();
+        hooked.when_opened_for_test(move || {
+            if waited.lock().unwrap().is_some() {
+                return;
+            }
+            assert_eq!(readers.begin_saving_for_test(), 0, "nothing is held yet");
+            // The save's own work waits for it.
+            let waiting = readers.clone();
+            let saving = std::thread::spawn(move || {
+                waiting.wait_for_opens_for_test();
+                Instant::now()
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(!saving.is_finished(), "the save waits for what's being opened");
+            *waited.lock().unwrap() = Some((saving, Instant::now()));
+        });
+    }
+    let open = document.open_large("assets/clip.mp4").unwrap();
+    assert_eq!(open.open_unless_saving().err(), Some(stagepack_studio::large_files::NotOpened::Saving), "refused, never held");
+    let (saving, hook_done) = waited.lock().unwrap().take().unwrap();
+    assert!(saving.join().unwrap() >= hook_done, "the save went on only once it was refused");
+    assert_eq!(document.readers_held(), 0, "nothing holds the file");
+    document.pack_save_ended();
+}
+
+#[test]
+fn a_save_waiting_on_an_export_can_be_cancelled() {
+    let _alone = alone();
+    let work = tempfile::tempdir().unwrap();
+    let (document, _) = packed(&talk(), &clip(3, 10), work.path());
+    let readers = document.readers();
+    // An export reading the talk, which doesn't end.
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let exporting = {
+        let readers = readers.clone();
+        std::thread::spawn(move || readers.while_reading(|| released.recv().ok()))
+    };
+    while document.opens_for_test().0 == 0 {
+        std::thread::yield_now();
+    }
+    document.begin_saving_the_pack();
+    let job = document.save_job().waiting_for_opens(readers.clone());
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saving = {
+        let stop = stop.clone();
+        std::thread::spawn(move || job.run_with(&|_, _| {}, &stop))
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    let cancelled = Instant::now();
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let saved = saving.join().unwrap();
+    assert!(cancelled.elapsed() < Duration::from_millis(500), "{:?}", cancelled.elapsed());
+    assert!(saved.is_err(), "cancelled, nothing written");
+    release.send(()).unwrap();
+    exporting.join().unwrap();
+}
+
+#[test]
+fn a_video_coded_taller_than_it_is_shown_lays_out_at_its_shown_size_from_the_start() {
+    let _alone = alone();
+    let video = clip(3, 10);
+    // Its pictures said to be coded 48 rows tall, shown 36 tall, as 1088 for 1080.
+    let mut coded = video.clone();
+    let at = coded.windows(4).position(|kind| kind == b"avc1").unwrap() - 4;
+    coded[at + 34..at + 36].copy_from_slice(&48u16.to_be_bytes());
+    let source = format!("# Video\n\n{}\n", VIDEO.replace(" w=\"640\" h=\"360\"", ""));
+    let folder = talk_folder(&source, &coded);
+    let mut document = Document::open(folder.path(), Fonts::bundled_only()).unwrap();
+    document.notices();
+    let video = document.videos_here().pop().unwrap();
+    assert_eq!((video.on.rect.w, video.on.rect.h), (WIDTH as f32, HEIGHT as f32));
 }

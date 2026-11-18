@@ -233,7 +233,14 @@ impl SaveJob {
             waits_for,
         } = self;
         if let Some(readers) = waits_for {
-            readers.wait_for_opens();
+            readers.wait_for_opens(stop);
+            // Cancelled while it waited: nothing is written.
+            if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let place = to.as_ref().map_or_else(|| from.directory(), |to| match to {
+                    SaveTarget::Folder(at) | SaveTarget::Packed(at) => at.clone(),
+                });
+                return Err(SaveError::Failed(failed(&place, PackError::Stopped)));
+            }
         }
         let mut builds_written = Vec::new();
         let mut reopened = None;

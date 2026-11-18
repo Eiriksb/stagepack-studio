@@ -28,7 +28,7 @@ use crate::cargo_file::{self, write_cargo_file};
 use crate::clipboard::ClipboardOp;
 use crate::clipboard_tools::ClipboardTools;
 use crate::document::{Document, EditRefused, OpenProblem, Reload, SLIDES_FILE, TalkPlace, UNREADABLE_FILE, UntitledId};
-use crate::export::{self, ExportKind, run_export, stagepack_executable};
+use crate::export::{self, ExportKind, stagepack_executable};
 use crate::icon_picker::{self, IconPicked, IconPicker};
 use crate::palette::InsertComponent;
 use crate::insert_tools::{InsertPicture, InsertShape, InsertTextBox};
@@ -1437,7 +1437,7 @@ impl WorkspaceView {
                 let (input, readers) = (document.export_input(), document.readers());
                 // After a save replacing the pack that's running, and keeping one from replacing
                 // it until it's done.
-                move |out: &Path| readers.while_reading(|| run_export(input, kind, out))
+                move |out: &Path| export::run_export_reading_with(input, kind, out, |make| readers.while_reading(make))
             },
             cx,
         );

@@ -43,10 +43,25 @@ impl ExportKind {
 /// Writes the talk to `out`, replacing whatever is there only once it has all been made, and
 /// returns what the user should hear about the slides. This blocks until it's done.
 pub fn run_export(input: ExportInput, kind: ExportKind, out: &Path) -> Result<Vec<String>, String> {
+    run_export_reading_with(input, kind, out, |make| make())
+}
+
+/// [`run_export`], reading the talk inside `reading`, as the talk's readers keep a save from
+/// replacing its files while they're read: the output is written after.
+pub fn run_export_reading_with(
+    input: ExportInput,
+    kind: ExportKind,
+    out: &Path,
+    reading: impl FnOnce(&mut dyn FnMut() -> Result<(Vec<u8>, Vec<String>), String>) -> Result<(Vec<u8>, Vec<String>), String>,
+) -> Result<Vec<String>, String> {
+    let mut input = Some(input);
     // Nothing in a talk should get this far, but the window is waiting to hear how it went.
-    let (bytes, notices) = catch_unwind(AssertUnwindSafe(|| make(input, kind)))
-        .unwrap_or_else(|_| Err("the exporter stopped on something in this talk".to_string()))
-        .map_err(|problem| format!("Could not export {}: {problem}", out.display()))?;
+    let mut make_it = || match input.take() {
+        Some(input) => catch_unwind(AssertUnwindSafe(|| make(input, kind)))
+            .unwrap_or_else(|_| Err("the exporter stopped on something in this talk".to_string())),
+        None => Err("the exporter stopped on something in this talk".to_string()),
+    };
+    let (bytes, notices) = reading(&mut make_it).map_err(|problem| format!("Could not export {}: {problem}", out.display()))?;
     write_atomically(out, |file| file.write_all(&bytes))
         .map_err(|error| format!("Could not write {}: {error}", out.display()))?;
     Ok(notices)
