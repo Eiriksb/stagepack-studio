@@ -159,8 +159,14 @@ impl Document {
         if let Some((place, files)) = saved.moved_to {
             self.place_name = place.name();
             self.place = place;
-            // Read from where they were written from now on.
-            self.untitled_files = Vec::new();
+            // Those written are read from where they were written from now on. One the text
+            // didn't use at this save wasn't written, and is kept as a file added, as Undo may
+            // bring back the text that uses it, and the save after that writes it.
+            for (path, bytes) in std::mem::take(&mut self.untitled_files) {
+                if !saved.files_written.contains(&path) && self.added.add(&path, bytes) {
+                    self.pending.insert(path);
+                }
+            }
             self.own_files = files.clone();
             self.files = Arc::new(WithAdded::new(files, self.added.clone()));
             self.deck.set_files(Box::new(self.files.clone()));

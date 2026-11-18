@@ -261,6 +261,51 @@ fn undo_after_the_first_save_is_unsaved_and_saves_where_it_is() {
         assert!(!document.has_unsaved_changes());
         assert_eq!(reopen(&at).source(), template("tour").unwrap().slides, "packed {packed}");
     }
+
+    // A picture of the template's that the text didn't use at the first save, so it wasn't
+    // written, comes back with Undo and is written by the next save: in a folder, a pack, and
+    // a pack that couldn't be read back after it was written.
+    for (packed, read_back) in [(false, true), (true, true), (true, false)] {
+        let what = format!("packed {packed}, read back {read_back}");
+        let drawn = drawing(&mut new_talk(template("tour").unwrap()));
+        let mut document = tour_without_its_picture();
+        let dir = tempfile::tempdir().unwrap();
+        let target = target(dir.path(), packed);
+        let at = path_of(&target);
+        let job = document.save_as_job(target);
+        let saved = if read_back { job.run() } else { job.run_reading_back_with(|_| Err("it can't be read just now".to_string())) };
+        document.saved(saved.unwrap());
+        assert!(saved_file(&at, "assets/photo.png").is_none(), "{what}: the text didn't use it, so it wasn't written");
+
+        // Undone, the picture is back, and draws as the template's does.
+        document.undo().unwrap();
+        assert_eq!(document.source(), template("tour").unwrap().slides, "{what}");
+        assert!(document.has_file("assets/photo.png"), "{what}");
+        assert!(document.has_unsaved_changes(), "{what}");
+        assert!(drawing(&mut document) == drawn, "{what}: the slides draw as the template's");
+
+        // The next save writes it, and it opens again the same.
+        let saved = document.save_job().run().unwrap();
+        document.saved(saved);
+        assert!(!document.has_unsaved_changes(), "{what}");
+        assert!(drawing(&mut document) == drawn, "{what}: read from where it's saved");
+        let mut reopened = reopen(&at);
+        assert_eq!(reopened.source(), template("tour").unwrap().slides, "{what}");
+        assert!(reopened.has_file("assets/photo.png"), "{what}");
+        assert_eq!(saved_file(&at, "assets/photo.png").as_deref(), Some(template("tour").unwrap().files[0].1), "{what}");
+        assert!(drawing(&mut reopened) == drawn, "{what}: the slides draw alike, opened again");
+    }
+}
+
+/// The Tour with its picture taken away in one step, before its first save.
+fn tour_without_its_picture() -> Document {
+    let mut document = new_talk(template("tour").unwrap());
+    let at = document.source().find("<Picture src=\"assets/photo.png\"").unwrap();
+    let end = at + document.source()[at..].find("/>").unwrap() + 2;
+    assert!((0..document.slide_count()).any(|slide| document.select(slide, at..end)), "the picture's slide");
+    document.delete_selected().unwrap();
+    assert!(!document.source().contains("assets/photo.png"));
+    document
 }
 
 #[test]
