@@ -140,7 +140,8 @@ fn dropping_it_ends_the_thread_quickly() {
     std::thread::sleep(Duration::from_millis(50));
     let dropped = Instant::now();
     drop(playing);
-    assert!(wait_for(Duration::from_millis(200), || alive.upgrade().is_none()), "the thread is still running");
+    // Dropping waits for the thread to let go of the file.
+    assert!(alive.upgrade().is_none(), "the thread is still running");
     #[cfg(target_os = "linux")]
     assert!(wait_for(Duration::from_millis(200), || !thread_is_running(&name)), "the thread is still running");
     assert!(dropped.elapsed() < Duration::from_millis(200), "{:?}", dropped.elapsed());
@@ -240,6 +241,10 @@ fn colours_follow_the_files_matrix() {
         assert!(is_colour(&frame, colour, 8), "{kind:?}: {:?}", middle(&frame));
         assert_eq!(frame.at, 0.0);
     }
+    // Stored as green, blue and red, with no matrix.
+    let identity = make_test_video_in(MadeColours::Identity, 64, 48, 2, 30, |_| solid(64, 48, colour));
+    let frame = open(reader(identity)).unwrap().first_frame().unwrap();
+    assert!(is_colour(&frame, colour, 8), "identity: {:?}", middle(&frame));
     // The same pictures said to be in the other matrix come out visibly different, so the
     // check above can tell.
     let video = make_test_video_in(MadeColours::Bt709, 64, 48, 2, 30, |_| solid(64, 48, colour));
@@ -249,8 +254,153 @@ fn colours_follow_the_files_matrix() {
         find(&mut boxes, "moov/trak/mdia/minf/stbl/stsd/avc1/avcC").data.clone()
     };
     let relabelled = edit(&video, |boxes| find(boxes, "moov/trak/mdia/minf/stbl/stsd/avc1/avcC").data = unsaid_sps);
-    let frame = open(reader(relabelled)).unwrap().first_frame().unwrap();
+    let frame = open(reader(relabelled.clone())).unwrap().first_frame().unwrap();
     assert!(!is_colour(&frame, colour, 8), "{:?}", middle(&frame));
+    // The sample entry's own words on colours count over the stream's.
+    let said = edit(&relabelled, |boxes| {
+        let avc1 = find(boxes, "moov/trak/mdia/minf/stbl/stsd/avc1");
+        let mut nclx = b"nclx".to_vec();
+        nclx.extend_from_slice(&[0, 1, 0, 1, 0, 1, 0]);
+        avc1.inside.push(Mp4Box { kind: *b"colr", head: Vec::new(), data: nclx, inside: Vec::new() });
+    });
+    let frame = open(reader(said)).unwrap().first_frame().unwrap();
+    assert!(is_colour(&frame, colour, 8), "said in the entry: {:?}", middle(&frame));
+}
+
+#[test]
+fn looped_with_reordering_goes_round() {
+    let made = coloured_video(64, 48, 30, 30);
+    let reordered = edit(&made, |boxes| {
+        let stbl = find(boxes, "moov/trak/mdia/minf/stbl");
+        let mut fields = vec![30];
+        for i in 0..30 {
+            fields.extend([1, if i % 3 == 0 { 3000 } else { 0 }]);
+        }
+        let ctts = Mp4Box { kind: *b"ctts", head: Vec::new(), data: table(0, &fields), inside: Vec::new() };
+        stbl.inside.insert(2, ctts);
+    });
+    let mut playing = open(reader(reordered)).unwrap().play(0.0, true);
+    for i in 0..75 {
+        let frame = next_frame(&mut playing, due(i, 30)).unwrap_or_else(|| panic!("no frame {i}"));
+        assert!((frame.at - (i % 30) as f64 / 30.0).abs() < 0.0005, "frame {i} at {}", frame.at);
+    }
+}
+
+/// Counts the bytes read through it.
+struct Counted {
+    inner: std::io::Cursor<Vec<u8>>,
+    read: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl std::io::Read for Counted {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.read.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+impl std::io::Seek for Counted {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(to)
+    }
+}
+
+#[test]
+fn pictures_that_never_decode_stop_the_reading() {
+    // 96 pictures of a megabyte each, each its own bytes, none of them a picture.
+    let made = coloured_video(64, 48, 96, 30);
+    let noise = with_samples(&made, |i, _| picture_of(&[[0x65, 0x88, (i as u8) | 0x80, 0x10].repeat(1 << 18)]));
+    let read = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counted = Counted { inner: std::io::Cursor::new(noise.clone()), read: read.clone() };
+    let mut video = open(Box::new(counted)).unwrap();
+    let started = Instant::now();
+    assert_eq!(video.first_frame().err(), Some(CantPlay::Damaged));
+    let first = read.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(first <= 65 << 20, "read {first} bytes for no picture");
+    let mut playing = video.play(0.0, true);
+    assert!(wait_for(Duration::from_secs(10), || playing.failed().is_some()));
+    assert_eq!(playing.failed(), Some(CantPlay::Damaged));
+    assert!(read.load(std::sync::atomic::Ordering::Relaxed) - first <= 65 << 20);
+    println!("gave up after {:?}", started.elapsed());
+    playing.frame_for(1.0);
+}
+
+#[test]
+fn a_hidden_start_code_damages_only_its_picture() {
+    // Picture 29 is the last before a picture of its own at one second, so nothing after needs it.
+    let made = coloured_video(64, 48, 60, 30);
+    let smuggled = with_samples(&made, |i, sample| {
+        if i != 29 {
+            return sample;
+        }
+        let mut units = units(&sample);
+        let slice = units.iter_mut().find(|u| u[0] & 0x1F == 1).expect("a slice");
+        assert!(slice.len() > 6, "the slice is {} bytes", slice.len());
+        // What would read as a new unit, a sequence parameter set, inside the slice.
+        slice.splice(3..3, [0, 0, 1, 0x67]);
+        picture_of(&units)
+    });
+    let mut playing = open(reader(smuggled)).unwrap().play(0.0, false);
+    for i in 0..29 {
+        let frame = next_frame(&mut playing, due(i, 30)).unwrap();
+        assert!(is_colour(&frame, colour_of(i), 8), "frame {i}");
+    }
+    // The damaged picture is passed over, and the next keeps its own time.
+    let frame = next_frame(&mut playing, due(30, 30)).unwrap();
+    assert!(is_colour(&frame, colour_of(30), 8), "{:?}", middle(&frame));
+    assert!((frame.at - 1.0).abs() < 0.0005, "{}", frame.at);
+    for i in 31..60 {
+        let frame = next_frame(&mut playing, due(i, 30)).unwrap();
+        assert!((frame.at - i as f64 / 30.0).abs() < 0.0005, "frame {i} at {}", frame.at);
+    }
+}
+
+#[test]
+fn every_parameter_set_reaches_the_decoder() {
+    let made = coloured_video(64, 48, 10, 30);
+    let avcc = find(&mut parse(&made), "moov/trak/mdia/minf/stbl/stsd/avc1/avcC").data.clone();
+    let sps_len = u16::from_be_bytes([avcc[6], avcc[7]]) as usize;
+    let real_sps = avcc[8..8 + sps_len].to_vec();
+    let pps_at = 8 + sps_len + 1;
+    let pps_len = u16::from_be_bytes([avcc[pps_at], avcc[pps_at + 1]]) as usize;
+    let real_pps = avcc[pps_at + 2..pps_at + 2 + pps_len].to_vec();
+
+    // Another picture parameter set first: the pictures name the second.
+    let other = pps_with_id(&real_pps, 1);
+    let two_pps = edit(&made, |boxes| {
+        let avcc = &mut find(boxes, "moov/trak/mdia/minf/stbl/stsd/avc1/avcC").data;
+        let mut data = avcc[..pps_at - 1].to_vec();
+        data.push(2);
+        for pps in [&other, &real_pps] {
+            data.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+            data.extend_from_slice(pps);
+        }
+        *avcc = data;
+    });
+    let frame = open(reader(two_pps)).unwrap().first_frame().unwrap();
+    assert!(is_colour(&frame, colour_of(0), 8), "{:?}", middle(&frame));
+
+    // A sequence parameter set in the first picture counts over the index's.
+    let wrong = with_sps(&made, &Sps::sized(64, 48).nal());
+    let in_picture = with_samples(&wrong, |i, sample| {
+        if i == 0 { [picture_of(&[real_sps.clone(), real_pps.clone()]), sample].concat() } else { sample }
+    });
+    let frame = open(reader(in_picture)).unwrap().first_frame().unwrap();
+    assert!(is_colour(&frame, colour_of(0), 8), "{:?}", middle(&frame));
+    // Without it the index's wrong one is used, so the check above can tell.
+    let frame = open(reader(wrong)).unwrap().first_frame();
+    assert!(frame.is_err() || !is_colour(frame.as_ref().unwrap(), colour_of(0), 8));
+
+    // One that wouldn't be played damages its picture.
+    let large = with_samples(&made, |i, sample| {
+        if i == 0 { [picture_of(&[Sps::sized(7680, 4320).nal()]), sample].concat() } else { sample }
+    });
+    let mut video = open(reader(large)).unwrap();
+    assert_eq!(video.info().width, 64);
+    if let Ok(frame) = video.first_frame() {
+        assert_eq!((frame.width, frame.height), (64, 48));
+    }
 }
 
 /// The time a frame takes to decode at 1920 by 1080. Run with `--release -- --ignored`.

@@ -9,6 +9,10 @@ license.workspace = true
 make = ["dep:bytes"]
 
 [dependencies]
+# Builds Cisco's decoder from source. Where `nasm` is installed it also builds the decoder's
+# assembly, which is faster; where it isn't, as on the machine this was written on, it falls
+# back to the same decoder in C alone. `OPENH264_NO_ASM` set while building makes every machine
+# build the C alone.
 openh264 = { workspace = true }
 mp4 = { workspace = true }
 yuvutils-rs = { workspace = true }

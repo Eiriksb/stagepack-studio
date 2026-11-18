@@ -10,28 +10,39 @@ use slides_video::*;
 use support::*;
 
 /// Counts the largest single allocation any test here makes, so a test can tell whether a size
-/// claimed by a file was ever allocated.
+/// claimed by a file was ever allocated, and the most in use at once. Only what Rust allocates is
+/// seen: the decoder's own allocations, made in C, aren't.
 struct Counting;
 
 static LARGEST: AtomicUsize = AtomicUsize::new(0);
+static IN_USE: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+fn allocated(size: usize) {
+    LARGEST.fetch_max(size, Ordering::Relaxed);
+    let now = IN_USE.fetch_add(size, Ordering::Relaxed) + size;
+    PEAK.fetch_max(now, Ordering::Relaxed);
+}
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        LARGEST.fetch_max(layout.size(), Ordering::Relaxed);
+        allocated(layout.size());
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        LARGEST.fetch_max(layout.size(), Ordering::Relaxed);
+        allocated(layout.size());
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        LARGEST.fetch_max(new_size, Ordering::Relaxed);
+        IN_USE.fetch_sub(layout.size(), Ordering::Relaxed);
+        allocated(new_size);
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        IN_USE.fetch_sub(layout.size(), Ordering::Relaxed);
         unsafe { System.dealloc(ptr, layout) }
     }
 }
@@ -40,6 +51,9 @@ unsafe impl GlobalAlloc for Counting {
 static COUNTING: Counting = Counting;
 
 const MOST_ALLOCATED: usize = 64 * 1024 * 1024;
+/// The most in use at once while a case runs. The other tests here run beside it and count too,
+/// so this is the whole test program's peak, a little more than one case's.
+const MOST_IN_USE: usize = 192 * 1024 * 1024;
 const MOST_TIME: Duration = Duration::from_secs(2);
 
 /// A small made video for damaging: 12 frames of 48 by 32.
@@ -48,22 +62,39 @@ fn small() -> &'static [u8] {
     SMALL.get_or_init(|| coloured_video(48, 32, 12, 30))
 }
 
+/// The same, with its index at the start, so damage can reach the pictures with the index whole.
+fn small_index_first() -> &'static [u8] {
+    static SMALL: OnceLock<Vec<u8>> = OnceLock::new();
+    SMALL.get_or_init(|| index_first(small()))
+}
+
 /// A made video of one frame, about a kilobyte.
 fn tiny() -> &'static [u8] {
     static TINY: OnceLock<Vec<u8>> = OnceLock::new();
     TINY.get_or_init(|| coloured_video(16, 16, 1, 30))
 }
 
+fn check_memory() {
+    assert!(LARGEST.load(Ordering::Relaxed) <= MOST_ALLOCATED, "allocated {} at once", LARGEST.load(Ordering::Relaxed));
+    assert!(PEAK.load(Ordering::Relaxed) <= MOST_IN_USE, "{} in use at once", PEAK.load(Ordering::Relaxed));
+}
+
 /// Opens `bytes`, takes its first frame and plays it through, each within two seconds, and
 /// allocating no more than 64 MB at once. What `open` said.
 fn open_and_play(bytes: Vec<u8>) -> Result<VideoInfo, CantPlay> {
+    open_and_play_looped(bytes, false)
+}
+
+/// The same, playing round twice if `looped`.
+fn open_and_play_looped(bytes: Vec<u8>, looped: bool) -> Result<VideoInfo, CantPlay> {
+    PEAK.store(IN_USE.load(Ordering::Relaxed), Ordering::Relaxed);
     let started = Instant::now();
     let opened = open(reader(bytes));
     assert!(started.elapsed() < MOST_TIME, "opening took {:?}", started.elapsed());
     let mut video = match opened {
         Ok(video) => video,
         Err(why) => {
-            assert!(LARGEST.load(Ordering::Relaxed) <= MOST_ALLOCATED);
+            check_memory();
             return Err(why);
         }
     };
@@ -72,17 +103,22 @@ fn open_and_play(bytes: Vec<u8>) -> Result<VideoInfo, CantPlay> {
     let _ = video.first_frame();
     assert!(started.elapsed() < MOST_TIME, "the first frame took {:?}", started.elapsed());
     let started = Instant::now();
-    let mut playing = video.play(0.0, false);
+    let mut playing = video.play(0.0, looped);
     let mut last = f64::NEG_INFINITY;
-    while !playing.ended() && playing.failed().is_none() {
+    let mut frames = 0;
+    while !playing.ended() && playing.failed().is_none() && frames < 2 * info.frames {
         if let Some(frame) = playing.frame_for(f64::INFINITY) {
-            assert!(frame.at >= last, "times went back: {} after {last}", frame.at);
+            if !looped {
+                assert!(frame.at >= last, "times went back: {} after {last}", frame.at);
+            }
             last = frame.at;
+            frames += 1;
         }
         assert!(started.elapsed() < MOST_TIME, "playing took {:?}", started.elapsed());
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert!(LARGEST.load(Ordering::Relaxed) <= MOST_ALLOCATED, "allocated {}", LARGEST.load(Ordering::Relaxed));
+    drop(playing);
+    check_memory();
     Ok(info)
 }
 
@@ -102,6 +138,7 @@ fn a_made_video_says_what_it_is() {
 
 #[derive(Debug, Clone)]
 enum Damage {
+    /// Anything at all after the file's type, which every made video starts with.
     Random(Vec<u8>),
     Byte(usize, u8),
     Zeroed(usize, usize),
@@ -117,10 +154,13 @@ fn damage() -> impl Strategy<Value = Damage> {
     ]
 }
 
-fn damaged(damage: &Damage) -> Vec<u8> {
-    let mut video = small().to_vec();
+fn damaged(damage: &Damage, index_first: bool) -> Vec<u8> {
+    let mut video = if index_first { small_index_first() } else { small() }.to_vec();
     match damage {
-        Damage::Random(bytes) => return bytes.clone(),
+        Damage::Random(bytes) => {
+            let ftyp = write(&parse(small())[..1]);
+            return [ftyp, bytes.clone()].concat();
+        }
         Damage::Byte(at, value) => {
             let at = at % video.len();
             video[at] = *value;
@@ -137,8 +177,8 @@ fn damaged(damage: &Damage) -> Vec<u8> {
 
 proptest! {
     #[test]
-    fn any_bytes_open_or_say_why(damage in damage()) {
-        let _ = open_and_play(damaged(&damage));
+    fn any_bytes_open_or_say_why(damage in damage(), index_first in any::<bool>(), looped in any::<bool>()) {
+        let _ = open_and_play_looped(damaged(&damage, index_first), looped);
     }
 }
 
@@ -229,7 +269,7 @@ fn any_bytes_open_or_say_why_named_cases() {
     // Timestamps going backwards, and overflowing.
     let backwards = edit(made, |boxes| {
         let stbl = find(boxes, "moov/trak/mdia/minf/stbl");
-        let offsets: Vec<u32> = (0..12u32).flat_map(|i| [1, if i % 2 == 0 { 5000 } else { (-7000i32) as u32 }]).collect();
+        let offsets: Vec<u32> = (0..12u32).flat_map(|i| [1, if i % 2 == 0 { 1500 } else { (-500i32) as u32 }]).collect();
         let mut fields = vec![12];
         fields.extend(offsets);
         let ctts = Mp4Box { kind: *b"ctts", head: Vec::new(), data: table(1, &fields), inside: Vec::new() };
@@ -280,6 +320,89 @@ fn any_bytes_open_or_say_why_named_cases() {
         boxes.push(Mp4Box { kind: *b"moof", head: Vec::new(), data: vec![0; 8], inside: Vec::new() });
     });
     assert_eq!(open_and_play(fragmented), Err(CantPlay::KindNotPlayed));
+
+    // Pictures that share their bytes: every one at the same place, so decoding would read the
+    // same bytes for ever.
+    let shared = edit(made, |boxes| {
+        let stbl = find(boxes, "moov/trak/mdia/minf/stbl");
+        let first = u32_at(&find(&mut stbl.inside, "stco").data, 8);
+        find(&mut stbl.inside, "stsc").data = table(0, &[1, 1, 1, 1]);
+        let mut chunks = vec![12];
+        chunks.extend([first; 12]);
+        find(&mut stbl.inside, "stco").data = table(0, &chunks);
+    });
+    assert_eq!(open_and_play(shared), Err(CantPlay::Damaged));
+    // As many as can be claimed in a small index, each as large as the file allows, all at once.
+    let piled = edit(made, |boxes| {
+        let len = made.len() as u32;
+        let stbl = find(boxes, "moov/trak/mdia/minf/stbl");
+        let count = 100_000;
+        find(&mut stbl.inside, "stsz").data = table(0, &[len - 100, count]);
+        find(&mut stbl.inside, "stsc").data = table(0, &[1, 1, 1, 1]);
+        let mut chunks = vec![count];
+        chunks.extend(std::iter::repeat_n(50, count as usize));
+        find(&mut stbl.inside, "stco").data = table(0, &chunks);
+        find(&mut stbl.inside, "stts").data = table(0, &[1, count, 1000]);
+    });
+    assert_eq!(open_and_play(piled), Err(CantPlay::Damaged));
+    // Overlapping by one byte.
+    let places = samples_of(made);
+    let overlapping = edit(made, |boxes| {
+        let stbl = find(boxes, "moov/trak/mdia/minf/stbl");
+        find(&mut stbl.inside, "stsc").data = table(0, &[1, 1, 1, 1]);
+        let mut chunks = vec![12];
+        chunks.extend(places.iter().map(|(at, _)| *at as u32));
+        find(&mut stbl.inside, "stco").data = table(0, &chunks);
+        let sizes = &mut find(&mut stbl.inside, "stsz").data;
+        let first = u32_at(sizes, 12);
+        set_u32(sizes, 12, first + 1);
+    });
+    let apart = edit(made, |boxes| {
+        let stbl = find(boxes, "moov/trak/mdia/minf/stbl");
+        find(&mut stbl.inside, "stsc").data = table(0, &[1, 1, 1, 1]);
+        let mut chunks = vec![12];
+        chunks.extend(places.iter().map(|(at, _)| *at as u32));
+        find(&mut stbl.inside, "stco").data = table(0, &chunks);
+    });
+    assert_eq!(open_and_play(apart), Ok(made_info));
+    assert_eq!(open_and_play(overlapping), Err(CantPlay::Damaged));
+
+    // A picture shown long after the video ends.
+    let late = edit(made, |boxes| {
+        let stbl = find(boxes, "moov/trak/mdia/minf/stbl");
+        let ctts = Mp4Box { kind: *b"ctts", head: Vec::new(), data: table(1, &[2, 11, 0, 1, 50_000_000]), inside: Vec::new() };
+        stbl.inside.insert(2, ctts);
+    });
+    assert_eq!(open_and_play(late), Err(CantPlay::Damaged));
+    let early = edit(made, |boxes| {
+        let stbl = find(boxes, "moov/trak/mdia/minf/stbl");
+        let ctts = Mp4Box { kind: *b"ctts", head: Vec::new(), data: table(1, &[2, 1, (-50_000_000i32) as u32, 11, 0]), inside: Vec::new() };
+        stbl.inside.insert(2, ctts);
+    });
+    assert_eq!(open_and_play(early), Err(CantPlay::Damaged));
+
+    // Pictures stored larger than the limit, cropped to within it; and crops of a block or more.
+    let cropped_large = Sps { crop_right: 8, ..Sps::sized(4112, 2304) };
+    assert!(open_and_play(with_sps(made, &cropped_large.nal())).is_err());
+    let tall = Sps { crop_bottom: 4, ..Sps::sized(2304, 4112) };
+    assert_eq!(open_and_play(with_sps(made, &tall.nal())), Err(CantPlay::TooLarge));
+    let whole_block = Sps { crop_right: 8, ..Sps::sized(64, 32) };
+    assert_eq!(open_and_play(with_sps(made, &whole_block.nal())), Err(CantPlay::Damaged));
+    let rounded = Sps { crop_bottom: 4, ..Sps::sized(48, 48) };
+    assert_eq!(open(reader(with_sps(made, &rounded.nal()))).unwrap().info().height, 40);
+    // Every parameter set is checked, not only the first.
+    let second_too_large = edit(made, |boxes| {
+        let avcc = &mut find(boxes, "moov/trak/mdia/minf/stbl/stsd/avc1/avcC").data;
+        let sps_len = u16::from_be_bytes([avcc[6], avcc[7]]) as usize;
+        let large = Sps::sized(7680, 4320).nal();
+        let mut data = avcc[..8 + sps_len].to_vec();
+        data[5] = 0xE2;
+        data.extend_from_slice(&(large.len() as u16).to_be_bytes());
+        data.extend_from_slice(&large);
+        data.extend_from_slice(&avcc[8 + sps_len..]);
+        *avcc = data;
+    });
+    assert_eq!(open_and_play(second_too_large), Err(CantPlay::TooLarge));
 }
 
 #[test]

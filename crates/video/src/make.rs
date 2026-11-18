@@ -6,7 +6,8 @@ use bytes::Bytes;
 use mp4::{AvcConfig, MediaConfig, Mp4Config, Mp4Sample, Mp4Writer, TrackConfig, TrackType};
 use openh264::OpenH264API;
 use openh264::encoder::{
-    BitRate, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, QpRange, RateControlMode, VuiConfig,
+    BitRate, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, MatrixCoefficients, QpRange,
+    RateControlMode, VuiConfig,
 };
 use openh264::formats::YUVBuffer;
 use yuvutils_rs::{YuvChromaSubsampling, YuvConversionMode, YuvPlanarImageMut, YuvRange, YuvStandardMatrix, bgra_to_yuv420};
@@ -20,6 +21,8 @@ pub enum MadeColours {
     Bt709,
     /// BT.709 in the full range.
     Bt709Full,
+    /// Green, blue and red stored as they are, with no matrix, in the full range.
+    Identity,
 }
 
 /// An H.264 MP4 of `frames` pictures, `picture` giving each as straight BGRA, opaque, `width` by
@@ -49,6 +52,11 @@ pub fn make_test_video_in(
         MadeColours::Unsaid => (YuvStandardMatrix::Bt601, YuvRange::Limited, None),
         MadeColours::Bt709 => (YuvStandardMatrix::Bt709, YuvRange::Limited, Some(VuiConfig::bt709())),
         MadeColours::Bt709Full => (YuvStandardMatrix::Bt709, YuvRange::Full, Some(VuiConfig::bt709_full())),
+        MadeColours::Identity => (
+            YuvStandardMatrix::Bt601,
+            YuvRange::Full,
+            Some(VuiConfig::bt709_full().matrix_coefficients(MatrixCoefficients::Identity)),
+        ),
     };
     let mut config = EncoderConfig::new()
         .skip_frames(false)
@@ -69,7 +77,11 @@ pub fn make_test_video_in(
     for i in 0..frames {
         let bgra = picture(i);
         assert_eq!(bgra.len(), (width * height * 4) as usize, "picture {i} isn't {width} by {height}");
-        let yuv = to_yuv(&bgra, width, height, range, matrix);
+        let yuv = if colours == MadeColours::Identity {
+            to_gbr(&bgra, width, height)
+        } else {
+            to_yuv(&bgra, width, height, range, matrix)
+        };
         let stream = encoder.encode(&yuv).expect("an encoded picture");
         let sync = matches!(stream.frame_type(), FrameType::IDR | FrameType::I);
         let mut sample = Vec::new();
@@ -129,6 +141,25 @@ fn to_yuv(bgra: &[u8], width: u32, height: u32, range: YuvRange, matrix: YuvStan
         yuv.extend_from_slice(plane.borrow());
     }
     YUVBuffer::from_vec(yuv, width as usize, height as usize)
+}
+
+/// Green, blue and red as the three planes, blue and red at half size each way.
+fn to_gbr(bgra: &[u8], width: u32, height: u32) -> YUVBuffer {
+    let (w, h) = (width as usize, height as usize);
+    let mut yuv = Vec::with_capacity(w * h * 3 / 2);
+    yuv.extend(bgra.as_chunks::<4>().0.iter().map(|px| px[1]));
+    for channel in [0, 2] {
+        for row in (0..h).step_by(2) {
+            for column in (0..w).step_by(2) {
+                let sum: u32 = [(row, column), (row, column + 1), (row + 1, column), (row + 1, column + 1)]
+                    .iter()
+                    .map(|(r, c)| u32::from(bgra[(r * w + c) * 4 + channel]))
+                    .sum();
+                yuv.push(((sum + 2) / 4) as u8);
+            }
+        }
+    }
+    YUVBuffer::from_vec(yuv, w, h)
 }
 
 fn strip_start_code(unit: &[u8]) -> &[u8] {

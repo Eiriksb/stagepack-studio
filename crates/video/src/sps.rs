@@ -5,13 +5,37 @@ use yuvutils_rs::{YuvRange, YuvStandardMatrix};
 
 use crate::CantPlay;
 
+/// The largest pictures played, either way round.
+const MOST_WIDE: u64 = 4096;
+const MOST_HIGH: u64 = 2304;
+
 /// What a sequence parameter set says.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Sps {
     pub width: u32,
     pub height: u32,
-    pub matrix: YuvStandardMatrix,
+    pub matrix: Matrix,
     pub range: YuvRange,
+}
+
+/// How a picture's colours are worked out from what's stored.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Matrix {
+    Standard(YuvStandardMatrix),
+    /// Stored as green, blue and red, with no matrix at all.
+    Identity,
+}
+
+/// The matrix that a file's number for it names. Those not played here are read as BT.601,
+/// as is a file that says none.
+pub(crate) fn matrix_of(code: u32) -> Matrix {
+    match code {
+        0 => Matrix::Identity,
+        1 => Matrix::Standard(YuvStandardMatrix::Bt709),
+        7 => Matrix::Standard(YuvStandardMatrix::Smpte240),
+        9 | 10 => Matrix::Standard(YuvStandardMatrix::Bt2020),
+        _ => Matrix::Standard(YuvStandardMatrix::Bt601),
+    }
 }
 
 /// The profiles the decoder plays: Baseline, Main and High, at 8 bits and 4:2:0.
@@ -21,7 +45,8 @@ const PLAYED_PROFILES: [u8; 3] = [66, 77, 100];
 const HIGH_PROFILES: [u8; 12] = [100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134];
 
 /// Reads a sequence parameter set, a whole unit with its one byte of header. A stream of a kind
-/// the decoder can't play is `KindNotPlayed`; one that can't be read is `Damaged`.
+/// the decoder can't play is `KindNotPlayed`; one too large, as stored or as shown, `TooLarge`;
+/// one that can't be read, or that crops a whole block or more from an edge, `Damaged`.
 pub(crate) fn read(nal: &[u8]) -> Result<Sps, CantPlay> {
     if nal.first().is_none_or(|header| header & 0x1F != 7) {
         return Err(CantPlay::Damaged);
@@ -87,23 +112,27 @@ pub(crate) fn read(nal: &[u8]) -> Result<Sps, CantPlay> {
         top = u64::from(bits.ue()?);
         bottom = u64::from(bits.ue()?);
     }
-    let width = (width_blocks * 16).checked_sub(2 * (left + right)).filter(|w| *w > 0).ok_or(CantPlay::Damaged)?;
-    let height = (height_units * 16).checked_sub(2 * (top + bottom)).filter(|h| *h > 0).ok_or(CantPlay::Damaged)?;
-    let (mut matrix, mut range) = (YuvStandardMatrix::Bt601, YuvRange::Limited);
+    // The decoder works on the pictures as stored, so it's their size that's limited, and a crop
+    // is only ever what rounds a picture up to whole blocks.
+    let (stored_width, stored_height) = (width_blocks * 16, height_units * 16);
+    if stored_width.max(stored_height) > MOST_WIDE || stored_width.min(stored_height) > MOST_HIGH {
+        return Err(CantPlay::TooLarge);
+    }
+    if 2 * (left + right) >= 16 || 2 * (top + bottom) >= 16 {
+        return Err(CantPlay::Damaged);
+    }
+    let width = stored_width - 2 * (left + right);
+    let height = stored_height - 2 * (top + bottom);
+    let (mut matrix, mut range) = (Matrix::Standard(YuvStandardMatrix::Bt601), YuvRange::Limited);
     // What follows is optional, and a stream cut short in it plays with the usual colours.
     if bits.u(1).unwrap_or(0) == 1 {
         let _ = colours(&mut bits, &mut matrix, &mut range);
     }
-    Ok(Sps {
-        width: u32::try_from(width).map_err(|_| CantPlay::TooLarge)?,
-        height: u32::try_from(height).map_err(|_| CantPlay::TooLarge)?,
-        matrix,
-        range,
-    })
+    Ok(Sps { width: width as u32, height: height as u32, matrix, range })
 }
 
 /// Reads the colours a stream says its pictures are in, from its usability information.
-fn colours(bits: &mut Bits, matrix: &mut YuvStandardMatrix, range: &mut YuvRange) -> Result<(), CantPlay> {
+fn colours(bits: &mut Bits, matrix: &mut Matrix, range: &mut YuvRange) -> Result<(), CantPlay> {
     if bits.u(1)? == 1 && bits.u(8)? == 255 {
         bits.u(32)?; // the shape of a pixel
     }
@@ -117,15 +146,16 @@ fn colours(bits: &mut Bits, matrix: &mut YuvStandardMatrix, range: &mut YuvRange
         }
         if bits.u(1)? == 1 {
             bits.u(16)?; // primaries and transfer
-            *matrix = match bits.u(8)? {
-                1 => YuvStandardMatrix::Bt709,
-                7 => YuvStandardMatrix::Smpte240,
-                9 | 10 => YuvStandardMatrix::Bt2020,
-                _ => YuvStandardMatrix::Bt601,
-            };
+            *matrix = matrix_of(bits.u(8)?);
         }
     }
     Ok(())
+}
+
+/// Whether a unit's body is free of anything that would read as the start of another, so the
+/// decoder sees the same units as were checked here. A well made stream never has one.
+pub(crate) fn safe_unit(unit: &[u8]) -> bool {
+    !unit.windows(3).any(|w| w[0] == 0 && w[1] == 0 && w[2] <= 2)
 }
 
 /// The bytes of a unit without those put in so its contents never look like the start of one.

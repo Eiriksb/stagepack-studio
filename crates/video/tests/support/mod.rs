@@ -177,11 +177,23 @@ pub struct Sps {
     pub chroma: u32,
     pub bit_depth: u32,
     pub progressive: bool,
+    /// Pixels cropped from the right and the bottom, in twos.
+    pub crop_right: u32,
+    pub crop_bottom: u32,
 }
 
 impl Sps {
     pub fn sized(width: u32, height: u32) -> Sps {
-        Sps { profile: 66, width_blocks: width / 16, height_blocks: height / 16, chroma: 1, bit_depth: 8, progressive: true }
+        Sps {
+            profile: 66,
+            width_blocks: width / 16,
+            height_blocks: height / 16,
+            chroma: 1,
+            bit_depth: 8,
+            progressive: true,
+            crop_right: 0,
+            crop_bottom: 0,
+        }
     }
 
     pub fn nal(&self) -> Vec<u8> {
@@ -211,25 +223,130 @@ impl Sps {
             bits.bit(false);
         }
         bits.bit(true);
-        bits.bit(false);
+        let cropped = self.crop_right > 0 || self.crop_bottom > 0;
+        bits.bit(cropped);
+        if cropped {
+            bits.ue(0);
+            bits.ue(self.crop_right);
+            bits.ue(0);
+            bits.ue(self.crop_bottom);
+        }
         bits.bit(false);
         bits.bit(true);
         while !bits.used.is_multiple_of(8) {
             bits.bit(false);
         }
-        // The bytes a stream puts in so its contents never look like the start of a unit.
-        let mut nal = vec![0x67];
-        let mut zeros = 0;
-        for byte in bits.bytes {
-            if zeros >= 2 && byte <= 3 {
-                nal.push(3);
-                zeros = 0;
-            }
-            zeros = if byte == 0 { zeros + 1 } else { 0 };
-            nal.push(byte);
-        }
-        nal
+        escape(0x67, &bits.bytes)
     }
+}
+
+/// A unit of `header` and `body`, with the bytes a stream puts in so its contents never look like
+/// the start of a unit.
+fn escape(header: u8, body: &[u8]) -> Vec<u8> {
+    let mut nal = vec![header];
+    let mut zeros = 0;
+    for &byte in body {
+        if zeros >= 2 && byte <= 3 {
+            nal.push(3);
+            zeros = 0;
+        }
+        zeros = if byte == 0 { zeros + 1 } else { 0 };
+        nal.push(byte);
+    }
+    nal
+}
+
+/// A picture parameter set like `pps` but numbered `id`.
+pub fn pps_with_id(pps: &[u8], id: u32) -> Vec<u8> {
+    let mut body = Vec::new();
+    let mut zeros = 0;
+    for &byte in &pps[1..] {
+        if zeros >= 2 && byte == 3 {
+            zeros = 0;
+            continue;
+        }
+        zeros = if byte == 0 { zeros + 1 } else { 0 };
+        body.push(byte);
+    }
+    let all: Vec<bool> = body.iter().flat_map(|b| (0..8).rev().map(move |i| b >> i & 1 == 1)).collect();
+    let stop = all.iter().rposition(|b| *b).unwrap();
+    // The set's own number is the first thing in it, and is 0 here: a single 1.
+    assert!(all[0]);
+    let mut bits = Bits { bytes: Vec::new(), used: 0 };
+    bits.ue(id);
+    for &bit in &all[1..stop] {
+        bits.bit(bit);
+    }
+    bits.bit(true);
+    while !bits.used.is_multiple_of(8) {
+        bits.bit(false);
+    }
+    escape(pps[0], &bits.bytes)
+}
+
+/// Where each picture of a made video lies, in the order stored: its offset and size.
+pub fn samples_of(video: &[u8]) -> Vec<(usize, usize)> {
+    let mut boxes = parse(video);
+    let stbl = find(&mut boxes, "moov/trak/mdia/minf/stbl");
+    let data = |kind: &[u8; 4]| stbl.inside.iter().find(|b| &b.kind == kind).unwrap().data.clone();
+    let (stsz, stsc, stco) = (data(b"stsz"), data(b"stsc"), data(b"stco"));
+    let count = u32_at(&stsz, 8) as usize;
+    let size = |i: usize| if u32_at(&stsz, 4) > 0 { u32_at(&stsz, 4) } else { u32_at(&stsz, 12 + i * 4) } as usize;
+    let runs: Vec<(usize, usize)> =
+        (0..u32_at(&stsc, 4) as usize).map(|r| (u32_at(&stsc, 8 + r * 12) as usize, u32_at(&stsc, 12 + r * 12) as usize)).collect();
+    let mut places = Vec::new();
+    for chunk in 0..u32_at(&stco, 4) as usize {
+        let in_chunk = runs.iter().rev().find(|(first, _)| *first <= chunk + 1).unwrap().1;
+        let mut at = u32_at(&stco, 8 + chunk * 4) as usize;
+        for _ in 0..in_chunk {
+            if places.len() < count {
+                places.push((at, size(places.len())));
+                at += size(places.len() - 1);
+            }
+        }
+    }
+    places
+}
+
+/// The same video with each picture's bytes changed by `change`, laid out again as one chunk.
+pub fn with_samples(video: &[u8], mut change: impl FnMut(usize, Vec<u8>) -> Vec<u8>) -> Vec<u8> {
+    let samples: Vec<Vec<u8>> =
+        samples_of(video).iter().enumerate().map(|(i, (at, size))| change(i, video[*at..at + size].to_vec())).collect();
+    let mut boxes = parse(video);
+    let mdat_at = boxes.iter().position(|b| &b.kind == b"mdat").unwrap();
+    let before = write(&boxes[..mdat_at]).len() as u32;
+    boxes[mdat_at].data = samples.concat();
+    let stbl = find(&mut boxes, "moov/trak/mdia/minf/stbl");
+    for b in &mut stbl.inside {
+        match &b.kind {
+            b"stsz" => {
+                let mut fields = vec![0, samples.len() as u32];
+                fields.extend(samples.iter().map(|s| s.len() as u32));
+                b.data = table(0, &fields);
+            }
+            b"stsc" => b.data = table(0, &[1, 1, samples.len() as u32, 1]),
+            b"stco" => b.data = table(0, &[1, before + 8]),
+            _ => {}
+        }
+    }
+    write(&boxes)
+}
+
+/// The units of one picture, each after its four bytes of length.
+pub fn units(sample: &[u8]) -> Vec<Vec<u8>> {
+    let mut units = Vec::new();
+    let mut at = 0;
+    while at + 4 <= sample.len() {
+        let size = u32_at(sample, at) as usize;
+        units.push(sample[at + 4..at + 4 + size].to_vec());
+        at += 4 + size;
+    }
+    units
+}
+
+/// A picture of `units`, each after its four bytes of length.
+pub fn picture_of(units: &[Vec<u8>]) -> Vec<u8> {
+    units.iter().flat_map(|u| (u.len() as u32).to_be_bytes().into_iter().chain(u.iter().copied())).collect()
 }
 
 /// Opens `bytes` as a video file would be opened.

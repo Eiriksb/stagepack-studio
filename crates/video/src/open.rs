@@ -10,12 +10,11 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use mp4::{Mp4Reader, Mp4Track};
-use yuvutils_rs::{YuvRange, YuvStandardMatrix};
+use yuvutils_rs::YuvRange;
 
-use crate::{CantPlay, ReadSeek, VideoInfo, sps};
+use crate::sps::{self, Matrix};
+use crate::{CantPlay, ReadSeek, VideoInfo};
 
-const MOST_WIDE: u32 = 4096;
-const MOST_HIGH: u32 = 2304;
 const MOST_FRAMES_A_SECOND: f64 = 120.0;
 const MOST_SECONDS: f64 = 6.0 * 3600.0;
 /// Six hours at 120 frames a second.
@@ -50,11 +49,11 @@ pub(crate) struct Index {
     pub ticks_a_second: u32,
     /// The whole video's length, in ticks.
     pub length: i64,
-    /// The sequence and picture parameter sets, each after a start code.
+    /// Every sequence and picture parameter set the index gives, each after a start code.
     pub headers: Vec<u8>,
     /// How many bytes give the length of each unit in a picture.
     pub length_bytes: usize,
-    pub matrix: YuvStandardMatrix,
+    pub matrix: Matrix,
     pub range: YuvRange,
 }
 
@@ -218,7 +217,7 @@ fn put(out: &mut Vec<u8>, kind: &[u8; 4], body: &[u8]) -> Result<(), CantPlay> {
 
 /// Rebuilds the index with only the first video track, and only the boxes needed of it, each
 /// checked to lie inside the one holding it. Says which kind of failure it found, if any.
-fn rebuild(moov: &[u8]) -> Result<Vec<u8>, CantPlay> {
+fn rebuild(moov: &[u8]) -> Result<(Vec<u8>, Option<Colr>), CantPlay> {
     let boxes = children(moov)?;
     if child(&boxes, b"mvex").is_some() {
         // Made in pieces, as for streaming: not what a video added to a talk is.
@@ -235,7 +234,7 @@ fn rebuild(moov: &[u8]) -> Result<Vec<u8>, CantPlay> {
             }
         }
     }
-    let trak = trak.ok_or(damaged.unwrap_or(CantPlay::NoPicture))?;
+    let (trak, colr) = trak.ok_or(damaged.unwrap_or(CantPlay::NoPicture))?;
     let mut out = Vec::with_capacity(moov.len().min(MOST_INDEX as usize) + 256);
     // The library wants a file type first.
     put(&mut out, b"ftyp", b"isom\0\0\0\0")?;
@@ -243,11 +242,14 @@ fn rebuild(moov: &[u8]) -> Result<Vec<u8>, CantPlay> {
     put(&mut body, b"mvhd", mvhd)?;
     put(&mut body, b"trak", &trak)?;
     put(&mut out, b"moov", &body)?;
-    Ok(out)
+    Ok((out, colr))
 }
 
-/// The track in `trak` rebuilt, if it's a video track.
-fn video_trak(trak: &[u8]) -> Result<Option<Vec<u8>>, CantPlay> {
+/// A video track rebuilt, and what it says of its colours.
+type Track = (Vec<u8>, Option<Colr>);
+
+/// The track in `trak` rebuilt, if it's a video track, and what it says of its colours.
+fn video_trak(trak: &[u8]) -> Result<Option<Track>, CantPlay> {
     let boxes = children(trak)?;
     let mdia = children(child(&boxes, b"mdia").ok_or(CantPlay::Damaged)?)?;
     let hdlr = child(&mdia, b"hdlr").ok_or(CantPlay::Damaged)?;
@@ -260,7 +262,8 @@ fn video_trak(trak: &[u8]) -> Result<Option<Vec<u8>>, CantPlay> {
     let stbl = children(child(&minf, b"stbl").ok_or(CantPlay::Damaged)?)?;
 
     let mut new_stbl = Vec::new();
-    put(&mut new_stbl, b"stsd", &sample_description(child(&stbl, b"stsd").ok_or(CantPlay::Damaged)?)?)?;
+    let (stsd, colr) = sample_description(child(&stbl, b"stsd").ok_or(CantPlay::Damaged)?)?;
+    put(&mut new_stbl, b"stsd", &stsd)?;
     for kind in [b"stts", b"ctts", b"stss", b"stsc", b"stsz", b"stco", b"co64"] {
         if let Some(body) = child(&stbl, kind) {
             put(&mut new_stbl, kind, body)?;
@@ -278,29 +281,47 @@ fn video_trak(trak: &[u8]) -> Result<Option<Vec<u8>>, CantPlay> {
     let mut new_trak = Vec::new();
     put(&mut new_trak, b"tkhd", tkhd)?;
     put(&mut new_trak, b"mdia", &new_mdia)?;
-    Ok(Some(new_trak))
+    Ok(Some((new_trak, colr)))
+}
+
+/// What a `colr` box says of a picture's colours: the matrix, and the range if it says one.
+#[derive(Clone, Copy, Debug)]
+struct Colr {
+    matrix: u16,
+    full: Option<bool>,
+}
+
+fn read_colr(body: &[u8]) -> Option<Colr> {
+    let matrix = u16::from_be_bytes(body.get(8..10)?.try_into().ok()?);
+    match body.get(..4)? {
+        b"nclx" => Some(Colr { matrix, full: Some(body.get(10)? & 0x80 != 0) }),
+        b"nclc" => Some(Colr { matrix, full: None }),
+        _ => None,
+    }
 }
 
 /// The description of the track's pictures rebuilt with only its first entry, which must be
-/// H.264 in the usual form, and only its configuration.
-fn sample_description(stsd: &[u8]) -> Result<Vec<u8>, CantPlay> {
+/// H.264 in the usual form, and only its configuration; and what the entry says of its colours.
+fn sample_description(stsd: &[u8]) -> Result<(Vec<u8>, Option<Colr>), CantPlay> {
     let entries = children(stsd.get(8..).ok_or(CantPlay::Damaged)?)?;
     let (kind, avc1) = entries.first().ok_or(CantPlay::Damaged)?;
     if kind != b"avc1" {
         return Err(CantPlay::KindNotPlayed);
     }
     let fixed = avc1.get(..78).ok_or(CantPlay::Damaged)?;
-    let avcc = child(&children(&avc1[78..])?, b"avcC").ok_or(CantPlay::Damaged)?;
+    let inside = children(&avc1[78..])?;
+    let avcc = child(&inside, b"avcC").ok_or(CantPlay::Damaged)?;
+    let colr = child(&inside, b"colr").and_then(read_colr);
     let mut entry = fixed.to_vec();
     put(&mut entry, b"avcC", avcc)?;
     let mut out = vec![0, 0, 0, 0, 0, 0, 0, 1];
     put(&mut out, b"avc1", &entry)?;
-    Ok(out)
+    Ok((out, colr))
 }
 
 /// Says what the video with this index is, and where its pictures lie in a file of `len` bytes.
 fn describe(moov: &[u8], len: u64) -> Result<Index, CantPlay> {
-    let rebuilt = rebuild(moov)?;
+    let (rebuilt, colr) = rebuild(moov)?;
     let size = rebuilt.len() as u64;
     let parsed = Mp4Reader::read_header(Cursor::new(rebuilt), size).map_err(|_| CantPlay::Damaged)?;
     let track = parsed.tracks().values().next().ok_or(CantPlay::NoPicture)?;
@@ -308,17 +329,30 @@ fn describe(moov: &[u8], len: u64) -> Result<Index, CantPlay> {
     let stbl = &mdia.minf.stbl;
     let avcc = &stbl.stsd.avc1.as_ref().ok_or(CantPlay::KindNotPlayed)?.avcc;
 
-    let sps_nal = &avcc.sequence_parameter_sets.first().ok_or(CantPlay::Damaged)?.bytes;
-    let sps = sps::read(sps_nal)?;
-    let (wide, high) = (sps.width.max(sps.height), sps.width.min(sps.height));
-    if wide > MOST_WIDE || high > MOST_HIGH {
-        return Err(CantPlay::TooLarge);
+    // Every parameter set is checked, as any of them may be the one the pictures name. The
+    // pictures are said to be the size and colours of the first.
+    let sps = sps::read(&avcc.sequence_parameter_sets.first().ok_or(CantPlay::Damaged)?.bytes)?;
+    for other in &avcc.sequence_parameter_sets[1..] {
+        sps::read(&other.bytes)?;
     }
-    let pps = avcc.picture_parameter_sets.first().ok_or(CantPlay::Damaged)?;
-    let mut headers = Vec::with_capacity(sps_nal.len() + pps.bytes.len() + 8);
-    for nal in [sps_nal, &pps.bytes] {
+    if avcc.picture_parameter_sets.is_empty() {
+        return Err(CantPlay::Damaged);
+    }
+    let mut headers = Vec::new();
+    for nal in avcc.sequence_parameter_sets.iter().chain(&avcc.picture_parameter_sets) {
+        if !sps::safe_unit(&nal.bytes) {
+            return Err(CantPlay::Damaged);
+        }
         headers.extend_from_slice(&[0, 0, 0, 1]);
-        headers.extend_from_slice(nal);
+        headers.extend_from_slice(&nal.bytes);
+    }
+    // The sample entry's own words on colours come before the stream's.
+    let (mut matrix, mut range) = (sps.matrix, sps.range);
+    if let Some(colr) = colr {
+        matrix = sps::matrix_of(u32::from(colr.matrix));
+        if let Some(full) = colr.full {
+            range = if full { YuvRange::Full } else { YuvRange::Limited };
+        }
     }
     let length_bytes = match avcc.length_size_minus_one {
         0 => 1,
@@ -341,6 +375,7 @@ fn describe(moov: &[u8], len: u64) -> Result<Index, CantPlay> {
     let count = count as usize;
     let mut samples = Vec::with_capacity(count);
     place_samples(track, count, len, &mut samples)?;
+    check_apart(&samples)?;
     let length = time_samples(track, &mut samples)?;
     if let Some(stss) = &stbl.stss {
         for sample in &mut samples {
@@ -365,7 +400,8 @@ fn describe(moov: &[u8], len: u64) -> Result<Index, CantPlay> {
     }
 
     let seconds = length as f64 / f64::from(ticks_a_second);
-    if seconds <= 0.0 {
+    // A picture shown at or after the end is a damaged table: it would never be due.
+    if seconds <= 0.0 || times[count - 1] >= length {
         return Err(CantPlay::Damaged);
     }
     let frames_a_second = count as f64 / seconds;
@@ -388,8 +424,8 @@ fn describe(moov: &[u8], len: u64) -> Result<Index, CantPlay> {
         length,
         headers,
         length_bytes,
-        matrix: sps.matrix,
-        range: sps.range,
+        matrix,
+        range,
     })
 }
 
@@ -444,6 +480,22 @@ fn place_samples(track: &Mp4Track, count: usize, len: u64, samples: &mut Vec<Sam
     }
     if samples.len() < count {
         return Err(CantPlay::Damaged);
+    }
+    Ok(())
+}
+
+/// Checks no two pictures share any bytes, so every byte of the file is read at most once a
+/// pass however the tables are made.
+fn check_apart(samples: &[Sample]) -> Result<(), CantPlay> {
+    let mut order: Vec<u32> = (0..samples.len() as u32).filter(|i| samples[*i as usize].size > 0).collect();
+    order.sort_unstable_by_key(|i| samples[*i as usize].offset);
+    let mut end = 0;
+    for i in order {
+        let sample = samples[i as usize];
+        if sample.offset < end {
+            return Err(CantPlay::Damaged);
+        }
+        end = sample.offset + u64::from(sample.size);
     }
     Ok(())
 }
