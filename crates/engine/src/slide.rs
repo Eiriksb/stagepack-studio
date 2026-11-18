@@ -1,6 +1,6 @@
 //! Puts a parsed slide's content into the regions of its layout.
 
-use slides_format::{Block, FlowPlace, Slide, Tag, Talk, Target};
+use slides_format::{Block, DEFAULT_LAYOUT, FlowPlace, Slide, Tag, Talk, Target};
 use tiny_skia::PathBuilder;
 use toolkit::{Color, Registry, Theme};
 
@@ -19,7 +19,6 @@ use crate::{
 /// How wide and high a slide is, in slide units.
 pub const SLIDE_WIDTH: f32 = 1920.0;
 pub const SLIDE_HEIGHT: f32 = 1080.0;
-const DEFAULT_LAYOUT: &str = "content";
 
 /// The attributes that place a component, which it doesn't see as props.
 pub const PLACEMENT_ATTRS: [&str; 8] = ["x", "y", "w", "h", "rotate", "click", "enter", "align"];

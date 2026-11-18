@@ -4,6 +4,7 @@
 
 use std::ops::Range;
 
+use crate::layouts::{DEFAULT_LAYOUT, layout_names};
 use crate::model::{Block, Slide, Span, Tag, Talk};
 
 /// What a paragraph is.
@@ -74,23 +75,11 @@ pub const MAX_LEVEL: u8 = 8;
 /// The tags that draw their text as a box of its own when they're given a place.
 const TEXT_BOXES: [&str; 3] = ["Text", "Box", "Shape"];
 
-/// The layouts' regions, and the region for what nothing sends elsewhere. These are the
-/// engine's layouts, which this crate can't see; `layout:` names one of them.
-const LAYOUTS: [(&str, &[&str], &str); 5] = [
-    ("title", &["title", "body"], "body"),
-    ("content", &["title", "body"], "body"),
-    ("two-columns", &["title", "left", "right"], "left"),
-    ("section", &["title", "body"], "body"),
-    ("blank", &["body"], "body"),
-];
-const DEFAULT_LAYOUT: &str = "content";
-
 /// The regions of the slide's layout, and its main one, as the engine finds them.
 pub(crate) fn layout_of(slide: &Slide) -> (&'static [&'static str], &'static str) {
     let name = slide.settings.as_ref().and_then(|settings| settings.get("layout")).filter(|name| !name.is_empty());
-    let find = |name: &str| LAYOUTS.iter().find(|layout| layout.0 == name);
-    let layout = name.and_then(find).or_else(|| find(DEFAULT_LAYOUT)).expect("the default layout is listed");
-    (layout.1, layout.2)
+    let layout = name.and_then(layout_names).or_else(|| layout_names(DEFAULT_LAYOUT)).expect("the default layout is listed");
+    (layout.regions, layout.main)
 }
 
 /// Whether a tag asks for a place on the slide, as the engine decides it.

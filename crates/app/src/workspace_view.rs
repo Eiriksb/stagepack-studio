@@ -18,6 +18,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use slides_components::{Bundle, Diagnostic};
 use slides_engine::{ComponentState, Fonts};
+use slides_format::DEFAULT_LAYOUT;
 
 use crate::animate::Choice;
 use crate::animate_tools::{ChooseAnimation, ChooseEntrance, ChooseTransition};
@@ -1395,7 +1396,7 @@ impl Render for WorkspaceView {
                 this.edit(|document| document.reorder_selected(order), cx)
             }))
             .on_action(cx.listener(|this, action: &SetLayout, _, cx| this.set_layout(action.layout, cx)))
-            .on_action(cx.listener(|this, _: &NewSlide, _, cx| this.add_slide("content", cx)))
+            .on_action(cx.listener(|this, _: &NewSlide, _, cx| this.add_slide(DEFAULT_LAYOUT, cx)))
             .on_action(cx.listener(|this, action: &AddSlide, _, cx| {
                 this.add_slide(action.layout, cx)
             }))

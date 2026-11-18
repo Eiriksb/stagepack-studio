@@ -281,3 +281,15 @@ fn layouts_are_listed_in_order() {
         assert!(std::ptr::eq(layout_by_name(layout.name).unwrap(), layout));
     }
 }
+
+#[test]
+fn the_engines_layouts_are_the_formats() {
+    let engine = slides_engine::layouts();
+    assert_eq!(engine.len(), slides_format::LAYOUT_NAMES.len());
+    for (ours, theirs) in engine.iter().zip(slides_format::LAYOUT_NAMES.iter()) {
+        assert_eq!(ours.name, theirs.name);
+        assert_eq!(ours.main, theirs.main);
+        let regions: Vec<&str> = ours.regions.iter().map(|region| region.name).collect();
+        assert_eq!(regions, theirs.regions, "{}", ours.name);
+    }
+}

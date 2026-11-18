@@ -3,9 +3,6 @@
 
 use super::*;
 
-/// The layout a slide has when its settings name none.
-const DEFAULT_LAYOUT: &str = "content";
-
 /// What Undo shows for giving a slide another layout.
 pub const CHANGE_LAYOUT: &str = "Change layout";
 
