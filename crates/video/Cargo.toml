@@ -1,0 +1,21 @@
+[package]
+name = "slides-video"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Makes small videos with the same library's encoder, for tests here and in the other crates.
+make = ["dep:bytes"]
+
+[dependencies]
+openh264 = { workspace = true }
+mp4 = { workspace = true }
+yuvutils-rs = { workspace = true }
+# The type the container writer takes a sample's bytes in, at the version it uses.
+bytes = { version = "=1.12.1", optional = true }
+
+[dev-dependencies]
+# The tests make their own videos.
+slides-video = { path = ".", features = ["make"] }
+proptest = "1"
