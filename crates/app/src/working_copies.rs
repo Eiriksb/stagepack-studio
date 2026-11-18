@@ -96,6 +96,8 @@ enum Job {
         adopted: Option<Adopted>,
         keep: Option<LargeKeep>,
         also: Vec<TalkPlace>,
+        /// Where a test hears that the window's last clear was made, if one listens.
+        log: Option<OrderLog>,
     },
     /// Keeps a file added to the talk, as it's added. Made only if no clear has been asked for
     /// since it was: a save has written it then, or the text doesn't use it yet, and the next
@@ -157,9 +159,8 @@ impl Job {
                 adopted,
                 keep,
                 also,
+                log,
             } => {
-                // What the talk holds is looked at now, not when this was asked for: a file may
-                // have been added since.
                 // What the talk holds is asked as each file would go, not when this was asked for.
                 let keep: &dyn Keeping = keep.as_ref().map_or(&KeepNothing, |keep| keep);
                 for place in also.iter().chain([&place]) {
@@ -176,6 +177,9 @@ impl Job {
                 // offered again; but not one a file the talk holds still lies in.
                 if let TalkPlace::Untitled(id) = place {
                     recovery.discard_untitled_keeping(id, keep);
+                }
+                if let Some(log) = log {
+                    log.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push("working copy cleared");
                 }
             }
             Job::KeepFile {
@@ -224,7 +228,12 @@ pub struct WorkingCopies {
     /// The places the talk was kept in before, whose slots may still hold a large file of the
     /// talk's, cleared again with each clear.
     left_in: Vec<TalkPlace>,
+    /// Where a test hears that the window's last clear was made.
+    order_log: Option<OrderLog>,
 }
+
+/// Where a test hears, in order, what a window closing did.
+pub type OrderLog = Arc<Mutex<Vec<&'static str>>>;
 
 impl EventEmitter<KeepFailed> for WorkingCopies {}
 
@@ -245,7 +254,14 @@ impl WorkingCopies {
             files_seen: 0,
             files_kept: BTreeSet::new(),
             left_in: Vec::new(),
+            order_log: None,
         }
+    }
+
+    /// Tells `log` when the window's last clear has been made. For tests.
+    #[doc(hidden)]
+    pub fn log_order_for_test(&mut self, log: OrderLog) {
+        self.order_log = Some(log);
     }
 
     /// Where working copies are kept, if anywhere.
@@ -470,6 +486,7 @@ impl WorkingCopies {
                 adopted: None,
                 keep: Some(document.large_keep()),
                 also: self.left_in.clone(),
+                log: None,
             });
         }
         // What a save would write, an untitled talk's own files among them, but only those a
@@ -542,6 +559,7 @@ impl WorkingCopies {
                 adopted: Some(self.adopted.clone()),
                 keep,
                 also,
+                log: None,
             },
             cx,
         );
@@ -566,7 +584,7 @@ impl WorkingCopies {
         self.pending = None;
         self.unkept_since = None;
         let also = self.left_in.iter().filter(|kept| **kept != place).cloned().collect();
-        let job = Job::Clear { recovery, place, adopted: Some(self.adopted.clone()), keep: None, also };
+        let job = Job::Clear { recovery, place, adopted: Some(self.adopted.clone()), keep: None, also, log: self.order_log.clone() };
         self.enqueue(job, cx);
     }
 

@@ -1626,3 +1626,88 @@ fn a_take_in_that_fails_is_not_tried_at_every_keep(cx: &mut TestAppContext) {
     back.document(cx).read_with(cx, |document, _| assert!(reads_back(document, &path, &from)));
     stagepack_studio::recovery::set_take_in_fails_for_test(&recovery_root, false);
 }
+
+// Round three of review: the order of a save and a close.
+
+/// A folder talk in a window, its working copies under `root`, with the video at `from` copied in
+/// and on its slide, kept, and listened to in order.
+fn talk_with_a_video_listened_to(
+    cx: &mut TestAppContext,
+    root: &Path,
+    from: &Path,
+) -> (Typing, PathBuf, String, stagepack_studio::working_copies::OrderLog) {
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::write(folder.path().join("slides.md"), "# Talk\n").unwrap();
+    let talk_folder = folder.path().to_path_buf();
+    let typing = open_folder(cx, folder, Some(Recovery::new(root.to_path_buf())));
+    let path = copy_in(&typing, cx, from);
+    wait(cx, KEEP_PAUSE);
+    let log = stagepack_studio::working_copies::OrderLog::default();
+    let listening = log.clone();
+    cx.update(|cx| typing.view.update(cx, |view, cx| view.log_order_for_test(listening, cx)));
+    (typing, talk_folder, path, log)
+}
+
+fn order(log: &stagepack_studio::working_copies::OrderLog) -> Vec<&'static str> {
+    log.lock().unwrap().clone()
+}
+
+const IN_ORDER: [&str; 5] = ["write done", "marked saved", "working copy let go", "working copy cleared", "window closed"];
+
+#[gpui_kit::test]
+fn a_close_waiting_for_a_save_goes_on_only_once_it_is_taken_in(cx: &mut TestAppContext) {
+    set_up();
+    let work = tempfile::tempdir().unwrap();
+    let from = patterned(work.path(), "clip.mp4", TWIN, 46);
+    let root = work.path().join("recovery");
+    let (typing, talk_folder, path, log) = talk_with_a_video_listened_to(cx, &root, &from);
+    hold_work(&typing, cx, true, false);
+    typing.press(cx, "ctrl-s");
+    let saving = typing.source(cx);
+    let handle = typing.handle;
+    assert!(!gpui_kit::VisualTestContext::from_window(handle, cx).simulate_close());
+    cx.run_until_parked();
+    click_in(cx, handle, stagepack_studio::workspace_view::CLOSE_DONT_SAVE_ID);
+    // Waiting, it says so, and an edit and a save asked for meanwhile write nothing.
+    let said = progress_label(&typing, cx).or_else(|| typing.status(cx)).unwrap_or_default();
+    assert!(said.contains(stagepack_studio::workspace_view::CLOSING_AFTER_SAVE), "{said}");
+    typing.press(cx, "ctrl-m");
+    typing.press(cx, "ctrl-s");
+    assert!(order(&log).is_empty(), "nothing yet: {:?}", order(&log));
+    release_work(&typing, cx);
+    assert_eq!(order(&log), IN_ORDER);
+    assert_eq!(std::fs::read_to_string(talk_folder.join("slides.md")).unwrap(), saving);
+    assert!(same_pieces(std::fs::File::open(talk_folder.join(&path)).unwrap(), std::fs::File::open(&from).unwrap()));
+    assert!(!is_open(cx, handle));
+}
+
+#[gpui_kit::test]
+fn dont_save_after_save_keeps_what_was_declined_from_being_written(cx: &mut TestAppContext) {
+    set_up();
+    let work = tempfile::tempdir().unwrap();
+    let from = patterned(work.path(), "clip.mp4", TWIN, 47);
+    let root = work.path().join("recovery");
+    let (typing, talk_folder, path, log) = talk_with_a_video_listened_to(cx, &root, &from);
+    hold_work(&typing, cx, true, false);
+    typing.press(cx, "ctrl-s");
+    let saving = typing.source(cx);
+    let handle = typing.handle;
+    // Close, and Save: the window would close once it's saved.
+    assert!(!gpui_kit::VisualTestContext::from_window(handle, cx).simulate_close());
+    cx.run_until_parked();
+    click_in(cx, handle, stagepack_studio::workspace_view::CLOSE_SAVE_ID);
+    // Edited meanwhile, then closed again, and not saved.
+    typing.press(cx, "ctrl-m");
+    assert_ne!(typing.source(cx), saving);
+    assert!(!gpui_kit::VisualTestContext::from_window(handle, cx).simulate_close());
+    cx.run_until_parked();
+    click_in(cx, handle, stagepack_studio::workspace_view::CLOSE_DONT_SAVE_ID);
+    assert!(is_open(cx, handle), "the first save is still running");
+    release_work(&typing, cx);
+    // The first save wrote what it was asked to, and nothing after it did.
+    assert_eq!(std::fs::read_to_string(talk_folder.join("slides.md")).unwrap(), saving, "the edits declined weren't written");
+    assert!(same_pieces(std::fs::File::open(talk_folder.join(&path)).unwrap(), std::fs::File::open(&from).unwrap()));
+    assert_eq!(order(&log), IN_ORDER, "one save, taken in before the working copy went");
+    assert!(!is_open(cx, handle));
+    assert!(files_under(&root).is_empty(), "{:?}", files_under(&root));
+}

@@ -320,6 +320,9 @@ struct Progressing {
     _ticker: Task<()>,
 }
 
+/// What the status line says while the window waits for a save to end before it closes.
+pub const CLOSING_AFTER_SAVE: &str = "Closing once the save is done; changes made now won't be kept.";
+
 /// What the status line says of work asked to stop, until it has.
 pub const STOPPING: &str = "Stopping…";
 
@@ -367,6 +370,11 @@ pub struct WorkspaceView {
     saves_running: usize,
     /// Whether the window is to finish closing once nothing it waits for runs.
     finish_closing: bool,
+    /// Whether the window has begun to close for good: its working copy is let go of, and it
+    /// goes once that's done. It does so once.
+    closing_for_good: bool,
+    /// Where a test hears, in order, what a save and a close did.
+    order_log: Option<crate::working_copies::OrderLog>,
     /// Whether it was asked to close again while copies it stopped hadn't ended, and closes
     /// without waiting for them.
     close_anyway: bool,
@@ -671,6 +679,8 @@ impl WorkspaceView {
             close_when_idle: false,
             saves_running: 0,
             finish_closing: false,
+            closing_for_good: false,
+            order_log: None,
             close_anyway: false,
             held_work: None,
             status_fading: None,
@@ -1205,7 +1215,34 @@ impl WorkspaceView {
     /// Whether the window closing has to wait: for a save running, which may be reading what the
     /// working copy holds, and for copies it stopped, unless it was asked to close anyway.
     pub(super) fn close_waits(&self) -> bool {
-        self.saves_running > 0 || (self.stops_running() && !self.close_anyway)
+        self.save_waits() || (self.stops_running() && !self.close_anyway)
+    }
+
+    /// Whether a save is running, or not yet taken in: the window closing waits for the talk to
+    /// be marked saved, as the order of a save is the write, then the talk marked saved, then the
+    /// working copy let go.
+    pub(super) fn save_waits(&self) -> bool {
+        self.saves_running > 0 || self.save_flow.is_saving()
+    }
+
+    /// Whether the window is closing: waiting to, or going. No save starts then.
+    pub(super) fn is_closing_window(&self) -> bool {
+        self.finish_closing || self.closing_for_good
+    }
+
+    /// Tells `log`, in order, when a save's write is done, the talk is marked saved, the working
+    /// copy is cleared as the window closes, and the window has closed. For tests.
+    #[doc(hidden)]
+    pub fn log_order_for_test(&mut self, log: crate::working_copies::OrderLog, cx: &mut Context<Self>) {
+        self.order_log = Some(log.clone());
+        self.working_copies.update(cx, |copies, _| copies.log_order_for_test(log));
+    }
+
+    /// Tells the test listening, if one is, that `what` has happened.
+    pub(super) fn log_order(&self, what: &'static str) {
+        if let Some(log) = &self.order_log {
+            log.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(what);
+        }
     }
 
     /// Finishes closing the window, if it's waiting to and nothing it waits for runs any more.
@@ -1250,6 +1287,9 @@ impl WorkspaceView {
         let (done, total) = (progressing.meter.done.load(Relaxed), progressing.meter.total.load(Relaxed));
         let stopping = progressing.meter.stop.load(std::sync::atomic::Ordering::SeqCst);
         let mut words = if stopping { STOPPING.to_string() } else { crate::large_files::progress_words(&progressing.doing, done, total) };
+        if self.finish_closing && self.save_waits() {
+            words = format!("{CLOSING_AFTER_SAVE} {words}");
+        }
         if self.progressing.len() > 1 {
             words = format!("{words} · {} running", self.progressing.len());
         }

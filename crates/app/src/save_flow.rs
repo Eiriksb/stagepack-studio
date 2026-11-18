@@ -149,7 +149,16 @@ impl SaveFlow {
     pub fn answer_close(&mut self, answer: CloseAnswer) -> Vec<Effect> {
         match answer {
             CloseAnswer::Save => self.save(true),
-            CloseAnswer::DontSave => vec![Effect::LetGo, Effect::Close],
+            CloseAnswer::DontSave => {
+                // A save running goes on, as it was asked for, but nothing follows it: not
+                // another save, of edits the person has just said not to keep, nor the close it
+                // would have made, which this makes.
+                if let SaveFlow::Saving { again, then_close, .. } = self {
+                    *again = false;
+                    *then_close = false;
+                }
+                vec![Effect::LetGo, Effect::Close]
+            }
             CloseAnswer::Cancel => Vec::new(),
         }
     }
