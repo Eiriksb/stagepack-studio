@@ -183,6 +183,7 @@ pub enum Align {
     Right,
 }
 
+#[derive(Clone)]
 pub struct ShapedText {
     pub buffer: Arc<Buffer>,
     pub width: f32,

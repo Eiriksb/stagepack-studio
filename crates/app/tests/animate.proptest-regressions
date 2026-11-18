@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f2756d79d997cb02b1d456fe9faca30c276771788868b00c1feeaaafa149dab8 # shrinks to (all, fixed, picked) = ([Stepped { target: Tag(0..5), click: None, each: false }, Stepped { target: Tag(10..15), click: None, each: false }, Stepped { target: Tag(20..25), click: Some(3), each: false }, Stepped { target: Tag(30..35), click: Some(2), each: false }, Stepped { target: Tag(40..45), click: Some(4), each: false }], 0, [Tag(20..25), Tag(30..35)]), choice = Later
+cc f454232519a0704756fd0a0690bb480bde4d281c8beb2e5edd569cdf0fd51902 # shrinks to (all, fixed, picked) = ([Stepped { target: Tag(0..5), click: Some(1), each: false }, Stepped { target: Tag(10..15), click: Some(2), each: false }], 0, [Tag(0..5)]), choice = Each(true)
+cc f9c941aab72ff016951017128cb6cdef565976d7dbc23cbe16ab24a7f4c72eb0 # shrinks to (all, fixed, picked) = ([Stepped { target: Tag(0..5), click: Some(8), each: false }, Stepped { target: Tag(10..15), click: Some(7), each: false }], 1, [Tag(10..15)]), choice = Earlier
+cc 4c86caf33889dec00550c737973fc4fe9941a607f541965e5bc9235515709ceb # shrinks to (all, fixed, picked) = ([Stepped { target: Tag(0..5), click: Some(3), each: false }, Stepped { target: Region("area1"), click: None, each: true }, Stepped { target: Tag(20..25), click: Some(4), each: false }, Stepped { target: Tag(30..35), click: Some(2), each: false }], 1, [Tag(30..35)]), choice = Earlier

@@ -1,6 +1,6 @@
 //! A talk and its drawn layers, kept so that an edit only draws again what it changed.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -8,17 +8,18 @@ use std::sync::Arc;
 use tiny_skia::Pixmap;
 
 use slides_components::Diagnostic;
-use slides_format::{Settings, Talk, is_hidden, parse_talk};
+use slides_format::{Settings, Talk, Target, is_hidden, parse_talk};
 use toolkit::{ComponentSchema, Registry};
 
 use crate::builtins::DEFAULT_ICON_SIZE;
 use crate::pictures::picture_size;
-use crate::slide::{EmptyRegion, MAX_SIZE, SLIDE_WIDTH, empty_region_layer};
-use crate::text_geometry::{LayerText, TextLayout};
+use crate::slide::{EmptyRegion, MAX_SIZE, SLIDE_WIDTH, empty_region_layer, layout_slide_placed, placed_at, placed_tag, placed_tag_layer};
+use crate::text_geometry::{LayerText, RegionBox, TextLayout};
 use crate::timeline::MAX_CLICK;
+use crate::render::device_offset;
 use crate::{
-    ComponentAsks, ComponentInfo, DisplayItem, Fonts, Layer, LayerSpec, LayerTiming, LayoutEnv, Moment, PictureCache, SlideTimeline,
-    SchemaLoad, TalkComponents, TalkFiles, Transition, builtin_registry, compose, layout_slide, render_layer, talk_theme,
+    ComponentAsks, ComponentInfo, DisplayItem, Fonts, Layer, LayerSpec, LayerTiming, LayoutEnv, Moment, PictureCache, Placing, SlideTimeline,
+    SchemaLoad, TalkComponents, TalkFiles, Transition, builtin_registry, compose, render_layer, talk_theme,
 };
 
 /// How many scales of one slide are kept drawn. A zoom or a resize asks for many in a row.
@@ -46,8 +47,63 @@ struct LayerKey {
     moment: Option<(u32, u32)>,
 }
 
+impl LayerKey {
+    /// Whether the two are the same layer but for where it sits: the same picture, moved.
+    fn moved_from(&self, other: &LayerKey) -> bool {
+        self.place[2..] == other.place[2..]
+            && self.drawing == other.drawing
+            && self.files_generation == other.files_generation
+            && self.moment == other.moment
+            && self.text == other.text
+    }
+}
+
+/// Where a layer sits and how it turns, as a key holds it.
+fn place_bits(spec: &LayerSpec) -> [u32; 5] {
+    let rect = spec.rect;
+    [rect.x, rect.y, rect.w, rect.h, spec.rotate].map(f32::to_bits)
+}
+
+/// Where a pixmap was drawn: the place on the slide it was drawn for, in slide units, and the
+/// device pixel it sits at there. A pixmap only moved is always placed from here, so that
+/// moving it again and again adds up no rounding.
+#[derive(Clone, Copy)]
+struct DrawnAt {
+    x: f32,
+    y: f32,
+    left: i32,
+    top: i32,
+}
+
+impl DrawnAt {
+    fn of(layer: &Layer, x: f32, y: f32) -> DrawnAt {
+        DrawnAt { x, y, left: layer.x, top: layer.y }
+    }
+
+    /// `pixmap`, drawn here, shown at (`x`, `y`) on the slide, at `scale`.
+    fn shown_at(&self, pixmap: &Arc<Pixmap>, x: f32, y: f32, scale: f32) -> Arc<Layer> {
+        let at = |from: i32, by: f32| device_offset(from as f32 + (by * scale).round());
+        Arc::new(Layer { pixmap: pixmap.clone(), x: at(self.left, x - self.x), y: at(self.top, y - self.y) })
+    }
+}
+
+/// A layer of `drawn` that is `key` but for where it sits, shown where `key` sits at `scale`,
+/// and where its pixmap was drawn. The slide's own layers are looked at first.
+fn moved_layer(drawn: &Drawn, key: &LayerKey, scale: f32) -> Option<(Arc<Layer>, DrawnAt)> {
+    let place = |key: &LayerKey| (f32::from_bits(key.place[0]), f32::from_bits(key.place[1]));
+    let own = drawn.by_key.iter().find(|(other, _)| key.moved_from(other)).map(|(other, layer)| {
+        let (x, y) = place(other);
+        (layer, DrawnAt::of(layer, x, y))
+    });
+    let placed = || drawn.placed_by_key.iter().find(|(other, _)| key.moved_from(other)).map(|(_, (layer, at))| (layer, *at));
+    let (layer, at) = own.or_else(placed)?;
+    let (x, y) = place(key);
+    Some((at.shown_at(&layer.pixmap, x, y, scale), at))
+}
+
 /// A slide laid out. The keys are made when the slide is, because `LayerSpec::source`
 /// points into the text of that moment, which later edits move.
+#[derive(Clone)]
 struct Laid {
     specs: Vec<LayerSpec>,
     keys: Vec<LayerKey>,
@@ -60,6 +116,12 @@ struct Laid {
     texts: Vec<LayerText>,
     /// The regions of the layout with nothing in them.
     empty_regions: Vec<EmptyRegion>,
+    /// Every region of the layout, as placed.
+    regions: Vec<RegionBox>,
+    /// The most steps a region shown a piece at a time takes.
+    each_steps: u32,
+    /// Each region shown a piece at a time, by name, and the steps it takes.
+    each_regions: Vec<(String, u32)>,
     /// Where the slide's editable text is, once it's been asked for, and the state of the
     /// talk's loaded modules it was worked out for: which of them take content.
     text_layout: Option<(u64, Arc<TextLayout>)>,
@@ -108,6 +170,12 @@ struct Drawn {
     ordered: Option<(Moment, Vec<Arc<Layer>>)>,
     /// What the editor shows in the slide's empty regions, as long as nothing in it has changed.
     empty_regions: Option<Vec<Arc<Layer>>>,
+    /// The layers shown with the deck's placing that the slide's own layers don't have.
+    placed_by_key: HashMap<LayerKey, (Arc<Layer>, DrawnAt)>,
+    /// The layers in order with the deck's placing, as long as it stays.
+    placed_ordered: Option<Vec<Arc<Layer>>>,
+    /// What the editor shows in the slide's empty regions with the deck's placing.
+    placed_empty_regions: Option<Vec<Arc<Layer>>>,
 }
 
 impl Drawn {
@@ -115,6 +183,25 @@ impl Drawn {
     fn slide_changed(&mut self) {
         self.ordered = None;
         self.empty_regions = None;
+        self.placing_cleared();
+    }
+
+    /// Forgets what's shown with a placing that has changed, keeping its layers by key.
+    fn placing_changed(&mut self) {
+        self.placed_ordered = None;
+        self.placed_empty_regions = None;
+    }
+
+    /// Forgets everything shown with a placing.
+    fn placing_cleared(&mut self) {
+        self.placing_changed();
+        self.placed_by_key.clear();
+    }
+
+    /// Every layer it holds, some of them perhaps more than once.
+    fn layers(&self) -> impl Iterator<Item = &Arc<Layer>> {
+        let empty = self.empty_regions.iter().chain(&self.placed_empty_regions).flatten();
+        self.by_key.values().chain(self.placed_by_key.values().map(|(layer, _)| layer)).chain(empty)
     }
 }
 
@@ -124,6 +211,8 @@ struct SlideState {
     laid: Option<Laid>,
     /// The slide laid out at the one other moment it was last asked for, which differs from the start.
     at_moment: Option<(Moment, Laid)>,
+    /// The slide laid out in its whole state with the deck's placing, while it has one here.
+    placed: Option<Laid>,
     drawn: HashMap<u32, Drawn>,
     /// The whole slide on one small pixmap, and the width it was made for. It lasts until the
     /// slide changes, and counts against the memory budget with the drawn layers.
@@ -165,6 +254,8 @@ pub struct Deck {
     shown: Vec<usize>,
     /// The last version given to a slide.
     versions_made: u64,
+    /// Where things on one slide are shown that their source doesn't say yet, and the slide.
+    placing: Option<(usize, Vec<Placing>)>,
 }
 
 /// The talk's settings, as far as they decide how a slide looks: not where they sit.
@@ -220,6 +311,7 @@ impl Deck {
                 text,
                 laid: None,
                 at_moment: None,
+                placed: None,
                 drawn: HashMap::new(),
                 thumbnail: None,
                 last_used: 0,
@@ -244,6 +336,7 @@ impl Deck {
             slides_holding_pictures: BTreeSet::new(),
             versions_made: slides.len() as u64,
             slides,
+            placing: None,
         }
     }
 
@@ -280,6 +373,7 @@ impl Deck {
     }
 
     fn take_talk(&mut self, talk: Talk, files_changed: bool, matching: Matching) -> Vec<usize> {
+        self.clear_placing();
         let same_look = !files_changed
             && settings_pairs(self.talk.slides.first().and_then(|s| s.settings.as_ref()))
                 == settings_pairs(talk.slides.first().and_then(|s| s.settings.as_ref()));
@@ -322,7 +416,7 @@ impl Deck {
                     }
                     self.versions_made += 1;
                     let version = self.versions_made;
-                    slides.push(SlideState { text, laid: None, at_moment: None, drawn, thumbnail: None, last_used, thumbnail_used, version });
+                    slides.push(SlideState { text, laid: None, at_moment: None, placed: None, drawn, thumbnail: None, last_used, thumbnail_used, version });
                 }
             }
         }
@@ -349,6 +443,7 @@ impl Deck {
         for slide in &mut self.slides {
             slide.laid = None;
             slide.at_moment = None;
+            slide.placed = None;
             slide.thumbnail = None;
             for scale in slide.drawn.values_mut() {
                 scale.slide_changed();
@@ -364,6 +459,7 @@ impl Deck {
     /// somewhere new. Every slide is laid out again when next asked for, as nothing drawn
     /// from the old files is kept.
     pub fn set_files(&mut self, files: Box<dyn TalkFiles>) {
+        self.clear_placing();
         self.files = Rc::from(files);
         self.components = TalkComponents::scan_for(self.files.clone(), &self.registry);
         self.pictures.clear();
@@ -517,11 +613,15 @@ impl Deck {
     }
 
     /// The pixel bytes the deck is holding in drawn layers. A layer the slides share counts once.
+    /// A pixmap that's moved, and so shown by two layers, counts once too.
     pub fn drawn_bytes(&self) -> usize {
-        let drawn = || self.slides.iter().flat_map(|slide| slide.drawn.values());
-        let empty_regions = drawn().flat_map(|drawn| drawn.empty_regions.iter().flatten());
-        let slide_layers = drawn().flat_map(|drawn| drawn.by_key.values()).chain(empty_regions);
-        let layers: usize = slide_layers.chain(self.backgrounds.values()).map(|layer| layer.pixmap.data().len()).sum();
+        let slide_layers = self.slides.iter().flat_map(|slide| slide.drawn.values()).flat_map(Drawn::layers);
+        let mut counted = HashSet::new();
+        let layers: usize = slide_layers
+            .chain(self.backgrounds.values())
+            .filter(|layer| counted.insert(Arc::as_ptr(&layer.pixmap)))
+            .map(|layer| layer.pixmap.data().len())
+            .sum();
         let thumbnails: usize = self.slides.iter().filter_map(|slide| slide.thumbnail.as_ref()).map(|(_, pixmap)| pixmap.data().len()).sum();
         layers + thumbnails
     }
@@ -641,13 +741,87 @@ impl Deck {
         self.slides[index].laid.as_ref().expect("the slide was just laid out").asks.tags.clone()
     }
 
-    /// What each layer of the slide draws in its whole state, before it is drawn at any scale.
+    /// What each layer of the slide draws in its whole state, before it is drawn at any scale,
+    /// with the deck's placing. [`Self::specs_fonts_and_files`] never shows a placing.
     pub fn specs(&mut self, index: usize) -> &[LayerSpec] {
+        if self.ensure_placed(index) {
+            return &self.slides[index].placed.as_ref().expect("the slide was just laid out").specs;
+        }
         let moment = self.ensure_whole(index);
         &self.slides[index].laid_at(moment).specs
     }
 
-    /// A slide's specs in its whole state, with what they are drawn from: the fonts, and the talk's files.
+    /// Shows the things and regions `placing` names on slide `slide` where it says, as if their
+    /// source said so, until it's cleared: in `specs`, `layers`, `editor_layers` and
+    /// `text_layout`. The source, the slide's version, its thumbnail, `layers_at` and what's
+    /// exported don't change. A placing for anything that isn't a placed tag at the top level
+    /// of the slide or a region of its layout is ignored. A layer only moved isn't drawn again:
+    /// its pixmap is shown at the new place.
+    pub fn set_placing(&mut self, slide: usize, placing: Vec<Placing>) {
+        if self.placing.as_ref().is_some_and(|(at, now)| *at == slide && *now == placing) {
+            return;
+        }
+        match self.placing.take() {
+            Some((at, _)) if at != slide => self.forget_placing(at),
+            _ => {}
+        }
+        let Some(state) = self.slides.get_mut(slide) else { return };
+        state.placed = None;
+        for drawn in state.drawn.values_mut() {
+            drawn.placing_changed();
+        }
+        self.placing = Some((slide, placing));
+    }
+
+    /// Shows every slide as its source says again.
+    pub fn clear_placing(&mut self) {
+        if let Some((slide, _)) = self.placing.take() {
+            self.forget_placing(slide);
+        }
+    }
+
+    /// The slide that has a placing, and the placing.
+    pub fn placing(&self) -> Option<(usize, &[Placing])> {
+        self.placing.as_ref().map(|(slide, placing)| (*slide, placing.as_slice()))
+    }
+
+    fn forget_placing(&mut self, slide: usize) {
+        if let Some(state) = self.slides.get_mut(slide) {
+            state.placed = None;
+            for drawn in state.drawn.values_mut() {
+                drawn.placing_cleared();
+            }
+            if !state.holds_pictures() {
+                self.slides_holding_pictures.remove(&slide);
+            }
+        }
+    }
+
+    /// The steps slide `slide` takes that no `click` can renumber: those of a region shown a
+    /// piece at a time, and of a component that steps. 0 for a slide the talk doesn't have.
+    pub fn fixed_steps(&mut self, slide: usize) -> u32 {
+        if slide >= self.slides.len() {
+            return 0;
+        }
+        self.ensure_laid(slide);
+        let laid = self.slides[slide].laid.as_ref().expect("the slide was just laid out");
+        laid.each_steps.max(laid.asks.steps).min(MAX_CLICK)
+    }
+
+    /// The steps region `region` of slide `slide` takes, shown a piece at a time from click 1:
+    /// one for a region turned, which shows whole on click 1. `None` for a region not shown
+    /// that way, one with nothing in it, or a slide the talk doesn't have.
+    pub fn each_steps(&mut self, slide: usize, region: &str) -> Option<u32> {
+        if slide >= self.slides.len() {
+            return None;
+        }
+        self.ensure_laid(slide);
+        let laid = self.slides[slide].laid.as_ref().expect("the slide was just laid out");
+        laid.each_regions.iter().find(|(name, _)| name == region).map(|(_, steps)| *steps)
+    }
+
+    /// A slide's specs in its whole state, with what they are drawn from: the fonts, and the talk's
+    /// files. They're always as the source says: unlike [`Self::specs`], never with a placing.
     pub fn specs_fonts_and_files(&mut self, index: usize) -> (&[LayerSpec], &mut Fonts, &dyn TalkFiles) {
         let moment = self.ensure_whole(index);
         (&self.slides[index].laid_at(moment).specs, &mut self.fonts, &*self.files)
@@ -662,38 +836,77 @@ impl Deck {
         &mut self.fonts
     }
 
-    /// The slide's layers in its whole state, first to last, drawn at `scale`: its last step, at time 0.
+    /// The slide's layers in its whole state, first to last, drawn at `scale`: its last step, at
+    /// time 0, with the deck's placing. Under a placing they needn't be as many as
+    /// `timeline().layers`, which is the source's: a region shown a piece at a time and turned by
+    /// the placing is one layer. So the two are only to be paired with no placing.
     pub fn layers(&mut self, index: usize, scale: f32) -> Vec<Arc<Layer>> {
+        if self.ensure_placed(index) {
+            return self.placed_layers(index, scale);
+        }
         let whole = self.ensure_whole(index);
         self.layers_at(index, whole, scale)
     }
 
     /// The slide's layers in its whole state, as `layers` gives them, and then, for the editor
     /// alone, what it shows in each region of the layout with nothing in it: an offer to add
-    /// a title or text there. A show, a thumbnail and an export never have those.
+    /// a title or text there. A show, a thumbnail and an export never have those. Like `layers`,
+    /// under a placing they needn't match `timeline().layers`.
     pub fn editor_layers(&mut self, index: usize, scale: f32) -> Vec<Arc<Layer>> {
         if index >= self.slides.len() {
             return Vec::new();
         }
         let mut layers = self.layers(index, scale);
-        let drawn = self.slides[index].drawn.entry(scale.to_bits()).or_default();
-        let empty = match &drawn.empty_regions {
-            Some(empty) => empty.clone(),
-            None => {
-                let moment = self.ensure_whole(index);
-                let theme = talk_theme(&self.talk);
-                let regions = &self.slides[index].laid_at(moment).empty_regions;
-                let empty: Vec<Arc<Layer>> = regions
-                    .iter()
-                    .map(|region| Arc::new(render_layer(&empty_region_layer(region, &theme, &mut self.fonts), scale, &mut self.fonts)))
-                    .collect();
-                self.slides[index].drawn.entry(scale.to_bits()).or_default().empty_regions = Some(empty.clone());
-                self.keep_within_budget(index);
-                empty
-            }
-        };
+        let empty = self.empty_region_layers(index, scale);
+        let empty = if self.ensure_placed(index) { self.placed_empty_region_layers(index, scale, empty) } else { empty };
         layers.extend(empty);
         layers
+    }
+
+    /// What the editor shows in slide `index`'s empty regions, as its source has them, drawn at `scale`.
+    fn empty_region_layers(&mut self, index: usize, scale: f32) -> Vec<Arc<Layer>> {
+        let drawn = self.slides[index].drawn.entry(scale.to_bits()).or_default();
+        if let Some(empty) = &drawn.empty_regions {
+            return empty.clone();
+        }
+        let moment = self.ensure_whole(index);
+        let theme = talk_theme(&self.talk);
+        let regions = &self.slides[index].laid_at(moment).empty_regions;
+        let empty: Vec<Arc<Layer>> = regions
+            .iter()
+            .map(|region| Arc::new(render_layer(&empty_region_layer(region, &theme, &mut self.fonts), scale, &mut self.fonts)))
+            .collect();
+        self.slides[index].drawn.entry(scale.to_bits()).or_default().empty_regions = Some(empty.clone());
+        self.keep_within_budget(index);
+        empty
+    }
+
+    /// What the editor shows in slide `index`'s empty regions with the deck's placing, drawn at
+    /// `scale`, from `own`, what it shows as the source has them: one that hasn't moved is as it
+    /// was, one only moved is shown at its new place, and any other is drawn again.
+    fn placed_empty_region_layers(&mut self, index: usize, scale: f32, own: Vec<Arc<Layer>>) -> Vec<Arc<Layer>> {
+        if let Some(empty) = &self.slides[index].drawn.entry(scale.to_bits()).or_default().placed_empty_regions {
+            return empty.clone();
+        }
+        let moment = self.ensure_whole(index);
+        let theme = talk_theme(&self.talk);
+        let slide = &self.slides[index];
+        let (base, placed) = (&slide.laid_at(moment).empty_regions, &slide.placed.as_ref().expect("the slide was just laid out").empty_regions);
+        let mut empty = Vec::with_capacity(placed.len());
+        for region in placed {
+            let was = base.iter().zip(&own).find(|(was, _)| was.name == region.name);
+            let layer = match was {
+                Some((was, layer)) if was.rect == region.rect && was.rotate == region.rotate => layer.clone(),
+                Some((was, layer)) if (was.rect.w, was.rect.h, was.rotate) == (region.rect.w, region.rect.h, region.rotate) => {
+                    DrawnAt::of(layer, was.rect.x, was.rect.y).shown_at(&layer.pixmap, region.rect.x, region.rect.y, scale)
+                }
+                _ => Arc::new(render_layer(&empty_region_layer(region, &theme, &mut self.fonts), scale, &mut self.fonts)),
+            };
+            empty.push(layer);
+        }
+        self.slides[index].drawn.entry(scale.to_bits()).or_default().placed_empty_regions = Some(empty.clone());
+        self.keep_within_budget(index);
+        empty
     }
 
     /// What `editor_layers` adds to the slide's own layers, before it's drawn.
@@ -715,17 +928,19 @@ impl Deck {
         if index >= self.slides.len() {
             return Arc::new(TextLayout::default());
         }
+        let placed = self.ensure_placed(index);
         let moment = self.ensure_whole(index);
         let (talk, components) = (&self.talk, &self.components);
         let generation = components.loaded_generation();
-        let laid = self.slides[index].laid_at_mut(moment);
+        let slide = &mut self.slides[index];
+        let laid = if placed { slide.placed.as_mut().expect("the slide was just laid out") } else { slide.laid_at_mut(moment) };
         if let Some((built_for, layout)) = &laid.text_layout
             && *built_for == generation
         {
             return layout.clone();
         }
         let takes_content = |tag: &str| components.takes_content(tag);
-        let layout = Arc::new(TextLayout::build(talk, index, &laid.specs, &laid.texts, &laid.empty_regions, &takes_content));
+        let layout = Arc::new(TextLayout::build(talk, index, &laid.specs, &laid.texts, &laid.empty_regions, &laid.regions, &takes_content));
         laid.text_layout = Some((generation, layout.clone()));
         layout
     }
@@ -863,6 +1078,7 @@ impl Deck {
             };
             self.slides[furthest].laid = None;
             self.slides[furthest].at_moment = None;
+            self.slides[furthest].placed = None;
             self.slides_holding_pictures.remove(&furthest);
             self.pictures.let_go_of_unused();
         }
@@ -923,38 +1139,32 @@ impl Deck {
     }
 
     fn lay_out(&mut self, index: usize, moment: Moment) -> Laid {
-        let mut env = LayoutEnv {
-            fonts: &mut self.fonts,
-            registry: &self.registry,
-            files: &*self.files,
-            pictures: &mut self.pictures,
-            components: &mut self.components,
-            moment,
-            asks: ComponentAsks::default(),
-        };
-        let laid = layout_slide(&self.talk, index, &mut env);
-        let source = &self.talk.source;
-        let theme = &self.theme;
-        let layout = self.talk.slides[index]
-            .settings
-            .as_ref()
-            .and_then(|settings| settings.get("layout"))
-            .unwrap_or_default();
-        let keys = laid
-            .layers
-            .iter()
-            .map(|spec| {
-                let text = spec.source.clone().map(|range| source[range].to_string()).unwrap_or_default();
-                let rect = spec.rect;
-                LayerKey {
-                    text: format!("{theme}\n{layout}\n{}\n{text}", spec.source.is_some()),
-                    place: [rect.x, rect.y, rect.w, rect.h, spec.rotate].map(f32::to_bits),
-                    drawing: drawing_fingerprint(&spec.items),
-                    files_generation: self.files_generation,
-                    moment: spec.varies.then_some((moment.step, moment.time.to_bits())),
-                }
-            })
-            .collect();
+        self.lay_out_placed(index, moment, &[])
+    }
+
+    /// What makes `spec`, one of slide `index`'s layers at `moment`, the same as a layer drawn before.
+    fn layer_key(&self, index: usize, moment: Moment, spec: &LayerSpec) -> LayerKey {
+        let layout = self.talk.slides[index].settings.as_ref().and_then(|settings| settings.get("layout")).unwrap_or_default();
+        let text = spec.source.clone().map(|range| &self.talk.source[range]).unwrap_or_default();
+        LayerKey {
+            text: format!("{}\n{layout}\n{}\n{text}", self.theme, spec.source.is_some()),
+            place: place_bits(spec),
+            drawing: drawing_fingerprint(&spec.items),
+            files_generation: self.files_generation,
+            moment: spec.varies.then_some((moment.step, moment.time.to_bits())),
+        }
+    }
+
+    /// Runs `lay_out` with the talk and what laying it out at `moment` takes.
+    fn with_layout_env<T>(&mut self, moment: Moment, lay_out: impl FnOnce(&Talk, &mut LayoutEnv) -> T) -> T {
+        let Deck { fonts, registry, files, pictures, components, talk, .. } = self;
+        let mut env = LayoutEnv { fonts, registry, files: &**files, pictures, components, moment, asks: ComponentAsks::default() };
+        lay_out(talk, &mut env)
+    }
+
+    fn lay_out_placed(&mut self, index: usize, moment: Moment, placing: &[Placing]) -> Laid {
+        let laid = self.with_layout_env(moment, |talk, env| layout_slide_placed(talk, index, env, placing));
+        let keys = laid.layers.iter().map(|spec| self.layer_key(index, moment, spec)).collect();
         let notices = laid.notices.into_iter().map(|notice| notice.0).collect();
         let holds_pictures = laid
             .layers
@@ -970,8 +1180,143 @@ impl Deck {
             asks: laid.asks,
             texts: laid.texts,
             empty_regions: laid.empty_regions,
+            regions: laid.regions,
+            each_steps: laid.each_steps,
+            each_regions: laid.each_regions,
             text_layout: None,
         }
+    }
+
+    /// Lays out slide `index` with the deck's placing if it has one here and it isn't already,
+    /// and says whether it has.
+    fn ensure_placed(&mut self, index: usize) -> bool {
+        let Some((_, placing)) = self.placing.as_ref().filter(|(slide, _)| *slide == index) else { return false };
+        let placing = placing.clone();
+        let moment = self.ensure_whole(index);
+        if self.slides[index].placed.is_none() {
+            let laid = self.placed_layout(index, moment, &placing);
+            self.slides[index].placed = Some(laid);
+            // Laid out again, it can hold pictures its own layouts don't.
+            self.held_pictures_changed(index);
+        }
+        true
+    }
+
+    /// Slide `index` in its whole state, at `moment`, with `placing`. What's only moved is
+    /// moved, a placed tag of a new size or turn is laid out again by itself, and the whole
+    /// slide is laid out again only for a region of a new size or turn.
+    fn placed_layout(&mut self, index: usize, moment: Moment, placing: &[Placing]) -> Laid {
+        // The last placing for each target is the one that counts.
+        let last: Vec<&Placing> =
+            placing.iter().enumerate().filter(|(at, this)| !placing[at + 1..].iter().any(|later| later.target == this.target)).map(|(_, this)| this).collect();
+        let base = self.slides[index].laid_at(moment);
+        let reshaped = |placing: &Placing| match &placing.target {
+            Target::Region(name) => base.regions.iter().find(|region| region.name == *name).is_some_and(|region| {
+                let (rect, rotate) = placed_at(region.rect, region.rotate, placing);
+                (rect.w, rect.h, rotate) != (region.rect.w, region.rect.h, region.rotate)
+            }),
+            Target::Tag(_) => false,
+        };
+        if last.iter().any(|placing| reshaped(placing)) {
+            return self.lay_out_placed(index, moment, placing);
+        }
+        let mut laid = base.clone();
+        laid.text_layout = None;
+        let mut laid_again = Vec::new();
+        for placing in last {
+            match &placing.target {
+                Target::Region(name) => {
+                    let Some(region) = laid.regions.iter_mut().find(|region| region.name == *name) else { continue };
+                    let (rect, _) = placed_at(region.rect, region.rotate, placing);
+                    let (dx, dy) = (rect.x - region.rect.x, rect.y - region.rect.y);
+                    region.rect = rect;
+                    for ((spec, text), key) in laid.specs.iter_mut().zip(&mut laid.texts).zip(&mut laid.keys) {
+                        // A region shown a piece at a time has a layer for each piece, whose own place this is.
+                        let Some((_, area)) = text.region.as_mut().filter(|(region, _)| *region == name.as_str()) else { continue };
+                        area.x += dx;
+                        area.y += dy;
+                        spec.rect.x += dx;
+                        spec.rect.y += dy;
+                        key.place = place_bits(spec);
+                    }
+                    for empty in laid.empty_regions.iter_mut().filter(|empty| empty.name == name.as_str()) {
+                        empty.rect = rect;
+                    }
+                }
+                Target::Tag(range) => {
+                    if placed_tag(&self.talk.slides[index], range).is_none() {
+                        continue;
+                    }
+                    let found = (0..laid.specs.len()).find(|&at| laid.texts[at].whole && laid.specs[at].source.as_ref() == Some(range));
+                    let Some(at) = found else { continue };
+                    let spec = &mut laid.specs[at];
+                    let (rect, rotate) = placed_at(spec.rect, spec.rotate, placing);
+                    if (rect.w, rect.h) == (spec.rect.w, spec.rect.h) {
+                        spec.rect = rect;
+                        spec.rotate = rotate;
+                        laid.keys[at].place = place_bits(spec);
+                    } else {
+                        laid_again.push((at, range.clone(), placing.clone()));
+                    }
+                }
+            }
+        }
+        for (at, range, placing) in laid_again {
+            let Some((spec, text)) = self.with_layout_env(moment, |talk, env| placed_tag_layer(talk, index, &range, &placing, env)) else { continue };
+            laid.keys[at] = self.layer_key(index, moment, &spec);
+            laid.specs[at] = spec;
+            laid.texts[at] = text;
+        }
+        laid
+    }
+
+    /// Slide `index`'s layers with the deck's placing, which `ensure_placed` laid out, drawn at
+    /// `scale`. A layer the slide's own layers have is theirs, and one only moved shows the
+    /// pixmap it was drawn into at its new place.
+    fn placed_layers(&mut self, index: usize, scale: f32) -> Vec<Arc<Layer>> {
+        self.keep_moments_of(index);
+        self.layers_asked_for += 1;
+        self.slides[index].last_used = self.layers_asked_for;
+        let slide = &mut self.slides[index];
+        if slide.drawn.len() >= KEPT_SCALES && !slide.drawn.contains_key(&scale.to_bits()) {
+            slide.drawn.clear();
+        }
+        let SlideState { placed, drawn, .. } = slide;
+        let placed = placed.as_ref().expect("the slide was just laid out");
+        let drawn = drawn.entry(scale.to_bits()).or_default();
+        if let Some(ordered) = &drawn.placed_ordered {
+            return ordered.clone();
+        }
+        let mut by_key = HashMap::new();
+        let mut ordered = Vec::with_capacity(placed.specs.len());
+        for (spec, key) in placed.specs.iter().zip(&placed.keys) {
+            let layer = if spec.source.is_none() {
+                self.backgrounds
+                    .entry((self.theme.clone(), scale.to_bits()))
+                    .or_insert_with(|| Arc::new(render_layer(spec, scale, &mut self.fonts)))
+                    .clone()
+            } else if let Some(layer) = drawn.by_key.get(key) {
+                layer.clone()
+            } else {
+                let (layer, at) = by_key
+                    .get(key)
+                    .or_else(|| drawn.placed_by_key.get(key))
+                    .cloned()
+                    .or_else(|| moved_layer(drawn, key, scale))
+                    .unwrap_or_else(|| {
+                        let layer = Arc::new(render_layer(spec, scale, &mut self.fonts));
+                        let at = DrawnAt::of(&layer, spec.rect.x, spec.rect.y);
+                        (layer, at)
+                    });
+                by_key.insert(key.clone(), (layer.clone(), at));
+                layer
+            };
+            ordered.push(layer);
+        }
+        drawn.placed_by_key = by_key;
+        drawn.placed_ordered = Some(ordered.clone());
+        self.keep_within_budget(index);
+        ordered
     }
 }
 
@@ -981,6 +1326,8 @@ impl SlideState {
         if from == to {
             return;
         }
+        // A placing names things by where they're written, so it's gone by now.
+        self.placed = None;
         let at_moment = self.at_moment.as_mut().map(|(_, laid)| laid);
         for laid in self.laid.iter_mut().chain(at_moment) {
             for spec in &mut laid.specs {
@@ -996,10 +1343,10 @@ impl SlideState {
         }
     }
 
-    /// Whether either of its layouts shows a picture from a file of the talk.
+    /// Whether any of its layouts shows a picture from a file of the talk.
     fn holds_pictures(&self) -> bool {
         let at_moment = self.at_moment.as_ref().map(|(_, laid)| laid);
-        self.laid.iter().chain(at_moment).any(|laid| laid.holds_pictures)
+        self.laid.iter().chain(at_moment).chain(&self.placed).any(|laid| laid.holds_pictures)
     }
 
     /// The layout at `moment`, which `Deck::ensure_laid_at` made sure of.

@@ -80,6 +80,14 @@ pub fn find_tag<'a>(talk: &'a Talk, slide: usize, range: &Range<usize>) -> Optio
     guarded(|| tag_at(talk, slide, range))
 }
 
+/// The tag at the top level of `slide` whose range is exactly `range`.
+pub(crate) fn top_tag<'a>(slide: &'a Slide, range: &Range<usize>) -> Option<&'a Tag> {
+    slide.blocks.iter().find_map(|block| match block {
+        Block::Tag(tag) if tag.range == *range => Some(tag),
+        _ => None,
+    })
+}
+
 fn tag_at<'a>(talk: &'a Talk, slide: usize, range: &Range<usize>) -> Option<&'a Tag> {
     match find_block(&talk.slides.get(slide)?.blocks, range)? {
         Block::Tag(tag) => Some(tag),
@@ -122,7 +130,7 @@ fn one_line_ending(text: &str) -> String {
 }
 
 /// What `make` gives, or `None` if it panics.
-fn guarded<T>(make: impl FnOnce() -> Option<T>) -> Option<T> {
+pub(crate) fn guarded<T>(make: impl FnOnce() -> Option<T>) -> Option<T> {
     catch_unwind(AssertUnwindSafe(make)).ok().flatten()
 }
 
@@ -131,7 +139,7 @@ fn is_tag_name(name: &str) -> bool {
     chars.next().is_some_and(|first| first.is_ascii_uppercase()) && chars.all(|c| c.is_ascii_alphanumeric())
 }
 
-fn is_attr_name(name: &str) -> bool {
+pub(crate) fn is_attr_name(name: &str) -> bool {
     let mut chars = name.chars();
     chars.next().is_some_and(|first| first.is_ascii_lowercase()) && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
@@ -152,7 +160,7 @@ fn find_block<'a>(blocks: &'a [Block], range: &Range<usize>) -> Option<&'a Block
 
 /// Calls `change` on the block at exactly `range` among `blocks`, at any depth, with the list
 /// that holds it and its place there. Whether there was one.
-fn with_block(blocks: &mut Vec<Block>, range: &Range<usize>, change: &mut impl FnMut(&mut Vec<Block>, usize)) -> bool {
+pub(crate) fn with_block(blocks: &mut Vec<Block>, range: &Range<usize>, change: &mut impl FnMut(&mut Vec<Block>, usize)) -> bool {
     if let Some(at) = blocks.iter().position(|block| block.range() == range) {
         change(blocks, at);
         return true;
@@ -165,27 +173,27 @@ fn with_block(blocks: &mut Vec<Block>, range: &Range<usize>, change: &mut impl F
 }
 
 /// The start of the line `at` is in.
-fn line_start(source: &str, at: usize) -> usize {
+pub(crate) fn line_start(source: &str, at: usize) -> usize {
     source[..at].rfind('\n').map_or(0, |i| i + 1)
 }
 
 /// Just past the line ending of the line `at` is in, or the end of the text.
-fn line_end(source: &str, at: usize) -> usize {
+pub(crate) fn line_end(source: &str, at: usize) -> usize {
     source[at..].find('\n').map_or(source.len(), |i| at + i + 1)
 }
 
-fn is_blank(line: &str) -> bool {
+pub(crate) fn is_blank(line: &str) -> bool {
     line.trim().is_empty()
 }
 
 /// The length of the line ending `text` ends with.
-fn ending_len(text: &str) -> usize {
+pub(crate) fn ending_len(text: &str) -> usize {
     if text.ends_with("\r\n") { 2 } else { usize::from(text.ends_with('\n')) }
 }
 
 /// Whether slide `index` of `after`, `talk` changed, reads as `blocks` with nothing else
 /// about it changed: the same number of slides, the same notes, and no error.
-fn reads_as(talk: &Talk, after: &Talk, index: usize, blocks: &[Block]) -> bool {
+pub(crate) fn reads_as(talk: &Talk, after: &Talk, index: usize, blocks: &[Block]) -> bool {
     let (Some(old), Some(new)) = (talk.slides.get(index), after.slides.get(index)) else { return false };
     after.slides.len() == talk.slides.len()
         && new.error.is_none()
@@ -200,7 +208,7 @@ fn settings_of(slide: &Slide) -> Option<Vec<(&str, &str)>> {
 }
 
 /// A readable slide of the talk, by index.
-fn readable(talk: &Talk, index: usize) -> Option<&Slide> {
+pub(crate) fn readable(talk: &Talk, index: usize) -> Option<&Slide> {
     talk.slides.get(index).filter(|slide| slide.error.is_none())
 }
 
@@ -308,7 +316,7 @@ fn after_block(source: &str, slide: &Slide, end: usize, text: &str, eol: &str) -
 
 /// `end`, the end of a block's range, moved back over the line endings and spaces it ends
 /// with: the `markdown` crate takes the blank lines after a list into the list.
-fn content_end(source: &str, end: usize) -> usize {
+pub(crate) fn content_end(source: &str, end: usize) -> usize {
     source[..end].trim_end_matches([' ', '\t', '\r', '\n']).len()
 }
 
@@ -369,32 +377,46 @@ fn attr_change(talk: &Talk, index: usize, range: &Range<usize>, name: &str, valu
         return None;
     }
     let source = talk.source.as_str();
-    let edits = match value {
-        Some(value) => vec![set_attr_as_typed(source, tag, name, value)?],
-        None => remove_attr(source, tag, name),
-    };
-    let edits: Vec<SourceEdit> = edits.into_iter().filter(|edit| source.get(edit.range.clone()) != Some(edit.text.as_str())).collect();
+    let edits = attr_edits(source, tag, name, value)?;
     if edits.is_empty() {
         return Some(Change { edits });
     }
-    if edits.iter().any(|edit| edit.range.start <= tag.range.start || edit.range.end >= tag.open_end) {
-        return None;
-    }
-
     let mut expected = slide.blocks.clone();
     with_block(&mut expected, range, &mut |blocks, at| {
-        let Block::Tag(tag) = &mut blocks[at] else { return };
-        match value {
-            Some(value) => match tag.attrs.iter_mut().find(|attr| attr.name == name) {
-                Some(attr) => attr.value = value.to_string(),
-                None => tag.attrs.push(Attr { name: name.to_string(), value: value.to_string(), name_range: 0..0, value_range: 0..0 }),
-            },
-            None => tag.attrs.retain(|attr| attr.name != name),
+        if let Block::Tag(tag) = &mut blocks[at] {
+            set_attr_read(tag, name, value);
         }
     });
     let change = Change { edits };
     let after = reparse(talk, change.apply(source));
     reads_as(talk, &after, index, &expected).then_some(change)
+}
+
+/// The edits that set attribute `name` of `tag` to `value`, written as [`tag_text`] writes
+/// values, or with `None` take every one of that name away, leaving out any that change no
+/// byte. `None` where the value can't be written, or an edit would reach outside the opening
+/// tag.
+pub(crate) fn attr_edits(source: &str, tag: &Tag, name: &str, value: Option<&str>) -> Option<Vec<SourceEdit>> {
+    let edits = match value {
+        Some(value) => vec![set_attr_as_typed(source, tag, name, value)?],
+        None => remove_attr(source, tag, name),
+    };
+    let edits: Vec<SourceEdit> = edits.into_iter().filter(|edit| source.get(edit.range.clone()) != Some(edit.text.as_str())).collect();
+    if edits.iter().any(|edit| edit.range.start <= tag.range.start || edit.range.end >= tag.open_end) {
+        return None;
+    }
+    Some(edits)
+}
+
+/// `tag` as it reads once [`attr_edits`] has set `name` to `value`, or taken it away.
+pub(crate) fn set_attr_read(tag: &mut Tag, name: &str, value: Option<&str>) {
+    match value {
+        Some(value) => match tag.attrs.iter_mut().find(|attr| attr.name == name) {
+            Some(attr) => attr.value = value.to_string(),
+            None => tag.attrs.push(Attr { name: name.to_string(), value: value.to_string(), name_range: 0..0, value_range: 0..0 }),
+        },
+        None => tag.attrs.retain(|attr| attr.name != name),
+    }
 }
 
 // ---------------------------------------------------------------------------------------

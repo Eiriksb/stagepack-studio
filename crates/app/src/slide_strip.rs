@@ -18,9 +18,10 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use slides_engine::{Pixmap, to_bgra_frame};
+use slides_engine::{Pixmap, layouts, to_bgra_frame};
 
 use crate::document::Document;
+use crate::layout_picker::{SetLayout, layout_name};
 use crate::slide_editor::SlideEditor;
 use crate::workspace_view::{
     CopyToClipboard, CutToClipboard, DeleteSlide, DuplicateSlide, MoveSlideDown, MoveSlideTo,
@@ -203,8 +204,9 @@ impl SlideStrip {
         self.editor = Some(editor);
     }
 
-    /// Lets go of the thing selected on a slide, and ends any typing on it as Escape does, as
-    /// the list takes the keyboard: from here Delete and the clipboard act on whole slides, and
+    /// Lets go of what's selected on a slide, things or areas, and ends any typing on it as
+    /// Escape does, as the list or the notes take the keyboard: from the list Delete and the
+    /// clipboard act on whole slides, and
     /// a thing still shown as selected, a caret still drawn or a new text box still waiting for
     /// its first letter would say otherwise. Typing ends at once, before anything the press
     /// goes on to do, so that nothing resumes it and takes the keyboard back for the slide.
@@ -215,7 +217,7 @@ impl SlideStrip {
         }
         if let Some(document) = &self.document {
             document.update(cx, |document, cx| {
-                if document.selected().is_some() {
+                if document.selection().is_some() {
                     document.deselect();
                     cx.notify();
                 }
@@ -571,6 +573,7 @@ impl SlideStrip {
         rows.map(|index| {
             let selected = index == current;
             let hidden = document.is_hidden(index);
+            let layout = document.layout_of(index);
             let number = index + 1;
             let label: SharedString = if hidden {
                 format!("Slide {number}, hidden").into()
@@ -676,7 +679,7 @@ impl SlideStrip {
                                 }),
                         ),
                 )
-                .context_menu(move |menu, _, _| {
+                .context_menu(move |menu, window, cx| {
                     menu.action_context(focus_handle.clone())
                         .menu("New slide", Box::new(NewSlide))
                         .menu("Duplicate", Box::new(DuplicateSlide))
@@ -695,6 +698,17 @@ impl SlideStrip {
                         .menu_with_disabled("Cut", Box::new(CutToClipboard), count < 2)
                         .menu("Copy", Box::new(CopyToClipboard))
                         .menu("Paste", Box::new(PasteFromClipboard))
+                        .separator()
+                        // The slide's own layout ticked.
+                        .submenu("Layout", window, cx, move |menu, _, _| {
+                            layouts().iter().fold(menu, |menu, each| {
+                                menu.menu_with_check(
+                                    layout_name(each.name),
+                                    each.name == layout,
+                                    Box::new(SetLayout { layout: each.name }),
+                                )
+                            })
+                        })
                 })
                 .into_any_element()
         })

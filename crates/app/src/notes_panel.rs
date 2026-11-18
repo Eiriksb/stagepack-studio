@@ -34,7 +34,12 @@ pub struct NotesPanel {
     _subscriptions: Vec<Subscription>,
 }
 
+/// Sent when the field takes the keyboard, by a press on it or otherwise: nothing on the slide
+/// stays selected or typed in then.
+pub struct NotesFocused;
+
 impl EventEmitter<NotesEdited> for NotesPanel {}
+impl EventEmitter<NotesFocused> for NotesPanel {}
 
 impl NotesPanel {
     pub fn new(
@@ -44,6 +49,9 @@ impl NotesPanel {
     ) -> Self {
         let field = cx.new(|cx| TextareaState::new(window, cx).placeholder(NOTES_PLACEHOLDER));
         let mut subscriptions = vec![cx.subscribe(&field, |this: &mut Self, field, event, cx| {
+            if matches!(event, InputEvent::Focus) {
+                cx.emit(NotesFocused);
+            }
             if matches!(event, InputEvent::Change)
                 && let Some(index) = this.showing
             {
@@ -120,11 +128,14 @@ impl Render for NotesPanel {
                     .child(NOTES_CAPTION),
             )
             .child(
-                Textarea::new(&self.field)
-                    .aria_label("Notes")
+                div()
                     .flex_1()
                     .min_h_0()
-                    .w_full(),
+                    .w_full()
+                    // A press on the field gives it the keyboard: what's on the slide is let go
+                    // of at once, before anything the press goes on to do.
+                    .capture_any_mouse_down(cx.listener(|_, _, _, cx| cx.emit(NotesFocused)))
+                    .child(Textarea::new(&self.field).aria_label("Notes").size_full()),
             )
     }
 }

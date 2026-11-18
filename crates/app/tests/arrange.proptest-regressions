@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c551bf4c6cb01eb5829d5e5897e181e38fd7f1673c5b083054b7e5b45f532f85 # shrinks to things = [Placed { rect: Rect { x: 40.0, y: 875.15576, w: 1.0, h: 1.0 }, rotate: 0.0 }, Placed { rect: Rect { x: 40.00002, y: 375.97754, w: 1.0, h: 431.03207 }, rotate: 180.0 }, Placed { rect: Rect { x: 40.0, y: 1012.1295, w: 1.0, h: 1.0 }, rotate: 0.0 }, Placed { rect: Rect { x: 40.00003, y: 332.37946, w: 1.0, h: 666.2865 }, rotate: 180.0 }, Placed { rect: Rect { x: 40.0, y: 1021.3505, w: 1.0, h: 1.0 }, rotate: 0.0 }], across = false

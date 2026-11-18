@@ -78,15 +78,6 @@ fn at_cell(typing: &Typing, cx: &TestAppContext) -> Option<(usize, usize)> {
     }
 }
 
-fn click_on(typing: &Typing, cx: &mut TestAppContext, id: impl Into<ElementId>) {
-    let id = id.into();
-    typing.with_window(cx, |window, cx| {
-        window.render_frame(cx);
-        window.click(id, cx);
-    });
-    typing.settle(cx);
-}
-
 /// Clicks tool `id` in what `scope` holds: the ribbon, scrolled along to it, or the inspector.
 fn click_in(typing: &Typing, cx: &mut TestAppContext, scope: &'static str, id: &'static str) {
     if scope == RIBBON_ID {
@@ -483,6 +474,9 @@ fn bold_and_colour_work_in_a_cell(cx: &mut TestAppContext) {
 fn bullets_are_off_in_a_cell(cx: &mut TestAppContext) {
     let source = "# T\n\nWords\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n";
     let typing = open(cx, source);
+    // Wide enough for the Home tab's list tools to show.
+    cx.simulate_window_resize(typing.handle, gpui_kit::size(gpui_kit::px(1600.), gpui_kit::px(800.)));
+    typing.settle(cx);
     click_cell(&typing, cx, 1, 0);
     for tool in [button_id(BULLETS_ID), button_id(NUMBERING_ID)] {
         assert!(disabled(&typing, cx, RIBBON_ID, tool.clone()), "{tool}");
@@ -538,6 +532,47 @@ fn each_row_and_column_tool_does_its_one_thing(cx: &mut TestAppContext) {
     click_cell(&typing, cx, 1, 0);
     click_in(&typing, cx, RIBBON_ID, TABLE_ROW_BELOW_ID);
     assert_eq!(typing.source(cx), "# T\n\n- Item\n\n  | a |\n  | - |\n  | 1 |\n  |  |\n");
+}
+
+#[gpui_kit::test]
+fn a_table_in_a_box_is_typed_in_and_its_tools_work(cx: &mut TestAppContext) {
+    // As a table dragged out of the text is written.
+    let boxed = "# T\n\nWords\n\n<Box x=\"200\" y=\"500\" w=\"900\" h=\"300\">\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n</Box>\n";
+    let typing = open(cx, boxed);
+    click_cell(&typing, cx, 1, 0);
+    typing.type_text(cx, "x");
+    assert_eq!(typing.source(cx), boxed.replacen("| 1 |", "| 1x |", 1));
+    undo(&typing, cx);
+    assert_eq!(typing.source(cx), boxed);
+    let cases = [
+        (TABLE_ROW_BELOW_ID, boxed.replacen("| 1 | 2 |", "| 1 | 2 |\n|  |  |", 1)),
+        (TABLE_COLUMN_RIGHT_ID, boxed.replacen("| a | b |\n| --- | --- |\n| 1 | 2 |", "| a |  | b |\n| --- | --- | --- |\n| 1 |  | 2 |", 1)),
+        (TABLE_DELETE_ROW_ID, boxed.replacen("\n| 1 | 2 |", "", 1)),
+    ];
+    for (tool, after) in cases {
+        click_cell(&typing, cx, 1, 0);
+        assert!(!disabled(&typing, cx, RIBBON_ID, tool), "{tool}");
+        click_in(&typing, cx, RIBBON_ID, tool);
+        assert_eq!(typing.source(cx), after, "{tool}");
+        undo(&typing, cx);
+        assert_eq!(typing.source(cx), boxed, "{tool}: one step");
+    }
+    // Picked by its border, it's the box that's selected, and the table has its tools still.
+    // Escape in a cell selects the table, and again the box it's in, then nothing.
+    let start = boxed.find("<Box").unwrap();
+    typing.press(cx, "escape");
+    assert_eq!(selected(&typing, cx), Some(boxed.find("| a").unwrap()..boxed.find("\n\n</Box>").unwrap()));
+    typing.press(cx, "escape");
+    assert_eq!(selected(&typing, cx), Some(start..boxed.len() - 1));
+    typing.press(cx, "escape");
+    assert_eq!(selected(&typing, cx), None);
+    let border = border_point(&typing, cx);
+    typing.click(cx, border);
+    assert_eq!(selected(&typing, cx), Some(start..boxed.len() - 1));
+    assert_eq!(label_of(&typing, cx, INSPECTOR_HEADING_ID).as_deref(), Some("Table in a box"));
+    assert!(shown_in(&typing, cx, INSPECTOR_ID, TABLE_TOOLS_ID));
+    click_in(&typing, cx, INSPECTOR_ID, TABLE_ROW_BELOW_ID);
+    assert_eq!(typing.source(cx), boxed.replacen("| 1 | 2 |", "| 1 | 2 |\n|  |  |", 1));
 }
 
 #[gpui_kit::test]

@@ -15,7 +15,8 @@
 use std::ops::Range;
 
 use crate::attrs::scan_open_tag;
-use crate::edit::{Change, SourceEdit, eol_in, set_attr, set_setting};
+use crate::edit::{Change, SourceEdit, add_settings, eol_in, set_attr, set_setting};
+use crate::element_ops::top_tag;
 use crate::model::{Block, Notes, Slide, Talk};
 use crate::rich::FlowPlace;
 use crate::parse::parse_talk;
@@ -117,7 +118,7 @@ pub fn set_hidden(talk: &Talk, index: usize, hidden: bool) -> Change {
     }
 }
 
-fn setting_entry<'a>(slide: &'a Slide, key: &str) -> Option<&'a crate::settings::SettingEntry> {
+pub(crate) fn setting_entry<'a>(slide: &'a Slide, key: &str) -> Option<&'a crate::settings::SettingEntry> {
     slide.settings.as_ref()?.entries.iter().find(|entry| entry.key == key)
 }
 
@@ -126,14 +127,25 @@ fn setting_entry<'a>(slide: &'a Slide, key: &str) -> Option<&'a crate::settings:
 /// or a first slide with nothing after its block. A slide left with nothing but
 /// `key: value` lines keeps a blank line after its `---`, so it isn't read as settings.
 pub fn remove_setting(source: &str, slide: &Slide, key: &str) -> Option<SourceEdit> {
-    let settings = slide.settings.as_ref()?;
     let entry = setting_entry(slide, key)?;
-    if settings.entries.len() > 1 {
-        return Some(SourceEdit { range: entry.line.start..line_end(source, entry.line.start), text: String::new() });
+    remove_entries(source, slide, &[entry.line.start], false)?.into_iter().next()
+}
+
+/// The edits that take the entries starting at `lines` out of the slide's block, each with its
+/// whole line, or the block itself, as [`remove_setting`] takes it, when they're all it has and
+/// `keep_block` doesn't say lines are to be added to it.
+pub(crate) fn remove_entries(source: &str, slide: &Slide, lines: &[usize], keep_block: bool) -> Option<Vec<SourceEdit>> {
+    let settings = slide.settings.as_ref()?;
+    let entries: Vec<_> = settings.entries.iter().filter(|entry| lines.contains(&entry.line.start)).collect();
+    if entries.len() != lines.len() {
+        return None;
+    }
+    if keep_block || settings.entries.len() > entries.len() {
+        return Some(entries.iter().map(|entry| SourceEdit { range: entry.line.start..line_end(source, entry.line.start), text: String::new() }).collect());
     }
     let first = slide.range.start == 0;
     if first && settings.range.end < slide.range.end {
-        return Some(SourceEdit { range: settings.range.clone(), text: String::new() });
+        return Some(vec![SourceEdit { range: settings.range.clone(), text: String::new() }]);
     }
     // The opening `---` stays as the slide's break line. At the very end of a file with
     // no last line ending, it's the line ending that goes, not the rule.
@@ -151,7 +163,7 @@ pub fn remove_setting(source: &str, slide: &Slide, key: &str) -> Option<SourceEd
     } else {
         String::new()
     };
-    Some(SourceEdit { range: start..settings.range.end, text })
+    Some(vec![SourceEdit { range: start..settings.range.end, text }])
 }
 
 /// Aligns the text in `place` on slide `index` `align`, one of `left`, `center` and `right`.
@@ -163,43 +175,149 @@ pub fn remove_setting(source: &str, slide: &Slide, key: &str) -> Option<SourceEd
 pub fn set_align(talk: &Talk, index: usize, place: &FlowPlace, align: &str) -> Option<Change> {
     let slide = talk.slides.get(index)?;
     let source = talk.source.as_str();
-    let edit = match place {
-        FlowPlace::Region(region) => set_region_value(source, slide, region, "align", align),
-        FlowPlace::Tag(range) => {
-            let tag = slide.blocks.iter().find_map(|block| match block {
-                Block::Tag(tag) if tag.range == *range => Some(tag),
-                _ => None,
-            })?;
-            (tag.attr("align") != Some(align)).then(|| set_attr(source, tag, "align", align))
+    match place {
+        FlowPlace::Region(region) => {
+            let edits = set_region_values(source, slide, &[RegionWord { region, name: "align", value: Some(align) }])?;
+            Some(Change { edits })
         }
-        FlowPlace::Cell { .. } => return None,
-    };
-    Some(edit.map_or_else(no_change, Change::single))
+        FlowPlace::Tag(range) => {
+            let tag = top_tag(slide, range)?;
+            let edit = (tag.attr("align") != Some(align)).then(|| set_attr(source, tag, "align", align));
+            Some(edit.map_or_else(no_change, Change::single))
+        }
+        FlowPlace::Cell { .. } => None,
+    }
 }
 
-/// Sets `name=value` on the `region.<region>` settings line of `slide`, as [`set_align`]
-/// does, or `None` if it says that already.
-fn set_region_value(source: &str, slide: &Slide, region: &str, name: &str, value: &str) -> Option<SourceEdit> {
-    let key = format!("region.{region}");
-    let Some(entry) = setting_entry(slide, &key) else {
-        return Some(set_setting(source, slide, &key, &format!("{name}={value}")));
-    };
-    let line = &source[entry.value_range.clone()];
+/// One word of a `region.<name>` settings line to set to a value, or with `None` to take away.
+pub(crate) struct RegionWord<'a> {
+    pub region: &'a str,
+    pub name: &'a str,
+    pub value: Option<&'a str>,
+}
+
+/// Whether the engine reads `value` as what the word `name` of a region's line says. A word
+/// it doesn't know it reads as anything.
+fn engine_reads(name: &str, value: &str) -> bool {
+    match name {
+        "x" | "y" | "w" | "h" | "rotate" => value.parse::<f32>().is_ok_and(f32::is_finite),
+        "click" => value == "each" || (value.bytes().all(|byte| byte.is_ascii_digit()) && value.parse::<u32>().is_ok_and(|click| (1..=999).contains(&click))),
+        "enter" => matches!(value, "appear" | "fade" | "fly-up"),
+        "align" => matches!(value, "left" | "center" | "right"),
+        _ => true,
+    }
+}
+
+/// Which of a line's `words` is the one for `name` that's written to: the one the engine reads,
+/// or, where it reads none, the last. For an alignment that's the first, which is all the
+/// engine looks at; for anything else the engine takes the last it can read.
+pub(crate) fn written_word(words: &[&str], name: &str) -> Option<usize> {
     let prefix = format!("{name}=");
-    let mut at = 0;
-    for word in line.split_whitespace() {
-        let start = at + line[at..].find(word).unwrap_or(0);
-        at = start + word.len();
-        if let Some(old) = word.strip_prefix(&prefix) {
-            if old == value {
-                return None;
+    let mut named = words.iter().enumerate().filter(|(_, word)| word.starts_with(&prefix));
+    if name == "align" {
+        return named.next().map(|(at, _)| at);
+    }
+    let named: Vec<_> = named.collect();
+    named.iter().rev().find(|(_, word)| engine_reads(name, &word[prefix.len()..])).or(named.last()).map(|(at, _)| *at)
+}
+
+/// The value the engine reads from the word `name` of `line`, a region's settings value.
+pub(crate) fn read_word<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let value = &words[written_word(&words, name)?][name.len() + 1..];
+    engine_reads(name, value).then_some(value)
+}
+
+/// Where each word of the text at `range` is.
+fn word_ranges(source: &str, range: Range<usize>) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let mut start = None;
+    for (at, character) in source[range.clone()].char_indices() {
+        match (character.is_whitespace(), start) {
+            (true, Some(from)) => {
+                out.push(range.start + from..range.start + at);
+                start = None;
             }
-            let from = entry.value_range.start + start + prefix.len();
-            return Some(SourceEdit { range: from..from + old.len(), text: value.to_string() });
+            (false, None) => start = Some(at),
+            _ => {}
         }
     }
-    let end = entry.value_range.end;
-    Some(SourceEdit { range: end..end, text: format!(" {name}={value}") })
+    if let Some(from) = start {
+        out.push(range.start + from..range.end);
+    }
+    out
+}
+
+/// The edits that set or take away `words` on the slide's `region.<name>` settings lines, all
+/// against the text as it is. A word set changes the one [`written_word`] picks, or is added
+/// at the line's end; one taken away goes with the white space before it, and every word of
+/// that name goes. The edits are sorted, those of one place in the order asked. A line that's missing is added, and the settings block with it, as
+/// [`set_setting`] adds them; one left with no words goes, and the block with it when that was
+/// its only line, as [`remove_setting`] takes them. A word already as asked makes no edit.
+/// `None` where the edits can't be made.
+pub(crate) fn set_region_values(source: &str, slide: &Slide, words: &[RegionWord]) -> Option<Vec<SourceEdit>> {
+    // In the order a value is first set on each, so that new lines come in that order whatever
+    // else is asked, and then those only taken from.
+    let mut regions: Vec<&str> = Vec::new();
+    for word in words.iter().filter(|word| word.value.is_some()).chain(words) {
+        if !regions.contains(&word.region) {
+            regions.push(word.region);
+        }
+    }
+    let mut edits = Vec::new();
+    let mut new_lines: Vec<(String, String)> = Vec::new();
+    let mut gone = Vec::new();
+    for region in regions {
+        let key = format!("region.{region}");
+        let asked = words.iter().filter(|word| word.region == region);
+        let Some(entry) = setting_entry(slide, &key) else {
+            let set: Vec<String> = asked.filter_map(|word| Some(format!("{}={}", word.name, word.value?))).collect();
+            if !set.is_empty() {
+                new_lines.push((key, set.join(" ")));
+            }
+            continue;
+        };
+        let ranges = word_ranges(source, entry.value_range.clone());
+        let texts: Vec<&str> = ranges.iter().map(|range| &source[range.clone()]).collect();
+        let mut line_edits = Vec::new();
+        let mut added = String::new();
+        let mut removed = 0;
+        for word in asked {
+            let prefix = format!("{}=", word.name);
+            match word.value {
+                Some(value) => match written_word(&texts, word.name) {
+                    Some(at) if &texts[at][prefix.len()..] == value => {}
+                    Some(at) => line_edits.push(SourceEdit { range: ranges[at].start + prefix.len()..ranges[at].end, text: value.to_string() }),
+                    None => added.push_str(&format!(" {prefix}{value}")),
+                },
+                None => {
+                    for (range, _) in ranges.iter().zip(&texts).filter(|(_, text)| text.starts_with(&prefix)) {
+                        let before = source[entry.line.start..range.start].trim_end_matches(char::is_whitespace).len();
+                        line_edits.push(SourceEdit { range: entry.line.start + before..range.end, text: String::new() });
+                        removed += 1;
+                    }
+                }
+            }
+        }
+        if removed > 0 && removed == texts.len() && added.is_empty() {
+            gone.push(entry.line.start);
+            continue;
+        }
+        edits.extend(line_edits);
+        if !added.is_empty() {
+            let end = entry.value_range.end;
+            edits.push(SourceEdit { range: end..end, text: added });
+        }
+    }
+    if !gone.is_empty() {
+        edits.extend(remove_entries(source, slide, &gone, !new_lines.is_empty())?);
+    }
+    if !new_lines.is_empty() {
+        let lines: Vec<(&str, &str)> = new_lines.iter().map(|(key, value)| (key.as_str(), value.as_str())).collect();
+        edits.push(add_settings(source, slide, &lines));
+    }
+    edits.sort_by_key(|edit| (edit.range.start, edit.range.end));
+    Some(edits)
 }
 
 /// Sets what slide `index`'s `<Notes>` hold: the words inside an existing element are

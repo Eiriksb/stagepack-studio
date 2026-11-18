@@ -35,6 +35,7 @@ const fn subtitle(x: f32, y: f32, w: f32, h: f32) -> RegionDef {
     RegionDef { name: "body", rect: Rect { x, y, w, h }, size: 44.0, bold: false, align: Align::Center }
 }
 
+/// In the order `layouts` gives them.
 static LAYOUTS: [LayoutDef; 5] = [
     LayoutDef {
         name: "title",
@@ -66,6 +67,11 @@ static LAYOUTS: [LayoutDef; 5] = [
         main: "body",
     },
 ];
+
+/// Every layout, in the order a picker offers them: title, content, two-columns, section, blank.
+pub fn layouts() -> &'static [LayoutDef] {
+    &LAYOUTS
+}
 
 pub fn layout_by_name(name: &str) -> Option<&'static LayoutDef> {
     LAYOUTS.iter().find(|layout| layout.name == name)

@@ -440,6 +440,22 @@ fn notes_between_two_lists_stay_empty_rather_than_join_them() {
 }
 
 #[test]
+fn notes_with_a_line_ending_in_a_bar_keep_the_table_after_them() {
+    // A quote or a list item ending in `|`, as the last line of the notes, made the `markdown`
+    // crate read a table after the notes as a paragraph. Found by the random case kept in
+    // `slide_ops.proptest-regressions`.
+    on_both(|e| {
+        let src = e("# A\n\n<Notes>\nx\n</Notes>\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n");
+        for typed in ["> a|", "><b>|", "- a|", "1. a|  ", "> a|b|", "first\n> a|", "> |a|"] {
+            let edited = applied(&src, &set_notes(&parse_talk(&src), 0, typed));
+            let slide = &parse_talk(&edited).slides[0];
+            assert!(matches!(slide.blocks.last(), Some(Block::Table { .. })), "{typed:?}: {edited:?}");
+            assert_eq!(slide.notes.as_ref().unwrap().text, typed.trim(), "{typed:?}");
+        }
+    });
+}
+
+#[test]
 fn hand_written_notes_read_as_before() {
     on_both(|e| {
         let src = e("# A\n\n<Notes>\nSee C:\\path and \\n and a\\b\n</Notes>\n");

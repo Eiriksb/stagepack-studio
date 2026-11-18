@@ -19,6 +19,9 @@ use gpui_kit::*;
 use slides_components::{Bundle, Diagnostic};
 use slides_engine::{ComponentState, Fonts};
 
+use crate::animate::Choice;
+use crate::animate_tools::{ChooseAnimation, ChooseEntrance, ChooseTransition};
+use crate::arrange_tools::{AlignThings, DistributeThings, ReorderThing};
 use crate::builds::{self, BuildOutcome, Compile};
 use crate::cargo_file::{self, write_cargo_file};
 use crate::clipboard::ClipboardOp;
@@ -28,15 +31,16 @@ use crate::export::{self, ExportKind, run_export, stagepack_executable};
 use crate::icon_picker::{self, IconPicked, IconPicker};
 use crate::palette::InsertComponent;
 use crate::insert_tools::{InsertPicture, InsertShape, InsertTextBox};
+use crate::layout_picker::SetLayout;
 use crate::inspector::{self, Inspector};
 use crate::markdown_panel::MarkdownPanel;
 use crate::notes_panel::{
-    NOTES_HEIGHT, NOTES_MAX_HEIGHT, NOTES_MIN_HEIGHT, NotesEdited, NotesPanel,
+    NOTES_HEIGHT, NOTES_MAX_HEIGHT, NOTES_MIN_HEIGHT, NotesEdited, NotesFocused, NotesPanel,
 };
 use crate::permissions::BuildPermissions;
 use crate::present_view::{self, Presentation, start_show};
 use crate::recovery::Recovery;
-use crate::ribbon::{Panels, Ribbon};
+use crate::ribbon::{Panels, Ribbon, RibbonTab};
 use crate::save_flow::{CloseAnswer, Effect, SaveFlow, SaveOutcome};
 use crate::saving::{SaveError, SaveJob, SaveTarget, Saved};
 use crate::slide_canvas::{ScaleChanged, SlideCanvas};
@@ -155,6 +159,7 @@ actions!(
         MoveSlideDown,
         ToggleNotes,
         ToggleSlideList,
+        ToggleInspector,
         CopyToClipboard,
         CutToClipboard,
         PasteFromClipboard,
@@ -289,8 +294,10 @@ pub struct WorkspaceView {
     show_slide_list: bool,
     notes_panel: Entity<NotesPanel>,
     show_notes: bool,
-    /// The form for the thing selected, always at the right.
+    /// The form for the thing selected, at the right.
     inspector: Entity<Inspector>,
+    /// Whether the form shows, while a talk is open.
+    show_inspector: bool,
     /// How wide the slide list, the slide's column and the Markdown are.
     columns: Entity<ResizableState>,
     focus_handle: FocusHandle,
@@ -345,8 +352,11 @@ pub struct WorkspaceView {
     _keep_failed: Subscription,
     _icon_picked: Subscription,
     _list_focused: Subscription,
+    _notes_focused: Subscription,
     /// A size chosen from the Insert tab's grid of tables.
     _table_picked: Subscription,
+    /// The slide shows the steps things come in on while the Animate tab is open.
+    _tab_changed: Subscription,
     _component_picked: Subscription,
 }
 
@@ -444,6 +454,7 @@ impl WorkspaceView {
             notes: true,
             slide_list: true,
             markdown: false,
+            inspector: true,
         };
         let clipboard_tools = cx.new(|cx| ClipboardTools::new(document.clone(), &slide_editor, cx));
         let icon_picker = cx.new(|cx| IconPicker::new(window, cx));
@@ -454,8 +465,17 @@ impl WorkspaceView {
             this.insert_icon(picked.0, cx);
             this.keyboard_to_the_slide(window, cx);
         });
+        let slide_focus = slide_editor.read(cx).focus_handle().clone();
         let ribbon = cx.new(|cx| {
-            Ribbon::new(document.clone(), clipboard_tools.clone(), text_tools, icon_picker, panels, cx)
+            Ribbon::new(document.clone(), clipboard_tools.clone(), text_tools, icon_picker, slide_focus, panels, cx)
+        });
+        // Typing in an area goes on while the Animate tab's tools, which act on it, have the keyboard.
+        let animate_focus = ribbon.read(cx).animate_focus().clone();
+        slide_editor.update(cx, |editor, cx| editor.keep_typing_with(animate_focus, window, cx));
+        let editor = slide_editor.clone();
+        let tab_changed = cx.observe(&ribbon, move |_, ribbon, cx| {
+            let animate = ribbon.read(cx).tab() == RibbonTab::Animate;
+            editor.update(cx, |editor, cx| editor.show_steps(animate, cx));
         });
         let table_grid = ribbon.read(cx).table_grid().clone();
         let table_picked = cx.subscribe_in(&table_grid, window, |this, _, picked: &InsertTable, window, cx| {
@@ -474,7 +494,7 @@ impl WorkspaceView {
         // it (at once on a press, and by the keyboard as the window next draws), and a thing
         // selected while the list has it takes the keyboard for the slide.
         let list_focus = slide_strip.read(cx).focus_handle().clone();
-        slide_editor.update(cx, |editor, _| editor.take_keyboard_from_list(list_focus.clone()));
+        slide_editor.update(cx, |editor, _| editor.take_keyboard_from(list_focus.clone()));
         // Typing on the slide ends then too, as Escape ends it: no caret shows, and no new text
         // box waits, while the list has the keyboard.
         let editor = slide_editor.downgrade();
@@ -487,6 +507,13 @@ impl WorkspaceView {
         let workspace = cx.weak_entity();
         let inspector = cx.new(|cx| Inspector::new(document.clone(), workspace, cx));
         let notes_focus = notes_panel.read(cx).field().focus_handle(cx);
+        // The notes taking the keyboard let go of what's selected on the slide, and end typing
+        // there, as the list of slides does; and nothing is selected while they have it.
+        slide_editor.update(cx, |editor, _| editor.give_way_to_notes(notes_focus.clone()));
+        let strip = slide_strip.clone();
+        let notes_focused = cx.subscribe_in(&notes_panel, window, move |_, _, _: &NotesFocused, window, cx| {
+            strip.update(cx, |strip, cx| strip.let_go_of_selection(window, cx));
+        });
         clipboard_tools.update(cx, |tools, cx| tools.follow_notes(notes_focus, window, cx));
         let notes_edited = cx.subscribe_in(
             &notes_panel,
@@ -547,6 +574,7 @@ impl WorkspaceView {
             notes_panel,
             show_notes: panels.notes,
             inspector,
+            show_inspector: panels.inspector,
             columns: cx.new(|_| ResizableState::default()),
             focus_handle,
             watcher: None,
@@ -577,7 +605,9 @@ impl WorkspaceView {
             _keep_failed: keep_failed,
             _icon_picked: icon_picked,
             _list_focused: list_focused,
+            _notes_focused: notes_focused,
             _table_picked: table_picked,
+            _tab_changed: tab_changed,
             _component_picked: component_picked,
         };
         view.always_build = view.is_always_built();
@@ -1337,6 +1367,34 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &ToggleSlideList, window, cx| {
                 this.toggle_panel(|this| &mut this.show_slide_list, window, cx)
             }))
+            .on_action(cx.listener(|this, _: &ToggleInspector, window, cx| {
+                this.toggle_panel(|this| &mut this.show_inspector, window, cx)
+            }))
+            .on_action(cx.listener(|this, action: &AlignThings, _, cx| {
+                let to = action.to;
+                this.edit(|document| document.align_things(to), cx)
+            }))
+            .on_action(cx.listener(|this, action: &DistributeThings, _, cx| {
+                let across = action.across;
+                this.edit(|document| document.distribute_things(across), cx)
+            }))
+            .on_action(cx.listener(|this, action: &ChooseAnimation, _, cx| {
+                let choice = action.choice;
+                this.edit(|document| document.animate(choice), cx)
+            }))
+            .on_action(cx.listener(|this, action: &ChooseEntrance, _, cx| match action.enter {
+                Some(enter) => this.edit(|document| document.set_entrance(enter), cx),
+                None => this.edit(|document| document.animate(Choice::Remove), cx),
+            }))
+            .on_action(cx.listener(|this, action: &ChooseTransition, _, cx| {
+                let (transition, all) = (action.transition, action.all);
+                this.edit(|document| document.set_slide_transition(transition, all), cx)
+            }))
+            .on_action(cx.listener(|this, action: &ReorderThing, _, cx| {
+                let order = action.order;
+                this.edit(|document| document.reorder_selected(order), cx)
+            }))
+            .on_action(cx.listener(|this, action: &SetLayout, _, cx| this.set_layout(action.layout, cx)))
             .on_action(cx.listener(|this, _: &NewSlide, _, cx| this.add_slide("content", cx)))
             .on_action(cx.listener(|this, action: &AddSlide, _, cx| {
                 this.add_slide(action.layout, cx)

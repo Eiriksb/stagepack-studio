@@ -1,10 +1,11 @@
-//! A thing picked on a slide as a whole: a picture, a shape, an icon, a table, a component or a
-//! positioned box. It's the editor's view of the talk, never part of it: it follows its thing
-//! through every edit by where that thing's text moves to, and goes once its text does.
+//! Things picked on a slide as a whole: a picture, a shape, an icon, a table, a component or a
+//! positioned box, and the areas of the slide's layout. It's the editor's view of the talk,
+//! never part of it: it follows each thing through every edit by where that thing's text moves
+//! to, and lets go of a thing once its text goes.
 
 use std::ops::Range;
 
-use slides_format::{Block, Change, Talk, TextFlow};
+use slides_format::{Block, Change, Tag, Talk, TextFlow};
 
 /// The thing selected: slide `slide`'s block or tag whose whole source is `source`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -13,12 +14,91 @@ pub struct Selected {
     pub source: Range<usize>,
 }
 
-/// What a step of the history selects once it's undone, `before`, or made again, `after`: the
-/// whole source of a thing, in the text as that leaves it, or nothing.
+/// One thing picked on a slide: a block or tag, by its whole source, or an area of the slide's
+/// layout, by its region's name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Thing {
+    Block(Range<usize>),
+    Region(String),
+}
+
+/// What's picked on slide `slide`: its things, in the order they were picked, the last picked
+/// last. Never empty, and no thing is in it twice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Selection {
+    pub slide: usize,
+    pub things: Vec<Thing>,
+}
+
+impl Selection {
+    /// The block on slide `slide` whose whole source is `source`, alone.
+    pub fn block(slide: usize, source: Range<usize>) -> Selection {
+        Selection { slide, things: vec![Thing::Block(source)] }
+    }
+
+    /// The blocks picked, in the order they were picked.
+    pub fn blocks(&self) -> impl Iterator<Item = &Range<usize>> {
+        self.things.iter().filter_map(|thing| match thing {
+            Thing::Block(source) => Some(source),
+            Thing::Region(_) => None,
+        })
+    }
+
+    /// The one block picked, if that's all that's picked.
+    pub fn one_block(&self) -> Option<&Range<usize>> {
+        match self.things.as_slice() {
+            [Thing::Block(source)] => Some(source),
+            _ => None,
+        }
+    }
+
+    /// The one area picked, if that's all that's picked.
+    pub fn one_region(&self) -> Option<&str> {
+        match self.things.as_slice() {
+            [Thing::Region(name)] => Some(name),
+            _ => None,
+        }
+    }
+}
+
+/// What a step of the history selects once it's undone, `before`, or made again, `after`: its
+/// things, in the text as that leaves it, or nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectMark {
-    pub before: Option<Range<usize>>,
-    pub after: Option<Range<usize>>,
+    pub before: Option<Selection>,
+    pub after: Option<Selection>,
+}
+
+impl SelectMark {
+    /// A mark of one block on slide `slide`, or none, before and after.
+    pub fn blocks(slide: usize, before: Option<Range<usize>>, after: Option<Range<usize>>) -> SelectMark {
+        SelectMark { before: before.map(|source| Selection::block(slide, source)), after: after.map(|source| Selection::block(slide, source)) }
+    }
+}
+
+/// What an area of a layout is called where a person reads it: "Title" for `title`, "Main
+/// text" for `body`, and the like.
+pub fn area_name(region: &str) -> String {
+    match region {
+        "title" => "Title".to_string(),
+        "body" => "Main text".to_string(),
+        "left" => "Left column".to_string(),
+        "right" => "Right column".to_string(),
+        other => {
+            let mut letters = other.chars();
+            letters.next().map_or_else(String::new, |first| first.to_uppercase().chain(letters).collect())
+        }
+    }
+}
+
+/// What the status line says of `selection` on `talk`: "Picture selected", "3 things selected"
+/// or "Title area selected".
+pub fn said_of_selection(talk: &Talk, selection: &Selection) -> Option<String> {
+    match selection.things.as_slice() {
+        [Thing::Block(source)] => said_of(talk, selection.slide, source),
+        [Thing::Region(name)] => Some(format!("{} area selected", area_name(name))),
+        things => Some(format!("{} things selected", things.len())),
+    }
 }
 
 /// Where `range` is once `change` is made, if its bytes are still there: moved along by edits
@@ -88,6 +168,23 @@ pub(crate) fn block_at<'a>(blocks: &'a [Block], range: &Range<usize>) -> Option<
     })
 }
 
+/// The box at the top level of slide `slide` of `talk`, with a place of its own, that holds the
+/// block at `range` and nothing else, as a table or a picture moved out of the text is held:
+/// what a press on that block picks, as what moves.
+pub(crate) fn box_holding(talk: &Talk, slide: usize, range: &Range<usize>) -> Option<Range<usize>> {
+    talk.slides.get(slide)?.blocks.iter().find_map(|block| match block {
+        Block::Tag(tag) if is_placed_box(tag) && matches!(tag.children.as_slice(), [only] if only.range() == range) => {
+            Some(tag.range.clone())
+        }
+        _ => None,
+    })
+}
+
+/// Whether `tag` is a box with a place of its own.
+pub(crate) fn is_placed_box(tag: &Tag) -> bool {
+    tag.name == "Box" && slides_engine::is_positioned(tag)
+}
+
 /// Whether paragraph `para` of flow `flow` of `flows`, a slide's, is written inside `range`.
 pub(crate) fn holds_para(flows: &[TextFlow], flow: usize, para: usize, range: &Range<usize>) -> bool {
     flows
@@ -108,6 +205,9 @@ pub fn name_of(talk: &Talk, slide: usize, range: &Range<usize>) -> Option<String
     let what = match block_at(&slide.blocks, range)? {
         Block::Picture { .. } => "Picture".to_string(),
         Block::Table { .. } => "Table".to_string(),
+        // A table or a picture moved out of the text, in the box that places it.
+        Block::Tag(tag) if is_placed_box(tag) && matches!(tag.children.as_slice(), [Block::Table { .. }]) => "Table in a box".to_string(),
+        Block::Tag(tag) if is_placed_box(tag) && matches!(tag.children.as_slice(), [Block::Picture { .. }]) => "Picture in a box".to_string(),
         Block::Tag(tag) => match tag.name.as_str() {
             "Picture" | "Shape" | "Icon" | "Table" | "Chart" => tag.name.clone(),
             // Text boxes, as the Insert tab and the format name them.
@@ -155,6 +255,16 @@ mod tests {
         assert_eq!(moved(&thing, &change(5..12, "x")), None, "cut into at the start");
         assert_eq!(moved(&thing, &change(18..22, "x")), None, "cut into at the end");
         assert_eq!(moved(&thing, &change(0..100, "x")), None, "the whole text");
+    }
+
+    #[test]
+    fn an_area_is_called_what_a_person_calls_it() {
+        assert_eq!(area_name("title"), "Title");
+        assert_eq!(area_name("body"), "Main text");
+        assert_eq!(area_name("left"), "Left column");
+        assert_eq!(area_name("right"), "Right column");
+        assert_eq!(area_name("quote"), "Quote");
+        assert_eq!(area_name(""), "");
     }
 
     #[test]

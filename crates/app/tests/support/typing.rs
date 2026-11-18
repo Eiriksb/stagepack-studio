@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 use std::cell::Cell;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -11,15 +12,15 @@ use std::time::Duration;
 
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext, Bounds, Entity, InputEvent as _, Modifiers, MouseButton,
+    AnyWindowHandle, App, AppContext, Bounds, ElementId, Entity, InputEvent as _, Modifiers, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, TestAppContext, Window,
     WindowBounds, WindowOptions, point, px, size,
 };
-use slides_engine::{Fonts, TextLayout};
+use slides_engine::{ElementBox, Fonts, TextLayout};
 use slides_format::{Pos, Selection, TextFlow, text_flows};
 use stagepack_studio::document::Document;
 use stagepack_studio::recovery::Recovery;
-use stagepack_studio::slide_editor::CARET_ID;
+use stagepack_studio::slide_editor::{CARET_ID, SELECTION_OUTLINE_ID};
 use stagepack_studio::text_editing::EditingText;
 use stagepack_studio::workspace_view::{self, STATUS_ID, WorkspaceView};
 
@@ -245,6 +246,24 @@ impl Typing {
         self.settle(cx);
     }
 
+    /// Moves the pointer to `at` with the button held, as it goes between a press and its
+    /// release.
+    pub fn move_held(&self, cx: &mut TestAppContext, at: Point<Pixels>, modifiers: Modifiers) {
+        self.with_window(cx, |window, cx| {
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: at,
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+        });
+        cx.run_until_parked();
+    }
+
     /// Clicks `count` times in a row at `at`, as a double or triple click does.
     pub fn clicks(
         &self,
@@ -333,6 +352,69 @@ pub fn caret_is_at(caret: Bounds<Pixels>, at: Point<Pixels>) -> bool {
         && at.y <= caret.origin.y + caret.size.height + px(1.)
 }
 
+/// Goes on to slide `index` with the keys, from the first.
+pub fn go_to(typing: &Typing, cx: &mut TestAppContext, index: usize) {
+    for _ in 0..index {
+        typing.press(cx, "pagedown");
+    }
+    assert_eq!(typing.current(cx), index);
+}
+
+/// The thing on the current slide whose source starts with `start`.
+pub fn thing(typing: &Typing, cx: &mut TestAppContext, start: &str) -> ElementBox {
+    let source = typing.source(cx);
+    typing
+        .layout(cx)
+        .elements()
+        .iter()
+        .find(|element| source[element.source.clone()].starts_with(start))
+        .cloned()
+        .unwrap_or_else(|| panic!("no thing starts with {start:?}"))
+}
+
+/// The middle of `element` in the window.
+pub fn middle(typing: &Typing, cx: &mut TestAppContext, element: &ElementBox) -> Point<Pixels> {
+    let rect = element.rect;
+    typing.at(cx, rect.x + rect.w / 2., rect.y + rect.h / 2.)
+}
+
+/// The slide and the source of the thing selected, if anything is.
+pub fn selected(typing: &Typing, cx: &TestAppContext) -> Option<(usize, Range<usize>)> {
+    typing.document(cx).read_with(cx, |document, _| {
+        document
+            .selected()
+            .map(|selected| (selected.slide, selected.source.clone()))
+    })
+}
+
+/// Where the selection's outline is drawn, if it is.
+pub fn outline(typing: &Typing, cx: &mut TestAppContext) -> Option<Bounds<Pixels>> {
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        window
+            .try_find(SELECTION_OUTLINE_ID)
+            .map(|outline| outline.bounds())
+    })
+}
+
+/// Where the element `id` is drawn in the window, if it is.
+pub fn bounds_of(typing: &Typing, cx: &mut TestAppContext, id: impl Into<ElementId>) -> Option<Bounds<Pixels>> {
+    let id = id.into();
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        window.try_find(id).map(|found| found.bounds())
+    })
+}
+
+/// Clicks the element `id`, and lets what it does settle.
+pub fn click_on(typing: &Typing, cx: &mut TestAppContext, id: impl Into<ElementId>) {
+    let id = id.into();
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        window.click(id, cx);
+    });
+    typing.settle(cx);
+}
 
 /// Counts how often `entity` asks to be drawn again.
 pub fn redraws<T: 'static>(

@@ -1,0 +1,564 @@
+//! The geometry of moving, resizing and turning things on a slide: the box a turned thing
+//! covers, keeping a thing on the slide, and where a handle takes it.
+
+use proptest::prelude::*;
+use slides_engine::{CaretRect, Rect};
+use stagepack_studio::arrange::{
+    AlignTo, Handle, MIN_SIZE, Placed, aligned, bounds, distributed, handle_point, holding, kept_move, kept_on_slide, moved, resized, straight, turned_to, whole,
+};
+
+/// The corners of `placed`, turned about its centre.
+fn corners(placed: &Placed) -> [(f32, f32); 4] {
+    let Rect { x, y, w, h } = placed.rect;
+    let (cx, cy) = (x + w / 2., y + h / 2.);
+    let (sin, cos) = placed.rotate.to_radians().sin_cos();
+    [(x, y), (x + w, y), (x + w, y + h), (x, y + h)].map(|(px, py)| {
+        let (dx, dy) = (px - cx, py - cy);
+        (cx + dx * cos - dy * sin, cy + dx * sin + dy * cos)
+    })
+}
+
+fn rect() -> impl Strategy<Value = Rect> {
+    (-3840f32..7680., -3840f32..7680., 0f32..3840., 0f32..3840.).prop_map(|(x, y, w, h)| Rect { x, y, w, h })
+}
+
+/// How much of `low..low + length` lies on `0..side`.
+fn on(low: f32, length: f32, side: f32) -> f32 {
+    ((low + length).min(side) - low.max(0.)).max(0.)
+}
+
+proptest! {
+    #[test]
+    fn bounds_hold_every_corner(rect in rect(), rotate in -360f32..360.) {
+        let placed = Placed { rect, rotate };
+        let held = bounds(&placed);
+        let slack = 0.01 * (1. + rect.w + rect.h);
+        let mut touched = [false; 4];
+        for (x, y) in corners(&placed) {
+            prop_assert!(held.x - slack <= x && x <= held.x + held.w + slack, "{x} is outside {held:?}");
+            prop_assert!(held.y - slack <= y && y <= held.y + held.h + slack, "{y} is outside {held:?}");
+            touched[0] |= (x - held.x).abs() <= slack;
+            touched[1] |= (x - held.x - held.w).abs() <= slack;
+            touched[2] |= (y - held.y).abs() <= slack;
+            touched[3] |= (y - held.y - held.h).abs() <= slack;
+        }
+        prop_assert!(touched.iter().all(|&side| side), "no wider than it needs to be: {held:?}");
+    }
+
+    #[test]
+    fn kept_on_slide_keeps_sixteen_units(rect in rect()) {
+        let kept = kept_on_slide(rect);
+        prop_assert_eq!((kept.w, kept.h), (rect.w, rect.h), "it's only moved");
+        prop_assert!(on(kept.x, kept.w, 1920.) >= rect.w.min(16.) - 0.01, "{:?}", kept);
+        prop_assert!(on(kept.y, kept.h, 1080.) >= rect.h.min(16.) - 0.01, "{:?}", kept);
+        prop_assert!((-3840. ..=7680.).contains(&kept.x) && (-3840. ..=7680.).contains(&kept.y));
+    }
+
+    #[test]
+    fn kept_on_slide_leaves_a_rect_already_inside_be(x in 0f32..1920., y in 0f32..1080., w in 0f32..1920., h in 0f32..1080.) {
+        let rect = Rect { x: x.min(1920. - w), y: y.min(1080. - h), w, h };
+        prop_assert_eq!(kept_on_slide(rect), rect);
+    }
+
+    #[test]
+    fn a_move_keeps_every_thing_on_the_slide_or_no_further_off(
+        things in proptest::collection::vec((rect(), -360f32..360.), 1..4),
+        dx in -20000f32..20000.,
+        dy in -20000f32..20000.,
+    ) {
+        let places: Vec<Placed> = things.into_iter().map(|(rect, rotate)| Placed { rect, rotate }).collect();
+        let (mx, my) = kept_move(&places, (dx, dy));
+        prop_assert!(mx.abs() <= dx.abs() + 0.01 && my.abs() <= dy.abs() + 0.01, "never further than asked");
+        for placed in &places {
+            let before = bounds(placed);
+            let after = Rect { x: before.x + mx, y: before.y + my, ..before };
+            prop_assert!(on(after.x, after.w, 1920.) + 0.01 >= on(before.x, before.w, 1920.).min(after.w.min(16.)));
+            prop_assert!(on(after.y, after.h, 1080.) + 0.01 >= on(before.y, before.h, 1080.).min(after.h.min(16.)));
+        }
+    }
+}
+
+#[test]
+fn an_upright_thing_covers_itself() {
+    let rect = Rect { x: 10., y: 20., w: 300., h: 100. };
+    assert_eq!(bounds(&Placed { rect, rotate: 0. }), rect);
+    let quarter = bounds(&Placed { rect, rotate: 90. });
+    assert!((quarter.w - 100.).abs() < 0.01 && (quarter.h - 300.).abs() < 0.01, "{quarter:?}");
+}
+
+#[test]
+fn straight_keeps_the_larger_direction() {
+    assert_eq!(straight((30., -10.)), (30., 0.));
+    assert_eq!(straight((5., -12.)), (0., -12.));
+}
+
+#[test]
+fn a_thing_dragged_far_away_keeps_sixteen_units_on() {
+    let placed = Placed { rect: Rect { x: 1300., y: 300., w: 200., h: 200. }, rotate: 0. };
+    assert_eq!(kept_move(&[placed], (-5000., 5000.)), (-1484., 764.));
+}
+
+/// The eight handles on a thing's sides and corners, in the order [`Handle::ALL`] has them.
+fn side_handles() -> [Handle; 8] {
+    std::array::from_fn(|at| Handle::ALL[at])
+}
+
+/// The handle across the thing from `handle`.
+fn opposite(handle: Handle) -> Handle {
+    let at = side_handles().iter().position(|&side| side == handle).expect("a handle on a side");
+    side_handles()[(at + 4) % 8]
+}
+
+fn side_handle() -> impl Strategy<Value = Handle> {
+    (0usize..8).prop_map(|at| side_handles()[at])
+}
+
+fn corner_handle() -> impl Strategy<Value = Handle> {
+    prop_oneof![Just(Handle::TopLeft), Just(Handle::TopRight), Just(Handle::BottomRight), Just(Handle::BottomLeft)]
+}
+
+/// Any turn, and the ones worth trying each time.
+fn turn() -> impl Strategy<Value = f32> {
+    prop_oneof![Just(0f32), Just(37.), Just(90.), Just(180.), Just(359.9), Just(-360.), -360f32..360.]
+}
+
+fn sized(low: f32) -> impl Strategy<Value = Rect> {
+    (-3840f32..7680., -3840f32..7680., low..3840., low..3840.).prop_map(|(x, y, w, h)| Rect { x, y, w, h })
+}
+
+/// Where `handle` is on a thing, as parts of its width and height.
+fn part(handle: Handle) -> (f32, f32) {
+    let start = Placed { rect: Rect { x: 0., y: 0., w: 1., h: 1. }, rotate: 0. };
+    handle_point(&start, handle, 0.)
+}
+
+/// `(x, y)` turned back by `degrees`.
+fn unturned((x, y): (f32, f32), degrees: f32) -> (f32, f32) {
+    let (sin, cos) = (-degrees).to_radians().sin_cos();
+    (x * cos - y * sin, x * sin + y * cos)
+}
+
+/// How far `at` is outside where the engine can place a thing.
+fn outside(at: f32) -> f32 {
+    (-3840. - at).max(at - 7680.).max(0.)
+}
+
+fn pointer() -> impl Strategy<Value = (f32, f32)> {
+    (-6000f32..10000., -6000f32..10000.)
+}
+
+fn near((ax, ay): (f32, f32), (bx, by): (f32, f32), within: f32) -> bool {
+    (ax - bx).abs() <= within && (ay - by).abs() <= within
+}
+
+/// How far apart two turns are, in degrees, the short way round.
+fn apart(a: f32, b: f32) -> f32 {
+    let off = (a - b).rem_euclid(360.);
+    off.min(360. - off)
+}
+
+/// The degrees that point a thing's top from `centre` towards `to`.
+fn pointing(centre: (f32, f32), to: (f32, f32)) -> f32 {
+    (to.0 - centre.0).atan2(centre.1 - to.1).to_degrees()
+}
+
+fn centre(placed: &Placed) -> (f32, f32) {
+    (placed.rect.x + placed.rect.w / 2., placed.rect.y + placed.rect.h / 2.)
+}
+
+proptest! {
+    #[test]
+    fn the_opposite_corner_stays_put_at_any_turn(
+        rect in sized(0.),
+        rotate in turn(),
+        handle in side_handle(),
+        to in pointer(),
+        keep_shape in any::<bool>(),
+    ) {
+        let start = Placed { rect, rotate };
+        let anchor = handle_point(&start, opposite(handle), 0.);
+        let resized = resized(&start, handle, to, keep_shape);
+        let now = handle_point(&resized, opposite(handle), 0.);
+        prop_assert!(near(anchor, now, 0.5), "{anchor:?} went to {now:?}: {resized:?}");
+        prop_assert_eq!(resized.rotate, rotate, "a resize doesn't turn it");
+    }
+
+    #[test]
+    fn a_thing_never_gets_smaller_than_eight_units(
+        rect in sized(0.),
+        rotate in turn(),
+        handle in side_handle(),
+        to in pointer(),
+        keep_shape in any::<bool>(),
+    ) {
+        let start = Placed { rect, rotate };
+        let resized = resized(&start, handle, to, keep_shape);
+        let Rect { w, h, .. } = resized.rect;
+        let across = !matches!(handle, Handle::Top | Handle::Bottom);
+        let down = !matches!(handle, Handle::Left | Handle::Right);
+        // A side the handle changes is never under eight units nor over the most a thing can
+        // be, and one it doesn't change stays as it was.
+        for (side, before, changes) in [(w, rect.w, across), (h, rect.h, down)] {
+            if changes {
+                prop_assert!((MIN_SIZE - 0.01..=3840.01).contains(&side), "{side} from {before}: {resized:?}");
+            } else {
+                prop_assert_eq!(side, before);
+            }
+        }
+        // Nor does it flip: on the thing before it's turned, the handle stays on its own side
+        // of the one across from it, each way it moves.
+        let anchor = handle_point(&resized, opposite(handle), 0.);
+        let is = handle_point(&resized, handle, 0.);
+        let (dx, dy) = unturned((is.0 - anchor.0, is.1 - anchor.1), rotate);
+        let (fx, fy) = part(handle);
+        if fx != 0.5 {
+            prop_assert!((dx > 0.) == (fx == 1.), "across: {dx} for {handle:?}: {resized:?}");
+        }
+        if fy != 0.5 {
+            prop_assert!((dy > 0.) == (fy == 1.), "down: {dy} for {handle:?}: {resized:?}");
+        }
+        // It keeps on the slide what a move would, and stays where the engine can place it, or
+        // goes no further from either.
+        let (before, after) = (bounds(&start), bounds(&resized));
+        prop_assert!(on(after.x, after.w, 1920.) + 0.02 >= on(before.x, before.w, 1920.).min(after.w.min(16.)), "{start:?} to {resized:?}");
+        prop_assert!(on(after.y, after.h, 1080.) + 0.02 >= on(before.y, before.h, 1080.).min(after.h.min(16.)), "{start:?} to {resized:?}");
+        for (was, is) in [(rect.x, resized.rect.x), (rect.y, resized.rect.y)] {
+            prop_assert!(outside(is) <= outside(was) + 0.02, "{was} to {is}");
+        }
+    }
+
+    #[test]
+    fn a_handle_dragged_onto_the_corner_across_leaves_the_least(
+        rect in sized(0.),
+        rotate in turn(),
+        handle in side_handle(),
+        keep_shape in any::<bool>(),
+    ) {
+        let start = Placed { rect, rotate };
+        let anchor = handle_point(&start, opposite(handle), 0.);
+        let resized = resized(&start, handle, anchor, keep_shape);
+        prop_assert!(resized.rect.x.is_finite() && resized.rect.y.is_finite() && resized.rect.w.is_finite() && resized.rect.h.is_finite());
+        prop_assert!(near(handle_point(&resized, opposite(handle), 0.), anchor, 0.5));
+        prop_assert!(resized.rect.w >= rect.w.min(MIN_SIZE) - 0.01 && resized.rect.h >= rect.h.min(MIN_SIZE) - 0.01, "{resized:?}");
+    }
+
+    #[test]
+    fn written_to_whole_units_the_corner_across_moves_half_a_unit_at_most(
+        rect in sized(MIN_SIZE),
+        rotate in turn(),
+        handle in side_handle(),
+        to in pointer(),
+        keep_shape in any::<bool>(),
+    ) {
+        let start = Placed { rect, rotate };
+        let anchor = handle_point(&start, opposite(handle), 0.);
+        let written = whole(&start, &resized(&start, handle, to, keep_shape), handle);
+        prop_assert!(near(handle_point(&written, opposite(handle), 0.), anchor, 0.51), "{written:?}");
+        for (was, is) in [(rect.x, written.rect.x), (rect.y, written.rect.y), (rect.w, written.rect.w), (rect.h, written.rect.h)] {
+            prop_assert!(is == is.round() || (is - was).abs() <= 0.011, "{was} written as {is}");
+        }
+    }
+
+    #[test]
+    fn keeping_the_shape_keeps_the_proportions(
+        rect in sized(MIN_SIZE),
+        rotate in turn(),
+        handle in corner_handle(),
+        to in pointer(),
+    ) {
+        let start = Placed { rect, rotate };
+        // Only where both sides can keep within their limits together.
+        let fits = (MIN_SIZE / rect.w).max(MIN_SIZE / rect.h) <= (3840. / rect.w).min(3840. / rect.h);
+        prop_assume!(fits);
+        let resized = resized(&start, handle, to, true);
+        let (before, after) = (rect.w / rect.h, resized.rect.w / resized.rect.h);
+        prop_assert!((after / before - 1.).abs() <= 0.01, "{before} became {after}: {resized:?}");
+    }
+
+    #[test]
+    fn an_edge_handle_changes_one_side_only(
+        rect in sized(0.),
+        rotate in turn(),
+        handle in prop_oneof![Just(Handle::Top), Just(Handle::Right), Just(Handle::Bottom), Just(Handle::Left)],
+        to in pointer(),
+        keep_shape in any::<bool>(),
+    ) {
+        let resized = resized(&Placed { rect, rotate }, handle, to, keep_shape);
+        if matches!(handle, Handle::Top | Handle::Bottom) {
+            prop_assert_eq!(resized.rect.w, rect.w);
+        } else {
+            prop_assert_eq!(resized.rect.h, rect.h);
+        }
+    }
+
+    #[test]
+    fn handles_sit_on_the_turned_thing(rect in sized(0.), rotate in turn()) {
+        let placed = Placed { rect, rotate };
+        let Rect { x, y, w, h } = rect;
+        let turned = CaretRect { x: 0., top: 0., height: 0., rotate, centre: centre(&placed) };
+        let corners = [(Handle::TopLeft, (x, y)), (Handle::TopRight, (x + w, y)), (Handle::BottomRight, (x + w, y + h)), (Handle::BottomLeft, (x, y + h))];
+        for (handle, (cx, cy)) in corners {
+            let engine = turned.on_slide(cx, cy);
+            prop_assert!(near(handle_point(&placed, handle, 30.), engine, 0.05), "{handle:?}");
+        }
+        // The turn handle is beyond the middle of the top edge, the gap away.
+        let top = turned.on_slide(x + w / 2., y - 30.);
+        prop_assert!(near(handle_point(&placed, Handle::Turn, 30.), top, 0.05));
+    }
+
+    #[test]
+    fn turning_points_the_top_at_the_pointer(rect in sized(0.), rotate in turn(), to in pointer()) {
+        let start = Placed { rect, rotate };
+        let middle = centre(&start);
+        prop_assume!(!near(middle, to, 1.));
+        let turned = turned_to(&start, to, false);
+        prop_assert_eq!(turned.rect, rect, "a turn doesn't move it");
+        prop_assert_eq!(turned.rotate, turned.rotate.round(), "whole degrees");
+        prop_assert!((-180. ..=180.).contains(&turned.rotate));
+        prop_assert!(apart(turned.rotate, pointing(middle, to)) <= 0.51, "{} for {}", turned.rotate, pointing(middle, to));
+    }
+
+    #[test]
+    fn stepped_turns_are_multiples_of_fifteen(rect in sized(0.), rotate in turn(), to in pointer()) {
+        let start = Placed { rect, rotate };
+        let middle = centre(&start);
+        prop_assume!(!near(middle, to, 1.));
+        let turned = turned_to(&start, to, true);
+        prop_assert_eq!(turned.rotate % 15., 0.);
+        prop_assert!((-180. ..=180.).contains(&turned.rotate));
+        prop_assert!(apart(turned.rotate, pointing(middle, to)) <= 7.51);
+    }
+}
+
+#[test]
+fn a_corner_dragged_out_makes_it_bigger() {
+    let start = Placed { rect: Rect { x: 100., y: 100., w: 200., h: 100. }, rotate: 0. };
+    assert_eq!(resized(&start, Handle::BottomRight, (400., 300.), false).rect, Rect { x: 100., y: 100., w: 300., h: 200. });
+    // Kept to its shape, the corner goes as far as the pointer does the furthest way.
+    assert_eq!(resized(&start, Handle::BottomRight, (400., 300.), true).rect, Rect { x: 100., y: 100., w: 400., h: 200. });
+    // Past the corner across from it, it stays eight units, on its own side.
+    assert_eq!(resized(&start, Handle::TopLeft, (900., 900.), false).rect, Rect { x: 292., y: 192., w: 8., h: 8. });
+    assert_eq!(resized(&start, Handle::Turn, (900., 900.), false), start);
+}
+
+#[test]
+fn a_thing_mostly_off_the_slide_cannot_be_resized_off_it() {
+    let start = Placed { rect: Rect { x: -1000., y: 300., w: 1100., h: 200. }, rotate: 0. };
+    let resized = resized(&start, Handle::Right, (-900., 400.), false);
+    assert_eq!(resized.rect.x, -1000.);
+    assert!((resized.rect.w - 1016.).abs() < 0.01, "sixteen units stay on: {resized:?}");
+}
+
+/// Every way of aligning.
+const ALIGNS: [AlignTo; 6] = [AlignTo::Left, AlignTo::Centre, AlignTo::Right, AlignTo::Top, AlignTo::Middle, AlignTo::Bottom];
+
+/// The line of `rect` that aligning `to` lines things up on.
+fn line_of(rect: Rect, to: AlignTo) -> f32 {
+    match to {
+        AlignTo::Left => rect.x,
+        AlignTo::Centre => rect.x + rect.w / 2.,
+        AlignTo::Right => rect.x + rect.w,
+        AlignTo::Top => rect.y,
+        AlignTo::Middle => rect.y + rect.h / 2.,
+        AlignTo::Bottom => rect.y + rect.h,
+    }
+}
+
+/// A thing somewhere, at the turns that are hard to get right and at any other.
+fn a_thing() -> impl Strategy<Value = Placed> {
+    let rotate = prop_oneof![Just(0f32), Just(37.), Just(90.), Just(180.), Just(359.9), Just(-360.), -360f32..360.];
+    (rect(), rotate).prop_map(|(rect, rotate)| Placed { rect, rotate })
+}
+
+fn things(least: usize) -> impl Strategy<Value = Vec<Placed>> {
+    proptest::collection::vec(a_thing(), least..6)
+}
+
+/// A thing at any turn whose box lies on the slide, 40 units in from its edges at least.
+fn a_thing_on_the_slide() -> impl Strategy<Value = Placed> {
+    let rotate = prop_oneof![Just(0f32), Just(37.), Just(90.), Just(180.), Just(359.9), Just(-360.), -360f32..360.];
+    (1f32..700., 1f32..700., rotate, 0f32..=1., 0f32..=1.).prop_map(|(w, h, rotate, along, down)| {
+        let covers = bounds(&Placed { rect: Rect { x: 0., y: 0., w, h }, rotate });
+        let middle = (40. + covers.w / 2. + along * (1840. - covers.w), 40. + covers.h / 2. + down * (1000. - covers.h));
+        Placed { rect: Rect { x: middle.0 - w / 2., y: middle.1 - h / 2., w, h }, rotate }
+    })
+}
+
+fn things_on_the_slide(least: usize) -> impl Strategy<Value = Vec<Placed>> {
+    proptest::collection::vec(a_thing_on_the_slide(), least..6)
+}
+
+/// Whether `after`, moved from `before`, keeps as much on the slide each way as a move keeps.
+fn kept_on(before: &Placed, after: &Placed) -> bool {
+    let (was, is) = (bounds(before), bounds(after));
+    on(is.x, is.w, 1920.) + 0.01 >= on(was.x, was.w, 1920.).min(is.w.min(16.))
+        && on(is.y, is.h, 1080.) + 0.01 >= on(was.y, was.h, 1080.).min(is.h.min(16.))
+}
+
+fn align_to() -> impl Strategy<Value = AlignTo> {
+    proptest::sample::select(ALIGNS.to_vec())
+}
+
+/// The middle of `placed` along the slide, across or down.
+fn middle_along(placed: &Placed, across: bool) -> f32 {
+    let covers = bounds(placed);
+    if across { covers.x + covers.w / 2. } else { covers.y + covers.h / 2. }
+}
+
+proptest! {
+    #[test]
+    fn aligning_uses_the_turned_bounds(things in things_on_the_slide(1), to in align_to()) {
+        let slide = Rect { x: 0., y: 0., w: 1920., h: 1080. };
+        let target = if things.len() == 1 { slide } else { holding(things.iter().copied()).unwrap() };
+        let line = line_of(target, to);
+        for placed in aligned(&things, to) {
+            let at = line_of(bounds(&placed), to);
+            prop_assert!((at - line).abs() <= 0.01, "{at} isn't on {line}: {placed:?}");
+        }
+    }
+
+    #[test]
+    fn aligning_twice_changes_nothing_more(things in things_on_the_slide(1), to in align_to()) {
+        let once = aligned(&things, to);
+        let twice = aligned(&once, to);
+        for (a, b) in once.iter().zip(&twice) {
+            prop_assert!((a.rect.x - b.rect.x).abs() <= 0.01 && (a.rect.y - b.rect.y).abs() <= 0.01, "{a:?} became {b:?}");
+        }
+    }
+
+    #[test]
+    fn aligning_keeps_sizes_and_turns(things in things(1), to in align_to()) {
+        let out = aligned(&things, to);
+        prop_assert_eq!(out.len(), things.len());
+        let across = matches!(to, AlignTo::Left | AlignTo::Centre | AlignTo::Right);
+        for (before, after) in things.iter().zip(&out) {
+            prop_assert_eq!((after.rect.w, after.rect.h, after.rotate), (before.rect.w, before.rect.h, before.rotate));
+            if across {
+                prop_assert_eq!(after.rect.y, before.rect.y, "only moved across");
+            } else {
+                prop_assert_eq!(after.rect.x, before.rect.x, "only moved down");
+            }
+        }
+    }
+
+    #[test]
+    fn distributing_makes_the_gaps_equal(things in things_on_the_slide(3), across in any::<bool>()) {
+        let out = distributed(&things, across).expect("three or more");
+        prop_assert_eq!(out.len(), things.len());
+        // In their order along the direction, as they were.
+        let mut order: Vec<usize> = (0..things.len()).collect();
+        order.sort_by(|&a, &b| middle_along(&things[a], across).total_cmp(&middle_along(&things[b], across)).then(a.cmp(&b)));
+        let (first, last) = (order[0], order[order.len() - 1]);
+        prop_assert_eq!(out[first], things[first], "the first stays put");
+        prop_assert_eq!(out[last], things[last], "the last stays put");
+        let span = |placed: &Placed| {
+            let covers = bounds(placed);
+            if across { (covers.x, covers.x + covers.w) } else { (covers.y, covers.y + covers.h) }
+        };
+        // Where each between the ends goes with the same gap everywhere, and whether that would
+        // leave less of it on the slide than a move keeps: then it's held, as a move would be,
+        // and only then. Overlapping things can make the gap less than nothing, and take a small
+        // one off the slide's edge.
+        let (first_end, last_start) = (span(&things[first]).1, span(&things[last]).0);
+        let between: f32 = order[1..order.len() - 1].iter().map(|&at| span(&things[at]).1 - span(&things[at]).0).sum();
+        let gap = (last_start - first_end - between) / (things.len() - 1) as f32;
+        let mut at = first_end + gap;
+        let mut held = vec![false; things.len()];
+        for &index in &order[1..order.len() - 1] {
+            let (start, end) = span(&things[index]);
+            let by = at - start;
+            let asked = if across { (by, 0.) } else { (0., by) };
+            let kept = kept_move(&things[index..=index], asked);
+            held[index] = (kept.0 - asked.0).abs() > 0.001 || (kept.1 - asked.1).abs() > 0.001;
+            let want = moved(&things[index], kept);
+            if held[index] {
+                // Held only where the gap would take it further off than a move goes, and then
+                // just as far as a move goes: as much of it on the slide as a move keeps.
+                let side = if across { 1920. } else { 1080. };
+                let length = end - start;
+                let left_on = |placed: &Placed| {
+                    let (start, end) = span(placed);
+                    on(start, end - start, side)
+                };
+                let unheld = moved(&things[index], asked);
+                prop_assert!(left_on(&unheld) < length.min(16.), "{index} was held though the gap left it on");
+                prop_assert!((left_on(&want) - length.min(16.)).abs() <= 0.02, "{index} was held further than a move holds it");
+            }
+            prop_assert!((out[index].rect.x - want.rect.x).abs() <= 0.02 && (out[index].rect.y - want.rect.y).abs() <= 0.02, "{index}: {:?}, not {want:?}", out[index]);
+            at += end - start + gap;
+        }
+        // Between two not held, the gap is the same everywhere.
+        let gaps: Vec<f32> = order
+            .windows(2)
+            .filter(|pair| !held[pair[0]] && !held[pair[1]])
+            .map(|pair| span(&out[pair[1]]).0 - span(&out[pair[0]]).1)
+            .collect();
+        for found in &gaps {
+            prop_assert!((found - gap).abs() <= 0.02, "gaps {gaps:?}, not {gap}");
+        }
+        for (before, after) in things.iter().zip(&out) {
+            prop_assert_eq!((after.rect.w, after.rect.h, after.rotate), (before.rect.w, before.rect.h, before.rotate));
+            if across {
+                prop_assert_eq!(after.rect.y, before.rect.y);
+            } else {
+                prop_assert_eq!(after.rect.x, before.rect.x);
+            }
+        }
+    }
+
+    #[test]
+    fn aligning_and_spacing_out_keep_things_on_the_slide(things in things(1), to in align_to(), across in any::<bool>()) {
+        for (before, after) in things.iter().zip(aligned(&things, to)) {
+            prop_assert!(kept_on(before, &after), "aligned off the slide: {before:?} to {after:?}");
+        }
+        for (before, after) in things.iter().zip(distributed(&things, across).unwrap_or_else(|| things.clone())) {
+            prop_assert!(kept_on(before, &after), "spaced off the slide: {before:?} to {after:?}");
+        }
+    }
+
+    #[test]
+    fn distributing_fewer_than_three_is_none(things in proptest::collection::vec(a_thing(), 0..3), across in any::<bool>()) {
+        prop_assert!(distributed(&things, across).is_none());
+    }
+}
+
+#[test]
+fn one_thing_aligns_to_the_slide_and_several_to_each_other() {
+    let one = Placed { rect: Rect { x: 100., y: 100., w: 200., h: 100. }, rotate: 0. };
+    assert_eq!(aligned(&[one], AlignTo::Right)[0].rect.x, 1720.);
+    assert_eq!(aligned(&[one], AlignTo::Middle)[0].rect.y, 490.);
+    let other = Placed { rect: Rect { x: 500., y: 300., w: 100., h: 100. }, rotate: 0. };
+    let both = aligned(&[one, other], AlignTo::Left);
+    assert_eq!((both[0].rect.x, both[1].rect.x), (100., 100.));
+    // A thing turned a quarter lines up by the box it covers: 100 wide by 200 tall.
+    let turned = Placed { rect: Rect { x: 500., y: 300., w: 200., h: 100. }, rotate: 90. };
+    assert_eq!(aligned(&[turned], AlignTo::Top)[0].rect.y, 50.);
+}
+
+#[test]
+fn a_line_far_off_the_slide_takes_a_thing_only_part_of_the_way() {
+    // Found in review: a thing mostly off the slide took another wholly off with it.
+    let far = Placed { rect: Rect { x: -984., y: 100., w: 1000., h: 100. }, rotate: 0. };
+    let other = Placed { rect: Rect { x: 600., y: 400., w: 500., h: 100. }, rotate: 0. };
+    let lined = aligned(&[far, other], AlignTo::Left);
+    assert_eq!(lined[0], far, "the far one is on the line already");
+    assert_eq!(lined[1].rect.x, -484., "sixteen units of the other stay on");
+}
+
+#[test]
+fn spacing_out_overlapping_things_holds_a_small_one_at_the_slides_edge() {
+    // Found by the property: two tall things turned upside down overlap so much that the gap
+    // is less than nothing, and with the same gap everywhere two small things would go wholly
+    // off the slide's bottom. Each is held with its one unit on, as a move holds it.
+    let dot = |y: f32| Placed { rect: Rect { x: 40., y, w: 1., h: 1. }, rotate: 0. };
+    let tall = |y: f32, h: f32| Placed { rect: Rect { x: 40., y, w: 1., h }, rotate: 180. };
+    let things = [dot(875.15576), tall(375.97754, 431.03207), dot(1012.1295), tall(332.37946, 666.2865), dot(1021.3505)];
+    let out = distributed(&things, false).expect("five");
+    assert_eq!(out[1], things[1], "the first along stays");
+    assert_eq!(out[4], things[4], "and the last");
+    assert!((out[0].rect.y - 1079.).abs() < 0.01 && (out[2].rect.y - 1079.).abs() < 0.01, "both held at the bottom: {out:?}");
+    // The tall one between the ends isn't held: it goes the gap after the first.
+    let first = bounds(&things[1]);
+    let gap = (things[4].rect.y - (first.y + first.h) - 666.2865 - 2.) / 4.;
+    assert!((bounds(&out[3]).y - (first.y + first.h + gap)).abs() < 0.02);
+}

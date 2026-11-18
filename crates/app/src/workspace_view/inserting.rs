@@ -132,7 +132,7 @@ impl WorkspaceView {
     pub(super) fn keyboard_to_the_slide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let selected_here = self.document.as_ref().is_some_and(|document| {
             let document = document.read(cx);
-            document.selected().is_some_and(|selected| selected.slide == document.current())
+            document.selection().is_some_and(|selection| selection.slide == document.current())
         });
         if selected_here {
             let slide = self.slide_editor.read(cx).focus_handle().clone();

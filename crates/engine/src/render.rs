@@ -1,5 +1,7 @@
 //! Draws a `LayerSpec` into its own pixmap, and puts layers together.
 
+use std::sync::Arc;
+
 use tiny_skia::{
     ColorU8, FillRule, FilterQuality, Paint, Pixmap, PixmapPaint, Point, Shader, Stroke, Transform,
 };
@@ -25,6 +27,11 @@ const MAX_PIXELS: u64 = 64_000_000;
 /// How far from the slide a layer can sit. `compose` adds a layer's size to its position,
 /// and that sum has to fit in an `i32`.
 const MAX_OFFSET: f32 = 1_000_000_000.0;
+
+/// A device pixel position, held to where a layer can sit.
+pub(crate) fn device_offset(at: f32) -> i32 {
+    at.clamp(-MAX_OFFSET, MAX_OFFSET) as i32
+}
 
 /// `(left, top, right, bottom)` of the box around the rect and everything drawn, before
 /// rotation, with the rect's top-left corner as the origin.
@@ -54,7 +61,7 @@ fn extent(spec: &LayerSpec) -> (f32, f32, f32, f32) {
 
 /// What a layer whose place makes no sense draws: nothing.
 fn blank_layer() -> Layer {
-    Layer { pixmap: Pixmap::new(1, 1).expect("1 by 1 is a valid size"), x: 0, y: 0 }
+    Layer { pixmap: Arc::new(Pixmap::new(1, 1).expect("1 by 1 is a valid size")), x: 0, y: 0 }
 }
 
 fn pixmap_side(from: f32, to: f32) -> u32 {
@@ -125,16 +132,16 @@ pub fn render_layer(spec: &LayerSpec, scale: f32, fonts: &mut Fonts) -> Layer {
         }
     }
     Layer {
-        pixmap,
-        x: min_x.clamp(-MAX_OFFSET, MAX_OFFSET) as i32,
-        y: min_y.clamp(-MAX_OFFSET, MAX_OFFSET) as i32,
+        pixmap: Arc::new(pixmap),
+        x: device_offset(min_x),
+        y: device_offset(min_y),
     }
 }
 
 /// Draws the layers over `target`, first to last.
 pub fn compose(target: &mut Pixmap, layers: &[Layer]) {
     for layer in layers {
-        target.draw_pixmap(layer.x, layer.y, layer.pixmap.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+        target.draw_pixmap(layer.x, layer.y, Pixmap::as_ref(&layer.pixmap), &PixmapPaint::default(), Transform::identity(), None);
     }
 }
 

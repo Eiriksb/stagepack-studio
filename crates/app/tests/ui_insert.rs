@@ -12,7 +12,7 @@ use typing::*;
 
 use gpui_kit::test::{TestQueryExt, TestWindowExt};
 use gpui_kit::{
-    AppContext as _, ClipboardEntry, ClipboardItem, ElementId, Entity, ExternalPaths, FileDropEvent, Image, ImageFormat,
+    AppContext as _, ClipboardEntry, ClipboardItem, Entity, ExternalPaths, FileDropEvent, Image, ImageFormat,
     InputEvent as _, Pixels, Point, TestAppContext, px, size,
 };
 use slides_engine::{Deck, FolderFiles, Fonts, NativeContent};
@@ -24,7 +24,8 @@ use stagepack_studio::recovery::Recovery;
 use stagepack_studio::ribbon::{DELETE_ID, DUPLICATE_ID, MORE_RIGHT_ID, RIBBON_ID, TAB_HOME_ID, TAB_INSERT_ID};
 use stagepack_studio::text_tools::{ALIGN_CENTER_ID, BOLD_ID, BULLETS_ID, NUMBERING_ID};
 use stagepack_studio::inspector::{INSPECTOR_HEADING_ID, INSPECTOR_MESSAGE_ID};
-use stagepack_studio::slide_editor::{NEW_BOX_ID, SELECTION_OUTLINE_ID, SlideEditor};
+use stagepack_studio::selection::Thing;
+use stagepack_studio::slide_editor::{NEW_BOX_ID, SELECTION_OUTLINE_ID, SlideEditor, selection_outline_id};
 use stagepack_studio::slide_strip::{STRIP_ID, strip_row_id};
 use stagepack_studio::workspace_view::{DIALOG_FAILED, ExportPdf, ONLY_THE_FIRST, RECOVER_ID};
 use toolkit::ShapeKind;
@@ -71,23 +72,6 @@ fn selected_text(typing: &Typing, cx: &TestAppContext) -> Option<String> {
 
 fn can_undo(typing: &Typing, cx: &TestAppContext) -> bool {
     typing.document(cx).read_with(cx, |document, _| document.can_undo())
-}
-
-fn click_on(typing: &Typing, cx: &mut TestAppContext, id: impl Into<ElementId>) {
-    let id = id.into();
-    typing.with_window(cx, |window, cx| {
-        window.render_frame(cx);
-        window.click(id, cx);
-    });
-    typing.settle(cx);
-}
-
-fn bounds_of(typing: &Typing, cx: &mut TestAppContext, id: impl Into<ElementId>) -> Option<gpui_kit::Bounds<Pixels>> {
-    let id = id.into();
-    typing.with_window(cx, |window, cx| {
-        window.render_frame(cx);
-        window.try_find(id).map(|found| found.bounds())
-    })
 }
 
 fn insert_tab(typing: &Typing, cx: &mut TestAppContext) {
@@ -494,7 +478,8 @@ fn list_has_keyboard(typing: &Typing, cx: &mut TestAppContext) -> bool {
 /// The rule that keeps Delete from taking a slide while a thing on it shows as selected: never
 /// both at once.
 fn holds_the_rule(typing: &Typing, cx: &mut TestAppContext, step: &str) {
-    let both = list_has_keyboard(typing, cx) && selected(typing, cx).is_some();
+    let picked = typing.document(cx).read_with(cx, |document, _| document.selection().is_some());
+    let both = list_has_keyboard(typing, cx) && picked;
     assert!(!both, "after {step}, the list has the keyboard while a thing is selected");
 }
 
@@ -615,7 +600,104 @@ fn the_list_never_has_the_keyboard_while_a_thing_is_selected(cx: &mut TestAppCon
         typing.press(cx, "ctrl-v");
         holds_the_rule(&typing, cx, &format!("{how:?} then a paste"));
         assert_eq!(typing.source(cx).matches("<Shape").count(), 2, "{how:?}: the paste is on the slide");
+        // Two things selected, and brought back selected by Undo and Redo pressed in the list.
+        let typing = open(cx, TALK);
+        select_two_shapes(&typing, cx);
+        to_the_list(&typing, cx, how);
+        holds_the_rule(&typing, cx, &format!("{how:?} after two things"));
+        assert!(bounds_of(&typing, cx, selection_outline_id(0)).is_none(), "{how:?}: no outline");
+        let two = typing.source(cx);
+        // Taken away, and brought back by Undo in the list.
+        select_two_shapes_again(&typing, cx);
+        typing.press(cx, "delete");
+        assert_eq!(typing.source(cx), TALK, "{how:?}: both taken");
+        to_the_list(&typing, cx, how);
+        typing.press(cx, "ctrl-z");
+        assert_eq!(typing.source(cx), two, "{how:?}: both back");
+        brought_back_on_the_slide(&typing, cx, &format!("{how:?} then Undo of two"), 2);
+        to_the_list(&typing, cx, how);
+        typing.press(cx, "ctrl-shift-z");
+        assert_eq!(typing.source(cx), TALK, "{how:?}: Redo takes them again");
+        holds_the_rule(&typing, cx, &format!("{how:?} then Redo of two"));
+        to_the_list(&typing, cx, how);
+        typing.press(cx, "ctrl-z");
+        brought_back_on_the_slide(&typing, cx, &format!("{how:?} then Undo again"), 2);
+        let slides = typing.slide_count(cx);
+        typing.press(cx, "delete");
+        assert_eq!(typing.slide_count(cx), slides, "{how:?}: Delete takes the things, and the slide stays");
+        assert_eq!(typing.source(cx), TALK, "{how:?}");
+        // An area, and brought back selected by an Undo of its place pressed in the list.
+        let typing = open(cx, TALK);
+        select_main_text(&typing, cx);
+        to_the_list(&typing, cx, how);
+        holds_the_rule(&typing, cx, &format!("{how:?} after an area"));
+        assert!(bounds_of(&typing, cx, SELECTION_OUTLINE_ID).is_none(), "{how:?}: no outline");
+        select_main_text(&typing, cx);
+        let field = gpui_kit::SharedString::from(stagepack_studio::inspector::field_id("x"));
+        click_on(&typing, cx, field);
+        typing.press(cx, "ctrl-a");
+        typing.type_text(cx, "120");
+        typing.press(cx, "enter");
+        assert!(typing.source(cx).contains("region.body: x=120"), "{how:?}: the area moved");
+        to_the_list(&typing, cx, how);
+        typing.press(cx, "ctrl-z");
+        assert_eq!(typing.source(cx), TALK, "{how:?}: the move undone");
+        brought_back_on_the_slide(&typing, cx, &format!("{how:?} then Undo of an area's move"), 1);
+        let slides = typing.slide_count(cx);
+        typing.press(cx, "delete");
+        assert_eq!(typing.slide_count(cx), slides, "{how:?}: Delete on an area takes no slide");
+        assert_eq!(typing.source(cx), TALK, "{how:?}: nor anything else");
     }
+}
+
+/// After an Undo or a Redo pressed in the list of slides brings `count` things back selected:
+/// the rule holds, they show their outlines, and the slide has the keyboard.
+fn brought_back_on_the_slide(typing: &Typing, cx: &mut TestAppContext, step: &str, count: usize) {
+    holds_the_rule(typing, cx, step);
+    let picked = typing.document(cx).read_with(cx, |document, _| document.selection().map(|selection| selection.things.len()));
+    assert_eq!(picked, Some(count), "{step}: selected again");
+    assert!(bounds_of(typing, cx, SELECTION_OUTLINE_ID).is_some(), "{step}: the outline shows");
+    if count > 1 {
+        assert!(bounds_of(typing, cx, selection_outline_id(0)).is_some(), "{step}: every outline shows");
+    }
+    let editor_has_it = typing.with_window(cx, |window, cx| typing.view.read(cx).slide_editor().read(cx).focus_handle().is_focused(window));
+    assert!(editor_has_it, "{step}: the slide has the keyboard");
+}
+
+/// Selects both shapes `select_two_shapes` put on the first slide, again.
+fn select_two_shapes_again(typing: &Typing, cx: &mut TestAppContext) {
+    let first = thing(typing, cx, "<Shape");
+    let corner = typing.at(cx, first.rect.x + 10., first.rect.y + 10.);
+    typing.click(cx, corner);
+    let shapes: Vec<_> = typing.layout(cx).elements().to_vec();
+    let second = shapes.iter().find(|element| element.source != first.source).expect("the copy").clone();
+    let at = typing.at(cx, second.rect.x + second.rect.w - 10., second.rect.y + second.rect.h - 10.);
+    typing.clicks(cx, at, 1, gpui_kit::Modifiers::shift());
+    let two = typing.document(cx).read_with(cx, |document, _| document.selection().map(|selection| selection.things.len()));
+    assert_eq!(two, Some(2), "both shapes are selected again");
+}
+
+/// Puts a shape on the first slide, and a copy of it beside it, and selects both.
+fn select_two_shapes(typing: &Typing, cx: &mut TestAppContext) {
+    insert_shape(typing, cx, "rect");
+    let first = thing(typing, cx, "<Shape");
+    typing.press(cx, "ctrl-d");
+    // A corner of the first that the copy, 40 down and right, doesn't cover.
+    let corner = typing.at(cx, first.rect.x + 10., first.rect.y + 10.);
+    typing.clicks(cx, corner, 1, gpui_kit::Modifiers::shift());
+    let two = typing.document(cx).read_with(cx, |document, _| document.selection().map(|selection| selection.things.len()));
+    assert_eq!(two, Some(2), "two things are selected");
+}
+
+/// Types in the first slide's main text, and selects its area by a press on its frame.
+fn select_main_text(typing: &Typing, cx: &mut TestAppContext) {
+    let body = typing.flows(cx, 0).len() - 1;
+    typing.click_text(cx, body, pos(0, 2));
+    let rect = typing.layout(cx).region("body").expect("the main text").rect;
+    let at = typing.at(cx, rect.x, rect.y + rect.h / 2.);
+    typing.click(cx, at);
+    let area = typing.document(cx).read_with(cx, |document, _| document.selection().map(|selection| selection.things.clone()));
+    assert_eq!(area, Some(vec![Thing::Region("body".into())]), "the area is selected");
 }
 
 #[gpui_kit::test]
@@ -679,6 +761,10 @@ enum Typed {
     InCell,
     /// A new text box waiting for its first letter.
     PendingBox,
+    /// Nothing typed, and two things selected.
+    TwoSelected,
+    /// Nothing typed, and the main text's area selected.
+    AreaSelected,
 }
 
 const TABLE_TALK: &str = "---\ntitle: T\n---\n\n# One\n\n| a | b |\n| --- | --- |\n| c | d |\n\n---\n\n# Two\n";
@@ -711,9 +797,15 @@ fn start_typing(cx: &mut TestAppContext, typed: Typed) -> Typing {
             typing.type_text(cx, "x");
         }
         Typed::PendingBox => insert_text_box(&typing, cx),
+        Typed::TwoSelected => select_two_shapes(&typing, cx),
+        Typed::AreaSelected => select_main_text(&typing, cx),
     }
-    let started = typing.editing(cx).is_some();
-    assert!(started, "{typed:?}: typing has started");
+    let started = if matches!(typed, Typed::TwoSelected | Typed::AreaSelected) {
+        typing.document(cx).read_with(cx, |document, _| document.selection().is_some())
+    } else {
+        typing.editing(cx).is_some()
+    };
+    assert!(started, "{typed:?}: typing has started, or something is selected");
     typing
 }
 
@@ -734,6 +826,9 @@ fn the_list_taking_the_keyboard_ends(cx: &mut TestAppContext, typed: Typed) {
         assert!(new_box(&typing, cx).is_none(), "{case}: no text box is waiting");
         assert!(bounds_of(&typing, cx, NEW_BOX_ID).is_none(), "{case}: no new box is drawn");
         assert_eq!(selected(&typing, cx), None, "{case}: nothing is selected");
+        let picked = typing.document(cx).read_with(cx, |document, _| document.selection().is_some());
+        assert!(!picked, "{case}: no area or things are selected");
+        assert!(bounds_of(&typing, cx, SELECTION_OUTLINE_ID).is_none(), "{case}: no outline");
         assert_eq!(typing.source(cx), after_escape, "{case}: the talk is as after Escape");
         // Only now that nothing on the slide shows as its target does the key take a slide.
         let slides = typing.slide_count(cx);
@@ -765,6 +860,16 @@ fn the_list_taking_the_keyboard_ends_typing_in_a_cell(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn the_list_taking_the_keyboard_drops_a_pending_text_box(cx: &mut TestAppContext) {
     the_list_taking_the_keyboard_ends(cx, Typed::PendingBox);
+}
+
+#[gpui_kit::test]
+fn the_list_taking_the_keyboard_lets_go_of_two_things(cx: &mut TestAppContext) {
+    the_list_taking_the_keyboard_ends(cx, Typed::TwoSelected);
+}
+
+#[gpui_kit::test]
+fn the_list_taking_the_keyboard_lets_go_of_an_area(cx: &mut TestAppContext) {
+    the_list_taking_the_keyboard_ends(cx, Typed::AreaSelected);
 }
 
 #[gpui_kit::test]
@@ -1369,6 +1474,9 @@ fn formatting_chosen_for_a_pending_box_is_written_with_it(cx: &mut TestAppContex
         (BOLD_ID, "**x**".to_string()),
     ] {
         let typing = open(cx, TALK);
+        // Wide enough for the Home tab's list tools to show.
+        cx.simulate_window_resize(typing.handle, gpui_kit::size(px(1600.), px(800.)));
+        typing.settle(cx);
         insert_text_box(&typing, cx);
         click_on(&typing, cx, TAB_HOME_ID);
         click_on(&typing, cx, tool);
@@ -1386,6 +1494,9 @@ fn formatting_chosen_for_a_pending_box_is_written_with_it(cx: &mut TestAppContex
 #[gpui_kit::test]
 fn an_alignment_chosen_for_a_pending_box_is_written_with_it(cx: &mut TestAppContext) {
     let typing = open(cx, TALK);
+    // Wide enough for the Home tab's alignment tools to show.
+    cx.simulate_window_resize(typing.handle, gpui_kit::size(px(1600.), px(800.)));
+    typing.settle(cx);
     insert_text_box(&typing, cx);
     click_on(&typing, cx, TAB_HOME_ID);
     click_on(&typing, cx, ALIGN_CENTER_ID);

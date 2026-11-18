@@ -1495,6 +1495,7 @@ mod tools {
         MORE_LEFT_ID, MORE_RIGHT_ID, REDO_ID, RIBBON_ID, RIBBON_TOOLS_ID,
         SAVE_ID, UNDO_ID,
     };
+    use stagepack_studio::arrange_tools::ARRANGE_ID;
 
     /// How a tool shows the selection.
     #[derive(Debug, PartialEq, Eq)]
@@ -1509,7 +1510,8 @@ mod tools {
     fn open(cx: &mut TestAppContext, source: &str) -> Typing {
         let typing = super::open(cx, source);
         typing.with_window(cx, |window, _| window.activate_window());
-        typing.settle(cx);
+        // Wide enough for every tool of the Home tab to show.
+        typing.resize(cx, 1600., 800.);
         typing
     }
 
@@ -2214,11 +2216,11 @@ mod tools {
         }
     }
 
-    const HOME_TOOLS: [&str; 24] = [
+    const HOME_TOOLS: [&str; 25] = [
         PASTE_ID, CUT_ID, COPY_ID, SAVE_ID, DUPLICATE_ID, DELETE_ID, HIDE_ID,
         BOLD_ID, ITALIC_ID, UNDERLINE_ID, SIZE_ID, SIZE_LIST_ID, COLOR_ID, AUTOMATIC_COLOR_ID,
         BULLETS_ID, NUMBERING_ID, INDENT_LESS_ID, INDENT_MORE_ID, ALIGN_LEFT_ID, ALIGN_CENTER_ID,
-        ALIGN_RIGHT_ID, UNDO_ID, REDO_ID, NEW_SLIDE_ID,
+        ALIGN_RIGHT_ID, UNDO_ID, REDO_ID, NEW_SLIDE_ID, ARRANGE_ID,
     ];
 
     #[gpui_kit::test]
@@ -2232,7 +2234,7 @@ mod tools {
             assert!(typing.bring_into_view(cx, tool), "{tool} can't be reached");
         }
         // At the far end, the arrow is on the other side.
-        typing.bring_into_view(cx, REDO_ID);
+        typing.bring_into_view(cx, ARRANGE_ID);
         assert!(typing.bounds_of(cx, MORE_LEFT_ID).is_some());
         // Tools reached by scrolling work, and typing goes on.
         assert!(typing.bring_into_view(cx, ALIGN_RIGHT_ID));
@@ -2268,9 +2270,10 @@ mod tools {
 
     #[gpui_kit::test]
     fn in_a_wide_window_nothing_scrolls(cx: &mut TestAppContext) {
-        // The Home tab's tools, Duplicate slide and Delete slide among them, take about 1,410 pixels.
+        // The Home tab's tools, Duplicate slide, Delete slide and Layout among them, take about
+        // 1,600 pixels.
         let typing = open(cx, TWO);
-        typing.resize(cx, 1440., 800.);
+        typing.resize(cx, 1700., 800.);
         typing.select_word(cx, 6);
         assert!(typing.bounds_of(cx, MORE_RIGHT_ID).is_none());
         assert!(typing.bounds_of(cx, MORE_LEFT_ID).is_none());
@@ -2286,7 +2289,7 @@ mod tools {
         // Narrowed, it does; widened again, it doesn't.
         typing.resize(cx, 1024., 600.);
         assert!(typing.bounds_of(cx, MORE_RIGHT_ID).is_some());
-        typing.resize(cx, 1440., 800.);
+        typing.resize(cx, 1700., 800.);
         assert!(typing.bounds_of(cx, MORE_RIGHT_ID).is_none());
     }
 

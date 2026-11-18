@@ -4,7 +4,7 @@
 
 /// The characters a backslash before them stands for. Before anything else a backslash
 /// is kept as written, so hand-written notes like `C:\path` read as they always did.
-const ESCAPED: [char; 5] = ['\\', '<', '`', '~', '-'];
+const ESCAPED: [char; 6] = ['\\', '<', '`', '~', '-', '|'];
 
 /// `notes` as written inside `<Notes>`:
 /// - every `\` is written `\\`, and every `<` is written `\<`, so no tag starts or ends
@@ -13,7 +13,10 @@ const ESCAPED: [char; 5] = ['\\', '<', '`', '~', '-'];
 ///   fence: one would swallow the rest of the talk, and one after a list marker makes the
 ///   `markdown` crate give up on the slide;
 /// - a line that is only `---` (and trailing spaces) is written `\---`, so it doesn't end
-///   the slide.
+///   the slide;
+/// - a `|` that ends a line, but for spaces after it, is written `\|`: a quote or a list item
+///   ending in one, as the notes' last line, makes the `markdown` crate read a table after the
+///   notes as a paragraph.
 ///
 /// `{`, `}` and `>` are left as they are: inside `<Notes>` the parser reads them as text.
 pub(crate) fn escape_notes(notes: &str) -> String {
@@ -26,12 +29,13 @@ pub(crate) fn escape_notes(notes: &str) -> String {
             out.push('\\');
         }
         let chars: Vec<char> = line.chars().collect();
+        let last_bar = chars.iter().rposition(|&c| !matches!(c, ' ' | '\r')).filter(|&at| chars[at] == '|');
         for (i, &c) in chars.iter().enumerate() {
             let starts_a_fence = matches!(c, '`' | '~')
                 && (i == 0 || chars[i - 1] != c)
                 && chars.get(i + 1) == Some(&c)
                 && chars.get(i + 2) == Some(&c);
-            if matches!(c, '\\' | '<') || starts_a_fence {
+            if matches!(c, '\\' | '<') || starts_a_fence || last_bar == Some(i) {
                 out.push('\\');
             }
             out.push(c);

@@ -10,7 +10,7 @@ use slides_engine::{Layer, to_bgra_frame};
 use crate::present::{LayerLook, SlideLook};
 
 /// The width of a 16:9 slide, in slide units.
-pub const SLIDE_WIDTH: f32 = 1920.0;
+pub use slides_engine::SLIDE_WIDTH;
 
 /// How far the slide can grow or shrink before its layers are drawn again. Below this they
 /// are stretched to fit, so a resize doesn't draw the slide again for every pixel.

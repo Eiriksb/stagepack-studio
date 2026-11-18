@@ -14,10 +14,11 @@ use slides_engine::{Fonts, pack_folder};
 use slides_format::is_hidden;
 use stagepack_studio::document::Document;
 use stagepack_studio::insert_tools::INSERT_PICTURE_ID;
+use stagepack_studio::layout_picker::layout_tile_id;
 use stagepack_studio::notes_panel::{NOTES_CAPTION_ID, NOTES_ID, NOTES_PLACEHOLDER};
 use stagepack_studio::ribbon::{
-    DELETE_ID, DUPLICATE_ID, HIDE_ID, MARKDOWN_TOGGLE_ID, NEW_SLIDE_ID, NEW_SLIDE_LAYOUTS_ID,
-    MORE_RIGHT_ID, NOTES_TOGGLE_ID, ON_THE_WAY, ON_THE_WAY_ID, PRESENT_ID, REDO_ID, REHEARSE_ID, RIBBON_ID,
+    DELETE_ID, DUPLICATE_ID, HIDE_ID, MARKDOWN_TOGGLE_ID, NEW_SLIDE_CARET_ID, NEW_SLIDE_ID,
+    NEW_SLIDE_LAYOUTS_ID, MORE_RIGHT_ID, NOTES_TOGGLE_ID, PRESENT_ID, REDO_ID, REHEARSE_ID, RIBBON_ID,
     SLIDE_LIST_TOGGLE_ID, TAB_ANIMATE_ID, TAB_HOME_ID, TAB_INSERT_ID, TAB_SLIDE_SHOW_ID,
     TAB_VIEW_ID, UNDO_ID,
 };
@@ -108,13 +109,13 @@ fn keys(cx: &mut TestAppContext, handle: AnyWindowHandle, keystrokes: &str) {
     settle(cx, handle);
 }
 
-/// Picks `row` of the New slide button's list of layouts.
-fn pick_layout(cx: &mut TestAppContext, handle: AnyWindowHandle, row: usize) {
+/// Picks the tile of the layout `layout` from the New slide button's arrow.
+fn pick_layout(cx: &mut TestAppContext, handle: AnyWindowHandle, layout: &str) {
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
-        window.within(NEW_SLIDE_LAYOUTS_ID).click("popup", cx);
+        window.within(NEW_SLIDE_LAYOUTS_ID).click(NEW_SLIDE_CARET_ID, cx);
         window.render_frame(cx);
-        window.within("popup-menu").click(row, cx);
+        window.click(layout_tile_id(layout), cx);
     })
     .unwrap();
     settle(cx, handle);
@@ -273,16 +274,16 @@ fn each_tab_shows_its_own_tools(cx: &mut TestAppContext) {
     click(cx, handle, TAB_INSERT_ID);
     with_window(cx, handle, |window, _| {
         assert_eq!(window.find(INSERT_PICTURE_ID).label(), Some("Picture"));
-        assert!(window.try_find(ON_THE_WAY_ID).is_none(), "the Insert tab has its tools");
         assert!(window.try_find(NEW_SLIDE_ID).is_none(), "Home's tools are put away");
         assert_eq!(window.find(TAB_INSERT_ID).selected(), Some(true));
     });
     click(cx, handle, TAB_ANIMATE_ID);
     with_window(cx, handle, |window, _| {
-        let line = window.find(ON_THE_WAY_ID);
-        assert!(line.visible());
-        assert_eq!(line.label(), Some(ON_THE_WAY));
-        assert_eq!(ON_THE_WAY, "Tools for this tab are on the way.");
+        use stagepack_studio::animate_tools::{EARLIER_ID, ENTRANCE_ID, LATER_ID, ONE_AT_A_TIME_ID, STEP_LABEL_ID, TRANSITION_ALL_ID, TRANSITION_ID};
+        for tool in [TRANSITION_ID, TRANSITION_ALL_ID, ENTRANCE_ID, EARLIER_ID, LATER_ID, STEP_LABEL_ID, ONE_AT_A_TIME_ID] {
+            assert!(window.try_find(tool).is_some(), "the Animate tab has its {tool}");
+        }
+        assert_eq!(window.find(TRANSITION_ALL_ID).label(), Some("Apply to all slides"));
         assert!(
             window.try_find(NEW_SLIDE_ID).is_none(),
             "Home's tools are put away"
@@ -293,7 +294,6 @@ fn each_tab_shows_its_own_tools(cx: &mut TestAppContext) {
     with_window(cx, handle, |window, _| {
         assert_eq!(window.find(PRESENT_ID).label(), Some("From the start"));
         assert_eq!(window.find(REHEARSE_ID).label(), Some("Rehearse"));
-        assert!(window.try_find(ON_THE_WAY_ID).is_none());
     });
     click(cx, handle, TAB_VIEW_ID);
     with_window(cx, handle, |window, _| {
@@ -391,33 +391,34 @@ fn the_layout_list_adds_a_slide_of_that_layout(cx: &mut TestAppContext) {
     let (handle, view) = open(cx, TWO);
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
-        window.within(NEW_SLIDE_LAYOUTS_ID).click("popup", cx);
+        window.within(NEW_SLIDE_LAYOUTS_ID).click(NEW_SLIDE_CARET_ID, cx);
         window.render_frame(cx);
-        let menu = window.within("popup-menu");
-        for name in [
-            "Title",
-            "Title and content",
-            "Section",
-            "Two columns",
-            "Blank",
+        for (layout, name) in [
+            ("title", "Title"),
+            ("content", "Title and content"),
+            ("two-columns", "Two columns"),
+            ("section", "Section"),
+            ("blank", "Blank"),
         ] {
-            assert!(menu.find_by_label(name).visible(), "{name}");
+            let tile = window.find(layout_tile_id(layout));
+            assert!(tile.visible(), "{name}");
+            assert_eq!(tile.label(), Some(name));
         }
         window.press("escape", cx);
     })
     .unwrap();
     settle(cx, handle);
     let expected = [
-        (0, Some("title")),
-        (1, None),
-        (2, Some("section")),
-        (3, Some("two-columns")),
-        (4, Some("blank")),
+        ("title", Some("title")),
+        ("content", None),
+        ("section", Some("section")),
+        ("two-columns", Some("two-columns")),
+        ("blank", Some("blank")),
     ];
-    for (row, layout) in expected {
-        pick_layout(cx, handle, row);
+    for (tile, layout) in expected {
+        pick_layout(cx, handle, tile);
         let at = current(cx, &view);
-        assert_eq!(layout_of(cx, &view, at).as_deref(), layout, "row {row}");
+        assert_eq!(layout_of(cx, &view, at).as_deref(), layout, "{tile}");
     }
     assert_eq!(count(cx, &view), 7);
 }
@@ -1263,8 +1264,8 @@ fn pick_from_rows_menu(cx: &mut TestAppContext, handle: AnyWindowHandle, row: us
     settle(cx, handle);
 }
 
-/// The menu's items, a line between the last two groups.
-const MENU: [&str; 10] = [
+/// The menu's items, a line between each two groups.
+const MENU: [&str; 12] = [
     "New slide",
     "Duplicate",
     "Delete",
@@ -1275,6 +1276,8 @@ const MENU: [&str; 10] = [
     "Cut",
     "Copy",
     "Paste",
+    "",
+    "Layout",
 ];
 
 #[gpui_kit::test]

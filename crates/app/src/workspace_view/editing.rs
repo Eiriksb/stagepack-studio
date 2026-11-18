@@ -7,6 +7,7 @@ use crate::clipboard::{self, AppData, Carried, PastedFiles, SlidePaste, TooLarge
 use crate::clipboard_tools::write_clipboard;
 use crate::document::{Brought, Selected};
 use crate::inspector::INSPECTOR_WIDTH;
+use crate::layout_picker::layout_name;
 
 impl WorkspaceView {
     /// Moves to another slide, unless the notes field has the keyboard: its keys move the caret.
@@ -90,7 +91,7 @@ impl WorkspaceView {
         }
     }
 
-    /// Sets attribute `name` of the thing the inspector shows to `value`, or takes it away, as
+    /// Sets each attribute of `values` on the thing the inspector shows, or takes it away, as
     /// one edit, or says why it wasn't made. The inspector shows the thing picked `pick`,
     /// now at `target`: while it's still the one selected, the selection's is the one changed;
     /// once another is picked, as by the click that took the keyboard from a field, the change
@@ -99,8 +100,7 @@ impl WorkspaceView {
         &mut self,
         pick: u64,
         target: &Selected,
-        name: &str,
-        value: Option<&str>,
+        values: &[(&str, Option<&str>)],
         cx: &mut Context<Self>,
     ) -> Result<(), EditRefused> {
         let Some(document) = self.document.clone() else {
@@ -111,9 +111,9 @@ impl WorkspaceView {
         self.edit(
             |document| {
                 let result = if picked {
-                    document.set_selected_attr(name, value)
+                    document.set_selected_attrs(values)
                 } else {
-                    document.set_attr_of(target, name, value)
+                    document.set_attrs_of(target, values)
                 };
                 made = result.as_ref().map(|_| ()).map_err(|refused| *refused);
                 result
@@ -123,10 +123,37 @@ impl WorkspaceView {
         made
     }
 
-    /// Whether the inspector shows: whenever a talk is open, so the slide's place never
-    /// changes as things are selected and let go of.
+    /// Sets the word `name` of area `region` of slide `slide` to `value`, or takes it away, from
+    /// the inspector, and says whether it was set.
+    pub(crate) fn set_region_value_from_inspector(
+        &mut self,
+        slide: usize,
+        region: &str,
+        name: &str,
+        value: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), EditRefused> {
+        let mut made = Err(EditRefused::CouldNotBeMade);
+        self.edit(
+            |document| {
+                let result = document.set_region_value(slide, region, name, value);
+                made = result.as_ref().map(|_| ()).map_err(|refused| *refused);
+                result
+            },
+            cx,
+        );
+        made
+    }
+
+    /// Puts area `region` of slide `slide` back where its layout has it, from the inspector.
+    pub(crate) fn put_back_region_from_inspector(&mut self, slide: usize, region: &str, cx: &mut Context<Self>) {
+        self.edit(|document| document.put_back_region(slide, region), cx);
+    }
+
+    /// Whether the inspector shows: whenever a talk is open, unless it's been hidden, so the
+    /// slide's place never changes as things are selected and let go of.
     pub(super) fn shows_inspector(&self) -> bool {
-        self.document.is_some()
+        self.document.is_some() && self.show_inspector
     }
 
     /// Leaves the talk tidy of what typing on the slide left empty, before it's saved, shown
@@ -176,6 +203,18 @@ impl WorkspaceView {
 
     pub(super) fn add_slide(&mut self, layout: &str, cx: &mut Context<Self>) {
         self.edit(|document| document.add_slide(layout), cx);
+    }
+
+    /// Gives the current slide the layout called `layout`, and says so once it has it.
+    pub(super) fn set_layout(&mut self, layout: &'static str, cx: &mut Context<Self>) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        let before = document.read(cx).layout_here();
+        self.edit(|document| document.set_layout(layout), cx);
+        if before != layout && document.read(cx).layout_here() == layout {
+            self.say_for_a_while(format!("Layout changed to {}.", layout_name(layout)), cx);
+        }
     }
 
     pub(super) fn delete_slide(&mut self, cx: &mut Context<Self>) {
@@ -262,7 +301,7 @@ impl WorkspaceView {
         }
         // The thing selected on the slide shown, unless the list of slides has the keyboard.
         let in_list = self.slide_strip.read(cx).focus_handle().contains_focused(window, cx);
-        let thing_here = document.read(cx).selected().is_some_and(|selected| selected.slide == document.read(cx).current());
+        let thing_here = document.read(cx).selection().is_some_and(|selection| selection.slide == document.read(cx).current());
         if thing_here && !in_list {
             if self.copy_thing(cx) && cut {
                 self.edit(Document::cut_selected, cx);
@@ -355,9 +394,12 @@ impl WorkspaceView {
         let Some(document) = self.document.clone() else {
             return false;
         };
-        let Some((text, files)) = document.read(cx).copy_selected() else {
-            self.say(EditRefused::CouldNotBeMade.to_string(), cx);
-            return false;
+        let (text, files) = match document.read(cx).copy_selected() {
+            Ok(copied) => copied,
+            Err(refused) => {
+                self.say(refused.to_string(), cx);
+                return false;
+            }
         };
         let Some(entry) = clipboard::element_entry(&text, &files) else {
             self.say(clipboard::THING_TOO_BIG, cx);
@@ -446,6 +488,7 @@ impl WorkspaceView {
             notes: self.show_notes,
             slide_list: self.show_slide_list,
             markdown: self.show_markdown,
+            inspector: self.show_inspector,
         }
     }
 
@@ -469,8 +512,27 @@ impl WorkspaceView {
                 .read(cx)
                 .focus_handle()
                 .contains_focused(window, cx);
+        let form_away = !self.show_inspector && self.inspector.read(cx).has_any_keyboard(window, cx);
         if notes_away || list_away {
             self.focus_handle.focus(window, cx);
+        } else if form_away {
+            // What was typed in the form is written, once this edit to the window is done, and
+            // then the keyboard goes to the slide while a thing on it is selected, or else to
+            // the window.
+            let (inspector, document) = (self.inspector.clone(), self.document.clone());
+            let (slide, away) = (self.slide_editor.read(cx).focus_handle().clone(), self.focus_handle.clone());
+            window.defer(cx, move |window, cx| {
+                inspector.update(cx, |inspector, cx| inspector.commit_typing(window, cx));
+                let selected_here = document.is_some_and(|document| {
+                    let document = document.read(cx);
+                    document.selection().is_some_and(|selection| selection.slide == document.current())
+                });
+                if selected_here {
+                    slide.focus(window, cx);
+                } else {
+                    away.focus(window, cx);
+                }
+            });
         }
         cx.notify();
     }

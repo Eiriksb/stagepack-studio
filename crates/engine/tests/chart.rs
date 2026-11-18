@@ -487,7 +487,7 @@ fn slide_png(source: &str, assets: &[(&str, &str)]) -> tiny_skia::Pixmap {
     assert!(d.notices(0).is_empty(), "{:?}", d.notices(0));
     let mut target = tiny_skia::Pixmap::new(1920, 1080).unwrap();
     for layer in &d.layers(0, 1.0) {
-        target.draw_pixmap(layer.x, layer.y, layer.pixmap.as_ref(), &tiny_skia::PixmapPaint::default(), tiny_skia::Transform::identity(), None);
+        target.draw_pixmap(layer.x, layer.y, tiny_skia::Pixmap::as_ref(&layer.pixmap), &tiny_skia::PixmapPaint::default(), tiny_skia::Transform::identity(), None);
     }
     target
 }

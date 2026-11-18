@@ -88,7 +88,7 @@ Once the component is built, it's in the list under *Component* on the Insert ta
 - **A fixed list of choices** (a `#[derive(Prop)]` enum): a dropdown, its choices as words.
 - **Can be left out** (`Option<…>`): the same field. Emptied, the argument is taken out of the tag; a colour has a *None* button for it.
 
-Under the arguments are the tag's place on the slide: *Left*, *Top*, *Width*, *Height* and *Turn*.
+Under the arguments are the tag's place on the slide: *Left*, *Top*, *Width*, *Height* and *Turn*. A component placed on a slide is also moved, resized and turned there like any other thing: dragged, by its handles, or with the arrow keys. Each writes the same `x`, `y`, `w`, `h` and `rotate` on its tag, which is why an argument can't have those names. The Animate tab writes its `click` and `enter` in the same way, to bring it in on a click. A component that steps through clicks of its own, as a chart built up by clicks does, keeps those steps: the tab never renumbers them.
 
 A label is the argument's name as words: each `_` is a space and the first letter is a capital, so `team_name` shows as *Team name* and `points` as *Points*. A choice is shown the same way, so `LineChart`, written `line-chart`, shows as *Line chart*. Name the arguments for the person who will fill the form in.
 

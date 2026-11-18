@@ -2,7 +2,8 @@
 //! them, as an office app has them.
 
 use gpui_kit::assets::IconName as Icons;
-use gpui_kit::component::button::{Button, ButtonVariants as _, DropdownButton};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, h_flex,
@@ -11,15 +12,18 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::animate_tools;
+use crate::arrange_tools;
 use crate::clipboard_tools::ClipboardTools;
 use crate::document::Document;
 use crate::icon_picker::IconPicker;
+use crate::layout_picker::{SetLayout, layout_tiles};
 use crate::palette::ComponentList;
 use crate::table_tools::{self, TableGrid};
 use crate::text_tools::TextTools;
 use crate::workspace_view::{
     AddSlide, DeleteSlide, DuplicateSlide, KEY_CONTEXT, NewSlide, Present, Redo, Rehearse, Save,
-    ToggleHidden, ToggleMarkdown, ToggleNotes, ToggleSlideList, Undo,
+    ToggleHidden, ToggleInspector, ToggleMarkdown, ToggleNotes, ToggleSlideList, Undo,
 };
 
 pub const RIBBON_ID: &str = "ribbon";
@@ -31,8 +35,14 @@ pub const TAB_SLIDE_SHOW_ID: &str = "tab-slide-show";
 pub const TAB_VIEW_ID: &str = "tab-view";
 pub const SAVE_ID: &str = "save";
 pub const NEW_SLIDE_ID: &str = "new-slide";
-/// The New slide button and the arrow beside it, which lists the layouts.
+/// The New slide button and the arrow beside it, which shows the layouts' tiles.
 pub const NEW_SLIDE_LAYOUTS_ID: &str = "new-slide-layouts";
+/// The arrow beside New slide, and the tiles it shows.
+pub const NEW_SLIDE_CARET_ID: &str = "popup";
+pub const NEW_SLIDE_TILES_ID: &str = "new-slide-tiles";
+/// The tool that shows the layouts' tiles, for the slide shown, and the tiles it shows.
+pub const LAYOUT_ID: &str = "slide-layout";
+pub const LAYOUT_TILES_ID: &str = "slide-layout-tiles";
 pub const DUPLICATE_ID: &str = "duplicate-slide";
 pub const DELETE_ID: &str = "delete-slide";
 pub const HIDE_ID: &str = "hide-slide";
@@ -43,7 +53,8 @@ pub const REHEARSE_ID: &str = "rehearse";
 pub const NOTES_TOGGLE_ID: &str = "toggle-notes";
 pub const SLIDE_LIST_TOGGLE_ID: &str = "toggle-slide-list";
 pub const MARKDOWN_TOGGLE_ID: &str = "toggle-markdown";
-pub const ON_THE_WAY_ID: &str = "on-the-way";
+/// The View tab's toggle that shows or hides the form beside the slide.
+pub const TOGGLE_INSPECTOR_ID: &str = "toggle-inspector";
 /// The row of tools under the tabs, which scrolls sideways when it's wider than the window.
 pub const RIBBON_TOOLS_ID: &str = "ribbon-tools";
 /// The arrows at the row's ends that show there are more tools that way, and scroll to them.
@@ -52,19 +63,6 @@ pub const MORE_RIGHT_ID: &str = "ribbon-more-right";
 
 /// How wide the arrows at the row's cut ends are.
 const MORE_WIDTH: Pixels = px(28.);
-
-/// What a tab whose tools aren't made yet says.
-pub const ON_THE_WAY: &str = "Tools for this tab are on the way.";
-
-/// The layouts the New slide list offers, by the names people know them by, and the engine's
-/// names for them.
-pub const LAYOUTS: [(&str, &str); 5] = [
-    ("Title", "title"),
-    ("Title and content", "content"),
-    ("Section", "section"),
-    ("Two columns", "two-columns"),
-    ("Blank", "blank"),
-];
 
 /// The height of the row of tools under the tabs, the same on every tab.
 const TOOLS_HEIGHT: Pixels = px(64.);
@@ -119,6 +117,8 @@ pub struct Panels {
     pub notes: bool,
     pub slide_list: bool,
     pub markdown: bool,
+    /// The form for the thing selected, beside the slide.
+    pub inspector: bool,
 }
 
 pub struct Ribbon {
@@ -133,6 +133,11 @@ pub struct Ribbon {
     table_grid: Entity<TableGrid>,
     /// What the Insert tab's Component tool opens.
     component_list: Entity<ComponentList>,
+    /// The slide's keyboard, which the Arrange menu gives back once it closes.
+    slide_focus: FocusHandle,
+    /// What holds the Animate tab's tools: the keyboard can go there, as to a menu they open,
+    /// and the text being typed goes on being the one they act on.
+    animate_focus: FocusHandle,
     tab: RibbonTab,
     panels: Panels,
     /// How far the row of tools is scrolled.
@@ -151,6 +156,7 @@ impl Ribbon {
         clipboard_tools: Entity<ClipboardTools>,
         text_tools: Entity<TextTools>,
         icon_picker: Entity<IconPicker>,
+        slide_focus: FocusHandle,
         panels: Panels,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -170,6 +176,8 @@ impl Ribbon {
             icon_picker,
             table_grid,
             component_list,
+            slide_focus,
+            animate_focus: cx.focus_handle(),
             tab: RibbonTab::default(),
             panels,
             scroll: ScrollHandle::new(),
@@ -202,6 +210,11 @@ impl Ribbon {
 
     pub fn tab(&self) -> RibbonTab {
         self.tab
+    }
+
+    /// What holds the Animate tab's tools, which can have the keyboard while typing goes on.
+    pub fn animate_focus(&self) -> &FocusHandle {
+        &self.animate_focus
     }
 
     /// Shows which panels are showing.
@@ -249,21 +262,36 @@ impl Ribbon {
         let redo = document.and_then(Document::redo_label);
         // While the caret is in a cell, or a table is selected, its tools come last.
         let table = document.and_then(Document::table_here);
-        let new_slide = DropdownButton::new(NEW_SLIDE_LAYOUTS_ID)
-            .button(
+        let arrange = document.map(Document::arrange_here).unwrap_or_default();
+        let new_slide = h_flex()
+            .id(NEW_SLIDE_LAYOUTS_ID)
+            .test_support()
+            .child(
                 tool(NEW_SLIDE_ID, Icons::SquarePlus, "New slide")
                     .tooltip_with_action("Add a slide after this one", &NewSlide, Some(KEY_CONTEXT))
+                    .disabled(!has_talk)
                     .on_click(|_, window, cx| window.dispatch_action(NewSlide.boxed_clone(), cx)),
             )
-            .ghost()
-            .small()
-            .disabled(!has_talk)
-            .menu_accessibility_label("Choose a layout")
-            .dropdown_menu(|menu, _, _| {
-                LAYOUTS.iter().fold(menu, |menu, &(name, layout)| {
-                    menu.menu(name, Box::new(AddSlide { layout }))
-                })
-            });
+            .child(tiles_tool(
+                NEW_SLIDE_TILES_ID,
+                Button::new(NEW_SLIDE_CARET_ID)
+                    .ghost()
+                    .small()
+                    .dropdown_caret(true)
+                    .accessibility_label("Choose a layout")
+                    .tooltip("Add a slide of a layout you choose"),
+                has_talk,
+                // A slide that isn't there yet has no layout to mark.
+                None,
+                |layout| AddSlide { layout }.boxed_clone(),
+            ));
+        let layout = tiles_tool(
+            LAYOUT_TILES_ID,
+            tool(LAYOUT_ID, Icons::LayoutTemplate, "Layout").tooltip("Change this slide's layout"),
+            has_talk,
+            document.map(Document::layout_here),
+            |layout| SetLayout { layout }.boxed_clone(),
+        );
         // "Slide" in both, so that Show isn't read as starting the show.
         let (hide_label, hide_icon) = if hidden {
             ("Show slide", IconName::Eye)
@@ -277,6 +305,30 @@ impl Ribbon {
         };
         vec![
             self.clipboard_tools.clone().into_any_element(),
+            group(
+                "History",
+                vec![
+                    tool(UNDO_ID, IconName::Undo2, "Undo")
+                        .tooltip_with_action(
+                            undo.map_or_else(|| "Undo".to_string(), |step| format!("Undo {step}")),
+                            &Undo,
+                            Some(KEY_CONTEXT),
+                        )
+                        .disabled(undo.is_none())
+                        .on_click(dispatch(Undo))
+                        .into_any_element(),
+                    tool(REDO_ID, IconName::Redo2, "Redo")
+                        .tooltip_with_action(
+                            redo.map_or_else(|| "Redo".to_string(), |step| format!("Redo {step}")),
+                            &Redo,
+                            Some(KEY_CONTEXT),
+                        )
+                        .disabled(redo.is_none())
+                        .on_click(dispatch(Redo))
+                        .into_any_element(),
+                ],
+                cx,
+            ),
             group(
                 "File",
                 vec![
@@ -292,6 +344,7 @@ impl Ribbon {
                 "Slides",
                 vec![
                     new_slide.into_any_element(),
+                    layout,
                     // "Slide" in both, as a thing on the slide can show as selected while it's the
                     // slide they act on.
                     tool(DUPLICATE_ID, Icons::CopyPlus, "Duplicate slide")
@@ -317,30 +370,7 @@ impl Ribbon {
                 cx,
             ),
             self.text_tools.clone().into_any_element(),
-            group(
-                "History",
-                vec![
-                    tool(UNDO_ID, IconName::Undo2, "Undo")
-                        .tooltip_with_action(
-                            undo.map_or_else(|| "Undo".to_string(), |step| format!("Undo {step}")),
-                            &Undo,
-                            Some(KEY_CONTEXT),
-                        )
-                        .disabled(undo.is_none())
-                        .on_click(dispatch(Undo))
-                        .into_any_element(),
-                    tool(REDO_ID, IconName::Redo2, "Redo")
-                        .tooltip_with_action(
-                            redo.map_or_else(|| "Redo".to_string(), |step| format!("Redo {step}")),
-                            &Redo,
-                            Some(KEY_CONTEXT),
-                        )
-                        .disabled(redo.is_none())
-                        .on_click(dispatch(Redo))
-                        .into_any_element(),
-                ],
-                cx,
-            ),
+            arrange_tools::arrange_group(&arrange, self.document.clone(), self.slide_focus.clone(), cx),
         ]
         .into_iter()
         .chain(table.map(|table| table_tools::ribbon_group(&table, cx)))
@@ -380,6 +410,7 @@ impl Ribbon {
             notes,
             slide_list,
             markdown,
+            inspector,
         } = self.panels;
         let toggle = |id: &'static str, icon: Icons, label: &'static str, on: bool| {
             tool(id, icon, label).selected(on).toggled(on)
@@ -408,23 +439,13 @@ impl Ribbon {
                     )
                     .on_click(dispatch(ToggleMarkdown))
                     .into_any_element(),
+                toggle(TOGGLE_INSPECTOR_ID, Icons::PanelRight, "Form", inspector)
+                    .tooltip("Show or hide the form for what's selected, beside the slide")
+                    .on_click(dispatch(ToggleInspector))
+                    .into_any_element(),
             ],
             cx,
         )]
-    }
-
-    fn on_the_way(cx: &App) -> Vec<AnyElement> {
-        vec![
-            div()
-                .id(ON_THE_WAY_ID)
-                .test_support()
-                .aria_label(ON_THE_WAY)
-                .px_3()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(ON_THE_WAY)
-                .into_any_element(),
-        ]
     }
 }
 
@@ -485,6 +506,39 @@ fn tool(id: &'static str, icon: impl Into<Icon>, label: &'static str) -> Button 
         .label(label)
 }
 
+/// A tool, `button`, that opens the layouts' tiles under it, the one called `current` marked: a
+/// pick closes them and asks for what `action` makes of the layout picked. A press on it leaves
+/// the keyboard where it was, and it goes back there once the tiles close. Off without a talk.
+fn tiles_tool(
+    id: &'static str,
+    button: Button,
+    has_talk: bool,
+    current: Option<&'static str>,
+    action: fn(&'static str) -> Box<dyn Action>,
+) -> AnyElement {
+    if !has_talk {
+        return button.disabled(true).into_any_element();
+    }
+    div()
+        .capture_any_mouse_down(|_, window, _| window.prevent_default())
+        .child(
+            Popover::new(id)
+                .trigger(button)
+                .content(move |_, _, cx| {
+                    let popover = cx.entity();
+                    layout_tiles(
+                        current,
+                        move |layout, window, cx| {
+                            popover.update(cx, |popover, cx| popover.dismiss(window, cx));
+                            window.dispatch_action(action(layout), cx);
+                        },
+                        cx,
+                    )
+                }),
+        )
+        .into_any_element()
+}
+
 /// What a click on a tool does: what its key does.
 fn dispatch(action: impl Action) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
     move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx)
@@ -538,8 +592,12 @@ impl Render for Ribbon {
             RibbonTab::Insert => {
                 crate::insert_tools::insert_tab(self.document.is_some(), &self.icon_picker, &self.table_grid, &self.component_list, cx)
             }
-            RibbonTab::Animate => Self::on_the_way(cx),
+            RibbonTab::Animate => {
+                let here = self.document.as_ref().map(|document| document.update(cx, |document, _| document.animate_here())).unwrap_or_default();
+                animate_tools::animate_tab(&here, self.document.is_some(), cx)
+            }
         };
+        let animate = self.tab == RibbonTab::Animate;
         let mut tools = Vec::with_capacity(groups.len() * 2);
         for (index, group) in groups.into_iter().enumerate() {
             if index > 0 {
@@ -598,6 +656,10 @@ impl Render for Ribbon {
                             .items_center()
                             .overflow_x_scroll()
                             .track_scroll(&self.scroll)
+                            // A press on the Animate tab's tools leaves the keyboard where it is.
+                            .when(animate, |this| {
+                                this.track_focus(&self.animate_focus).capture_any_mouse_down(|_, window, _| window.prevent_default())
+                            })
                             .children(tools),
                     )
                     .when(more_left, |this| this.child(self.more_arrow(false, cx)))

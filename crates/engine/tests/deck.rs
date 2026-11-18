@@ -1,6 +1,7 @@
 mod common;
 use slides_engine::*;
 use std::sync::{Arc, Weak};
+use proptest::prelude::*;
 
 struct NoFiles;
 impl TalkFiles for NoFiles { fn read(&self, _: &str) -> Option<Vec<u8>> { None } }
@@ -128,7 +129,7 @@ fn golden_showcase() {
         let layers: Vec<_> = d.layers(index, 1.0);
         let mut target = tiny_skia::Pixmap::new(1920, 1080).unwrap();
         for layer in &layers {
-            target.draw_pixmap(layer.x, layer.y, layer.pixmap.as_ref(), &tiny_skia::PixmapPaint::default(), tiny_skia::Transform::identity(), None);
+            target.draw_pixmap(layer.x, layer.y, tiny_skia::Pixmap::as_ref(&layer.pixmap), &tiny_skia::PixmapPaint::default(), tiny_skia::Transform::identity(), None);
         }
         common::assert_golden(&format!("showcase-{index}"), &target);
     }
@@ -676,4 +677,285 @@ fn a_picture_outside_the_talks_folder_is_not_measured() {
     assert_eq!(d.default_size("Picture", &[("src", "../outside.png")]), (640.0, 360.0));
     let absolute = dir.path().join("outside.png");
     assert_eq!(d.default_size("Picture", &[("src", absolute.to_str().unwrap())]), (640.0, 360.0));
+}
+
+const PLACED_TALK: &str = "# Title\n\nBody\n\n<Box x=\"100\" y=\"600\" w=\"300\" h=\"200\" fill=\"#ff0000\" />\n\n<Box x=\"1200\" y=\"600\" w=\"300\" h=\"200\" fill=\"#0000ff\" />\n\n---\n\n# Two\n";
+
+/// The source of the top-level block of slide 0 that starts with `text`.
+fn top_block(d: &Deck, text: &str) -> std::ops::Range<usize> {
+    let at = d.source().find(text).unwrap_or_else(|| panic!("no {text}"));
+    d.talk().slides[0].blocks.iter().map(|block| block.range().clone()).find(|range| range.start == at).expect("a block starts there")
+}
+
+fn layer_of(d: &mut Deck, source: &std::ops::Range<usize>) -> usize {
+    d.specs(0).iter().position(|spec| spec.source.as_ref() == Some(source)).expect("a layer for it")
+}
+
+fn place(target: slides_format::Target, x: f32, y: f32, w: f32, h: f32) -> Placing { Placing { target, rect: Rect { x, y, w, h }, rotate: 0.0 } }
+
+fn same_pixels(a: &[Arc<Layer>], b: &[Arc<Layer>]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| (a.x, a.y) == (b.x, b.y) && a.pixmap.data() == b.pixmap.data())
+}
+
+#[test]
+fn a_placing_shows_without_changing_the_source() {
+    let mut d = deck(PLACED_TALK);
+    let red = top_block(&d, "<Box x=\"100\"");
+    let before = d.editor_layers(0, SCALE);
+    let thumbnail = d.thumbnail(0, 320).unwrap();
+    let (source, version) = (d.source().to_string(), d.slide_version(0));
+    let old = d.text_layout(0).element(&red).unwrap().rect;
+    assert_eq!(old, Rect { x: 100.0, y: 600.0, w: 300.0, h: 200.0 });
+
+    let moved = Rect { x: 500.0, y: 300.0, w: 300.0, h: 200.0 };
+    d.set_placing(0, vec![Placing { target: slides_format::Target::Tag(red.clone()), rect: moved, rotate: 0.0 }]);
+    assert_eq!(d.placing().map(|(slide, placing)| (slide, placing.len())), Some((0, 1)));
+    let layer = layer_of(&mut d, &red);
+    assert_eq!(d.specs(0)[layer].rect, moved);
+    assert_eq!(d.text_layout(0).element(&red).unwrap().rect, moved);
+    assert_eq!(d.text_layout(0).elements().iter().find(|element| element.source == red).unwrap().rect, moved);
+    let shown = d.editor_layers(0, SCALE);
+    assert_ne!((shown[layer].x, shown[layer].y), (before[layer].x, before[layer].y));
+    assert_eq!((d.source(), d.slide_version(0)), (source.as_str(), version));
+    assert!(Arc::ptr_eq(&thumbnail, &d.thumbnail(0, 320).unwrap()), "the thumbnail is the source's");
+    let steps = d.timeline(0).steps;
+    assert!(same_pixels(&d.layers_at(0, Moment { step: steps, time: 0.0 }, SCALE), &before[..shown.len()]), "a moment is the source's");
+
+    d.clear_placing();
+    assert_eq!(d.placing(), None);
+    assert_eq!(d.specs(0)[layer].rect, old);
+    assert_eq!(d.text_layout(0).element(&red).unwrap().rect, old);
+    assert!(same_pixels(&d.editor_layers(0, SCALE), &before));
+}
+
+#[test]
+fn a_placing_of_a_region_moves_its_text() {
+    let mut d = deck(PLACED_TALK);
+    let flows = slides_format::text_flows(d.talk(), 0);
+    let body = flows.iter().position(|flow| flow.place == slides_format::FlowPlace::Region("body".into())).unwrap();
+    let start = slides_format::Pos { para: 0, offset: 0 };
+    let before = d.text_layout(0).caret(body, start).unwrap();
+    let region = d.text_layout(0).region("body").unwrap().rect;
+    let target = || slides_format::Target::Region("body".into());
+
+    d.set_placing(0, vec![place(target(), region.x + 50.0, region.y + 30.0, region.w, region.h)]);
+    let after = d.text_layout(0).caret(body, start).unwrap();
+    assert_eq!((after.x, after.top), (before.x + 50.0, before.top + 30.0));
+    assert_eq!(d.text_layout(0).region("body").unwrap().rect.x, region.x + 50.0);
+    let body_source = top_block(&d, "Body");
+    let layer = d.specs(0).iter().position(|spec| spec.source.as_ref().is_some_and(|s| s.start == body_source.start)).unwrap();
+    assert_eq!(d.specs(0)[layer].rect.y, region.y + 30.0);
+    d.clear_placing();
+    let before = d.editor_layers(0, SCALE);
+    d.set_placing(0, vec![place(target(), region.x + 50.0, region.y + 30.0, region.w, region.h)]);
+    assert!(Arc::ptr_eq(&before[layer].pixmap, &d.editor_layers(0, SCALE)[layer].pixmap), "only moved");
+
+    // An empty region's offer moves with it.
+    let mut empty = deck("# Title\n");
+    let before = empty.editor_layers(0, SCALE);
+    let (rect, _) = empty.text_layout(0).placeholder("body").unwrap();
+    empty.set_placing(0, vec![place(target(), rect.x + 100.0, rect.y, rect.w, rect.h)]);
+    assert_eq!(empty.text_layout(0).placeholder("body").unwrap().0.x, rect.x + 100.0);
+    let after = empty.editor_layers(0, SCALE);
+    let (was, now) = (before.last().unwrap(), after.last().unwrap());
+    assert!(Arc::ptr_eq(&was.pixmap, &now.pixmap));
+    assert_eq!(now.x, was.x + 50);
+
+    // Made narrower, its text is laid out again in the new width.
+    d.set_placing(0, vec![place(target(), 300.0, 300.0, 600.0, 400.0)]);
+    assert_eq!(d.text_layout(0).region("body").unwrap().rect, Rect { x: 300.0, y: 300.0, w: 600.0, h: 400.0 });
+    assert_eq!(d.text_layout(0).caret(body, start).unwrap().x, 300.0);
+    let fresh = deck(&PLACED_TALK.replacen("# Title", "---\nregion.body: x=300 y=300 w=600 h=400\n---\n\n# Title", 1)).editor_layers(0, SCALE);
+    assert!(same_pixels(&d.editor_layers(0, SCALE), &fresh), "as if the source said so");
+}
+
+#[test]
+fn an_update_clears_the_placing() {
+    let mut d = deck(PLACED_TALK);
+    let red = top_block(&d, "<Box x=\"100\"");
+    let placing = || vec![place(slides_format::Target::Tag(red.clone()), 0.0, 0.0, 300.0, 200.0)];
+    d.set_placing(0, placing());
+    d.update(PLACED_TALK.replace("Two", "Three"));
+    assert_eq!(d.placing(), None);
+    d.set_placing(0, placing());
+    d.update_parsed(slides_format::parse_talk(PLACED_TALK));
+    assert_eq!(d.placing(), None);
+    d.set_placing(0, placing());
+    d.update_text(slides_format::parse_talk(PLACED_TALK));
+    assert_eq!(d.placing(), None);
+    d.set_placing(0, placing());
+    d.set_files(Box::new(NoFiles));
+    assert_eq!(d.placing(), None);
+    assert_eq!(d.text_layout(0).element(&red).unwrap().rect.x, 100.0);
+}
+
+#[test]
+fn a_moved_layer_is_not_drawn_again() {
+    let mut d = deck(PLACED_TALK);
+    let red = top_block(&d, "<Box x=\"100\"");
+    let layer = layer_of(&mut d, &red);
+    let before = d.editor_layers(0, SCALE);
+    for step in 1..4 {
+        let shift = 40.0 * step as f32;
+        d.set_placing(0, vec![place(slides_format::Target::Tag(red.clone()), 100.0 + shift, 600.0 + shift, 300.0, 200.0)]);
+        let moved = d.editor_layers(0, SCALE);
+        assert!(Arc::ptr_eq(&before[layer].pixmap, &moved[layer].pixmap), "the same picture");
+        assert_eq!((moved[layer].x, moved[layer].y), (before[layer].x + 20 * step, before[layer].y + 20 * step));
+        for other in (0..before.len()).filter(|other| *other != layer) {
+            assert!(Arc::ptr_eq(&before[other], &moved[other]), "layer {other} is as it was");
+        }
+    }
+    d.set_placing(0, vec![place(slides_format::Target::Tag(red.clone()), 100.0, 600.0, 400.0, 200.0)]);
+    let resized = d.editor_layers(0, SCALE);
+    assert!(!Arc::ptr_eq(&before[layer].pixmap, &resized[layer].pixmap), "a new size is drawn again");
+    assert!(resized[layer].pixmap.width() > before[layer].pixmap.width());
+    d.set_placing(0, vec![Placing { target: slides_format::Target::Tag(red.clone()), rect: Rect { x: 100.0, y: 600.0, w: 300.0, h: 200.0 }, rotate: 30.0 }]);
+    assert!(!Arc::ptr_eq(&before[layer].pixmap, &d.editor_layers(0, SCALE)[layer].pixmap), "and so is a new turn");
+    d.clear_placing();
+    let back = d.editor_layers(0, SCALE);
+    assert!(before.iter().zip(&back).all(|(a, b)| Arc::ptr_eq(a, b)), "the source's layers are kept");
+}
+
+#[test]
+fn a_placing_for_a_missing_target_is_ignored() {
+    let source = "# Title\n\n<Box fill=\"#dbeafe\">\n\nIn the text\n\n</Box>\n\n<Box x=\"100\" y=\"600\" w=\"300\" h=\"200\" fill=\"#ff0000\" />\n";
+    let mut d = deck(source);
+    let in_text = top_block(&d, "<Box fill");
+    let before = d.editor_layers(0, SCALE);
+    let layout = d.text_layout(0);
+    let targets = [
+        slides_format::Target::Tag(0..3),
+        slides_format::Target::Tag(in_text),
+        slides_format::Target::Tag(0..source.len() + 10),
+        slides_format::Target::Region("left".into()),
+        slides_format::Target::Region(String::new()),
+    ];
+    for target in targets {
+        d.set_placing(0, vec![place(target.clone(), 700.0, 100.0, 50.0, 50.0)]);
+        let after = d.editor_layers(0, SCALE);
+        assert!(before.iter().zip(&after).all(|(a, b)| Arc::ptr_eq(a, b)) && before.len() == after.len(), "{target:?}");
+        assert_eq!(*d.text_layout(0), *layout, "{target:?}");
+    }
+    d.set_placing(7, vec![place(slides_format::Target::Region("body".into()), 0.0, 0.0, 1.0, 1.0)]);
+    assert!(same_pixels(&d.editor_layers(0, SCALE), &before));
+}
+
+fn any_number() -> impl Strategy<Value = f32> {
+    prop_oneof![
+        Just(f32::NAN),
+        Just(f32::INFINITY),
+        Just(f32::NEG_INFINITY),
+        Just(0.0),
+        Just(-0.0),
+        Just(f32::MAX),
+        Just(f32::MIN),
+        -10_000.0f32..10_000.0,
+        any::<f32>(),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(48))]
+
+    #[test]
+    fn placing_never_panics(target in 0usize..6, x in any_number(), y in any_number(), w in any_number(), h in any_number(), rotate in any_number()) {
+        let source = "---\nregion.body: click=each\n---\n\n# Title\n\n- one\n- two\n\n<Box x=\"100\" y=\"600\" w=\"300\" h=\"200\" fill=\"#ff0000\">\n\nIn it\n\n</Box>\n\n<Icon x=\"900\" y=\"600\" name=\"star\" />\n";
+        let mut d = deck(source);
+        let targets = [
+            slides_format::Target::Tag(top_block(&d, "<Box")),
+            slides_format::Target::Tag(top_block(&d, "<Icon")),
+            slides_format::Target::Region("body".into()),
+            slides_format::Target::Region("title".into()),
+            slides_format::Target::Region("left".into()),
+            slides_format::Target::Tag(std::ops::Range { start: 5, end: 1 }),
+        ];
+        d.editor_layers(0, 0.1);
+        d.set_placing(0, vec![Placing { target: targets[target].clone(), rect: Rect { x, y, w, h }, rotate }]);
+        d.specs(0);
+        d.editor_layers(0, 0.1);
+        let layout = d.text_layout(0);
+        prop_assert_eq!(layout.regions().len(), 2);
+        for region in layout.regions() {
+            prop_assert!([region.rect.x, region.rect.y, region.rect.w, region.rect.h, region.rotate].iter().all(|n| n.is_finite()));
+        }
+        for element in layout.elements() {
+            prop_assert!([element.rect.x, element.rect.y, element.rect.w, element.rect.h, element.rotate].iter().all(|n| n.is_finite()));
+        }
+        d.clear_placing();
+        d.editor_layers(0, 0.1);
+    }
+}
+
+#[test]
+fn a_one_at_a_time_area_only_moved_is_laid_out_as_written() {
+    let talk = |line: &str| format!("---\nregion.body: {line}\n---\n\n# Title\n\n- one\n- two\n- three\n");
+    let mut d = deck(&talk("click=each"));
+    let region = d.text_layout(0).region("body").unwrap().rect;
+    d.set_placing(0, vec![place(slides_format::Target::Region("body".into()), region.x + 60.0, region.y + 40.0, region.w, region.h)]);
+    let placed = d.text_layout(0);
+    let mut fresh = deck(&talk(&format!("click=each x={} y={}", region.x + 60.0, region.y + 40.0)));
+    let written = fresh.text_layout(0);
+    assert_eq!(placed.regions().iter().map(|region| region.rect).collect::<Vec<_>>(), written.regions().iter().map(|region| region.rect).collect::<Vec<_>>());
+    assert_eq!(placed.paras(), written.paras());
+    assert_eq!(placed.elements(), written.elements());
+    for y in (0..1080).step_by(8) {
+        for x in (0..1920).step_by(16) {
+            let point = (x as f32, y as f32);
+            assert_eq!(placed.hit(point.0, point.1), written.hit(point.0, point.1), "{point:?}");
+        }
+    }
+}
+
+#[test]
+fn many_small_moves_end_where_one_large_move_ends() {
+    let target = |d: &Deck| slides_format::Target::Tag(top_block(d, "<Box x=\"100\""));
+    // Nothing drawn at this scale before the placing, so every picture shown is one drawn with it.
+    let mut small = deck(PLACED_TALK);
+    let red = top_block(&small, "<Box x=\"100\"");
+    let layer = layer_of(&mut small, &red);
+    for step in 0..=20 {
+        small.set_placing(0, vec![place(target(&small), 100.0 + 0.45 * step as f32, 600.0 + 0.45 * step as f32, 300.0, 200.0)]);
+        small.layers(0, SCALE);
+    }
+    let mut large = deck(PLACED_TALK);
+    large.set_placing(0, vec![place(target(&large), 100.0, 600.0, 300.0, 200.0)]);
+    large.layers(0, SCALE);
+    large.set_placing(0, vec![place(target(&large), 109.0, 609.0, 300.0, 200.0)]);
+    let (small, large) = (small.layers(0, SCALE), large.layers(0, SCALE));
+    assert_eq!((small[layer].x, small[layer].y), (large[layer].x, large[layer].y));
+
+    // A thing made bigger and then only moved under one drag is shown from where it was drawn.
+    let mut d = deck(PLACED_TALK);
+    d.set_placing(0, vec![place(target(&d), 100.0, 600.0, 320.0, 200.0)]);
+    let drawn = d.layers(0, SCALE)[layer].clone();
+    for step in 1..=20 {
+        d.set_placing(0, vec![place(target(&d), 100.0 + 0.45 * step as f32, 600.0, 320.0, 200.0)]);
+        d.layers(0, SCALE);
+    }
+    let moved = d.layers(0, SCALE)[layer].clone();
+    assert!(Arc::ptr_eq(&drawn.pixmap, &moved.pixmap));
+    assert_eq!(moved.x, drawn.x + (9.0 * SCALE).round() as i32);
+}
+
+#[test]
+fn a_placing_on_one_slide_leaves_the_others_alone() {
+    let mut d = deck(PLACED_TALK);
+    let mut fresh = deck(PLACED_TALK);
+    let red = top_block(&d, "<Box x=\"100\"");
+    d.set_placing(0, vec![place(slides_format::Target::Tag(red), 500.0, 300.0, 300.0, 200.0)]);
+    let rects = |d: &mut Deck| d.specs(1).iter().map(|spec| spec.rect).collect::<Vec<_>>();
+    assert_eq!(rects(&mut d), rects(&mut fresh));
+    assert!(same_pixels(&d.editor_layers(1, SCALE), &fresh.editor_layers(1, SCALE)));
+    assert_eq!(*d.text_layout(1), *fresh.text_layout(1));
+    assert_eq!(d.placing().map(|(slide, _)| slide), Some(0), "asking for another slide keeps it");
+}
+
+#[test]
+fn a_thumbnail_first_drawn_under_a_placing_shows_the_source() {
+    let mut d = deck(PLACED_TALK);
+    let red = top_block(&d, "<Box x=\"100\"");
+    d.set_placing(0, vec![place(slides_format::Target::Tag(red), 500.0, 300.0, 300.0, 200.0)]);
+    d.layers(0, SCALE);
+    let thumbnail = d.thumbnail(0, 320).unwrap();
+    assert_eq!(thumbnail.data(), deck(PLACED_TALK).thumbnail(0, 320).unwrap().data());
 }

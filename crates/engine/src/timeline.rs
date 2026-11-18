@@ -96,7 +96,7 @@ impl ComponentAsks {
 }
 
 /// The most clicks a slide can ask for.
-pub(crate) const MAX_CLICK: u32 = 999;
+pub const MAX_CLICK: u32 = 999;
 
 /// What a `region.<name>` line says about when its content appears.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -113,8 +113,8 @@ pub(crate) struct RegionTiming {
     pub enter: Enter,
 }
 
-/// A whole number from 1 to 999.
-fn read_click(value: &str) -> Option<u32> {
+/// The click `value`, as a talk writes it, reads as: a whole number from 1 to 999, or none.
+pub fn read_click(value: &str) -> Option<u32> {
     let value = value.trim();
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
@@ -122,12 +122,22 @@ fn read_click(value: &str) -> Option<u32> {
     value.parse::<u32>().ok().filter(|click| (1..=MAX_CLICK).contains(click))
 }
 
-fn read_enter(value: &str) -> Option<Enter> {
+/// How `value`, as a talk writes it, says a layer comes in, if it's one of the ways.
+pub fn read_enter(value: &str) -> Option<Enter> {
     match value.trim() {
         "appear" => Some(Enter::Appear),
         "fade" => Some(Enter::Fade),
         "fly-up" => Some(Enter::FlyUp),
         _ => None,
+    }
+}
+
+/// How `enter` is written, as [`read_enter`] reads it.
+pub fn enter_word(enter: Enter) -> &'static str {
+    match enter {
+        Enter::Appear => "appear",
+        Enter::Fade => "fade",
+        Enter::FlyUp => "fly-up",
     }
 }
 
