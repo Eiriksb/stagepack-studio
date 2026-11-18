@@ -149,6 +149,28 @@ Found in this run and not changed are under *What looks wrong and wasn't changed
 
 - **Not in this plan:** changing a talk's colours or fonts after it's made; templates from a file or the internet; saving a talk as a template; presenting from the current slide; installers and the file type.
 - **The Home tab doesn't fit at 1,280 pixels**, the window's width when it opens; the tools past *Hide slide* are behind the arrow.
-- **On a white slide, selection outlines and snapping lines are near-black**, to be softened in the fix wave.
-- **A talk opened by its path that can't be opened** shows technical words on the window's overlay.
+- **On a white slide, selection outlines and snapping lines were near-black.** (Softened after the final review, in ef6a8f8: a mark is darkened or lightened only as far as it takes to stand out.)
+- **A talk opened by its path that couldn't be opened** showed technical words on the window's overlay. (Fixed after the final review, in 49ca3e0: it says the start screen's plain sentence.)
 - **D4's known issues**, in `docs/checks/plan-d4.md`, still stand.
+
+## The final review
+
+A reviewer read the whole branch at 4c170c6 in a copy of its own, ran the plan's six focused suites (142 tests), the engine's pack-and-folder property at 3,000 cases, and the random window session on twelve new seeds for each of its four starts, and wrote three throwaway tests to prove what it suspected. It traced the life of an untitled presentation for lost work: the order of the write, the talk being marked saved, its working copy being cleared and the window closing; edits made while a save runs; a save that fails; the app killed in the middle of a save; a presentation brought back; two windows; two copies of the app. It found no way to lose a person's edits, nothing read or written outside the talk and the app's own data folder, and nothing compiled without a yes. It asked for four fixes, and the one fix wave made them:
+
+- **A template's picture could be lost for good.** The Tour's picture deleted, then a first save, then Undo: the line came back naming a file that had never been written anywhere. A template's file the first save didn't write is now kept with the talk, so Undo finds it and the next save that uses it writes it. (7f6cf8b)
+- **A picture added and taken back within two seconds left a folder holding only that picture**, which later start screens counted as *1 couldn't be read.* with nothing to press. Such a folder is now cleared when the window closes, isn't counted, and is removed at the next start if a crash left it. (d26ea30)
+- **A talk opened by its path that couldn't be opened showed file names** on the window. It says the start screen's plain sentence. (49ca3e0)
+- **Marks on a white slide were near-black.** A mark that doesn't stand out is now darkened or lightened only as far as it must be. (ef6a8f8)
+
+The wave also made a copy left behind by a crash during a bring-back go with the one brought back, took line breaks out of listed names, and kept the pack-and-folder test from failing by chance on a reserved file name. (4367996)
+
+At 4367996, `scripts/cargo-safe.sh test --workspace` passed: 2,264 tests, 0 failed, 19 ignored, and clippy gave no warnings. The random session at 500 cases passed, and the release timing tests passed, with a drag frame at 0.18 to 0.39 ms and the slowest keystroke, in a table cell, at 4.5 ms at the median. A second reviewer then checked the wave, ran the five suites it touched, and found every finding met and nothing new broken. The window wasn't run again after the wave, so its fixes have been seen in tests only.
+
+Known after the final review, and not changed:
+
+- **Between a working copy's folder being made and its lock being taken, or on a disk that can't lock files, a second running copy of the app starting at that instant can remove a folder that holds no text yet.** Nothing a person could get back is in it, and the window's next keep writes it whole again.
+- **A component pasted into a folder that is already always built is built without a further yes**, as the design has it for such folders. It should be settled before the compiler ships in an installer.
+- **Working copies over 30 days old are removed at launch**, never-saved presentations among them, with nothing said.
+- **The Home tab doesn't fit at 1,280 pixels**, the width the window opens at.
+- The smaller findings and the notes for plan E are in `docs/superpowers/plans/2026-11-18-native-rust-plan-d5-decisions.md`.
+
