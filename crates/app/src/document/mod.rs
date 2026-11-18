@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use slides_components::{BuildEntry, BuildIndex, Diagnostic, INDEX_FILE, source_hash};
 use slides_engine::{
-    AddedSet, Align, ComponentInfo, ComponentState, Deck, SchemaLoad, ElementBox, Rect, FolderFiles, Fonts, Layer, LayerTiming, Moment, PackError, Pixmap,
+    AddedSet, Align, ComponentInfo, ComponentState, Deck, SchemaLoad, ElementBox, Rect, FolderFiles, Fonts, Layer, LayerTiming, MemoryFiles, Moment, PackError, Pixmap,
     SlideTimeline, TalkFiles, TextLayout, Transition, WithAdded, layout_by_name, open_packed, text_align,
     read_talk_text,
 };
@@ -31,6 +31,7 @@ use crate::palette::{self, COMPONENT_SIZE, LISTED_BUILT_INS};
 pub use crate::palette::PaletteEntry;
 use crate::present::TalkShape;
 use crate::saving::{SaveJob, SaveTarget, Saved};
+use crate::templates::Template;
 use crate::table_tools::{CLICK_IN_A_CELL, HEADING_ROW_STAYS, LONG_ROW, MOST_COLUMNS, MOST_ROWS, ONE_COLUMN_STAYS};
 use crate::selection::{self, SelectMark};
 pub use crate::selection::{Selected, Thing};
@@ -63,7 +64,7 @@ pub use self::core::EditRun;
 use self::core::{Holds, Join, others_alike};
 pub use errors::{AREA_STAYS, DRAG_OUT_FIRST, EditRefused, InsertFailed, LAYOUT_FAILED, OpenProblem, panic_in_next_change, panic_in_next_layout};
 use errors::{built, guarded, laid_out, read_after, worked_out};
-pub use open::TalkPlace;
+pub use open::{TalkPlace, UNTITLED_NAME, UntitledId};
 pub use reading::talk_settings;
 pub use saving::{Reload, UNREADABLE_FILE};
 pub use slides::CHANGE_LAYOUT;
@@ -114,6 +115,9 @@ pub struct Document {
     added: Arc<AddedSet>,
     /// The talk's files where it's kept, without those added: what a save writes over.
     own_files: Arc<dyn TalkFiles + Send + Sync>,
+    /// The files an untitled talk was made with, which [`Self::own_files`] holds in memory: its
+    /// first save writes those its text uses. None once it has a place.
+    untitled_files: Vec<(String, Arc<[u8]>)>,
     /// The files added that no save has written yet.
     pending: BTreeSet<String>,
     /// The talk's own fonts, for exports to load into decks of their own.

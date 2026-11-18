@@ -55,6 +55,17 @@ impl Document {
             .collect()
     }
 
+    /// The files a save writes besides the text: those added to the talk that its text uses and
+    /// no save has written yet, and for an untitled talk the files it was made with that its
+    /// text uses. A file its text no longer uses is never written.
+    pub fn files_to_write(&self) -> Vec<(String, Arc<[u8]>)> {
+        let talk = self.talk();
+        let mut files: Vec<(String, Arc<[u8]>)> =
+            self.untitled_files.iter().filter(|(path, _)| talk_uses(talk, &*self.files, path)).cloned().collect();
+        files.extend(self.added_files());
+        files
+    }
+
     /// The files added to the talk that no save has written, used or not, for its working copy.
     pub fn unsaved_files(&self) -> Vec<(String, Arc<[u8]>)> {
         self.pending.iter().filter_map(|path| Some((path.clone(), self.added.get(path)?))).collect()
@@ -184,7 +195,7 @@ impl Document {
     pub(super) fn on_disk(&self, path: &str) -> bool {
         match &self.place {
             TalkPlace::Folder(folder) => std::fs::symlink_metadata(folder.join(path)).is_ok(),
-            TalkPlace::Packed(_) => false,
+            TalkPlace::Packed(_) | TalkPlace::Untitled(_) => false,
         }
     }
 }

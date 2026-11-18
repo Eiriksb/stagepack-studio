@@ -6,7 +6,6 @@
 //! [`settled`]: WorkingCopies::settled
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -14,6 +13,7 @@ use std::time::{Duration, Instant};
 use gpui_kit::*;
 use slides_components::BuildEntry;
 
+use crate::added_files::is_added_path;
 use crate::document::{Document, TalkPlace};
 use crate::recovery::{Found, Recovery, hash_text};
 
@@ -35,7 +35,7 @@ pub struct KeepFailed;
 /// The working copy last written for the talk, so the same one isn't written again.
 #[derive(PartialEq)]
 struct Kept {
-    place: PathBuf,
+    place: TalkPlace,
     text: String,
     on_disk: String,
     /// The files added to the talk that the text uses, by their path in it.
@@ -376,10 +376,12 @@ impl WorkingCopies {
                 adopted: None,
             });
         }
-        let (TalkPlace::Folder(path) | TalkPlace::Packed(path)) = &place;
-        let files = document.added_files();
+        // What a save would write, an untitled talk's own files among them, but only those a
+        // working copy can hold.
+        let files: Vec<(String, Arc<[u8]>)> =
+            document.files_to_write().into_iter().filter(|(path, _)| is_added_path(path)).collect();
         let kept = Kept {
-            place: path.clone(),
+            place: place.clone(),
             text: document.source().to_string(),
             on_disk: document.stamp_on_disk().to_string(),
             files: files.iter().map(|(path, _)| path.clone()).collect(),

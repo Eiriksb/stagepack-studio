@@ -331,6 +331,8 @@ pub struct WorkspaceView {
     permissions: Option<BuildPermissions>,
     /// Whether this talk's folder is one of them.
     always_build: bool,
+    /// Where an untitled talk is first saved, in place of the person's Documents folder.
+    documents: Option<PathBuf>,
     /// Whether a build is running.
     building: bool,
     /// Whether another build was asked for while one ran.
@@ -553,10 +555,7 @@ impl WorkspaceView {
             .unwrap_or_default();
         let talk_folder = document
             .as_ref()
-            .and_then(|document| match document.read(cx).place() {
-                TalkPlace::Folder(folder) => Some(folder.clone()),
-                TalkPlace::Packed(_) => None,
-            });
+            .and_then(|document| talk_folder_of(document.read(cx).place()));
         let permissions = BuildPermissions::default_file().map(BuildPermissions::load);
         let mut view = Self {
             document,
@@ -590,6 +589,7 @@ impl WorkspaceView {
             bundle: Bundle::find(),
             editor_projects: cargo_file::default_projects_root(),
             permissions,
+            documents: None,
             always_build: false,
             building: false,
             build_again: false,
@@ -638,6 +638,21 @@ impl WorkspaceView {
     pub fn set_permissions_for_test(&mut self, permissions: BuildPermissions) {
         self.permissions = Some(permissions);
         self.always_build = self.is_always_built();
+    }
+
+    /// Saves an untitled talk, and anything made from it, in `folder` first, in place of the
+    /// person's Documents folder.
+    pub fn set_documents_folder_for_test(&mut self, folder: PathBuf) {
+        self.documents = Some(folder);
+    }
+
+    /// The folder anything saved from `document` starts out in: the one its talk sits in, or
+    /// for an untitled talk the Documents folder.
+    fn save_folder(&self, document: &Document) -> PathBuf {
+        if let (TalkPlace::Untitled(_), Some(documents)) = (document.place(), &self.documents) {
+            return documents.clone();
+        }
+        document.place().directory()
     }
 
     /// Follows a folder's saves without watching it for real, so a test can see which folder
@@ -1040,7 +1055,7 @@ impl WorkspaceView {
         let document = document.read(cx);
         let stem = export::file_stem_for(&document.name());
         let suggested = extension.map_or_else(|| stem.clone(), |ext| format!("{stem}.{ext}"));
-        let chosen = cx.prompt_for_new_path(document.place().directory(), Some(&suggested));
+        let chosen = cx.prompt_for_new_path(&self.save_folder(document), Some(&suggested));
         cx.spawn(async move |this, cx| {
             let out = match chosen.await {
                 Ok(Ok(Some(out))) => out,
@@ -1113,6 +1128,14 @@ impl WorkspaceView {
         if let Err(error) = export::open_in_stagepack(&offer.executable, &offer.file) {
             self.say(format!("Could not start Stagepack: {error}"), cx);
         }
+    }
+}
+
+/// The folder of the talk at `place`, if it's kept in one: the folder that's watched and built.
+fn talk_folder_of(place: &TalkPlace) -> Option<PathBuf> {
+    match place {
+        TalkPlace::Folder(folder) => Some(folder.clone()),
+        TalkPlace::Packed(_) | TalkPlace::Untitled(_) => None,
     }
 }
 
@@ -1435,7 +1458,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &Redo, _, cx| this.step_history(Document::redo, cx)))
             .on_action(cx.listener(|this, _: &OpenFolder, _, cx| this.ask_to_open(true, cx)))
             .on_action(cx.listener(|this, _: &OpenPacked, _, cx| this.ask_to_open(false, cx)))
-            .on_action(cx.listener(|this, _: &Save, _, cx| this.save(cx)))
+            .on_action(cx.listener(|this, _: &Save, window, cx| this.save(window, cx)))
             .on_action(cx.listener(|this, _: &SaveAs, window, cx| this.ask_to_save_as(window, cx)))
             .on_action(
                 cx.listener(|this, _: &SetUpForCodeEditor, _, cx| this.set_up_for_code_editor(cx)),
@@ -1454,7 +1477,7 @@ impl Render for WorkspaceView {
                     h_flex()
                         .gap_1()
                         .items_center()
-                        .child(file_menu(packed, self.bundle.is_some()))
+                        .child(file_menu(packed, self.bundle.is_some() && self.talk_folder.is_some()))
                         .child(export_menu(packed.is_some()))
                         .child(
                             div()

@@ -257,7 +257,8 @@ impl Ribbon {
         let has_talk = document.is_some();
         let several = document.is_some_and(|document| document.slide_count() > 1);
         let hidden = document.is_some_and(|document| document.is_hidden(document.current()));
-        let unsaved = document.is_some_and(Document::has_unsaved_changes);
+        // An untitled talk can always be saved: Save is Save As for it.
+        let unsaved = document.is_some_and(|document| document.has_unsaved_changes() || document.is_untitled());
         let undo = document.and_then(Document::undo_label);
         let redo = document.and_then(Document::redo_label);
         // While the caret is in a cell, or a table is selected, its tools come last.

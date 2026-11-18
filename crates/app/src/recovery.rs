@@ -443,11 +443,16 @@ fn random_name() -> String {
     format!("{:016x}", hasher.finish())
 }
 
-/// The talk's path, as one path however it's written, if it's there to be found.
+/// What the talk's working copies are kept under: its path, as one path however it's written,
+/// if it's there to be found. An untitled talk has no path, so it's its id, under a name no
+/// talk's path can be, as those all start at the root.
 fn canonical(place: &TalkPlace) -> PathBuf {
-    let (TalkPlace::Folder(path) | TalkPlace::Packed(path)) = place;
-    path.canonicalize()
-        .unwrap_or_else(|_| std::path::absolute(path).unwrap_or_else(|_| path.clone()))
+    match place {
+        TalkPlace::Folder(path) | TalkPlace::Packed(path) => path
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::absolute(path).unwrap_or_else(|_| path.clone())),
+        TalkPlace::Untitled(id) => PathBuf::from(format!("untitled/{id}")),
+    }
 }
 
 /// The name of the folder that holds the working copy of the talk at `talk`.
@@ -469,6 +474,8 @@ fn on_disk(place: &TalkPlace) -> Option<String> {
     match place {
         TalkPlace::Folder(folder) => read_talk_text(&folder.join(SLIDES_FILE)).ok(),
         TalkPlace::Packed(file) => open_packed(file).ok()?.slides().ok(),
+        // Held in memory: no file holds anything of it.
+        TalkPlace::Untitled(_) => None,
     }
 }
 

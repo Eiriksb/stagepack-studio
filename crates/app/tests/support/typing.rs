@@ -18,7 +18,8 @@ use gpui_kit::{
 };
 use slides_engine::{ElementBox, Fonts, TextLayout};
 use slides_format::{Pos, Selection, TextFlow, text_flows};
-use stagepack_studio::document::Document;
+use stagepack_studio::document::{Document, UntitledId};
+use stagepack_studio::permissions::BuildPermissions;
 use stagepack_studio::recovery::Recovery;
 use stagepack_studio::slide_editor::{CARET_ID, SELECTION_OUTLINE_ID};
 use stagepack_studio::text_editing::EditingText;
@@ -45,6 +46,69 @@ pub fn open_with(cx: &mut TestAppContext, source: &str, recovery: Option<Recover
 pub fn open_folder(cx: &mut TestAppContext, folder: tempfile::TempDir, recovery: Option<Recovery>) -> Typing {
     let file = folder.path().join("slides.md");
     let talk = Document::open(folder.path(), Fonts::bundled_only()).unwrap();
+    open_document(cx, talk, folder, file, move |view, cx| {
+        if let Some(recovery) = recovery {
+            view.set_recovery_for_test(recovery, cx);
+        }
+    })
+}
+
+/// Where the window of an untitled talk keeps what a test looks at, all in a scratch folder:
+/// the folder standing in for Documents, the working copies, and the build permissions.
+pub struct UntitledPlaces {
+    pub documents: PathBuf,
+    pub recovery: PathBuf,
+    pub permissions: PathBuf,
+}
+
+impl UntitledPlaces {
+    pub fn under(root: &std::path::Path) -> UntitledPlaces {
+        let documents = root.join("Documents");
+        std::fs::create_dir_all(&documents).unwrap();
+        UntitledPlaces {
+            documents,
+            recovery: root.join("recovery"),
+            permissions: root.join("build-permissions.json"),
+        }
+    }
+}
+
+/// Opens a new, untitled talk made from the template `template` in a window, with everything
+/// it keeps in a scratch folder of its own: see [`open_untitled_under`].
+pub fn open_untitled(cx: &mut TestAppContext, template: &str) -> (Typing, UntitledPlaces) {
+    let root = tempfile::tempdir().unwrap();
+    let places = UntitledPlaces::under(root.path());
+    let typing = open_untitled_under(cx, template, 1, root.path());
+    let typing = Typing { _folder: root, ..typing };
+    (typing, places)
+}
+
+/// Opens a new, untitled talk made from the template `template`, numbered `number` among those
+/// open, in a window whose Documents folder, working copies and build permissions are those of
+/// [`UntitledPlaces::under`] `root`. Its saves are followed without watching for real.
+pub fn open_untitled_under(cx: &mut TestAppContext, template: &str, number: usize, root: &std::path::Path) -> Typing {
+    let places = UntitledPlaces::under(root);
+    let template = stagepack_studio::templates::template(template).expect("a template");
+    let mut talk = Document::new_untitled(template, UntitledId::random(), Fonts::bundled_only()).unwrap();
+    talk.set_untitled_number(number);
+    let scratch = tempfile::tempdir().unwrap();
+    let file = scratch.path().join("no file yet");
+    open_document(cx, talk, scratch, file, move |view, cx| {
+        view.set_recovery_for_test(Recovery::new(places.recovery), cx);
+        view.set_permissions_for_test(BuildPermissions::load(places.permissions));
+        view.set_documents_folder_for_test(places.documents);
+        view.set_no_watching_for_test();
+    })
+}
+
+/// Shows `talk` in a window, set up by `set_up` before anything is drawn.
+fn open_document(
+    cx: &mut TestAppContext,
+    talk: Document,
+    folder: tempfile::TempDir,
+    file: PathBuf,
+    set_up: impl FnOnce(&mut WorkspaceView, &mut gpui_kit::Context<WorkspaceView>) + 'static,
+) -> Typing {
     let (handle, view) = cx.update(|cx: &mut App| {
         gpui_kit::init(cx);
         workspace_view::init(cx);
@@ -61,9 +125,7 @@ pub fn open_folder(cx: &mut TestAppContext, folder: tempfile::TempDir, recovery:
             |window, cx| {
                 cx.new(|cx| {
                     let mut view = WorkspaceView::open_with(talk, window, cx);
-                    if let Some(recovery) = recovery {
-                        view.set_recovery_for_test(recovery, cx);
-                    }
+                    set_up(&mut view, cx);
                     view
                 })
             },
