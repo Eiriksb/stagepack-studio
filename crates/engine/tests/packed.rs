@@ -1302,11 +1302,17 @@ mod alike {
                 0..=8,
             ),
         ) {
-            // Names that only differ by case, or repeat with other bytes, aren't one talk's.
+            // Names that only differ by case, or repeat with other bytes, aren't one talk's, and
+            // nor are the names a system keeps for its devices, which no talk can hold.
+            const RESERVED: [&str; 22] = [
+                "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+                "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+            ];
             let mut given: Vec<NewFile> = Vec::new();
             for (folder, name, bytes) in files {
                 let path = format!("{folder}/{name}.bin");
-                if !given.iter().any(|(other, _)| other.eq_ignore_ascii_case(&path)) {
+                let reserved = RESERVED.contains(&name.to_ascii_lowercase().as_str());
+                if !reserved && !given.iter().any(|(other, _)| other.eq_ignore_ascii_case(&path)) {
                     given.push((path, bytes));
                 }
             }

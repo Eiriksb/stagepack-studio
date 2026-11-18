@@ -1434,7 +1434,7 @@ fn a_recovery_folder_in_any_state_is_listed_or_skipped() {
         ("a name no window could show", true, 0, Box::new(|slot: &Path| {
             let about = slot.join("about.json");
             let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(&about).unwrap()).unwrap();
-            json["untitled"]["name"] = format!("Odd\u{7}\n\u{202e}\u{200b}\u{feff}\u{2066}{}", "x".repeat(10_000)).into();
+            json["untitled"]["name"] = format!("Odd\u{7}\n\u{202e}\u{200b}\u{feff}\u{2066}\u{2028}\u{2029}\u{85}{}", "x".repeat(10_000)).into();
             std::fs::write(&about, json.to_string()).unwrap()
         })),
         ("a time far ahead of the clock", true, 0, Box::new(|slot: &Path| set_kept_at(slot, now_secs() + 10 * 365 * 24 * 60 * 60))),
@@ -1462,7 +1462,7 @@ fn a_recovery_folder_in_any_state_is_listed_or_skipped() {
         if listed_it {
             let copy = listed.iter().find(|copy| copy.id == id).unwrap();
             assert!(copy.name.chars().count() <= 80 && !copy.name.chars().any(char::is_control), "{what}");
-            assert!(!copy.name.contains(['\u{202e}', '\u{200b}', '\u{feff}', '\u{2066}']), "{what}: {:?}", copy.name);
+            assert!(!copy.name.contains(['\u{202e}', '\u{200b}', '\u{feff}', '\u{2066}', '\u{2028}', '\u{2029}', '\u{85}']), "{what}: {:?}", copy.name);
             assert!(copy.first_words.chars().count() <= 60, "{what}");
             assert!(copy.when <= SystemTime::now() + Duration::from_secs(60), "{what}: no time ahead of the clock");
             let whole = std::fs::read_to_string(untitled_slot(&root, id).join("slides.md")).unwrap();

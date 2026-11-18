@@ -132,6 +132,12 @@ impl Job {
                 if let Some(adopted) = adopted.as_ref().and_then(take_adopted) {
                     recovery.discard(&adopted);
                 }
+                // A new presentation's id is its own: any other copy of it that no window holds
+                // is an older one, as a crash leaves while one is brought back, which would be
+                // offered again.
+                if let TalkPlace::Untitled(id) = place {
+                    recovery.discard_untitled(id);
+                }
             }
             Job::KeepFile {
                 recovery,

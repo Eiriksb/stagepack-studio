@@ -784,9 +784,12 @@ fn untitled_about(slot: &Path, key_name: &str) -> Option<Option<UntitledFound>> 
 }
 
 /// Whether `c` is drawn as nothing but changes how the text around it reads: a mark that only
-/// orders or joins the letters around it.
+/// orders or joins the letters around it, or one that breaks the line.
 fn is_invisible(c: char) -> bool {
-    matches!(c, '\u{ad}' | '\u{61c}' | '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}')
+    matches!(
+        c,
+        '\u{85}' | '\u{ad}' | '\u{61c}' | '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}'
+    )
 }
 
 /// Whether `about` says it's a copy of the talk at `place` as its kind of place has it: a new

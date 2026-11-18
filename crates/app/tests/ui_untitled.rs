@@ -670,3 +670,45 @@ fn a_talk_brought_back_is_kept_before_its_old_copy_goes(cx: &mut TestAppContext)
     assert_eq!(listed[0].id, id);
     assert_eq!(recovery.take_untitled(id).unwrap().text, edited);
 }
+
+#[gpui_kit::test]
+fn an_older_copy_left_by_a_crash_goes_with_the_one_brought_back(cx: &mut TestAppContext) {
+    // Let go with Don't save, and saved.
+    for saves in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let places = UntitledPlaces::under(root.path());
+        let recovery = Recovery::new(places.recovery.clone());
+        // Two copies of one presentation, as a crash between a brought-back window's keep and
+        // its letting go of the copy it brought back leaves: an older one, and a newer.
+        let id = UntitledId::random();
+        Recovery::new(places.recovery.clone()).keep_untitled(id, "Untitled presentation", "# Older\n", &[], &[]).unwrap();
+        let older = std::fs::read_dir(&places.recovery).unwrap().next().unwrap().unwrap().path();
+        let older = std::fs::read_dir(older).unwrap().next().unwrap().unwrap().path();
+        let about = older.join("about.json");
+        let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(&about).unwrap()).unwrap();
+        json["kept_at"] = (json["kept_at"].as_u64().unwrap() - 60).into();
+        std::fs::write(&about, json.to_string()).unwrap();
+        Recovery::new(places.recovery.clone()).keep_untitled(id, "Untitled presentation", "# Newer\n", &[], &[]).unwrap();
+
+        // The newer is brought back, and kept here before it goes; the older stays meanwhile.
+        let found = recovery.take_untitled(id).unwrap();
+        assert_eq!(found.text, "# Newer\n");
+        let typing = open_brought_back(cx, id, found, 1, root.path());
+        wait(cx, KEEP_PAUSE);
+        assert!(older.join("slides.md").is_file(), "saves {saves}");
+
+        if saves {
+            first_save(&typing, cx, SAVE_AS_PACKED_ID, &places.documents.join("Kept.sptx"));
+            wait(cx, KEEP_PAUSE);
+            assert!(closes_without_asking(cx, typing.handle), "saves {saves}");
+        } else {
+            assert!(!try_to_close(cx, typing.handle));
+            click_in(cx, typing.handle, CLOSE_DONT_SAVE_ID);
+        }
+        drop(typing);
+        cx.run_until_parked();
+        assert!(!older.exists(), "saves {saves}: the older copy goes too");
+        assert_eq!(recovery.untitled(), (Vec::new(), 0), "saves {saves}: nothing is listed again");
+        assert_eq!(recovery.take_untitled(id).unwrap_err(), NotTaken::Gone, "saves {saves}");
+    }
+}
