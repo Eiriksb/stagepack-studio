@@ -142,10 +142,15 @@ impl WorkspaceView {
         self.run_save(job, name, cx);
     }
 
-    /// Asks which form to save the talk in, then where. While a dialog is showing, that's
-    /// answered first.
+    /// Asks which form to save the talk in, then where. While another dialog is showing, nothing
+    /// is asked.
     pub(super) fn ask_to_save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.document.is_none() || window.has_active_dialog(cx) {
+        if self.document.is_none() {
+            return;
+        }
+        if window.has_active_dialog(cx) {
+            // Nothing is asked, so nothing waits on an answer.
+            self.place_not_chosen(cx);
             return;
         }
         let view = cx.weak_entity();
@@ -204,7 +209,9 @@ impl WorkspaceView {
 
     /// The folder the Save As dialog starts in, and the name it suggests, for the talk saved as
     /// a packed file if `packed`, or a folder: beside the talk, or for an untitled one in the
-    /// Documents folder, under the talk's name.
+    /// Documents folder, under the talk's name. For tests, which can't see what the dialog is
+    /// given.
+    #[doc(hidden)]
     pub fn save_as_suggestion(&self, packed: bool, cx: &App) -> (PathBuf, String) {
         let Some(document) = &self.document else {
             return (PathBuf::new(), String::new());
@@ -298,6 +305,8 @@ impl WorkspaceView {
                 let moved = saved.moved();
                 let saved_from = document.read(cx).place().clone();
                 let first = matches!(saved_from, TalkPlace::Untitled(_));
+                // Made here, and nothing in it came from anyone else's code.
+                let made_here = first && !document.read(cx).holds_component_source();
                 document.update(cx, |document, cx| {
                     document.saved(saved);
                     cx.notify();
@@ -306,7 +315,7 @@ impl WorkspaceView {
                 self.working_copies
                     .update(cx, |copies, cx| copies.saved(saved_from, cx));
                 if moved {
-                    self.moved(first, cx);
+                    self.moved(first, made_here, cx);
                 }
                 self.say_for_a_while(said, cx);
                 (SaveOutcome::Saved, None)
@@ -328,14 +337,17 @@ impl WorkspaceView {
     }
 
     /// Follows the talk to where Save As put it: its folder is the one watched and built. After
-    /// its `first` save, a talk made in the app is the app's own: a folder is always built, as
-    /// whatever it holds came from here, and its saves are followed as an opened folder's are.
-    fn moved(&mut self, first: bool, cx: &mut Context<Self>) {
+    /// its `first` save its saves are followed as an opened folder's are. A folder of a talk
+    /// `made_here`, holding no component source at all, is always built from then on, as the
+    /// design has it for talks made in the app. One holding any, pasted or brought back, came
+    /// partly from someone else, so nothing is built without a yes: its bar asks, as for any
+    /// folder opened.
+    fn moved(&mut self, first: bool, made_here: bool, cx: &mut Context<Self>) {
         let Some(document) = &self.document else {
             return;
         };
         self.talk_folder = talk_folder_of(document.read(cx).place());
-        if first && let (Some(folder), Some(permissions)) = (&self.talk_folder, &mut self.permissions) {
+        if made_here && let (Some(folder), Some(permissions)) = (&self.talk_folder, &mut self.permissions) {
             // If it can't be written down, the bar offers it, as for any folder.
             permissions.set_always(folder).ok();
         }

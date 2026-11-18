@@ -87,10 +87,15 @@ pub fn open_untitled(cx: &mut TestAppContext, template: &str) -> (Typing, Untitl
 /// open, in a window whose Documents folder, working copies and build permissions are those of
 /// [`UntitledPlaces::under`] `root`. Its saves are followed without watching for real.
 pub fn open_untitled_under(cx: &mut TestAppContext, template: &str, number: usize, root: &std::path::Path) -> Typing {
-    let places = UntitledPlaces::under(root);
     let template = stagepack_studio::templates::template(template).expect("a template");
     let mut talk = Document::new_untitled(template, UntitledId::random(), Fonts::bundled_only()).unwrap();
     talk.set_untitled_number(number);
+    open_untitled_talk(cx, talk, root)
+}
+
+/// Shows `talk`, an untitled one, in a window set up as [`open_untitled_under`] sets it up.
+pub fn open_untitled_talk(cx: &mut TestAppContext, talk: Document, root: &std::path::Path) -> Typing {
+    let places = UntitledPlaces::under(root);
     let scratch = tempfile::tempdir().unwrap();
     let file = scratch.path().join("no file yet");
     open_document(cx, talk, scratch, file, move |view, cx| {

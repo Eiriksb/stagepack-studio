@@ -278,8 +278,9 @@ fn save_on_an_untitled_talk_asks_where_first() {
         "save",
         &[
             (SaveUntitled, vec![AskWhereToSave]),
-            // Asked again while it's being chosen, the window shows no second dialog.
-            (SaveUntitled, vec![AskWhereToSave]),
+            // Asked again while it's being chosen, as with Ctrl+S while the file dialog is up,
+            // it's asked once.
+            (SaveUntitled, vec![]),
             (NotChosen, vec![]),
             (SaveUntitled, vec![AskWhereToSave]),
             (Chosen { first: true }, vec![StartSave]),
@@ -345,6 +346,51 @@ fn closing_an_untitled_talk_with_save_closes_once_its_first_save_is_done() {
             (Chosen { first: true }, vec![StartSave]),
             (CloseAsked { unsaved: true }, vec![AskBeforeClosing]),
             (AnswerUntitled(CloseAnswer::Save), vec![]),
+            (saved(false), vec![Close]),
+        ],
+    );
+}
+
+#[test]
+fn closing_with_nothing_unsaved_while_a_save_runs_waits_for_it() {
+    check(
+        "a save",
+        &[
+            (Save, vec![StartSave]),
+            (CloseAsked { unsaved: false }, vec![]),
+            (saved(false), vec![Close]),
+        ],
+    );
+    check(
+        "a first save",
+        &[
+            (SaveUntitled, vec![AskWhereToSave]),
+            (Chosen { first: true }, vec![StartSave]),
+            (CloseAsked { unsaved: false }, vec![]),
+            (saved(false), vec![Close]),
+        ],
+    );
+    check(
+        "one that fails",
+        &[
+            (Chosen { first: true }, vec![StartSave]),
+            (CloseAsked { unsaved: false }, vec![]),
+            (failed(), vec![Say("The disk is full.".into())]),
+            (CloseAsked { unsaved: false }, vec![Close]),
+        ],
+    );
+}
+
+#[test]
+fn closing_while_a_place_is_chosen_asks_once() {
+    check(
+        "close and save, then save again",
+        &[
+            (CloseAsked { unsaved: true }, vec![AskBeforeClosing]),
+            (AnswerUntitled(CloseAnswer::Save), vec![AskWhereToSave]),
+            (SaveUntitled, vec![]),
+            (AnswerUntitled(CloseAnswer::Save), vec![]),
+            (Chosen { first: true }, vec![StartSave]),
             (saved(false), vec![Close]),
         ],
     );

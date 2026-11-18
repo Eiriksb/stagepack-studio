@@ -193,6 +193,23 @@ fn no_template_carries_code() {
 }
 
 #[test]
+fn every_bundled_file_can_be_kept_in_a_working_copy() {
+    // A new presentation's working copy holds the template's files it uses, so it comes back
+    // whole after a crash: one whose name a copy can't hold would be lost then.
+    let kept = tempfile::tempdir().unwrap();
+    let recovery = stagepack_studio::recovery::Recovery::new(kept.path().to_path_buf());
+    for template in templates() {
+        let place = stagepack_studio::document::TalkPlace::Untitled(stagepack_studio::document::UntitledId::random());
+        let files: Vec<(String, Arc<[u8]>)> = template.files.iter().map(|(path, bytes)| (path.to_string(), Arc::from(*bytes))).collect();
+        recovery
+            .keep_with_files(&place, "base", template.slides, &files)
+            .unwrap_or_else(|error| panic!("{}: {error}", template.id));
+        let found = recovery.find(&place).expect("the copy");
+        assert_eq!(found.files.len(), template.files.len(), "{}", template.id);
+    }
+}
+
+#[test]
 fn every_file_a_template_names_is_bundled() {
     for template in templates() {
         let files = memory_files(template);

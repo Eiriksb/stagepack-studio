@@ -9,7 +9,7 @@ use slides_format::Order;
 use stagepack_studio::added_files::FileKind;
 use stagepack_studio::clipboard::{self, AppData, PastedFiles};
 use stagepack_studio::document::{Document, TalkPlace, UntitledId};
-use stagepack_studio::saving::SaveTarget;
+use stagepack_studio::saving::{NOT_READ_BACK, SaveTarget};
 use stagepack_studio::templates::{Template, template, templates};
 
 const SCORE_SOURCE: &str = include_str!("../../components/tests/fixtures/v1/score.rs");
@@ -210,6 +210,7 @@ fn the_first_save_writes_all_the_talk_uses() {
             let text = document.source().to_string();
             let drawn = drawing(&mut document);
             save_as(&mut document, target).unwrap_or_else(|problem| panic!("{what}: {problem}"));
+            assert!(drawing(&mut document) == drawn, "{what}: it draws as it did, read from where it's saved");
             assert!(!document.is_untitled(), "{what}");
             assert!(!document.has_unsaved_changes(), "{what}");
             assert_eq!(document.is_packed(), packed, "{what}");
@@ -240,6 +241,82 @@ fn the_first_save_writes_all_the_talk_uses() {
             assert_eq!(reopen(&at).source(), document.source(), "{what}");
         }
     }
+}
+
+#[test]
+fn undo_after_the_first_save_is_unsaved_and_saves_where_it_is() {
+    for packed in [false, true] {
+        let mut document = new_talk(template("tour").unwrap());
+        document.add_slide("content").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let target = target(dir.path(), packed);
+        let at = path_of(&target);
+        save_as(&mut document, target).unwrap();
+        assert!(!document.has_unsaved_changes());
+        document.undo().unwrap();
+        assert!(document.has_unsaved_changes(), "packed {packed}");
+        assert_eq!(document.source(), template("tour").unwrap().slides);
+        let saved = document.save_job().run().unwrap();
+        document.saved(saved);
+        assert!(!document.has_unsaved_changes());
+        assert_eq!(reopen(&at).source(), template("tour").unwrap().slides, "packed {packed}");
+    }
+}
+
+#[test]
+fn a_first_pack_that_cannot_be_read_back_is_saved_and_says_so() {
+    let (markdown, files) = copied_score();
+    let mut document = new_talk(template("tour").unwrap());
+    let added = document.add_file(FileKind::Picture, "added.png", other_photo("added")).unwrap();
+    document.insert_tag("Insert picture", "Picture", &[("src", &added)], None).unwrap();
+    document.paste_element(&markdown, files).unwrap();
+    let drawn = drawing(&mut document);
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("talk.sptx");
+    let saved = document
+        .save_as_job(SaveTarget::Packed(out.clone()))
+        .run_reading_back_with(|_| Err("it can't be read just now".to_string()))
+        .unwrap();
+    assert_eq!(saved.notices(), [NOT_READ_BACK.to_string()]);
+    document.saved(saved);
+    // The pack was written: the talk is kept there now, and goes on as it was.
+    assert!(!document.is_untitled() && document.is_packed());
+    assert!(!document.has_unsaved_changes());
+    assert!(drawing(&mut document) == drawn);
+    assert!(document.notices().is_empty(), "{:?}", document.notices());
+    assert_eq!(reopen(&out).source(), document.source());
+    // The next save goes there too, the pasted component's index with it.
+    document.add_slide("content").unwrap();
+    let saved = document.save_job().run().unwrap();
+    document.saved(saved);
+    let mut reopened = reopen(&out);
+    assert_eq!(reopened.source(), document.source());
+    assert!(reopened.notices().is_empty(), "{:?}", reopened.notices());
+    assert!(saved_file(&out, "build/index.json").is_some());
+    assert_eq!(saved_file(&out, &added), Some(other_photo("added")));
+}
+
+#[test]
+fn whether_a_talk_holds_component_source() {
+    let (markdown, files) = copied_score();
+    for template in templates() {
+        let mut document = new_talk(template);
+        assert!(!document.holds_component_source(), "{}", template.id);
+        document.paste_element(&markdown, files.clone()).unwrap();
+        assert!(document.holds_component_source(), "{}", template.id);
+        // Undone, it's still held, and could come back with a redo.
+        document.undo().unwrap();
+        assert!(document.holds_component_source(), "{}", template.id);
+    }
+    let back = Document::untitled_with(
+        UntitledId::random(),
+        format!("# Back\n\n{SCORE}\n"),
+        vec![("components/score.rs".to_string(), std::sync::Arc::from(SCORE_SOURCE.as_bytes()))],
+        Vec::new(),
+        Fonts::bundled_only(),
+    )
+    .unwrap();
+    assert!(back.holds_component_source());
 }
 
 #[test]

@@ -66,6 +66,12 @@ impl Document {
         files
     }
 
+    /// Whether the talk holds the source of any component of its own, wherever it came from: its
+    /// own files, a paste, or a copy brought back, used by its text or not.
+    pub fn holds_component_source(&self) -> bool {
+        !self.files.names_in(FileKind::ComponentSource.folder()).is_empty()
+    }
+
     /// The files added to the talk that no save has written, used or not, for its working copy.
     pub fn unsaved_files(&self) -> Vec<(String, Arc<[u8]>)> {
         self.pending.iter().filter_map(|path| Some((path.clone(), self.added.get(path)?))).collect()

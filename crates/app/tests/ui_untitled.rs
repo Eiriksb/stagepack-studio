@@ -5,24 +5,57 @@
 mod typing;
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use typing::*;
 
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{AnyWindowHandle, AppContext as _, TestAppContext, VisualTestContext};
-use slides_engine::{TalkFiles as _, open_packed};
-use stagepack_studio::document::TalkPlace;
+use slides_engine::{Fonts, TalkFiles as _, open_packed};
+use stagepack_studio::builds::Compile;
+use stagepack_studio::clipboard::{self, AppData, CopiedFile, PastedFiles};
+use stagepack_studio::document::{Document, TalkPlace, UntitledId};
 use stagepack_studio::permissions::BuildPermissions;
 use stagepack_studio::recovery::Recovery;
 use stagepack_studio::ribbon::SAVE_ID;
 use stagepack_studio::workspace_view::{
-    CLOSE_DONT_SAVE_ID, CLOSE_SAVE_ID, ExportPdf, ExportPowerPoint, SAVE_AS_CANCEL_ID, SAVE_AS_FOLDER_ID,
+    BUILD_ALWAYS_ID, CLOSE_DONT_SAVE_ID, CLOSE_SAVE_ID, ExportPdf, ExportPowerPoint, SAVE_AS_CANCEL_ID, SAVE_AS_FOLDER_ID,
     SAVE_AS_PACKED_ID, Save, TITLE_ID,
 };
 
 /// Long enough for a working copy to be kept after the last edit.
 const KEEP_PAUSE: u64 = 5_000;
+
+const SCORE_SOURCE: &str = include_str!("../../components/tests/fixtures/v1/score.rs");
+const SCORE_BUILD: &[u8] = include_bytes!("../../components/tests/fixtures/v1/score.wasm");
+const SCORE: &str = "<Score team=\"Reds\" points=\"3\" x=\"300\" y=\"300\" w=\"600\" h=\"300\" />";
+
+/// Score as a copy of it from another talk brings it: its source, and its build as built from
+/// the source with the hash `built_from`.
+fn copied_score(built_from: &str) -> (String, PastedFiles) {
+    let copied = [
+        CopiedFile { path: "components/score.rs".into(), bytes: SCORE_SOURCE.as_bytes().into(), built_from: None },
+        CopiedFile { path: "build/score.wasm".into(), bytes: SCORE_BUILD.into(), built_from: Some(built_from.into()) },
+    ];
+    let entry = clipboard::element_entry(SCORE, &copied).unwrap();
+    match clipboard::read_app_data(entry.metadata.as_deref()) {
+        AppData::Element(carried) => (carried.markdown, carried.files),
+        _ => panic!("element data"),
+    }
+}
+
+/// Builds with a compiler that only counts its calls.
+fn count_builds(typing: &Typing, cx: &mut TestAppContext) -> Arc<AtomicUsize> {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let compile: Compile = Arc::new(move |_: &str, _: &str| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        Err(Vec::new())
+    });
+    cx.update(|cx| typing.view.update(cx, |view, _| view.set_compile_for_test(compile)));
+    calls
+}
 
 fn title(typing: &Typing, cx: &mut TestAppContext) -> String {
     typing.with_window(cx, |window, cx| {
@@ -149,6 +182,10 @@ fn an_untitled_talk_is_never_lost(cx: &mut TestAppContext) {
     let said = typing.status(cx).expect("it says what happened");
     assert!(said.starts_with("Couldn't save"), "{said}");
     assert_eq!(std::fs::read_dir(&not_empty).unwrap().count(), 1, "nothing was written there");
+    wait(cx, KEEP_PAUSE);
+    let untitled = place(&typing, cx);
+    let kept = Recovery::new(places.recovery.clone()).find(&untitled).expect("the edits are still kept");
+    assert_eq!(kept.text, edited);
 
     // Save, and a place chosen: it's written, and the window closes.
     let out = places.documents.join("Kept.sptx");
@@ -289,9 +326,16 @@ fn a_folder_saved_from_the_app_is_always_built(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn a_packed_talk_is_not(cx: &mut TestAppContext) {
     let (typing, places) = open_untitled(cx, "light");
+    add_slide(&typing, cx);
+    wait(cx, KEEP_PAUSE);
+    let untitled = place(&typing, cx);
+    let recovery = Recovery::new(places.recovery.clone());
+    assert!(recovery.find(&untitled).is_some());
     let out = places.documents.join("Packed.sptx");
     first_save(&typing, cx, SAVE_AS_PACKED_ID, &out);
     assert!(out.is_file());
+    wait(cx, KEEP_PAUSE);
+    assert!(recovery.find(&untitled).is_none(), "the untitled copy is cleared");
     assert!(!places.permissions.exists(), "nothing is said about a packed talk");
     let followed = cx.read(|cx| typing.view.read(cx).follows_saves());
     assert!(!followed, "nothing edits a packed file in place");
@@ -358,5 +402,62 @@ fn the_save_tool_is_on_for_an_untitled_talk_and_off_once_saved(cx: &mut TestAppC
     assert!(save_is_off(&typing, cx), "nothing unsaved now");
     assert_eq!(title(&typing, cx), "Tour · 1 / 8");
     assert!(open_packed(&out).unwrap().read("assets/photo.png").is_some(), "the template's picture is in it");
-    cx.executor().advance_clock(Duration::from_secs(1));
+}
+
+#[gpui_kit::test]
+fn a_folder_holding_a_pasted_component_is_not_always_built(cx: &mut TestAppContext) {
+    let (typing, places) = open_untitled(cx, "light");
+    let calls = count_builds(&typing, cx);
+    // Pasted from someone else's talk, with a build that isn't of its source.
+    let (markdown, files) = copied_score(&"0".repeat(64));
+    typing.document(cx).update(cx, |document, cx| {
+        document.paste_element(&markdown, files).unwrap();
+        cx.notify();
+    });
+    typing.settle(cx);
+    let folder = places.documents.join("Pasted");
+    first_save(&typing, cx, SAVE_AS_FOLDER_ID, &folder);
+    assert!(folder.join("components/score.rs").is_file());
+    assert!(!BuildPermissions::load(places.permissions.clone()).always(&folder));
+    assert!(!places.permissions.exists(), "nothing is written down");
+    wait(cx, KEEP_PAUSE);
+    assert!(shows(&typing, cx, BUILD_ALWAYS_ID), "the bar asks, as for any folder");
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing is built without a yes");
+}
+
+#[gpui_kit::test]
+fn a_folder_of_a_copy_brought_back_with_a_component_is_not_always_built(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let places = UntitledPlaces::under(root.path());
+    let talk = Document::untitled_with(
+        UntitledId::random(),
+        format!("# Back\n\n{SCORE}\n"),
+        vec![("components/score.rs".to_string(), Arc::from(SCORE_SOURCE.as_bytes()))],
+        Vec::new(),
+        Fonts::bundled_only(),
+    )
+    .unwrap();
+    let typing = open_untitled_talk(cx, talk, root.path());
+    let calls = count_builds(&typing, cx);
+    let folder = places.documents.join("Back");
+    first_save(&typing, cx, SAVE_AS_FOLDER_ID, &folder);
+    assert!(folder.join("components/score.rs").is_file());
+    assert!(!BuildPermissions::load(places.permissions.clone()).always(&folder));
+    wait(cx, KEEP_PAUSE);
+    assert!(shows(&typing, cx, BUILD_ALWAYS_ID));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[gpui_kit::test]
+fn closing_while_a_save_runs_waits_for_it(cx: &mut TestAppContext) {
+    // A window keeping no working copies, which would make it wait for those anyway.
+    let typing = open(cx, "# One\n");
+    std::fs::remove_file(&typing.file).unwrap();
+    // Nothing unsaved, and a save asked for and left running, as the first save of a new
+    // presentation can be when its window is closed.
+    cx.update_window(typing.handle, |_, window, cx| window.dispatch_action(Box::new(Save), cx)).unwrap();
+    assert!(!VisualTestContext::from_window(typing.handle, cx).simulate_close(), "not while it writes");
+    cx.run_until_parked();
+    assert!(typing.file.is_file(), "the save finished");
+    assert!(!is_open(cx, typing.handle), "and then the window went");
 }

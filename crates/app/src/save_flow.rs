@@ -68,7 +68,7 @@ pub enum Effect {
     Close,
     /// Ask whether to save before the window closes.
     AskBeforeClosing,
-    /// Ask where to save an untitled talk, and in which form, unless that's being asked already.
+    /// Ask where to save an untitled talk, and in which form.
     AskWhereToSave,
     /// Let the unsaved changes and their working copies go.
     LetGo,
@@ -129,12 +129,18 @@ impl SaveFlow {
     }
 
     /// The window is asked to close, and the talk has changes `unsaved` or not. With changes
-    /// unsaved it asks first.
+    /// unsaved it asks first. With none, but a save running, it closes once that's done: a write
+    /// cut short by the app going would leave a file half made.
     pub fn ask_close(&mut self, unsaved: bool) -> Vec<Effect> {
         if unsaved {
-            vec![Effect::AskBeforeClosing]
-        } else {
-            vec![Effect::Close]
+            return vec![Effect::AskBeforeClosing];
+        }
+        match self {
+            SaveFlow::Saving { then_close, .. } => {
+                *then_close = true;
+                Vec::new()
+            }
+            SaveFlow::Idle | SaveFlow::Choosing { .. } => vec![Effect::Close],
         }
     }
 
@@ -165,9 +171,10 @@ impl SaveFlow {
                 *self = SaveFlow::Choosing { then_close: close };
                 vec![Effect::AskWhereToSave]
             }
+            // Asked already: the dialogs are up, and their answer makes the save.
             SaveFlow::Choosing { then_close } => {
                 *then_close |= close;
-                vec![Effect::AskWhereToSave]
+                Vec::new()
             }
             SaveFlow::Saving { .. } => self.save(close),
         }
