@@ -77,6 +77,10 @@ impl WorkspaceView {
     /// Closes the window once the changes to the working copies asked for are made: they'd
     /// be lost with it.
     fn close_after_working_copies(&mut self, cx: &mut Context<Self>) {
+        // A copy still running has no use now: it stops, and what it copied goes with it.
+        self.stop_before_closing();
+        self.close_when_idle = false;
+        self.working_copies.update(cx, |copies, cx| copies.let_go_closing(cx));
         let settled = self.working_copies.update(cx, |copies, _| copies.settled());
         cx.spawn(async move |this, cx| {
             settled.await;
@@ -282,12 +286,14 @@ impl WorkspaceView {
     /// large file shows how far it's got on the status line, with a Cancel. One that replaces the
     /// talk's pack lets go of every reader of it first, as nothing may hold it open meanwhile.
     fn run_save(&mut self, job: SaveJob, name: String, cx: &mut Context<Self>) {
+        let mut job = job;
         if job.replaces_the_pack()
             && let Some(document) = &self.document
         {
-            document.read(cx).let_go_of_readers();
+            let let_go = document.read(cx).let_go_of_readers();
+            job = job.reading_back(let_go > 0);
         }
-        let meter = job.moves_large().then(|| self.start_progress(format!("{} {name}", SAVING.doing), cx));
+        let meter = job.moves_large().then(|| self.start_progress(format!("{} {name}", SAVING.doing), false, cx));
         if meter.is_none() {
             self.say(format!("{} {name}…", SAVING.doing), cx);
         }
@@ -438,6 +444,10 @@ impl WorkspaceView {
         if self.working_copies.read(cx).is_closing() {
             return true;
         }
+        // A copy into the talk running is stopped first, and the window closes once it has ended.
+        if self.stop_before_closing() {
+            return false;
+        }
         for effect in self.save_flow.ask_close(unsaved) {
             match effect {
                 Effect::Close => return self.close_now_or_once_settled(cx),
@@ -455,14 +465,9 @@ impl WorkspaceView {
     /// Whether the window, with nothing unsaved, can close now. If changes to the working
     /// copies are still to be made, it closes itself once they are.
     fn close_now_or_once_settled(&mut self, cx: &mut Context<Self>) -> bool {
-        // Back to what's saved within the wait: the copy still there goes first.
-        if self.working_copies.read(cx).holds_a_copy()
-            && let Some(document) = &self.document
-        {
-            let place = document.read(cx).place().clone();
-            self.working_copies
-                .update(cx, |copies, cx| copies.let_go(place, cx));
-        }
+        // Back to what's saved within the wait: the copy still there goes first, and with it any
+        // video added that the talk no longer uses.
+        self.working_copies.update(cx, |copies, cx| copies.let_go_closing(cx));
         // A change to the working copies still to be made, such as the clear after a save,
         // would be lost with the window.
         if self.working_copies.read(cx).has_jobs() {

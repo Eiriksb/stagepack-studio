@@ -11,7 +11,7 @@ use slides_engine::{AddedFile, is_large_kind};
 use super::*;
 use crate::clipboard::{CopiedLarge, PastedLarge};
 use crate::large_files::{self, HeldReader, LargeSource, Looked, Readers, Told, VideoCache};
-use crate::recovery::Recovery;
+use crate::recovery::{Keeping, Recovery};
 
 /// The files in the working copy that a copy is being made to, or has been made to and not yet
 /// taken in, which a slot that's cleared keeps.
@@ -30,9 +30,14 @@ pub(crate) struct LargeHome {
     /// The SHA-256 of each large file copied in, by where it lies, for telling the same file
     /// added again without reading it.
     hashes: BTreeMap<PathBuf, [u8; 32]>,
+    /// The large files brought back from last time that couldn't be taken into this window's
+    /// working copy, and lie in last time's still, which is kept until they're taken in.
+    left_in_last: BTreeSet<String>,
     readers: Arc<Readers>,
     /// Where a video a pack holds compressed is unpacked to; the app's own if none is given.
     cache: Option<VideoCache>,
+    /// Whether a large file was ever to be copied into the working copy, which made its folder.
+    copied_in: std::cell::Cell<bool>,
 }
 
 /// What a working copy that's cleared keeps of its slot: every file a large file added to the
@@ -50,19 +55,26 @@ impl LargeKeep {
         held.extend(lock(&self.spoken_for).iter().cloned());
         held
     }
+}
 
-    /// Whether a file of a slot is to be kept, as things are now: one of [`Self::held`], or the
-    /// file one of them is being written as beside it, which is named for it and starts with a
-    /// dot, until it's whole and put in place.
-    pub fn keeper(&self) -> impl Fn(&Path) -> bool + use<> {
-        let held = self.held();
-        move |file: &Path| {
-            held.contains(file)
-                || held.iter().any(|kept| {
-                    let (Some(kept_name), Some(name)) = (kept.file_name(), file.file_name()) else { return false };
-                    kept.parent() == file.parent() && name.to_string_lossy().starts_with(&format!(".{}.", kept_name.to_string_lossy()))
-                })
-        }
+/// Whether `file` is `kept`, or the file it's being written as beside it, which is named for it
+/// and starts with a dot, until it's whole and put in place.
+fn is_or_becomes(file: &Path, kept: &Path) -> bool {
+    if file == kept {
+        return true;
+    }
+    let (Some(kept_name), Some(name)) = (kept.file_name(), file.file_name()) else { return false };
+    kept.parent() == file.parent() && name.to_string_lossy().starts_with(&format!(".{}.", kept_name.to_string_lossy()))
+}
+
+/// Asked as each file would go, so what's held is what's held then.
+impl Keeping for LargeKeep {
+    fn keeps(&self, file: &Path) -> bool {
+        self.held().iter().any(|kept| is_or_becomes(file, kept))
+    }
+
+    fn keeps_any_under(&self, folder: &Path) -> bool {
+        self.held().iter().any(|kept| kept.starts_with(folder))
     }
 }
 
@@ -96,6 +108,10 @@ pub struct LargeCopy {
     candidates: Vec<(String, Option<[u8; 32]>)>,
     files: Arc<dyn TalkFiles + Send + Sync>,
     claim: Claim,
+    /// The window's working copies and the talk's place, to make the folder again with, if a
+    /// clear took it away meanwhile.
+    recovery: Recovery,
+    place: TalkPlace,
 }
 
 enum Copied {
@@ -137,7 +153,7 @@ impl LargeCopy {
     /// is hashed first, and one with the same hash is the file: nothing is copied. Room on the
     /// disk is looked for before anything is copied. Stopped, or failing, nothing is left.
     pub fn run(self, progress: &dyn Fn(u64, u64), stop: &AtomicBool) -> CopiedIn {
-        let LargeCopy { source, looked, path, folder, candidates, files, mut claim } = self;
+        let LargeCopy { source, looked, path, folder, candidates, files, mut claim, recovery, place } = self;
         let hashing = !candidates.is_empty();
         let total = if hashing { looked.len.saturating_mul(2) } else { looked.len };
         let outcome = (|| {
@@ -153,11 +169,14 @@ impl LargeCopy {
             if stop.load(Ordering::SeqCst) {
                 return Err(NotAdded::Cancelled);
             }
+            // A clear may have taken the slot's folders away before this had room kept: they're
+            // made, and held, again.
+            recovery.large_folder(&place).map_err(|_| NotAdded::NowhereToKeep)?;
             if !large_files::has_room(&folder, looked.len) {
                 return Err(NotAdded::NoRoom);
             }
             let before = if hashing { looked.len } else { 0 };
-            let hash = large_files::copy_to(&source, looked, &claim.to, &Told { progress, before, total }, stop)?;
+            let hash = large_files::copy_to(&source, looked, &claim.to, &Told { progress, before, total }, stop, large_files::CopyFor::WorkingCopy)?;
             claim.made = true;
             Ok(Copied::New(hash))
         })();
@@ -185,7 +204,7 @@ impl LargeOpen {
                 let pack = self.pack.as_ref().filter(|_| is_large_kind(&self.path))?;
                 let cache = self.cache.or_else(VideoCache::app)?;
                 let at = cache.unpacked(pack, &self.path)?;
-                let file = std::fs::File::open(at).ok()?;
+                let file = large_files::open_plain(&at)?;
                 Box::new(file) as Box<dyn slides_engine::ReadSeek>
             }
         };
@@ -244,6 +263,7 @@ impl Document {
         }
         let recovery = self.large.recovery.as_ref().ok_or(NotAdded::NowhereToKeep)?;
         let folder = recovery.large_folder(&self.place).map_err(|_| NotAdded::NowhereToKeep)?;
+        self.large.copied_in.set(true);
         let mut spoken_for = lock(&self.large.spoken_for);
         let taken = |path: &str| {
             let at = folder.join(path);
@@ -261,7 +281,8 @@ impl Document {
         spoken_for.insert(to.clone());
         drop(spoken_for);
         let claim = Claim { to, spoken_for: self.large.spoken_for.clone(), made: false };
-        Ok(LargeCopy { source: from, looked, path, folder, candidates, files: self.files.clone(), claim })
+        let (recovery, place) = (recovery.clone(), self.place.clone());
+        Ok(LargeCopy { source: from, looked, path, folder, candidates, files: self.files.clone(), claim, recovery, place })
     }
 
     /// The last part of [`Self::add_large_file`], on the window's thread: the file copied becomes
@@ -273,6 +294,10 @@ impl Document {
             Ok(Copied::There(path)) => Ok(path),
             Ok(Copied::New(hash)) => {
                 let to = copied.claim.to.clone();
+                // Taken away since, which nothing should do: never taken in as if it were there.
+                if !std::fs::symlink_metadata(&to).is_ok_and(|meta| meta.is_file() && meta.len() == copied.len) {
+                    return Err(NotAdded::Unreadable);
+                }
                 let free = self.files.len(&copied.path).is_none() && !self.on_disk(&copied.path);
                 // Taken since, as by a paste: the copy is let go of with the claim.
                 if !free || !self.added.add_at(&copied.path, to.clone(), copied.len) {
@@ -303,27 +328,35 @@ impl Document {
     /// own files, or from the working copies the app keeps, and only if it's as long, and was
     /// last changed when, the copy says.
     pub fn large_copy_for_paste(&self, large: &PastedLarge) -> Result<LargeCopy, NotAdded> {
-        if !self.may_bring(large) {
-            return Err(NotAdded::Unreadable);
-        }
+        let source = self.may_bring(large).ok_or(NotAdded::Unreadable)?;
         let name = large.path.split_once('/').map_or(large.path.as_str(), |(_, name)| name);
         let expected = Looked { len: large.len, modified: large.modified };
-        self.large_copy(large.kind, name, large.source.clone(), Some(expected))
+        self.large_copy(large.kind, name, source, Some(expected))
     }
 
-    /// Whether `large`, as a clipboard says, lies where a large file of a talk can: in a talk's
-    /// folder, at its path there, in a pack under its path there, or in the working copies.
-    fn may_bring(&self, large: &PastedLarge) -> bool {
+    /// Where `large`, as a clipboard says, is copied from, if it lies where a large file of a talk
+    /// can, under a video's name, at the path the copy gives it: in a talk's folder, beside its
+    /// `slides.md`; in the working copies, in a slot's folder of files; or in a pack, under that
+    /// path. A file on disk is copied from where the system resolves it to, links and all.
+    fn may_bring(&self, large: &PastedLarge) -> Option<LargeSource> {
+        let named = large.kind.is_large() && added_files::is_added_path(&large.path) && is_large_kind(&large.path);
+        if !named {
+            return None;
+        }
         match &large.source {
             LargeSource::File(at) => {
-                let Ok(at) = at.canonicalize() else { return false };
-                let in_working_copies = self.large.recovery.as_ref().is_some_and(|recovery| recovery.holds(&at));
+                let at = at.canonicalize().ok()?;
                 let parts = large.path.split('/').count();
-                let talk = at.ancestors().nth(parts);
-                let in_a_talk = at.ends_with(&large.path) && talk.is_some_and(|talk| talk.join(SLIDES_FILE).is_file());
-                in_working_copies || in_a_talk
+                let above = at.ancestors().nth(parts).filter(|_| at.ends_with(&large.path))?;
+                let in_working_copies = above.file_name().is_some_and(|name| name == "files")
+                    && self.large.recovery.as_ref().is_some_and(|recovery| recovery.holds(&at));
+                let in_a_talk = above.join(SLIDES_FILE).is_file();
+                (in_working_copies || in_a_talk).then_some(LargeSource::File(at))
             }
-            LargeSource::InPack { pack, entry } => *entry == large.path && open_packed(pack.as_path()).is_ok(),
+            LargeSource::InPack { pack, entry } => {
+                let pack = pack.canonicalize().ok()?;
+                (*entry == large.path && open_packed(pack.as_path()).is_ok()).then(|| LargeSource::InPack { pack, entry: entry.clone() })
+            }
         }
     }
 
@@ -368,13 +401,30 @@ impl Document {
     /// Lets go of every reader of the talk's files held: done before a save that replaces the
     /// talk's pack, as a file that's open can't be replaced on some systems, and on others keeps
     /// the disk space of what was replaced. Whatever was reading opens the file again.
-    pub fn let_go_of_readers(&self) {
-        self.large.readers.let_go();
+    pub fn let_go_of_readers(&self) -> usize {
+        self.large.readers.let_go()
+    }
+
+    /// Whether a reader was let go of since the talk was last saved: a save in place of its pack
+    /// then opens the pack again, so nothing holds the pack it replaced.
+    pub(crate) fn readers_were_let_go(&self) -> bool {
+        self.large.readers.were_let_go()
+    }
+
+    /// The talk was saved.
+    pub(crate) fn readers_saved(&self) {
+        self.large.readers.saved();
     }
 
     /// How many readers of the talk's files are held.
     pub fn readers_held(&self) -> usize {
         self.large.readers.count()
+    }
+
+    /// Whether the talk's working copy holds, or held, anything of a large file: a closing
+    /// window clears it then, whatever else it holds.
+    pub fn kept_large_files(&self) -> bool {
+        self.large.copied_in.get() || !self.added.files_on_disk().is_empty()
     }
 
     /// What the working copies keep of their slot when they clear it.
@@ -404,11 +454,14 @@ impl Document {
                 clashed = true;
                 continue;
             }
-            let held = match &self.large.recovery {
-                Some(recovery) => recovery.take_in(&self.place, &path, &at).unwrap_or(at),
-                None => at,
-            };
-            if self.added.add_at(&path, held, len) {
+            // If it can't be taken in, it's read where it lies, and last time's slot is kept
+            // until it is: see `Self::take_in_left_in_last`.
+            let taken = self.large.recovery.as_ref().and_then(|recovery| recovery.take_in(&self.place, &path, &at).ok());
+            let left = taken.is_none();
+            if self.added.add_at(&path, taken.unwrap_or(at), len) {
+                if left {
+                    self.large.left_in_last.insert(path.clone());
+                }
                 self.pending.insert(path);
                 any = true;
             }
@@ -419,6 +472,28 @@ impl Document {
         if any {
             self.deck.files_added();
             self.components_looked_at();
+        }
+    }
+
+    /// Takes each large file brought back that still lies in last time's working copy into this
+    /// window's own, now, and reads it from there from then on: once none lie there, last time's
+    /// copy can go. One that still can't be taken in is tried again next time.
+    pub fn take_in_left_in_last(&mut self) {
+        let Some(recovery) = self.large.recovery.clone() else {
+            return;
+        };
+        let mut moved = false;
+        for path in std::mem::take(&mut self.large.left_in_last) {
+            let Some(at) = self.added.lies_at(&path) else { continue };
+            match recovery.take_in(&self.place, &path, &at) {
+                Ok(here) => moved |= self.added.move_at(&path, here),
+                Err(_) => {
+                    self.large.left_in_last.insert(path);
+                }
+            }
+        }
+        if moved {
+            self.deck.files_added();
         }
     }
 

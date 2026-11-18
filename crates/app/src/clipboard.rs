@@ -104,10 +104,14 @@ pub fn large_left_out(count: usize) -> String {
 /// since they were copied.
 pub fn large_gone(count: usize) -> String {
     match count {
-        1 => "The video's file is gone, so it wasn't copied and has nothing to play.".to_string(),
-        count => format!("The files of {count} videos are gone, so they weren't copied and have nothing to play."),
+        1 => "The video's file is gone, or has changed since it was copied, so it wasn't copied and has nothing to play.".to_string(),
+        count => format!("The files of {count} videos are gone, or have changed since they were copied, so they weren't copied and have nothing to play."),
     }
 }
+
+/// What the window says when a paste would ask whether to copy videos in while another question
+/// is open, and so pastes nothing.
+pub const ANSWER_FIRST: &str = "Answer the question that's open first, then paste again.";
 
 /// What the window says when a pasted component has the name of a different one the talk has,
 /// called `name`.
@@ -350,6 +354,8 @@ pub enum LargeCopied {
     Declined,
     /// It's gone, or changed, since it was copied.
     Gone,
+    /// It couldn't be copied in, for this reason.
+    Refused(crate::added_files::NotAdded),
 }
 
 /// What a copied thing or slide holds.

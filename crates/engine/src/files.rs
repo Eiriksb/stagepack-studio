@@ -349,6 +349,21 @@ impl AddedSet {
         true
     }
 
+    /// Has the file added at `path` that lies on disk be read from `file` from now on, which holds
+    /// the same bytes: whether it was one that lies on disk.
+    pub fn move_at(&self, path: &str, file: PathBuf) -> bool {
+        let Some(path) = crate::packed::normalise(path) else {
+            return false;
+        };
+        let mut files = self.files();
+        let Some(AddedFile::At(at, _)) = files.get_mut(&path) else {
+            return false;
+        };
+        *at = file;
+        self.added.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
     /// Lets go of the files added at `paths`, which a save has written where the talk is read
     /// from: from now on they're read there. Whether any was let go of.
     pub fn release(&self, paths: &[String]) -> bool {

@@ -21,6 +21,8 @@ pub struct Brought {
     pub large_left_out: usize,
     /// How many large files it uses were gone, or changed, by the time it was pasted.
     pub large_gone: usize,
+    /// Why a large file it uses couldn't be copied in, if one couldn't.
+    pub large_refused: Option<NotAdded>,
     /// The stems of the builds that came without their sources.
     builds_alone: Vec<String>,
 }
@@ -38,7 +40,8 @@ impl Brought {
     }
 
     /// The one thing to say of it, if any: a different component first, then one with a
-    /// built-in's name, then files too big, then videos gone, then videos not copied, then
+    /// built-in's name, then files too big, then videos gone, then why one couldn't be copied in,
+    /// then videos not copied, then
     /// pictures left out, then a component left out.
     pub fn said(&self) -> Option<String> {
         let said = |is: bool, sentence: &str| is.then(|| sentence.to_string());
@@ -47,6 +50,7 @@ impl Brought {
             .or_else(|| said(self.built_in, clipboard::BUILT_IN_NAME))
             .or_else(|| said(self.too_large, clipboard::FILES_TOO_LARGE))
             .or_else(|| (self.large_gone > 0).then(|| clipboard::large_gone(self.large_gone)))
+            .or_else(|| self.large_refused.map(|why| why.to_string()))
             .or_else(|| (self.large_left_out > 0).then(|| clipboard::large_left_out(self.large_left_out)))
             .or_else(|| said(self.left_out, clipboard::MISSING_PICTURES))
             .or_else(|| said(self.component_left_out, clipboard::MISSING_COMPONENT))
@@ -215,6 +219,9 @@ impl Document {
                 LargeCopied::To(path) if *path != large.path => renames.push((large.path.clone(), path.clone())),
                 LargeCopied::To(_) => {}
                 LargeCopied::Gone => brought.large_gone += 1,
+                LargeCopied::Refused(why) => {
+                    brought.large_refused.get_or_insert(*why);
+                }
                 LargeCopied::Declined | LargeCopied::NotYet => brought.large_left_out += 1,
             }
         }

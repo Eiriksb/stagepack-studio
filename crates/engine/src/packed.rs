@@ -899,7 +899,27 @@ fn is_stop(e: &std::io::Error) -> bool {
 
 /// The error for `what`, a file on disk, which changed or went while it was copied.
 fn changed(what: &str) -> PackError {
-    PackError::Io(std::io::Error::other(format!("{what} changed while it was copied")))
+    PackError::Io(std::io::Error::other(ChangedWhileCopied(what.to_string())))
+}
+
+/// What a write's error of the disk holds when a file it copied, named here, changed or went
+/// while it was copied: whatever passes the error on can tell it from any other by this.
+#[derive(Debug)]
+pub struct ChangedWhileCopied(pub String);
+
+impl fmt::Display for ChangedWhileCopied {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} changed while it was copied", self.0)
+    }
+}
+
+impl std::error::Error for ChangedWhileCopied {}
+
+impl PackError {
+    /// Whether this is a file that changed or went while it was copied.
+    pub fn is_changed_while_copied(&self) -> bool {
+        matches!(self, PackError::Io(e) if e.get_ref().is_some_and(|inner| inner.is::<ChangedWhileCopied>()))
+    }
 }
 
 /// How far a write has got, told as it goes, and whether it's been asked to stop.

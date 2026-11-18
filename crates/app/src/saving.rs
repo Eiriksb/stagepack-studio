@@ -48,6 +48,9 @@ pub struct SaveJob {
     index: Option<Vec<u8>>,
     /// Whether it moves a large file, which can take a while.
     moves_large: bool,
+    /// Whether a save in place of a pack opens it again even if it wrote no file, as a reader of
+    /// the pack was let go of for it, and nothing may go on holding the pack it replaced.
+    read_back: bool,
 }
 
 /// Why a save didn't write anything.
@@ -81,6 +84,9 @@ impl From<String> for SaveError {
 
 /// What a save of an untitled talk to where it's kept says: it's kept nowhere yet.
 pub const NO_PLACE_YET: &str = "This presentation hasn't been saved anywhere yet, so it needs Save As.";
+
+/// Why a save stopped when the disk filled up as it wrote.
+const DISK_FILLED: &str = "the disk filled up while it was written, and nothing was changed.";
 
 /// What a save says when the pack it saved in place in couldn't be opened again afterwards.
 pub const NOT_READ_BACK: &str = "The talk was saved, but couldn't be read back. Close it and open it again to be sure of it.";
@@ -137,7 +143,14 @@ impl SaveJob {
             builds,
             index,
             moves_large: false,
+            read_back: false,
         }
+    }
+
+    /// The job, opening a pack saved in place in again even if it writes no file, if `read_back`.
+    pub fn reading_back(mut self, read_back: bool) -> SaveJob {
+        self.read_back |= read_back;
+        self
     }
 
     /// The job, saying whether it moves a large file.
@@ -205,6 +218,7 @@ impl SaveJob {
             builds,
             index,
             moves_large: _,
+            read_back: read_back_anyway,
         } = self;
         let mut builds_written = Vec::new();
         let mut reopened = None;
@@ -270,16 +284,18 @@ impl SaveJob {
                 }
                 repack_with_slides_from(file, file, &text, APP_VERSION, &extra(), progress, stop).map_err(|e| failed(file, e))?;
                 // The talk is read from the pack as it's written from now on, so what it holds,
-                // files and entries, is the talk's, as after a save in a folder, and nothing goes
-                // on holding the pack it replaced, which would keep that pack's disk space.
+                // files and entries, is the talk's, as after a save in a folder. So it is after a
+                // reader of it was let go of, so that nothing goes on holding the pack it replaced.
                 // If it can't be read back, the save has still been made: that's said, the talk
                 // goes on being read as it was, and the next save starts from the index written.
                 let mut notices: Vec<String> = index_notice(file).into_iter().collect();
-                match read_back(file) {
-                    Ok(files) => reopened = Some(files),
-                    Err(_) => {
-                        notices.push(NOT_READ_BACK.to_string());
-                        index_kept_in_pack = index.clone().filter(|_| index_written);
+                if index_written || !files_written.is_empty() || read_back_anyway {
+                    match read_back(file) {
+                        Ok(files) => reopened = Some(files),
+                        Err(_) => {
+                            notices.push(NOT_READ_BACK.to_string());
+                            index_kept_in_pack = index.clone().filter(|_| index_written);
+                        }
                     }
                 }
                 (None, notices)
@@ -451,7 +467,7 @@ fn write_added_from(folder: &Path, path: &str, at: &Path, told: &crate::large_fi
     if holds_file(&target, at, looked.len).map_err(|e| failed(&target, e))? {
         return Ok(());
     }
-    match crate::large_files::copy_to(&source, looked, &target, told, stop) {
+    match crate::large_files::copy_to(&source, looked, &target, told, stop, crate::large_files::CopyFor::Talk) {
         Ok(_) => Ok(()),
         // Put there since it was looked at.
         Err(NotAdded::NameTaken) => match holds_file(&target, at, looked.len) {
@@ -459,7 +475,9 @@ fn write_added_from(folder: &Path, path: &str, at: &Path, told: &crate::large_fi
             _ => Err(failed(folder, NotAdded::NameTaken)),
         },
         Err(NotAdded::Cancelled) => Err(failed(&target, PackError::Stopped)),
-        Err(why) => Err(failed(&target, why)),
+        Err(NotAdded::RanOutOfRoom) => Err(failed(&target, DISK_FILLED)),
+        Err(NotAdded::Changed) => Err(failed(&target, "it changed or went while it was copied.")),
+        Err(_) => Err(failed(&target, "it couldn't be read or written.")),
     }
 }
 

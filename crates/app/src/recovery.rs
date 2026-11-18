@@ -462,6 +462,9 @@ impl Recovery {
     /// A copy from last time is brought back this way, so that it's this window's own, whatever
     /// becomes of last time's.
     pub fn take_in(&self, place: &TalkPlace, path: &str, from: &Path) -> io::Result<PathBuf> {
+        if take_in_fails(&self.root) {
+            return Err(io::Error::other("taking it in was refused, for a test"));
+        }
         if !is_added_path(path) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{path:?} isn't a file added to a talk")));
         }
@@ -503,13 +506,24 @@ impl Recovery {
 
     /// Removes this slot's working copy of the talk at `place` as [`Self::clear`] does, but for
     /// the files kept in it that `keep` says are still the talk's, such as a video added that no
-    /// save has written: until one is, it's the only copy there is. While any is kept, the slot
-    /// stays held, with nothing in it but those.
-    pub fn clear_keeping(&self, place: &TalkPlace, keep: &dyn Fn(&Path) -> bool) {
+    /// save has written: until one is, it's the only copy there is. Each file is asked about as
+    /// it would be removed, so one put in place meanwhile stays, and while anything in the slot
+    /// is kept, or has room kept for it as it's copied in, the slot stays, held, with nothing in
+    /// it but those.
+    pub fn clear_keeping(&self, place: &TalkPlace, keep: &dyn Keeping) {
+        self.clear_keeping_between(place, keep, &|| {});
+    }
+
+    /// [`Self::clear_keeping`], doing `between` once it has looked at what's kept and before it
+    /// removes anything, as a copy running on another thread may. For tests.
+    #[doc(hidden)]
+    pub fn clear_keeping_between(&self, place: &TalkPlace, keep: &dyn Keeping, between: &dyn Fn()) {
         let folder = self.root.join(key(&canonical(place))).join(&self.slot);
         let files = folder.join(FILES_FOLDER);
-        let kept: Vec<PathBuf> = files_kept_in(&files).into_iter().filter(|file| keep(file)).collect();
-        if kept.is_empty() {
+        let any_kept = keep.keeps_any_under(&folder) || files_kept_in(&files).iter().any(|file| keep.keeps(file));
+        between();
+        if !any_kept {
+            // A copy that has room kept for it from now on makes the slot's folders again.
             self.clear(place);
             return;
         }
@@ -530,13 +544,26 @@ impl Recovery {
             }
             let Ok(entries) = std::fs::read_dir(&path) else { continue };
             for entry in entries.flatten() {
-                if !kept.contains(&entry.path()) {
+                // Asked now, not from a list made before: what's put in place meanwhile stays.
+                if !keep.keeps(&entry.path()) {
                     remove_entry(&entry.path());
                 }
             }
-            // Only when nothing is left in it.
-            std::fs::remove_dir(&path).ok();
+            // Only when nothing is left in it, and nothing is about to be copied into it.
+            if !keep.keeps_any_under(&path) {
+                std::fs::remove_dir(&path).ok();
+            }
         }
+    }
+
+    /// Removes `found`, as [`Self::discard`] does, unless a file the talk holds lies in its slot,
+    /// as one brought back from it does until it's taken into this window's own: whether it went.
+    pub fn discard_keeping(&self, found: &Found, keep: &dyn Keeping) -> bool {
+        if keep.keeps_any_under(&found.slot) {
+            return false;
+        }
+        self.discard(found);
+        true
     }
 
     /// Removes `found`, a working copy found with [`Self::find`], whichever slot it's in, unless
@@ -661,6 +688,12 @@ impl Recovery {
     /// Removes the working copies of the new presentation `id` that say they're its, but those
     /// an open window holds.
     pub fn discard_untitled(&self, id: UntitledId) {
+        self.discard_untitled_keeping(id, &KeepNothing);
+    }
+
+    /// [`Self::discard_untitled`], but for a slot a file of the talk's that `keep` says is held
+    /// lies in.
+    pub fn discard_untitled_keeping(&self, id: UntitledId, keep: &dyn Keeping) {
         let place = TalkPlace::Untitled(id);
         let Some(key_folder) = self.key_folder(&place) else {
             return;
@@ -669,7 +702,7 @@ impl Recovery {
         for slot in slots(&key_folder) {
             let its = read_about(&slot).is_some_and(|(about, _)| about.talk == talk && says_it_is(&about, &place));
             // Looked at again just before it goes, as a window may have come to hold it.
-            if its && !is_held(&slot, &live_slots().clone()) {
+            if its && !keep.keeps_any_under(&slot) && !is_held(&slot, &live_slots().clone()) {
                 remove_slot(&slot);
             }
         }
@@ -706,6 +739,45 @@ impl Recovery {
             }
         }
     }
+}
+
+/// What a slot that's cleared keeps of the files in it.
+pub trait Keeping {
+    /// Whether the file at `file` is to stay.
+    fn keeps(&self, file: &Path) -> bool;
+    /// Whether anything under `folder` is to stay, there already or being copied there.
+    fn keeps_any_under(&self, folder: &Path) -> bool;
+}
+
+/// Keeps nothing.
+pub struct KeepNothing;
+
+impl Keeping for KeepNothing {
+    fn keeps(&self, _: &Path) -> bool {
+        false
+    }
+
+    fn keeps_any_under(&self, _: &Path) -> bool {
+        false
+    }
+}
+
+/// The working copies' folders tests have taking a file in fail in.
+static TAKE_IN_FAILS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Has [`Recovery::take_in`] fail for the working copies under `root`, as on a disk that can
+/// neither link nor copy. For tests.
+#[doc(hidden)]
+pub fn set_take_in_fails_for_test(root: &Path, fails: bool) {
+    let mut failing = TAKE_IN_FAILS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    failing.retain(|at| at != root);
+    if fails {
+        failing.push(root.to_path_buf());
+    }
+}
+
+fn take_in_fails(root: &Path) -> bool {
+    TAKE_IN_FAILS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter().any(|at| at == root)
 }
 
 /// Why a new presentation's working copy wasn't taken.
@@ -828,7 +900,7 @@ fn link_or_copy(from: &Path, len: u64, target: &Path) -> io::Result<()> {
         let told = crate::large_files::Told { progress: &quiet, before: 0, total: len };
         let source = crate::large_files::LargeSource::File(from.to_path_buf());
         let looked = source.look().map_err(io::Error::other)?;
-        crate::large_files::copy_to(&source, looked, &beside, &told, &never).map_err(io::Error::other)?;
+        crate::large_files::copy_to(&source, looked, &beside, &told, &never, crate::large_files::CopyFor::WorkingCopy).map_err(io::Error::other)?;
     }
     let placed = std::fs::rename(&beside, target);
     if placed.is_err() {

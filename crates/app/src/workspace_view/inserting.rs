@@ -159,7 +159,7 @@ impl WorkspaceView {
             Ok(copy) => copy,
             Err(why) => return self.say(why.to_string(), cx),
         };
-        let meter = self.start_progress(COPYING_VIDEO, cx);
+        let meter = self.start_progress(COPYING_VIDEO, true, cx);
         let running = meter.clone();
         cx.spawn(async move |this, cx| {
             let copied = cx.background_spawn(async move { copy.run(&|done, total| running.tell(done, total), running.stop()) }).await;
@@ -201,9 +201,9 @@ impl WorkspaceView {
         for at in document.read(cx).large_to_bring(markdown, &files) {
             match document.read(cx).large_copy_for_paste(&files.large[at]) {
                 Ok(copy) => copies.push((at, copy)),
-                // Nowhere to keep it: left out, as if told not to copy it.
-                Err(NotAdded::NowhereToKeep) => files.large[at].copied = LargeCopied::Declined,
-                Err(_) => files.large[at].copied = LargeCopied::Gone,
+                // Not where the copy said, or not as it was.
+                Err(NotAdded::Unreadable | NotAdded::Changed) => files.large[at].copied = LargeCopied::Gone,
+                Err(why) => files.large[at].copied = LargeCopied::Refused(why),
             }
         }
         if copies.is_empty() {
@@ -216,7 +216,7 @@ impl WorkspaceView {
         }
         if window.has_active_dialog(cx) {
             // Nothing is asked while another question is up, so nothing is pasted.
-            return;
+            return self.say(crate::clipboard::ANSWER_FIRST, cx);
         }
         let asked = ask_to_copy(waiting.copies.len(), bytes);
         let waiting = std::rc::Rc::new(std::cell::RefCell::new(Some(waiting)));
@@ -266,7 +266,7 @@ impl WorkspaceView {
             return;
         };
         let WaitingPaste { copies, mut files, paste } = waiting;
-        let meter = self.start_progress(COPYING_VIDEO, cx);
+        let meter = self.start_progress(COPYING_VIDEO, true, cx);
         let running = meter.clone();
         cx.spawn(async move |this, cx| {
             let copied = cx
@@ -303,7 +303,8 @@ impl WorkspaceView {
                     let taken = document.update(cx, |document, _| document.take_large_copy(one));
                     files.large[at].copied = match taken {
                         Ok(path) => LargeCopied::To(path),
-                        Err(_) => LargeCopied::Gone,
+                        Err(NotAdded::Changed) => LargeCopied::Gone,
+                        Err(why) => LargeCopied::Refused(why),
                     };
                 }
                 paste(this, files, cx);

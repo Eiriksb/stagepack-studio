@@ -21,10 +21,10 @@ use gpui_kit::test::TestWindowExt;
 use gpui_kit::{AppContext as _, ClipboardItem, TestAppContext};
 use slides_engine::{Fonts, ReadSeek, TalkFiles as _, open_packed};
 use stagepack_studio::added_files::{FileKind, NotAdded};
-use stagepack_studio::clipboard::{self, AppData};
+use stagepack_studio::clipboard::{self, AppData, LargeCopied, PastedLarge};
 use stagepack_studio::document::{Document, TalkPlace, UntitledId};
 use stagepack_studio::large_files::{
-    self, CACHE_LIMIT, VideoCache, ask_to_copy, progress_words, set_ask_before_copying_for_test, set_free_space_for_test,
+    self, CACHE_LIMIT, LargeSource, VideoCache, ask_to_copy, progress_words, set_ask_before_copying_for_test, set_free_space_for_test,
 };
 use stagepack_studio::recovery::Recovery;
 use stagepack_studio::saving::SaveTarget;
@@ -905,9 +905,37 @@ fn a_copy_carries_where_a_large_file_lies_and_a_paste_checks_it() {
         .unwrap()
         .replace(&source.path().join("assets/clip.mp4").display().to_string(), &outside.display().to_string())
         .replace(&format!("\"len\":{TWIN}"), "\"len\":100");
+    assert_ne!(forged, *item.metadata().unwrap(), "the copy was forged");
     let AppData::Element(carried) = clipboard::read_app_data(Some(&forged)) else { panic!("element data") };
-    if let Some(large) = carried.files.large.first() {
-        assert_eq!(other.bring_large(large, &no_progress, &never()), Err(NotAdded::Unreadable));
+    assert_eq!(carried.files.large.len(), 1, "a forged place is read as any other");
+    assert_eq!(other.bring_large(&carried.files.large[0], &no_progress, &never()), Err(NotAdded::Unreadable));
+    // Nor is anything else that isn't a video where a talk's file lies, whatever it's called.
+    let root = work.path().join("recovery");
+    let slot_text = files_under(&root).into_iter().find(|name| name.ends_with("held"));
+    let in_root = root.join(slot_text.expect("a slot"));
+    let loose = work.path().join("loose").join("assets");
+    std::fs::create_dir_all(&loose).unwrap();
+    let not_in_a_talk = patterned(&loose, "clip.mp4", 100, 20);
+    let forgeries = [
+        ("assets/clip.mp4", in_root.clone()),
+        ("assets/held.mp4", in_root),
+        ("assets/passwd.mp4", PathBuf::from("/etc/passwd")),
+        ("assets/clip.mp4", PathBuf::from("/etc/passwd")),
+        ("assets/clip.mp4", not_in_a_talk.clone()),
+        ("assets/notes.txt", not_in_a_talk),
+    ];
+    for (path, at) in forgeries {
+        let len = std::fs::metadata(&at).map_or(0, |meta| meta.len());
+        let modified = std::fs::metadata(&at).ok().and_then(|meta| meta.modified().ok());
+        let forged = PastedLarge {
+            path: path.to_string(),
+            kind: FileKind::Video,
+            source: LargeSource::File(at.clone()),
+            len,
+            modified,
+            copied: LargeCopied::NotYet,
+        };
+        assert_eq!(other.bring_large(&forged, &no_progress, &never()), Err(NotAdded::Unreadable), "{path} at {}", at.display());
     }
 }
 
@@ -1083,17 +1111,388 @@ fn a_slot_cleared_while_a_file_is_copied_in_keeps_it() {
     // A save made while it copies clears the working copy, as the window does.
     let half = |done: u64, total: u64| {
         if done * 2 >= total && !cleared.replace(true) {
-            recovery.clear_keeping(&place, &keep.keeper());
+            recovery.clear_keeping(&place, &keep);
         }
     };
     let path = document.add_large_file(FileKind::Video, "clip.mp4", &from, &half, &never()).unwrap();
     assert!(cleared.get());
     assert!(reads_back(&document, &path, &from));
     // Cleared again now that the talk holds it: it stays, and nothing else does.
-    recovery.clear_keeping(&place, &document.large_keep().keeper());
+    recovery.clear_keeping(&place, &document.large_keep());
     let lies = lies_at(&document, &path).unwrap();
     assert!(lies.exists());
     let slot = lies.parent().unwrap().parent().unwrap().parent().unwrap();
     let left: Vec<String> = files_under(slot);
     assert_eq!(left, ["files/assets/clip.mp4", "held"], "only the file and the slot's lock");
+}
+
+// A working copy cleared while a file is copied in (review I1).
+
+/// Puts the video at `path` on `document`'s slide, saves it as a folder under `dir`, and checks
+/// the folder holds the bytes of `from`.
+fn saves_as_it_should(document: &mut Document, path: &str, from: &Path, dir: &Path) {
+    assert!(reads_back(document, path, from));
+    show(document, path);
+    let out = dir.join(format!("saved-{}", std::process::id() as u64 + rand_suffix()));
+    save_as(document, SaveTarget::Folder(out.clone()));
+    assert!(same_pieces(saved_file(&out, path).unwrap(), std::fs::File::open(from).unwrap()));
+}
+
+fn rand_suffix() -> u64 {
+    use std::sync::atomic::AtomicU64;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::SeqCst)
+}
+
+#[test]
+fn a_clear_while_a_file_is_copied_in_never_loses_it() {
+    set_up();
+    let work = tempfile::tempdir().unwrap();
+    let from = patterned(work.path(), "clip.mp4", TWIN, 27);
+    let root = work.path().join("recovery");
+
+    // The copy is put in place after the clear has looked, and before it removes anything.
+    let mut document = untitled();
+    let recovery = keep_in(&mut document, &root);
+    let place = document.place().clone();
+    let copy = std::cell::RefCell::new(Some(document.large_copy(FileKind::Video, "clip.mp4", LargeSource::File(from.clone()), None).unwrap()));
+    let copied = std::cell::RefCell::new(None);
+    let lands = || *copied.borrow_mut() = Some(copy.borrow_mut().take().unwrap().run(&no_progress, &never()));
+    recovery.clear_keeping_between(&place, &document.large_keep(), &lands);
+    let path = document.take_large_copy(copied.into_inner().unwrap()).unwrap();
+    saves_as_it_should(&mut document, &path, &from, work.path());
+
+    // The copy is given room after the clear has looked, finding nothing to keep.
+    let mut document = untitled();
+    let recovery = keep_in(&mut document, &root);
+    let place = document.place().clone();
+    let copy = std::cell::RefCell::new(None);
+    let keep = document.large_keep();
+    let claims = || *copy.borrow_mut() = Some(document.large_copy(FileKind::Video, "clip.mp4", LargeSource::File(from.clone()), None).unwrap());
+    recovery.clear_keeping_between(&place, &keep, &claims);
+    let copied = copy.into_inner().unwrap().run(&no_progress, &never());
+    let path = document.take_large_copy(copied).unwrap();
+    saves_as_it_should(&mut document, &path, &from, work.path());
+
+    // The clear comes while the source is hashed, as the talk has a file as long, before
+    // anything of the copy is on disk.
+    let folder = work.path().join("talk");
+    std::fs::create_dir_all(folder.join("assets")).unwrap();
+    std::fs::write(folder.join("slides.md"), "# Talk\n").unwrap();
+    patterned(&folder.join("assets"), "other.mp4", TWIN, 28);
+    let mut document = Document::open(&folder, Fonts::bundled_only()).unwrap();
+    let recovery = keep_in(&mut document, &root);
+    let place = document.place().clone();
+    let keep = document.large_keep();
+    let cleared = std::cell::Cell::new(false);
+    let while_hashed = |done: u64, total: u64| {
+        if done * 4 >= total && !cleared.replace(true) {
+            assert!(done * 2 < total, "still hashing");
+            recovery.clear_keeping(&place, &keep);
+        }
+    };
+    let path = document.add_large_file(FileKind::Video, "clip.mp4", &from, &while_hashed, &never()).unwrap();
+    assert!(cleared.get());
+    assert_eq!(path, "assets/clip.mp4");
+    saves_as_it_should(&mut document, &path, &from, work.path());
+}
+
+// A video brought back that can't be taken into the new window's copy (review I2).
+
+#[gpui_kit::test]
+fn a_video_brought_back_that_cant_be_taken_in_is_never_lost(cx: &mut TestAppContext) {
+    set_up();
+    let work = tempfile::tempdir().unwrap();
+    let from = patterned(work.path(), "clip.mp4", TWIN, 29);
+    let root = work.path().join("root");
+    let recovery_root = root.join("recovery");
+    let (typing, path) = window_with_video(cx, &root, &from);
+    wait(cx, KEEP_PAUSE);
+    let TalkPlace::Untitled(id) = typing.document(cx).read_with(cx, |document, _| document.place().clone()) else {
+        panic!("untitled")
+    };
+    let crash = |cx: &mut TestAppContext, typing: Typing| {
+        let Typing { handle, view, .. } = typing;
+        drop(view);
+        cx.update_window(handle, |_, window, _| window.remove_window()).unwrap();
+        cx.run_until_parked();
+    };
+    crash(cx, typing);
+
+    // Brought back where its file can't be taken in: it's read where it lies, and last time's
+    // copy stays, kept, after this window has kept its own.
+    stagepack_studio::recovery::set_take_in_fails_for_test(&recovery_root, true);
+    let found = Recovery::new(recovery_root.clone()).take_untitled(id).unwrap();
+    let back = open_brought_back(cx, id, found, 2, &root);
+    wait(cx, KEEP_PAUSE);
+    back.document(cx).read_with(cx, |document, _| assert!(reads_back(document, &path, &from)));
+    crash(cx, back);
+    stagepack_studio::recovery::set_take_in_fails_for_test(&recovery_root, false);
+
+    // After a second crash, it's still there, and plays.
+    let found = Recovery::new(recovery_root.clone()).take_untitled(id).unwrap();
+    assert_eq!(found.large.len(), 1, "{:?}", files_under(&recovery_root));
+    assert!(same_pieces(std::fs::File::open(&found.large[0].1).unwrap(), std::fs::File::open(&from).unwrap()));
+    let again = open_brought_back(cx, id, found, 3, &root);
+    wait(cx, KEEP_PAUSE);
+    again.document(cx).read_with(cx, |document, _| {
+        assert!(reads_back(document, &path, &from));
+        assert!(document.source().contains(&path));
+    });
+}
+
+// Copies at once, and closing the window (review I3).
+
+/// Starts copying the video at `from` into the talk in `typing`'s window, without letting it run.
+fn start_copy(typing: &Typing, cx: &mut TestAppContext, from: &Path) {
+    let from = from.to_path_buf();
+    cx.update(|cx| typing.view.update(cx, |view, cx| view.copy_in_large_file(FileKind::Video, from, |_, _, _| {}, cx)));
+}
+
+fn progress_label(typing: &Typing, cx: &mut TestAppContext) -> Option<String> {
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        window.try_find(PROGRESS_ID).and_then(|found| found.label().map(str::to_string))
+    })
+}
+
+#[gpui_kit::test]
+fn two_copies_at_once_each_keep_their_cancel(cx: &mut TestAppContext) {
+    set_up();
+    let work = tempfile::tempdir().unwrap();
+    let (a, b) = (patterned(work.path(), "a.mp4", TWIN, 30), patterned(work.path(), "b.mp4", TWIN, 31));
+    let root = work.path().join("root");
+    let typing = open_untitled_talk(cx, untitled(), &root);
+    start_copy(&typing, cx, &a);
+    start_copy(&typing, cx, &b);
+    assert_eq!(progress_label(&typing, cx).as_deref(), Some("Copying video… 0% · 2 running"));
+    typing.with_window(cx, |window, cx| window.click(CANCEL_PROGRESS_ID, cx));
+    // The other is still shown, and can still be stopped.
+    assert_eq!(progress_label(&typing, cx).as_deref(), Some("Copying video… 0% · 2 running"), "both run until the first has stopped");
+    cx.run_until_parked();
+    typing.settle(cx);
+    assert!(progress_label(&typing, cx).is_none(), "the second ran to its end");
+    let held: Vec<String> = typing.document(cx).read_with(cx, |document, _| {
+        ["assets/a.mp4", "assets/b.mp4"].into_iter().filter(|path| document.has_file(path)).map(str::to_string).collect()
+    });
+    assert_eq!(held, ["assets/a.mp4"], "the one cancelled was the one shown, the newest");
+
+    // Started again together, and both stopped, one after the other.
+    start_copy(&typing, cx, &b);
+    let c = patterned(work.path(), "c.mp4", TWIN, 32);
+    start_copy(&typing, cx, &c);
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        window.click(CANCEL_PROGRESS_ID, cx);
+    });
+    let label = progress_label(&typing, cx);
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        window.click(CANCEL_PROGRESS_ID, cx);
+    });
+    assert!(label.is_some());
+    cx.run_until_parked();
+    typing.settle(cx);
+    typing.document(cx).read_with(cx, |document, _| {
+        assert!(!document.has_file("assets/b.mp4") && !document.has_file("assets/c.mp4"));
+    });
+    assert_eq!(videos_under(&root).len(), 1, "only a.mp4: {:?}", videos_under(&root));
+}
+
+#[gpui_kit::test]
+fn closing_the_window_stops_a_copy_first(cx: &mut TestAppContext) {
+    set_up();
+    let work = tempfile::tempdir().unwrap();
+    let from = patterned(work.path(), "clip.mp4", TWIN, 33);
+    let root = work.path().join("root");
+    let typing = open_untitled_talk(cx, untitled(), &root);
+    start_copy(&typing, cx, &from);
+    let handle = typing.handle;
+    let closed = gpui_kit::VisualTestContext::from_window(handle, cx).simulate_close();
+    assert!(!closed, "it waits for the copy it stopped");
+    assert_eq!(progress_label(&typing, cx).as_deref(), Some(stagepack_studio::workspace_view::STOPPING), "stopped by the close");
+    cx.run_until_parked();
+    let open = cx.read(|cx| cx.windows().iter().any(|window| window.window_id() == handle.window_id()));
+    assert!(!open, "and closes once it has ended");
+    assert!(videos_under(&root).is_empty(), "nothing is left: {:?}", files_under(&root));
+    assert!(files_under(&root.join("recovery")).is_empty(), "nor its working copy: {:?}", files_under(&root));
+}
+
+// Smaller things from review.
+
+#[test]
+fn a_pack_saved_in_place_is_read_back_only_when_it_has_to_be() {
+    set_up();
+    let work = tempfile::tempdir().unwrap();
+    let from = patterned(work.path(), "clip.mp4", TWIN, 34);
+    let mut document = untitled();
+    keep_in(&mut document, &work.path().join("recovery"));
+    let path = add(&mut document, &from).unwrap();
+    show(&mut document, &path);
+    let pack = work.path().join("talk.sptx");
+    save_as(&mut document, SaveTarget::Packed(pack));
+    let unreadable = |_: &Path| -> Result<std::sync::Arc<dyn slides_engine::TalkFiles + Send + Sync>, String> { Err("not now".to_string()) };
+    // Nothing written but the text, and nothing let go of: it isn't opened again.
+    document.insert_tag("Insert text", "Box", &[], None).unwrap();
+    let saved = document.save_job().run_reading_back_with(unreadable).unwrap();
+    assert!(saved.notices().is_empty(), "{:?}", saved.notices());
+    document.saved(saved);
+    // A reader let go of for it: it is.
+    let _reader = document.open_large(&path).unwrap().open().unwrap();
+    assert_eq!(document.let_go_of_readers(), 1);
+    document.insert_tag("Insert text", "Box", &[], None).unwrap();
+    let saved = document.save_job().run_reading_back_with(unreadable).unwrap();
+    assert_eq!(saved.notices(), [stagepack_studio::saving::NOT_READ_BACK]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_saved_video_is_like_the_talks_other_files() {
+    use std::os::unix::fs::PermissionsExt as _;
+    set_up();
+    let work = tempfile::tempdir().unwrap();
+    let from = patterned(work.path(), "clip.mp4", TWIN, 35);
+    let root = work.path().join("recovery");
+    let mode = |at: &Path| std::fs::metadata(at).unwrap().permissions().mode() & 0o777;
+    // In the working copy it's the person's alone.
+    let mut document = untitled();
+    keep_in(&mut document, &root);
+    let path = add(&mut document, &from).unwrap();
+    show(&mut document, &path);
+    assert_eq!(mode(&lies_at(&document, &path).unwrap()), 0o600);
+    // Saved, as a folder and in place in one, it's as the talk's own files are.
+    let folder = work.path().join("talk");
+    save_as(&mut document, SaveTarget::Folder(folder.clone()));
+    assert_eq!(mode(&folder.join(&path)), mode(&folder.join("slides.md")));
+    let other = patterned(work.path(), "other.mp4", TWIN, 36);
+    let more = add(&mut document, &other).unwrap();
+    show(&mut document, &more);
+    save(&mut document);
+    assert_eq!(mode(&folder.join(&more)), mode(&folder.join("slides.md")));
+}
+
+#[gpui_kit::test]
+fn a_kept_video_is_offered_unless_the_talk_has_that_very_file(cx: &mut TestAppContext) {
+    set_up();
+    let work = tempfile::tempdir().unwrap();
+    let from = patterned(work.path(), "clip.mp4", TWIN, 37);
+    let root = work.path().join("recovery");
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::write(folder.path().join("slides.md"), "# Talk\n").unwrap();
+    let talk_folder = folder.path().to_path_buf();
+    let typing = open_folder(cx, folder, Some(Recovery::new(root.clone())));
+    let path = copy_in(&typing, cx, &from);
+    wait(cx, KEEP_PAUSE);
+    let edited = typing.source(cx);
+    let Typing { _folder: folder, handle, view, .. } = typing;
+    drop(view);
+    cx.update_window(handle, |_, window, _| window.remove_window()).unwrap();
+    cx.run_until_parked();
+    // The talk's file says what was kept, and has a different video of the same length there.
+    std::fs::write(talk_folder.join("slides.md"), &edited).unwrap();
+    std::fs::create_dir_all(talk_folder.join("assets")).unwrap();
+    patterned(&talk_folder.join("assets"), "clip.mp4", TWIN, 38);
+    let typing = open_folder(cx, folder, Some(Recovery::new(root.clone())));
+    wait(cx, 500);
+    let offered = typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        window.try_find(stagepack_studio::workspace_view::RECOVERY_ID).is_some()
+    });
+    assert!(offered, "the kept video isn't the talk's, though it's as long");
+    let _ = path;
+}
+
+#[test]
+fn a_full_disk_while_copying_or_saving_leaves_nothing_and_says_so() {
+    set_up();
+    let work = tempfile::tempdir().unwrap();
+    let from = patterned(work.path(), "clip.mp4", TWIN, 39);
+    let root = work.path().join("recovery");
+    // Copying in.
+    let mut document = untitled();
+    keep_in(&mut document, &root);
+    large_files::set_full_after_for_test(&root, Some(TWIN / 2));
+    assert_eq!(add(&mut document, &from), Err(NotAdded::RanOutOfRoom));
+    assert!(files_under(&root).iter().all(|name| !name.contains(".mp4")), "{:?}", files_under(&root));
+    large_files::set_full_after_for_test(&root, None);
+    // Saving in place in a folder.
+    let path = add(&mut document, &from).unwrap();
+    show(&mut document, &path);
+    let folder = work.path().join("talk");
+    save_as(&mut document, SaveTarget::Folder(folder.clone()));
+    let other = patterned(work.path(), "other.mp4", TWIN, 40);
+    let more = add(&mut document, &other).unwrap();
+    show(&mut document, &more);
+    let edited = document.source().to_string();
+    large_files::set_full_after_for_test(&folder, Some(TWIN / 2));
+    let failed = document.save_job().run().err().expect("the save fails").to_string();
+    assert!(failed.contains("filled up"), "{failed}");
+    assert!(files_under(&folder).iter().all(|name| !name.contains("other") && !name.ends_with(".tmp")), "{:?}", files_under(&folder));
+    assert_ne!(std::fs::read_to_string(folder.join("slides.md")).unwrap(), edited, "the talk is as it was");
+    assert!(document.has_unsaved_changes());
+    large_files::set_full_after_for_test(&folder, None);
+    save(&mut document);
+    assert!(same_pieces(saved_file(&folder, &more).unwrap(), std::fs::File::open(&other).unwrap()));
+}
+
+// Through the window: adding and saving, with what it holds of memory (review 6).
+
+#[cfg(target_os = "linux")]
+fn window_adds_and_saves(cx: &mut TestAppContext, len: u64) {
+    set_up();
+    let work = tempfile::tempdir().unwrap();
+    enough_disk(work.path(), len * 4);
+    let from = patterned(work.path(), "clip.mp4", len, 41);
+    let root = work.path().join("root");
+    let typing = open_untitled_talk(cx, untitled(), &root);
+    let mut path = String::new();
+    let added = growth_of(|| path = copy_in(&typing, cx, &from));
+    // Saved as a pack, from the window, as Ctrl+S on a new presentation does.
+    let out = root.join("Documents").join("talk.sptx");
+    let saved = growth_of(|| {
+        typing.press(cx, "ctrl-s");
+        typing.with_window(cx, |window, cx| {
+            window.render_frame(cx);
+            window.click(stagepack_studio::workspace_view::SAVE_AS_PACKED_ID, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_new_path_selection(|_| Some(out.clone()));
+        cx.run_until_parked();
+        typing.settle(cx);
+    });
+    eprintln!("through the window, {len} bytes: adding grew by {:.1} MB, saving by {:.1} MB", added as f64 / 1e6, saved as f64 / 1e6);
+    if len == LARGE {
+        assert!(added < 64 * 1024 * 1024 && saved < 64 * 1024 * 1024, "grew by {added} and {saved} bytes");
+    }
+    assert!(same_pieces(saved_file(&out, &path).unwrap(), std::fs::File::open(&from).unwrap()));
+
+    // A reader held while it's saved in place again is let go of first, and nothing holds the
+    // pack it replaced.
+    let mut reader = typing.document(cx).read_with(cx, |document, _| document.open_large(&path).unwrap().open().unwrap());
+    let mut start = [0u8; 16];
+    reader.read_exact(&mut start).unwrap();
+    typing.press(cx, "ctrl-m");
+    typing.press(cx, "ctrl-s");
+    wait(cx, 500);
+    assert!(reader.read(&mut start).is_err(), "let go of");
+    let held_deleted = std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .flatten()
+        .filter_map(|fd| std::fs::read_link(fd.path()).ok())
+        .any(|target| target.to_string_lossy().starts_with(&*out.to_string_lossy()) && target.to_string_lossy().ends_with("(deleted)"));
+    assert!(!held_deleted, "the replaced pack is still held open");
+    assert!(typing.document(cx).read_with(cx, |document, _| !document.has_unsaved_changes()));
+}
+
+#[cfg(target_os = "linux")]
+#[gpui_kit::test]
+fn the_window_adds_and_saves_a_large_file_as_a_file_twin(cx: &mut TestAppContext) {
+    window_adds_and_saves(cx, TWIN);
+}
+
+#[cfg(target_os = "linux")]
+#[gpui_kit::test]
+#[ignore = "writes 300 MB files: run alone, in release"]
+fn the_window_adds_and_saves_a_large_file_as_a_file(cx: &mut TestAppContext) {
+    window_adds_and_saves(cx, LARGE);
 }

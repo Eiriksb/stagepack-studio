@@ -75,6 +75,7 @@ impl Document {
             self.index_for_save(),
         )
         .moving_large(self.moves_large())
+        .reading_back(self.readers_were_let_go())
     }
 
     /// A save of the talk as it is now, somewhere new. For an untitled talk that's its first
@@ -138,6 +139,7 @@ impl Document {
     /// Takes in a save that worked. The talk is saved if its text is still what was written,
     /// and after a Save As it's kept in the new place from now on.
     pub fn saved(&mut self, saved: Saved) {
+        self.readers_saved();
         // Part of the talk now, wherever it's kept.
         for path in &saved.files_written {
             self.pending.remove(path);

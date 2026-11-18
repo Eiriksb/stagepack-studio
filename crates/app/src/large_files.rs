@@ -54,6 +54,47 @@ pub fn set_free_space_for_test(folder: &Path, bytes: u64) {
     free.push((folder.to_path_buf(), bytes));
 }
 
+/// Folders whose disk tests say fills up once a copy into them has written so many bytes.
+static FULL_AFTER_FOR_TEST: Mutex<Vec<(PathBuf, u64)>> = Mutex::new(Vec::new());
+
+/// Has a copy into `folder` find the disk full once it has written `bytes`, as a full disk does:
+/// for tests, which have no small disk to fill.
+#[doc(hidden)]
+pub fn set_full_after_for_test(folder: &Path, bytes: Option<u64>) {
+    let mut full = FULL_AFTER_FOR_TEST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    full.retain(|(at, _)| at != folder);
+    if let Some(bytes) = bytes {
+        full.push((folder.to_path_buf(), bytes));
+    }
+}
+
+/// How many bytes a copy to `to` can write before tests say the disk is full.
+fn full_after(to: &Path) -> Option<u64> {
+    FULL_AFTER_FOR_TEST.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter().find(|(at, _)| to.starts_with(at)).map(|(_, bytes)| *bytes)
+}
+
+/// A writer that finds the disk full after so many bytes, for [`set_full_after_for_test`].
+struct FillsUp<'a> {
+    out: &'a mut dyn Write,
+    left: Option<u64>,
+}
+
+impl Write for FillsUp<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(left) = self.left {
+            if left < buf.len() as u64 {
+                return Err(io::Error::new(io::ErrorKind::StorageFull, "the disk is full"));
+            }
+            self.left = Some(left - buf.len() as u64);
+        }
+        self.out.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.out.flush()
+    }
+}
+
 /// How many bytes can be written under `folder`, or `None` if the system won't say.
 pub(crate) fn free_space(folder: &Path) -> Option<u64> {
     let said = FREE_FOR_TEST.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter().find(|(at, _)| folder.starts_with(at)).map(|(_, bytes)| *bytes);
@@ -194,6 +235,23 @@ fn open_regular(path: &Path) -> Option<std::fs::File> {
     file.metadata().ok()?.is_file().then_some(file)
 }
 
+/// The plain file at `path`, opened to read, unless it's a link or anything but a file. Where the
+/// system allows, a link put there after it's looked at isn't followed either.
+pub(crate) fn open_plain(path: &Path) -> Option<std::fs::File> {
+    if !std::fs::symlink_metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
 /// How far a copy has got, told as it goes, out of a whole that may be bigger than this one copy.
 pub(crate) struct Told<'a> {
     pub(crate) progress: &'a dyn Fn(u64, u64),
@@ -243,6 +301,9 @@ fn refused(why: NotAdded) -> PackError {
 
 /// What `error`, from a copy, is said as.
 fn said_of(error: &PackError) -> NotAdded {
+    if error.is_changed_while_copied() {
+        return NotAdded::Changed;
+    }
     match error {
         PackError::Stopped => NotAdded::Cancelled,
         PackError::Io(error) => {
@@ -254,7 +315,6 @@ fn said_of(error: &PackError) -> NotAdded {
                 io::ErrorKind::AlreadyExists => NotAdded::NameTaken,
                 #[cfg(unix)]
                 _ if error.raw_os_error() == Some(libc::ENOSPC) => NotAdded::RanOutOfRoom,
-                _ if error.to_string().contains("changed while it was copied") => NotAdded::Changed,
                 _ => NotAdded::Unreadable,
             }
         }
@@ -277,7 +337,8 @@ fn copy_pieces(from: &mut dyn Read, to: &mut dyn Write, len: u64, told: &Told<'_
         let n = match from.read(&mut piece[..want]) {
             Ok(n) => n,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => return Err(refused(NotAdded::Changed)),
+            // Gone or cut short reads as less, which is a change; this is the disk failing.
+            Err(_) => return Err(refused(NotAdded::Unreadable)),
         };
         if n == 0 {
             break;
@@ -295,21 +356,39 @@ fn copy_pieces(from: &mut dyn Read, to: &mut dyn Write, len: u64, told: &Told<'_
     Ok(())
 }
 
+/// Who a file copied in is for: the working copy, where it's someone's unsaved work and theirs
+/// alone, or the talk itself, where it's like any other file a save writes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyFor {
+    WorkingCopy,
+    Talk,
+}
+
 /// Copies `source`, as it was when `looked` at, into the new file `to`, a piece at a time, and
 /// gives the SHA-256 of what was copied. `to` is written beside and put in place only once it's
 /// whole and safe on the disk, so a copy cut short, by a stop, a crash or a full disk, never
 /// leaves a file there. Whatever is at `to` already is never replaced. If the source changes or
 /// goes while it's copied, nothing is left either.
-pub(crate) fn copy_to(source: &LargeSource, looked: Looked, to: &Path, told: &Told<'_>, stop: &AtomicBool) -> Result<[u8; 32], NotAdded> {
+pub(crate) fn copy_to(
+    source: &LargeSource,
+    looked: Looked,
+    to: &Path,
+    told: &Told<'_>,
+    stop: &AtomicBool,
+    copy_for: CopyFor,
+) -> Result<[u8; 32], NotAdded> {
     let hash = Cell::new([0u8; 32]);
     let written = write_new_atomically_with(to, |file| {
         // Someone's unsaved work: theirs alone.
         #[cfg(unix)]
-        {
+        if copy_for == CopyFor::WorkingCopy {
             use std::os::unix::fs::PermissionsExt as _;
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
-        let mut out = Hashing { out: file, hash: Sha256::new() };
+        #[cfg(not(unix))]
+        let _ = copy_for;
+        let mut fills_up = FillsUp { out: file, left: full_after(to) };
+        let mut out = Hashing { out: &mut fills_up, hash: Sha256::new() };
         match source {
             LargeSource::File(path) => {
                 let mut from = open_regular(path).ok_or_else(|| refused(NotAdded::Changed))?;
@@ -402,6 +481,8 @@ type Held = Arc<Slot>;
 #[derive(Default)]
 pub struct Readers {
     held: Mutex<Vec<Weak<Slot>>>,
+    /// Whether any was let go of since the talk was last saved.
+    let_go: AtomicBool,
 }
 
 impl Readers {
@@ -418,12 +499,28 @@ impl Readers {
         HeldReader(held)
     }
 
-    /// Lets go of every reader held: each closes what it reads, and reads nothing more.
-    pub(crate) fn let_go(&self) {
+    /// Lets go of every reader held: each closes what it reads, and reads nothing more. How many
+    /// there were is given.
+    pub(crate) fn let_go(&self) -> usize {
         let all = std::mem::take(&mut *self.held());
+        let mut let_go = 0;
         for reader in all.iter().filter_map(Weak::upgrade) {
-            reader.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+            let_go += usize::from(reader.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take().is_some());
         }
+        if let_go > 0 {
+            self.let_go.store(true, Ordering::SeqCst);
+        }
+        let_go
+    }
+
+    /// Whether any reader was let go of since [`Self::saved`].
+    pub(crate) fn were_let_go(&self) -> bool {
+        self.let_go.load(Ordering::SeqCst)
+    }
+
+    /// The talk was saved: what's let go of from now on is for the next save.
+    pub(crate) fn saved(&self) {
+        self.let_go.store(false, Ordering::SeqCst);
     }
 
     /// How many readers are held, and not let go of.
@@ -504,7 +601,14 @@ impl VideoCache {
         let len = files.len(entry)?;
         if std::fs::symlink_metadata(&at).is_ok_and(|there| there.is_file() && there.len() == len) {
             // Used now: it goes after those used longer ago.
-            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&at) {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            }
+            if let Ok(file) = options.open(&at) {
                 file.set_modified(SystemTime::now()).ok();
             }
             return Some(at);
@@ -517,8 +621,12 @@ impl VideoCache {
         let written = write_new_atomically_with(&at, |file| files.copy_entry(entry, file, &|_, _| {}, &never));
         match written {
             Ok(()) => {}
-            // Unpacked by another window meanwhile.
-            Err(PackError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            // Unpacked by another window meanwhile: taken only if it's a plain file, as long.
+            Err(PackError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if !std::fs::symlink_metadata(&at).is_ok_and(|there| there.is_file() && there.len() == len) {
+                    return None;
+                }
+            }
             Err(_) => return None,
         }
         self.trim(&at);

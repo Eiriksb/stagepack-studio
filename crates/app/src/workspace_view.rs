@@ -311,10 +311,16 @@ impl Meter {
 struct Progressing {
     /// What it's doing, such as *Copying video*.
     doing: SharedString,
+    /// Whether it's stopped when the window closes, as a copy into the talk is, which the talk
+    /// closing has no use for. A save goes on.
+    stops_on_close: bool,
     meter: std::sync::Arc<Meter>,
     /// Draws the line again while it goes on.
     _ticker: Task<()>,
 }
+
+/// What the status line says of work asked to stop, until it has.
+pub const STOPPING: &str = "Stopping…";
 
 /// How often the status line is drawn again while it shows how far work has got.
 const PROGRESS_TICK: Duration = Duration::from_millis(100);
@@ -341,8 +347,10 @@ pub struct WorkspaceView {
     notices: Vec<String>,
     /// What came of the last thing asked of the File or Export menu.
     status: Option<SharedString>,
-    /// Work that moves a large file, while it goes on.
-    progressing: Option<Progressing>,
+    /// Work that moves a large file, while it goes on, the newest last.
+    progressing: Vec<Progressing>,
+    /// Whether the window is to close once the copies it stopped as it was closed have ended.
+    close_when_idle: bool,
     /// The wait before a status that only stays a while goes, while it's showing.
     status_fading: Option<Task<()>>,
     markdown_panel: Entity<MarkdownPanel>,
@@ -638,7 +646,8 @@ impl WorkspaceView {
             slide_editor,
             notices,
             status: None,
-            progressing: None,
+            progressing: Vec::new(),
+            close_when_idle: false,
             status_fading: None,
             markdown_panel,
             show_markdown: panels.markdown,
@@ -1077,32 +1086,72 @@ impl WorkspaceView {
 
     /// Shows how far work that moves a large file has got on the status line, `doing` it, with a
     /// Cancel, until [`Self::end_progress`]. What it gives is told how far it's got, and says when
-    /// to stop.
-    pub(crate) fn start_progress(&mut self, doing: impl Into<SharedString>, cx: &mut Context<Self>) -> std::sync::Arc<Meter> {
+    /// to stop. Work that `stops_on_close` is stopped when the window closes, which waits for it
+    /// to end. While more than one runs, the newest is shown, saying how many there are.
+    pub(crate) fn start_progress(&mut self, doing: impl Into<SharedString>, stops_on_close: bool, cx: &mut Context<Self>) -> std::sync::Arc<Meter> {
         let meter = std::sync::Arc::new(Meter::default());
+        let ticking = meter.clone();
         let ticker = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(PROGRESS_TICK).await;
                 let going = this.update(cx, |this, cx| {
                     cx.notify();
-                    this.progressing.is_some()
+                    this.progressing.iter().any(|progressing| std::sync::Arc::ptr_eq(&progressing.meter, &ticking))
                 });
                 if !matches!(going, Ok(true)) {
                     break;
                 }
             }
         });
-        self.progressing = Some(Progressing { doing: doing.into(), meter: meter.clone(), _ticker: ticker });
+        self.progressing.push(Progressing { doing: doing.into(), stops_on_close, meter: meter.clone(), _ticker: ticker });
         cx.notify();
         meter
     }
 
-    /// The work `meter` is told of is done: the status line no longer shows it.
+    /// The work `meter` is told of is done: the status line no longer shows it. If the window was
+    /// closed while it ran, and nothing it stopped runs any more, it closes now.
     pub(crate) fn end_progress(&mut self, meter: &std::sync::Arc<Meter>, cx: &mut Context<Self>) {
-        if self.progressing.as_ref().is_some_and(|progressing| std::sync::Arc::ptr_eq(&progressing.meter, meter)) {
-            self.progressing = None;
-            cx.notify();
+        self.progressing.retain(|progressing| !std::sync::Arc::ptr_eq(&progressing.meter, meter));
+        cx.notify();
+        if self.close_when_idle && !self.stops_running() {
+            self.close_when_idle = false;
+            let (window, view) = (self.window_handle, cx.weak_entity());
+            cx.defer(move |cx| {
+                window
+                    .update(cx, |_, window, cx| {
+                        let closes = view.update(cx, |view, cx| view.should_close(window, cx)).unwrap_or(true);
+                        if closes {
+                            window.remove_window();
+                        }
+                    })
+                    .ok();
+            });
         }
+    }
+
+    /// The work the status line shows: the newest not yet stopped, whose Cancel stops it, or else
+    /// the newest, while it stops.
+    fn progress_shown(&self) -> Option<&Progressing> {
+        let stopped = |progressing: &&Progressing| progressing.meter.stop.load(std::sync::atomic::Ordering::SeqCst);
+        self.progressing.iter().rev().find(|progressing| !stopped(progressing)).or(self.progressing.last())
+    }
+
+    /// Whether any work runs that the window closing stops.
+    fn stops_running(&self) -> bool {
+        self.progressing.iter().any(|progressing| progressing.stops_on_close)
+    }
+
+    /// Stops every copy running, as the window is closing, and closes it once they've ended: they
+    /// copy into a working copy the close may be about to clear. Whether any was running.
+    pub(super) fn stop_before_closing(&mut self) -> bool {
+        if !self.stops_running() {
+            return false;
+        }
+        for progressing in self.progressing.iter().filter(|progressing| progressing.stops_on_close) {
+            progressing.meter.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.close_when_idle = true;
+        true
     }
 
     /// The status line while work that moves a large file goes on: what it's doing, how far it's
@@ -1110,7 +1159,12 @@ impl WorkspaceView {
     fn progress_line(&self, progressing: &Progressing, cx: &Context<Self>) -> impl IntoElement + use<> {
         use std::sync::atomic::Ordering::Relaxed;
         let (done, total) = (progressing.meter.done.load(Relaxed), progressing.meter.total.load(Relaxed));
-        let words: SharedString = crate::large_files::progress_words(&progressing.doing, done, total).into();
+        let stopping = progressing.meter.stop.load(std::sync::atomic::Ordering::SeqCst);
+        let mut words = if stopping { STOPPING.to_string() } else { crate::large_files::progress_words(&progressing.doing, done, total) };
+        if self.progressing.len() > 1 {
+            words = format!("{words} · {} running", self.progressing.len());
+        }
+        let words: SharedString = words.into();
         let fraction = if total == 0 { 0.0 } else { (done as f64 / total as f64).clamp(0.0, 1.0) as f32 };
         let meter = progressing.meter.clone();
         h_flex()
@@ -1675,7 +1729,7 @@ impl Render for WorkspaceView {
                     muted_text,
                 ))
             })
-            .map(|this| match (&self.progressing, self.status.clone()) {
+            .map(|this| match (self.progress_shown(), self.status.clone()) {
                 (Some(progressing), _) => this.child(self.progress_line(progressing, cx)),
                 (None, Some(status)) => this.child(footer_line(STATUS_ID, status, muted_text)),
                 // The line keeps its room with nothing on it, so the slide stays put as what's

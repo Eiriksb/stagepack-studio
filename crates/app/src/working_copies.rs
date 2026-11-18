@@ -16,7 +16,7 @@ use slides_engine::AddedFile;
 
 use crate::added_files::is_added_path;
 use crate::document::{Document, LargeKeep, TalkPlace};
-use crate::recovery::{Found, Recovery, hash_text};
+use crate::recovery::{Found, KeepNothing, Keeping, Recovery, hash_text};
 
 /// How long after the last edit the working copy of unsaved changes is brought up to date.
 const WORKING_COPY_DELAY: Duration = Duration::from_secs(1);
@@ -51,6 +51,14 @@ struct Kept {
 /// holds what it did. The jobs take it when they run, not when they're asked for.
 type Adopted = Arc<Mutex<Option<Found>>>;
 
+/// Puts `found` back as the copy brought back, to be let go of later.
+fn give_back(adopted: &Adopted, found: Found) {
+    let mut held = adopted.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if held.is_none() {
+        *held = Some(found);
+    }
+}
+
 fn take_adopted(adopted: &Adopted) -> Option<Found> {
     adopted
         .lock()
@@ -75,6 +83,9 @@ enum Job {
         /// The builds entered in its index with them.
         builds: Vec<BuildEntry>,
         adopted: Adopted,
+        /// What of the talk's lies on disk, which the adopted copy isn't let go of while any lies
+        /// in it.
+        keep: Option<LargeKeep>,
     },
     /// Removes this window's copy, and the adopted one too if `adopted` is given, but for the
     /// large files `keep` says the talk still holds, which are the only copies there are. The
@@ -114,6 +125,7 @@ impl Job {
                 files,
                 builds,
                 adopted,
+                keep,
             } => {
                 if clears.load(Ordering::SeqCst) == at {
                     let kept = match &place {
@@ -125,9 +137,13 @@ impl Job {
                     };
                     kept.map_err(|_| ())?;
                 }
-                // Kept, or overtaken by a clear: either way it's no longer needed.
-                if let Some(adopted) = take_adopted(&adopted) {
-                    recovery.discard(&adopted);
+                // Kept, or overtaken by a clear: either way it's no longer needed, unless a file the
+                // talk holds still lies in it, when it's kept for the next keep or clear.
+                let keep: &dyn Keeping = keep.as_ref().map_or(&KeepNothing, |keep| keep);
+                if let Some(found) = take_adopted(&adopted)
+                    && !recovery.discard_keeping(&found, keep)
+                {
+                    give_back(&adopted, found);
                 }
             }
             Job::Clear {
@@ -139,19 +155,22 @@ impl Job {
             } => {
                 // What the talk holds is looked at now, not when this was asked for: a file may
                 // have been added since.
-                let keeps = keep.map(|keep| keep.keeper());
-                let keeps = |file: &std::path::Path| keeps.as_ref().is_some_and(|keeps| keeps(file));
+                // What the talk holds is asked as each file would go, not when this was asked for.
+                let keep: &dyn Keeping = keep.as_ref().map_or(&KeepNothing, |keep| keep);
                 for place in also.iter().chain([&place]) {
-                    recovery.clear_keeping(place, &keeps);
+                    recovery.clear_keeping(place, keep);
                 }
-                if let Some(adopted) = adopted.as_ref().and_then(take_adopted) {
-                    recovery.discard(&adopted);
+                if let Some(adopted) = adopted.as_ref()
+                    && let Some(found) = take_adopted(adopted)
+                    && !recovery.discard_keeping(&found, keep)
+                {
+                    give_back(adopted, found);
                 }
                 // A new presentation's id is its own: any other copy of it that no window holds
                 // is an older one, as a crash leaves while one is brought back, which would be
-                // offered again.
+                // offered again; but not one a file the talk holds still lies in.
                 if let TalkPlace::Untitled(id) = place {
-                    recovery.discard_untitled(id);
+                    recovery.discard_untitled_keeping(id, keep);
                 }
             }
             Job::KeepFile {
@@ -281,10 +300,12 @@ impl WorkingCopies {
         let document = document.read(cx);
         let files = document.export_input().files;
         let has_them = found.files.iter().all(|(path, bytes)| files.read(path).is_some_and(|held| *held == **bytes));
-        // A large file is never read to tell: one that lies where the copy's does, or is as long.
+        // A large file is never read to tell: one that lies where the copy's does, or in a file as
+        // long that last changed when it did.
         let has_large = found.large.iter().all(|(path, at)| {
-            files.lies_at(path).is_some_and(|lies| lies == *at)
-                || std::fs::metadata(at).is_ok_and(|meta| files.len(path) == Some(meta.len()))
+            let Some(lies) = files.lies_at(path) else { return false };
+            let looked = |file: &std::path::Path| std::fs::metadata(file).ok().map(|meta| (meta.len(), meta.modified().ok()));
+            lies == *at || looked(&lies).is_some_and(|here| Some(here) == looked(at))
         });
         let has_them = has_them && has_large;
         if found.text == document.source() && has_them {
@@ -428,8 +449,11 @@ impl WorkingCopies {
 
     /// What brings the working copy in line with the talk: one while it has unsaved changes,
     /// and none once it hasn't, nor any file kept as it was added.
-    fn job(&mut self, cx: &App) -> Option<Job> {
+    fn job(&mut self, cx: &mut App) -> Option<Job> {
         let recovery = self.recovery.clone()?;
+        // A file brought back that still lies in last time's copy is taken into this window's own
+        // first, so that last time's can go once this is kept.
+        self.document.as_ref()?.update(cx, |document, _| document.take_in_left_in_last());
         let document = self.document.as_ref()?.read(cx);
         let place = document.place().clone();
         if !document.has_unsaved_changes() {
@@ -470,6 +494,7 @@ impl WorkingCopies {
             files,
             builds: kept.builds.clone(),
             adopted: self.adopted.clone(),
+            keep: Some(document.large_keep()),
         };
         self.kept = Some(kept);
         Some(job)
@@ -518,6 +543,29 @@ impl WorkingCopies {
             },
             cx,
         );
+    }
+
+    /// The window is closing with nothing unsaved: its copies go, each slot it kept anything in
+    /// whole. A video added that the talk doesn't use, as its insert was undone, has stayed in
+    /// the slot while the window was open, as Redo may want it; it goes now. If the app stops
+    /// instead, the next start sweeps it away with the slot, as it holds no text.
+    pub fn let_go_closing(&mut self, cx: &mut Context<Self>) {
+        let (Some(recovery), Some(document)) = (self.recovery.clone(), self.document.clone()) else {
+            return;
+        };
+        let document = document.read(cx);
+        let lies = document.kept_large_files() || !document.large_keep().held().is_empty();
+        if !(self.holds_a_copy() || lies || !self.left_in.is_empty()) {
+            return;
+        }
+        let place = document.place().clone();
+        self.kept = None;
+        self.files_kept.clear();
+        self.pending = None;
+        self.unkept_since = None;
+        let also = self.left_in.iter().filter(|kept| **kept != place).cloned().collect();
+        let job = Job::Clear { recovery, place, adopted: Some(self.adopted.clone()), keep: None, also };
+        self.enqueue(job, cx);
     }
 
     /// Whether this window's copy is there, as last written, or any file added to the talk was
