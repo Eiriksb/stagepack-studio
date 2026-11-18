@@ -70,7 +70,20 @@ Windows checklist at the end of each.
 
 Stage D is done with D5. How far the design's first success test holds at its end, and what plan E still owes it, is in `docs/checks/plan-d5.md`.
 
+### G. Live content
+
+Design: `docs/superpowers/specs/2026-11-18-live-content-design.md`. The owner asked for it to come before packaging (2026-11-18). Two spikes come first, for video and for 3D; their results go in `docs/checks/live-content-spikes.md`. Each part is its own plan, written when the one before it has finished.
+
+- **G1. Large files and video:** a clip in the talk plays on its slide.
+- **G2. 3D models:** a model file drawn on its slide, turned by hand or between saved views on clicks.
+- **G3. Terminal replay:** a recorded session played back on its slide.
+- **G4. The AI tool:** commands, and a server an AI assistant can use, to read what a talk may hold, check a talk and see a picture of a slide.
+- **G5. The live terminal add-on:** a real shell or container behind a slide, off unless connected and said yes to.
+
 ### E. Packaging
+
+After stage G. It gains what G adds: the video decoder, the add-on's helper and the AI tool's command.
+
 
 - Installers for Windows and Linux, per user, with no administrator rights.
 - The bundled compiler, fonts, icons and licence notices.
@@ -88,4 +101,4 @@ It isn't part of the success tests, so it can follow the first public release if
 
 ## Order
 
-The spikes come first, and then A to F in order. C can start once A's slide model exists, so it can run beside B. The first public release is when both success tests pass, at the end of E.
+The spikes come first, and then A to D in order, then G, then E and F. C can start once A's slide model exists, so it can run beside B. The first public release is when both success tests pass, at the end of E.
