@@ -455,15 +455,23 @@ pub fn contrast(a: Color, b: Color) -> f32 {
     (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
 
-/// `color`, if it stands out from `background` as [`MARKS_STAND_OUT`] says, or else whichever
-/// of a near black and a near white stands out more, which on any background is enough.
+/// `color`, if it stands out from `background` as [`MARKS_STAND_OUT`] says, or else `color`
+/// taken toward whichever of a near black and a near white stands out more, only as far as it
+/// takes to stand out: all the way, that's enough on any background.
 pub fn standing_out(color: Color, background: Color) -> Color {
     const DARK: Color = Color::rgb(0x0a, 0x0a, 0x0a);
     const LIGHT: Color = Color::rgb(0xfa, 0xfa, 0xfa);
+    /// How many steps there are from the colour to the extreme.
+    const STEPS: u16 = 255;
     if contrast(color, background) >= MARKS_STAND_OUT {
         return color;
     }
-    if contrast(DARK, background) >= contrast(LIGHT, background) { DARK } else { LIGHT }
+    let extreme = if contrast(DARK, background) >= contrast(LIGHT, background) { DARK } else { LIGHT };
+    let toward = |steps: u16| {
+        let channel = |from: u8, to: u8| ((u16::from(from) * (STEPS - steps) + u16::from(to) * steps + STEPS / 2) / STEPS) as u8;
+        Color { r: channel(color.r, extreme.r), g: channel(color.g, extreme.g), b: channel(color.b, extreme.b), a: color.a }
+    };
+    (1..=STEPS).map(toward).find(|stepped| contrast(*stepped, background) >= MARKS_STAND_OUT).unwrap_or(extreme)
 }
 
 /// The colour of the editor's offer in an empty region: the theme's text colour faded toward

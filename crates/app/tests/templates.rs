@@ -12,16 +12,13 @@ use std::sync::Arc;
 use typing::*;
 
 use gpui_kit::{Modifiers, Pixels, Point, TestAppContext, point, px};
-use slides_engine::{Deck, DisplayItem, Fonts, LayerSpec, Pixmap, TalkFiles};
+use slides_engine::{Deck, DisplayItem, Fonts, LayerSpec, MARKS_STAND_OUT, Pixmap, TalkFiles};
 use slides_format::{Block, DEFAULT_LAYOUT, LAYOUT_NAMES, layout_names, parse_talk};
 use stagepack_studio::export::{ExportInput, ExportKind, run_export};
 use stagepack_studio::ribbon::TAB_ANIMATE_ID;
 use stagepack_studio::slide_editor::{MarkColors, step_badge_id};
 use stagepack_studio::templates::{Template, contrast, memory_files, template, templates};
 use toolkit::Color;
-
-/// How much a mark drawn over the slide must stand out from its background.
-const MARKS_STAND_OUT: f32 = 3.0;
 
 fn deck_of(template: &Template) -> Deck {
     Deck::open(Box::new(memory_files(template)), Fonts::bundled_only(), template.slides.to_string())
@@ -360,6 +357,31 @@ fn every_mark_stands_out_on_every_template(cx: &mut TestAppContext) {
         let words = marks.badge_words.expect("the badge has words");
         assert!(contrast(words, badge) >= MARKS_STAND_OUT, "{id}: the badge's words {words:?} on {badge:?}");
     }
+}
+
+#[gpui_kit::test]
+fn a_selection_on_a_white_slide_is_only_as_dark_as_it_must_be(cx: &mut TestAppContext) {
+    let typing = open(cx, &format!("# One\n{TEXT_BOX}"));
+    let background = typing.document(cx).read_with(cx, |document, _| document.theme().background);
+    assert_eq!(background, Color::rgb(255, 255, 255), "a slide with no colours of its own is white");
+    let element = thing(&typing, cx, "<Box");
+    let at = middle(&typing, cx, &element);
+    typing.click(cx, at);
+    assert!(outline(&typing, cx).is_some(), "the box is selected");
+    // The window theme's colour for it, as it shows on white, which doesn't stand out there.
+    let grey = typing.with_window(cx, |_, cx| {
+        let ring = gpui_kit::Rgba::from(gpui_kit::component::ActiveTheme::theme(cx).ring);
+        let over = |value: f32| (value * ring.a * 255. + 255. * (1. - ring.a)).round() as u8;
+        Color::rgb(over(ring.r), over(ring.g), over(ring.b))
+    });
+    assert!(contrast(grey, background) < MARKS_STAND_OUT, "{grey:?}");
+    let shown = mark_colours(&typing, cx).outline.expect("the outline was drawn");
+    let ratio = contrast(shown, background);
+    assert!((MARKS_STAND_OUT..4.0).contains(&ratio), "{shown:?} is {ratio:.2}");
+    for (channel, old) in [(shown.r, grey.r), (shown.g, grey.g), (shown.b, grey.b)] {
+        assert!(channel <= old && channel > 0, "{shown:?}: between {grey:?} and black");
+    }
+    assert!(shown != Color::rgb(0x0a, 0x0a, 0x0a), "not the near black");
 }
 
 /// Every colour a PDF sets for filling or drawing, from its content streams: three numbers

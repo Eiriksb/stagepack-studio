@@ -211,3 +211,33 @@ fn a_path_inside_a_shape_is_kept_in_the_export() {
     assert!(native.iter().any(|e| matches!(e.content, NativeContent::Shape { .. })));
     assert!(native.iter().any(|e| matches!(e.content, NativeContent::Path { .. })));
 }
+
+#[test]
+fn a_mark_is_taken_toward_black_or_white_only_as_far_as_it_must_be() {
+    use toolkit::Color;
+    let (white, black, mid) = (Color::rgb(255, 255, 255), Color::rgb(0, 0, 0), Color::rgb(0x77, 0x77, 0x77));
+    // A light grey on white, a dark grey on black, a blue on white, and a grey on a mid grey.
+    let cases = [
+        (Color::rgb(0xd4, 0xd4, 0xd8), white),
+        (Color::rgb(0x27, 0x27, 0x2a), black),
+        (Color::rgb(0x93, 0xc5, 0xfd), white),
+        (Color::rgb(0x80, 0x80, 0x80), mid),
+    ];
+    for (mark, background) in cases {
+        let shown = standing_out(mark, background);
+        let ratio = contrast(shown, background);
+        assert!(ratio >= MARKS_STAND_OUT, "{mark:?} on {background:?}: {shown:?} is {ratio:.2}");
+        assert!(ratio < MARKS_STAND_OUT + 0.1, "{mark:?} on {background:?}: {shown:?} is {ratio:.2}, further than it had to go");
+        assert_eq!(shown.a, mark.a);
+    }
+    // Toward black on white: darker than it was in every channel, and not black.
+    let shown = standing_out(cases[0].0, white);
+    assert!(shown.r < 0xd4 && shown.g < 0xd4 && shown.b < 0xd8 && shown.r > 0x0a, "{shown:?}");
+    // Toward white on black.
+    let shown = standing_out(cases[1].0, black);
+    assert!(shown.r > 0x27 && shown.r < 0xfa, "{shown:?}");
+    // One that stands out already is as it was.
+    for (mark, background) in [(Color::rgb(0x25, 0x63, 0xeb), white), (Color::rgb(0xfa, 0xcc, 0x15), black)] {
+        assert_eq!(standing_out(mark, background), mark);
+    }
+}
