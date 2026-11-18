@@ -27,7 +27,7 @@ use crate::builds::{self, BuildOutcome, Compile};
 use crate::cargo_file::{self, write_cargo_file};
 use crate::clipboard::ClipboardOp;
 use crate::clipboard_tools::ClipboardTools;
-use crate::document::{Document, EditRefused, LargeOpen, OpenProblem, Reload, SLIDES_FILE, TalkPlace, UNREADABLE_FILE, UntitledId};
+use crate::document::{Document, EditRefused, OpenProblem, Reload, SLIDES_FILE, TalkPlace, UNREADABLE_FILE, UntitledId};
 use crate::export::{self, ExportKind, run_export, stagepack_executable};
 use crate::icon_picker::{self, IconPicked, IconPicker};
 use crate::palette::InsertComponent;
@@ -45,6 +45,7 @@ use crate::ribbon::{Panels, Ribbon, RibbonTab};
 use crate::save_flow::{CloseAnswer, Effect, SaveFlow, SaveOutcome};
 use crate::saving::{SaveError, SaveJob, SaveTarget, Saved};
 use crate::slide_canvas::{ScaleChanged, SlideCanvas};
+use crate::video_player::StillsTaken;
 use crate::slide_editor::{self, EditorEvent, SlideEditor};
 use crate::table_tools::{
     InsertTable, TableColumnLeft, TableColumnRight, TableDeleteColumn, TableDeleteRow, TableRowAbove, TableRowBelow,
@@ -725,49 +726,13 @@ impl WorkspaceView {
         view
     }
 
-    /// Has the talk's videos' stills made on background tasks, one at a time, each taken in, and
-    /// its slide drawn again, as it comes. Nothing runs while none is wanted.
+    /// Has the talk's videos' stills made, and its slide drawn again as each comes.
     fn make_stills_aside(&mut self, cx: &mut Context<Self>) {
         let Some(document) = self.document.clone() else {
             return;
         };
-        let (wanted, mut asked) = mpsc::unbounded::<()>();
-        document.update(cx, |document, _| {
-            document.make_stills_aside(std::sync::Arc::new(move || {
-                wanted.unbounded_send(()).ok();
-            }))
-        });
-        // Held weakly, as the talk holds what tells this.
-        let document = document.downgrade();
-        cx.spawn(async move |this, cx| {
-            while asked.next().await.is_some() {
-                loop {
-                    let Ok(jobs) = document.update(cx, |document, _| document.still_jobs()) else { return };
-                    if jobs.is_empty() {
-                        break;
-                    }
-                    for (job, open) in jobs {
-                        let made = cx
-                            .background_spawn(async move {
-                                let reader = open.and_then(LargeOpen::open);
-                                job.make(reader.map(|reader| Box::new(reader) as Box<dyn slides_engine::ReadSeek>))
-                            })
-                            .await;
-                        let shown = document.update(cx, |document, cx| {
-                            let shown = document.take_still(made);
-                            if shown {
-                                cx.notify();
-                            }
-                            shown
-                        });
-                        if shown.is_ok_and(|shown| shown) && this.update(cx, |this, cx| this.show_slide(cx)).is_err() {
-                            return;
-                        }
-                    }
-                }
-            }
-        })
-        .detach();
+        crate::video_player::make_stills(&document, cx);
+        cx.subscribe(&document, |this, _, _: &StillsTaken, cx| this.show_slide(cx)).detach();
     }
 
     pub fn document(&self) -> Option<&Entity<Document>> {

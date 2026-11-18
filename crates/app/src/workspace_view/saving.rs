@@ -298,7 +298,8 @@ impl WorkspaceView {
         if job.replaces_the_pack()
             && let Some(document) = &self.document
         {
-            let let_go = document.read(cx).let_go_of_readers();
+            // Nothing of the talk is opened until the save is done.
+            let let_go = document.read(cx).begin_saving_the_pack();
             job = job.reading_back(let_go > 0);
         }
         let meter = job.moves_large().then(|| self.start_progress(format!("{} {name}", SAVING.doing), false, cx));
@@ -343,6 +344,9 @@ impl WorkspaceView {
             self.save_flow = SaveFlow::Idle;
             return;
         };
+        // Whatever came of it, the talk's files can be opened again: what waited is opened
+        // once the talk follows the save.
+        document.update(cx, |document, _| document.pack_save_ended());
         let (outcome, mut theirs) = match outcome {
             Ok(saved) => {
                 let said = if saved.notices().is_empty() {

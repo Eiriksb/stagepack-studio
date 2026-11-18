@@ -90,16 +90,21 @@ pub fn render_layer(spec: &LayerSpec, scale: f32, fonts: &mut Fonts) -> Layer {
 /// One of a video's pictures, `width` by `height` in straight BGRA, drawn as the layer of a
 /// video placed at `rect` and turned by `rotate` would show it, at `scale`: for a turned video,
 /// which the window can't turn. `None` if the picture isn't that size.
-pub fn frame_layer(width: u32, height: u32, bgra: &[u8], rect: Rect, rotate: f32, scale: f32) -> Option<Layer> {
+/// `from` is the pixmap the last picture was read into, filled again if it's this one's size.
+pub fn frame_layer(width: u32, height: u32, bgra: &[u8], rect: Rect, rotate: f32, scale: f32, from: &mut Option<Pixmap>) -> Option<Layer> {
     if bgra.len() as u64 != u64::from(width) * u64::from(height) * 4 {
         return None;
     }
-    let mut picture = Pixmap::new(width, height)?;
+    let mut picture = match from.take() {
+        Some(kept) if (kept.width(), kept.height()) == (width, height) => kept,
+        _ => Pixmap::new(width, height)?,
+    };
     // Opaque, so it needs no premultiplying.
     for (pixel, bgra) in picture.pixels_mut().iter_mut().zip(bgra.as_chunks::<4>().0) {
         *pixel = ColorU8::from_rgba(bgra[2], bgra[1], bgra[0], 255).premultiply();
     }
-    let item = DisplayItem::Picture { pixmap: Arc::new(picture), src: None, rect: Rect { x: 0.0, y: 0.0, w: rect.w, h: rect.h } };
+    let picture = Arc::new(picture);
+    let item = DisplayItem::Picture { pixmap: picture.clone(), src: None, rect: Rect { x: 0.0, y: 0.0, w: rect.w, h: rect.h } };
     let spec = LayerSpec {
         source: None,
         rect,
@@ -112,7 +117,10 @@ pub fn frame_layer(width: u32, height: u32, bgra: &[u8], rect: Rect, rotate: f32
         varies: false,
         video: None,
     };
-    Some(draw_layer(&spec, scale, |_, _, _| {}))
+    let layer = draw_layer(&spec, scale, |_, _, _| {});
+    drop(spec);
+    *from = Arc::into_inner(picture);
+    Some(layer)
 }
 
 /// Draws `spec` at `scale`, its text with `text`.

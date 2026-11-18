@@ -23,6 +23,10 @@ use crate::{Align, DisplayItem, LayoutEnv, NativeContent, Notice, PLACEMENT_ATTR
 pub(crate) const VIDEO_TAG: &str = "Video";
 /// The room a video's own size is fitted within, when no size is written.
 const VIDEO_ROOM: (f32, f32) = (960.0, 540.0);
+/// What's said of a video written in the text, not placed on the slide.
+pub const VIDEO_IN_TEXT: &str = "This video plays only when it's placed on the slide. Drag it out of the text to place it.";
+/// What's said of a video whose named still can't be shown.
+const POSTER_UNREAD: &str = "The picture named to show for this video can't be shown, so its first picture shows instead.";
 /// The side of the play mark on the panel of a video with no still.
 const PLAY_MARK: f32 = 96.0;
 
@@ -236,6 +240,7 @@ impl Flow<'_, '_> {
             self.notice(ALIGN_UNPLACED.to_string());
         }
         if tag.name == VIDEO_TAG {
+            self.notice(VIDEO_IN_TEXT.to_string());
             return Some(self.video(tag, false).1);
         }
         match self.render_tag(tag, (self.width, 0.0)) {
@@ -385,21 +390,32 @@ impl Flow<'_, '_> {
             self.notice(why.to_string());
         }
         let poster = tag.attr("poster").map(str::trim).filter(|poster| !poster.is_empty());
-        let poster = poster.and_then(|poster| self.env.pictures.get(poster, self.env.files));
-        let natural = match &still {
-            Still::Frame(_, (w, h)) => fitted(*w as f32, *h as f32),
-            _ => poster.as_ref().map_or(VIDEO_ROOM, |poster| fitted(poster.width() as f32, poster.height() as f32)),
+        let poster = poster.and_then(|poster| {
+            let picture = self.env.pictures.get(poster, self.env.files);
+            if picture.is_none() {
+                self.notice(POSTER_UNREAD.to_string());
+            }
+            picture
+        });
+        let own = match &still {
+            Still::Frame(_, size) | Still::Coming(Some(size)) => Some(*size),
+            Still::Coming(None) | Still::Cannot(_) => None,
+        };
+        let natural = match own {
+            Some((w, h)) => fitted(w as f32, h as f32),
+            None => poster.as_ref().map_or(VIDEO_ROOM, |poster| fitted(poster.width() as f32, poster.height() as f32)),
         };
         let picture = match still {
             Still::Frame(frame, _) => poster.or(Some(frame)),
-            Still::Cannot(_) | Still::Coming => poster,
+            Still::Cannot(_) | Still::Coming(_) => poster,
         };
         let node = match picture {
             Some(picture) => {
                 let size = if boxed { size_of(0.0, 0.0, true) } else { size_of(natural.0, natural.1, false) };
                 self.leaf(Style { size, ..Style::default() }, Content::Picture(picture))
             }
-            None => self.video_panel(size_when_empty(0.0, 0.0, boxed)),
+            None if boxed => self.video_panel(size_when_empty(0.0, 0.0, true)),
+            None => self.video_panel(size_of(natural.0, natural.1, false)),
         };
         (natural, node)
     }

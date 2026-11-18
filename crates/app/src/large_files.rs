@@ -471,18 +471,51 @@ pub(crate) fn hash_in(files: &dyn TalkFiles, path: &str, stop: &AtomicBool) -> O
     hash_of(files.open(path)?, &Told { progress: &quiet, before: 0, total: 0 }, stop)
 }
 
-/// A reader, until it's let go of.
-type Slot = Mutex<Option<Box<dyn ReadSeek>>>;
+/// A reader, until it's let go of, and whether a save let go of it.
+struct Slot {
+    reader: Mutex<Option<Box<dyn ReadSeek>>>,
+    let_go: Arc<AtomicBool>,
+}
+
+impl Slot {
+    fn reader(&self) -> std::sync::MutexGuard<'_, Option<Box<dyn ReadSeek>>> {
+        self.reader.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 type Held = Arc<Slot>;
+
+/// Why a talk's file wasn't opened to be read in pieces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotOpened {
+    /// A save is replacing the talk's pack: it's opened once that's done.
+    Saving,
+    /// It isn't there, or couldn't be read.
+    Unreadable,
+    /// A pack holds it compressed, and it hasn't been unpacked to play yet.
+    NotUnpacked,
+}
+
+#[derive(Default)]
+struct Gate {
+    /// Whether a save replacing the talk's pack is running, when nothing may open it.
+    saving: bool,
+    /// How many files are being opened, which a save waits for before it lets go of them.
+    opening: usize,
+}
 
 /// The readers the app holds on a talk's files, such as a video's while it plays, so that a save
 /// that replaces the pack they read can let go of them first: on some systems a file that's open
-/// can't be replaced, and on others it keeps the disk space of the file it replaced.
+/// can't be replaced, and on others it keeps the disk space of the file it replaced. While such a
+/// save runs, nothing more is opened.
 #[derive(Default)]
 pub struct Readers {
     held: Mutex<Vec<Weak<Slot>>>,
     /// Whether any was let go of since the talk was last saved.
     let_go: AtomicBool,
+    gate: Mutex<Gate>,
+    /// Told when no file is being opened any more.
+    opened: std::sync::Condvar,
 }
 
 impl Readers {
@@ -490,9 +523,33 @@ impl Readers {
         self.held.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    fn gate(&self) -> std::sync::MutexGuard<'_, Gate> {
+        self.gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Opens a reader with `open`, held among these until it's dropped or let go of, unless a
+    /// save replacing the pack is running: then nothing is opened.
+    pub(crate) fn open(&self, open: impl FnOnce() -> Result<Box<dyn ReadSeek>, NotOpened>) -> Result<HeldReader, NotOpened> {
+        {
+            let mut gate = self.gate();
+            if gate.saving {
+                return Err(NotOpened::Saving);
+            }
+            gate.opening += 1;
+        }
+        let opened = open();
+        let held = opened.map(|reader| self.hold(reader));
+        let mut gate = self.gate();
+        gate.opening -= 1;
+        if gate.opening == 0 {
+            self.opened.notify_all();
+        }
+        held
+    }
+
     /// `reader`, held among these until it's dropped or let go of.
     pub(crate) fn hold(&self, reader: Box<dyn ReadSeek>) -> HeldReader {
-        let held: Held = Arc::new(Mutex::new(Some(reader)));
+        let held: Held = Arc::new(Slot { reader: Mutex::new(Some(reader)), let_go: Arc::default() });
         let mut all = self.held();
         all.retain(|reader| reader.strong_count() > 0);
         all.push(Arc::downgrade(&held));
@@ -505,12 +562,39 @@ impl Readers {
         let all = std::mem::take(&mut *self.held());
         let mut let_go = 0;
         for reader in all.iter().filter_map(Weak::upgrade) {
-            let_go += usize::from(reader.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take().is_some());
+            let taken = reader.reader().take().is_some();
+            if taken {
+                reader.let_go.store(true, Ordering::SeqCst);
+            }
+            let_go += usize::from(taken);
         }
         if let_go > 0 {
             self.let_go.store(true, Ordering::SeqCst);
         }
         let_go
+    }
+
+    /// A save that replaces the talk's pack begins: nothing more is opened until
+    /// [`Self::save_ended`], what's being opened is waited for, and then every reader held is let
+    /// go of. How many there were is given.
+    pub(crate) fn begin_saving(&self) -> usize {
+        let mut gate = self.gate();
+        gate.saving = true;
+        while gate.opening > 0 {
+            gate = self.opened.wait(gate).unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        drop(gate);
+        self.let_go()
+    }
+
+    /// The save that replaces the pack is done, whatever came of it: files can be opened again.
+    pub(crate) fn save_ended(&self) {
+        self.gate().saving = false;
+    }
+
+    /// Whether a save replacing the pack is running, when nothing is opened.
+    pub(crate) fn saving(&self) -> bool {
+        self.gate().saving
     }
 
     /// Whether any reader was let go of since [`Self::saved`].
@@ -525,11 +609,7 @@ impl Readers {
 
     /// How many readers are held, and not let go of.
     pub(crate) fn count(&self) -> usize {
-        self.held()
-            .iter()
-            .filter_map(Weak::upgrade)
-            .filter(|reader| reader.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_some())
-            .count()
+        self.held().iter().filter_map(Weak::upgrade).filter(|reader| reader.reader().is_some()).count()
     }
 }
 
@@ -540,29 +620,30 @@ pub struct HeldReader(Held);
 impl HeldReader {
     /// Whether it was let go of.
     pub fn is_let_go(&self) -> bool {
-        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_none()
+        self.0.reader().is_none()
     }
 
-    /// Something that tells whether this reader has been let go of, once it's been handed on.
+    /// Something that tells whether a save let go of this reader, once it's been handed on.
     pub fn watch(&self) -> ReaderWatch {
-        ReaderWatch(Arc::downgrade(&self.0))
+        ReaderWatch(self.0.let_go.clone())
     }
 
     fn with<T>(&mut self, f: impl FnOnce(&mut dyn ReadSeek) -> io::Result<T>) -> io::Result<T> {
-        match &mut *self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
+        match &mut *self.0.reader() {
             Some(reader) => f(&mut **reader),
             None => Err(io::Error::other(LET_GO)),
         }
     }
 }
 
-/// Tells whether a [`HeldReader`] handed on has been let go of.
-pub struct ReaderWatch(Weak<Slot>);
+/// Tells whether a save let go of a [`HeldReader`] handed on. A reader dropped, as when what read
+/// it failed, wasn't let go of: only a save lets go.
+pub struct ReaderWatch(Arc<AtomicBool>);
 
 impl ReaderWatch {
-    /// Whether it was let go of. One that's gone altogether was let go of too.
+    /// Whether a save let go of it.
     pub fn is_let_go(&self) -> bool {
-        self.0.upgrade().is_none_or(|reader| reader.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_none())
+        self.0.load(Ordering::SeqCst)
     }
 }
 
@@ -602,18 +683,7 @@ impl VideoCache {
     /// isn't already. The file is named for the pack, as it is now, and the entry, so a pack
     /// that changes is unpacked again.
     pub(crate) fn unpacked(&self, pack: &Path, entry: &str) -> Option<PathBuf> {
-        let metadata = std::fs::metadata(pack).ok()?;
-        let mut key = Sha256::new();
-        key.update(pack.canonicalize().ok()?.as_os_str().as_encoded_bytes());
-        key.update(metadata.len().to_le_bytes());
-        let since = metadata.modified().ok()?.duration_since(SystemTime::UNIX_EPOCH).ok()?;
-        key.update(since.as_nanos().to_le_bytes());
-        key.update(entry.as_bytes());
-        let key: String = key.finalize().iter().take(16).map(|byte| format!("{byte:02x}")).collect();
-        let ext = entry.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()).filter(|ext| ext.bytes().all(|b| b.is_ascii_alphanumeric()))?;
-        let at = self.folder.join(format!("{key}.{ext}"));
-        let files = open_packed(pack).ok()?;
-        let len = files.len(entry)?;
+        let (at, files, len) = self.place_for(pack, entry)?;
         if std::fs::symlink_metadata(&at).is_ok_and(|there| there.is_file() && there.len() == len) {
             // Used now: it goes after those used longer ago.
             let mut options = std::fs::OpenOptions::new();
@@ -646,6 +716,30 @@ impl VideoCache {
         }
         self.trim(&at);
         Some(at)
+    }
+
+    /// The file the pack at `pack` holds as `entry`, if it's unpacked here already: nothing is
+    /// unpacked to find out.
+    pub(crate) fn unpacked_already(&self, pack: &Path, entry: &str) -> Option<PathBuf> {
+        let (at, _, len) = self.place_for(pack, entry)?;
+        std::fs::symlink_metadata(&at).is_ok_and(|there| there.is_file() && there.len() == len).then_some(at)
+    }
+
+    /// Where the pack at `pack`'s `entry` is unpacked to, named for the pack as it is now and the
+    /// entry, with the pack opened and the entry's length.
+    fn place_for(&self, pack: &Path, entry: &str) -> Option<(PathBuf, slides_engine::PackedFiles, u64)> {
+        let metadata = std::fs::metadata(pack).ok()?;
+        let mut key = Sha256::new();
+        key.update(pack.canonicalize().ok()?.as_os_str().as_encoded_bytes());
+        key.update(metadata.len().to_le_bytes());
+        let since = metadata.modified().ok()?.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+        key.update(since.as_nanos().to_le_bytes());
+        key.update(entry.as_bytes());
+        let key: String = key.finalize().iter().take(16).map(|byte| format!("{byte:02x}")).collect();
+        let ext = entry.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()).filter(|ext| ext.bytes().all(|b| b.is_ascii_alphanumeric()))?;
+        let files = open_packed(pack).ok()?;
+        let len = files.len(entry)?;
+        Some((self.folder.join(format!("{key}.{ext}")), files, len))
     }
 
     /// Takes away the files used longest ago, but `keep`, until what's here is within the limit.

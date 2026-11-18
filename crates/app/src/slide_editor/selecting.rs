@@ -20,10 +20,7 @@ impl SlideEditor {
         let selection = self.selection_here(cx)?;
         let document = self.document.clone()?;
         let said = selection::said_of_selection(document.read(cx).talk(), &selection)?;
-        let problem = document.update(cx, |document, _| {
-            let video = document.selected_video()?;
-            document.video_problem(video.source.as_ref()?)
-        });
+        let problem = document.update(cx, |document, _| document.selected_video_said());
         Some(match problem {
             Some(problem) => format!("{said}. {problem}").into(),
             None => said.into(),
@@ -92,7 +89,7 @@ impl SlideEditor {
             return;
         }
         let waiting = self.canvas.read(cx).videos_let_go();
-        if !waiting.is_empty() && !document.read(cx).readers_were_let_go() {
+        if !waiting.is_empty() && !document.read(cx).saving_the_pack() {
             let mut opened: Vec<(String, LargeOpen)> =
                 waiting.into_iter().filter_map(|src| Some((src.clone(), document.read(cx).open_large(&src)?))).collect();
             self.canvas.update(cx, |canvas, cx| {

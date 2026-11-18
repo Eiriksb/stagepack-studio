@@ -1296,7 +1296,8 @@ fn a_talk_of_twenty_videos_opens_reading_only_their_starts() {
 fn a_still_made_aside_is_taken_in_and_its_slide_shown_again() {
     let video = video_of(64, 36, 2, |_| RED_BGRA);
     let files: HashMap<String, Vec<u8>> = [("assets/clip.mp4".to_string(), video.clone())].into();
-    let talk = "# One\n\n<Video src=\"assets/clip.mp4\" x=\"0\" w=\"640\" h=\"360\" />\n\n---\n\n# Two\n";
+    // Unsized: it takes its own shape from what its file says, before its still is made.
+    let talk = "# One\n\n<Video src=\"assets/clip.mp4\" x=\"0\" />\n\n---\n\n# Two\n";
     // Files that can say how long each is, as a talk's on disk can.
     struct Sized(MapFiles);
     impl TalkFiles for Sized {
@@ -1310,13 +1311,18 @@ fn a_still_made_aside_is_taken_in_and_its_slide_shown_again() {
     let mut deck = Deck::open(Box::new(Sized(MapFiles(files))), Fonts::bundled_only(), talk.to_string());
     let wanted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let told = wanted.clone();
-    deck.make_stills_aside(std::sync::Arc::new(move || {
-        told.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }));
+    deck.make_stills_aside(
+        std::sync::Arc::new(move || {
+            told.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }),
+        std::sync::Arc::new(|path: &str| (path == "assets/clip.mp4").then_some((64, 36))),
+    );
     let version = deck.slide_version(0);
     let video_layer = |deck: &mut Deck| deck.specs(0).iter().find(|spec| spec.video.is_some()).expect("the video has a layer").clone();
     // A panel while it's made, and nothing said of it.
-    assert!(!has_picture(&video_layer(&mut deck)));
+    let panel = video_layer(&mut deck);
+    assert!(!has_picture(&panel));
+    assert_eq!((panel.rect.w, panel.rect.h), (64.0, 36.0), "its own shape while its still is made");
     assert!(deck.stills_coming());
     assert!(deck.notices(0).is_empty());
     assert_eq!(wanted.load(std::sync::atomic::Ordering::SeqCst), 1, "told once");
@@ -1332,7 +1338,15 @@ fn a_still_made_aside_is_taken_in_and_its_slide_shown_again() {
     assert!(!deck.stills_coming());
     let layer = video_layer(&mut deck);
     assert!(close_to(middle_of(picture_of(&layer).0), (255, 0, 0)));
+    assert_eq!(layer.rect, panel.rect, "nothing moved when it came");
     assert!(deck.still_jobs().is_empty(), "it's made once");
+    // The talk's files taken anew, as after a save, the same file keeps its still.
+    let files: HashMap<String, Vec<u8>> = [("assets/clip.mp4".to_string(), video_of(64, 36, 2, |_| RED_BGRA))].into();
+    deck.set_files(Box::new(Sized(MapFiles(files))));
+    let layer = video_layer(&mut deck);
+    assert!(has_picture(&layer), "the still is kept");
+    assert!(deck.still_jobs().is_empty(), "and isn't made again");
+    assert_eq!(wanted.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -1343,4 +1357,90 @@ fn a_video_keeps_its_shape_as_a_picture_does() {
     let video = layout.elements().iter().find(|element| talk.source[element.source.clone()].starts_with("<Video")).expect("the video is a thing on the slide");
     assert!(video.keeps_shape);
     assert!(!video.holds_text);
+}
+
+#[test]
+fn loop_is_read_as_yes_or_no() {
+    let video = video_of(64, 36, 1, |_| RED_BGRA);
+    for (written, looped, said) in [
+        (" loop", true, false),
+        (" loop=\"true\"", true, false),
+        (" loop=\"yes\"", true, false),
+        (" loop=\"1\"", true, false),
+        (" loop=\"no\"", false, false),
+        (" loop=\"0\"", false, false),
+        ("", false, false),
+        (" loop=\"often\"", false, true),
+    ] {
+        let source = format!("<Video src=\"assets/clip.mp4\" x=\"0\" w=\"64\" h=\"36\"{written} />\n");
+        let (slide, _) = lay_out(&source, &[("assets/clip.mp4", video.clone())]);
+        assert_eq!(slide.layers[1].video.as_ref().unwrap().looped, looped, "{written}");
+        let noticed = slide.notices.iter().any(|notice| notice.0.contains("loop can be yes or no"));
+        assert_eq!(noticed, said, "{written}: {:?}", slide.notices);
+    }
+}
+
+#[test]
+fn a_poster_that_cannot_be_shown_is_said() {
+    let files = [("assets/clip.mp4", video_of(64, 36, 1, |_| RED_BGRA)), ("assets/still.png", b"not a picture".to_vec())];
+    let (slide, _) = lay_out("<Video src=\"assets/clip.mp4\" poster=\"assets/still.png\" x=\"0\" w=\"64\" h=\"36\" />\n", &files);
+    assert!(slide.notices.iter().any(|notice| notice.0.contains("can't be shown, so its first picture shows instead")), "{:?}", slide.notices);
+}
+
+#[test]
+fn a_video_in_the_text_says_it_plays_only_once_placed() {
+    let (slide, _) = lay_out("# One\n\n<Video src=\"assets/clip.mp4\" />\n", &[("assets/clip.mp4", video_of(64, 36, 1, |_| RED_BGRA))]);
+    assert!(slide.notices.iter().any(|notice| notice.0 == VIDEO_IN_TEXT), "{:?}", slide.notices);
+    assert!(slide.layers.iter().all(|layer| layer.video.is_none()), "it doesn't play");
+}
+
+/// Files that can be changed under a deck, each stamped with how many times it has been.
+type ChangingFiles = std::rc::Rc<std::cell::RefCell<HashMap<String, (Vec<u8>, u64)>>>;
+
+struct Changing(ChangingFiles);
+
+impl TalkFiles for Changing {
+    fn read(&self, path: &str) -> Option<Vec<u8>> {
+        self.0.borrow().get(path).map(|(bytes, _)| bytes.clone())
+    }
+    fn stamp(&self, path: &str) -> Option<(u64, std::time::SystemTime)> {
+        let files = self.0.borrow();
+        let (bytes, changes) = files.get(path)?;
+        Some((bytes.len() as u64, std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(*changes)))
+    }
+    fn len(&self, path: &str) -> Option<u64> {
+        self.0.borrow().get(path).map(|(bytes, _)| bytes.len() as u64)
+    }
+}
+
+#[test]
+fn a_video_replaced_under_its_name_gets_a_new_still() {
+    let files = std::rc::Rc::new(std::cell::RefCell::new(HashMap::new()));
+    files.borrow_mut().insert("assets/clip.mp4".to_string(), (video_of(64, 36, 1, |_| RED_BGRA), 0));
+    let talk = "# One\n\n<Video src=\"assets/clip.mp4\" x=\"0\" w=\"640\" h=\"360\" />\n";
+    let mut deck = Deck::open(Box::new(Changing(files.clone())), Fonts::bundled_only(), talk.to_string());
+    let still = |deck: &mut Deck| {
+        let layer = deck.specs(0).iter().find(|spec| spec.video.is_some()).unwrap().clone();
+        middle_of(picture_of(&layer).0)
+    };
+    assert!(close_to(still(&mut deck), (255, 0, 0)));
+    files.borrow_mut().insert("assets/clip.mp4".to_string(), (video_of(64, 36, 1, |_| BLUE_BGRA), 1));
+    assert_eq!(deck.update(talk.to_string()), vec![0], "the slide shows anew");
+    assert!(close_to(still(&mut deck), (0, 0, 255)), "{:?}", still(&mut deck));
+}
+
+#[test]
+fn stills_count_in_the_picture_budget() {
+    let video = video_of(320, 180, 1, |_| RED_BGRA);
+    let paths: Vec<String> = (0..6).map(|at| format!("assets/clip{at}.mp4")).collect();
+    let talk: Vec<String> = paths.iter().map(|path| format!("# Slide\n\n<Video src=\"{path}\" x=\"0\" w=\"640\" h=\"360\" />\n")).collect();
+    let files = MapFiles(paths.iter().map(|path| (path.clone(), video.clone())).collect());
+    let mut deck = Deck::open(Box::new(files), Fonts::bundled_only(), talk.join("\n---\n\n"));
+    let one = 320 * 180 * 4;
+    deck.set_picture_budget(2 * one);
+    for slide in 0..6 {
+        deck.specs(slide);
+        assert!(deck.picture_bytes() >= one, "slide {slide}'s still is counted");
+        assert!(deck.picture_bytes() <= 3 * one, "slide {slide}: {} bytes held", deck.picture_bytes());
+    }
 }

@@ -24,7 +24,7 @@ use crate::clipboard::{self, TextPaste};
 use crate::clipboard_tools::write_clipboard;
 use crate::document::{Beside, CellMove, Document, EditRefused};
 use crate::selection::{self, Thing};
-use crate::slide_canvas::{SLIDE_WIDTH, SlideCanvas, VideoLetGo, letterbox};
+use crate::slide_canvas::{SLIDE_WIDTH, SlideCanvas, VideoFailed, VideoLetGo, VideoOpened, letterbox};
 use crate::insert::TEXT_BOX_SIZE;
 use crate::text_editing::{Composing, EditingText, clean_typed, one_line, utf16_slice};
 use crate::text_tools::{
@@ -276,6 +276,16 @@ impl SlideEditor {
         }
         // A save let go of the file of the video playing: it's opened again once that's done.
         subscriptions.push(cx.subscribe(&canvas, |this, _, _: &VideoLetGo, cx| this.keep_playing_only_what_holds(cx)));
+        // A video that couldn't go on says why.
+        subscriptions.push(cx.subscribe(&canvas, |_, _, failed: &VideoFailed, cx| {
+            cx.emit(EditorEvent::Said(failed.0.to_string().into()));
+        }));
+        // A video opened to play may have been unpacked: a still that waited for that is made.
+        if let Some(document) = document.clone() {
+            subscriptions.push(cx.subscribe(&canvas, move |_, _, _: &VideoOpened, cx| {
+                document.update(cx, |document, _| document.try_waiting_stills_again());
+            }));
+        }
         // A shortcut pressed while the system composes ends the composition, before anything
         // the shortcut does: a platform that drops its own composition then, as Linux does on
         // Ctrl and a letter, doesn't say so, and what it was composing mustn't stay shown.

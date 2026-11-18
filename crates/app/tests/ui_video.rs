@@ -13,13 +13,14 @@ use std::time::{Duration, Instant};
 use typing::*;
 
 use gpui_kit::test::TestWindowExt as _;
-use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, Modifiers, RenderImage, TestAppContext, point, px};
-use slides_engine::Fonts;
+use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, Modifiers, RenderImage, TestAppContext, VisualTestContext, point, px};
+use slides_engine::{Fonts, stills_decoded_on_this_thread};
 use stagepack_studio::arrange::Handle;
 use stagepack_studio::document::Document;
 use stagepack_studio::present_view::{AudienceView, Presentation, PresenterView, start_show};
 use stagepack_studio::saving::SaveTarget;
 use stagepack_studio::slide_canvas::SlideCanvas;
+use stagepack_studio::video_player::decodings_started_and_ended_aside;
 use stagepack_studio::slide_editor::{VIDEO_PLAY_ID, VIDEO_STOP_ID, handle_id};
 use stagepack_studio::workspace_view;
 
@@ -567,7 +568,17 @@ fn rehearse_with(cx: &mut TestAppContext, source: &str, video: &[u8], more: &[(&
     for (path, bytes) in more {
         std::fs::write(folder.path().join(path), bytes).unwrap();
     }
-    let document = cx.new(|_| Document::open(folder.path(), Fonts::bundled_only()).unwrap());
+    let document = Document::open(folder.path(), Fonts::bundled_only()).unwrap();
+    show_of(cx, folder, document)
+}
+
+/// A rehearsed show of `document`, whose files `folder` holds.
+fn show_of(cx: &mut TestAppContext, folder: tempfile::TempDir, document: Document) -> Show {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        workspace_view::bind_keys(cx);
+    });
+    let document = cx.new(|_| document);
     let show = cx.update(|cx| start_show(document.clone(), true, cx));
     let (audience, presenter) = cx.read(|cx| {
         let show = show.read(cx);
@@ -687,4 +698,264 @@ fn the_same_file_twice_plays_twice(cx: &mut TestAppContext) {
     decoded_ahead(cx, show.audience, &canvas, 1);
     next_frame(cx, show.audience, 100);
     assert_eq!(frame_times(cx, &canvas), vec![Some(0.1), Some(0.1)], "both go on");
+}
+
+// What the first review found.
+
+/// A packed talk of `source` with `video`, kept in `work`, opened from its pack.
+fn packed(source: &str, video: &[u8], work: &std::path::Path) -> (Document, std::path::PathBuf) {
+    let folder = talk_folder(source, video);
+    let pack = work.join("talk.sptx");
+    let saved = Document::open(folder.path(), Fonts::bundled_only()).unwrap().save_as_job(SaveTarget::Packed(pack.clone())).run();
+    assert!(saved.is_ok());
+    (Document::open_packed(&pack, Fonts::bundled_only()).unwrap(), pack)
+}
+
+#[gpui_kit::test]
+fn a_video_that_fails_part_way_says_why_and_is_not_opened_again(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let typing = editor(cx, &talk(), &clip(300, 30));
+    let canvas = play_selected(&typing, cx);
+    let file = typing._folder.path().join("assets/clip.mp4");
+    let len = std::fs::metadata(&file).unwrap().len();
+    // The file is cut short under it, as a disk going away would.
+    std::fs::OpenOptions::new().write(true).open(&file).unwrap().set_len(len / 3).unwrap();
+    until(cx, typing.handle, "it to fail", |cx| {
+        cx.executor().advance_clock(Duration::from_millis(34));
+        cx.read(|cx| canvas.read(cx).video_failures()) == vec![Some(slides_video::CantPlay::CouldNotRead)]
+    });
+    typing.settle(cx);
+    assert_eq!(typing.status(cx).as_deref(), Some("This video couldn't be read."));
+    assert!(frames(cx, &canvas)[0].is_none(), "its still shows");
+    // Nothing opens it again, whatever the talk does.
+    let (opened, _) = decodings_started_and_ended_aside();
+    typing.document(cx).update(cx, |_, cx| cx.notify());
+    for _ in 0..20 {
+        next_frame(cx, typing.handle, 34);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(decodings_started_and_ended_aside().0, opened, "never opened again");
+    assert!(threads_of(cx, &canvas).is_empty());
+}
+
+#[gpui_kit::test]
+fn opening_a_talk_decodes_no_still_on_its_thread(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let source = format!("# Video\n\n{}\n", VIDEO.replace(" w=\"640\" h=\"360\"", ""));
+    let folder = talk_folder(&source, &clip(3, 10));
+    let before = stills_decoded_on_this_thread();
+    let mut document = Document::open(folder.path(), Fonts::bundled_only()).unwrap();
+    document.notices();
+    let video = document.videos_here().pop().expect("the video has a layer");
+    assert!(document.stills_coming(), "its still is to be made aside");
+    assert_eq!(stills_decoded_on_this_thread(), before, "nothing was decoded here");
+    // Unsized, it has its own shape already, read from the file without decoding.
+    assert_eq!((video.on.rect.w, video.on.rect.h), (WIDTH as f32, HEIGHT as f32));
+    // In a window, it's made aside, and the slide keeps its shape when it comes.
+    let typing = open_document_for_test(cx, folder, document);
+    stills_made(&typing, cx);
+    let made = typing.document(cx).update(cx, |document, _| document.videos_here().pop().unwrap());
+    assert_eq!(made.on.rect, video.on.rect);
+}
+
+/// `document` in a window, its files in `folder`.
+fn open_document_for_test(cx: &mut TestAppContext, folder: tempfile::TempDir, document: Document) -> Typing {
+    let root = tempfile::tempdir().unwrap();
+    let typing = open_untitled_talk(cx, document, root.path());
+    std::mem::forget(root);
+    Typing { _folder: folder, ..typing }
+}
+
+#[gpui_kit::test]
+fn a_video_stopped_while_it_opens_ends_off_the_windows_thread(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let typing = editor(cx, &talk(), &clip(300, 30));
+    select_video(&typing, cx);
+    let canvas = editor_canvas(&typing, cx);
+    let (started, ended) = decodings_started_and_ended_aside();
+    let document = typing.document(cx);
+    cx.update(|cx| {
+        let video = document.update(cx, |document, _| document.selected_video()).unwrap();
+        let open = document.read(cx).open_large(&video.on.src).unwrap();
+        canvas.update(cx, |canvas, cx| {
+            canvas.play(video.layer, video.on, open, cx);
+            // Stopped before it's open.
+            canvas.stop_videos(cx);
+        });
+    });
+    cx.run_until_parked();
+    let (started_now, ended_now) = decodings_started_and_ended_aside();
+    assert_eq!(started_now - started, 1, "it was opened");
+    assert_eq!(ended_now - ended, 1, "and ended on a background task");
+    // And stopped as it plays, the same.
+    play_selected(&typing, cx);
+    click_on(&typing, cx, VIDEO_STOP_ID);
+    cx.run_until_parked();
+    let (started_now, ended_now) = decodings_started_and_ended_aside();
+    assert_eq!(started_now - started, ended_now - ended);
+}
+
+#[gpui_kit::test]
+fn play_pressed_during_a_save_opens_the_saved_pack_after_it(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let work = tempfile::tempdir().unwrap();
+    let (document, pack) = packed(&talk(), &clip(300, 30), work.path());
+    let typing = open_untitled_talk(cx, document, work.path());
+    stills_made(&typing, cx);
+    select_video(&typing, cx);
+    let canvas = editor_canvas(&typing, cx);
+    // The save starts, and Play is pressed before it's done.
+    typing.with_window(cx, |window, cx| {
+        window.press("ctrl-s", cx);
+        window.press("space", cx);
+    });
+    let saving = typing.document(cx).read_with(cx, |document, _| document.saving_the_pack());
+    typing.settle(cx);
+    wait(cx, 500);
+    assert!(saving, "Play came while the save ran");
+    assert_eq!(typing.status(cx).as_deref(), Some("Saved talk.sptx."));
+    until(cx, typing.handle, "playing", |cx| frames(cx, &canvas).first().is_some_and(Option::is_some));
+    assert_eq!(typing.document(cx).read_with(cx, |document, _| document.readers_held()), 1);
+    // It reads the pack as saved: the one there now.
+    assert!(slides_engine::open_packed(&pack).is_ok());
+    decoded_ahead(cx, typing.handle, &canvas, 2);
+    let at = frame_times(cx, &canvas)[0].unwrap();
+    next_frame(cx, typing.handle, 34);
+    assert!(frame_times(cx, &canvas)[0].unwrap() > at);
+}
+
+#[gpui_kit::test]
+fn a_save_in_place_keeps_every_still_and_shape(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let work = tempfile::tempdir().unwrap();
+    let source = format!("# Video\n\n{}\n\n---\n\n# Two\n", VIDEO.replace(" w=\"640\" h=\"360\"", ""));
+    let (document, _) = packed(&source, &clip(3, 10), work.path());
+    let typing = open_untitled_talk(cx, document, work.path());
+    stills_made(&typing, cx);
+    let shape = typing.document(cx).update(cx, |document, _| document.videos_here().pop().unwrap().on.rect);
+    let made = stills_decoded_on_this_thread();
+    typing.press(cx, "ctrl-s");
+    wait(cx, 500);
+    assert_eq!(typing.status(cx).as_deref(), Some("Saved talk.sptx."));
+    assert!(!typing.document(cx).read_with(cx, |document, _| document.stills_coming()), "no still is made again");
+    assert_eq!(stills_decoded_on_this_thread(), made, "none was decoded again");
+    let after = typing.document(cx).update(cx, |document, _| document.videos_here().pop().unwrap().on.rect);
+    assert_eq!(after, shape);
+}
+
+#[gpui_kit::test]
+fn a_video_in_the_text_says_it_plays_once_placed_when_selected(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let typing = editor(cx, "# Video\n\n<Video src=\"assets/clip.mp4\" />\n", &clip(3, 10));
+    let video = thing(&typing, cx, "<Video");
+    let at = middle(&typing, cx, &video);
+    typing.click(cx, at);
+    assert_eq!(
+        typing.status(cx).as_deref(),
+        Some("Video selected. This video plays only when it's placed on the slide. Drag it out of the text to place it.")
+    );
+    assert!(bounds_of(&typing, cx, VIDEO_PLAY_ID).is_none(), "nothing to press");
+}
+
+#[gpui_kit::test]
+fn the_window_losing_the_keyboard_stops_a_video(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let typing = editor(cx, &talk(), &clip(300, 30));
+    let before = thread_count();
+    let names = {
+        let canvas = play_selected(&typing, cx);
+        threads_of(cx, &canvas)
+    };
+    typing.with_window(cx, |window, _| window.activate_window());
+    cx.run_until_parked();
+    VisualTestContext::from_window(typing.handle, cx).deactivate_window();
+    typing.settle(cx);
+    threads_end(cx, &names, before);
+    assert!(frames(cx, &editor_canvas(&typing, cx)).is_empty());
+}
+
+#[gpui_kit::test]
+fn ending_the_show_ends_its_videos(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let show = rehearse(cx, &talk(), &clip(300, 30));
+    let before = thread_count();
+    let names = {
+        let canvas = show.first_pictures(cx, 1);
+        threads_of(cx, &canvas)
+    };
+    cx.simulate_keystrokes(show.audience, "escape");
+    cx.run_until_parked();
+    assert!(show.show.read_with(cx, |show, _| show.has_ended()));
+    let took = threads_end(cx, &names, before);
+    assert!(took <= Duration::from_millis(300), "{took:?}");
+}
+
+#[gpui_kit::test]
+fn the_show_opens_a_video_again_after_a_save_in_place(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let work = tempfile::tempdir().unwrap();
+    let (document, _) = packed(&talk(), &clip(300, 30), work.path());
+    let show = show_of(cx, tempfile::tempdir().unwrap(), document);
+    let canvas = show.first_pictures(cx, 1);
+    let names = threads_of(cx, &canvas);
+    // A save in place of the pack, as the editor's window runs one.
+    show.document.update(cx, |document, _| assert_eq!(document.begin_saving_the_pack(), 1));
+    until(cx, show.audience, "its file let go of", |cx| {
+        // Pictures are taken, so its thread reads on, and finds its file let go of.
+        cx.executor().advance_clock(Duration::from_millis(34));
+        cx.read(|cx| canvas.read(cx).videos_let_go()).len() == 1
+    });
+    let job = show.document.read_with(cx, |document, _| document.save_job());
+    let saved = job.run().expect("saved");
+    show.document.update(cx, |document, cx| {
+        document.pack_save_ended();
+        document.saved(saved);
+        cx.notify();
+    });
+    show.settle(cx);
+    until(cx, show.audience, "playing again", |cx| threads_of(cx, &canvas).len() == 1 && frames(cx, &canvas)[0].is_some());
+    assert_ne!(threads_of(cx, &canvas), names);
+    assert_eq!(show.document.read_with(cx, |document, _| document.readers_held()), 1);
+}
+
+#[gpui_kit::test]
+fn a_slide_left_keeps_its_videos_last_picture_through_its_transition(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let source = format!("# Video\n\n{VIDEO}\n\n---\ntransition: fade\n---\n\n# Two\n");
+    let show = rehearse(cx, &source, &clip(300, 30));
+    let canvas = show.first_pictures(cx, 1);
+    let names = threads_of(cx, &canvas);
+    let before = thread_count();
+    show.press(cx, "right");
+    let view: Entity<AudienceView> = cx.read(|cx| show.show.read(cx).audience()).unwrap().1;
+    let leaving = cx.read(|cx| view.read(cx).outgoing(cx).cloned()).expect("the slide left is still seen");
+    assert!(frames(cx, &leaving)[0].is_some(), "its last picture stays");
+    threads_end(cx, &names, before);
+    // Once the transition's done, it goes.
+    for _ in 0..30 {
+        next_frame(cx, show.audience, 50);
+    }
+    assert!(frames(cx, &leaving).is_empty());
+}
+
+/// How long the window's thread takes for each picture of a turned 1080p video shown full
+/// screen. Timed in a release build only.
+#[gpui_kit::test]
+#[cfg_attr(debug_assertions, ignore = "timed in a release build")]
+fn a_turned_full_size_video_costs_the_window_little(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let video = slides_video::make_test_video(1920, 1080, 60, 30, |at| COLOURS[at as usize % COLOURS.len()].repeat(1920 * 1080));
+    let source = "# Video\n\n<Video src=\"assets/clip.mp4\" x=\"0\" y=\"0\" w=\"1920\" h=\"1080\" rotate=\"5\" />\n";
+    let show = rehearse(cx, source, &video);
+    let canvas = show.first_pictures(cx, 1);
+    let mut times = Vec::new();
+    for _ in 0..40 {
+        decoded_ahead(cx, show.audience, &canvas, 1);
+        next_frame(cx, show.audience, 34);
+        times.push(cx.read(|cx| canvas.read(cx).last_video_advance()));
+    }
+    times.sort();
+    let median = times[times.len() / 2];
+    eprintln!("the window's thread, a turned 1080p picture: median {median:?}, most {:?}", times.last().unwrap());
+    assert!(median < Duration::from_millis(2), "{median:?}");
 }

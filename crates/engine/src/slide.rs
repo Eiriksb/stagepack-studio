@@ -359,7 +359,7 @@ fn positioned_layer(tag: &Tag, placing: Option<&Placing>, theme: &Theme, env: &m
     let rotate = place.rotate.unwrap_or(0.0);
     let video = (tag.name == VIDEO_TAG).then(|| VideoOn {
         src: tag.attr("src").unwrap_or_default().trim().to_string(),
-        looped: tag.attr("loop").is_some_and(|value| value.trim() == "true"),
+        looped: read_loop(tag.attr("loop"), notices),
         rect,
         rotate,
     });
@@ -376,6 +376,23 @@ fn positioned_layer(tag: &Tag, placing: Option<&Placing>, theme: &Theme, env: &m
         video,
     };
     (layer, drawing.text)
+}
+
+/// Whether a video's `loop` says to go round again: written bare, or as `true`, `yes` or `1`.
+/// `false`, `no` and `0` say not to, and anything else says not to and is a notice.
+fn read_loop(value: Option<&str>, notices: &mut Vec<Notice>) -> bool {
+    let Some(value) = value else { return false };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "true" | "yes" | "1" => true,
+        "false" | "no" | "0" => false,
+        _ => {
+            let notice = Notice(shortened(&format!("A video's loop can be yes or no, not {value}, so it plays once"), MAX_NOTICE_CHARS));
+            if !notices.contains(&notice) {
+                notices.push(notice);
+            }
+            false
+        }
+    }
 }
 
 /// Whether the text of any of `blocks`, at any depth, has an inline `<Text>` tag that asks for

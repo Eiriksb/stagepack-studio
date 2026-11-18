@@ -159,7 +159,7 @@ impl Document {
             self.own_files = files.clone();
             self.files = Arc::new(WithAdded::new(files, self.added.clone()));
             self.deck.set_files(Box::new(self.files.clone()));
-            self.open_stills_aside();
+            self.follow_files();
             self.components_looked_at();
         }
         if let Some((place, files)) = saved.moved_to {
@@ -176,7 +176,7 @@ impl Document {
             self.own_files = files.clone();
             self.files = Arc::new(WithAdded::new(files, self.added.clone()));
             self.deck.set_files(Box::new(self.files.clone()));
-            self.open_stills_aside();
+            self.follow_files();
             self.components_looked_at();
         }
         // Read from where the talk is kept from here on, as its own files are, so that a change

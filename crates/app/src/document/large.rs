@@ -6,16 +6,20 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use slides_engine::{AddedFile, MadeStill, StillJob, StillWanted, VideoLayer, is_large_kind};
+use slides_engine::{AddedFile, MadeStill, MeasureVideo, StillJob, StillWanted, VideoLayer, is_large_kind};
 
 use super::*;
 use crate::clipboard::{CopiedLarge, PastedLarge};
-use crate::large_files::{self, HeldReader, LargeSource, Looked, Readers, Told, VideoCache};
+use crate::large_files::{self, HeldReader, LargeSource, Looked, NotOpened, Readers, Told, VideoCache};
 use crate::recovery::{Keeping, Recovery};
 
 /// The files in the working copy that a copy is being made to, or has been made to and not yet
 /// taken in, which a slot that's cleared keeps.
 type SpokenFor = Arc<Mutex<BTreeSet<PathBuf>>>;
+
+fn lock_any<T>(held: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    held.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn lock(spoken_for: &SpokenFor) -> std::sync::MutexGuard<'_, BTreeSet<PathBuf>> {
     spoken_for.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -38,8 +42,23 @@ pub(crate) struct LargeHome {
     cache: Option<VideoCache>,
     /// Whether a large file was ever to be copied into the working copy, which made its folder.
     copied_in: std::cell::Cell<bool>,
-    /// What's told when a video's still is wanted, once stills are made aside.
-    stills_wanted: Option<StillWanted>,
+    /// What's told when a video's still is wanted, once something makes them.
+    stills_wanted: Arc<Mutex<Option<StillWanted>>>,
+    /// Whether one was wanted before anything made them.
+    still_wanted_early: Arc<AtomicBool>,
+    /// The stills that couldn't be made yet: while a save replaced the pack, or for a video a
+    /// pack holds compressed that hasn't been unpacked to play.
+    stills_waiting: Vec<StillJob>,
+    /// What a talk's file is read from, as things are now, for what reads off the window's thread.
+    opening: Arc<Mutex<Opening>>,
+}
+
+/// What a talk's file is opened from: see [`LargeOpen`].
+#[derive(Clone, Default)]
+struct Opening {
+    files: Option<Arc<dyn TalkFiles + Send + Sync>>,
+    pack: Option<PathBuf>,
+    cache: Option<VideoCache>,
 }
 
 /// What a working copy that's cleared keeps of its slot: every file a large file added to the
@@ -263,20 +282,46 @@ pub struct LargeOpen {
 }
 
 impl LargeOpen {
+    /// `path` of the talk's files as `opening` says they're read, if it's one of them.
+    fn of(opening: &Opening, path: &str, readers: &Arc<Readers>) -> Option<LargeOpen> {
+        let files = opening.files.clone()?;
+        let path = slides_engine::normalise(path)?;
+        files.len(&path)?;
+        Some(LargeOpen { files, path, pack: opening.pack.clone(), cache: opening.cache.clone(), readers: readers.clone() })
+    }
+
     /// The file, to read in pieces, held among the talk's readers until it's dropped, or a save
     /// lets go of it. A file a pack holds compressed is unpacked to the cache, and read there.
+    /// `None` while a save replaces the talk's pack, as well as for a file that can't be read.
     pub fn open(self) -> Option<HeldReader> {
-        let reader = match self.files.open(&self.path) {
-            Some(reader) => reader,
+        self.open_unless_saving().ok()
+    }
+
+    /// [`Self::open`], saying why not.
+    pub fn open_unless_saving(self) -> Result<HeldReader, NotOpened> {
+        self.open_as(true)
+    }
+
+    /// [`Self::open`] for a still: a file a pack holds compressed is read from the cache only if
+    /// it's unpacked there already, as it is once the video has been played, and is never
+    /// unpacked whole just for its first picture.
+    pub fn open_for_still(self) -> Result<HeldReader, NotOpened> {
+        self.open_as(false)
+    }
+
+    fn open_as(self, unpacking: bool) -> Result<HeldReader, NotOpened> {
+        let LargeOpen { files, path, pack, cache, readers } = self;
+        readers.open(|| match files.open(&path) {
+            Some(reader) => Ok(reader),
             None => {
-                let pack = self.pack.as_ref().filter(|_| is_large_kind(&self.path))?;
-                let cache = self.cache.or_else(VideoCache::app)?;
-                let at = cache.unpacked(pack, &self.path)?;
-                let file = large_files::open_plain(&at)?;
-                Box::new(file) as Box<dyn slides_engine::ReadSeek>
+                let unreadable = NotOpened::Unreadable;
+                let pack = pack.as_ref().filter(|_| is_large_kind(&path)).ok_or(unreadable)?;
+                let cache = cache.or_else(VideoCache::app).ok_or(unreadable)?;
+                let at = if unpacking { cache.unpacked(pack, &path).ok_or(unreadable)? } else { cache.unpacked_already(pack, &path).ok_or(NotOpened::NotUnpacked)? };
+                let file = large_files::open_plain(&at).ok_or(unreadable)?;
+                Ok(Box::new(file) as Box<dyn slides_engine::ReadSeek>)
             }
-        };
-        Some(self.readers.hold(reader))
+        })
     }
 }
 
@@ -291,34 +336,85 @@ impl Document {
     /// Unpacks a video a pack holds compressed into `cache`, in place of the app's own.
     pub fn use_video_cache(&mut self, cache: VideoCache) {
         self.large.cache = Some(cache);
-        self.open_stills_aside();
+        self.follow_files();
     }
 
-    /// Leaves the stills of the talk's videos to be made aside, as a window's thread mustn't
-    /// decode a video: `wanted` is told, on the window's thread, each time one is wanted, and
-    /// [`Self::still_jobs`] then gives it.
+    /// Has the deck leave every video's still to be made aside, from the moment the talk is
+    /// opened, as a window's thread mustn't decode a video: until something makes them, with
+    /// [`Self::make_stills_aside`], a video shows a plain panel. A video's own size is read from
+    /// its file, gated as every reader is.
+    pub(crate) fn leave_stills_aside(&mut self) {
+        self.follow_files();
+        let (slot, early) = (self.large.stills_wanted.clone(), self.large.still_wanted_early.clone());
+        let wanted: StillWanted = Arc::new(move || match lock_any(&slot).clone() {
+            Some(wanted) => wanted(),
+            None => early.store(true, Ordering::SeqCst),
+        });
+        let (opening, readers) = (self.large.opening.clone(), self.large.readers.clone());
+        let measure: MeasureVideo = Arc::new(move |path: &str| {
+            let reader = LargeOpen::of(&lock_any(&opening), path, &readers)?.open_for_still().ok()?;
+            let info = slides_video::open(Box::new(reader)).ok()?.info();
+            Some((info.width, info.height))
+        });
+        self.deck.make_stills_aside(wanted, measure);
+    }
+
+    /// Notes what the talk's files are read from now, for what reads them off the window's thread.
+    pub(crate) fn follow_files(&mut self) {
+        *lock_any(&self.large.opening) = Opening { files: Some(self.files.clone()), pack: self.pack(), cache: self.large.cache.clone() };
+    }
+
+    /// Makes the talk's videos' stills from now on: `wanted` is told, on the window's thread,
+    /// each time one is wanted, and [`Self::still_jobs`] then gives it. It's told now if any was
+    /// wanted before.
     pub fn make_stills_aside(&mut self, wanted: StillWanted) {
-        self.large.stills_wanted = Some(wanted);
-        self.open_stills_aside();
-    }
-
-    /// Tells the deck stills are made aside, if they are: after the talk's files are new too.
-    pub(crate) fn open_stills_aside(&mut self) {
-        if let Some(wanted) = self.large.stills_wanted.clone() {
-            self.deck.make_stills_aside(wanted);
+        *lock_any(&self.large.stills_wanted) = Some(wanted.clone());
+        if self.large.still_wanted_early.swap(false, Ordering::SeqCst) {
+            wanted();
         }
     }
 
-    /// The stills wanted to be made aside since last asked, each with its video's file to read
-    /// it from, held among the talk's readers while it's read, on another thread.
+    /// Whether something makes the talk's videos' stills.
+    pub fn stills_made_aside(&self) -> bool {
+        lock_any(&self.large.stills_wanted).is_some()
+    }
+
+    /// The stills wanted to be made since last asked, each with its video's file to read it from,
+    /// on another thread, held among the talk's readers: with [`LargeOpen::open_for_still`].
+    /// While a save replaces the pack there are none: they're given once it's done.
     pub fn still_jobs(&mut self) -> Vec<(StillJob, Option<LargeOpen>)> {
-        let jobs = self.deck.still_jobs();
+        if self.saving_the_pack() {
+            return Vec::new();
+        }
+        let mut jobs = std::mem::take(&mut self.large.stills_waiting);
+        jobs.extend(self.deck.still_jobs());
         jobs.into_iter()
             .map(|job| {
                 let open = self.open_large(job.path());
                 (job, open)
             })
             .collect()
+    }
+
+    /// Keeps `job`, a still that couldn't be made yet, to be given again: after a save, or once
+    /// a video has been opened to play, which may have unpacked it.
+    pub fn still_waits(&mut self, job: StillJob) {
+        self.large.stills_waiting.push(job);
+    }
+
+    /// Gives again the stills that couldn't be made yet, telling what makes them.
+    pub fn try_waiting_stills_again(&mut self) {
+        if !self.large.stills_waiting.is_empty() {
+            self.ask_for_stills();
+        }
+    }
+
+    /// Tells what makes the stills to look for any wanted.
+    fn ask_for_stills(&self) {
+        let wanted = lock_any(&self.large.stills_wanted).clone();
+        if let Some(wanted) = wanted {
+            wanted();
+        }
     }
 
     /// Takes in a still made aside, and says whether a slide shows it: it's drawn again when
@@ -342,6 +438,18 @@ impl Document {
     /// [`Self::layers_at`] gives then.
     pub fn videos_at(&mut self, index: usize, moment: slides_engine::Moment) -> Vec<VideoLayer> {
         guarded(|| self.deck.videos_at(index, moment)).unwrap_or_default()
+    }
+
+    /// What's said of the one thing selected, if it's a video that can't be played: why not, or
+    /// that one in the text plays only once it's placed.
+    pub fn selected_video_said(&mut self) -> Option<String> {
+        if let Some(video) = self.selected_video() {
+            return self.video_problem(video.source.as_ref()?);
+        }
+        let selected = self.selected()?.clone();
+        let one = self.selection().is_some_and(|selection| selection.things.len() == 1);
+        let tag = self.selected_tag().filter(|_| one && selected.slide == self.current())?;
+        (tag.name == "Video" && !slides_engine::is_positioned(tag)).then(|| slides_engine::VIDEO_IN_TEXT.to_string())
     }
 
     /// The one thing selected on the slide shown, if it's a video.
@@ -532,10 +640,28 @@ impl Document {
 
     /// The talk's file at `path`, to read in pieces, wherever it lies: see [`LargeOpen::open`].
     pub fn open_large(&self, path: &str) -> Option<LargeOpen> {
-        let path = slides_engine::normalise(path)?;
-        self.files.len(&path)?;
-        let pack = self.pack();
-        Some(LargeOpen { files: self.files.clone(), path, pack, cache: self.large.cache.clone(), readers: self.large.readers.clone() })
+        let opening = Opening { files: Some(self.files.clone()), pack: self.pack(), cache: self.large.cache.clone() };
+        LargeOpen::of(&opening, path, &self.large.readers)
+    }
+
+    /// A save that replaces the talk's pack begins: nothing of the talk is opened until
+    /// [`Self::pack_save_ended`], and every reader held is let go of first. How many there were
+    /// is given.
+    pub fn begin_saving_the_pack(&self) -> usize {
+        self.large.readers.begin_saving()
+    }
+
+    /// The save that replaced the pack is done, whatever came of it: the talk's files can be
+    /// opened again, and the stills that waited for it are made.
+    pub fn pack_save_ended(&mut self) {
+        self.large.readers.save_ended();
+        // Those wanted meanwhile, as well as those that waited.
+        self.ask_for_stills();
+    }
+
+    /// Whether a save replacing the talk's pack is running, when nothing of it is opened.
+    pub fn saving_the_pack(&self) -> bool {
+        self.large.readers.saving()
     }
 
     /// Lets go of every reader of the talk's files held: done before a save that replaces the

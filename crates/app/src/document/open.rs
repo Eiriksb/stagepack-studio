@@ -222,6 +222,8 @@ impl Document {
             large: Default::default(),
         };
         document.components_looked_at();
+        // A still is never made on the thread that lays a slide out.
+        document.leave_stills_aside();
         Ok(document)
     }
 }

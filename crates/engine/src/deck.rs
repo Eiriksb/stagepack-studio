@@ -19,7 +19,7 @@ use crate::timeline::MAX_CLICK;
 use crate::render::device_offset;
 use crate::{
     ComponentAsks, ComponentInfo, DisplayItem, Fonts, Layer, LayerSpec, LayerTiming, LayoutEnv, Moment, MadeStill, PictureCache, Placing,
-    SlideTimeline, SchemaLoad, StillJob, StillWanted, TalkComponents, TalkFiles, Transition, VideoLayer, builtin_registry, compose, render_layer, talk_theme,
+    SlideTimeline, SchemaLoad, MeasureVideo, StillJob, StillWanted, TalkComponents, TalkFiles, Transition, VideoLayer, builtin_registry, compose, render_layer, talk_theme,
 };
 
 /// How many scales of one slide are kept drawn. A zoom or a resize asks for many in a row.
@@ -464,7 +464,7 @@ impl Deck {
         self.clear_placing();
         self.files = Rc::from(files);
         self.components = TalkComponents::scan_for(self.files.clone(), &self.registry);
-        self.pictures.clear();
+        self.pictures.files_replaced(&*self.files);
         self.files_generation += 1;
         for slide in &mut self.slides {
             slide.laid = None;
@@ -613,10 +613,11 @@ impl Deck {
     /// Leaves videos' stills to be made aside from now on, as the window's thread mustn't decode
     /// a video: `wanted` is told, on the thread laying a slide out, each time one is wanted, and
     /// [`Self::still_jobs`] then gives it, to be made on another thread and taken in with
-    /// [`Self::take_still`]. Until then a video shows a plain panel. Without this, a still is made
-    /// on the thread that lays its slide out.
-    pub fn make_stills_aside(&mut self, wanted: StillWanted) {
-        self.pictures.make_stills_aside(wanted);
+    /// [`Self::take_still`]. Until then a video shows a plain panel, as large as `measure`, which
+    /// decodes nothing, says the video is. Without this, a still is made on the thread that lays
+    /// its slide out.
+    pub fn make_stills_aside(&mut self, wanted: StillWanted, measure: MeasureVideo) {
+        self.pictures.make_stills_aside(wanted, measure);
     }
 
     /// The stills wanted to be made aside since last asked.
@@ -1248,11 +1249,9 @@ impl Deck {
         let stills = self.pictures.take_stills_asked();
         let keys = laid.layers.iter().map(|spec| self.layer_key(index, moment, spec)).collect();
         let notices = laid.notices.into_iter().map(|notice| notice.0).collect();
-        let holds_pictures = laid
-            .layers
-            .iter()
-            .flat_map(|spec| &spec.items)
-            .any(|item| matches!(item, DisplayItem::Picture { src: Some(_), .. }));
+        // A video's still counts as a picture of the talk's.
+        let holds_pictures = !stills.is_empty()
+            || laid.layers.iter().flat_map(|spec| &spec.items).any(|item| matches!(item, DisplayItem::Picture { src: Some(_), .. }));
         Laid {
             specs: laid.layers,
             keys,
