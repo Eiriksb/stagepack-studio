@@ -165,6 +165,55 @@ impl TalkFiles for std::sync::Arc<dyn TalkFiles + Send + Sync> {
     }
 }
 
+/// A talk's files held in memory, by their path in it: the files of a presentation that hasn't
+/// been saved anywhere yet. They never change.
+pub struct MemoryFiles {
+    files: std::collections::BTreeMap<String, std::sync::Arc<[u8]>>,
+}
+
+impl MemoryFiles {
+    /// Holds `files`. One whose path isn't a plain one inside the talk (a `..`, a leading `/`, a
+    /// drive, a backslash or a NUL, or a name no talk could be saved with) is dropped, as it
+    /// couldn't be read from a folder either. If a path is given twice, the last one is kept.
+    pub fn new(files: Vec<(String, std::sync::Arc<[u8]>)>) -> MemoryFiles {
+        let files = files
+            .into_iter()
+            .filter(|(path, _)| crate::packed::safe_name(path) && !path.ends_with('/'))
+            .collect();
+        MemoryFiles { files }
+    }
+
+    fn get(&self, path: &str) -> Option<&std::sync::Arc<[u8]>> {
+        self.files.get(crate::packed::normalise(path)?.as_str())
+    }
+}
+
+impl TalkFiles for MemoryFiles {
+    fn read(&self, path: &str) -> Option<Vec<u8>> {
+        self.get(path).map(|bytes| bytes.to_vec())
+    }
+
+    fn len(&self, path: &str) -> Option<u64> {
+        self.get(path).map(|bytes| bytes.len() as u64)
+    }
+
+    fn names_in(&self, folder: &str) -> Vec<String> {
+        let folder = crate::packed::normalise(folder.trim_end_matches('/')).unwrap_or_default();
+        self.files
+            .keys()
+            .filter(|name| match name.rsplit_once('/') {
+                Some((parent, _)) => parent == folder,
+                None => folder.is_empty(),
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn never_changes(&self) -> bool {
+        true
+    }
+}
+
 /// Files added to a talk while it's open, by their path in it, kept in memory until they're
 /// saved. Shared between the talk and whatever saves it. A file added keeps its bytes until a
 /// save has written it where the talk is read from and it's released, from when it's read

@@ -139,7 +139,7 @@ fn safe_part(part: &str) -> bool {
 
 /// Whether `name` (a `/`-separated path, optionally ending in `/` for a folder) stays inside
 /// the talk and can be a file on every platform.
-fn safe_name(name: &str) -> bool {
+pub(crate) fn safe_name(name: &str) -> bool {
     let name = name.strip_suffix('/').unwrap_or(name);
     !name.is_empty() && name.split('/').all(safe_part)
 }
@@ -685,6 +685,65 @@ fn pack(
         Ok(())
     })?;
     Ok(PackReport { skipped, outside_pictures: pictures_outside(folder, &source) })
+}
+
+/// The files of `files`, which a talk made whole from them holds besides `slides.md`, checked as
+/// a pack and a copy of a folder check theirs: each a file a talk can hold, none twice, and all
+/// within the limits.
+fn whole_talk_files<'a>(slides: &str, files: &'a [NewFile], limits: PackLimits) -> Result<Vec<&'a NewFile>, PackError> {
+    let files = new_files(&[], |name| Err(PackError::Corrupt(format!("{name} is missing"))), files, limits.entry_bytes)?;
+    check_sizes(&[], Some(slides), &files, limits)?;
+    Ok(files)
+}
+
+/// Writes a talk, made of `slides` and `files`, as a pack in the file `out`, with the manifest
+/// [`pack_folder_with_slides`] writes. The entries are the same ones that would make, in the same
+/// order, within the same limits, and the file is written beside and put in place as that one is:
+/// `out` is replaced only by a whole pack. Each of `files` must be one a pack can hold, as
+/// [`repack_with_slides`] asks of the files it adds.
+pub fn pack_new(out: &Path, slides: &str, app_version: &str, files: &[NewFile]) -> Result<(), PackError> {
+    let limits = PackLimits::default();
+    let files = whole_talk_files(slides, files, limits)?;
+    let manifest = manifest_for(app_version);
+    let mut entries: Vec<(&str, &[u8])> = files.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())).collect();
+    entries.push((SLIDES_NAME, slides.as_bytes()));
+    entries.push((MANIFEST_NAME, &manifest));
+    entries.sort_by_key(|(name, _)| *name);
+    write_atomically(out, |file| {
+        let mut zip = ZipWriter::new(file);
+        for (name, bytes) in &entries {
+            zip.start_file(*name, entry_options(name)).map_err(io_other)?;
+            zip.write_all(bytes)?;
+        }
+        zip.finish().map_err(io_other)?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// Writes a talk, made of `slides` and `files`, as the folder `to`, which must be missing or
+/// empty. Each file is written whole or not at all, `slides.md` last, so that a folder cut short
+/// has no talk in it. Each of `files` must be one a pack can hold, as for [`pack_new`]. A
+/// failure leaves `to` as it was found.
+pub fn write_new_folder(to: &Path, slides: &str, files: &[NewFile]) -> Result<(), PackError> {
+    let files = whole_talk_files(slides, files, PackLimits::default())?;
+    let existed = missing_or_empty(to)?;
+    let result = (|| {
+        std::fs::create_dir_all(to)?;
+        for (name, bytes) in files.iter().copied() {
+            let target = target_in(to, name)?;
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            write_new_atomically(&target, bytes)?;
+        }
+        write_new_atomically(&target_in(to, SLIDES_NAME)?, slides.as_bytes())?;
+        Ok(())
+    })();
+    if result.is_err() {
+        clear_away(to, existed);
+    }
+    result
 }
 
 /// Unpacks a packed talk into `folder`, which must be missing or empty. `talk.json` isn't
