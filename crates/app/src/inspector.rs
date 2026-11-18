@@ -181,8 +181,15 @@ struct LookedUp {
     tag: String,
     components: Vec<ComponentInfo>,
     schema: Option<ComponentSchema>,
-    /// The talk's pictures, for a video's still.
-    pictures: Vec<String>,
+}
+
+/// The talk's pictures, for a video's still, as last read off the window's thread, and for which
+/// thing picked and which files added they were read, or are being read.
+#[derive(Default)]
+struct Pictures {
+    read_for: Option<(u64, u64)>,
+    reading: Option<(u64, u64)>,
+    found: Vec<String>,
 }
 
 pub struct Inspector {
@@ -191,6 +198,7 @@ pub struct Inspector {
     workspace: WeakEntity<WorkspaceView>,
     form: Option<Form>,
     looked_up: Option<LookedUp>,
+    pictures: Pictures,
     /// Pictures of a form let go of, which the window lets go of as the panel is drawn.
     retired: Vec<Arc<RenderImage>>,
     _subscriptions: Vec<Subscription>,
@@ -203,7 +211,7 @@ impl Inspector {
             .iter()
             .map(|document| cx.observe(document, |_, _, cx| cx.notify()))
             .collect();
-        Inspector { document, workspace, form: None, looked_up: None, retired: Vec::new(), _subscriptions: subscriptions }
+        Inspector { document, workspace, form: None, looked_up: None, pictures: Pictures::default(), retired: Vec::new(), _subscriptions: subscriptions }
     }
 
     /// The labels of the fields shown, in order.
@@ -280,13 +288,15 @@ impl Inspector {
     /// from the field's list does. For a video's still, `value` is one of the talk's pictures, or
     /// empty for its first frame, which takes the still away.
     pub fn choose(&mut self, name: &str, value: &str, _window: &mut Window, cx: &mut Context<Self>) {
-        let known = self.field(name).is_some_and(|field| match &field.spec.kind {
-            Kind::Choice(options) => options.iter().any(|option| option == value),
-            Kind::Still(pictures) => value.is_empty() || pictures.iter().any(|picture| picture == value),
-            _ => false,
+        let written = self.field(name).and_then(|field| match &field.spec.kind {
+            Kind::Choice(options) => options.iter().any(|option| option == value).then_some(Some(value)),
+            // Its first frame is no still of its own.
+            Kind::Still(_) if value.is_empty() => Some(None),
+            Kind::Still(pictures) => pictures.iter().any(|picture| picture == value).then_some(Some(value)),
+            _ => None,
         });
-        if known {
-            self.write(name, (!value.is_empty()).then_some(value), cx).ok();
+        if let Some(written) = written {
+            self.write(name, written, cx).ok();
             cx.notify();
         }
     }
@@ -340,8 +350,9 @@ impl Inspector {
         if form.shape.tag.as_deref() != Some("Video") {
             return (None, None);
         }
-        let Some(src) = self.talk_attr("src", cx) else {
-            return (None, None);
+        let src = self.talk_attr("src", cx).map(|src| src.trim().to_string()).filter(|src| !src.is_empty());
+        let Some(src) = src else {
+            return (None, Some(slides_engine::VIDEO_NO_FILE.to_string()));
         };
         let (known, to_read, problem) = document.update(cx, |document, _| {
             let known = document.video_facts(&src);

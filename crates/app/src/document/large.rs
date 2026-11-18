@@ -51,11 +51,18 @@ pub(crate) struct LargeHome {
     stills_waiting: Vec<StillJob>,
     /// What a talk's file is read from, as things are now, for what reads off the window's thread.
     opening: Arc<Mutex<Opening>>,
-    /// What's known of each video, by its path, and the version of its file it was read from.
-    facts: BTreeMap<String, (Option<FileStamp>, Facts)>,
+    /// What's known of each video, by its path, and the version of its file it was read from,
+    /// at most [`MOST_FACTS`] of them, each numbered as it was asked for.
+    facts: BTreeMap<String, (Option<FileStamp>, Facts, u64)>,
+    facts_asked: u64,
 }
 
-/// A file's length and when it was last changed, which tell a new version of it.
+/// The most videos whose facts are kept: the one asked for longest ago goes first.
+const MOST_FACTS: usize = 256;
+
+/// A file's length and when it was last changed, which tell a new version of it. A file the
+/// talk's files give no time for is one that doesn't change while it's open, as one in a pack
+/// or one added and kept in the working copy, and is told by its length alone.
 type FileStamp = (u64, std::time::SystemTime);
 
 /// What's known of a video's facts.
@@ -477,12 +484,14 @@ impl Document {
     }
 
     /// Gives again the stills that couldn't be made yet, telling what makes them, and lets the
-    /// videos' facts that couldn't be read yet be read.
-    pub fn try_waiting_stills_again(&mut self) {
-        self.read_waiting_facts_again();
+    /// videos' facts that couldn't be read yet be read: whether any had waited is given, for the
+    /// form to be drawn again, and read them.
+    pub fn try_waiting_stills_again(&mut self) -> bool {
+        let facts = self.read_waiting_facts_again();
         if !self.large.stills_waiting.is_empty() {
             self.ask_for_stills();
         }
+        facts
     }
 
     /// What's known of the video at `path`, a file of the talk's, as its file is now: its facts,
@@ -491,7 +500,7 @@ impl Document {
     pub fn video_facts(&self, path: &str) -> Option<Result<VideoFacts, slides_video::CantPlay>> {
         let key = slides_engine::normalise(path).unwrap_or_else(|| path.to_string());
         match self.large.facts.get(&key)? {
-            (version, Facts::Known(known)) if *version == self.file_stamp(&key) => Some(*known),
+            (version, Facts::Known(known), _) if *version == self.file_stamp(&key) => Some(*known),
             _ => None,
         }
     }
@@ -501,14 +510,14 @@ impl Document {
     pub fn video_facts_to_read(&mut self, path: &str) -> Option<FactsToRead> {
         let key = slides_engine::normalise(path).unwrap_or_else(|| path.to_string());
         let version = self.file_stamp(&key);
-        let asked = self.large.facts.get(&key).is_some_and(|(held, facts)| match facts {
+        let asked = self.large.facts.get(&key).is_some_and(|(held, facts, _)| match facts {
             Facts::Reading | Facts::Waiting => true,
             Facts::Known(_) => *held == version,
         });
         if asked {
             return None;
         }
-        self.large.facts.insert(key.clone(), (version, Facts::Reading));
+        self.keep_facts(key.clone(), version, Facts::Reading);
         let open = self.open_large(&key);
         Some(FactsToRead { path: key, version, open })
     }
@@ -519,13 +528,30 @@ impl Document {
         let FactsRead { path, version, read } = read;
         let known = read.is_some();
         let facts = read.map_or(Facts::Waiting, Facts::Known);
-        self.large.facts.insert(path, (version, facts));
+        // One let go of meanwhile, to keep within the most kept, is asked for again if wanted.
+        if self.large.facts.contains_key(&path) {
+            self.keep_facts(path, version, facts);
+        }
         known
     }
 
-    /// Lets the videos' facts that waited be read again.
-    fn read_waiting_facts_again(&mut self) {
-        self.large.facts.retain(|_, (_, facts)| !matches!(facts, Facts::Waiting));
+    /// Keeps `facts` of the video at `path`, read from `version` of its file, letting go of the
+    /// one asked for longest ago once there are more than [`MOST_FACTS`].
+    fn keep_facts(&mut self, path: String, version: Option<FileStamp>, facts: Facts) {
+        self.large.facts_asked += 1;
+        self.large.facts.insert(path, (version, facts, self.large.facts_asked));
+        while self.large.facts.len() > MOST_FACTS {
+            let oldest = self.large.facts.iter().min_by_key(|(_, (_, _, asked))| *asked).map(|(path, _)| path.clone());
+            let Some(oldest) = oldest else { break };
+            self.large.facts.remove(&oldest);
+        }
+    }
+
+    /// Lets the videos' facts that waited be read again, and says whether any had.
+    fn read_waiting_facts_again(&mut self) -> bool {
+        let before = self.large.facts.len();
+        self.large.facts.retain(|_, (_, facts, _)| !matches!(facts, Facts::Waiting));
+        self.large.facts.len() != before
     }
 
     /// The length and last change of the talk's file at `path`, found without reading it, or
@@ -565,10 +591,13 @@ impl Document {
         guarded(|| self.deck.videos_at(index, moment)).unwrap_or_default()
     }
 
-    /// What's said of the one thing selected, if it's a video that can't be played: why not, or
-    /// that one in the text plays only once it's placed.
+    /// What's said of the one thing selected, if it's a video that can't be played: why not, that
+    /// it has no file, or that one in the text plays only once it's placed.
     pub fn selected_video_said(&mut self) -> Option<String> {
         if let Some(video) = self.selected_video() {
+            if video.on.src.is_empty() {
+                return Some(slides_engine::VIDEO_NO_FILE.to_string());
+            }
             return self.video_problem(video.source.as_ref()?);
         }
         let selected = self.selected()?.clone();

@@ -1367,6 +1367,101 @@ fn a_dropped_video_is_inserted_among_dropped_pictures(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn dropped_videos_are_copied_one_at_a_time_in_turn(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let work = tempfile::tempdir().unwrap();
+    let typing = copying_editor(cx, PLAIN_TALK, work.path());
+    let wide = outside(work.path(), "wide.mp4", &clip(3, 10));
+    let small = slides_video::make_test_video(32, 18, 3, 10, |_| COLOURS[1].repeat(32 * 18));
+    let small = outside(work.path(), "small.mp4", &small);
+    let view = typing.view.clone();
+    cx.update(|cx| view.update(cx, |view, cx| view.chosen_videos(vec![wide, small], cx)));
+    // One copy runs, the other waits for it.
+    let label = typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        window.find(workspace_view::PROGRESS_ID).label().map(str::to_string)
+    });
+    assert_eq!(label.as_deref(), Some("Copying video… 0%"));
+    cx.run_until_parked();
+    typing.settle(cx);
+    let source = typing.source(cx);
+    let (first, second) = (source.find("assets/wide.mp4").unwrap(), source.find("assets/small.mp4").unwrap());
+    assert!(first < second, "in the order asked for: {source}");
+}
+
+#[gpui_kit::test]
+fn a_video_goes_on_the_slide_it_was_asked_for_on(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let work = tempfile::tempdir().unwrap();
+    let typing = copying_editor(cx, PLAIN_TALK, work.path());
+    let from = outside(work.path(), "clip.mp4", &clip(3, 10));
+    let view = typing.view.clone();
+    cx.update(|cx| view.update(cx, |view, cx| view.chosen_videos(vec![from], cx)));
+    // The next slide is shown before the copy ends.
+    let document = typing.document(cx);
+    cx.update(|cx| document.update(cx, |document, cx| {
+        document.go_to(1);
+        cx.notify();
+    }));
+    assert_eq!(typing.current(cx), 1);
+    cx.run_until_parked();
+    typing.settle(cx);
+    assert_eq!(typing.source(cx), with_inserted(INSERTED), "on the first slide");
+    // Shown again, as any edit shows its slide, with it selected.
+    assert_eq!(typing.current(cx), 0);
+    assert_eq!(selected_text(&typing, cx).as_deref(), Some(INSERTED));
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), PLAIN_TALK);
+}
+
+#[gpui_kit::test]
+fn a_drop_of_more_than_twenty_files_with_videos_among_them_takes_the_first_twenty(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let work = tempfile::tempdir().unwrap();
+    let typing = copying_editor(cx, PLAIN_TALK, work.path());
+    let video = clip(3, 10);
+    let paths: Vec<std::path::PathBuf> = (0..21)
+        .map(|at| match at {
+            5 | 10 | 20 => outside(work.path(), &format!("v{at}.mp4"), &video),
+            at => outside(work.path(), &format!("p{at}.png"), &png(10, 10, [at as u8, 0, 0, 255])),
+        })
+        .collect();
+    drop_on_slide(&typing, cx, &paths);
+    let source = typing.source(cx);
+    assert_eq!(source.matches("<Picture").count(), 18, "{source}");
+    assert_eq!(source.matches("<Video").count(), 2, "the 21st was left out: {source}");
+    assert!(!source.contains("v20"), "{source}");
+    // Said once the videos are in, so it's what the line says.
+    assert_eq!(typing.status(cx).as_deref(), Some("Only the first 20 files were added."));
+}
+
+#[gpui_kit::test]
+fn a_video_that_fails_in_a_drop_leaves_the_rest_to_go_on(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let work = tempfile::tempdir().unwrap();
+    let typing = copying_editor(cx, PLAIN_TALK, work.path());
+    let red = outside(work.path(), "red.png", &png(100, 100, [255, 0, 0, 255]));
+    let words = outside(work.path(), "words.mp4", b"these are words, not pictures");
+    // A container with no video track in it.
+    let no_track = outside(work.path(), "empty.mp4", &[0, 0, 0, 8, b'm', b'o', b'o', b'v']);
+    let video = outside(work.path(), "clip.mp4", &clip(3, 10));
+    let blue = outside(work.path(), "blue.png", &png(100, 100, [0, 0, 255, 255]));
+    drop_on_slide(&typing, cx, &[red, words, no_track, video, blue]);
+    let source = typing.source(cx);
+    assert_eq!(source.matches("<Picture").count(), 2, "{source}");
+    assert_eq!(source.matches("<Video").count(), 1, "{source}");
+    assert!(source.contains("assets/clip.mp4") && !source.contains("words.mp4") && !source.contains("empty.mp4"), "{source}");
+    for _ in 0..3 {
+        typing.press(cx, "ctrl-z");
+    }
+    assert_eq!(typing.source(cx), PLAIN_TALK, "each one whole step");
+    assert!(!can_undo(&typing, cx));
+    let root = work.path().join("recovery");
+    let videos: Vec<String> = files_under(&root).into_iter().filter(|name| name.ends_with(".mp4")).collect();
+    assert!(videos.iter().all(|name| name.ends_with("clip.mp4")), "{videos:?}");
+}
+
+#[gpui_kit::test]
 fn a_cancelled_copy_inserts_nothing(cx: &mut TestAppContext) {
     let _alone = alone();
     let work = tempfile::tempdir().unwrap();
@@ -1494,7 +1589,11 @@ fn the_form_says_how_long_and_how_big_and_sets_loop_and_the_still(cx: &mut TestA
         typing.with_window(cx, |window, cx| inspector.update(cx, |inspector, cx| inspector.choose("poster", value, window, cx)));
         typing.settle(cx);
     };
-    choose(&typing, cx, "assets/poster.png");
+    // The talk's pictures are read off the window's thread: chosen once they're in.
+    until(cx, typing.handle, "the talk's pictures", |cx| {
+        choose(&typing, cx, "assets/poster.png");
+        video_tag(&typing, cx).contains("poster=")
+    });
     assert!(video_tag(&typing, cx).contains("poster=\"assets/poster.png\""), "{}", video_tag(&typing, cx));
     assert_eq!(shown(&typing, cx, "poster").as_deref(), Some("poster.png"));
     choose(&typing, cx, "");
@@ -1503,6 +1602,19 @@ fn the_form_says_how_long_and_how_big_and_sets_loop_and_the_still(cx: &mut TestA
     // A file that's no picture of the talk's is no choice.
     choose(&typing, cx, "assets/clip.mp4");
     assert!(!video_tag(&typing, cx).contains("poster"), "{}", video_tag(&typing, cx));
+    // A picture added to the talk meanwhile is one, once it's been read.
+    let document = typing.document(cx);
+    let added = cx.update(|cx| document.update(cx, |document, cx| {
+        let added = document.add_file(stagepack_studio::added_files::FileKind::Picture, "later.png", png(16, 9, [0, 0, 200, 255]));
+        cx.notify();
+        added
+    }));
+    assert_eq!(added.as_deref(), Ok("assets/later.png"));
+    until(cx, typing.handle, "the picture added", |cx| {
+        choose(&typing, cx, "assets/later.png");
+        video_tag(&typing, cx).contains("poster=\"assets/later.png\"")
+    });
+    choose(&typing, cx, "");
     // The facts were read once.
     assert_eq!(facts(&typing, cx), "14 seconds, 1120 by 630");
 }
@@ -1549,6 +1661,7 @@ fn a_hand_written_video_reads_or_says_why(cx: &mut TestAppContext) {
             Some("The picture named to show for this video can't be shown, so its first picture shows instead."),
         ),
         ("<Video src=\"assets/clip.mp4\" loop=\"no\" x=\"100\" y=\"100\" w=\"640\" h=\"360\" />".to_string(), None),
+        ("<Video x=\"100\" y=\"100\" w=\"640\" h=\"360\" />".to_string(), Some("This video has no file. Insert a video to choose one.")),
     ];
     let slides: Vec<String> = cases.iter().enumerate().map(|(at, (tag, _))| format!("# Case {at}\n\n{tag}\n\nAfter\n")).collect();
     std::fs::write(folder.path().join("slides.md"), slides.join("\n---\n\n")).unwrap();
@@ -1575,6 +1688,11 @@ fn a_hand_written_video_reads_or_says_why(cx: &mut TestAppContext) {
         if matches!(why, Some(why) if why.starts_with("This")) {
             assert_eq!(problem.as_deref(), *why, "case {at}: the form says why too");
         }
+        let named = label_of(&typing, cx, stagepack_studio::inspector::INSPECTOR_MESSAGE_ID);
+        assert_eq!(named.is_some(), tag.contains("src="), "case {at}: its file is named if it has one: {named:?}");
+        if !tag.contains("src=") {
+            assert_eq!(status, format!("Video selected. {}", why.unwrap()), "case {at}");
+        }
         let before = typing.source(cx);
         if placed {
             typing.press(cx, "right");
@@ -1594,6 +1712,7 @@ fn a_hand_written_video_reads_or_says_why(cx: &mut TestAppContext) {
         assert_eq!(typing.source(cx), before, "case {at}");
     }
     // A loop of no is unticked.
+    go_to_slide(&typing, cx, 6);
     select_video(&typing, cx);
     assert_eq!(shown(&typing, cx, "loop").as_deref(), Some("false"));
 }
@@ -1684,4 +1803,44 @@ fn nothing_about_a_video_shows_code(cx: &mut TestAppContext) {
     }
     assert!(!shows_code("This kind of video can't be played here. An MP4 made with the usual settings (H.264) can.", false));
     assert!(shows_code("Only H.264 plays", false));
+}
+
+#[test]
+fn a_videos_facts_are_read_once_and_the_oldest_let_go_of() {
+    let _alone = alone();
+    let folder = talk_folder(&talk(), &clip(3, 10));
+    let mut document = Document::open(folder.path(), Fonts::bundled_only()).unwrap();
+    let to_read = document.video_facts_to_read("assets/clip.mp4").expect("read once");
+    assert!(document.video_facts_to_read("assets/clip.mp4").is_none(), "not again while it's read");
+    assert!(document.take_video_facts(to_read.read()));
+    let facts = document.video_facts("assets/clip.mp4").unwrap().unwrap();
+    assert_eq!(facts.size, (WIDTH, HEIGHT));
+    assert!((facts.seconds - 0.3).abs() < 0.01, "{facts:?}");
+    assert!(document.video_facts_to_read("assets/clip.mp4").is_none(), "known");
+    // 256 more asked for, and the first goes.
+    for at in 0..256 {
+        document.video_facts_to_read(&format!("assets/v{at}.mp4"));
+    }
+    assert!(document.video_facts("assets/clip.mp4").is_none(), "let go of");
+    assert!(document.video_facts_to_read("assets/clip.mp4").is_some(), "read again when wanted");
+
+    // Read while a save holds the talk's files back, they wait for it, and are read after.
+    let folder = talk_folder(&talk(), &clip(3, 10));
+    let mut document = Document::open(folder.path(), Fonts::bundled_only()).unwrap();
+    document.begin_saving_the_pack();
+    let to_read = document.video_facts_to_read("assets/clip.mp4").unwrap();
+    assert!(!document.take_video_facts(to_read.read()), "not read yet");
+    assert!(document.video_facts_to_read("assets/clip.mp4").is_none(), "it waits");
+    document.pack_save_ended();
+    let to_read = document.video_facts_to_read("assets/clip.mp4").expect("read after the save");
+    assert!(document.take_video_facts(to_read.read()));
+    // One that waited says so, for the form to be drawn again.
+    document.begin_saving_the_pack();
+    let other = talk_folder(&talk(), &clip(3, 10));
+    std::fs::copy(other.path().join("assets/clip.mp4"), folder.path().join("assets/again.mp4")).unwrap();
+    let to_read = document.video_facts_to_read("assets/again.mp4").unwrap();
+    document.take_video_facts(to_read.read());
+    assert!(document.try_waiting_stills_again(), "one waited");
+    assert!(!document.try_waiting_stills_again(), "and none waits now");
+    document.pack_save_ended();
 }

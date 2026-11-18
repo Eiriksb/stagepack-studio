@@ -521,7 +521,11 @@ impl AudienceView {
     /// Makes the stills that waited for a video to be unpacked to play.
     fn videos_opened(&mut self, cx: &mut Context<Self>) {
         let document = self.show.read(cx).document.clone();
-        document.update(cx, |document, _| document.try_waiting_stills_again());
+        document.update(cx, |document, cx| {
+            if document.try_waiting_stills_again() {
+                cx.notify();
+            }
+        });
     }
 
     /// The canvas of the slide being left, while a transition is holding on to one.

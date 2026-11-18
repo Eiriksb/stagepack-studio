@@ -280,6 +280,25 @@ fn slide_xml(out: &Path, index: usize) -> String {
     xml
 }
 
+/// Every stream of the PDF `pdf` that inflates, inflated.
+fn pdf_streams(pdf: &[u8]) -> Vec<Vec<u8>> {
+    let find = |from: usize, needle: &[u8]| pdf[from..].windows(needle.len()).position(|window| window == needle).map(|at| from + at);
+    let mut streams = Vec::new();
+    let mut at = 0;
+    while let Some(start) = find(at, b"stream") {
+        let mut body = start + b"stream".len();
+        while matches!(pdf.get(body), Some(b'\r' | b'\n')) {
+            body += 1;
+        }
+        let Some(end) = find(body, b"endstream") else { break };
+        if let Ok(inflated) = miniz_oxide::inflate::decompress_to_vec_zlib(&pdf[body..end]) {
+            streams.push(inflated);
+        }
+        at = end + b"endstream".len();
+    }
+    streams
+}
+
 fn holds(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|window| window == needle)
 }
@@ -299,7 +318,14 @@ fn a_video_is_a_picture_in_the_pdf_and_in_powerpoint() {
     let (_folder, input) = with_video(ONE_VIDEO, &blue_clip());
     let (_dir, pdf) = target("talk.pdf");
     run_export(input, ExportKind::Pdf, &pdf).unwrap();
-    assert!(holds(&std::fs::read(&pdf).unwrap(), b"/Subtype/Image"), "the still is a picture");
+    let pdf_bytes = std::fs::read(&pdf).unwrap();
+    assert!(holds(&pdf_bytes, b"/Subtype/Image"), "the still is a picture");
+    // Its first picture, blue, as the PDF holds it.
+    let pictures: Vec<Vec<u8>> = pdf_streams(&pdf_bytes).into_iter().filter(|stream| stream.len() == 64 * 36 * 3).collect();
+    assert_eq!(pictures.len(), 1, "the still's 64 by 36 pixels");
+    let at = (18 * 64 + 32) * 3;
+    let middle = &pictures[0][at..at + 3];
+    assert!(middle[2] > 200 && middle[0] < 40 && middle[1] < 40, "{middle:?}");
 
     // One that can't be played is its panel, and no picture.
     let (_folder, input) = with_video(ONE_VIDEO, b"these are words, not pictures");
@@ -312,6 +338,26 @@ fn a_video_is_a_picture_in_the_pdf_and_in_powerpoint() {
     let (_dir, pdf) = target("talk.pdf");
     run_export(input, ExportKind::Pdf, &pdf).unwrap();
     assert!(!holds(&std::fs::read(&pdf).unwrap(), b"/Subtype/Image"));
+}
+
+#[test]
+fn a_videos_still_picture_is_what_powerpoint_gets() {
+    let mut poster = Vec::new();
+    image::RgbaImage::from_pixel(16, 9, image::Rgba([0, 255, 0, 255]))
+        .write_to(&mut std::io::Cursor::new(&mut poster), image::ImageFormat::Png)
+        .unwrap();
+    let source = ONE_VIDEO.replace(" x=", " poster=\"assets/still.png\" x=");
+    for video in [blue_clip(), b"these are words, not pictures".to_vec()] {
+        let (folder, input) = with_video(&source, &video);
+        std::fs::write(folder.path().join("assets/still.png"), &poster).unwrap();
+        let (_dir, out) = target("talk.pptx");
+        let notices = run_export(input, ExportKind::PowerPoint, &out).unwrap();
+        let pictures = pptx_pictures(&out);
+        assert_eq!(pictures.len(), 1);
+        let middle = pictures[0].get_pixel(pictures[0].width() / 2, pictures[0].height() / 2).0;
+        assert!(middle[1] > 200 && middle[0] < 40 && middle[2] < 40, "green: {middle:?}");
+        assert!(notices.iter().any(|notice| notice == "1 video was exported as a picture."), "{notices:?}");
+    }
 }
 
 #[test]
@@ -330,6 +376,17 @@ fn the_export_says_how_many() {
         assert!(notices.iter().any(|notice| notice == "1 video was exported as a picture."), "{kind:?}: {notices:?}");
         let notices = said(TALK);
         assert!(notices.iter().all(|notice| !notice.contains("exported as")), "{kind:?}: {notices:?}");
+    }
+    // One that can't be played is its panel, and isn't counted: its own notice says why.
+    let mixed = format!("{ONE_VIDEO}\n<Video src=\"assets/words.mp4\" x=\"900\" y=\"100\" w=\"640\" h=\"360\" />\n");
+    for kind in [ExportKind::PowerPoint, ExportKind::Pdf] {
+        let (folder, input) = with_video(&mixed, &blue_clip());
+        std::fs::write(folder.path().join("assets/words.mp4"), b"these are words, not pictures").unwrap();
+        let (_dir, out) = target(&format!("talk.{}", kind.extension()));
+        let notices = run_export(input, kind, &out).unwrap();
+        let counted: Vec<&String> = notices.iter().filter(|notice| notice.contains("exported as")).collect();
+        assert_eq!(counted, ["1 video was exported as a picture."], "{kind:?}: {notices:?}");
+        assert!(notices.iter().any(|notice| notice == "Slide 1: This file isn't a video."), "{kind:?}: {notices:?}");
     }
     // A slide left out of the PDF leaves its videos out of the count.
     let hidden = format!("{ONE_VIDEO}\n---\nhidden: true\n---\n\n{ONE_VIDEO}");

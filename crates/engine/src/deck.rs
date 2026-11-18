@@ -670,6 +670,17 @@ impl Deck {
         self.pictures.still_problem(&src).map(|why| why.to_string())
     }
 
+    /// Whether the video `src`, with the still `poster` names if it names one, is drawn as a
+    /// picture once its slide is laid out: its first picture, or that still, could be shown.
+    /// What laying the slide out found is what's said: ask once it's laid out. A still made and
+    /// let go of since, to keep within the budget, was a picture.
+    pub fn video_shows_a_picture(&mut self, src: &str, poster: Option<&str>) -> bool {
+        let src = src.trim();
+        let made = !src.is_empty() && self.pictures.still_problem(src).is_none();
+        let poster = poster.map(str::trim).filter(|poster| !poster.is_empty());
+        made || poster.is_some_and(|poster| self.pictures.get(poster, &*self.files).is_some())
+    }
+
     /// The videos on slide `index` in its whole state, among its layers as `specs` and `layers`
     /// give them, with the deck's placing.
     pub fn videos(&mut self, index: usize) -> Vec<VideoLayer> {

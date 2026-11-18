@@ -23,6 +23,19 @@ const PASTED_PICTURE: &str = "pasted-picture.png";
 /// What the status line says while a video is copied into the talk.
 const COPYING_VIDEO: &str = "Copying video";
 
+/// A video waiting to be copied in, from the file at `path`, and put on slide `slide`, the slide
+/// shown when it was asked for.
+pub(super) struct WaitingVideo {
+    path: PathBuf,
+    slide: usize,
+}
+
+/// Why a large file wasn't copied in: what's said of it, and whether it was cancelled.
+struct NotCopied {
+    said: String,
+    cancelled: bool,
+}
+
 /// What pastes, once the large files a paste carries are copied in, or not.
 type Paste = Box<dyn FnOnce(&mut WorkspaceView, PastedFiles, &mut Context<WorkspaceView>)>;
 
@@ -137,8 +150,12 @@ impl WorkspaceView {
     }
 
     /// Puts `said` on the status line once the line has heard what's selected, so that this is
-    /// what it says.
+    /// what it says: once the videos being copied in are all in, if any are.
     fn say_later(&mut self, said: &'static str, cx: &mut Context<Self>) {
+        if self.video_copying {
+            self.said_after_videos = Some(said);
+            return;
+        }
         cx.spawn(async move |this, cx| {
             this.update(cx, |this, cx| this.say(said, cx)).ok();
         })
@@ -146,21 +163,56 @@ impl WorkspaceView {
     }
 
     /// Copies the video in the file at `path`, from outside the talk, into it, the status line
-    /// showing how far that's got, with a Cancel, and then puts it on the slide, selected, at its
-    /// own size. Its headers are looked at first, off the window's thread: a file that isn't a
-    /// video is said, and nothing is copied. Cancelled or refused, nothing is put on the slide.
+    /// showing how far that's got, with a Cancel, and then puts it on the slide shown now, at its
+    /// own size, selected: that slide is shown again then, as any edit shows its slide. Videos are copied one at a time,
+    /// in the order they were asked for. Its headers are looked at first, off the window's
+    /// thread: a file that isn't a video is said, and nothing is copied. Cancelled or refused,
+    /// nothing is put on the slide; cancelled, the videos waiting after it aren't copied either.
     fn insert_video_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let insert = |this: &mut Self, name: String, size: (u32, u32), cx: &mut Context<Self>| {
-            this.edit(|document| document.insert_video(name, size), cx);
-            // Its Delete and its arrow keys are the slide's, as a picture's are once it's put on.
-            let (window, view) = (this.window_handle, cx.weak_entity());
-            cx.defer(move |cx| {
-                window
-                    .update(cx, |_, window, cx| view.update(cx, |view, cx| view.keyboard_to_the_slide(window, cx)).ok())
-                    .ok();
-            });
+        let Some(document) = &self.document else {
+            return;
         };
-        self.copy_in_looked_at(FileKind::Video, path, video_shape, insert, cx);
+        let slide = document.read(cx).current();
+        self.videos_waiting.push_back(WaitingVideo { path, slide });
+        self.copy_next_video(cx);
+    }
+
+    /// Copies in the next video waiting, unless one is being copied.
+    fn copy_next_video(&mut self, cx: &mut Context<Self>) {
+        if self.video_copying {
+            return;
+        }
+        let Some(WaitingVideo { path, slide }) = self.videos_waiting.pop_front() else {
+            if let Some(said) = self.said_after_videos.take() {
+                self.say_later(said, cx);
+            }
+            return;
+        };
+        self.video_copying = true;
+        let finished = move |this: &mut Self, copied: Result<(String, (u32, u32)), NotCopied>, cx: &mut Context<Self>| {
+            this.video_copying = false;
+            match copied {
+                Ok((name, size)) => {
+                    this.edit(|document| document.insert_video_on(slide, name, size), cx);
+                    // Its Delete and its arrow keys are the slide's, as a picture's are once it's put on.
+                    let (window, view) = (this.window_handle, cx.weak_entity());
+                    cx.defer(move |cx| {
+                        window
+                            .update(cx, |_, window, cx| view.update(cx, |view, cx| view.keyboard_to_the_slide(window, cx)).ok())
+                            .ok();
+                    });
+                }
+                Err(NotCopied { said, cancelled }) => {
+                    if cancelled {
+                        this.videos_waiting.clear();
+                        this.said_after_videos = None;
+                    }
+                    this.say(said, cx);
+                }
+            }
+            this.copy_next_video(cx);
+        };
+        self.copy_in_looked_at(FileKind::Video, path, video_shape, finished, cx);
     }
 
     /// Puts the picture in the file at `path`, from outside the talk, on the slide.
@@ -222,18 +274,23 @@ impl WorkspaceView {
         then: impl FnOnce(&mut Self, String, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) {
-        self.copy_in_looked_at(kind, path, |_| Ok(()), move |this, path, (), cx| then(this, path, cx), cx);
+        let finished = move |this: &mut Self, copied: Result<(String, ()), NotCopied>, cx: &mut Context<Self>| match copied {
+            Ok((path, ())) => then(this, path, cx),
+            Err(why) => this.say(why.said, cx),
+        };
+        self.copy_in_looked_at(kind, path, |_| Ok(()), finished, cx);
     }
 
     /// [`Self::copy_in_large_file`], looking at the file with `look` first, on the same
-    /// background task, before anything is copied: what it finds is handed to `then` with the
-    /// path, and why it refuses the file is said instead, and nothing is copied.
+    /// background task, before anything is copied: what it finds is handed to `finished` with
+    /// the path, or why the file wasn't copied: `look` refused it, or the copy was refused or
+    /// cancelled. Whatever comes of it, `finished` hears of it once, unless the window has gone.
     fn copy_in_looked_at<Found: Send + 'static>(
         &mut self,
         kind: FileKind,
         path: PathBuf,
         look: impl FnOnce(&Path) -> Result<Found, String> + Send + 'static,
-        then: impl FnOnce(&mut Self, String, Found, &mut Context<Self>) + 'static,
+        finished: impl FnOnce(&mut Self, Result<(String, Found), NotCopied>, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) {
         let Some(document) = self.document.clone() else {
@@ -243,7 +300,7 @@ impl WorkspaceView {
         let suggested = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
         let copy = match document.read(cx).large_copy(kind, &suggested, LargeSource::File(path), None) {
             Ok(copy) => copy,
-            Err(why) => return self.say(why.to_string(), cx),
+            Err(why) => return finished(self, Err(NotCopied { said: why.to_string(), cancelled: false }), cx),
         };
         let meter = self.start_progress(COPYING_VIDEO, true, cx);
         let running = meter.clone();
@@ -259,17 +316,18 @@ impl WorkspaceView {
                 this.end_progress(&meter, cx);
                 let (found, copied) = match copied {
                     Ok(copied) => copied,
-                    Err(why) => return this.say(why, cx),
+                    Err(said) => return finished(this, Err(NotCopied { said, cancelled: false }), cx),
                 };
                 let taken = document.update(cx, |document, cx| {
                     let taken = document.take_large_copy(copied);
                     cx.notify();
                     taken
                 });
-                match taken {
-                    Ok(path) => then(this, path, found, cx),
-                    Err(why) => this.say(why.to_string(), cx),
-                }
+                let copied = match taken {
+                    Ok(path) => Ok((path, found)),
+                    Err(why) => Err(NotCopied { said: why.to_string(), cancelled: why == NotAdded::Cancelled }),
+                };
+                finished(this, copied, cx);
             })
             .ok();
         })
@@ -453,14 +511,15 @@ fn is_video(path: &Path) -> bool {
 }
 
 /// The size of the video in the file at `path`, outside the talk, from its headers alone, or why
-/// it isn't one: for a background task. A video whose size can't be read, as one damaged or of a
-/// kind that isn't played, is still a video, and says why once it's on the slide: it's given
-/// the room a video's put in.
+/// it isn't one, as a file with no video track isn't: for a background task. A video whose size
+/// can't be read, as one damaged or of a kind that isn't played, is still a video, and says why
+/// once it's on the slide: it's given the room a video's put in.
 fn video_shape(path: &Path) -> Result<(u32, u32), String> {
     let mut file = std::fs::File::open(path).map_err(|_| NotAdded::Unreadable.to_string())?;
     match slides_video::video_size(&mut file) {
         Ok(size) => Ok(size),
-        Err(CantPlay::NotAVideo) => Err(CantPlay::NotAVideo.to_string()),
+        // A file with no pictures in it is no video.
+        Err(CantPlay::NotAVideo | CantPlay::NoPicture) => Err(CantPlay::NotAVideo.to_string()),
         Err(CantPlay::CouldNotRead) => Err(NotAdded::Unreadable.to_string()),
         Err(_) => Ok((crate::insert::VIDEO_ROOM.0 as u32, crate::insert::VIDEO_ROOM.1 as u32)),
     }

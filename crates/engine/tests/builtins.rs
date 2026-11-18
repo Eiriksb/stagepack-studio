@@ -1212,6 +1212,43 @@ fn a_video_that_cannot_be_read_draws_a_panel_and_says_why() {
     assert_eq!(deck.video_problem(0, &(0..5)), None);
 }
 
+#[test]
+fn a_video_with_no_file_draws_a_panel_and_says_so() {
+    for source in ["<Video x=\"0\" w=\"640\" h=\"360\" />\n", "<Video src=\"  \" x=\"0\" w=\"640\" h=\"360\" />\n"] {
+        let (slide, _) = lay_out(source, &[]);
+        let layer = &slide.layers[1];
+        assert!(!has_picture(layer), "{source}");
+        assert!(fills(layer).len() >= 2, "a panel and its play mark: {source}");
+        let notices: Vec<&str> = slide.notices.iter().map(|notice| notice.0.as_str()).collect();
+        assert_eq!(notices, [slides_engine::VIDEO_NO_FILE], "{source}");
+    }
+    assert_eq!(slides_engine::VIDEO_NO_FILE, "This video has no file. Insert a video to choose one.");
+}
+
+#[test]
+fn a_deck_says_which_videos_show_as_pictures() {
+    let mut poster = Vec::new();
+    image::RgbaImage::from_pixel(16, 9, image::Rgba([0, 255, 0, 255]))
+        .write_to(&mut std::io::Cursor::new(&mut poster), image::ImageFormat::Png)
+        .unwrap();
+    let files = MapFiles(
+        [
+            ("assets/clip.mp4".to_string(), video_of(64, 36, 2, |_| RED_BGRA)),
+            ("assets/words.mp4".to_string(), b"just some words".to_vec()),
+            ("assets/still.png".to_string(), poster),
+        ]
+        .into(),
+    );
+    let talk = "# One\n\n<Video src=\"assets/clip.mp4\" x=\"0\" />\n\n<Video src=\"assets/words.mp4\" x=\"700\" />\n";
+    let mut deck = Deck::open(Box::new(files), Fonts::bundled_only(), talk.to_string());
+    deck.notices(0);
+    assert!(deck.video_shows_a_picture("assets/clip.mp4", None));
+    assert!(!deck.video_shows_a_picture("assets/words.mp4", None), "its panel");
+    assert!(deck.video_shows_a_picture("assets/words.mp4", Some("assets/still.png")), "its still");
+    assert!(!deck.video_shows_a_picture("assets/words.mp4", Some("assets/clip.mp4")), "a still that isn't a picture");
+    assert!(!deck.video_shows_a_picture("", None), "no file");
+}
+
 /// Files that count the bytes read from each in pieces, and those of each read whole apart.
 struct CountingFiles {
     files: HashMap<String, Vec<u8>>,

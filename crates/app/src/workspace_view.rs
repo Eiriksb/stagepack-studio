@@ -363,6 +363,12 @@ pub struct WorkspaceView {
     status: Option<SharedString>,
     /// Work that moves a large file, while it goes on, the newest last.
     progressing: Vec<Progressing>,
+    /// Videos dropped, pasted or chosen, waiting to be copied in, one at a time in turn, and
+    /// whether one is being copied now.
+    videos_waiting: std::collections::VecDeque<inserting::WaitingVideo>,
+    video_copying: bool,
+    /// What to say once the videos waiting are all in, as that more files were dropped than go on.
+    said_after_videos: Option<&'static str>,
     /// Whether the window is to close once the copies it stopped as it was closed have ended.
     close_when_idle: bool,
     /// How many saves are running, which a window closing waits for before it lets anything of
@@ -676,6 +682,9 @@ impl WorkspaceView {
             notices,
             status: None,
             progressing: Vec::new(),
+            videos_waiting: std::collections::VecDeque::new(),
+            video_copying: false,
+            said_after_videos: None,
             close_when_idle: false,
             saves_running: 0,
             finish_closing: false,

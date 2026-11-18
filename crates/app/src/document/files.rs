@@ -8,17 +8,21 @@ impl Document {
         self.files.len(path).is_some()
     }
 
-    /// The talk's pictures, by their paths, in name order: those a video's still can be.
-    pub fn picture_files(&self) -> Vec<String> {
-        let pictures = FileKind::Picture.extensions();
-        self.files
-            .names_in(FileKind::Picture.folder())
-            .into_iter()
-            .filter(|path| {
-                let extension = path.rsplit_once('.').map(|(_, extension)| extension.to_ascii_lowercase());
-                extension.is_some_and(|extension| pictures.contains(&extension.as_str()))
-            })
-            .collect()
+    /// What lists the talk's pictures, by their paths, in name order, as its files are now:
+    /// those a video's still can be. It reads the talk's folder, so it's for another thread.
+    pub fn picture_files(&self) -> impl FnOnce() -> Vec<String> + Send + 'static {
+        let files = self.files.clone();
+        move || {
+            let pictures = FileKind::Picture.extensions();
+            files
+                .names_in(FileKind::Picture.folder())
+                .into_iter()
+                .filter(|path| {
+                    let extension = path.rsplit_once('.').map(|(_, extension)| extension.to_ascii_lowercase());
+                    extension.is_some_and(|extension| pictures.contains(&extension.as_str()))
+                })
+                .collect()
+        }
     }
 
     /// Adds `bytes` to the talk as a file of `kind`, named as like `suggested` as is safe, and

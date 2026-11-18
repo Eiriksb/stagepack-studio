@@ -84,13 +84,13 @@ fn make(input: ExportInput, kind: ExportKind) -> Result<(Vec<u8>, Vec<String>), 
         ExportKind::PowerPoint => {
             let PptxOutput { bytes, mut notices } = write_pptx(&mut deck, &files)?;
             let every: Vec<usize> = (0..deck.slide_count()).collect();
-            notices.extend(videos_as_pictures(videos_on(&deck, &every)));
+            notices.extend(videos_as_pictures(videos_on(&mut deck, &every)));
             Ok((bytes, notices))
         }
         ExportKind::Pdf => {
             let bytes = write_pdf(&mut deck)?;
             let shown = deck.shown_slides().to_vec();
-            let videos = videos_on(&deck, &shown);
+            let videos = videos_on(&mut deck, &shown);
             let mut notices: Vec<String> = shown
                 .into_iter()
                 .flat_map(|index| {
@@ -105,19 +105,25 @@ fn make(input: ExportInput, kind: ExportKind) -> Result<(Vec<u8>, Vec<String>), 
     }
 }
 
-/// How many videos slides `slides` of `deck`'s talk hold, placed or in the text.
-fn videos_on(deck: &Deck, slides: &[usize]) -> usize {
-    fn count(blocks: &[Block]) -> usize {
-        blocks
-            .iter()
-            .map(|block| match block {
-                Block::Tag(tag) => usize::from(tag.name == "Video") + count(&tag.children),
-                _ => 0,
-            })
-            .sum()
+/// How many videos slides `slides` of `deck`'s talk hold, placed or in the text, that were drawn
+/// as a picture, their first or the still they name: one that can't be played is its plain panel,
+/// and says so in its own notice. Asked once the slides are laid out.
+fn videos_on(deck: &mut Deck, slides: &[usize]) -> usize {
+    fn videos(blocks: &[Block], found: &mut Vec<(String, Option<String>)>) {
+        for block in blocks {
+            if let Block::Tag(tag) = block {
+                if tag.name == "Video" {
+                    found.push((tag.attr("src").unwrap_or_default().to_string(), tag.attr("poster").map(str::to_string)));
+                }
+                videos(&tag.children, found);
+            }
+        }
     }
-    let talk = deck.talk();
-    slides.iter().filter_map(|index| talk.slides.get(*index)).map(|slide| count(&slide.blocks)).sum()
+    let mut found = Vec::new();
+    for slide in slides.iter().filter_map(|index| deck.talk().slides.get(*index)) {
+        videos(&slide.blocks, &mut found);
+    }
+    found.into_iter().filter(|(src, poster)| deck.video_shows_a_picture(src, poster.as_deref())).count()
 }
 
 /// What an export says of the `videos` it holds, which PowerPoint and PDF get as their stills:

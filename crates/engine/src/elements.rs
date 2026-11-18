@@ -25,6 +25,8 @@ pub(crate) const VIDEO_TAG: &str = "Video";
 const VIDEO_ROOM: (f32, f32) = (960.0, 540.0);
 /// What's said of a video written in the text, not placed on the slide.
 pub const VIDEO_IN_TEXT: &str = "This video plays only when it's placed on the slide. Drag it out of the text to place it.";
+/// What's said of a video that names no file to play.
+pub const VIDEO_NO_FILE: &str = "This video has no file. Insert a video to choose one.";
 /// What's said of a video whose named still can't be shown.
 const POSTER_UNREAD: &str = "The picture named to show for this video can't be shown, so its first picture shows instead.";
 /// The side of the play mark on the panel of a video with no still.
@@ -385,9 +387,12 @@ impl Flow<'_, '_> {
     /// [`VIDEO_ROOM`], or the room itself while that isn't known.
     fn video(&mut self, tag: &Tag, boxed: bool) -> ((f32, f32), NodeId) {
         let src = tag.attr("src").unwrap_or_default().trim();
-        let still = self.env.pictures.still(src, self.env.files);
-        if let Still::Cannot(why) = &still {
-            self.notice(why.to_string());
+        // One with no file is never looked for.
+        let still = if src.is_empty() { Still::Cannot(slides_video::CantPlay::CouldNotRead) } else { self.env.pictures.still(src, self.env.files) };
+        match &still {
+            Still::Cannot(_) if src.is_empty() => self.notice(VIDEO_NO_FILE.to_string()),
+            Still::Cannot(why) => self.notice(why.to_string()),
+            Still::Frame(..) | Still::Coming(_) => {}
         }
         let poster = tag.attr("poster").map(str::trim).filter(|poster| !poster.is_empty());
         let poster = poster.and_then(|poster| {

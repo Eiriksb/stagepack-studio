@@ -45,7 +45,7 @@ impl SlideEditor {
         let Some(source) = video.source.clone() else { return };
         let opened = document.read(cx).open_large(&video.on.src);
         let Some(opened) = opened else {
-            let said = document.update(cx, |document, _| document.video_problem(&source));
+            let said = document.update(cx, |document, _| document.selected_video_said());
             let said = said.unwrap_or_else(|| slides_video::CantPlay::CouldNotRead.to_string());
             cx.emit(EditorEvent::Said(said.into()));
             return;
