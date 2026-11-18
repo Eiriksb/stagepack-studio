@@ -30,6 +30,9 @@ pub const UNREADABLE_ID: &str = "start-unreadable";
 pub const CONFIRM_DISCARD_ID: &str = "confirm-discard";
 pub const CANCEL_DISCARD_ID: &str = "cancel-discard";
 
+/// What Discard says of a presentation from last time that a window has open.
+pub const OPEN_ELSEWHERE: &str = "It's open in another window.";
+
 /// What Discard asks before a presentation from last time goes.
 pub const DISCARD_QUESTION: &str = "Discard this presentation? It can't be brought back.";
 
@@ -107,6 +110,9 @@ pub struct StartScreen {
     offers_stagepack: bool,
     /// The read of the presentations from last time, while it runs.
     _reading: Option<Task<()>>,
+    /// The list is read again as the window comes to the front, so that what's listed and when
+    /// it was kept, *Today* or *Yesterday*, is as it is now. Nothing is read while it's left.
+    _activated: Subscription,
 }
 
 impl EventEmitter<StartEvent> for StartScreen {}
@@ -117,7 +123,13 @@ impl StartScreen {
     pub fn new(recovery: Option<Recovery>, window: &mut Window, cx: &mut Context<Self>) -> StartScreen {
         let tiles = templates().iter().map(|_| cx.focus_handle()).collect();
         ask_for_pictures(window, cx);
+        let activated = cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                this.refresh(cx);
+            }
+        });
         let mut screen = StartScreen {
+            _activated: activated,
             recovery,
             tiles,
             unsaved: Vec::new(),
@@ -218,6 +230,13 @@ impl StartScreen {
         let Some(recovery) = self.recovery.clone() else {
             return;
         };
+        // Its old copy is still there for a moment after another window brings it back, and
+        // that window's edits would go with it.
+        if workspace_view::open_untitled_ids(cx).contains(&id) {
+            self.set_problem(Some(OPEN_ELSEWHERE.into()), false, cx);
+            self.refresh(cx);
+            return;
+        }
         self.unsaved.retain(|copy| copy.id != id);
         cx.notify();
         cx.spawn(async move |_, cx| {

@@ -19,7 +19,6 @@ struct Stored {
 }
 
 /// The folders whose components are built whenever they change.
-#[derive(Clone)]
 pub struct BuildPermissions {
     file: PathBuf,
     /// Each folder by its canonical path, so however it's written it's the same folder.
@@ -34,6 +33,11 @@ impl BuildPermissions {
             always_build: read(&file).always_build,
             file,
         }
+    }
+
+    /// The file these permissions are kept in.
+    pub fn file(&self) -> &Path {
+        &self.file
     }
 
     /// Where the app keeps its permissions: in its own data folder, if the system has one.

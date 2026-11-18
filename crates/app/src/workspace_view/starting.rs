@@ -2,6 +2,8 @@
 //! a talk and bringing one back from it, all in this window, and showing a talk in a window that
 //! has none.
 
+use slides_engine::PackError;
+
 use super::*;
 
 /// Opens a window with no talk, showing the start screen. It lists the new presentations kept in
@@ -65,7 +67,9 @@ struct Setup {
     compile: Option<Compile>,
     bundle: Option<Bundle>,
     editor_projects: Option<PathBuf>,
-    permissions: Option<BuildPermissions>,
+    /// The file the window's build permissions are kept in, read again for each window, as
+    /// another may have changed it.
+    permissions: Option<PathBuf>,
     documents: Option<PathBuf>,
     really_watch: bool,
     stagepack: Option<Option<PathBuf>>,
@@ -131,7 +135,7 @@ impl WorkspaceView {
             compile: self.compile.clone(),
             bundle: self.bundle.clone(),
             editor_projects: self.editor_projects.clone(),
-            permissions: self.permissions.clone(),
+            permissions: self.permissions.as_ref().map(|permissions| permissions.file().to_path_buf()),
             documents: self.documents.clone(),
             really_watch: self.really_watch,
             stagepack: self.stagepack.clone(),
@@ -144,7 +148,7 @@ impl WorkspaceView {
         self.compile = setup.compile;
         self.bundle = setup.bundle;
         self.editor_projects = setup.editor_projects;
-        self.permissions = setup.permissions;
+        self.permissions = setup.permissions.map(BuildPermissions::load);
         self.always_build = self.is_always_built();
         self.documents = setup.documents;
         self.really_watch = setup.really_watch;
@@ -202,7 +206,7 @@ impl WorkspaceView {
                 let offers = self.stagepack_offer.is_some();
                 self.say_on_start(SLIDEV_TALK, offers, cx);
             }
-            Err(OpenProblem::Other(problem)) => self.say_on_start(start_problem(&path, problem), false, cx),
+            Err(OpenProblem::Other(_)) => self.say_on_start(start_problem(&path), false, cx),
         }
     }
 
@@ -215,7 +219,8 @@ impl WorkspaceView {
         // Its old copy is still there for a moment after another window brings it back.
         if open_untitled_ids(cx).contains(&id) {
             self.say_on_start(NotTaken::Held.to_string(), false, cx);
-            refresh_start_screens(cx);
+            // Once every window can be looked at, this one with it.
+            cx.defer(refresh_start_screens);
             return;
         }
         let taking = recovery.clone();
@@ -239,8 +244,17 @@ impl WorkspaceView {
             // Something else was shown here in the meantime. The copy stays where it is.
             return;
         }
+        // Another start screen may have brought it back while this one took it: nothing holds
+        // a copy that is only being read.
+        let taken = taken.and_then(|found| match open_untitled_ids(cx).contains(&id) {
+            true => Err(NotTaken::Held),
+            false => Ok(found),
+        });
         let found = match taken {
             Ok(found) => found,
+            // Still there, for Discard to let go of.
+            Err(NotTaken::Unreadable) => return self.say_on_start(NotTaken::Unreadable.to_string(), false, cx),
+            // Gone, or open elsewhere: it comes off the list.
             Err(not_taken) => {
                 self.say_on_start(not_taken.to_string(), false, cx);
                 cx.defer(refresh_start_screens);
@@ -254,7 +268,8 @@ impl WorkspaceView {
                 // Once every window can be looked at, this one with it.
                 cx.defer(refresh_start_screens);
             }
-            Err(problem) => self.say_on_start(problem, false, cx),
+            // What it says is about the text inside, which isn't for the start screen.
+            Err(_) => self.say_on_start(NotTaken::Unreadable.to_string(), false, cx),
         }
     }
 
@@ -328,18 +343,35 @@ impl WorkspaceView {
     }
 }
 
-/// Why the talk at `path` couldn't be opened, as the start screen says it, in words and with no
-/// path: `problem` is what reading it said.
-fn start_problem(path: &Path, problem: String) -> String {
+/// Why the talk at `path` couldn't be opened, as the start screen says it: one plain sentence
+/// for each kind of failure, with no path, file name or detail from inside the file. A file is
+/// read again to tell which kind it is, as only a failure comes here.
+fn start_problem(path: &Path) -> &'static str {
     if path.is_dir() {
         return if path.join(SLIDES_FILE).is_file() {
-            "That folder's talk couldn't be read.".to_string()
+            "That folder's presentation couldn't be read."
         } else {
-            "That folder has no talk in it.".to_string()
+            "That folder has no presentation in it."
         };
     }
-    if problem.contains(&path.display().to_string()) {
-        return "That file couldn't be read as a talk.".to_string();
+    if !path.exists() {
+        return "That file isn't there any more.";
     }
-    problem
+    // A packed presentation is a zip file, which starts so.
+    let mut start = [0u8; 4];
+    match std::fs::File::open(path).and_then(|mut file| std::io::Read::read_exact(&mut file, &mut start)) {
+        Ok(()) if start == *b"PK\x03\x04" => {}
+        Err(error) if error.kind() != std::io::ErrorKind::UnexpectedEof => return "That file couldn't be read.",
+        _ => return NOT_A_PRESENTATION,
+    }
+    match slides_engine::open_packed(path).and_then(|pack| pack.slides()) {
+        Err(PackError::NotATalk) => NOT_A_PRESENTATION,
+        Err(PackError::TooNew { .. }) => "That presentation was made by a newer version of this app. Update the app to open it.",
+        Err(PackError::TooLarge(_)) => "That presentation is too large to open.",
+        Err(PackError::Io(_)) => "That file couldn't be read.",
+        // Damaged, in one way or another, or holding something that can't be read.
+        _ => "That file is damaged, so it can't be opened.",
+    }
 }
+
+const NOT_A_PRESENTATION: &str = "That file isn't a presentation made with this app.";

@@ -144,6 +144,8 @@ static LIVE_SLOTS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 struct LiveSlot {
     name: String,
     held: Mutex<Vec<(PathBuf, std::fs::File)>>,
+    /// Whether taking a lock fails, as it can on a folder that refuses them, for tests.
+    locks_fail: std::sync::atomic::AtomicBool,
 }
 
 impl LiveSlot {
@@ -152,6 +154,7 @@ impl LiveSlot {
         LiveSlot {
             name: slot.to_string(),
             held: Mutex::new(Vec::new()),
+            locks_fail: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -160,8 +163,9 @@ impl LiveSlot {
     }
 
     /// Holds `folder`, one of this slot's, against other running copies of the app: its `held`
-    /// file is made if it isn't there and locked for as long as this is live. A system that
-    /// can't lock files keeps the copy all the same.
+    /// file is made if it isn't there and locked for as long as this is live. If the lock can't
+    /// be taken, for whatever reason, the copy is kept all the same: a working copy that no
+    /// other running app knows is held is far better than none.
     fn hold(&self, folder: &Path) -> io::Result<()> {
         let path = folder.join(HELD_FILE);
         let mut held = self.held();
@@ -183,10 +187,13 @@ impl LiveSlot {
             return Err(io::Error::other("something other than a file is where a working copy's lock would go"));
         }
         // Another copy of the app only ever holds it shared for a moment, to look.
-        match file.lock() {
-            Ok(()) => held.push((folder.to_path_buf(), file)),
-            Err(error) if error.kind() == io::ErrorKind::Unsupported => {}
-            Err(error) => return Err(error),
+        let locked = if self.locks_fail.load(std::sync::atomic::Ordering::Relaxed) {
+            Err(io::Error::other("the lock was refused, for a test"))
+        } else {
+            file.lock()
+        };
+        if locked.is_ok() {
+            held.push((folder.to_path_buf(), file));
         }
         Ok(())
     }
@@ -269,6 +276,15 @@ impl Recovery {
             root: self.root.clone(),
             live: Some(Arc::new(LiveSlot::new(&slot))),
             slot,
+        }
+    }
+
+    /// Has every lock this window's slot takes from now on fail, as on a folder that refuses
+    /// them. For tests.
+    #[doc(hidden)]
+    pub fn fail_locks_for_test(&self) {
+        if let Some(live) = &self.live {
+            live.locks_fail.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 

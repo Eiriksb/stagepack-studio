@@ -23,14 +23,17 @@ use stagepack_studio::permissions::BuildPermissions;
 use stagepack_studio::recovery::{Recovery, hash_text};
 use stagepack_studio::ribbon::SAVE_ID;
 use stagepack_studio::slide_strip::strip_row_id;
+use stagepack_studio::inspector::field_id;
+use stagepack_studio::notes_panel::NOTES_ID;
+use stagepack_studio::recovery::NotTaken;
 use stagepack_studio::start_screen::{
-    CANCEL_DISCARD_ID, CONFIRM_DISCARD_ID, DISCARD_QUESTION, START_OPEN_FILE_ID, START_OPEN_FOLDER_ID,
+    CANCEL_DISCARD_ID, CONFIRM_DISCARD_ID, DISCARD_QUESTION, OPEN_ELSEWHERE, START_OPEN_FILE_ID, START_OPEN_FOLDER_ID,
     START_PROBLEM_ID, UNREADABLE_ID, template_picture_id, template_tile_id, tile_picture, unsaved_discard_id,
     unsaved_open_id, unsaved_row_id, when_words,
 };
 use stagepack_studio::templates::{template, templates};
 use stagepack_studio::workspace_view::{
-    self, BUILD_BAR_ID, BUILD_ONCE_ID, CANVAS_ID, DISCARD_RECOVERY_ID, FILE_MENU_ID, OPEN_IN_STAGEPACK_ID, PROBLEM_ID,
+    self, BUILD_ALWAYS_ID, BUILD_BAR_ID, BUILD_ONCE_ID, CANVAS_ID, CLOSE_SAVE_ID, SAVE_AS_FOLDER_ID, SAVE_AS_PACKED_ID, DISCARD_RECOVERY_ID, FILE_MENU_ID, OPEN_IN_STAGEPACK_ID, PROBLEM_ID,
     RECOVERY_ID, TITLE_ID,
     UNSAVED_MARK, WorkspaceView,
 };
@@ -438,6 +441,32 @@ fn a_cancelled_dialog_leaves_the_start_screen(cx: &mut TestAppContext) {
     assert!(is_start_screen(&typing, cx));
 }
 
+/// A zip file at `path` holding `files`, each a name and its bytes, stored as they are.
+fn zip_file(path: &Path, files: &[(&str, &[u8])]) {
+    use std::io::Write as _;
+
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+    let stored = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, bytes) in files {
+        zip.start_file(*name, stored).unwrap();
+        zip.write_all(bytes).unwrap();
+    }
+    zip.finish().unwrap();
+}
+
+/// What a start screen may never show: code, file names from inside a talk, or a path.
+fn assert_plain(words: &str, path: &Path) {
+    let hyphenated: Vec<&str> =
+        slides_format::LAYOUT_NAMES.iter().map(|layout| layout.name).filter(|name| name.contains('-')).collect();
+    let code = ["<", ".md", ".json", ".png", "assets/", "slides.md", "talk.json", "bytes", "os error"];
+    for code in code.iter().chain(&hyphenated) {
+        assert!(!words.contains(code), "{words:?} shows {code:?}");
+    }
+    assert!(!words.contains(&path.display().to_string()), "{words:?} shows its path");
+    let name = path.file_name().unwrap().to_string_lossy();
+    assert!(!words.contains(name.as_ref()), "{words:?} shows its name");
+}
+
 #[gpui_kit::test]
 fn a_talk_that_cannot_be_opened_says_why_and_stays(cx: &mut TestAppContext) {
     let (typing, _places, _root) = open_start(cx);
@@ -447,17 +476,51 @@ fn a_talk_that_cannot_be_opened_says_why_and_stays(cx: &mut TestAppContext) {
     answer_open(&typing, cx, true, Some(no_talk.path().to_path_buf()));
     assert!(is_start_screen(&typing, cx));
     assert!(!shows(&typing, cx, PROBLEM_ID));
-    assert_eq!(label_of(&typing, cx, START_PROBLEM_ID).as_deref(), Some("That folder has no talk in it."));
+    let said = label_of(&typing, cx, START_PROBLEM_ID);
+    assert_eq!(said.as_deref(), Some("That folder has no presentation in it."));
+    assert_plain(&said.unwrap(), no_talk.path());
     // Under the buttons.
     let problem = bounds_of(&typing, cx, START_PROBLEM_ID).unwrap();
     assert!(problem.top() >= bounds_of(&typing, cx, START_OPEN_FILE_ID).unwrap().bottom());
 
-    click_on(&typing, cx, START_OPEN_FILE_ID);
-    answer_open(&typing, cx, false, Some(no_talk.path().join("notes.txt")));
-    assert!(is_start_screen(&typing, cx));
-    let said = label_of(&typing, cx, START_PROBLEM_ID).expect("it says why");
-    assert!(said.contains("isn't a talk"), "{said}");
-    assert!(!said.contains(&no_talk.path().display().to_string()), "in words, not a path: {said}");
+    // Each kind of file that can't be opened, in one plain sentence.
+    let files = tempfile::tempdir().unwrap();
+    let manifest: &[u8] = br#"{"format":1,"entry":"slides.md"}"#;
+    let newer: &[u8] = br#"{"format":99,"entry":"slides.md"}"#;
+    let not_named: &[u8] = br#"{"format":1,"entry":"other.md"}"#;
+    let not_a_zip = files.path().join("notes.txt");
+    std::fs::write(&not_a_zip, "Just notes").unwrap();
+    let tiny = files.path().join("tiny.sptx");
+    std::fs::write(&tiny, "ab").unwrap();
+    let no_slides = files.path().join("no-slides.sptx");
+    zip_file(&no_slides, &[("talk.json", manifest), ("assets/x.png", b"png")]);
+    let unnamed = files.path().join("unnamed.sptx");
+    zip_file(&unnamed, &[("talk.json", not_named), ("slides.md", b"# Hi\n")]);
+    let from_later = files.path().join("later.sptx");
+    zip_file(&from_later, &[("talk.json", newer), ("slides.md", b"# Hi\n")]);
+    let not_ours = files.path().join("other.sptx");
+    zip_file(&not_ours, &[("readme.txt", b"hello")]);
+    let crowded = files.path().join("crowded.sptx");
+    let names: Vec<String> = (0..10_001).map(|at| format!("assets/{at}.txt")).collect();
+    let many: Vec<(&str, &[u8])> = names.iter().map(|name| (name.as_str(), &b""[..])).collect();
+    zip_file(&crowded, &many);
+    let cases = [
+        (&not_a_zip, "That file isn't a presentation made with this app."),
+        (&tiny, "That file isn't a presentation made with this app."),
+        (&not_ours, "That file isn't a presentation made with this app."),
+        (&no_slides, "That file is damaged, so it can't be opened."),
+        (&unnamed, "That file is damaged, so it can't be opened."),
+        (&from_later, "That presentation was made by a newer version of this app. Update the app to open it."),
+        (&crowded, "That presentation is too large to open."),
+    ];
+    for (file, expected) in cases {
+        click_on(&typing, cx, START_OPEN_FILE_ID);
+        answer_open(&typing, cx, false, Some(file.clone()));
+        assert!(is_start_screen(&typing, cx), "{}", file.display());
+        let said = label_of(&typing, cx, START_PROBLEM_ID).expect("it says why");
+        assert_eq!(said, expected, "{}", file.display());
+        assert_plain(&said, file);
+    }
 
     // The screen still works.
     pick(&typing, cx, "light");
@@ -496,23 +559,30 @@ fn unsaved_talks_are_listed_newest_first_with_their_words(cx: &mut TestAppContex
     assert!(!shows(&typing, cx, UNREADABLE_ID));
 }
 
+/// The time `hour`:`minute` on the day `year`-`month`-`day` here, in this computer's time zone.
+fn here_at(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> SystemTime {
+    use chrono::TimeZone as _;
+
+    chrono::Local.with_ymd_and_hms(year, month, day, hour, minute, 0).earliest().expect("a time that is").into()
+}
+
 #[test]
 fn when_reads_as_a_day_and_a_time() {
-    let now = SystemTime::now();
-    let today = when_words(now, now);
-    assert!(today.starts_with("Today "), "{today}");
-    let time = &today["Today ".len()..];
-    assert!(time.len() == 5 && time.as_bytes()[2] == b':', "{today}");
-    assert_eq!(when_words(now - Duration::from_secs(24 * 60 * 60), now), "Yesterday");
-    let long_ago = when_words(now - Duration::from_secs(40 * 24 * 60 * 60), now);
-    let months = [
-        "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November",
-        "December",
-    ];
-    assert!(months.iter().any(|month| long_ago.contains(month)), "{long_ago}");
-    assert!(long_ago.chars().next().unwrap().is_ascii_digit(), "the day first: {long_ago}");
-    let years_ago = when_words(now - Duration::from_secs(800 * 24 * 60 * 60), now);
-    assert!(years_ago.ends_with(|c: char| c.is_ascii_digit()), "with its year: {years_ago}");
+    let now = here_at(2026, 3, 12, 18, 0);
+    assert_eq!(when_words(here_at(2026, 3, 12, 14, 5), now), "Today 14:05");
+    assert_eq!(when_words(here_at(2026, 3, 12, 0, 1), now), "Today 00:01");
+    assert_eq!(when_words(here_at(2026, 3, 11, 23, 59), now), "Yesterday");
+    assert_eq!(when_words(here_at(2026, 3, 11, 0, 1), now), "Yesterday");
+    // Just after midnight, an hour back is yesterday.
+    assert_eq!(when_words(here_at(2026, 3, 11, 23, 30), here_at(2026, 3, 12, 0, 30)), "Yesterday");
+    // Across the first of a month and of a year.
+    assert_eq!(when_words(here_at(2026, 2, 28, 12, 0), here_at(2026, 3, 1, 9, 0)), "Yesterday");
+    assert_eq!(when_words(here_at(2025, 12, 31, 12, 0), here_at(2026, 1, 1, 9, 0)), "Yesterday");
+    assert_eq!(when_words(here_at(2026, 3, 10, 9, 0), now), "10 March");
+    assert_eq!(when_words(here_at(2026, 1, 2, 9, 0), now), "2 January");
+    assert_eq!(when_words(here_at(2025, 12, 31, 9, 0), now), "31 December 2025");
+    // A time ahead of the clock still reads as its day.
+    assert_eq!(when_words(here_at(2026, 3, 14, 9, 0), now), "14 March");
 }
 
 #[gpui_kit::test]
@@ -900,4 +970,313 @@ fn a_slidev_talk_can_still_be_opened_in_stagepack(cx: &mut TestAppContext) {
     }
     assert_eq!(std::fs::read_to_string(&said).unwrap(), format!("open\n{}\n", file.display()));
     assert!(is_start_screen(&typing, cx));
+}
+
+/// Clicks `id` in the window without letting anything that follows run.
+fn press_on(typing: &Typing, cx: &mut TestAppContext, id: impl Into<gpui_kit::ElementId>) {
+    let id = id.into();
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        window.click(id, cx);
+    });
+}
+
+fn is_open(cx: &TestAppContext, handle: AnyWindowHandle) -> bool {
+    windows(cx).iter().any(|window| window.window_id() == handle.window_id())
+}
+
+/// Answers the Save dialog that has just been asked for with `chosen`.
+fn choose_save(cx: &mut TestAppContext, chosen: PathBuf) {
+    cx.run_until_parked();
+    assert!(cx.did_prompt_for_new_path(), "a Save dialog is showing");
+    cx.simulate_new_path_selection(move |_| Some(chosen));
+    cx.run_until_parked();
+}
+
+/// The copies kept for the new presentation `id`, one folder each.
+fn slots_of(recovery: &Path, id: UntitledId) -> usize {
+    let hex = id.to_string();
+    let Ok(keys) = std::fs::read_dir(recovery) else { return 0 };
+    keys.flatten()
+        .filter_map(|key| std::fs::read_dir(key.path()).ok())
+        .flat_map(|slots| slots.flatten())
+        .filter(|slot| std::fs::read_to_string(slot.path().join("about.json")).unwrap_or_default().contains(&hex))
+        .count()
+}
+
+/// A window that has the new presentation `id` open, as if brought back from `text`, kept
+/// under `root`.
+fn open_elsewhere(cx: &mut TestAppContext, id: UntitledId, text: &str, root: &Path) -> Typing {
+    let talk = stagepack_studio::document::Document::untitled_with(
+        id,
+        text.to_string(),
+        Vec::new(),
+        Vec::new(),
+        slides_engine::Fonts::bundled_only(),
+    )
+    .unwrap();
+    open_untitled_talk(cx, talk, root)
+}
+
+#[gpui_kit::test]
+fn two_start_screens_never_bring_back_one_copy_twice(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let text = "# Only once\n";
+    let id = keep_untitled(root.path(), "Untitled presentation", text);
+    let here = open_start_under(cx, root.path());
+    let there = open_start_under(cx, root.path());
+    // Both asked before either has it.
+    press_on(&here, cx, unsaved_open_id(id));
+    press_on(&there, cx, unsaved_open_id(id));
+    cx.run_until_parked();
+    here.settle(cx);
+    there.settle(cx);
+    let (shown, left) = match (has_talk(&here, cx), has_talk(&there, cx)) {
+        (true, false) => (&here, &there),
+        (false, true) => (&there, &here),
+        both => panic!("one window has it, not {both:?}"),
+    };
+    assert_eq!(shown.source(cx), text);
+    assert!(is_start_screen(left, cx));
+    assert_eq!(label_of(left, cx, START_PROBLEM_ID), Some(NotTaken::Held.to_string()));
+    assert!(!shows(left, cx, unsaved_row_id(id)), "it comes off the list");
+}
+
+#[gpui_kit::test]
+fn a_copy_gone_since_it_was_listed_says_so(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let id = keep_untitled(root.path(), "Untitled presentation", "# Gone\n");
+    let typing = open_start_under(cx, root.path());
+    Recovery::new(root.path().join("recovery")).discard_untitled(id);
+    click_on(&typing, cx, unsaved_open_id(id));
+    cx.run_until_parked();
+    typing.settle(cx);
+    assert!(is_start_screen(&typing, cx));
+    assert_eq!(label_of(&typing, cx, START_PROBLEM_ID), Some(NotTaken::Gone.to_string()));
+    assert!(!shows(&typing, cx, unsaved_row_id(id)), "it comes off the list");
+}
+
+#[gpui_kit::test]
+fn a_copy_open_in_another_window_says_so(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let text = "# Elsewhere\n";
+    let id = keep_untitled(root.path(), "Untitled presentation", text);
+    let typing = open_start_under(cx, root.path());
+    assert!(shows(&typing, cx, unsaved_row_id(id)));
+    // Another window of this app has it, its own copy not kept yet.
+    let _other = open_elsewhere(cx, id, text, root.path());
+    click_on(&typing, cx, unsaved_open_id(id));
+    cx.run_until_parked();
+    typing.settle(cx);
+    assert!(is_start_screen(&typing, cx));
+    assert_eq!(label_of(&typing, cx, START_PROBLEM_ID), Some(NotTaken::Held.to_string()));
+    assert!(!shows(&typing, cx, unsaved_row_id(id)), "it comes off the list");
+}
+
+#[gpui_kit::test]
+fn a_copy_another_running_app_holds_says_so(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let recovery = root.path().join("recovery");
+    let id = keep_untitled(root.path(), "Untitled presentation", "# Held\n");
+    let typing = open_start_under(cx, root.path());
+    assert!(shows(&typing, cx, unsaved_row_id(id)));
+    // The other app's lock on it, taken once it was listed.
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(untitled_slot(&recovery, id).join("held"))
+        .unwrap();
+    held.lock().unwrap();
+    click_on(&typing, cx, unsaved_open_id(id));
+    cx.run_until_parked();
+    typing.settle(cx);
+    assert!(is_start_screen(&typing, cx));
+    assert_eq!(label_of(&typing, cx, START_PROBLEM_ID), Some(NotTaken::Held.to_string()));
+    assert!(!shows(&typing, cx, unsaved_row_id(id)), "it comes off the list");
+    assert_eq!(slots_of(&recovery, id), 1, "and stays where it is");
+}
+
+#[gpui_kit::test]
+fn a_copy_that_cannot_be_read_stays_to_be_discarded(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let recovery = root.path().join("recovery");
+    let id = keep_untitled(root.path(), "Untitled presentation", "# Spoilt later\n");
+    let typing = open_start_under(cx, root.path());
+    std::fs::write(untitled_slot(&recovery, id).join("slides.md"), [0xff, 0xfe, b'#']).unwrap();
+    click_on(&typing, cx, unsaved_open_id(id));
+    cx.run_until_parked();
+    typing.settle(cx);
+    assert!(is_start_screen(&typing, cx));
+    assert_eq!(label_of(&typing, cx, START_PROBLEM_ID), Some(NotTaken::Unreadable.to_string()));
+    assert!(shows(&typing, cx, unsaved_row_id(id)), "it stays");
+    assert!(shows(&typing, cx, unsaved_discard_id(id)), "with Discard offered");
+    click_on(&typing, cx, unsaved_discard_id(id));
+    click_on(&typing, cx, CONFIRM_DISCARD_ID);
+    cx.run_until_parked();
+    typing.settle(cx);
+    assert!(!shows(&typing, cx, unsaved_row_id(id)));
+    assert_eq!(slots_of(&recovery, id), 0);
+}
+
+#[gpui_kit::test]
+fn open_clicked_twice_brings_it_back_once(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let recovery = root.path().join("recovery");
+    let text = "# Twice\n";
+    let id = keep_untitled(root.path(), "Untitled presentation", text);
+    let typing = open_start_under(cx, root.path());
+    let before = windows(cx).len();
+    press_on(&typing, cx, unsaved_open_id(id));
+    press_on(&typing, cx, unsaved_open_id(id));
+    cx.run_until_parked();
+    typing.settle(cx);
+    assert_eq!(windows(cx).len(), before);
+    assert_eq!(typing.source(cx), text);
+    wait(cx, KEEP_PAUSE);
+    assert_eq!(slots_of(&recovery, id), 1, "kept once, as this window's own");
+}
+
+#[gpui_kit::test]
+fn discard_leaves_a_copy_another_window_has_open(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let recovery = root.path().join("recovery");
+    let text = "# Still needed\n";
+    let id = keep_untitled(root.path(), "Untitled presentation", text);
+    let typing = open_start_under(cx, root.path());
+    click_on(&typing, cx, unsaved_discard_id(id));
+    // Brought back in another window while the question was up, and edited there before it
+    // kept its own copy: last time's is offered there, not let go.
+    let _other = open_elsewhere(cx, id, "# Still needed, and more\n", root.path());
+    click_on(&typing, cx, CONFIRM_DISCARD_ID);
+    cx.run_until_parked();
+    typing.settle(cx);
+    assert_eq!(label_of(&typing, cx, START_PROBLEM_ID).as_deref(), Some(OPEN_ELSEWHERE));
+    assert_eq!(slots_of(&recovery, id), 1, "last time's copy stays until that window keeps its own");
+    assert!(!shows(&typing, cx, unsaved_row_id(id)));
+}
+
+#[gpui_kit::test]
+fn the_list_is_read_again_as_the_window_comes_to_the_front(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let typing = open_start_under(cx, root.path());
+    let id = keep_untitled(root.path(), "Untitled presentation", "# Since\n");
+    wait(cx, 1_000);
+    assert!(!shows(&typing, cx, unsaved_row_id(id)), "nothing is read while it's left");
+    VisualTestContext::from_window(typing.handle, cx).deactivate_window();
+    typing.with_window(cx, |window, _| window.activate_window());
+    cx.run_until_parked();
+    typing.settle(cx);
+    assert!(shows(&typing, cx, unsaved_row_id(id)));
+}
+
+#[gpui_kit::test]
+fn a_window_reads_its_build_permissions_again(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let places = UntitledPlaces::under(root.path());
+    let talk = tempfile::tempdir().unwrap();
+    std::fs::write(talk.path().join("slides.md"), "# One\n\n<Score />\n").unwrap();
+    std::fs::create_dir(talk.path().join("components")).unwrap();
+    std::fs::write(
+        talk.path().join("components/score.rs"),
+        "use toolkit::prelude::*;\n\n#[component]\nfn Score() -> Element {\n    text(\"Score\")\n}\n",
+    )
+    .unwrap();
+    let typing = open_start_under(cx, root.path());
+    // Another window says it's always built, after this one was opened.
+    BuildPermissions::load(places.permissions.clone()).set_always(talk.path()).unwrap();
+    click_on(&typing, cx, START_OPEN_FOLDER_ID);
+    answer_open(&typing, cx, true, Some(talk.path().to_path_buf()));
+    assert!(shows(&typing, cx, BUILD_BAR_ID));
+    assert!(!shows(&typing, cx, BUILD_ALWAYS_ID), "it knows the folder is always built");
+}
+
+#[gpui_kit::test]
+fn closing_a_talk_made_from_the_start_screen_asks_and_saves(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let places = UntitledPlaces::under(root.path());
+
+    // Made from a template, then edited.
+    let typing = open_start_under(cx, root.path());
+    pick(&typing, cx, "light");
+    let at = typing.placeholder_point(cx, "body");
+    typing.click(cx, at);
+    typing.type_text(cx, "Kept words");
+    typing.press(cx, "escape");
+    let edited = typing.source(cx);
+    assert!(!VisualTestContext::from_window(typing.handle, cx).simulate_close(), "it asks");
+    cx.run_until_parked();
+    click_on(&typing, cx, CLOSE_SAVE_ID);
+    click_on(&typing, cx, SAVE_AS_PACKED_ID);
+    let out = places.documents.join("Kept.sptx");
+    choose_save(cx, out.clone());
+    assert_eq!(slides_engine::open_packed(&out).unwrap().slides().unwrap(), edited);
+    assert!(!is_open(cx, typing.handle), "and closes once saved");
+
+    // Brought back.
+    let text = "# Brought back\n";
+    let id = keep_untitled(root.path(), "Untitled presentation", text);
+    let typing = open_start_under(cx, root.path());
+    click_on(&typing, cx, unsaved_open_id(id));
+    cx.run_until_parked();
+    typing.settle(cx);
+    assert!(!VisualTestContext::from_window(typing.handle, cx).simulate_close(), "unsaved, so it asks");
+    cx.run_until_parked();
+    click_on(&typing, cx, CLOSE_SAVE_ID);
+    click_on(&typing, cx, SAVE_AS_FOLDER_ID);
+    let folder = places.documents.join("Back");
+    choose_save(cx, folder.clone());
+    assert_eq!(std::fs::read_to_string(folder.join("slides.md")).unwrap(), text);
+    assert!(!is_open(cx, typing.handle));
+}
+
+/// Presses Ctrl+N and Ctrl+O in `typing`'s window: a start screen opens, and the Open dialog
+/// is asked for, which is then cancelled.
+fn new_and_open(typing: &Typing, cx: &mut TestAppContext, what: &str) {
+    let before = windows(cx);
+    typing.press(cx, "ctrl-n");
+    cx.run_until_parked();
+    let new = the_new_window(cx, &before);
+    new.settle(cx);
+    assert!(is_start_screen(&new, cx), "{what}: Ctrl+N");
+    typing.press(cx, "ctrl-o");
+    cx.run_until_parked();
+    assert!(cx.did_prompt_for_paths(), "{what}: Ctrl+O");
+    cx.simulate_path_prompt_response(|options| {
+        assert!(options.files && !options.directories);
+        None
+    });
+    cx.run_until_parked();
+}
+
+#[gpui_kit::test]
+fn the_keys_open_from_wherever_the_keyboard_is(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let typing = open_start_under(cx, root.path());
+    pick(&typing, cx, "tour");
+    let source = typing.source(cx);
+
+    // Typing on the slide.
+    typing.click_text(cx, 0, pos(0, 2));
+    assert!(typing.editing(cx).is_some());
+    new_and_open(&typing, cx, "on the slide");
+    assert_eq!(typing.source(cx), source, "nothing typed");
+    typing.press(cx, "escape");
+
+    // In the notes.
+    click_on(&typing, cx, NOTES_ID);
+    new_and_open(&typing, cx, "in the notes");
+    assert_eq!(typing.source(cx), source, "nothing typed");
+
+    // In a form field.
+    click_on(&typing, cx, strip_row_id(3));
+    assert_eq!(typing.current(cx), 3);
+    let shape = thing(&typing, cx, "<Shape");
+    let at = middle(&typing, cx, &shape);
+    typing.click(cx, at);
+    assert!(selected(&typing, cx).is_some());
+    click_on(&typing, cx, gpui_kit::SharedString::from(field_id("x")));
+    new_and_open(&typing, cx, "in a form field");
+    assert_eq!(typing.source(cx), source, "nothing typed");
 }

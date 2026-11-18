@@ -1813,3 +1813,15 @@ fn a_copy_with_a_time_ahead_of_the_clock_is_still_swept() {
     recovery.sweep(KEEP_FOR);
     assert!(!slot.exists());
 }
+
+#[test]
+fn a_copy_is_kept_when_its_lock_is_refused() {
+    let (_dir, root) = scratch_root();
+    let window = Recovery::new(root.clone()).for_another_window();
+    window.fail_locks_for_test();
+    let id = UntitledId::random();
+    window.keep_untitled(id, "Untitled presentation", "# Kept anyway\n", &[], &[]).expect("kept without a lock");
+    window.keep_untitled(id, "Untitled presentation", "# And again\n", &[], &[]).expect("and every time after");
+    let slot = untitled_slot(&root, id);
+    assert_eq!(std::fs::read_to_string(slot.join("slides.md")).unwrap(), "# And again\n");
+}
