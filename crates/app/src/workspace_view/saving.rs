@@ -20,6 +20,7 @@ impl WorkspaceView {
     /// Keeps working copies of unsaved changes in `recovery`, in a slot of this window's own,
     /// and offers back the newest one left there for this talk, if any.
     pub(super) fn use_recovery(&mut self, recovery: Recovery, cx: &mut Context<Self>) {
+        self.recovery = Some(recovery.clone());
         self.working_copies
             .update(cx, |copies, cx| copies.use_recovery(recovery, cx));
     }

@@ -7150,6 +7150,7 @@ name = "stagepack-studio"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "dirs 6.0.0",
  "futures",
  "gpui-kit",

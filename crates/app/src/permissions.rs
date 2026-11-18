@@ -19,6 +19,7 @@ struct Stored {
 }
 
 /// The folders whose components are built whenever they change.
+#[derive(Clone)]
 pub struct BuildPermissions {
     file: PathBuf,
     /// Each folder by its canonical path, so however it's written it's the same folder.

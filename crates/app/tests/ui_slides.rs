@@ -2086,6 +2086,7 @@ fn saved_goes_from_the_status_line_after_five_seconds_or_at_the_next_edit(
 #[gpui_kit::test]
 fn the_file_menu_names_both_ways_to_open_a_talk(cx: &mut TestAppContext) {
     let handle = open_talk(cx, "# One\n");
+    assert!(file_menu_has(cx, handle, "New presentation…"));
     assert!(file_menu_has(cx, handle, "Open talk folder…"));
     assert!(file_menu_has(cx, handle, "Open talk file…"));
     assert!(!file_menu_has(cx, handle, "Open folder…"));

@@ -49,6 +49,20 @@ impl Document {
         };
     }
 
+    /// The number of an untitled talk among those open, as [`Self::set_untitled_number`] gave
+    /// it, 1 for one called by the name alone. A talk with a place has none.
+    pub fn untitled_number(&self) -> Option<usize> {
+        if !self.is_untitled() {
+            return None;
+        }
+        let name = self.place.name();
+        match self.place_name.strip_prefix(name.as_str()) {
+            Some("") => Some(1),
+            Some(rest) => rest.strip_prefix(' ')?.parse().ok(),
+            None => None,
+        }
+    }
+
     /// A save of the talk as it is now, where it's kept: for a folder, only its `slides.md` and
     /// the files added that it uses. An untitled talk is kept nowhere, so its job fails.
     pub fn save_job(&self) -> SaveJob {

@@ -33,6 +33,7 @@ pub mod slide_canvas;
 pub mod slide_editor;
 pub mod slide_strip;
 pub mod snap;
+pub mod start_screen;
 pub mod table_tools;
 pub mod templates;
 pub mod text_editing;
