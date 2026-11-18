@@ -32,7 +32,7 @@ pub(crate) struct LargeHome {
     hashes: BTreeMap<PathBuf, [u8; 32]>,
     /// The large files brought back from last time that couldn't be taken into this window's
     /// working copy, and lie in last time's still, which is kept until they're taken in.
-    left_in_last: BTreeSet<String>,
+    left_in_last: LeftInLast,
     readers: Arc<Readers>,
     /// Where a video a pack holds compressed is unpacked to; the app's own if none is given.
     cache: Option<VideoCache>,
@@ -48,14 +48,57 @@ pub(crate) struct LargeHome {
 pub struct LargeKeep {
     added: Arc<AddedSet>,
     spoken_for: SpokenFor,
+    left_in_last: LeftInLast,
 }
 
 impl LargeKeep {
     /// The files to keep, by where they lie, as things are now.
     pub fn held(&self) -> BTreeSet<PathBuf> {
+        self.held_with(&lock(&self.spoken_for))
+    }
+
+    /// Takes each large file brought back that still lies in last time's working copy into
+    /// `recovery`, this window's, for the talk at `place`, and reads it from there from then on:
+    /// once none lie there, last time's copy can go. Done by a background job, as it may copy the
+    /// whole file; one that can't be taken in waits for the next save, or the next start.
+    pub fn take_in_left_in_last(&self, recovery: &Recovery, place: &TalkPlace) {
+        if !self.left_in_last.again.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let left: Vec<String> = self.left_in_last.paths().iter().cloned().collect();
+        for path in left {
+            let Some(at) = self.added.lies_at(&path) else {
+                self.left_in_last.paths().remove(&path);
+                continue;
+            };
+            if let Ok(here) = recovery.take_in(place, &path, &at) {
+                self.added.move_at(&path, here);
+                self.left_in_last.paths().remove(&path);
+            }
+        }
+    }
+
+    fn held_with(&self, spoken_for: &BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
         let mut held: BTreeSet<PathBuf> = self.added.files_on_disk().into_iter().collect();
-        held.extend(lock(&self.spoken_for).iter().cloned());
+        held.extend(spoken_for.iter().cloned());
         held
+    }
+}
+
+/// What's to stay as it was at one moment.
+struct HeldNow(BTreeSet<PathBuf>);
+
+impl Keeping for HeldNow {
+    fn keeps(&self, file: &Path) -> bool {
+        self.0.iter().any(|kept| is_or_becomes(file, kept))
+    }
+
+    fn keeps_any_under(&self, folder: &Path) -> bool {
+        self.0.iter().any(|kept| kept.starts_with(folder))
+    }
+
+    fn while_held(&self, f: &mut dyn FnMut(&dyn Keeping)) {
+        f(self);
     }
 }
 
@@ -77,6 +120,29 @@ impl Keeping for LargeKeep {
 
     fn keeps_any_under(&self, folder: &Path) -> bool {
         self.held().iter().any(|kept| kept.starts_with(folder))
+    }
+
+    /// No copy is given room while `f` runs: room is given under the same lock.
+    fn while_held(&self, f: &mut dyn FnMut(&dyn Keeping)) {
+        let spoken_for = lock(&self.spoken_for);
+        f(&HeldNow(self.held_with(&spoken_for)));
+    }
+}
+
+/// The large files brought back from last time that couldn't be taken into this window's
+/// working copy, shared with the working copies' background jobs, which try again.
+#[derive(Clone, Default)]
+pub(crate) struct LeftInLast {
+    paths: Arc<Mutex<BTreeSet<String>>>,
+    /// Whether to try again: once, after they're brought back, and again after each save. A
+    /// try that fails waits for one of those, as on a disk that can't link it copies the whole
+    /// file each time.
+    again: Arc<AtomicBool>,
+}
+
+impl LeftInLast {
+    fn paths(&self) -> std::sync::MutexGuard<'_, BTreeSet<String>> {
+        self.paths.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -503,7 +569,7 @@ impl Document {
 
     /// What the working copies keep of their slot when they clear it.
     pub fn large_keep(&self) -> LargeKeep {
-        LargeKeep { added: self.added.clone(), spoken_for: self.large.spoken_for.clone() }
+        LargeKeep { added: self.added.clone(), spoken_for: self.large.spoken_for.clone(), left_in_last: self.large.left_in_last.clone() }
     }
 
     /// Takes back `large`, the large files kept with a working copy from last time, by their
@@ -529,12 +595,13 @@ impl Document {
                 continue;
             }
             // If it can't be taken in, it's read where it lies, and last time's slot is kept
-            // until it is: see `Self::take_in_left_in_last`.
+            // until it is: see `LargeKeep::take_in_left_in_last`.
             let taken = self.large.recovery.as_ref().and_then(|recovery| recovery.take_in(&self.place, &path, &at).ok());
             let left = taken.is_none();
             if self.added.add_at(&path, taken.unwrap_or(at), len) {
                 if left {
-                    self.large.left_in_last.insert(path.clone());
+                    self.large.left_in_last.paths().insert(path.clone());
+                    self.large.left_in_last.again.store(true, Ordering::SeqCst);
                 }
                 self.pending.insert(path);
                 any = true;
@@ -549,25 +616,11 @@ impl Document {
         }
     }
 
-    /// Takes each large file brought back that still lies in last time's working copy into this
-    /// window's own, now, and reads it from there from then on: once none lie there, last time's
-    /// copy can go. One that still can't be taken in is tried again next time.
-    pub fn take_in_left_in_last(&mut self) {
-        let Some(recovery) = self.large.recovery.clone() else {
-            return;
-        };
-        let mut moved = false;
-        for path in std::mem::take(&mut self.large.left_in_last) {
-            let Some(at) = self.added.lies_at(&path) else { continue };
-            match recovery.take_in(&self.place, &path, &at) {
-                Ok(here) => moved |= self.added.move_at(&path, here),
-                Err(_) => {
-                    self.large.left_in_last.insert(path);
-                }
-            }
-        }
-        if moved {
-            self.deck.files_added();
+    /// The talk was saved: a large file brought back that couldn't be taken into this window's
+    /// working copy is tried again.
+    pub(crate) fn large_saved(&self) {
+        if !self.large.left_in_last.paths().is_empty() {
+            self.large.left_in_last.again.store(true, Ordering::SeqCst);
         }
     }
 

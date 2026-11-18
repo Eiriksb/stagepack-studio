@@ -514,17 +514,24 @@ impl Recovery {
         self.clear_keeping_between(place, keep, &|| {});
     }
 
-    /// [`Self::clear_keeping`], doing `between` once it has looked at what's kept and before it
-    /// removes anything, as a copy running on another thread may. For tests.
+    /// [`Self::clear_keeping`], doing `between` once it has begun and before it looks at what's
+    /// kept, as a copy running on another thread may. For tests.
     #[doc(hidden)]
     pub fn clear_keeping_between(&self, place: &TalkPlace, keep: &dyn Keeping, between: &dyn Fn()) {
         let folder = self.root.join(key(&canonical(place))).join(&self.slot);
         let files = folder.join(FILES_FOLDER);
-        let any_kept = keep.keeps_any_under(&folder) || files_kept_in(&files).iter().any(|file| keep.keeps(file));
         between();
-        if !any_kept {
-            // A copy that has room kept for it from now on makes the slot's folders again.
-            self.clear(place);
+        // Whether to take the whole slot is decided, and done, while no copy can be given room
+        // in it; one given room after makes the slot's folders again.
+        let mut cleared = false;
+        keep.while_held(&mut |keep| {
+            let any_kept = keep.keeps_any_under(&folder) || files_kept_in(&files).iter().any(|file| keep.keeps(file));
+            if !any_kept {
+                self.clear(place);
+                cleared = true;
+            }
+        });
+        if cleared {
             return;
         }
         let Ok(entries) = std::fs::read_dir(&folder) else { return };
@@ -747,6 +754,8 @@ pub trait Keeping {
     fn keeps(&self, file: &Path) -> bool;
     /// Whether anything under `folder` is to stay, there already or being copied there.
     fn keeps_any_under(&self, folder: &Path) -> bool;
+    /// Does `f` with what's to stay as it is now, which nothing is added to until `f` is done.
+    fn while_held(&self, f: &mut dyn FnMut(&dyn Keeping));
 }
 
 /// Keeps nothing.
@@ -760,24 +769,43 @@ impl Keeping for KeepNothing {
     fn keeps_any_under(&self, _: &Path) -> bool {
         false
     }
+
+    fn while_held(&self, f: &mut dyn FnMut(&dyn Keeping)) {
+        f(self);
+    }
 }
 
-/// The working copies' folders tests have taking a file in fail in.
-static TAKE_IN_FAILS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+/// The working copies' folders tests have taking a file in fail in, with how often it was tried.
+static TAKE_IN_FAILS: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
 
 /// Has [`Recovery::take_in`] fail for the working copies under `root`, as on a disk that can
 /// neither link nor copy. For tests.
 #[doc(hidden)]
 pub fn set_take_in_fails_for_test(root: &Path, fails: bool) {
     let mut failing = TAKE_IN_FAILS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    failing.retain(|at| at != root);
+    failing.retain(|(at, _)| at != root);
     if fails {
-        failing.push(root.to_path_buf());
+        failing.push((root.to_path_buf(), 0));
     }
 }
 
+/// How often taking a file in was tried under `root` since [`set_take_in_fails_for_test`]. For
+/// tests.
+#[doc(hidden)]
+pub fn take_in_tries_for_test(root: &Path) -> usize {
+    TAKE_IN_FAILS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter().find(|(at, _)| at == root).map_or(0, |(_, tries)| *tries)
+}
+
+/// Whether taking a file in under `root` is to fail, for a test, counting the try.
 fn take_in_fails(root: &Path) -> bool {
-    TAKE_IN_FAILS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter().any(|at| at == root)
+    let mut failing = TAKE_IN_FAILS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match failing.iter_mut().find(|(at, _)| at == root) {
+        Some((_, tries)) => {
+            *tries += 1;
+            true
+        }
+        None => false,
+    }
 }
 
 /// Why a new presentation's working copy wasn't taken.

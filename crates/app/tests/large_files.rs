@@ -1496,3 +1496,133 @@ fn the_window_adds_and_saves_a_large_file_as_a_file_twin(cx: &mut TestAppContext
 fn the_window_adds_and_saves_a_large_file_as_a_file(cx: &mut TestAppContext) {
     window_adds_and_saves(cx, LARGE);
 }
+
+// Round two of review.
+
+/// Holds back the window's saves, if `saves`, and copies, if `copies`, until released.
+fn hold_work(typing: &Typing, cx: &mut TestAppContext, saves: bool, copies: bool) {
+    cx.update(|cx| typing.view.update(cx, |view, _| view.hold_work_for_test(saves, copies)));
+}
+
+fn release_work(typing: &Typing, cx: &mut TestAppContext) {
+    cx.update(|cx| typing.view.update(cx, |view, cx| view.release_held_work_for_test(cx)));
+    cx.run_until_parked();
+}
+
+fn is_open(cx: &TestAppContext, handle: gpui_kit::AnyWindowHandle) -> bool {
+    cx.read(|cx| cx.windows().iter().any(|window| window.window_id() == handle.window_id()))
+}
+
+fn click_in(cx: &mut TestAppContext, handle: gpui_kit::AnyWindowHandle, id: &'static str) {
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(id, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui_kit::test]
+fn dont_save_while_a_save_runs_waits_for_it(cx: &mut TestAppContext) {
+    set_up();
+    let work = tempfile::tempdir().unwrap();
+    let from = patterned(work.path(), "clip.mp4", TWIN, 42);
+    let root = work.path().join("recovery");
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::write(folder.path().join("slides.md"), "# Talk\n").unwrap();
+    let talk_folder = folder.path().to_path_buf();
+    let typing = open_folder(cx, folder, Some(Recovery::new(root.clone())));
+    let path = copy_in(&typing, cx, &from);
+    wait(cx, KEEP_PAUSE);
+    let lies = typing.document(cx).read_with(cx, |document, _| lies_at(document, &path)).unwrap();
+    // The save is held as if it took a while; meanwhile the window is closed, and the person
+    // says not to save.
+    hold_work(&typing, cx, true, false);
+    typing.press(cx, "ctrl-s");
+    let handle = typing.handle;
+    assert!(!gpui_kit::VisualTestContext::from_window(handle, cx).simulate_close());
+    cx.run_until_parked();
+    click_in(cx, handle, stagepack_studio::workspace_view::CLOSE_DONT_SAVE_ID);
+    assert!(is_open(cx, handle), "it waits for the save");
+    assert!(lies.exists(), "the video the save reads is still there");
+    release_work(&typing, cx);
+    // The save ran to its end and wrote the video; only then did the working copy go, and the
+    // window with it.
+    assert!(same_pieces(std::fs::File::open(talk_folder.join(&path)).unwrap(), std::fs::File::open(&from).unwrap()));
+    assert!(!is_open(cx, handle), "closed once the save was done");
+    assert!(files_under(&root).is_empty(), "{:?}", files_under(&root));
+}
+
+#[gpui_kit::test]
+fn a_copy_that_never_ends_never_keeps_the_window_open(cx: &mut TestAppContext) {
+    set_up();
+    let work = tempfile::tempdir().unwrap();
+    let from = patterned(work.path(), "clip.mp4", TWIN, 43);
+    let root = work.path().join("root");
+    let typing = open_untitled_talk(cx, untitled(), &root);
+    // Held, as a copy stuck reading a disk that went away is.
+    hold_work(&typing, cx, false, true);
+    start_copy(&typing, cx, &from);
+    let handle = typing.handle;
+    assert!(!gpui_kit::VisualTestContext::from_window(handle, cx).simulate_close());
+    cx.run_until_parked();
+    assert!(is_open(cx, handle), "the first close waits for the copy it stopped");
+    // Asked again, it closes without it.
+    gpui_kit::VisualTestContext::from_window(handle, cx).simulate_close();
+    cx.run_until_parked();
+    assert!(!is_open(cx, handle), "the second doesn't");
+}
+
+#[gpui_kit::test]
+fn dont_save_waits_for_a_copy_it_stopped(cx: &mut TestAppContext) {
+    set_up();
+    let work = tempfile::tempdir().unwrap();
+    let from = patterned(work.path(), "clip.mp4", TWIN, 44);
+    let root = work.path().join("root");
+    let typing = open_untitled_talk(cx, untitled(), &root);
+    typing.press(cx, "ctrl-m");
+    let handle = typing.handle;
+    assert!(!gpui_kit::VisualTestContext::from_window(handle, cx).simulate_close());
+    cx.run_until_parked();
+    // A copy started while the window asks whether to save.
+    hold_work(&typing, cx, false, true);
+    start_copy(&typing, cx, &from);
+    click_in(cx, handle, stagepack_studio::workspace_view::CLOSE_DONT_SAVE_ID);
+    assert!(is_open(cx, handle), "it waits for the copy it stopped to end");
+    assert_eq!(progress_label(&typing, cx).as_deref(), Some(stagepack_studio::workspace_view::STOPPING));
+    release_work(&typing, cx);
+    assert!(!is_open(cx, handle), "and closes once it has");
+    assert!(files_under(&root.join("recovery")).is_empty(), "nothing is left: {:?}", files_under(&root));
+}
+
+#[gpui_kit::test]
+fn a_take_in_that_fails_is_not_tried_at_every_keep(cx: &mut TestAppContext) {
+    set_up();
+    let work = tempfile::tempdir().unwrap();
+    let from = patterned(work.path(), "clip.mp4", TWIN, 45);
+    let root = work.path().join("root");
+    let recovery_root = root.join("recovery");
+    let (typing, path) = window_with_video(cx, &root, &from);
+    wait(cx, KEEP_PAUSE);
+    let TalkPlace::Untitled(id) = typing.document(cx).read_with(cx, |document, _| document.place().clone()) else {
+        panic!("untitled")
+    };
+    let Typing { handle, view, .. } = typing;
+    drop(view);
+    cx.update_window(handle, |_, window, _| window.remove_window()).unwrap();
+    cx.run_until_parked();
+    stagepack_studio::recovery::set_take_in_fails_for_test(&recovery_root, true);
+    let found = Recovery::new(recovery_root.clone()).take_untitled(id).unwrap();
+    let back = open_brought_back(cx, id, found, 2, &root);
+    wait(cx, KEEP_PAUSE);
+    let tried = stagepack_studio::recovery::take_in_tries_for_test(&recovery_root);
+    assert!(tried >= 1);
+    // More edits, more keeps: not tried again until the talk is saved.
+    for _ in 0..3 {
+        back.press(cx, "ctrl-m");
+        wait(cx, KEEP_PAUSE);
+    }
+    assert_eq!(stagepack_studio::recovery::take_in_tries_for_test(&recovery_root), tried);
+    back.document(cx).read_with(cx, |document, _| assert!(reads_back(document, &path, &from)));
+    stagepack_studio::recovery::set_take_in_fails_for_test(&recovery_root, false);
+}

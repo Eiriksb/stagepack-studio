@@ -161,7 +161,7 @@ impl WorkspaceView {
         };
         let meter = self.start_progress(COPYING_VIDEO, true, cx);
         let running = meter.clone();
-        cx.spawn(async move |this, cx| {
+        let start = move |_: &mut Self, cx: &mut Context<Self>| cx.spawn(async move |this, cx| {
             let copied = cx.background_spawn(async move { copy.run(&|done, total| running.tell(done, total), running.stop()) }).await;
             this.update(cx, |this, cx| {
                 this.end_progress(&meter, cx);
@@ -178,6 +178,7 @@ impl WorkspaceView {
             .ok();
         })
         .detach();
+        self.start_work(false, start, cx);
     }
 
     /// Copies the large files `files` carries that `markdown`, a pasted thing's or slide's, uses
@@ -268,7 +269,7 @@ impl WorkspaceView {
         let WaitingPaste { copies, mut files, paste } = waiting;
         let meter = self.start_progress(COPYING_VIDEO, true, cx);
         let running = meter.clone();
-        cx.spawn(async move |this, cx| {
+        let start = move |_: &mut Self, cx: &mut Context<Self>| cx.spawn(async move |this, cx| {
             let copied = cx
                 .background_spawn(async move {
                     let total: u64 = copies.iter().map(|(_, copy)| copy.len()).sum();
@@ -312,6 +313,7 @@ impl WorkspaceView {
             .ok();
         })
         .detach();
+        self.start_work(false, start, cx);
     }
 
     /// Gives the slide the keyboard once a thing just put on it is selected there, from

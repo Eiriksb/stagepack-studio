@@ -322,6 +322,16 @@ struct Progressing {
 /// What the status line says of work asked to stop, until it has.
 pub const STOPPING: &str = "Stopping…";
 
+/// Background work, started on the window's thread.
+type Start = Box<dyn FnOnce(&mut WorkspaceView, &mut Context<WorkspaceView>)>;
+
+/// Background work a test holds back, to do things while it would be running.
+struct HeldWork {
+    saves: bool,
+    copies: bool,
+    held: Vec<Start>,
+}
+
 /// How often the status line is drawn again while it shows how far work has got.
 const PROGRESS_TICK: Duration = Duration::from_millis(100);
 
@@ -351,6 +361,16 @@ pub struct WorkspaceView {
     progressing: Vec<Progressing>,
     /// Whether the window is to close once the copies it stopped as it was closed have ended.
     close_when_idle: bool,
+    /// How many saves are running, which a window closing waits for before it lets anything of
+    /// the working copy go: a save may be reading a video from it.
+    saves_running: usize,
+    /// Whether the window is to finish closing once nothing it waits for runs.
+    finish_closing: bool,
+    /// Whether it was asked to close again while copies it stopped hadn't ended, and closes
+    /// without waiting for them.
+    close_anyway: bool,
+    /// For tests: which kinds of background work are held back, and those held.
+    held_work: Option<HeldWork>,
     /// The wait before a status that only stays a while goes, while it's showing.
     status_fading: Option<Task<()>>,
     markdown_panel: Entity<MarkdownPanel>,
@@ -648,6 +668,10 @@ impl WorkspaceView {
             status: None,
             progressing: Vec::new(),
             close_when_idle: false,
+            saves_running: 0,
+            finish_closing: false,
+            close_anyway: false,
+            held_work: None,
             status_fading: None,
             markdown_panel,
             show_markdown: panels.markdown,
@@ -1164,6 +1188,7 @@ impl WorkspaceView {
     pub(crate) fn end_progress(&mut self, meter: &std::sync::Arc<Meter>, cx: &mut Context<Self>) {
         self.progressing.retain(|progressing| !std::sync::Arc::ptr_eq(&progressing.meter, meter));
         cx.notify();
+        self.closing_may_go_on(cx);
         if self.close_when_idle && !self.stops_running() {
             self.close_when_idle = false;
             let (window, view) = (self.window_handle, cx.weak_entity());
@@ -1187,6 +1212,45 @@ impl WorkspaceView {
         self.progressing.iter().rev().find(|progressing| !stopped(progressing)).or(self.progressing.last())
     }
 
+    /// Holds back saves, if `saves`, and copies into the talk, if `copies`, as they're started,
+    /// until [`Self::release_held_work_for_test`]: they count as running meanwhile. For tests,
+    /// whose background work otherwise runs to its end at once.
+    #[doc(hidden)]
+    pub fn hold_work_for_test(&mut self, saves: bool, copies: bool) {
+        self.held_work = Some(HeldWork { saves, copies, held: Vec::new() });
+    }
+
+    /// Starts the work held back, and holds back no more.
+    #[doc(hidden)]
+    pub fn release_held_work_for_test(&mut self, cx: &mut Context<Self>) {
+        for start in self.held_work.take().map(|held| held.held).unwrap_or_default() {
+            start(self, cx);
+        }
+    }
+
+    /// Starts `start`, background work that's a save if `save` and else a copy into the talk,
+    /// unless a test holds that kind back.
+    pub(crate) fn start_work(&mut self, save: bool, start: impl FnOnce(&mut Self, &mut Context<Self>) + 'static, cx: &mut Context<Self>) {
+        match &mut self.held_work {
+            Some(held) if (save && held.saves) || (!save && held.copies) => held.held.push(Box::new(start)),
+            _ => start(self, cx),
+        }
+    }
+
+    /// Whether the window closing has to wait: for a save running, which may be reading what the
+    /// working copy holds, and for copies it stopped, unless it was asked to close anyway.
+    pub(super) fn close_waits(&self) -> bool {
+        self.saves_running > 0 || (self.stops_running() && !self.close_anyway)
+    }
+
+    /// Finishes closing the window, if it's waiting to and nothing it waits for runs any more.
+    pub(super) fn closing_may_go_on(&mut self, cx: &mut Context<Self>) {
+        if self.finish_closing && !self.close_waits() {
+            self.finish_closing = false;
+            self.close_after_working_copies(cx);
+        }
+    }
+
     /// Whether any work runs that the window closing stops.
     fn stops_running(&self) -> bool {
         self.progressing.iter().any(|progressing| progressing.stops_on_close)
@@ -1196,6 +1260,15 @@ impl WorkspaceView {
     /// copy into a working copy the close may be about to clear. Whether any was running.
     pub(super) fn stop_before_closing(&mut self) -> bool {
         if !self.stops_running() {
+            return false;
+        }
+        if self.close_when_idle || self.finish_closing {
+            // Asked again while they stop: a copy blocked on a disk that went away may never get
+            // to its next stop. The window closes without them; what they've written is in files
+            // under names of their own beside where they'd go, which a copy that ends takes away,
+            // and the next start's sweep takes away with the slot otherwise.
+            self.close_anyway = true;
+            self.close_when_idle = false;
             return false;
         }
         for progressing in self.progressing.iter().filter(|progressing| progressing.stops_on_close) {

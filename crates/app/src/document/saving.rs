@@ -140,6 +140,7 @@ impl Document {
     /// and after a Save As it's kept in the new place from now on.
     pub fn saved(&mut self, saved: Saved) {
         self.readers_saved();
+        self.large_saved();
         // Part of the talk now, wherever it's kept.
         for path in &saved.files_written {
             self.pending.remove(path);

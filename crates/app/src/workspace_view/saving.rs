@@ -76,10 +76,18 @@ impl WorkspaceView {
 
     /// Closes the window once the changes to the working copies asked for are made: they'd
     /// be lost with it.
-    fn close_after_working_copies(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn close_after_working_copies(&mut self, cx: &mut Context<Self>) {
         // A copy still running has no use now: it stops, and what it copied goes with it.
-        self.stop_before_closing();
+        if !self.close_anyway {
+            self.stop_before_closing();
+        }
         self.close_when_idle = false;
+        // Nothing of the working copy goes while a save may be reading it, or a copy stopped may
+        // still be writing to it: the window finishes closing once they've ended.
+        if self.close_waits() {
+            self.finish_closing = true;
+            return;
+        }
         self.working_copies.update(cx, |copies, cx| copies.let_go_closing(cx));
         let settled = self.working_copies.update(cx, |copies, _| copies.settled());
         cx.spawn(async move |this, cx| {
@@ -298,24 +306,31 @@ impl WorkspaceView {
             self.say(format!("{} {name}…", SAVING.doing), cx);
         }
         let running = meter.clone();
-        cx.spawn(async move |this, cx| {
-            let outcome = cx
-                .background_spawn(async move {
-                    match running {
-                        Some(meter) => job.run_with(&|done, total| meter.tell(done, total), meter.stop()),
-                        None => job.run(),
+        self.saves_running += 1;
+        let start = move |_: &mut Self, cx: &mut Context<Self>| {
+            cx.spawn(async move |this, cx| {
+                let outcome = cx
+                    .background_spawn(async move {
+                        match running {
+                            Some(meter) => job.run_with(&|done, total| meter.tell(done, total), meter.stop()),
+                            None => job.run(),
+                        }
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.saves_running = this.saves_running.saturating_sub(1);
+                    if let Some(meter) = &meter {
+                        this.end_progress(meter, cx);
                     }
+                    this.finish_save(outcome, name, cx);
+                    // A window closing that waited for the save closes now.
+                    this.closing_may_go_on(cx);
                 })
-                .await;
-            this.update(cx, |this, cx| {
-                if let Some(meter) = &meter {
-                    this.end_progress(meter, cx);
-                }
-                this.finish_save(outcome, name, cx)
+                .ok();
             })
-            .ok();
-        })
-        .detach();
+            .detach();
+        };
+        self.start_work(true, start, cx);
     }
 
     fn finish_save(
@@ -444,7 +459,15 @@ impl WorkspaceView {
         if self.working_copies.read(cx).is_closing() {
             return true;
         }
+        if self.finish_closing {
+            // Closing already, once what it waits for has ended. Asked again, it no longer waits
+            // for copies it stopped, though it does for a save.
+            self.close_anyway = true;
+            self.closing_may_go_on(cx);
+            return false;
+        }
         // A copy into the talk running is stopped first, and the window closes once it has ended.
+        // Asked again meanwhile, it goes ahead without waiting for it.
         if self.stop_before_closing() {
             return false;
         }
@@ -465,6 +488,12 @@ impl WorkspaceView {
     /// Whether the window, with nothing unsaved, can close now. If changes to the working
     /// copies are still to be made, it closes itself once they are.
     fn close_now_or_once_settled(&mut self, cx: &mut Context<Self>) -> bool {
+        // A save running may be reading what the working copy holds: the window closes once it
+        // has ended.
+        if self.close_waits() {
+            self.finish_closing = true;
+            return false;
+        }
         // Back to what's saved within the wait: the copy still there goes first, and with it any
         // video added that the talk no longer uses.
         self.working_copies.update(cx, |copies, cx| copies.let_go_closing(cx));

@@ -128,6 +128,11 @@ impl Job {
                 keep,
             } => {
                 if clears.load(Ordering::SeqCst) == at {
+                    // A file brought back that still lies in last time's copy is taken into this
+                    // window's own first, so that last time's can go once this is kept.
+                    if let Some(keep) = &keep {
+                        keep.take_in_left_in_last(&recovery, &place);
+                    }
                     let kept = match &place {
                         // No file holds anything of it, so there's no text it started from.
                         TalkPlace::Untitled(_) => recovery.keep_from(&place, Some(&name), &hash_text(""), &text, &files, &builds),
@@ -449,11 +454,8 @@ impl WorkingCopies {
 
     /// What brings the working copy in line with the talk: one while it has unsaved changes,
     /// and none once it hasn't, nor any file kept as it was added.
-    fn job(&mut self, cx: &mut App) -> Option<Job> {
+    fn job(&mut self, cx: &App) -> Option<Job> {
         let recovery = self.recovery.clone()?;
-        // A file brought back that still lies in last time's copy is taken into this window's own
-        // first, so that last time's can go once this is kept.
-        self.document.as_ref()?.update(cx, |document, _| document.take_in_left_in_last());
         let document = self.document.as_ref()?.read(cx);
         let place = document.place().clone();
         if !document.has_unsaved_changes() {
