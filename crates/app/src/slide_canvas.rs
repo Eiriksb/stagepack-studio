@@ -5,9 +5,11 @@ use std::sync::Arc;
 
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::*;
-use slides_engine::{Layer, to_bgra_frame};
+use slides_engine::{Layer, VideoLayer, VideoOn, to_bgra_frame};
 
+use crate::document::LargeOpen;
 use crate::present::{LayerLook, SlideLook};
+use crate::video_player::{Placed, Player, Shown, open_and_play};
 
 /// The width of a 16:9 slide, in slide units.
 pub use slides_engine::SLIDE_WIDTH;
@@ -20,6 +22,10 @@ const REDRAW_CHANGE: f32 = 0.01;
 /// [`SlideCanvas::scale`].
 pub struct ScaleChanged;
 
+/// Sent when a save has let go of the file of a video playing here: whatever plays it opens it
+/// again, with [`SlideCanvas::open_videos_again`], once the save is done.
+pub struct VideoLetGo;
+
 #[derive(Clone)]
 struct Sprite {
     layer: Arc<Layer>,
@@ -27,10 +33,10 @@ struct Sprite {
 }
 
 /// Showing layers next to each other that share an opacity. Each sprite comes with how far
-/// below its place it is, in slide units.
+/// below its place it is, in slide units, and the pictures of the videos playing over it.
 struct Run {
     opacity: f32,
-    sprites: Vec<(Sprite, f32)>,
+    sprites: Vec<(Sprite, f32, Vec<Shown>)>,
 }
 
 #[derive(Default)]
@@ -47,9 +53,18 @@ pub struct SlideCanvas {
     edge: Option<Bounds<Pixels>>,
     /// Where the slide was last drawn, and the area it was drawn in.
     placed: Option<(Bounds<Pixels>, Bounds<Pixels>)>,
+    /// The videos playing over its layers, each with a number of its own.
+    players: Vec<(u64, Player)>,
+    players_made: u64,
+    /// Pictures of videos no longer shown, which the next paint releases.
+    retired_frames: Vec<Arc<RenderImage>>,
+    /// How many pictures of videos have been made to show, and released, in all.
+    frames_made: usize,
+    frames_released: usize,
 }
 
 impl EventEmitter<ScaleChanged> for SlideCanvas {}
+impl EventEmitter<VideoLetGo> for SlideCanvas {}
 
 impl SlideCanvas {
     /// A canvas with a line around its slide, for the editor. A show's has none.
@@ -135,6 +150,192 @@ impl SlideCanvas {
         self.scale
     }
 
+    /// Plays the video `on` over layer `layer`, from its start, reading it with `open`.
+    pub fn play(&mut self, layer: usize, on: VideoOn, open: LargeOpen, cx: &mut Context<Self>) {
+        self.start(Player::opening(layer, on, 0.0), open, cx);
+    }
+
+    /// Starts `player`, opening its file with `open` on a background task.
+    fn start(&mut self, player: Player, open: LargeOpen, cx: &mut Context<Self>) {
+        self.players_made += 1;
+        let id = self.players_made;
+        let (from, looped) = (player.resume_from(), player.on.looped);
+        self.players.push((id, player));
+        cx.spawn(async move |canvas, cx| {
+            let opened = cx
+                .background_spawn(async move { open_and_play(open, from, looped) })
+                .await;
+            canvas
+                .update(cx, |canvas, cx| {
+                    // One stopped meanwhile ends its thread as what came is dropped.
+                    if let Some((_, player)) = canvas.players.iter_mut().find(|(at, _)| *at == id) {
+                        player.opened(opened);
+                        cx.notify();
+                    }
+                })
+                .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Stops every video playing, which shows its still again.
+    pub fn stop_videos(&mut self, cx: &mut Context<Self>) {
+        if self.players.is_empty() {
+            return;
+        }
+        for (_, mut player) in std::mem::take(&mut self.players) {
+            self.retired_frames.extend(player.take_shown());
+        }
+        cx.notify();
+    }
+
+    /// Stops the video playing over layer `layer`, if one is.
+    pub fn stop_video(&mut self, layer: usize, cx: &mut Context<Self>) {
+        let (gone, kept) = std::mem::take(&mut self.players).into_iter().partition(|(_, player)| player.layer == layer);
+        self.players = kept;
+        let gone: Vec<(u64, Player)> = gone;
+        if gone.is_empty() {
+            return;
+        }
+        for (_, mut player) in gone {
+            self.retired_frames.extend(player.take_shown());
+        }
+        cx.notify();
+    }
+
+    /// The layers a video is playing over, or being opened to play over.
+    pub fn playing_videos(&self) -> Vec<usize> {
+        self.players.iter().filter(|(_, player)| player.is_playing()).map(|(_, player)| player.layer).collect()
+    }
+
+    /// Whether any video is held here, playing or not.
+    pub fn has_videos(&self) -> bool {
+        !self.players.is_empty()
+    }
+
+    /// Follows the videos among the layers as they're placed now: a video still over its layer
+    /// plays where the layer is, and one whose layer plays something else, or nothing, stops.
+    pub fn place_videos(&mut self, videos: &[VideoLayer], cx: &mut Context<Self>) {
+        let mut gone = Vec::new();
+        for (id, player) in &mut self.players {
+            match videos.iter().find(|video| video.layer == player.layer && video.on.src == player.on.src) {
+                Some(video) if video.on != player.on => {
+                    player.place(video.on.clone());
+                    cx.notify();
+                }
+                Some(_) => {}
+                None => gone.push(*id),
+            }
+        }
+        self.players.retain_mut(|(id, player)| {
+            let keep = !gone.contains(id);
+            if !keep {
+                self.retired_frames.extend(player.take_shown());
+            }
+            keep
+        });
+        if !gone.is_empty() {
+            cx.notify();
+        }
+    }
+
+    /// Plays `wanted` and nothing else, reading each with what `open` gives for its file: one
+    /// already playing goes on, unless `afresh`, when every video starts again from its start.
+    pub fn show_videos(&mut self, wanted: &[VideoLayer], afresh: bool, mut open: impl FnMut(&str) -> Option<LargeOpen>, cx: &mut Context<Self>) {
+        if afresh {
+            self.stop_videos(cx);
+        }
+        self.place_videos(wanted, cx);
+        for video in wanted {
+            let playing = self.players.iter().any(|(_, player)| player.layer == video.layer && player.on.src == video.on.src);
+            if !playing && let Some(opened) = open(&video.on.src) {
+                self.play(video.layer, video.on.clone(), opened, cx);
+            }
+        }
+    }
+
+    /// Opens again, with what `open` gives for its file, each video whose file a save let go of,
+    /// and plays it on from where it had got to.
+    pub fn open_videos_again(&mut self, mut open: impl FnMut(&str) -> Option<LargeOpen>, cx: &mut Context<Self>) {
+        let waiting: Vec<u64> = self.players.iter().filter(|(_, player)| player.was_let_go()).map(|(id, _)| *id).collect();
+        for id in waiting {
+            let Some(at) = self.players.iter().position(|(at, _)| *at == id) else { continue };
+            let (_, mut player) = self.players.remove(at);
+            match open(&player.on.src) {
+                Some(opened) => {
+                    player.reopening();
+                    self.start(player, opened, cx);
+                }
+                None => self.retired_frames.extend(player.take_shown()),
+            }
+        }
+    }
+
+    /// The files of the videos whose files a save let go of, waiting to be opened again.
+    pub fn videos_let_go(&self) -> Vec<String> {
+        self.players.iter().filter(|(_, player)| player.was_let_go()).map(|(_, player)| player.on.src.clone()).collect()
+    }
+
+    /// Why each video held here stopped, if it couldn't go on, in order.
+    pub fn video_failures(&self) -> Vec<Option<slides_video::CantPlay>> {
+        self.players.iter().map(|(_, player)| player.failed()).collect()
+    }
+
+    /// The picture each video held here shows now, in the order they were started.
+    #[doc(hidden)]
+    pub fn video_frames(&self) -> Vec<Option<Arc<RenderImage>>> {
+        self.players.iter().map(|(_, player)| player.shown().map(|shown| shown.image.clone())).collect()
+    }
+
+    /// When in its video each picture shown is from, in seconds, in the same order.
+    #[doc(hidden)]
+    pub fn video_frame_times(&self) -> Vec<Option<f64>> {
+        self.players.iter().map(|(_, player)| player.shown().map(|shown| shown.at)).collect()
+    }
+
+    /// The names of the threads decoding the videos held here.
+    #[doc(hidden)]
+    pub fn video_threads(&self) -> Vec<String> {
+        self.players.iter().filter_map(|(_, player)| player.thread().map(str::to_string)).collect()
+    }
+
+    /// How many pictures each video held here has decoded ahead.
+    #[doc(hidden)]
+    pub fn videos_queued(&self) -> Vec<usize> {
+        self.players.iter().map(|(_, player)| player.queued()).collect()
+    }
+
+    /// How many pictures of videos have been made to show, and how many released, in all.
+    #[doc(hidden)]
+    pub fn video_images(&self) -> (usize, usize) {
+        (self.frames_made, self.frames_released)
+    }
+
+    /// Takes the pictures due now from the videos playing, and asks the window for another frame
+    /// while any plays.
+    fn advance_videos(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.players.is_empty() {
+            return;
+        }
+        let now = cx.background_executor().now();
+        let (mut playing, mut let_go) = (false, false);
+        for (_, player) in &mut self.players {
+            let waiting = player.was_let_go();
+            let advanced = player.advance(now, self.scale);
+            self.frames_made += usize::from(advanced.made);
+            self.retired_frames.extend(advanced.replaced);
+            playing |= player.wants_frames();
+            let_go |= !waiting && player.was_let_go();
+        }
+        if playing {
+            window.request_animation_frame();
+        }
+        if let_go {
+            cx.emit(VideoLetGo);
+        }
+    }
+
     /// The image of every layer, first to last, hidden ones included.
     pub fn images(&self) -> Vec<Arc<RenderImage>> {
         self.sprites
@@ -171,7 +372,13 @@ impl SlideCanvas {
             if !look.visible {
                 continue;
             }
-            let sprite = (sprite.clone(), look.offset_y);
+            let over = self
+                .players
+                .iter()
+                .filter(|(_, player)| player.layer == index)
+                .filter_map(|(_, player)| player.shown().cloned())
+                .collect();
+            let sprite = (sprite.clone(), look.offset_y, over);
             match runs.last_mut() {
                 Some(run) if run.opacity == look.opacity => run.sprites.push(sprite),
                 _ => runs.push(Run {
@@ -210,7 +417,7 @@ fn fit(area: Bounds<Pixels>, scale_factor: f32) -> Option<(Bounds<Pixels>, f32)>
 }
 
 fn paint_sprites(
-    sprites: Vec<(Sprite, f32)>,
+    sprites: Vec<(Sprite, f32, Vec<Shown>)>,
     area: Bounds<Pixels>,
     drawn_at: Option<f32>,
     offset_x: f32,
@@ -223,7 +430,8 @@ fn paint_sprites(
     // From the device pixels the layers were drawn in to the window's own.
     let to_window = drawn_at.map_or(1.0, |drawn_at| scale / drawn_at) / scale_factor;
     let width = f32::from(slide.size.width);
-    for (Sprite { layer, image }, offset_y) in sprites {
+    let unit = width / SLIDE_WIDTH;
+    for (Sprite { layer, image }, offset_y, over) in sprites {
         let place = Bounds {
             origin: slide.origin
                 + point(
@@ -240,12 +448,43 @@ fn paint_sprites(
         window
             .paint_image(slide, place, Corners::default(), image, 0, false)
             .ok();
+        // A video playing over the layer, where the layer is and moving as it does.
+        for shown in over {
+            let place = match shown.placed {
+                Placed::Rect(rect) => Bounds {
+                    origin: slide.origin
+                        + point(
+                            px(rect.x * unit + offset_x * width),
+                            px((rect.y + offset_y) * unit),
+                        ),
+                    size: size(px(rect.w * unit), px(rect.h * unit)),
+                },
+                Placed::Drawn { x, y, width: drawn_width, height: drawn_height, scale: drawn } => {
+                    let to_window = scale / drawn / scale_factor;
+                    Bounds {
+                        origin: slide.origin
+                            + point(
+                                px(x as f32 * to_window + offset_x * width),
+                                px(y as f32 * to_window + offset_y * unit),
+                            ),
+                        size: size(px(drawn_width as f32 * to_window), px(drawn_height as f32 * to_window)),
+                    }
+                }
+            };
+            window
+                .paint_image(slide, place, Corners::default(), shown.image, 0, false)
+                .ok();
+        }
     }
 }
 
 impl Render for SlideCanvas {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let retired = std::mem::take(&mut self.retired);
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.advance_videos(window, cx);
+        let mut retired = std::mem::take(&mut self.retired);
+        let frames = std::mem::take(&mut self.retired_frames);
+        self.frames_released += frames.len();
+        retired.extend(frames);
         let edge_color = self.framed.then(|| cx.theme().border);
         let this = cx.entity().downgrade();
         // A child of its own, as it has to happen even with no layer showing.

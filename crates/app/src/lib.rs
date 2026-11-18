@@ -39,6 +39,7 @@ pub mod table_tools;
 pub mod templates;
 pub mod text_editing;
 pub mod text_tools;
+pub mod video_player;
 pub mod watcher;
 pub mod workspace_view;
 pub mod working_copies;

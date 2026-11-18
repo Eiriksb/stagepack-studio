@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use slides_engine::{AddedFile, is_large_kind};
+use slides_engine::{AddedFile, MadeStill, StillJob, StillWanted, VideoLayer, is_large_kind};
 
 use super::*;
 use crate::clipboard::{CopiedLarge, PastedLarge};
@@ -38,6 +38,8 @@ pub(crate) struct LargeHome {
     cache: Option<VideoCache>,
     /// Whether a large file was ever to be copied into the working copy, which made its folder.
     copied_in: std::cell::Cell<bool>,
+    /// What's told when a video's still is wanted, once stills are made aside.
+    stills_wanted: Option<StillWanted>,
 }
 
 /// What a working copy that's cleared keeps of its slot: every file a large file added to the
@@ -223,6 +225,81 @@ impl Document {
     /// Unpacks a video a pack holds compressed into `cache`, in place of the app's own.
     pub fn use_video_cache(&mut self, cache: VideoCache) {
         self.large.cache = Some(cache);
+        self.open_stills_aside();
+    }
+
+    /// Leaves the stills of the talk's videos to be made aside, as a window's thread mustn't
+    /// decode a video: `wanted` is told, on the window's thread, each time one is wanted, and
+    /// [`Self::still_jobs`] then gives it.
+    pub fn make_stills_aside(&mut self, wanted: StillWanted) {
+        self.large.stills_wanted = Some(wanted);
+        self.open_stills_aside();
+    }
+
+    /// Tells the deck stills are made aside, if they are: after the talk's files are new too.
+    pub(crate) fn open_stills_aside(&mut self) {
+        if let Some(wanted) = self.large.stills_wanted.clone() {
+            self.deck.make_stills_aside(wanted);
+        }
+    }
+
+    /// The stills wanted to be made aside since last asked, each with its video's file to read
+    /// it from, held among the talk's readers while it's read, on another thread.
+    pub fn still_jobs(&mut self) -> Vec<(StillJob, Option<LargeOpen>)> {
+        let jobs = self.deck.still_jobs();
+        jobs.into_iter()
+            .map(|job| {
+                let open = self.open_large(job.path());
+                (job, open)
+            })
+            .collect()
+    }
+
+    /// Takes in a still made aside, and says whether a slide shows it: it's drawn again when
+    /// next asked for.
+    pub fn take_still(&mut self, made: MadeStill) -> bool {
+        !self.deck.take_still(made).is_empty()
+    }
+
+    /// Whether any video's still is still being made aside.
+    pub fn stills_coming(&self) -> bool {
+        self.deck.stills_coming()
+    }
+
+    /// The videos on the current slide, among the layers [`Self::editor_layers`] gives.
+    pub fn videos_here(&mut self) -> Vec<VideoLayer> {
+        let current = self.current();
+        guarded(|| self.deck.videos(current)).unwrap_or_default()
+    }
+
+    /// The videos on slide `index`, of those a show goes through, at `moment`, among the layers
+    /// [`Self::layers_at`] gives then.
+    pub fn videos_at(&mut self, index: usize, moment: slides_engine::Moment) -> Vec<VideoLayer> {
+        guarded(|| self.deck.videos_at(index, moment)).unwrap_or_default()
+    }
+
+    /// The one thing selected on the slide shown, if it's a video.
+    pub fn selected_video(&mut self) -> Option<VideoLayer> {
+        let selected = self.selected()?.clone();
+        if selected.slide != self.current() || self.selection().is_none_or(|selection| selection.things.len() != 1) {
+            return None;
+        }
+        self.videos_here().into_iter().find(|video| video.source.as_ref() == Some(&selected.source))
+    }
+
+    /// Why the video at `source` on the current slide can't be played, in a plain sentence, if it
+    /// can't.
+    pub fn video_problem(&mut self, source: &std::ops::Range<usize>) -> Option<String> {
+        let current = self.current();
+        guarded(|| self.deck.video_problem(current, source)).ok().flatten()
+    }
+
+    /// Where the talk's pack is, if it's kept in one.
+    fn pack(&self) -> Option<PathBuf> {
+        match &self.place {
+            TalkPlace::Packed(pack) => Some(pack.clone()),
+            TalkPlace::Folder(_) | TalkPlace::Untitled(_) => None,
+        }
     }
 
     /// Adds the file at `at`, outside the talk, to it as a file of `kind`, a video, named as like
@@ -391,10 +468,7 @@ impl Document {
     pub fn open_large(&self, path: &str) -> Option<LargeOpen> {
         let path = slides_engine::normalise(path)?;
         self.files.len(&path)?;
-        let pack = match &self.place {
-            TalkPlace::Packed(pack) => Some(pack.clone()),
-            TalkPlace::Folder(_) | TalkPlace::Untitled(_) => None,
-        };
+        let pack = self.pack();
         Some(LargeOpen { files: self.files.clone(), path, pack, cache: self.large.cache.clone(), readers: self.large.readers.clone() })
     }
 

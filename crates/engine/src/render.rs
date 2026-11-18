@@ -3,11 +3,11 @@
 use std::sync::Arc;
 
 use tiny_skia::{
-    ColorU8, FillRule, FilterQuality, Paint, Pixmap, PixmapPaint, Point, Shader, Stroke, Transform,
+    ColorU8, FillRule, FilterQuality, Paint, Pixmap, PixmapMut, PixmapPaint, Point, Shader, Stroke, Transform,
 };
 use toolkit::Color;
 
-use crate::{DisplayItem, Fonts, Layer, LayerSpec, draw_text};
+use crate::{DisplayItem, Enter, Fonts, Layer, LayerSpec, Rect, ShapedText, draw_text};
 
 fn paint(color: Color) -> Paint<'static> {
     Paint {
@@ -84,6 +84,39 @@ fn within_max_pixels(width: u32, height: u32) -> (u32, u32) {
 /// still turns around the centre of `spec.rect`. A talk decides these numbers, so no
 /// rect, however absurd, may panic here.
 pub fn render_layer(spec: &LayerSpec, scale: f32, fonts: &mut Fonts) -> Layer {
+    draw_layer(spec, scale, |target, text, at| draw_text(target, text, fonts, at))
+}
+
+/// One of a video's pictures, `width` by `height` in straight BGRA, drawn as the layer of a
+/// video placed at `rect` and turned by `rotate` would show it, at `scale`: for a turned video,
+/// which the window can't turn. `None` if the picture isn't that size.
+pub fn frame_layer(width: u32, height: u32, bgra: &[u8], rect: Rect, rotate: f32, scale: f32) -> Option<Layer> {
+    if bgra.len() as u64 != u64::from(width) * u64::from(height) * 4 {
+        return None;
+    }
+    let mut picture = Pixmap::new(width, height)?;
+    // Opaque, so it needs no premultiplying.
+    for (pixel, bgra) in picture.pixels_mut().iter_mut().zip(bgra.as_chunks::<4>().0) {
+        *pixel = ColorU8::from_rgba(bgra[2], bgra[1], bgra[0], 255).premultiply();
+    }
+    let item = DisplayItem::Picture { pixmap: Arc::new(picture), src: None, rect: Rect { x: 0.0, y: 0.0, w: rect.w, h: rect.h } };
+    let spec = LayerSpec {
+        source: None,
+        rect,
+        rotate,
+        items: vec![item],
+        click: None,
+        enter: Enter::Appear,
+        native: Vec::new(),
+        is_title: false,
+        varies: false,
+        video: None,
+    };
+    Some(draw_layer(&spec, scale, |_, _, _| {}))
+}
+
+/// Draws `spec` at `scale`, its text with `text`.
+fn draw_layer(spec: &LayerSpec, scale: f32, mut text: impl FnMut(&mut PixmapMut, &ShapedText, Transform)) -> Layer {
     let (x, y) = (spec.rect.x * scale, spec.rect.y * scale);
     let (w, h) = (spec.rect.w * scale, spec.rect.h * scale);
     let place = Transform::from_translate(x, y).pre_concat(Transform::from_rotate_at(spec.rotate, w / 2.0, h / 2.0));
@@ -119,8 +152,8 @@ pub fn render_layer(spec: &LayerSpec, scale: f32, fonts: &mut Fonts) -> Layer {
                 let stroke = Stroke { width: *width, ..Stroke::default() };
                 target.stroke_path(path, &paint(*color), &stroke, at, None);
             }
-            DisplayItem::Text { text, x, y } => {
-                draw_text(&mut target, text, fonts, at.pre_translate(*x, *y));
+            DisplayItem::Text { text: shaped, x, y } => {
+                text(&mut target, shaped, at.pre_translate(*x, *y));
             }
             DisplayItem::Picture { pixmap: picture, rect, .. } => {
                 let fit = at
@@ -143,6 +176,12 @@ pub fn compose(target: &mut Pixmap, layers: &[Layer]) {
     for layer in layers {
         target.draw_pixmap(layer.x, layer.y, Pixmap::as_ref(&layer.pixmap), &PixmapPaint::default(), Transform::identity(), None);
     }
+}
+
+/// A picture `width` by `height` already in straight BGRA, as the window's image type holds
+/// pixels, or `None` if it isn't that size.
+pub fn bgra_frame(width: u32, height: u32, bgra: Vec<u8>) -> Option<image::Frame> {
+    Some(image::Frame::new(image::RgbaImage::from_raw(width, height, bgra)?))
 }
 
 /// Straight-alpha BGRA, the way the window's image type holds pixels.

@@ -27,7 +27,7 @@ use crate::builds::{self, BuildOutcome, Compile};
 use crate::cargo_file::{self, write_cargo_file};
 use crate::clipboard::ClipboardOp;
 use crate::clipboard_tools::ClipboardTools;
-use crate::document::{Document, EditRefused, OpenProblem, Reload, SLIDES_FILE, TalkPlace, UNREADABLE_FILE, UntitledId};
+use crate::document::{Document, EditRefused, LargeOpen, OpenProblem, Reload, SLIDES_FILE, TalkPlace, UNREADABLE_FILE, UntitledId};
 use crate::export::{self, ExportKind, run_export, stagepack_executable};
 use crate::icon_picker::{self, IconPicked, IconPicker};
 use crate::palette::InsertComponent;
@@ -697,7 +697,53 @@ impl WorkspaceView {
             _start_asked: None,
         };
         view.always_build = view.is_always_built();
+        view.make_stills_aside(cx);
         view
+    }
+
+    /// Has the talk's videos' stills made on background tasks, one at a time, each taken in, and
+    /// its slide drawn again, as it comes. Nothing runs while none is wanted.
+    fn make_stills_aside(&mut self, cx: &mut Context<Self>) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        let (wanted, mut asked) = mpsc::unbounded::<()>();
+        document.update(cx, |document, _| {
+            document.make_stills_aside(std::sync::Arc::new(move || {
+                wanted.unbounded_send(()).ok();
+            }))
+        });
+        // Held weakly, as the talk holds what tells this.
+        let document = document.downgrade();
+        cx.spawn(async move |this, cx| {
+            while asked.next().await.is_some() {
+                loop {
+                    let Ok(jobs) = document.update(cx, |document, _| document.still_jobs()) else { return };
+                    if jobs.is_empty() {
+                        break;
+                    }
+                    for (job, open) in jobs {
+                        let made = cx
+                            .background_spawn(async move {
+                                let reader = open.and_then(LargeOpen::open);
+                                job.make(reader.map(|reader| Box::new(reader) as Box<dyn slides_engine::ReadSeek>))
+                            })
+                            .await;
+                        let shown = document.update(cx, |document, cx| {
+                            let shown = document.take_still(made);
+                            if shown {
+                                cx.notify();
+                            }
+                            shown
+                        });
+                        if shown.is_ok_and(|shown| shown) && this.update(cx, |this, cx| this.show_slide(cx)).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        })
+        .detach();
     }
 
     pub fn document(&self) -> Option<&Entity<Document>> {
@@ -827,8 +873,11 @@ impl WorkspaceView {
         }
         self.notices = notices;
         if let Some(layers) = layers {
-            self.slide_canvas
-                .update(cx, |canvas, cx| canvas.set_layers(layers, cx));
+            let videos = document.update(cx, |document, _| document.videos_here());
+            self.slide_canvas.update(cx, |canvas, cx| {
+                canvas.set_layers(layers, cx);
+                canvas.place_videos(&videos, cx);
+            });
         }
         cx.notify();
     }
@@ -1054,6 +1103,8 @@ impl WorkspaceView {
         if running {
             return;
         }
+        // The show plays the talk's videos: none plays here meanwhile.
+        self.slide_editor.update(cx, |editor, cx| editor.stop_video(cx));
         let this = cx.entity().downgrade();
         // Once this window is free again, as the show asks it which screen it's on.
         cx.defer(move |cx| {

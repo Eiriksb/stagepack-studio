@@ -41,6 +41,28 @@ pub struct LayerSpec {
     pub is_title: bool,
     /// Whether something in this layer changes with the moment the slide is at.
     pub varies: bool,
+    /// The video this layer is the still of, which plays over it when asked.
+    pub video: Option<VideoOn>,
+}
+
+/// A video among a slide's layers: the place of its layer among them, where its tag is written,
+/// the click it appears on, and what it plays.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VideoLayer {
+    pub layer: usize,
+    pub source: Option<Range<usize>>,
+    pub click: Option<u32>,
+    pub on: VideoOn,
+}
+
+/// A video on a slide: the file it plays, whether it goes round again at its end, and where it
+/// plays, as its layer is placed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VideoOn {
+    pub src: String,
+    pub looped: bool,
+    pub rect: Rect,
+    pub rotate: f32,
 }
 
 /// A drawn element in device pixels, placed at (`x`, `y`) on the slide. It has no

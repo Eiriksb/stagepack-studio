@@ -543,11 +543,26 @@ impl HeldReader {
         self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_none()
     }
 
+    /// Something that tells whether this reader has been let go of, once it's been handed on.
+    pub fn watch(&self) -> ReaderWatch {
+        ReaderWatch(Arc::downgrade(&self.0))
+    }
+
     fn with<T>(&mut self, f: impl FnOnce(&mut dyn ReadSeek) -> io::Result<T>) -> io::Result<T> {
         match &mut *self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
             Some(reader) => f(&mut **reader),
             None => Err(io::Error::other(LET_GO)),
         }
+    }
+}
+
+/// Tells whether a [`HeldReader`] handed on has been let go of.
+pub struct ReaderWatch(Weak<Slot>);
+
+impl ReaderWatch {
+    /// Whether it was let go of. One that's gone altogether was let go of too.
+    pub fn is_let_go(&self) -> bool {
+        self.0.upgrade().is_none_or(|reader| reader.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_none())
     }
 }
 
