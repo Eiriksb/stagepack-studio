@@ -36,6 +36,8 @@ pub struct KeepFailed;
 #[derive(PartialEq)]
 struct Kept {
     place: TalkPlace,
+    /// What the talk is called, which an untitled one's copy says.
+    name: String,
     text: String,
     on_disk: String,
     /// The files added to the talk that the text uses, by their path in it.
@@ -62,6 +64,8 @@ enum Job {
     Keep {
         recovery: Recovery,
         place: TalkPlace,
+        /// What the talk is called.
+        name: String,
         on_disk: String,
         text: String,
         /// The files added to the talk that the text uses and no save has written.
@@ -98,6 +102,7 @@ impl Job {
             Job::Keep {
                 recovery,
                 place,
+                name,
                 on_disk,
                 text,
                 files,
@@ -105,9 +110,13 @@ impl Job {
                 adopted,
             } => {
                 if clears.load(Ordering::SeqCst) == at {
-                    recovery
-                        .keep_with_builds(&place, &hash_text(&on_disk), &text, &files, &builds)
-                        .map_err(|_| ())?;
+                    let kept = match &place {
+                        TalkPlace::Untitled(id) => recovery.keep_untitled(*id, &name, &text, &files, &builds),
+                        TalkPlace::Folder(_) | TalkPlace::Packed(_) => {
+                            recovery.keep_with_builds(&place, &hash_text(&on_disk), &text, &files, &builds)
+                        }
+                    };
+                    kept.map_err(|_| ())?;
                 }
                 // Kept, or overtaken by a clear: either way it's no longer needed.
                 if let Some(adopted) = take_adopted(&adopted) {
@@ -382,6 +391,7 @@ impl WorkingCopies {
             document.files_to_write().into_iter().filter(|(path, _)| is_added_path(path)).collect();
         let kept = Kept {
             place: place.clone(),
+            name: document.name(),
             text: document.source().to_string(),
             on_disk: document.stamp_on_disk().to_string(),
             files: files.iter().map(|(path, _)| path.clone()).collect(),
@@ -393,6 +403,7 @@ impl WorkingCopies {
         let job = Job::Keep {
             recovery,
             place,
+            name: kept.name.clone(),
             on_disk: kept.on_disk.clone(),
             text: kept.text.clone(),
             files,

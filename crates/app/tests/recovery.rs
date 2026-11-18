@@ -7,9 +7,10 @@ use gpui_kit::{
     WindowBounds, WindowOptions, px, size,
 };
 use slides_engine::Fonts;
-use stagepack_studio::document::{Document, TalkPlace};
+use stagepack_studio::document::{Document, TalkPlace, UntitledId};
 use stagepack_studio::notes_panel::NOTES_ID;
 use stagepack_studio::recovery::{KEEP_FOR, Recovery, hash_text};
+use stagepack_studio::saving::SaveTarget;
 use stagepack_studio::ribbon::{HIDE_ID, NEW_SLIDE_ID, RIBBON_ID};
 use stagepack_studio::workspace_view::{
     self, CANVAS_ID, CLOSE_DONT_SAVE_ID, DISCARD_RECOVERY_ID, RECOVER_ID, RECOVERY_CHANGED_SINCE,
@@ -1251,4 +1252,429 @@ fn a_crash_keeps_an_added_file_the_text_named_already(cx: &mut TestAppContext) {
             assert!(document.has_unsaved_changes());
         })
     });
+}
+
+// New presentations that were never saved.
+
+const UNTITLED_TEXT: &str = "---\nlayout: title\n---\n\n# Plans **for** the spring\nand the summer\n\n---\n\n# Two\n";
+
+/// A recovery folder of its own, in a scratch folder.
+fn scratch_root() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("recovery");
+    (dir, root)
+}
+
+/// The folder `id`'s copy is kept in under `root`: the only one whose about file says so.
+fn untitled_slot(root: &Path, id: UntitledId) -> PathBuf {
+    let hex = id.to_string();
+    let mut found: Vec<PathBuf> = kept_folders(root)
+        .into_iter()
+        .filter(|slot| {
+            std::fs::read(slot.join("about.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .is_some_and(|about| about["untitled"]["id"].as_str() == Some(hex.as_str()))
+        })
+        .collect();
+    assert_eq!(found.len(), 1, "{found:?}");
+    found.remove(0)
+}
+
+/// Says the copy in `slot` was kept `secs` seconds after 1970.
+fn set_kept_at(slot: &Path, secs: u64) {
+    let about = slot.join("about.json");
+    let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(&about).unwrap()).unwrap();
+    json["kept_at"] = secs.into();
+    std::fs::write(&about, json.to_string()).unwrap();
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs()
+}
+
+#[test]
+fn an_untitled_copy_is_kept_listed_taken_and_discarded() {
+    let (_dir, root) = scratch_root();
+    let recovery = Recovery::new(root.clone());
+    let id = UntitledId::random();
+    let files = vec![("assets/photo.png".to_string(), std::sync::Arc::<[u8]>::from(red_png()))];
+    let before = SystemTime::now() - Duration::from_secs(2);
+    recovery.keep_untitled(id, "Untitled presentation 2", UNTITLED_TEXT, &files, &[]).unwrap();
+    // A talk with a place isn't listed among them.
+    let setup = Setup::new(ONE);
+    keep(&setup, EDITED);
+
+    let about: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(untitled_slot(&root, id).join("about.json")).unwrap()).unwrap();
+    assert_eq!(about["untitled"]["id"].as_str(), Some(id.to_string().as_str()));
+    assert_eq!(about["untitled"]["name"].as_str(), Some("Untitled presentation 2"));
+
+    let (listed, skipped) = recovery.untitled();
+    assert_eq!(skipped, 0);
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    let copy = &listed[0];
+    assert_eq!(copy.id, id);
+    assert_eq!(copy.name, "Untitled presentation 2");
+    assert_eq!(copy.slides, 2);
+    assert_eq!(copy.first_words, "Plans for the spring", "as a person reads it, its first line");
+    assert!(copy.when >= before && copy.when <= SystemTime::now() + Duration::from_secs(2));
+
+    let found = recovery.take_untitled(id).expect("its copy");
+    assert_eq!(found.text, UNTITLED_TEXT);
+    assert_eq!(found.files, files);
+    assert!(found.builds.is_empty());
+    assert!(!found.base_matches, "no file holds anything of it");
+    // Taking it leaves it there until the window that brings it back keeps its own.
+    assert_eq!(recovery.untitled().0.len(), 1);
+
+    recovery.discard_untitled(id);
+    assert_eq!(recovery.untitled(), (Vec::new(), 0));
+    assert!(recovery.take_untitled(id).is_none());
+    assert!(recovery.take_untitled(UntitledId::random()).is_none());
+    assert!(setup.recovery().find(&setup.place()).is_some(), "the other talk's copy stays");
+
+    // Kept with no name of its own, as any talk's is, it's called what a new one is.
+    let other = UntitledId::random();
+    recovery.keep(&TalkPlace::Untitled(other), &hash_text(""), "# Plain\n").unwrap();
+    let (listed, _) = recovery.untitled();
+    assert_eq!(listed[0].name, "Untitled presentation");
+}
+
+#[test]
+fn the_first_words_are_short_and_plain() {
+    let (_dir, root) = scratch_root();
+    let recovery = Recovery::new(root);
+    let cases = [
+        ("", ""),
+        ("---\nlayout: title\n---\n", ""),
+        ("# \n\n- *First* point\n- Second\n", "First point"),
+        ("```\ncode\n```\n\nAfter   the    code\n", "After the code"),
+        (&format!("# {}\n", "word ".repeat(30)), "word word word word word word word word word word word word"),
+        ("# Ünïcödé ✓ wörds\n", "Ünïcödé ✓ wörds"),
+    ];
+    for (text, words) in cases {
+        let id = UntitledId::random();
+        recovery.keep_untitled(id, "Untitled presentation", text, &[], &[]).unwrap();
+        let (listed, _) = recovery.untitled();
+        let copy = listed.iter().find(|copy| copy.id == id).unwrap();
+        assert_eq!(copy.first_words, words, "{text:?}");
+        assert!(copy.first_words.chars().count() <= 60);
+        recovery.discard_untitled(id);
+    }
+}
+
+#[test]
+fn a_recovery_folder_in_any_state_is_listed_or_skipped() {
+    // No folder at all.
+    let (_dir, root) = scratch_root();
+    assert_eq!(Recovery::new(root.clone()).untitled(), (Vec::new(), 0));
+    std::fs::create_dir_all(&root).unwrap();
+    assert_eq!(Recovery::new(root.clone()).untitled(), (Vec::new(), 0));
+
+    // Fifty, all listed, newest first.
+    let (_dir, root) = scratch_root();
+    let recovery = Recovery::new(root.clone());
+    let ids: Vec<UntitledId> = (0..50).map(|_| UntitledId::random()).collect();
+    let start = now_secs() - 1_000;
+    for (at, id) in ids.iter().enumerate() {
+        recovery.keep_untitled(*id, "Untitled presentation", &format!("# Talk {at}\n"), &[], &[]).unwrap();
+        set_kept_at(&untitled_slot(&root, *id), start + at as u64);
+    }
+    let (listed, skipped) = recovery.untitled();
+    assert_eq!(skipped, 0);
+    let newest_first: Vec<UntitledId> = ids.iter().rev().copied().collect();
+    assert_eq!(listed.iter().map(|copy| copy.id).collect::<Vec<_>>(), newest_first);
+    assert_eq!(listed[0].first_words, "Talk 49");
+
+    // Each odd state on its own: whether it's listed, and how many are skipped.
+    // What's done to a copy, whether it's listed after, and how many are skipped.
+    type Spoil = Box<dyn Fn(&Path)>;
+    let odd: Vec<(&str, bool, usize, Spoil)> = vec![
+        ("text that doesn't read as slides", true, 0, Box::new(|slot: &Path| {
+            std::fs::write(slot.join("slides.md"), "<Box x=\"\n---\n---\n<<< }}} \u{0}").unwrap()
+        })),
+        ("text that isn't UTF-8", false, 1, Box::new(|slot: &Path| {
+            std::fs::write(slot.join("slides.md"), [0xff, 0xfe, b'#']).unwrap()
+        })),
+        ("no text", false, 1, Box::new(|slot: &Path| std::fs::remove_file(slot.join("slides.md")).unwrap())),
+        ("no about file", false, 1, Box::new(|slot: &Path| std::fs::remove_file(slot.join("about.json")).unwrap())),
+        ("a truncated about file", false, 1, Box::new(|slot: &Path| {
+            let about = std::fs::read(slot.join("about.json")).unwrap();
+            std::fs::write(slot.join("about.json"), &about[..about.len() / 2]).unwrap()
+        })),
+        ("an about file from a newer version", true, 0, Box::new(|slot: &Path| {
+            let about = slot.join("about.json");
+            let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(&about).unwrap()).unwrap();
+            json["colour"] = "teal".into();
+            json["untitled"]["pinned"] = true.into();
+            std::fs::write(&about, json.to_string()).unwrap()
+        })),
+        ("an id that points outside", false, 1, Box::new(|slot: &Path| {
+            let about = slot.join("about.json");
+            let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(&about).unwrap()).unwrap();
+            json["untitled"]["id"] = "../../../../etc/passwd".into();
+            std::fs::write(&about, json.to_string()).unwrap()
+        })),
+        ("an id that isn't its folder's", false, 1, Box::new(|slot: &Path| {
+            let about = slot.join("about.json");
+            let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(&about).unwrap()).unwrap();
+            let stranger = UntitledId::random();
+            json["untitled"]["id"] = stranger.to_string().into();
+            json["talk"] = format!("untitled/{stranger}").into();
+            std::fs::write(&about, json.to_string()).unwrap()
+        })),
+        ("a talk path that isn't its own", false, 1, Box::new(|slot: &Path| {
+            let about = slot.join("about.json");
+            let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(&about).unwrap()).unwrap();
+            json["talk"] = "/etc".into();
+            std::fs::write(&about, json.to_string()).unwrap()
+        })),
+        ("a name no window could show", true, 0, Box::new(|slot: &Path| {
+            let about = slot.join("about.json");
+            let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(&about).unwrap()).unwrap();
+            json["untitled"]["name"] = format!("Odd\u{7}\n{}", "x".repeat(10_000)).into();
+            std::fs::write(&about, json.to_string()).unwrap()
+        })),
+        ("text too large to bring back", false, 1, Box::new(|slot: &Path| {
+            // Sparse, so it takes no room.
+            let file = std::fs::OpenOptions::new().write(true).open(slot.join("slides.md")).unwrap();
+            file.set_len(64 * 1024 * 1024 + 1).unwrap();
+        })),
+        ("text larger than is read to list it", true, 0, Box::new(|slot: &Path| {
+            let mut text = "# Big\n\n".to_string();
+            text.push_str(&"Words on a line.\n".repeat(200_000));
+            std::fs::write(slot.join("slides.md"), text).unwrap()
+        })),
+    ];
+    for (what, listed_it, skips, spoil) in odd {
+        let (_dir, root) = scratch_root();
+        let recovery = Recovery::new(root.clone());
+        let id = UntitledId::random();
+        recovery.keep_untitled(id, "Untitled presentation", "# Hello\n", &[], &[]).unwrap();
+        spoil(&untitled_slot(&root, id));
+        let (listed, skipped) = recovery.untitled();
+        assert_eq!(listed.iter().any(|copy| copy.id == id), listed_it, "{what}: {listed:?}");
+        assert_eq!(skipped, skips, "{what}");
+        assert_eq!(recovery.take_untitled(id).is_some(), listed_it, "{what}");
+        if listed_it {
+            let copy = listed.iter().find(|copy| copy.id == id).unwrap();
+            assert!(copy.name.chars().count() <= 100 && !copy.name.chars().any(char::is_control), "{what}");
+            assert!(copy.first_words.chars().count() <= 60, "{what}");
+        }
+    }
+
+    #[cfg(unix)]
+    links_and_locked_folders();
+}
+
+#[cfg(unix)]
+fn links_and_locked_folders() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    // A picture folder that's a link to somewhere else: the copy is listed and brought back,
+    // with nothing read through the link.
+    let (_dir, root) = scratch_root();
+    let recovery = Recovery::new(root.clone());
+    let id = UntitledId::random();
+    let files = vec![("assets/photo.png".to_string(), std::sync::Arc::<[u8]>::from(red_png()))];
+    recovery.keep_untitled(id, "Untitled presentation", "# Hello\n", &files, &[]).unwrap();
+    let slot = untitled_slot(&root, id);
+    std::fs::remove_dir_all(slot.join("files/assets")).unwrap();
+    symlink("/etc", slot.join("files/assets")).unwrap();
+    let (listed, skipped) = recovery.untitled();
+    assert_eq!((listed.len(), skipped), (1, 0));
+    assert!(recovery.take_untitled(id).unwrap().files.is_empty());
+    // The files folder itself as a link.
+    std::fs::remove_file(slot.join("files/assets")).unwrap();
+    std::fs::remove_dir_all(slot.join("files")).unwrap();
+    symlink("/etc", slot.join("files")).unwrap();
+    assert!(recovery.take_untitled(id).unwrap().files.is_empty());
+    // A picture that's a link.
+    std::fs::remove_file(slot.join("files")).unwrap();
+    std::fs::create_dir_all(slot.join("files/assets")).unwrap();
+    symlink("/etc/hostname", slot.join("files/assets/photo.png")).unwrap();
+    assert!(recovery.take_untitled(id).unwrap().files.is_empty());
+
+    // Text, an about file, a slot or a talk's folder that are links are never read through.
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("slides.md"), "# Not kept here\n").unwrap();
+    for linked in ["slides.md", "about.json", "slot", "key"] {
+        let (_dir, root) = scratch_root();
+        let recovery = Recovery::new(root.clone());
+        let id = UntitledId::random();
+        recovery.keep_untitled(id, "Untitled presentation", "# Hello\n", &[], &[]).unwrap();
+        let slot = untitled_slot(&root, id);
+        let key = slot.parent().unwrap().to_path_buf();
+        match linked {
+            "slides.md" | "about.json" => {
+                if linked == "about.json" {
+                    std::fs::copy(slot.join(linked), outside.path().join(linked)).unwrap();
+                }
+                std::fs::remove_file(slot.join(linked)).unwrap();
+                symlink(outside.path().join(linked), slot.join(linked)).unwrap();
+            }
+            "slot" => {
+                let moved = outside.path().join("moved-slot");
+                std::fs::rename(&slot, &moved).unwrap();
+                symlink(&moved, &slot).unwrap();
+            }
+            _ => {
+                let moved = outside.path().join("moved-key");
+                std::fs::rename(&key, &moved).unwrap();
+                symlink(&moved, &key).unwrap();
+            }
+        }
+        let (listed, _) = recovery.untitled();
+        assert!(listed.is_empty(), "{linked}: {listed:?}");
+        assert!(recovery.take_untitled(id).is_none(), "{linked}");
+        recovery.discard_untitled(id);
+        recovery.sweep(Duration::ZERO);
+        assert!(outside.path().join("slides.md").is_file(), "{linked}: nothing outside is removed");
+    }
+
+    // A folder that can't be read is skipped, and the others listed.
+    let (_dir, root) = scratch_root();
+    let recovery = Recovery::new(root.clone());
+    let (locked, open) = (UntitledId::random(), UntitledId::random());
+    recovery.keep_untitled(locked, "Untitled presentation", "# Locked\n", &[], &[]).unwrap();
+    recovery.keep_untitled(open, "Untitled presentation", "# Open\n", &[], &[]).unwrap();
+    let slot = untitled_slot(&root, locked);
+    std::fs::set_permissions(&slot, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let still_readable = std::fs::read_dir(&slot).is_ok();
+    let (listed, skipped) = recovery.untitled();
+    std::fs::set_permissions(&slot, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if !still_readable {
+        assert_eq!(listed.iter().map(|copy| copy.id).collect::<Vec<_>>(), vec![open]);
+        assert_eq!(skipped, 1);
+    }
+    let key = slot.parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let still_readable = std::fs::read_dir(&key).is_ok();
+    let (listed, skipped) = recovery.untitled();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if !still_readable {
+        assert_eq!(listed.iter().map(|copy| copy.id).collect::<Vec<_>>(), vec![open]);
+        assert_eq!(skipped, 1);
+    }
+}
+
+#[test]
+fn a_copy_held_by_a_live_window_is_not_listed() {
+    let (_dir, root) = scratch_root();
+    let app = Recovery::new(root.clone());
+    let window = app.for_another_window();
+    let id = UntitledId::random();
+    window.keep_untitled(id, "Untitled presentation", "# Mine\n", &[], &[]).unwrap();
+
+    assert_eq!(app.untitled(), (Vec::new(), 0), "held, so not left over from a crash");
+    assert!(app.take_untitled(id).is_none());
+    let another = app.for_another_window();
+    assert_eq!(another.untitled(), (Vec::new(), 0));
+    assert!(another.take_untitled(id).is_none());
+    app.discard_untitled(id);
+    another.discard_untitled(id);
+    assert!(window.find(&TalkPlace::Untitled(id)).is_some(), "nobody else lets it go");
+
+    // Once the window has gone, as it has after a crash, it's listed.
+    drop(window);
+    let (listed, skipped) = app.untitled();
+    assert_eq!((listed.len(), skipped), (1, 0));
+    assert_eq!(another.take_untitled(id).unwrap().text, "# Mine\n");
+}
+
+#[test]
+fn an_old_untitled_copy_is_swept() {
+    let (_dir, root) = scratch_root();
+    let recovery = Recovery::new(root.clone());
+    let (old, recent) = (UntitledId::random(), UntitledId::random());
+    recovery.keep_untitled(old, "Untitled presentation", "# Old\n", &[], &[]).unwrap();
+    recovery.keep_untitled(recent, "Untitled presentation", "# Recent\n", &[], &[]).unwrap();
+    let month_ago = SystemTime::now() - KEEP_FOR - Duration::from_secs(60 * 60);
+    let old_slot = untitled_slot(&root, old);
+    set_kept_at(&old_slot, month_ago.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs());
+
+    recovery.sweep(KEEP_FOR);
+
+    assert!(!old_slot.parent().unwrap().exists(), "its folder goes too");
+    let (listed, skipped) = recovery.untitled();
+    assert_eq!(listed.iter().map(|copy| copy.id).collect::<Vec<_>>(), vec![recent]);
+    assert_eq!(skipped, 0);
+}
+
+#[test]
+fn older_about_files_still_read() {
+    // As plan D4 wrote them, for a talk in a folder.
+    let setup = Setup::new(ONE);
+    keep(&setup, EDITED);
+    let json = serde_json::json!({
+        "talk": setup.folder.canonicalize().unwrap(),
+        "base_sha256": hash_text(ONE),
+        "kept_at": now_secs(),
+    });
+    std::fs::write(setup.kept_folder().join("about.json"), json.to_string()).unwrap();
+    let found = setup.recovery().find(&setup.place()).expect("still found");
+    assert_eq!(found.text, EDITED);
+    assert!(found.base_matches);
+    assert_eq!(setup.recovery().untitled(), (Vec::new(), 0), "not a new presentation");
+    // And what's written now has nothing about being untitled.
+    keep(&setup, EDITED);
+    let about: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(setup.kept_folder().join("about.json")).unwrap()).unwrap();
+    assert!(about.get("untitled").is_none(), "{about}");
+}
+
+#[gpui_kit::test]
+fn a_crash_before_the_first_save_brings_it_back(cx: &mut TestAppContext) {
+    let setup = Setup::new(ONE);
+    let id = UntitledId::random();
+    let template = stagepack_studio::templates::template("light").unwrap();
+    let talk = Document::new_untitled(template, id, Fonts::bundled_only()).unwrap();
+    let (handle, view) = open_view_on(cx, &setup, move |window, cx| WorkspaceView::open_with(talk, window, cx));
+    let picture = add_red(cx, &view, "red");
+    let talk = document(cx, &view);
+    cx.update(|cx| {
+        talk.update(cx, |document, cx| {
+            document.insert_tag("Insert picture", "Picture", &[("src", &picture)], None).unwrap();
+            assert!(document.begin_text_in_region(0, "title"));
+            document.apply_text(|edit| edit.insert("Plans for spring")).unwrap();
+            document.end_typing_run();
+            cx.notify();
+        })
+    });
+    cx.run_until_parked();
+    let edited = source_of(cx, &view);
+    assert!(edited.contains("Plans for spring") && edited.contains(&picture), "{edited}");
+    wait(cx, 1_000);
+    assert!(setup.recovery().find(&TalkPlace::Untitled(id)).is_some(), "kept");
+    assert_eq!(Recovery::new(setup.root.clone()).untitled(), (Vec::new(), 0), "held while the window's open");
+    drop(talk);
+    drop(view);
+    crash(cx, handle);
+
+    let recovery = Recovery::new(setup.root.clone());
+    let (listed, skipped) = recovery.untitled();
+    assert_eq!(skipped, 0);
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0].id, id);
+    assert_eq!(listed[0].name, "Untitled presentation");
+    assert_eq!(listed[0].slides, 1);
+    assert_eq!(listed[0].first_words, "Plans for spring");
+
+    let found = recovery.take_untitled(id).expect("its copy");
+    let mut back = Document::untitled_with(id, found.text, found.files, found.builds, Fonts::bundled_only()).unwrap();
+    assert_eq!(back.source().as_bytes(), edited.as_bytes());
+    assert!(back.is_untitled());
+    assert!(back.has_unsaved_changes());
+    assert!(back.has_file(&picture));
+    assert!(draws_red(&mut back));
+
+    let out = tempfile::tempdir().unwrap();
+    let packed = out.path().join("Back.sptx");
+    let saved = back.save_as_job(SaveTarget::Packed(packed.clone())).run().unwrap();
+    back.saved(saved);
+    assert!(!back.is_untitled());
+    let pack = slides_engine::open_packed(&packed).unwrap();
+    assert_eq!(pack.slides().unwrap().as_bytes(), edited.as_bytes());
+    assert_eq!(slides_engine::TalkFiles::read(&pack, &picture).as_deref(), Some(red_png().as_slice()));
 }

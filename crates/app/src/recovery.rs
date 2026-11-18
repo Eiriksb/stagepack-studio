@@ -5,7 +5,9 @@
 //!
 //! Each talk has a folder named for the hash of its path, and each window that keeps a copy of
 //! it has a slot of its own in there: `<root>/<key>/<slot>/slides.md` and `about.json`, and the
-//! files added to the talk that the text uses, at `files/<path>`.
+//! files added to the talk that the text uses, at `files/<path>`. A new presentation that was
+//! never saved has no path, so its folder is named for its id, and its about file says it's
+//! untitled, which is how [`Recovery::untitled`] finds it.
 
 use std::collections::BTreeSet;
 use std::io::{self, Read as _, Write as _};
@@ -19,7 +21,7 @@ use slides_components::BuildEntry;
 use slides_engine::{open_packed, read_talk_text, write_atomically};
 
 use crate::added_files::{FileKind, MAX_ADDED_BYTES, is_added_path};
-use crate::document::{SLIDES_FILE, TalkPlace};
+use crate::document::{SLIDES_FILE, TalkPlace, UNTITLED_NAME, UntitledId};
 use crate::permissions::BuildPermissions;
 
 /// The working copies' folder in the app's data folder.
@@ -37,6 +39,15 @@ const KEY_LENGTH: usize = 16;
 const MAX_TEXT_BYTES: u64 = 64 * 1024 * 1024;
 /// The largest about file that is read.
 const MAX_ABOUT_BYTES: u64 = 64 * 1024;
+/// The most of a working copy's text that is read to list it: enough for its first words and
+/// its slides, for any talk a person writes.
+const MAX_LISTED_TEXT_BYTES: u64 = 1024 * 1024;
+/// The most new presentations listed.
+const MAX_LISTED: usize = 100;
+/// The most characters of a listed presentation's first words.
+const FIRST_WORDS_CHARS: usize = 60;
+/// The most characters of a listed presentation's name.
+const NAME_CHARS: usize = 100;
 
 /// How long a working copy is kept for a talk that isn't opened again.
 pub const KEEP_FOR: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -50,6 +61,33 @@ struct About {
     base_sha256: String,
     /// When it was kept, in seconds since 1970.
     kept_at: u64,
+    /// For a new presentation that was never saved, which one it is. Copies kept before there
+    /// were any have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    untitled: Option<UntitledAbout>,
+}
+
+/// What a working copy of a new presentation says about it besides.
+#[derive(Serialize, Deserialize)]
+struct UntitledAbout {
+    /// Its id, as 32 hex digits.
+    id: String,
+    /// What it was called when it was kept.
+    name: String,
+}
+
+/// A new presentation's working copy left over from last time, as it's listed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UntitledCopy {
+    pub id: UntitledId,
+    /// What it was called when it was kept.
+    pub name: String,
+    pub when: SystemTime,
+    /// How many slides it has.
+    pub slides: usize,
+    /// The first line of text on its first slide, as it reads, 60 characters at most, or empty
+    /// if it has none.
+    pub first_words: String,
 }
 
 /// A working copy found for a talk.
@@ -171,6 +209,34 @@ impl Recovery {
         files: &[(String, Arc<[u8]>)],
         builds: &[BuildEntry],
     ) -> io::Result<()> {
+        self.keep_named(place, None, base_hash, text, files, builds)
+    }
+
+    /// Keeps `text`, `files` and `builds` as [`Self::keep_with_builds`] does, as the working
+    /// copy of the new presentation `id`, which is called `name`.
+    pub fn keep_untitled(
+        &self,
+        id: UntitledId,
+        name: &str,
+        text: &str,
+        files: &[(String, Arc<[u8]>)],
+        builds: &[BuildEntry],
+    ) -> io::Result<()> {
+        // No file holds anything of it, so there's no text it started from.
+        self.keep_named(&TalkPlace::Untitled(id), Some(name), &hash_text(""), text, files, builds)
+    }
+
+    /// Keeps the working copy of the talk at `place`, which is called `name` if it's untitled
+    /// and that's given, or else what a new presentation is called.
+    fn keep_named(
+        &self,
+        place: &TalkPlace,
+        name: Option<&str>,
+        base_hash: &str,
+        text: &str,
+        files: &[(String, Arc<[u8]>)],
+        builds: &[BuildEntry],
+    ) -> io::Result<()> {
         if let Some((odd, _)) = files.iter().find(|(path, _)| !is_added_path(path)) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{odd:?} isn't a file added to a talk")));
         }
@@ -187,6 +253,13 @@ impl Recovery {
             kept_at: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map_or(0, |since| since.as_secs()),
+            untitled: match place {
+                TalkPlace::Untitled(id) => Some(UntitledAbout {
+                    id: id.to_string(),
+                    name: name.unwrap_or(UNTITLED_NAME).to_string(),
+                }),
+                TalkPlace::Folder(_) | TalkPlace::Packed(_) => None,
+            },
         };
         let about = serde_json::to_vec_pretty(&about).map_err(io::Error::other)?;
         for (path, bytes) in files {
@@ -250,19 +323,30 @@ impl Recovery {
     /// The newest working copy of the talk at `place` that can be read, in any slot. For a
     /// window's own, that's in any slot but those other open windows hold.
     pub fn find(&self, place: &TalkPlace) -> Option<Found> {
+        let others_live = match &self.live {
+            Some(_) => self.held_by_others(),
+            None => BTreeSet::new(),
+        };
+        self.newest(place, &others_live)
+    }
+
+    /// The slots other open windows hold.
+    fn held_by_others(&self) -> BTreeSet<String> {
+        live_slots()
+            .iter()
+            .filter(|slot| **slot != self.slot)
+            .cloned()
+            .collect()
+    }
+
+    /// The newest working copy of the talk at `place` that can be read, in any slot but those in
+    /// `others_live`.
+    fn newest(&self, place: &TalkPlace, others_live: &BTreeSet<String>) -> Option<Found> {
         let talk = canonical(place);
         let key_folder = self.root.join(key(&talk));
         if refuse_link(&key_folder).is_err() {
             return None;
         }
-        let others_live: BTreeSet<String> = match &self.live {
-            Some(_) => live_slots()
-                .iter()
-                .filter(|slot| **slot != self.slot)
-                .cloned()
-                .collect(),
-            None => BTreeSet::new(),
-        };
         let newest = slots(&key_folder)
             .into_iter()
             .filter(|slot| {
@@ -272,7 +356,7 @@ impl Recovery {
             })
             .filter_map(|slot| {
                 let (about, written) = read_about(&slot)?;
-                (about.talk == talk).then_some((about, written, slot))
+                (about.talk == talk && says_it_is(&about, place)).then_some((about, written, slot))
             })
             .filter_map(|(about, written, slot)| {
                 let when = kept_at(&about)?;
@@ -291,6 +375,92 @@ impl Recovery {
             when,
             slot,
         })
+    }
+
+    /// The working copies of new presentations that were never saved, left over from last time:
+    /// each one that can be read and no open window holds, newest first, [`MAX_LISTED`] at
+    /// most, and how many more there are that couldn't be read. Only what's in the working
+    /// copies' folder is read, never through a link, and of each copy's text no more than
+    /// [`MAX_LISTED_TEXT_BYTES`]. It's quick, and can be asked from any thread while windows
+    /// keep their copies.
+    pub fn untitled(&self) -> (Vec<UntitledCopy>, usize) {
+        let held = self.held_by_others();
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return (Vec::new(), 0);
+        };
+        let mut skipped = 0;
+        let mut found = Vec::new();
+        for entry in entries.flatten() {
+            let Some(key_name) = entry.file_name().to_str().filter(|name| is_hex_name(name)).map(str::to_string) else {
+                continue;
+            };
+            // Not a link, and not a file.
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let Some(slots) = slots_in(&entry.path()) else {
+                skipped += 1;
+                continue;
+            };
+            for slot in slots {
+                let held_here = slot
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| held.contains(name));
+                if held_here {
+                    continue;
+                }
+                match untitled_about(&slot, &key_name) {
+                    Some(Some(about)) => found.push(about),
+                    Some(None) => {}
+                    None => skipped += 1,
+                }
+            }
+        }
+        found.sort_by_key(|about| std::cmp::Reverse((about.when, about.written)));
+        let mut listed: Vec<UntitledCopy> = Vec::new();
+        for about in found {
+            if listed.len() == MAX_LISTED {
+                break;
+            }
+            // An older copy of one listed already, as a crash can leave while one is brought
+            // back: it goes with the newer.
+            if listed.iter().any(|copy| copy.id == about.id) {
+                continue;
+            }
+            match listed_copy(about) {
+                Some(copy) => listed.push(copy),
+                None => skipped += 1,
+            }
+        }
+        (listed, skipped)
+    }
+
+    /// The newest working copy of the new presentation `id`, to bring it back with
+    /// [`Document::untitled_with`], unless it's gone or an open window holds it. It stays where
+    /// it is until the window that brings it back keeps its own, or lets it go.
+    ///
+    /// [`Document::untitled_with`]: crate::document::Document::untitled_with
+    pub fn take_untitled(&self, id: UntitledId) -> Option<Found> {
+        self.newest(&TalkPlace::Untitled(id), &self.held_by_others())
+    }
+
+    /// Removes the working copies of the new presentation `id`, but those an open window holds.
+    pub fn discard_untitled(&self, id: UntitledId) {
+        let key_folder = self.root.join(key(&canonical(&TalkPlace::Untitled(id))));
+        if refuse_link(&key_folder).is_err() {
+            return;
+        }
+        let held = self.held_by_others();
+        for slot in slots(&key_folder) {
+            let held_here = slot
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| held.contains(name));
+            if !held_here {
+                remove_slot(&slot);
+            }
+        }
     }
 
     /// Removes the working copies kept longer ago than `older_than`. One whose about file
@@ -386,16 +556,117 @@ fn kept_builds(slot: &Path) -> Vec<BuildEntry> {
 
 /// The working copies' folders in the talk's folder `key_folder`.
 fn slots(key_folder: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(key_folder) else {
-        return Vec::new();
-    };
-    entries
+    slots_in(key_folder).unwrap_or_default()
+}
+
+/// The working copies' folders in the talk's folder `key_folder`, or none if it can't be read.
+fn slots_in(key_folder: &Path) -> Option<Vec<PathBuf>> {
+    let entries = std::fs::read_dir(key_folder).ok()?;
+    let slots = entries
         .flatten()
         .filter(|entry| entry.file_name().to_str().is_some_and(is_hex_name))
         // Not a link, and not a file.
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .map(|entry| entry.path())
-        .collect()
+        .collect();
+    Some(slots)
+}
+
+/// A new presentation's copy, as its about file has it, before its text is read.
+struct UntitledFound {
+    id: UntitledId,
+    name: String,
+    when: SystemTime,
+    written: SystemTime,
+    slot: PathBuf,
+}
+
+/// What the working copy in `slot`, in the talk's folder named `key_name`, says about the new
+/// presentation it's a copy of: none if it's a copy of a talk with a place, and nothing if it
+/// can't be read or doesn't hold together.
+fn untitled_about(slot: &Path, key_name: &str) -> Option<Option<UntitledFound>> {
+    let (about, written) = read_about(slot)?;
+    let Some(untitled) = &about.untitled else {
+        return Some(None);
+    };
+    let id = untitled_id(&untitled.id)?;
+    // Kept where its id says, and saying the same itself.
+    let talk = canonical(&TalkPlace::Untitled(id));
+    if about.talk != talk || key(&talk) != key_name {
+        return None;
+    }
+    let name: String = untitled.name.chars().filter(|c| !c.is_control()).take(NAME_CHARS).collect();
+    let name = match name.trim() {
+        "" => UNTITLED_NAME.to_string(),
+        name => name.to_string(),
+    };
+    Some(Some(UntitledFound {
+        id,
+        name,
+        when: kept_at(&about)?,
+        written,
+        slot: slot.to_path_buf(),
+    }))
+}
+
+/// Whether `about` says it's a copy of the talk at `place` as its kind of place has it: a new
+/// presentation's says which one it is.
+fn says_it_is(about: &About, place: &TalkPlace) -> bool {
+    match place {
+        TalkPlace::Untitled(id) => about.untitled.as_ref().and_then(|untitled| untitled_id(&untitled.id)) == Some(*id),
+        TalkPlace::Folder(_) | TalkPlace::Packed(_) => about.untitled.is_none(),
+    }
+}
+
+/// The id written as `hex`, if it's 32 lowercase hex digits, as ids are written.
+fn untitled_id(hex: &str) -> Option<UntitledId> {
+    let digits = hex.len() == 32 && hex.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    digits.then(|| u128::from_str_radix(hex, 16).ok()).flatten().map(UntitledId)
+}
+
+/// `found` as it's listed, with its slides and first words read from its text, unless the text
+/// can't be brought back.
+fn listed_copy(found: UntitledFound) -> Option<UntitledCopy> {
+    let file = found.slot.join(SLIDES_FILE);
+    let meta = std::fs::symlink_metadata(&file).ok()?;
+    if !meta.is_file() || meta.len() > MAX_TEXT_BYTES {
+        return None;
+    }
+    let mut bytes = read_start(&file, MAX_LISTED_TEXT_BYTES)?;
+    if bytes.len() as u64 == MAX_LISTED_TEXT_BYTES && meta.len() > MAX_LISTED_TEXT_BYTES {
+        // Only its start is read: up to the last whole line in that.
+        let end = bytes.iter().rposition(|byte| *byte == b'\n').map_or(0, |at| at + 1);
+        bytes.truncate(end);
+    }
+    let text = String::from_utf8(bytes).ok()?;
+    let (slides, first_words) = std::panic::catch_unwind(|| {
+        let talk = slides_format::parse_talk(&text);
+        (talk.slides.len(), first_words(&talk))
+    })
+    .ok()?;
+    Some(UntitledCopy {
+        id: found.id,
+        name: found.name,
+        when: found.when,
+        slides,
+        first_words,
+    })
+}
+
+/// The first line of text on the talk's first slide, as it reads, [`FIRST_WORDS_CHARS`]
+/// characters at most, or empty if there's none.
+fn first_words(talk: &slides_format::Talk) -> String {
+    let line = slides_format::text_flows(talk, 0)
+        .into_iter()
+        .flat_map(|flow| flow.paras)
+        .flat_map(|para| {
+            let text: String = para.spans.iter().map(|span| span.text.as_str()).collect();
+            text.split('\n').map(|line| line.split_whitespace().collect::<Vec<_>>().join(" ")).collect::<Vec<_>>()
+        })
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let words: String = line.chars().take(FIRST_WORDS_CHARS).collect();
+    words.trim_end().to_string()
 }
 
 /// What the working copy in `slot` says about itself, and when that was written.
@@ -492,6 +763,16 @@ fn read_small(path: &Path, most: u64) -> Option<Vec<u8>> {
         .read_to_end(&mut bytes)
         .ok()?;
     (bytes.len() as u64 <= most).then_some(bytes)
+}
+
+/// The first `most` bytes of the plain file at `path`, or all of it if it holds fewer.
+fn read_start(path: &Path, most: u64) -> Option<Vec<u8>> {
+    if !std::fs::symlink_metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).ok()?.take(most).read_to_end(&mut bytes).ok()?;
+    Some(bytes)
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {

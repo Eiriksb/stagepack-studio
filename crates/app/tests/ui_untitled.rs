@@ -461,3 +461,84 @@ fn closing_while_a_save_runs_waits_for_it(cx: &mut TestAppContext) {
     assert!(typing.file.is_file(), "the save finished");
     assert!(!is_open(cx, typing.handle), "and then the window went");
 }
+
+/// Closes the window as a crash would: without asking, and without anything cleared.
+fn crash(cx: &mut TestAppContext, typing: Typing) {
+    let handle = typing.handle;
+    drop(typing);
+    cx.update_window(handle, |_, window, _| window.remove_window()).unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui_kit::test]
+fn an_untitled_talk_keeps_its_copy_as_it_is_edited(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let places = UntitledPlaces::under(root.path());
+    let typing = open_untitled_under(cx, "tour", 2, root.path());
+    let untitled = place(&typing, cx);
+    let TalkPlace::Untitled(id) = untitled else { panic!("untitled") };
+    let recovery = Recovery::new(places.recovery.clone());
+    wait(cx, KEEP_PAUSE);
+    assert!(recovery.find(&untitled).is_none(), "no edits, no copy");
+
+    add_slide(&typing, cx);
+    wait(cx, KEEP_PAUSE);
+    let edited = typing.source(cx);
+    assert_eq!(recovery.find(&untitled).expect("a copy of the edits").text, edited);
+    assert_eq!(recovery.untitled(), (Vec::new(), 0), "the window holds it, so it isn't listed");
+    assert!(recovery.take_untitled(id).is_none());
+
+    crash(cx, typing);
+    let (listed, skipped) = recovery.untitled();
+    assert_eq!(skipped, 0);
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0].id, id);
+    assert_eq!(listed[0].name, "Untitled presentation 2", "what it was called when it was kept");
+    assert_eq!(listed[0].first_words, "Welcome");
+    let found = recovery.take_untitled(id).unwrap();
+    assert_eq!(found.text, edited);
+    assert!(found.files.iter().any(|(path, _)| path == "assets/photo.png"), "with the template's picture");
+}
+
+#[gpui_kit::test]
+fn the_first_save_clears_the_untitled_copy(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let places = UntitledPlaces::under(root.path());
+    let typing = open_untitled_under(cx, "light", 1, root.path());
+    let untitled = place(&typing, cx);
+    let TalkPlace::Untitled(id) = untitled else { panic!("untitled") };
+    add_slide(&typing, cx);
+    wait(cx, KEEP_PAUSE);
+    let recovery = Recovery::new(places.recovery.clone());
+    assert!(recovery.find(&untitled).is_some());
+
+    first_save(&typing, cx, SAVE_AS_PACKED_ID, &places.documents.join("First.sptx"));
+    wait(cx, KEEP_PAUSE);
+    assert!(!is_untitled(&typing, cx));
+    assert!(recovery.find(&untitled).is_none(), "the save holds it now");
+    crash(cx, typing);
+    assert_eq!(recovery.untitled(), (Vec::new(), 0));
+    assert!(recovery.take_untitled(id).is_none());
+}
+
+#[gpui_kit::test]
+fn closing_with_dont_save_discards_the_copy(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let places = UntitledPlaces::under(root.path());
+    let typing = open_untitled_under(cx, "dark", 1, root.path());
+    let untitled = place(&typing, cx);
+    add_slide(&typing, cx);
+    wait(cx, KEEP_PAUSE);
+    let recovery = Recovery::new(places.recovery.clone());
+    assert!(recovery.find(&untitled).is_some());
+
+    let handle = typing.handle;
+    assert!(!try_to_close(cx, handle));
+    click_in(cx, handle, CLOSE_DONT_SAVE_ID);
+    assert!(!is_open(cx, handle));
+    drop(typing);
+    cx.run_until_parked();
+    assert!(recovery.find(&untitled).is_none());
+    assert_eq!(recovery.untitled(), (Vec::new(), 0));
+    assert!(!places.recovery.exists() || std::fs::read_dir(&places.recovery).unwrap().count() == 0, "nothing left behind");
+}
