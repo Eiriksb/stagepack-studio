@@ -15,7 +15,7 @@ You don't need to know Rust well. If you have written a function in any language
 
 ## Where a component goes
 
-A talk is a folder with `slides.md` in it. Put each component in its own file in a folder called `components`, next to `slides.md`. Pictures and data files go in a folder called `assets`. The example talk has:
+A talk is a folder with `slides.md` in it. To start one, choose a template on the app's start screen, or *New presentation…* in the File menu, and save it with *Save As* as a talk folder; or make the folder and `slides.md` yourself. Put each component in its own file in a folder called `components`, next to `slides.md`. Pictures and data files go in a folder called `assets`. The example talk has:
 
 - `slides.md`, the slides.
 - `components/score.rs`, `components/callout.rs` and the other examples.
@@ -332,6 +332,8 @@ Opening a talk never builds anything. A talk can come from anyone, and building 
 
 - **Build components** builds once, now.
 - **Always build this folder** builds now, and again every time a component in the folder changes. That includes changes that arrive from somewhere else, such as a `git pull`.
+
+A talk you made in the app and saved as a talk folder starts with *Always build this folder* on, as its code is your own. A packed talk never builds.
 
 The app remembers *Always build this folder* by the folder's path, not by what's in it. So don't turn it on for a folder that you'll later replace with someone else's talk: their components would then be built without asking you.
 

@@ -64,9 +64,11 @@ The largest stage, and it will be split into several plans when it starts.
 - **D2. Text:** typing on the slide, per-word styling, bullets, copy and paste between talks (goals 2, 9). File: `2026-11-12-native-rust-plan-d2-text.md`. What ran is in `docs/checks/plan-d2.md`.
 - **D3. Insert:** pictures, shapes, icons, tables and the component palette with its forms (goals 3, 4, 6). File: `2026-11-16-native-rust-plan-d3-insert.md`. What ran is in `docs/checks/plan-d3.md`.
 - **D4. Arrange and animate:** moving regions and boxes, align, distribute, order, snapping, the Animate tab and the layout picker (goals 5, 7). File: `2026-11-17-native-rust-plan-d4-arrange-animate.md`. What ran is in `docs/checks/plan-d4.md`.
-- **D5. New presentation:** starter templates (goal 10).
+- **D5. New presentation:** the start screen, starter templates, and a new presentation that is untitled until its first save and brought back after a crash (goal 10, and the save part of 11). File: `2026-11-18-native-rust-plan-d5-new-presentation.md`. What ran is in `docs/checks/plan-d5.md`.
 
 Windows checklist at the end of each.
+
+Stage D is done with D5. How far the design's first success test holds at its end, and what plan E still owes it, is in `docs/checks/plan-d5.md`.
 
 ### E. Packaging
 
