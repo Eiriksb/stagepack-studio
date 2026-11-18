@@ -501,3 +501,21 @@ proptest! {
         prop_assert!(read <= MOST_READ);
     }
 }
+
+/// `video` with the height its sample description gives changed to `height`, as a file whose
+/// pictures are coded taller than they're shown says.
+fn described_as(video: &[u8], height: u16) -> Vec<u8> {
+    let mut bytes = video.to_vec();
+    let at = bytes.windows(4).position(|kind| kind == b"avc1").expect("a sample description") - 4;
+    bytes[at + 34..at + 36].copy_from_slice(&height.to_be_bytes());
+    bytes
+}
+
+#[test]
+fn a_videos_size_is_the_size_it_is_shown_at() {
+    let video = coloured_video(64, 48, 3, 30);
+    // Its pictures coded 64 rows tall, shown 48 tall, as 1088 for 1080.
+    let (size, _) = size_and_read(described_as(&video, 64));
+    assert_eq!(size, Ok((64, 48)));
+    assert_eq!(open(reader(described_as(&video, 64))).map(|video| (video.info().width, video.info().height)), Ok((64, 48)), "as it plays");
+}

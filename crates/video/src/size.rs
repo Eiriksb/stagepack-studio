@@ -100,6 +100,11 @@ fn track_size(file: &mut Counted, at: u64, end: u64) -> Result<Option<(u32, u32)
     if &handler != b"vide" {
         return Ok(None);
     }
+    // The size it's shown at, as its track's header says, if that's believable: a picture coded
+    // larger, as 1088 rows for 1080, is cropped to it.
+    if let Some(size) = shown_size(file, at, end)? {
+        return Ok(Some(size));
+    }
     let Some((minf, minf_end)) = file.find(b"minf", mdia, mdia_end)? else { return Ok(None) };
     let Some((stbl, stbl_end)) = file.find(b"stbl", minf, minf_end)? else { return Ok(None) };
     let Some((stsd, stsd_end)) = file.find(b"stsd", stbl, stbl_end)? else { return Ok(None) };
@@ -117,4 +122,26 @@ fn track_size(file: &mut Counted, at: u64, end: u64) -> Result<Option<(u32, u32)
         return Err(CantPlay::Damaged);
     }
     Ok(Some((width, height)))
+}
+
+/// The width and height the track header in the track from `at` to `end` gives, in whole
+/// pixels, if it has one and they're believable.
+fn shown_size(file: &mut Counted, at: u64, end: u64) -> Result<Option<(u32, u32)>, CantPlay> {
+    let Some((tkhd, tkhd_end)) = file.find(b"tkhd", at, end)? else { return Ok(None) };
+    let mut version = [0u8; 1];
+    if tkhd_end - tkhd < 1 {
+        return Ok(None);
+    }
+    file.read_at(tkhd, &mut version)?;
+    // Its times are four bytes each, or eight in version 1; the sides come last, 16.16 each.
+    let sides_at = if version[0] == 1 { 88 } else { 76 };
+    if tkhd_end - tkhd < sides_at + 8 {
+        return Ok(None);
+    }
+    let mut sides = [0u8; 8];
+    file.read_at(tkhd + sides_at, &mut sides)?;
+    let width = u32::from_be_bytes([sides[0], sides[1], sides[2], sides[3]]) >> 16;
+    let height = u32::from_be_bytes([sides[4], sides[5], sides[6], sides[7]]) >> 16;
+    let believable = |side: u32| side > 0 && side <= MOST_SIDE;
+    Ok((believable(width) && believable(height)).then_some((width, height)))
 }
