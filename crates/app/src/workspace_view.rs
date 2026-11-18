@@ -1434,8 +1434,10 @@ impl WorkspaceView {
             Some(kind.extension()),
             EXPORTING,
             move |document| {
-                let input = document.export_input();
-                move |out: &Path| run_export(input, kind, out)
+                let (input, readers) = (document.export_input(), document.readers());
+                // After a save replacing the pack that's running, and keeping one from replacing
+                // it until it's done.
+                move |out: &Path| readers.while_reading(|| run_export(input, kind, out))
             },
             cx,
         );

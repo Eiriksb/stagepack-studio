@@ -784,15 +784,19 @@ fn a_video_stopped_while_it_opens_ends_off_the_windows_thread(cx: &mut TestAppCo
         });
     });
     cx.run_until_parked();
-    let (started_now, ended_now) = decodings_started_and_ended_aside();
-    assert_eq!(started_now - started, 1, "it was opened");
-    assert_eq!(ended_now - ended, 1, "and ended on a background task");
+    // Ended on a thread of its own, which may take a moment.
+    let ended_as_started = |cx: &mut TestAppContext, count: usize| {
+        until(cx, typing.handle, "its decoding ended aside", |_| {
+            let (started_now, ended_now) = decodings_started_and_ended_aside();
+            assert_eq!(started_now - started, count, "opened");
+            ended_now - ended == count
+        });
+    };
+    ended_as_started(cx, 1);
     // And stopped as it plays, the same.
     play_selected(&typing, cx);
     click_on(&typing, cx, VIDEO_STOP_ID);
-    cx.run_until_parked();
-    let (started_now, ended_now) = decodings_started_and_ended_aside();
-    assert_eq!(started_now - started, ended_now - ended);
+    ended_as_started(cx, 2);
 }
 
 #[gpui_kit::test]
@@ -949,13 +953,177 @@ fn a_turned_full_size_video_costs_the_window_little(cx: &mut TestAppContext) {
     let show = rehearse(cx, source, &video);
     let canvas = show.first_pictures(cx, 1);
     let mut times = Vec::new();
+    let mut shown = Vec::new();
     for _ in 0..40 {
         decoded_ahead(cx, show.audience, &canvas, 1);
         next_frame(cx, show.audience, 34);
         times.push(cx.read(|cx| canvas.read(cx).last_video_advance()));
+        shown.extend(frame_times(cx, &canvas)[0]);
     }
+    shown.dedup();
+    assert!(shown.len() >= 20, "turned pictures come: {shown:?}");
     times.sort();
     let median = times[times.len() / 2];
     eprintln!("the window's thread, a turned 1080p picture: median {median:?}, most {:?}", times.last().unwrap());
     assert!(median < Duration::from_millis(2), "{median:?}");
+}
+
+// What the second review found.
+
+#[test]
+fn a_save_letting_go_while_a_video_is_read_waits_for_it_rather_than_failing() {
+    use stagepack_studio::video_player::{Making, Unopened, make_still_from, play_from};
+    let work = tempfile::tempdir().unwrap();
+    let (mut document, _) = packed(&talk(), &clip(30, 10), work.path());
+    // Its index being read as a save lets go of it.
+    let reader = document.open_large("assets/clip.mp4").unwrap().open_unless_saving().unwrap();
+    assert_eq!(document.begin_saving_the_pack(), 1);
+    assert_eq!(play_from(reader, 0.0, false).err(), Some(Unopened::Saving), "it's opened again after the save");
+    document.pack_save_ended();
+    // Its still being made as a save lets go of it.
+    document.notices();
+    let (job, open) = document.still_jobs().pop().expect("its still is wanted");
+    let reader = open.unwrap().open_for_still().unwrap();
+    document.begin_saving_the_pack();
+    assert!(matches!(make_still_from(job, reader), Making::Waits(_)), "made again after the save, not said to be unreadable");
+    document.pack_save_ended();
+    // A file that isn't a video still says so.
+    let folder = talk_folder(&talk(), b"words, not pictures");
+    let mut words = Document::open(folder.path(), Fonts::bundled_only()).unwrap();
+    let reader = words.open_large("assets/clip.mp4").unwrap().open_unless_saving().unwrap();
+    assert_eq!(play_from(reader, 0.0, false).err(), Some(Unopened::Cannot(slides_video::CantPlay::NotAVideo)));
+    words.notices();
+    let (job, open) = words.still_jobs().pop().unwrap();
+    assert!(matches!(make_still_from(job, open.unwrap().open_for_still().unwrap()), Making::Made(_)));
+}
+
+#[gpui_kit::test]
+fn a_save_that_fails_or_is_cancelled_leaves_the_video_playing(cx: &mut TestAppContext) {
+    let _alone = alone();
+    use std::os::unix::fs::PermissionsExt as _;
+    let work = tempfile::tempdir().unwrap();
+    let place = work.path().join("place");
+    std::fs::create_dir(&place).unwrap();
+    let (document, _) = packed(&talk(), &clip(300, 30), &place);
+    let typing = open_untitled_talk(cx, document, work.path());
+    stills_made(&typing, cx);
+    let canvas = play_selected(&typing, cx);
+    let playing_again = |cx: &mut TestAppContext, names: &[String], how: &str| {
+        until(cx, typing.handle, how, |cx| {
+            cx.executor().advance_clock(Duration::from_millis(34));
+            let threads = threads_of(cx, &canvas);
+            threads.len() == 1 && threads != names && frames(cx, &canvas)[0].is_some()
+        });
+        assert!(!typing.document(cx).read_with(cx, |document, _| document.saving_the_pack()), "{how}");
+    };
+    // Failed: the folder the pack is in can't be written to.
+    let names = threads_of(cx, &canvas);
+    std::fs::set_permissions(&place, std::fs::Permissions::from_mode(0o500)).unwrap();
+    typing.press(cx, "ctrl-s");
+    wait(cx, 500);
+    std::fs::set_permissions(&place, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let said = typing.status(cx).unwrap_or_default();
+    assert!(!said.starts_with("Saved"), "{said}");
+    playing_again(cx, &names, "after a failed save");
+    // Cancelled as it starts.
+    let names = threads_of(cx, &canvas);
+    typing.with_window(cx, |window, cx| {
+        window.press("ctrl-s", cx);
+        window.render_frame(cx);
+        window.click(stagepack_studio::workspace_view::CANCEL_PROGRESS_ID, cx);
+    });
+    wait(cx, 500);
+    playing_again(cx, &names, "after a cancelled save");
+}
+
+#[test]
+fn a_save_beginning_while_a_video_is_unpacked_does_not_wait_for_it() {
+    use std::io::Write as _;
+    let work = tempfile::tempdir().unwrap();
+    // A pack from another program, its video compressed, large enough to take a while to unpack.
+    let pack = work.path().join("odd.sptx");
+    {
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&pack).unwrap());
+        let deflated = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("talk.json", deflated).unwrap();
+        zip.write_all(br#"{"format":1,"app":"another","entry":"slides.md"}"#).unwrap();
+        zip.start_file("slides.md", deflated).unwrap();
+        zip.write_all(b"# Odd\n\n<Video src=\"assets/clip.mp4\" x=\"0\" w=\"640\" h=\"360\" />\n").unwrap();
+        zip.start_file("assets/clip.mp4", deflated).unwrap();
+        let mut state = 7u32;
+        let mut piece = vec![0u8; 1 << 20];
+        for _ in 0..256 {
+            for byte in piece.iter_mut() {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                *byte = state as u8;
+            }
+            zip.write_all(&piece).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    let mut document = Document::open_packed(&pack, Fonts::bundled_only()).unwrap();
+    document.use_video_cache(stagepack_studio::large_files::VideoCache::new(work.path().join("cache"), u64::MAX));
+    let open = document.open_large("assets/clip.mp4").unwrap();
+    let unpacking = std::thread::spawn(move || open.open_unless_saving().err());
+    let began = Instant::now();
+    while document.opens_for_test().0 == 0 {
+        assert!(began.elapsed() < Duration::from_secs(10), "it never started unpacking");
+        std::thread::yield_now();
+    }
+    // The save begins on the window's thread at once, whatever is being opened.
+    let began = Instant::now();
+    document.begin_saving_the_pack();
+    assert!(began.elapsed() < Duration::from_millis(20), "{:?}", began.elapsed());
+    // Its own work waits for the unpacking, which gives up, and then saves.
+    let job = document.save_job().waiting_for_opens(document.readers());
+    let saved = std::thread::spawn(move || job.run()).join().unwrap();
+    assert_eq!(unpacking.join().unwrap(), Some(stagepack_studio::large_files::NotOpened::Saving), "it gave up for the save");
+    assert!(saved.is_ok(), "{:?}", saved.err());
+    document.pack_save_ended();
+}
+
+#[test]
+fn an_export_waits_for_a_save_replacing_the_pack() {
+    let work = tempfile::tempdir().unwrap();
+    let (document, _) = packed(&talk(), &clip(3, 10), work.path());
+    let readers = document.readers();
+    document.begin_saving_the_pack();
+    let exporting = {
+        let readers = readers.clone();
+        std::thread::spawn(move || readers.while_reading(Instant::now))
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    let ended = Instant::now();
+    let mut document = document;
+    document.pack_save_ended();
+    let exported = exporting.join().unwrap();
+    assert!(exported >= ended, "it read the talk only once the save was done");
+}
+
+#[gpui_kit::test]
+fn a_turned_video_opened_again_after_a_save_goes_on_playing(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let work = tempfile::tempdir().unwrap();
+    let source = talk().replace(VIDEO, &VIDEO.replace(" />", " rotate=\"20\" />"));
+    let (document, _) = packed(&source, &clip(300, 30), work.path());
+    let typing = open_untitled_talk(cx, document, work.path());
+    stills_made(&typing, cx);
+    let canvas = play_selected(&typing, cx);
+    let names = threads_of(cx, &canvas);
+    typing.press(cx, "ctrl-s");
+    wait(cx, 500);
+    until(cx, typing.handle, "playing again", |cx| {
+        cx.executor().advance_clock(Duration::from_millis(34));
+        let threads = threads_of(cx, &canvas);
+        threads.len() == 1 && threads != names
+    });
+    let mut seen = Vec::new();
+    until(cx, typing.handle, "new pictures", |cx| {
+        cx.executor().advance_clock(Duration::from_millis(34));
+        seen.extend(frame_times(cx, &canvas)[0]);
+        seen.dedup();
+        seen.len() >= 4
+    });
 }

@@ -309,15 +309,23 @@ impl LargeOpen {
         self.open_as(false)
     }
 
+    /// [`Self::open`] for reading a few headers on the window's thread: only a file read where it
+    /// lies, never one from the cache, whose pack's list of files would have to be read first.
+    pub(crate) fn open_in_place(self) -> Result<HeldReader, NotOpened> {
+        let LargeOpen { files, path, readers, .. } = self;
+        readers.open(|| files.open(&path).ok_or(NotOpened::NotUnpacked))
+    }
+
     fn open_as(self, unpacking: bool) -> Result<HeldReader, NotOpened> {
         let LargeOpen { files, path, pack, cache, readers } = self;
+        let stop = readers.clone();
         readers.open(|| match files.open(&path) {
             Some(reader) => Ok(reader),
             None => {
                 let unreadable = NotOpened::Unreadable;
                 let pack = pack.as_ref().filter(|_| is_large_kind(&path)).ok_or(unreadable)?;
                 let cache = cache.or_else(VideoCache::app).ok_or(unreadable)?;
-                let at = if unpacking { cache.unpacked(pack, &path).ok_or(unreadable)? } else { cache.unpacked_already(pack, &path).ok_or(NotOpened::NotUnpacked)? };
+                let at = if unpacking { cache.unpacked(pack, &path, stop.saving_now()).ok_or(unreadable)? } else { cache.unpacked_already(pack, &path).ok_or(NotOpened::NotUnpacked)? };
                 let file = large_files::open_plain(&at).ok_or(unreadable)?;
                 Ok(Box::new(file) as Box<dyn slides_engine::ReadSeek>)
             }
@@ -352,9 +360,9 @@ impl Document {
         });
         let (opening, readers) = (self.large.opening.clone(), self.large.readers.clone());
         let measure: MeasureVideo = Arc::new(move |path: &str| {
-            let reader = LargeOpen::of(&lock_any(&opening), path, &readers)?.open_for_still().ok()?;
-            let info = slides_video::open(Box::new(reader)).ok()?.info();
-            Some((info.width, info.height))
+            // Its headers alone, 64 KB at most: this is on the thread laying the slide out.
+            let mut reader = LargeOpen::of(&lock_any(&opening), path, &readers)?.open_in_place().ok()?;
+            slides_video::video_size(&mut reader).ok()
         });
         self.deck.make_stills_aside(wanted, measure);
     }
@@ -657,6 +665,19 @@ impl Document {
         self.large.readers.save_ended();
         // Those wanted meanwhile, as well as those that waited.
         self.ask_for_stills();
+    }
+
+    /// The talk's readers, for a save to wait on what's being opened as it begins.
+    #[doc(hidden)]
+    pub fn readers(&self) -> Arc<Readers> {
+        self.large.readers.clone()
+    }
+
+    /// How many of the talk's files are being opened now, and how many were refused while a save
+    /// ran, for tests.
+    #[doc(hidden)]
+    pub fn opens_for_test(&self) -> (usize, u64) {
+        (self.large.readers.opening(), self.large.readers.refused())
     }
 
     /// Whether a save replacing the talk's pack is running, when nothing of it is opened.

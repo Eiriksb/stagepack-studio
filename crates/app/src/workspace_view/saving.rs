@@ -322,8 +322,10 @@ impl WorkspaceView {
             && let Some(document) = &self.document
         {
             // Nothing of the talk is opened until the save is done.
-            let let_go = document.read(cx).begin_saving_the_pack();
-            job = job.reading_back(let_go > 0);
+            let document = document.read(cx);
+            let let_go = document.begin_saving_the_pack();
+            // What's being opened as it begins is waited for in the save's own work, not here.
+            job = job.reading_back(let_go > 0).waiting_for_opens(document.readers());
         }
         let meter = job.moves_large().then(|| self.start_progress(format!("{} {name}", SAVING.doing), false, cx));
         if meter.is_none() {
@@ -368,9 +370,6 @@ impl WorkspaceView {
             self.save_flow = SaveFlow::Idle;
             return;
         };
-        // Whatever came of it, the talk's files can be opened again: what waited is opened
-        // once the talk follows the save.
-        document.update(cx, |document, _| document.pack_save_ended());
         let (outcome, mut theirs) = match outcome {
             Ok(saved) => {
                 let said = if saved.notices().is_empty() {
@@ -400,6 +399,12 @@ impl WorkspaceView {
             Err(SaveError::ChangedOutside(theirs)) => (SaveOutcome::ChangedOutside, Some(theirs)),
             Err(problem) => (SaveOutcome::Failed(problem.to_string()), None),
         };
+        // Whatever came of it, and once the talk follows what was saved, its files can be opened
+        // again: everything the save let go of, or held back, is opened again.
+        document.update(cx, |document, cx| {
+            document.pack_save_ended();
+            cx.notify();
+        });
         let still_unsaved = document.read(cx).has_unsaved_changes();
         for effect in self.save_flow.finished(outcome, still_unsaved) {
             match effect {

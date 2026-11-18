@@ -51,6 +51,9 @@ pub struct SaveJob {
     /// Whether a save in place of a pack opens it again even if it wrote no file, as a reader of
     /// the pack was let go of for it, and nothing may go on holding the pack it replaced.
     read_back: bool,
+    /// The talk's readers, whose files being opened as the save began it waits for, before it
+    /// writes anything: each is let go of as soon as it's open.
+    waits_for: Option<Arc<crate::large_files::Readers>>,
 }
 
 /// Why a save didn't write anything.
@@ -144,10 +147,18 @@ impl SaveJob {
             index,
             moves_large: false,
             read_back: false,
+            waits_for: None,
         }
     }
 
     /// The job, opening a pack saved in place in again even if it writes no file, if `read_back`.
+    /// The job, waiting for the files of `readers` being opened as it began, before it writes.
+    #[doc(hidden)]
+    pub fn waiting_for_opens(mut self, readers: Arc<crate::large_files::Readers>) -> SaveJob {
+        self.waits_for = Some(readers);
+        self
+    }
+
     pub fn reading_back(mut self, read_back: bool) -> SaveJob {
         self.read_back |= read_back;
         self
@@ -219,7 +230,11 @@ impl SaveJob {
             index,
             moves_large: _,
             read_back: read_back_anyway,
+            waits_for,
         } = self;
+        if let Some(readers) = waits_for {
+            readers.wait_for_opens();
+        }
         let mut builds_written = Vec::new();
         let mut reopened = None;
         let mut index_kept_in_pack = None;

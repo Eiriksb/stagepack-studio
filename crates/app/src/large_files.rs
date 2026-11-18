@@ -514,8 +514,12 @@ pub struct Readers {
     /// Whether any was let go of since the talk was last saved.
     let_go: AtomicBool,
     gate: Mutex<Gate>,
-    /// Told when no file is being opened any more.
-    opened: std::sync::Condvar,
+    /// Told when the save is done, or no file is being opened any more.
+    changed: std::sync::Condvar,
+    /// Set while a save replaces the pack, for what reads the talk a piece at a time to stop.
+    saving_now: Arc<AtomicBool>,
+    /// How many files were refused as a save ran, for tests.
+    refused: AtomicU64,
 }
 
 impl Readers {
@@ -528,23 +532,50 @@ impl Readers {
     }
 
     /// Opens a reader with `open`, held among these until it's dropped or let go of, unless a
-    /// save replacing the pack is running: then nothing is opened.
+    /// save replacing the pack is running, or begins while it's being opened: then nothing is
+    /// held. `open` can look at [`Self::saving_now`] between the pieces of a long open, and stop.
     pub(crate) fn open(&self, open: impl FnOnce() -> Result<Box<dyn ReadSeek>, NotOpened>) -> Result<HeldReader, NotOpened> {
         {
             let mut gate = self.gate();
             if gate.saving {
+                self.refused.fetch_add(1, Ordering::SeqCst);
                 return Err(NotOpened::Saving);
             }
             gate.opening += 1;
         }
         let opened = open();
-        let held = opened.map(|reader| self.hold(reader));
         let mut gate = self.gate();
         gate.opening -= 1;
-        if gate.opening == 0 {
-            self.opened.notify_all();
+        self.changed.notify_all();
+        if gate.saving {
+            // The file is let go of at once, unread.
+            self.refused.fetch_add(1, Ordering::SeqCst);
+            return Err(NotOpened::Saving);
         }
-        held
+        drop(gate);
+        opened.map(|reader| self.hold(reader))
+    }
+
+    /// Runs `work`, which reads the talk's files, once no save replacing the pack is running, and
+    /// keeps such a save from replacing it until `work` is done: for an export. It waits, so it's
+    /// for another thread than the window's.
+    pub fn while_reading<T>(&self, work: impl FnOnce() -> T) -> T {
+        {
+            let mut gate = self.gate();
+            while gate.saving {
+                gate = self.changed.wait(gate).unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            gate.opening += 1;
+        }
+        let done = work();
+        self.gate().opening -= 1;
+        self.changed.notify_all();
+        done
+    }
+
+    /// Set while a save replaces the pack: something reading the talk a piece at a time stops.
+    pub(crate) fn saving_now(&self) -> &AtomicBool {
+        &self.saving_now
     }
 
     /// `reader`, held among these until it's dropped or let go of.
@@ -578,18 +609,36 @@ impl Readers {
     /// [`Self::save_ended`], what's being opened is waited for, and then every reader held is let
     /// go of. How many there were is given.
     pub(crate) fn begin_saving(&self) -> usize {
-        let mut gate = self.gate();
-        gate.saving = true;
-        while gate.opening > 0 {
-            gate = self.opened.wait(gate).unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
-        drop(gate);
+        self.gate().saving = true;
+        self.saving_now.store(true, Ordering::SeqCst);
         self.let_go()
+    }
+
+    /// Waits until nothing is being opened: what was being opened as the save began is let go of
+    /// as soon as it is. For the save's own work, before it replaces the pack, never for the
+    /// window's thread.
+    pub(crate) fn wait_for_opens(&self) {
+        let mut gate = self.gate();
+        while gate.opening > 0 {
+            gate = self.changed.wait(gate).unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    /// How many files are being opened now, for tests.
+    pub(crate) fn opening(&self) -> usize {
+        self.gate().opening
+    }
+
+    /// How many files were refused as a save ran, for tests.
+    pub(crate) fn refused(&self) -> u64 {
+        self.refused.load(Ordering::SeqCst)
     }
 
     /// The save that replaces the pack is done, whatever came of it: files can be opened again.
     pub(crate) fn save_ended(&self) {
         self.gate().saving = false;
+        self.saving_now.store(false, Ordering::SeqCst);
+        self.changed.notify_all();
     }
 
     /// Whether a save replacing the pack is running, when nothing is opened.
@@ -682,7 +731,7 @@ impl VideoCache {
     /// The file the pack at `pack` holds as `entry`, unpacked here, a piece at a time, if it
     /// isn't already. The file is named for the pack, as it is now, and the entry, so a pack
     /// that changes is unpacked again.
-    pub(crate) fn unpacked(&self, pack: &Path, entry: &str) -> Option<PathBuf> {
+    pub(crate) fn unpacked(&self, pack: &Path, entry: &str, stop: &AtomicBool) -> Option<PathBuf> {
         let (at, files, len) = self.place_for(pack, entry)?;
         if std::fs::symlink_metadata(&at).is_ok_and(|there| there.is_file() && there.len() == len) {
             // Used now: it goes after those used longer ago.
@@ -702,8 +751,7 @@ impl VideoCache {
         if !has_room(&self.folder, len) {
             return None;
         }
-        let never = AtomicBool::new(false);
-        let written = write_new_atomically_with(&at, |file| files.copy_entry(entry, file, &|_, _| {}, &never));
+        let written = write_new_atomically_with(&at, |file| files.copy_entry(entry, file, &|_, _| {}, stop));
         match written {
             Ok(()) => {}
             // Unpacked by another window meanwhile: taken only if it's a plain file, as long.

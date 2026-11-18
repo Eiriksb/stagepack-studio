@@ -175,6 +175,18 @@ pub struct MadeStill {
     still: Still,
 }
 
+impl MadeStill {
+    /// Whether no still could be made: why is said once it's taken in.
+    pub fn failed(&self) -> bool {
+        matches!(self.still, Still::Cannot(_))
+    }
+
+    /// The still to be made again, as when its file was taken away while it was read.
+    pub fn again(self) -> StillJob {
+        StillJob { path: self.path, version: self.version }
+    }
+}
+
 /// Stills to be made aside, as the window's thread mustn't decode a video.
 struct Aside {
     wanted: StillWanted,

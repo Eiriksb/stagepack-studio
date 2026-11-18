@@ -15,7 +15,7 @@ use slides_engine::{MadeStill, Pixmap, Rect, StillJob, VideoOn, bgra_frame, fram
 use slides_video::{CantPlay, Frame, Playing};
 
 use crate::document::{Document, LargeOpen};
-use crate::large_files::{NotOpened, ReaderWatch};
+use crate::large_files::{HeldReader, NotOpened, ReaderWatch};
 
 /// Sent by a talk when a video's still has come, and the slides showing it are to be drawn again.
 pub struct StillsTaken;
@@ -23,7 +23,8 @@ pub struct StillsTaken;
 impl EventEmitter<StillsTaken> for Document {}
 
 /// What came of making a still.
-enum Making {
+#[doc(hidden)]
+pub enum Making {
     Made(MadeStill),
     /// It couldn't be made yet: while a save replaces the pack, or before a video a pack holds
     /// compressed is unpacked to play.
@@ -36,10 +37,22 @@ fn make_one(job: StillJob, open: Option<LargeOpen>) -> Making {
         return Making::Made(job.make(None));
     };
     match open.open_for_still() {
-        Ok(reader) => Making::Made(job.make(Some(Box::new(reader)))),
+        Ok(reader) => make_still_from(job, reader),
         Err(NotOpened::Unreadable) => Making::Made(job.make(None)),
         Err(NotOpened::Saving | NotOpened::NotUnpacked) => Making::Waits(job),
     }
+}
+
+/// Makes `job` from `reader`. One that failed because a save let go of its file waits to be
+/// made again after the save, rather than saying it can't be read.
+#[doc(hidden)]
+pub fn make_still_from(job: StillJob, reader: HeldReader) -> Making {
+    let watch = reader.watch();
+    let made = job.make(Some(Box::new(reader)));
+    if made.failed() && watch.is_let_go() {
+        return Making::Waits(made.again());
+    }
+    Making::Made(made)
 }
 
 /// Has `document`'s videos' stills made on background tasks, one at a time, as each is wanted,
@@ -147,14 +160,16 @@ pub struct Player {
 
 /// Why a video wasn't opened to play.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Unopened {
+#[doc(hidden)]
+pub enum Unopened {
     /// A save replacing the talk's pack was running: it's opened once that's done.
     Saving,
     Cannot(CantPlay),
 }
 
 /// What came of opening a video: it playing, or why not.
-pub(crate) type Opened = Result<(Playing, ReaderWatch), Unopened>;
+#[doc(hidden)]
+pub type Opened = Result<(Playing, ReaderWatch), Unopened>;
 
 /// Opens the video `open` reads and starts it decoding from `from` seconds: for a background
 /// task, as opening reads the file.
@@ -163,21 +178,38 @@ pub(crate) fn open_and_play(open: LargeOpen, from: f64, looped: bool) -> Opened 
         NotOpened::Saving => Unopened::Saving,
         NotOpened::Unreadable | NotOpened::NotUnpacked => Unopened::Cannot(CantPlay::CouldNotRead),
     })?;
+    play_from(reader, from, looped)
+}
+
+/// Reads the index of the video `reader` reads, and starts it decoding. One that failed because
+/// a save let go of its file waits to be opened again after the save.
+#[doc(hidden)]
+pub fn play_from(reader: HeldReader, from: f64, looped: bool) -> Opened {
     let watch = reader.watch();
-    let video = slides_video::open(Box::new(reader)).map_err(Unopened::Cannot)?;
+    let video = slides_video::open(Box::new(reader)).map_err(|why| if watch.is_let_go() { Unopened::Saving } else { Unopened::Cannot(why) })?;
     OPENED.fetch_add(1, Ordering::SeqCst);
     Ok((video.play(from, looped), watch))
 }
 
-/// Ends a video's decoding on a background task: dropping it waits for its thread to let go
-/// of the file, which the window's thread mustn't wait for.
+/// Ends a video's decoding on a short thread of its own: dropping it waits for its thread to
+/// let go of the file, which neither the window's thread nor the background tasks that make
+/// stills and turn pictures should wait for. With no thread to be had, a background task does it.
 pub(crate) fn stop_aside(playing: Playing, background: &BackgroundExecutor) {
-    background
-        .spawn(async move {
-            drop(playing);
-            ENDED_ASIDE.fetch_add(1, Ordering::SeqCst);
-        })
-        .detach();
+    let held = Arc::new(Mutex::new(Some(playing)));
+    let theirs = held.clone();
+    let spawned = std::thread::Builder::new().name("stopping a video".to_string()).spawn(move || {
+        drop(theirs.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take());
+        ENDED_ASIDE.fetch_add(1, Ordering::SeqCst);
+    });
+    if spawned.is_err() {
+        let playing = held.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+        background
+            .spawn(async move {
+                drop(playing);
+                ENDED_ASIDE.fetch_add(1, Ordering::SeqCst);
+            })
+            .detach();
+    }
 }
 
 /// Lets go of what came of opening a video no one wants any more, off the window's thread.
@@ -288,6 +320,8 @@ impl Player {
         self.from = self.resume_from();
         self.started = None;
         self.state = State::Opening;
+        // A picture being turned for it before is for a player that's gone.
+        self.turning = false;
     }
 
     /// Ends its decoding where it is, its picture staying, as for a slide being left.
