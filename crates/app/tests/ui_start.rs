@@ -476,6 +476,84 @@ fn assert_plain(words: &str, path: &Path) {
     assert!(!words.contains(name.as_ref()), "{words:?} shows its name");
 }
 
+/// A file of each kind that can't be opened, made in `dir`, with what's said about it.
+fn unopenable_files(dir: &Path) -> Vec<(PathBuf, &'static str)> {
+    let manifest: &[u8] = br#"{"format":1,"entry":"slides.md"}"#;
+    let newer: &[u8] = br#"{"format":99,"entry":"slides.md"}"#;
+    let not_named: &[u8] = br#"{"format":1,"entry":"other.md"}"#;
+    let not_a_zip = dir.join("notes.txt");
+    std::fs::write(&not_a_zip, "Just notes").unwrap();
+    let tiny = dir.join("tiny.sptx");
+    std::fs::write(&tiny, "ab").unwrap();
+    let no_slides = dir.join("no-slides.sptx");
+    zip_file(&no_slides, &[("talk.json", manifest), ("assets/x.png", b"png")]);
+    let unnamed = dir.join("unnamed.sptx");
+    zip_file(&unnamed, &[("talk.json", not_named), ("slides.md", b"# Hi\n")]);
+    let from_later = dir.join("later.sptx");
+    zip_file(&from_later, &[("talk.json", newer), ("slides.md", b"# Hi\n")]);
+    let not_ours = dir.join("other.sptx");
+    zip_file(&not_ours, &[("readme.txt", b"hello")]);
+    let crowded = dir.join("crowded.sptx");
+    let names: Vec<String> = (0..10_001).map(|at| format!("assets/{at}.txt")).collect();
+    let many: Vec<(&str, &[u8])> = names.iter().map(|name| (name.as_str(), &b""[..])).collect();
+    zip_file(&crowded, &many);
+    vec![
+        (not_a_zip, "That file isn't a presentation made with this app."),
+        (tiny, "That file isn't a presentation made with this app."),
+        (not_ours, "That file isn't a presentation made with this app."),
+        (no_slides, "That file is damaged, so it can't be opened."),
+        (unnamed, "That file is damaged, so it can't be opened."),
+        (from_later, "That presentation was made by a newer version of this app. Update the app to open it."),
+        (crowded, "That presentation is too large to open."),
+    ]
+}
+
+/// A window opened on the talk at `path`, as the command line and a file the system opens with
+/// the app do.
+fn open_by_path(cx: &mut TestAppContext, path: PathBuf) -> Typing {
+    let scratch = tempfile::tempdir().unwrap();
+    let file = scratch.path().join("no file");
+    let (handle, view) = cx.update(|cx: &mut App| {
+        gpui_kit::init(cx);
+        workspace_view::init(cx);
+        let bounds = Bounds { origin: Point::default(), size: size(px(1280.), px(800.)) };
+        gpui_kit::open_window(
+            WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
+            cx,
+            |window, cx| cx.new(|cx| WorkspaceView::open(path, window, cx)),
+        )
+        .expect("open test window")
+    });
+    let typing = Typing { _folder: scratch, file, handle, view };
+    typing.settle(cx);
+    typing
+}
+
+#[gpui_kit::test]
+fn a_talk_opened_by_path_that_cannot_be_opened_says_why_plainly(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let no_talk = dir.path().join("Notes");
+    std::fs::create_dir(&no_talk).unwrap();
+    std::fs::write(no_talk.join("notes.txt"), "Just notes").unwrap();
+    let unreadable = dir.path().join("Broken");
+    std::fs::create_dir(&unreadable).unwrap();
+    std::fs::write(unreadable.join("slides.md"), [0xff, 0xfe, b'#']).unwrap();
+    let mut cases = vec![
+        (no_talk, "That folder has no presentation in it."),
+        (unreadable, "That folder's presentation couldn't be read."),
+        (dir.path().join("gone.sptx"), "That file isn't there any more."),
+    ];
+    let files = tempfile::tempdir().unwrap();
+    cases.extend(unopenable_files(files.path()));
+    for (path, expected) in cases {
+        let typing = open_by_path(cx, path.clone());
+        let said = label_of(&typing, cx, PROBLEM_ID).expect("it says why");
+        assert_eq!(said, expected, "{}", path.display());
+        assert_plain(&said, &path);
+        assert!(!has_talk(&typing, cx), "{}", path.display());
+    }
+}
+
 #[gpui_kit::test]
 fn a_talk_that_cannot_be_opened_says_why_and_stays(cx: &mut TestAppContext) {
     let (typing, _places, _root) = open_start(cx);
@@ -494,41 +572,14 @@ fn a_talk_that_cannot_be_opened_says_why_and_stays(cx: &mut TestAppContext) {
 
     // Each kind of file that can't be opened, in one plain sentence.
     let files = tempfile::tempdir().unwrap();
-    let manifest: &[u8] = br#"{"format":1,"entry":"slides.md"}"#;
-    let newer: &[u8] = br#"{"format":99,"entry":"slides.md"}"#;
-    let not_named: &[u8] = br#"{"format":1,"entry":"other.md"}"#;
-    let not_a_zip = files.path().join("notes.txt");
-    std::fs::write(&not_a_zip, "Just notes").unwrap();
-    let tiny = files.path().join("tiny.sptx");
-    std::fs::write(&tiny, "ab").unwrap();
-    let no_slides = files.path().join("no-slides.sptx");
-    zip_file(&no_slides, &[("talk.json", manifest), ("assets/x.png", b"png")]);
-    let unnamed = files.path().join("unnamed.sptx");
-    zip_file(&unnamed, &[("talk.json", not_named), ("slides.md", b"# Hi\n")]);
-    let from_later = files.path().join("later.sptx");
-    zip_file(&from_later, &[("talk.json", newer), ("slides.md", b"# Hi\n")]);
-    let not_ours = files.path().join("other.sptx");
-    zip_file(&not_ours, &[("readme.txt", b"hello")]);
-    let crowded = files.path().join("crowded.sptx");
-    let names: Vec<String> = (0..10_001).map(|at| format!("assets/{at}.txt")).collect();
-    let many: Vec<(&str, &[u8])> = names.iter().map(|name| (name.as_str(), &b""[..])).collect();
-    zip_file(&crowded, &many);
-    let cases = [
-        (&not_a_zip, "That file isn't a presentation made with this app."),
-        (&tiny, "That file isn't a presentation made with this app."),
-        (&not_ours, "That file isn't a presentation made with this app."),
-        (&no_slides, "That file is damaged, so it can't be opened."),
-        (&unnamed, "That file is damaged, so it can't be opened."),
-        (&from_later, "That presentation was made by a newer version of this app. Update the app to open it."),
-        (&crowded, "That presentation is too large to open."),
-    ];
+    let cases = unopenable_files(files.path());
     for (file, expected) in cases {
         click_on(&typing, cx, START_OPEN_FILE_ID);
         answer_open(&typing, cx, false, Some(file.clone()));
         assert!(is_start_screen(&typing, cx), "{}", file.display());
         let said = label_of(&typing, cx, START_PROBLEM_ID).expect("it says why");
         assert_eq!(said, expected, "{}", file.display());
-        assert_plain(&said, file);
+        assert_plain(&said, &file);
     }
 
     // The screen still works.

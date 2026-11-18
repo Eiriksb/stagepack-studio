@@ -343,10 +343,10 @@ impl WorkspaceView {
     }
 }
 
-/// Why the talk at `path` couldn't be opened, as the start screen says it: one plain sentence
-/// for each kind of failure, with no path, file name or detail from inside the file. A file is
-/// read again to tell which kind it is, as only a failure comes here.
-fn start_problem(path: &Path) -> &'static str {
+/// Why the talk at `path` couldn't be opened, as the start screen and a window opened on it say
+/// it: one plain sentence for each kind of failure, with no path, file name or detail from
+/// inside the file. A file is read again to tell which kind it is, as only a failure comes here.
+pub(super) fn start_problem(path: &Path) -> &'static str {
     if path.is_dir() {
         return if path.join(SLIDES_FILE).is_file() {
             "That folder's presentation couldn't be read."

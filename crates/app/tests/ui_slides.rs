@@ -539,12 +539,7 @@ fn a_folder_that_cannot_be_opened_says_why(cx: &mut TestAppContext) {
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
         let problem = window.find(PROBLEM_ID);
-        assert!(
-            problem
-                .label()
-                .is_some_and(|label| label.contains("slides.md")),
-            "{problem:?}"
-        );
+        assert_eq!(problem.label(), Some("That folder has no presentation in it."), "{problem:?}");
     })
     .unwrap();
 }
@@ -944,12 +939,7 @@ fn opening_a_folder_gives_it_a_window_of_its_own(cx: &mut TestAppContext) {
     cx.update_window(opened, |_, window, cx| {
         window.render_frame(cx);
         let problem = window.find(PROBLEM_ID);
-        assert!(
-            problem
-                .label()
-                .is_some_and(|label| label.contains("slides.md")),
-            "{problem:?}"
-        );
+        assert_eq!(problem.label(), Some("That folder has no presentation in it."), "{problem:?}");
     })
     .unwrap();
 }

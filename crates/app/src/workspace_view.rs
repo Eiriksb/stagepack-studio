@@ -382,7 +382,8 @@ pub struct WorkspaceView {
 
 impl WorkspaceView {
     /// Opens the talk at `path`, a folder or a packed file. A folder's saves are followed, as
-    /// nothing edits a packed file in place. If it can't be opened, the window says why.
+    /// nothing edits a packed file in place. If it can't be opened, the window says why, in the
+    /// start screen's plain words.
     pub fn open(path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         match read_talk(&path, Fonts::with_system_fallback()) {
             Ok(document) => {
@@ -394,7 +395,7 @@ impl WorkspaceView {
                 view
             }
             Err(OpenProblem::SlidevTalk) => Self::for_slidev_talk(path, installed_stagepack(), window, cx),
-            Err(OpenProblem::Other(problem)) => Self::build(None, Some(problem.into()), window, cx),
+            Err(OpenProblem::Other(_)) => Self::build(None, Some(starting::start_problem(&path).into()), window, cx),
         }
     }
 
