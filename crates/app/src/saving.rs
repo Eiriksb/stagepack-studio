@@ -498,7 +498,8 @@ fn write_added_from(folder: &Path, path: &str, at: &Path, told: &crate::large_fi
         },
         Err(NotAdded::Cancelled) => Err(failed(&target, PackError::Stopped)),
         Err(NotAdded::RanOutOfRoom) => Err(failed(&target, DISK_FILLED)),
-        Err(NotAdded::Changed) => Err(failed(&target, "it changed or went while it was copied.")),
+        // A program keeping files in step with another place can touch one as it's copied.
+        Err(NotAdded::Changed) => Err(failed(&target, "it changed while it was being copied. Try again.")),
         Err(_) => Err(failed(&target, "it couldn't be read or written.")),
     }
 }

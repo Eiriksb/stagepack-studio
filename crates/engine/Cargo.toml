@@ -22,6 +22,9 @@ unicode-segmentation = "=1.13.3"
 # The script type of cosmic-text's fallback lists, at the version it uses.
 unicode-script = "=0.5.9"
 
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.191"
+
 [dev-dependencies]
 # The tests make their own videos.
 slides-video = { path = "../video", features = ["make"] }

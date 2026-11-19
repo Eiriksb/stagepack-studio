@@ -1673,6 +1673,11 @@ fn a_source_that_shrinks_or_goes_while_copied_fails_whole() {
         let given = [(CLIP.to_string(), FileSource::At(src.clone()))];
         let result = pack_new_from(&out, CLIP_SLIDES, "0.1.0", &given, &progress, &never());
         assert!(matches!(result, Err(PackError::Io(_))), "pack, {what}: {result:?}");
+        if what != "goes" {
+            // Said so that whoever saved tries again: a program keeping files in step can do it.
+            let said = result.unwrap_err().to_string();
+            assert!(said.ends_with("changed while it was being copied. Try again."), "{said}");
+        }
         assert_eq!(std::fs::read(&out).unwrap(), old, "pack, {what}");
         made_up_file(&src, 3 << 20, 12);
 

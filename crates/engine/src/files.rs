@@ -140,6 +140,21 @@ fn read_bounded(path: &Path) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// The regular file at `path`, opened to read. What's opened is asked again, in case something
+/// else was put there since it was looked at: a named pipe put there isn't waited on for a
+/// writer, and where the system allows, a link isn't followed.
+pub fn open_plain_file(path: &Path) -> Option<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
 /// The text of a folder talk's own `slides.md`, held to the same rules as the files it uses.
 pub fn read_talk_text(path: &Path) -> io::Result<String> {
     String::from_utf8(read_bounded(path)?)
@@ -154,9 +169,7 @@ impl TalkFiles for FolderFiles {
     /// The file itself, if it's a regular file: never a folder or a named pipe, which would wait
     /// for a writer.
     fn open(&self, path: &str) -> Option<Box<dyn ReadSeek>> {
-        let file = File::open(self.lies_at(path)?).ok()?;
-        // Asked again of what was opened, in case something else was put there in between.
-        file.metadata().ok()?.is_file().then(|| Box::new(file) as Box<dyn ReadSeek>)
+        open_plain_file(&self.lies_at(path)?).map(|file| Box::new(file) as Box<dyn ReadSeek>)
     }
 
     fn lies_at(&self, path: &str) -> Option<PathBuf> {

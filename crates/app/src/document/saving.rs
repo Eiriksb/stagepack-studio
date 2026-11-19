@@ -75,7 +75,9 @@ impl Document {
             self.index_for_save(),
         )
         .moving_large(self.moves_large())
-        .reading_back(self.readers_were_let_go())
+        // A pack holding a large file is opened again whatever the save wrote, so nothing goes on
+        // holding the one it replaced: that would keep its disk space, videos and all.
+        .reading_back(self.readers_were_let_go() || self.holds_large())
     }
 
     /// A save of the talk as it is now, somewhere new. For an untitled talk that's its first

@@ -1324,6 +1324,16 @@ fn closing_the_window_stops_a_copy_first(cx: &mut TestAppContext) {
 fn a_pack_saved_in_place_is_read_back_only_when_it_has_to_be() {
     set_up();
     let work = tempfile::tempdir().unwrap();
+    let unreadable = |_: &Path| -> Result<std::sync::Arc<dyn slides_engine::TalkFiles + Send + Sync>, String> { Err("not now".to_string()) };
+    // A pack holding no large file, with nothing written but the text: it isn't opened again.
+    let mut plain = untitled();
+    keep_in(&mut plain, &work.path().join("recovery"));
+    save_as(&mut plain, SaveTarget::Packed(work.path().join("plain.sptx")));
+    plain.insert_tag("Insert text", "Box", &[], None).unwrap();
+    let saved = plain.save_job().run_reading_back_with(unreadable).unwrap();
+    assert!(saved.notices().is_empty(), "{:?}", saved.notices());
+    // One holding a video is, whatever was written: held, the pack it replaced would keep its
+    // disk space, the video's with it.
     let from = patterned(work.path(), "clip.mp4", TWIN, 34);
     let mut document = untitled();
     keep_in(&mut document, &work.path().join("recovery"));
@@ -1331,13 +1341,11 @@ fn a_pack_saved_in_place_is_read_back_only_when_it_has_to_be() {
     show(&mut document, &path);
     let pack = work.path().join("talk.sptx");
     save_as(&mut document, SaveTarget::Packed(pack));
-    let unreadable = |_: &Path| -> Result<std::sync::Arc<dyn slides_engine::TalkFiles + Send + Sync>, String> { Err("not now".to_string()) };
-    // Nothing written but the text, and nothing let go of: it isn't opened again.
     document.insert_tag("Insert text", "Box", &[], None).unwrap();
     let saved = document.save_job().run_reading_back_with(unreadable).unwrap();
-    assert!(saved.notices().is_empty(), "{:?}", saved.notices());
+    assert_eq!(saved.notices(), [stagepack_studio::saving::NOT_READ_BACK]);
     document.saved(saved);
-    // A reader let go of for it: it is.
+    // And so it is after a reader was let go of for it.
     let _reader = document.open_large(&path).unwrap().open().unwrap();
     assert_eq!(document.let_go_of_readers(), 1);
     document.insert_tag("Insert text", "Box", &[], None).unwrap();
@@ -1710,4 +1718,31 @@ fn dont_save_after_save_keeps_what_was_declined_from_being_written(cx: &mut Test
     assert_eq!(order(&log), IN_ORDER, "one save, taken in before the working copy went");
     assert!(!is_open(cx, handle));
     assert!(files_under(&root).is_empty(), "{:?}", files_under(&root));
+}
+
+#[test]
+fn a_file_changed_while_it_is_saved_says_to_try_again() {
+    set_up();
+    let work = tempfile::tempdir().unwrap();
+    let from = patterned(work.path(), "clip.mp4", TWIN, 46);
+    let root = work.path().join("recovery");
+    let mut document = untitled();
+    keep_in(&mut document, &root);
+    let path = add(&mut document, &from).unwrap();
+    show(&mut document, &path);
+    let folder = work.path().join("talk");
+    save_as(&mut document, SaveTarget::Folder(folder.clone()));
+    let other = patterned(work.path(), "other.mp4", TWIN, 47);
+    let more = add(&mut document, &other).unwrap();
+    show(&mut document, &more);
+    // Touched half-way, as a program keeping the file in step with another place may do.
+    let lies = lies_at(&document, &more).unwrap();
+    let changed = std::cell::Cell::new(false);
+    let progress = |done: u64, total: u64| {
+        if done * 2 >= total && !changed.replace(true) {
+            std::fs::OpenOptions::new().append(true).open(&lies).unwrap().write_all(b"more").unwrap();
+        }
+    };
+    let failed = document.save_job().run_with(&progress, &never()).err().expect("the save fails").to_string();
+    assert!(failed.ends_with("it changed while it was being copied. Try again."), "{failed}");
 }

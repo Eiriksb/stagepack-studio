@@ -922,6 +922,11 @@ impl Document {
     /// while, and the window shows how far it's got.
     pub(crate) fn moves_large(&self) -> bool {
         let added = self.files_to_write().iter().any(|(_, file)| matches!(file, AddedFile::At(..)));
-        added || self.own_files.names_in(FileKind::Video.folder()).iter().any(|path| is_large_kind(path))
+        added || self.holds_large()
+    }
+
+    /// Whether the talk's own files, as last saved, hold a large file.
+    pub(crate) fn holds_large(&self) -> bool {
+        self.own_files.names_in(FileKind::Video.folder()).iter().any(|path| is_large_kind(path))
     }
 }

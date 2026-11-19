@@ -563,8 +563,12 @@ impl Readers {
         // it held and lets go of it, or waits for this, and never misses it.
         let mut gate = self.gate();
         let held = if gate.saving {
-            // The file is let go of at once, unread.
             self.refused.fetch_add(1, Ordering::SeqCst);
+            // The file is let go of at once, unread, and closed before the save waiting for it
+            // goes on: closing may take a while, so not with the gate held.
+            drop(gate);
+            drop(opened);
+            gate = self.gate();
             Err(NotOpened::Saving)
         } else {
             opened.map(|reader| self.hold(reader))
@@ -573,6 +577,12 @@ impl Readers {
         drop(gate);
         self.changed.notify_all();
         held
+    }
+
+    /// [`Self::open`], for tests.
+    #[doc(hidden)]
+    pub fn open_for_test(&self, open: impl FnOnce() -> Result<Box<dyn ReadSeek>, NotOpened>) -> Result<HeldReader, NotOpened> {
+        self.open(open)
     }
 
     /// Has `hook` run each time a file has been opened, before it's held, for tests.

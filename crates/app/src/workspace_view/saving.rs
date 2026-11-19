@@ -288,6 +288,12 @@ impl WorkspaceView {
                 }
             };
             this.update(cx, |this, cx| {
+                // Closed without saving while the dialog was up: nothing is saved, as the person
+                // said, and the working copy it would read from may be going.
+                if this.is_closing_window() {
+                    this.save_flow = SaveFlow::Idle;
+                    return;
+                }
                 // Typing may have gone on while the dialog was up.
                 this.settle_typing(cx);
                 let Some(document) = this.document.clone() else {
@@ -317,6 +323,11 @@ impl WorkspaceView {
     /// large file shows how far it's got on the status line, with a Cancel. One that replaces the
     /// talk's pack lets go of every reader of it first, as nothing may hold it open meanwhile.
     fn run_save(&mut self, job: SaveJob, name: String, cx: &mut Context<Self>) {
+        // Nothing more is saved once the window is closing.
+        if self.is_closing_window() {
+            self.save_flow = SaveFlow::Idle;
+            return;
+        }
         let mut job = job;
         if job.replaces_the_pack()
             && let Some(document) = &self.document

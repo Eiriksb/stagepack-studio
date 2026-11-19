@@ -365,3 +365,25 @@ fn large_kinds_are_told_by_their_ending() {
     }
     assert_eq!(MAX_LARGE_FILE, 4 * 1024 * 1024 * 1024);
 }
+
+#[cfg(unix)]
+#[test]
+fn a_named_pipe_put_in_after_the_look_is_refused_without_waiting() {
+    // What a talk's file is opened with, after it's been looked at: given a named pipe, as one
+    // swapped in between would be, it doesn't wait for a writer; nor does it follow a link.
+    let dir = tempfile::tempdir().unwrap();
+    let pipe = dir.path().join("pipe.mp4");
+    assert!(std::process::Command::new("mkfifo").arg(&pipe).status().unwrap().success());
+    let file = dir.path().join("clip.mp4");
+    std::fs::write(&file, b"pictures").unwrap();
+    let link = dir.path().join("link.mp4");
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+    let (done, finished) = std::sync::mpsc::channel();
+    let (pipe_at, link_at) = (pipe.clone(), link.clone());
+    std::thread::spawn(move || done.send((open_plain_file(&pipe_at).is_none(), open_plain_file(&link_at).is_none())));
+    let refused = finished.recv_timeout(std::time::Duration::from_secs(5)).expect("the open waited for a writer");
+    assert_eq!(refused, (true, true));
+    let mut read = Vec::new();
+    std::io::Read::read_to_end(&mut open_plain_file(&file).unwrap(), &mut read).unwrap();
+    assert_eq!(read, b"pictures");
+}

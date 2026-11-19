@@ -909,7 +909,9 @@ pub struct ChangedWhileCopied(pub String);
 
 impl fmt::Display for ChangedWhileCopied {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} changed while it was copied", self.0)
+        // Said inside a sentence that gives its own last stop. A program keeping files in step
+        // with another place can touch one as it's copied, so it's worth trying again.
+        write!(f, "{} changed while it was being copied. Try again", self.0)
     }
 }
 

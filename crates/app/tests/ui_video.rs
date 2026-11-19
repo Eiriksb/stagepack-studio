@@ -1960,3 +1960,123 @@ fn a_save_waiting_on_a_read_can_be_cancelled() {
     assert!(dropped.lock().unwrap().is_some(), "and closed what it read");
     document.pack_save_ended();
 }
+
+#[gpui_kit::test]
+fn a_closing_window_copies_no_more_videos(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let work = tempfile::tempdir().unwrap();
+    let typing = copying_editor(cx, PLAIN_TALK, work.path());
+    let words = outside(work.path(), "words.mp4", b"these are words, not pictures");
+    let video = outside(work.path(), "clip.mp4", &clip(3, 10));
+    let view = typing.view.clone();
+    // The first copy held as the window is closed, which stops it; it comes back refused, as
+    // not a video, rather than cancelled.
+    cx.update(|cx| view.update(cx, |view, cx| {
+        view.hold_work_for_test(false, true);
+        view.chosen_videos(vec![words, video], cx);
+    }));
+    let handle = typing.handle;
+    assert!(!VisualTestContext::from_window(handle, cx).simulate_close());
+    cx.run_until_parked();
+    assert!(is_open(cx, handle), "it waits for the copy it stopped");
+    // A copy started after it would be held, and keep the window open.
+    cx.update(|cx| view.update(cx, |view, cx| {
+        view.release_held_work_for_test(cx);
+        view.hold_work_for_test(false, true);
+    }));
+    cx.run_until_parked();
+    assert!(!is_open(cx, handle), "the video waiting wasn't copied, and the window closed");
+    let root = work.path().join("recovery");
+    assert!(files_under(&root).iter().all(|name| !name.ends_with(".mp4")), "{:?}", files_under(&root));
+}
+
+fn is_open(cx: &TestAppContext, handle: AnyWindowHandle) -> bool {
+    cx.read(|cx| cx.windows().iter().any(|window| window.window_id() == handle.window_id()))
+}
+
+/// A reader that takes a while to close, as one on a slow share does, and says when it had.
+struct SlowToClose(std::sync::Arc<Mutex<Option<Instant>>>);
+
+impl std::io::Read for SlowToClose {
+    fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+        Ok(0)
+    }
+}
+
+impl std::io::Seek for SlowToClose {
+    fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
+        Ok(0)
+    }
+}
+
+impl Drop for SlowToClose {
+    fn drop(&mut self) {
+        std::thread::sleep(Duration::from_millis(100));
+        *self.0.lock().unwrap() = Some(Instant::now());
+    }
+}
+
+#[test]
+fn a_file_refused_as_a_save_begins_is_closed_before_the_save_goes_on() {
+    let _alone = alone();
+    let work = tempfile::tempdir().unwrap();
+    let (mut document, _) = packed(&talk(), &clip(3, 10), work.path());
+    let readers = document.readers();
+    let saving = std::sync::Arc::new(Mutex::new(None));
+    {
+        let (readers, saving) = (readers.clone(), saving.clone());
+        let hooked = readers.clone();
+        hooked.when_opened_for_test(move || {
+            readers.begin_saving_for_test();
+            let waiting = readers.clone();
+            *saving.lock().unwrap() = Some(std::thread::spawn(move || {
+                waiting.wait_for_opens_for_test();
+                Instant::now()
+            }));
+        });
+    }
+    let closed = std::sync::Arc::new(Mutex::new(None));
+    let file = closed.clone();
+    let opened = readers.open_for_test(move || Ok(Box::new(SlowToClose(file))));
+    assert_eq!(opened.err(), Some(stagepack_studio::large_files::NotOpened::Saving));
+    let went_on = saving.lock().unwrap().take().unwrap().join().unwrap();
+    let closed = closed.lock().unwrap().expect("the file was closed");
+    assert!(went_on >= closed, "the save went on {:?} before the file was closed", closed - went_on);
+    document.pack_save_ended();
+}
+
+/// Whether this process holds open a file at `path` that's been deleted, or replaced.
+#[cfg(target_os = "linux")]
+fn holds_deleted(path: &std::path::Path) -> bool {
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .flatten()
+        .filter_map(|fd| std::fs::read_link(fd.path()).ok())
+        .any(|target| target.to_string_lossy().starts_with(&*path.to_string_lossy()) && target.to_string_lossy().ends_with("(deleted)"))
+}
+
+#[cfg(target_os = "linux")]
+#[gpui_kit::test]
+fn a_pack_saved_in_place_with_only_its_text_changed_is_not_held_open(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let work = tempfile::tempdir().unwrap();
+    let (document, pack) = packed(&talk(), &clip(30, 10), work.path());
+    let typing = open_untitled_talk(cx, document, work.path());
+    stills_made(&typing, cx);
+    assert_eq!(typing.document(cx).read_with(cx, |document, _| document.readers_held()), 0, "nothing plays");
+    typing.press(cx, "ctrl-m");
+    typing.press(cx, "ctrl-s");
+    wait(cx, 500);
+    typing.settle(cx);
+    assert_eq!(typing.status(cx).as_deref(), Some("Saved talk.sptx."));
+    assert!(!holds_deleted(&pack), "the pack it replaced, videos and all, is still held open");
+    // It plays from the pack as saved.
+    let document = typing.document(cx);
+    cx.update(|cx| document.update(cx, |document, cx| {
+        document.go_to(0);
+        cx.notify();
+    }));
+    typing.settle(cx);
+    let canvas = play_selected(&typing, cx);
+    until(cx, typing.handle, "playing", |cx| frames(cx, &canvas)[0].is_some());
+}

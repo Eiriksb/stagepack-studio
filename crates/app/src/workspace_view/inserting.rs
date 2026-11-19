@@ -177,9 +177,14 @@ impl WorkspaceView {
         self.copy_next_video(cx);
     }
 
-    /// Copies in the next video waiting, unless one is being copied.
+    /// Copies in the next video waiting, unless one is being copied. In a window closing, none is.
     fn copy_next_video(&mut self, cx: &mut Context<Self>) {
         if self.video_copying {
+            return;
+        }
+        if self.is_closing_window() {
+            self.videos_waiting.clear();
+            self.said_after_videos = None;
             return;
         }
         let Some(WaitingVideo { path, slide }) = self.videos_waiting.pop_front() else {
@@ -313,10 +318,13 @@ impl WorkspaceView {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                // Stopped, by its Cancel or the window closing, it counts as cancelled however it
+                // came back: nothing waiting after it is copied.
+                let stopped = meter.stop.load(std::sync::atomic::Ordering::SeqCst);
                 this.end_progress(&meter, cx);
                 let (found, copied) = match copied {
                     Ok(copied) => copied,
-                    Err(said) => return finished(this, Err(NotCopied { said, cancelled: false }), cx),
+                    Err(said) => return finished(this, Err(NotCopied { said, cancelled: stopped }), cx),
                 };
                 let taken = document.update(cx, |document, cx| {
                     let taken = document.take_large_copy(copied);
@@ -325,7 +333,7 @@ impl WorkspaceView {
                 });
                 let copied = match taken {
                     Ok(path) => Ok((path, found)),
-                    Err(why) => Err(NotCopied { said: why.to_string(), cancelled: why == NotAdded::Cancelled }),
+                    Err(why) => Err(NotCopied { said: why.to_string(), cancelled: stopped || why == NotAdded::Cancelled }),
                 };
                 finished(this, copied, cx);
             })

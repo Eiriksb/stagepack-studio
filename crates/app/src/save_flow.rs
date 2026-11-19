@@ -145,7 +145,8 @@ impl SaveFlow {
     }
 
     /// The dialog asking before the window closes is answered. With Save, the window closes
-    /// once the talk is saved, edits made while a save runs among them.
+    /// once the talk is saved, edits made while a save runs among them. With Cancel, it stays
+    /// open, whatever was asked before.
     pub fn answer_close(&mut self, answer: CloseAnswer) -> Vec<Effect> {
         match answer {
             CloseAnswer::Save => self.save(true),
@@ -153,13 +154,25 @@ impl SaveFlow {
                 // A save running goes on, as it was asked for, but nothing follows it: not
                 // another save, of edits the person has just said not to keep, nor the close it
                 // would have made, which this makes.
-                if let SaveFlow::Saving { again, then_close, .. } = self {
-                    *again = false;
-                    *then_close = false;
+                match self {
+                    SaveFlow::Saving { again, then_close, .. } => {
+                        *again = false;
+                        *then_close = false;
+                    }
+                    // A place still being chosen has nothing left to save.
+                    SaveFlow::Choosing { .. } => *self = SaveFlow::Idle,
+                    SaveFlow::Idle => {}
                 }
                 vec![Effect::LetGo, Effect::Close]
             }
-            CloseAnswer::Cancel => Vec::new(),
+            CloseAnswer::Cancel => {
+                // The window stays open: a save running, or one waiting on a place, doesn't close
+                // it when it's done, as an earlier close may have asked.
+                if let SaveFlow::Saving { then_close, .. } | SaveFlow::Choosing { then_close } = self {
+                    *then_close = false;
+                }
+                Vec::new()
+            }
         }
     }
 
