@@ -50,6 +50,9 @@ pub enum CantDraw {
     TooLarge,
     CouldNotRead,
     NoAdapter,
+    /// The graphics card refused the model though it's within the limits: a card with less
+    /// memory, or smaller buffers, than the model needs.
+    CardRefused,
 }
 
 impl fmt::Display for CantDraw {
@@ -69,6 +72,9 @@ impl fmt::Display for CantDraw {
             CantDraw::CouldNotRead => "This model couldn't be read.",
             CantDraw::NoAdapter => {
                 "This computer can't draw 3D models here. The slide shows a still when it's presented somewhere that can."
+            }
+            CantDraw::CardRefused => {
+                "This computer's graphics can't draw this model, though it's within what can be drawn. The slide shows a still when it's presented somewhere that can."
             }
         })
     }

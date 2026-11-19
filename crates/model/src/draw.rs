@@ -5,7 +5,6 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::ops::Deref;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -129,6 +128,9 @@ struct Shared {
     /// How many devices the thread has made.
     #[cfg(feature = "test-hooks")]
     made: Arc<AtomicU32>,
+    /// How many times the thread has tried to make one.
+    #[cfg(feature = "test-hooks")]
+    tried: Arc<AtomicU32>,
 }
 
 impl Drop for Shared {
@@ -158,18 +160,35 @@ impl Drop for Scene {
     }
 }
 
-/// Where a picture asked for comes: receive from it as from any receiver. Dropping it before
-/// the picture is begun means it isn't drawn.
+/// Where a picture asked for comes. Dropping it before the picture is begun means it isn't
+/// drawn. A drawer that ends without answering is said as `Closed`.
 pub struct Answer {
     receiver: Receiver<Result<Picture, NotDrawn>>,
     _wanted: Arc<()>,
 }
 
-impl Deref for Answer {
-    type Target = Receiver<Result<Picture, NotDrawn>>;
+impl Answer {
+    /// Waits for the answer: never call this on a window's thread.
+    pub fn recv(&self) -> Result<Picture, NotDrawn> {
+        self.receiver.recv().unwrap_or(Err(NotDrawn::Closed))
+    }
 
-    fn deref(&self) -> &Self::Target {
-        &self.receiver
+    /// Waits up to `within` for the answer: `None` if it hasn't come.
+    pub fn recv_timeout(&self, within: Duration) -> Option<Result<Picture, NotDrawn>> {
+        match self.receiver.recv_timeout(within) {
+            Ok(answer) => Some(answer),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(mpsc::RecvTimeoutError::Disconnected) => Some(Err(NotDrawn::Closed)),
+        }
+    }
+
+    /// The answer if it has come, without waiting.
+    pub fn try_recv(&self) -> Option<Result<Picture, NotDrawn>> {
+        match self.receiver.try_recv() {
+            Ok(answer) => Some(answer),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => Some(Err(NotDrawn::Closed)),
+        }
     }
 }
 
@@ -197,6 +216,8 @@ enum Job {
     Lose,
     #[cfg(feature = "test-hooks")]
     FailMaking(u32),
+    #[cfg(feature = "test-hooks")]
+    Refuse,
     Stop,
 }
 
@@ -211,8 +232,9 @@ impl Drawer {
         let (jobs, receiver) = mpsc::channel();
         let ready: Ready = Arc::new(Mutex::new(None));
         let made = Arc::new(AtomicU32::new(0));
+        let tried = Arc::new(AtomicU32::new(0));
         let (ending, ended) = mpsc::channel();
-        let thread = Thread { ready: ready.clone(), made: made.clone(), _ending: ending };
+        let thread = Thread { ready: ready.clone(), made: made.clone(), tried: tried.clone(), _ending: ending };
         let started = std::thread::Builder::new().name("model drawer".into()).spawn(move || run(options, receiver, thread));
         if started.is_err() {
             say(&ready, Err(CantDraw::NoAdapter));
@@ -225,6 +247,8 @@ impl Drawer {
                 ended: Mutex::new(ended),
                 #[cfg(feature = "test-hooks")]
                 made,
+                #[cfg(feature = "test-hooks")]
+                tried,
             }),
         }
     }
@@ -288,6 +312,19 @@ impl Drawer {
     pub fn devices_made(&self) -> u32 {
         self.shared.made.load(Ordering::Acquire)
     }
+
+    /// For tests: how many times the drawer has tried to make a device.
+    #[cfg(feature = "test-hooks")]
+    pub fn devices_tried(&self) -> u32 {
+        self.shared.tried.load(Ordering::Acquire)
+    }
+
+    /// For tests: the next picture drawn asks the device for something it refuses, as a card
+    /// short of memory would.
+    #[cfg(feature = "test-hooks")]
+    pub fn refuse_next_draw(&self) {
+        let _ = self.shared.jobs.send(Job::Refuse);
+    }
 }
 
 /// What the thread shares with the drawer. Dropped as the thread ends, after its device has
@@ -295,6 +332,7 @@ impl Drawer {
 struct Thread {
     ready: Ready,
     made: Arc<AtomicU32>,
+    tried: Arc<AtomicU32>,
     _ending: Sender<()>,
 }
 
@@ -318,6 +356,7 @@ fn run(options: DrawerOptions, jobs: Receiver<Job>, thread: Thread) {
         no_adapter,
         most_buffer,
         failing: 0,
+        refuse: false,
         first_retry: options.retry_after,
         retry_after: options.retry_after,
         next_try: Instant::now(),
@@ -356,10 +395,14 @@ fn run(options: DrawerOptions, jobs: Receiver<Job>, thread: Thread) {
             }
             #[cfg(feature = "test-hooks")]
             Job::FailMaking(times) => drawing.failing = times,
+            #[cfg(feature = "test-hooks")]
+            Job::Refuse => drawing.refuse = true,
             Job::Stop => break,
         }
     }
-    // Every answer still waiting is told the drawer is closed.
+    // Every answer still waiting is told the drawer is closed, those not yet taken from the
+    // channel too.
+    pending.extend(jobs.try_iter());
     for job in pending {
         if let Job::Draw(asked) = job {
             let _ = asked.answer.send(Err(NotDrawn::Closed));
@@ -378,6 +421,8 @@ struct Drawing<'a> {
     no_adapter: bool,
     most_buffer: Option<u64>,
     failing: u32,
+    /// For tests: the next picture drawn asks the device for something it refuses.
+    refuse: bool,
     /// When to try again to make a device, and how long to wait after that if it fails again.
     first_retry: Duration,
     retry_after: Duration,
@@ -408,13 +453,14 @@ impl Drawing<'_> {
     /// Tries to make a device, saying whether one can draw.
     fn make(&mut self) {
         self.card = None;
+        self.thread.tried.fetch_add(1, Ordering::AcqRel);
         let fail = self.no_adapter || self.failing > 0;
         self.failing = self.failing.saturating_sub(1);
         if !fail {
             let only = self.only;
-            if let Ok(Ok(mut gpu)) = catch_unwind(move || device::make(only))
-                && let Ok(kit) = catch_unwind(AssertUnwindSafe(|| Kit::new(&gpu)))
-            {
+            // An adapter whose device can't make the pipelines is passed over for the next.
+            let kit = |gpu: &Gpu| catch_unwind(AssertUnwindSafe(|| scoped(gpu, "making the pipelines", || Ok(Kit::new(gpu))))).ok()?.ok();
+            if let Ok(Ok((mut gpu, kit))) = catch_unwind(AssertUnwindSafe(|| device::make(only, kit))) {
                 if let Some(most) = self.most_buffer {
                     gpu.most_buffer = gpu.most_buffer.min(most);
                 }
@@ -455,7 +501,7 @@ impl Drawing<'_> {
     fn upload(&mut self, id: u64, model: Model) {
         self.mend();
         let on = match &self.card {
-            Some(card) => match catch_unwind(AssertUnwindSafe(|| scoped(&card.gpu, || upload(card, &model)))) {
+            Some(card) => match catch_unwind(AssertUnwindSafe(|| scoped(&card.gpu, "uploading a model", || upload(card, &model)))) {
                 Ok(Ok(on_card)) => OnDevice::On(on_card),
                 Ok(Err(Failure::Cant(why))) => OnDevice::Cant(why),
                 Ok(Err(Failure::Lost)) | Err(_) => {
@@ -477,21 +523,34 @@ impl Drawing<'_> {
             Some(OnDevice::Gone) | None => return Err(NotDrawn::UploadAgain),
         };
         let most = card.gpu.limits.max_texture_dimension_2d;
-        let row = u64::from(width * 4).next_multiple_of(u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
-        if width > most
-            || height > most
-            || u64::from(width) * u64::from(height) * u64::from(card.gpu.samples) > MOST_SAMPLES
-            || row * u64::from(height) > card.gpu.limits.max_buffer_size
-        {
+        let row = (u64::from(width) * 4).next_multiple_of(u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
+        let pixels = u64::from(width) * u64::from(height);
+        if width > most || height > most || pixels > MOST_SAMPLES || row * u64::from(height) > card.gpu.limits.max_buffer_size {
             return Err(CantDraw::TooLarge.into());
         }
+        // Edges are smoothed with several samples a pixel where that isn't too many.
+        let samples = if pixels * u64::from(card.gpu.samples) <= MOST_SAMPLES { card.gpu.samples } else { 1 };
         if width == 0 || height == 0 {
             return Ok(Picture { width, height, bgra: Vec::new(), drawing: Duration::ZERO, reading_back: Duration::ZERO });
         }
         let Card { gpu, kit } = card;
-        match catch_unwind(AssertUnwindSafe(|| scoped(gpu, || render(gpu, kit, on_card, view, width, height)))) {
+        let refuse = std::mem::take(&mut self.refuse);
+        let drawn = catch_unwind(AssertUnwindSafe(|| {
+            scoped(gpu, "drawing a picture", || {
+                if refuse {
+                    // Writing past the end of a buffer, which the device refuses.
+                    gpu.queue.write_buffer(&kit.frame, FRAME_BYTES, &[0; 4]);
+                }
+                render(gpu, kit, on_card, view, width, height, samples)
+            })
+        }));
+        match drawn {
             Ok(Ok(picture)) => Ok(picture),
-            Ok(Err(Failure::Cant(why))) => Err(why.into()),
+            Ok(Err(Failure::Cant(why))) => {
+                // What it was drawn into may be what was refused.
+                kit.targets.clear();
+                Err(why.into())
+            }
             Ok(Err(Failure::Lost)) | Err(_) => {
                 gpu.set_lost();
                 // Made again now, so that the model can be uploaded again at once.
@@ -502,9 +561,9 @@ impl Drawing<'_> {
     }
 }
 
-/// Does `work`, an error the device reports about it said as what was asked being too large
-/// for this device, and the device found lost as that.
-fn scoped<T>(gpu: &Gpu, work: impl FnOnce() -> Result<T, Failure>) -> Result<T, Failure> {
+/// Does `work`, an error the device reports about it said as the card refusing it, and the
+/// device found lost as that. `what` names the work in the line written about an error.
+fn scoped<T>(gpu: &Gpu, what: &str, work: impl FnOnce() -> Result<T, Failure>) -> Result<T, Failure> {
     let validation = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
     let memory = gpu.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
     let internal = gpu.device.push_error_scope(wgpu::ErrorFilter::Internal);
@@ -513,17 +572,17 @@ fn scoped<T>(gpu: &Gpu, work: impl FnOnce() -> Result<T, Failure>) -> Result<T, 
     if gpu.lost() {
         return Err(Failure::Lost);
     }
-    if errors.iter().any(Option::is_some) {
-        return Err(Failure::Cant(CantDraw::TooLarge));
+    if let Some(error) = errors.iter().flatten().next() {
+        eprintln!("The graphics card refused {what}: {error}");
+        return Err(Failure::Cant(CantDraw::CardRefused));
     }
     result
 }
 
 /// The pipelines and pictures a device draws with.
 struct Kit {
-    meshes: wgpu::RenderPipeline,
-    meshes_both_sides: wgpu::RenderPipeline,
-    points: wgpu::RenderPipeline,
+    /// For as many samples a pixel as the device draws with, and for one where that's more.
+    pipelines: Vec<(u32, Pipelines)>,
     texture_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     frame: wgpu::Buffer,
@@ -535,10 +594,17 @@ struct Kit {
     targets: Vec<Targets>,
 }
 
+struct Pipelines {
+    meshes: wgpu::RenderPipeline,
+    meshes_both_sides: wgpu::RenderPipeline,
+    points: wgpu::RenderPipeline,
+}
+
 /// What a picture of one size is drawn into and read back through.
 struct Targets {
     width: u32,
     height: u32,
+    samples: u32,
     /// Drawn into, with several samples a pixel, where the device can.
     many: Option<wgpu::TextureView>,
     /// The picture, one sample a pixel.
@@ -627,7 +693,7 @@ impl Kit {
         });
         let mesh_attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4];
         let point_attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Unorm8x4];
-        let pipeline = |label, layout, shader, stride, attributes: &[wgpu::VertexAttribute], topology, cull_mode| {
+        let pipeline = |label, layout, shader, stride, attributes: &[wgpu::VertexAttribute], topology, cull_mode, samples| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(layout),
@@ -654,7 +720,7 @@ impl Kit {
                     stencil: Default::default(),
                     bias: Default::default(),
                 }),
-                multisample: wgpu::MultisampleState { count: gpu.samples, ..Default::default() },
+                multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
                 fragment: Some(wgpu::FragmentState {
                     module: shader,
                     entry_point: Some("fragment"),
@@ -666,10 +732,17 @@ impl Kit {
             })
         };
         let triangles = wgpu::PrimitiveTopology::TriangleList;
+        let set = |samples| Pipelines {
+            meshes: pipeline("meshes", &mesh_layout, &mesh_shader, MESH_STRIDE, &mesh_attributes, triangles, Some(wgpu::Face::Back), samples),
+            meshes_both_sides: pipeline("meshes seen from behind too", &mesh_layout, &mesh_shader, MESH_STRIDE, &mesh_attributes, triangles, None, samples),
+            points: pipeline("points", &points_layout, &points_shader, POINT_STRIDE, &point_attributes, wgpu::PrimitiveTopology::PointList, None, samples),
+        };
+        let mut pipelines = vec![(gpu.samples, set(gpu.samples))];
+        if gpu.samples > 1 {
+            pipelines.push((1, set(1)));
+        }
         Kit {
-            meshes: pipeline("meshes", &mesh_layout, &mesh_shader, MESH_STRIDE, &mesh_attributes, triangles, Some(wgpu::Face::Back)),
-            meshes_both_sides: pipeline("meshes seen from behind too", &mesh_layout, &mesh_shader, MESH_STRIDE, &mesh_attributes, triangles, None),
-            points: pipeline("points", &points_layout, &points_shader, POINT_STRIDE, &point_attributes, wgpu::PrimitiveTopology::PointList, None),
+            pipelines,
             texture_layout,
             sampler,
             frame,
@@ -679,8 +752,8 @@ impl Kit {
         }
     }
 
-    fn targets(&mut self, gpu: &Gpu, width: u32, height: u32) -> &Targets {
-        if let Some(at) = self.targets.iter().position(|t| (t.width, t.height) == (width, height)) {
+    fn targets(&mut self, gpu: &Gpu, width: u32, height: u32, samples: u32) -> &Targets {
+        if let Some(at) = self.targets.iter().position(|t| (t.width, t.height, t.samples) == (width, height, samples)) {
             let targets = self.targets.remove(at);
             self.targets.insert(0, targets);
         } else {
@@ -699,10 +772,11 @@ impl Kit {
                 })
             };
             let drawn = wgpu::TextureUsages::RENDER_ATTACHMENT;
-            let many = (gpu.samples > 1).then(|| texture("drawn", COLOUR, gpu.samples, drawn).create_view(&Default::default()));
+            let many = (samples > 1).then(|| texture("drawn", COLOUR, samples, drawn).create_view(&Default::default()));
             let colour = texture("picture", COLOUR, 1, drawn | wgpu::TextureUsages::COPY_SRC);
             let colour_view = colour.create_view(&Default::default());
-            let depth = texture("depth", DEPTH, gpu.samples, drawn).create_view(&Default::default());
+            let depth = texture("depth", DEPTH, samples, drawn).create_view(&Default::default());
+            // Within the device's largest texture, so the multiply can't overflow.
             let row = (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
             let read_back = gpu.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("read back"),
@@ -710,7 +784,7 @@ impl Kit {
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            self.targets.insert(0, Targets { width, height, many, colour, colour_view, depth, read_back, row });
+            self.targets.insert(0, Targets { width, height, samples, many, colour, colour_view, depth, read_back, row });
         }
         &self.targets[0]
     }
@@ -771,11 +845,11 @@ struct MeshOnCard {
 fn filled(gpu: &Gpu, label: &str, count: usize, stride: usize, usage: wgpu::BufferUsages, fill: impl Fn(usize, &mut [u8])) -> Result<wgpu::Buffer, Failure> {
     let size = count as u64 * stride as u64;
     if size > gpu.most_buffer || size == 0 {
-        return Err(Failure::Cant(CantDraw::TooLarge));
+        return Err(Failure::Cant(CantDraw::CardRefused));
     }
     let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: true });
     {
-        let mut mapped = buffer.slice(..).get_mapped_range_mut().map_err(|_| Failure::Cant(CantDraw::TooLarge))?;
+        let mut mapped = buffer.slice(..).get_mapped_range_mut().map_err(|_| Failure::Cant(CantDraw::CardRefused))?;
         let each = (PIECE / stride).max(1);
         let mut piece = vec![0u8; each * stride];
         for first in (0..count).step_by(each) {
@@ -883,7 +957,7 @@ fn upload(card: &Card, model: &Model) -> Result<OnCard, Failure> {
         Some(texture) if meshes.iter().any(|mesh| mesh.textured) => {
             let most = gpu.limits.max_texture_dimension_2d;
             if texture.width > most || texture.height > most {
-                return Err(Failure::Cant(CantDraw::TooLarge));
+                return Err(Failure::Cant(CantDraw::CardRefused));
             }
             if texture.width == 0 || texture.height == 0 || texture.rgba.len() as u64 != u64::from(texture.width) * u64::from(texture.height) * 4 {
                 return Err(Failure::Cant(CantDraw::Damaged));
@@ -955,15 +1029,16 @@ fn wait(gpu: &Gpu, submitted: wgpu::SubmissionIndex) -> Result<(), Failure> {
     if gpu.lost() { Err(Failure::Lost) } else { Ok(()) }
 }
 
-fn render(gpu: &Gpu, kit: &mut Kit, on_card: &OnCard, view: View, width: u32, height: u32) -> Result<Picture, Failure> {
+fn render(gpu: &Gpu, kit: &mut Kit, on_card: &OnCard, view: View, width: u32, height: u32, samples: u32) -> Result<Picture, Failure> {
     let started = Instant::now();
     let (matrix, light) = frame(view, on_card.middle, on_card.radius, width, height).ok_or(Failure::Cant(CantDraw::TooLarge))?;
     let mut bytes = [0u8; FRAME_BYTES as usize];
     put(&mut bytes[0..64], &matrix);
     put(&mut bytes[64..80], &[light[0], light[1], light[2], 0.0]);
     gpu.queue.write_buffer(&kit.frame, 0, &bytes);
-    kit.targets(gpu, width, height);
+    kit.targets(gpu, width, height, samples);
     let targets = &kit.targets[0];
+    let pipelines = &kit.pipelines.iter().find(|(count, _)| *count == samples).ok_or(Failure::Cant(CantDraw::CardRefused))?.1;
 
     let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("draw") });
     {
@@ -988,7 +1063,7 @@ fn render(gpu: &Gpu, kit: &mut Kit, on_card: &OnCard, view: View, width: u32, he
         });
         pass.set_bind_group(0, &kit.frame_group, &[]);
         for mesh in &on_card.meshes {
-            pass.set_pipeline(if mesh.double_sided { &kit.meshes_both_sides } else { &kit.meshes });
+            pass.set_pipeline(if mesh.double_sided { &pipelines.meshes_both_sides } else { &pipelines.meshes });
             let texture = on_card.texture.as_ref().filter(|_| mesh.textured).unwrap_or(&kit.white);
             pass.set_bind_group(1, texture, &[]);
             pass.set_vertex_buffer(0, mesh.vertices.slice(..));
@@ -998,7 +1073,7 @@ fn render(gpu: &Gpu, kit: &mut Kit, on_card: &OnCard, view: View, width: u32, he
             }
         }
         if !on_card.points.is_empty() {
-            pass.set_pipeline(&kit.points);
+            pass.set_pipeline(&pipelines.points);
         }
         for (points, count) in &on_card.points {
             pass.set_vertex_buffer(0, points.slice(..));
@@ -1025,11 +1100,11 @@ fn render(gpu: &Gpu, kit: &mut Kit, on_card: &OnCard, view: View, width: u32, he
     });
     wait(gpu, submitted)?;
     if is_mapped.try_recv() != Ok(true) {
-        return Err(Failure::Cant(CantDraw::TooLarge));
+        return Err(Failure::Cant(CantDraw::CardRefused));
     }
     let mut bgra = vec![0u8; width as usize * height as usize * 4];
     {
-        let view = targets.read_back.slice(..).get_mapped_range().map_err(|_| Failure::Cant(CantDraw::TooLarge))?;
+        let view = targets.read_back.slice(..).get_mapped_range().map_err(|_| Failure::Cant(CantDraw::CardRefused))?;
         let threads = if gpu.kind.copies_on_threads() { std::thread::available_parallelism().map_or(4, |n| n.get()).min(8) } else { 1 };
         copy_rows(&view, targets.row as usize, width as usize, &mut bgra, threads);
     }

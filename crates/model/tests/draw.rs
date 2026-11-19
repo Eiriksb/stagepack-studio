@@ -352,7 +352,7 @@ fn with_no_adapter_a_model_is_a_panel_and_says_why() {
 
 #[test]
 fn a_lost_device_is_made_again() {
-    let quick = DrawerOptions { retry_after: Duration::from_millis(50), ..DrawerOptions::default() };
+    let quick = DrawerOptions { retry_after: Duration::from_millis(200), ..DrawerOptions::default() };
     let Some(drawer) = drawer_with("a_lost_device_is_made_again", quick) else { return };
     let model = || boxes();
     let view = View::framing(&model().facts);
@@ -371,20 +371,35 @@ fn a_lost_device_is_made_again() {
         assert_eq!(covered(&after), covered(&before));
     }
 
-    // Making it again fails: nothing can be drawn until a later try makes one.
+    // Making it again fails twice: nothing can be drawn until a later try makes one, each try
+    // waiting twice as long as the one before. Only the least each wait can be is checked, by
+    // the drawer's own count of tries, so a slow machine can't fail it.
+    let tried = drawer.devices_tried();
     drawer.fail_making(2);
     drawer.lose_device();
+    let first = Instant::now();
     assert_eq!(picture(drawer.draw(&scene, view, 120, 90)).unwrap_err(), NotDrawn::Cant(CantDraw::NoAdapter));
+    assert_eq!(drawer.devices_tried(), tried + 1);
     assert_eq!(drawer.ready(), Some(Err(CantDraw::NoAdapter)));
-    // Asked again at once, it waits before trying again.
-    assert_eq!(picture(drawer.draw(&scene, view, 120, 90)).unwrap_err(), NotDrawn::Cant(CantDraw::NoAdapter));
-    // The second try fails too, and the wait before the next doubles.
-    std::thread::sleep(Duration::from_millis(60));
-    assert_eq!(picture(drawer.draw(&scene, view, 120, 90)).unwrap_err(), NotDrawn::Cant(CantDraw::NoAdapter));
-    std::thread::sleep(Duration::from_millis(60));
-    assert_eq!(picture(drawer.draw(&scene, view, 120, 90)).unwrap_err(), NotDrawn::Cant(CantDraw::NoAdapter), "the wait doubled");
-    std::thread::sleep(Duration::from_millis(60));
-    assert_eq!(picture(drawer.draw(&scene, view, 120, 90)).unwrap_err(), NotDrawn::UploadAgain);
+    // Asked again until the next try, then until the one after, which makes a device. Each try
+    // happens after the draw asked before it, and before the answer after it comes, so the time
+    // from the one to the other is at least the wait between tries.
+    let until = |tries: u32| loop {
+        let before = Instant::now();
+        let answer = picture(drawer.draw(&scene, view, 120, 90));
+        if drawer.devices_tried() == tries {
+            return (answer, before, Instant::now());
+        }
+        assert!(first.elapsed() < Duration::from_secs(30), "the drawer never tried again");
+        assert_eq!(answer.unwrap_err(), NotDrawn::Cant(CantDraw::NoAdapter));
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let (answer, second_asked, second_done) = until(tried + 2);
+    assert_eq!(answer.unwrap_err(), NotDrawn::Cant(CantDraw::NoAdapter));
+    assert!(second_done - first >= Duration::from_millis(200), "tried again after {:?}", second_done - first);
+    let (answer, _, third_done) = until(tried + 3);
+    assert_eq!(answer.unwrap_err(), NotDrawn::UploadAgain);
+    assert!(third_done - second_asked >= Duration::from_millis(400), "the wait didn't double: {:?}", third_done - second_asked);
     assert_eq!(drawer.devices_made(), 4);
     assert_eq!(drawer.ready(), kind);
     let scene = drawer.upload(model());
@@ -398,17 +413,23 @@ fn what_is_too_large_for_the_device_says_so_and_keeps_the_device() {
     let model = boxes();
     let view = View::framing(&model.facts);
     let scene = drawer.upload(model);
-    for (width, height) in [(8192, 8192), (100_000, 10)] {
+    for (width, height) in [(9000, 8000), (100_000, 10), ((1 << 30) + 1, 1), (u32::MAX, u32::MAX)] {
         assert_eq!(picture(drawer.draw(&scene, view, width, height)).unwrap_err(), NotDrawn::Cant(CantDraw::TooLarge));
     }
     assert!(picture(drawer.draw(&scene, view, 64, 36)).is_ok());
     assert_eq!(drawer.devices_made(), 1, "a picture too large isn't a lost device");
 
+    // Something the card refuses while drawing is said so, and the device is kept.
+    drawer.refuse_next_draw();
+    assert_eq!(picture(drawer.draw(&scene, view, 64, 36)).unwrap_err(), NotDrawn::Cant(CantDraw::CardRefused));
+    assert!(picture(drawer.draw(&scene, view, 64, 36)).is_ok());
+    assert_eq!(drawer.devices_made(), 1, "a refusal isn't a lost device");
+
     // A device whose buffers can't hold even one triangle: the model is too large, and stays so.
     let Some(tiny) = drawer_with("what_is_too_large_for_the_device_says_so_and_keeps_the_device", DrawerOptions { most_buffer: Some(8), ..DrawerOptions::default() }) else { return };
     let scene = tiny.upload(boxes());
     for _ in 0..2 {
-        assert_eq!(picture(tiny.draw(&scene, view, 64, 36)).unwrap_err(), NotDrawn::Cant(CantDraw::TooLarge));
+        assert_eq!(picture(tiny.draw(&scene, view, 64, 36)).unwrap_err(), NotDrawn::Cant(CantDraw::CardRefused));
     }
     assert_eq!(tiny.devices_made(), 1);
     assert_eq!(tiny.ready().map(|r| r.is_ok()), Some(true));
@@ -486,6 +507,31 @@ fn a_closed_drawer_says_so() {
     assert!(drawer.clone().close(Duration::from_secs(30)));
     assert_eq!(drawer.ready(), Some(Err(CantDraw::NoAdapter)), "was {ready:?}");
     assert_eq!(picture(drawer.draw(&scene, View::framing(&boxes().facts), 32, 18)).unwrap_err(), NotDrawn::Closed);
+
+    // Asked for after the drawer is told to close but before its thread ends: answered too.
+    let slow = Drawer::start_with(DrawerOptions { device_delay: Duration::from_millis(300), ..DrawerOptions::default() });
+    let scene = slow.upload(boxes());
+    let closing = std::thread::spawn({
+        let slow = slow.clone();
+        move || slow.close(Duration::from_secs(30))
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    let late = slow.draw(&scene, View::framing(&boxes().facts), 32, 18);
+    assert_eq!(picture(late).unwrap_err(), NotDrawn::Closed);
+    assert!(closing.join().unwrap());
+}
+
+#[test]
+fn a_picture_too_large_to_smooth_is_drawn_with_one_sample() {
+    let Some(drawer) = drawer("a_picture_too_large_to_smooth_is_drawn_with_one_sample") else { return };
+    let model = boxes();
+    let view = View::framing(&model.facts);
+    let scene = drawer.upload(model);
+    // 4,200 by 4,100 pixels of 4 samples each are more than are drawn; of one each, not.
+    let picture = picture(drawer.draw(&scene, view, 4200, 4100)).expect("drawn");
+    assert!(covered(&picture).is_some());
+    let partly = picture.bgra.chunks(4).filter(|p| p[3] != 0 && p[3] != 255).count();
+    assert_eq!(partly, 0, "drawn with one sample a pixel, every pixel is covered or not");
 }
 
 #[test]

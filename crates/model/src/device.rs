@@ -144,8 +144,9 @@ pub fn adapter_kinds() -> Vec<AdapterKind> {
     kinds
 }
 
-/// A device on the best adapter there is, or on the best of kind `only`.
-pub(crate) fn make(only: Option<AdapterKind>) -> Result<Gpu, CantDraw> {
+/// A device on the best adapter there is, or on the best of kind `only`, and what `ready` makes
+/// on it: an adapter whose device `ready` can't make it on is passed over for the next.
+pub(crate) fn make<T>(only: Option<AdapterKind>, mut ready: impl FnMut(&Gpu) -> Option<T>) -> Result<(Gpu, T), CantDraw> {
     for (_instance, adapter) in adapters() {
         let kind = AdapterKind::of(adapter.get_info().device_type);
         if only.is_some_and(|only| only != kind) {
@@ -168,7 +169,10 @@ pub(crate) fn make(only: Option<AdapterKind>) -> Result<Gpu, CantDraw> {
         let four = |format| adapter.get_texture_format_features(format).flags.sample_count_supported(4);
         let samples = if four(COLOUR) && four(DEPTH) { 4 } else { 1 };
         let most_buffer = limits.max_buffer_size;
-        return Ok(Gpu { device, queue, kind, limits, samples, lost, most_buffer });
+        let gpu = Gpu { device, queue, kind, limits, samples, lost, most_buffer };
+        if let Some(made) = ready(&gpu) {
+            return Ok((gpu, made));
+        }
     }
     Err(CantDraw::NoAdapter)
 }
