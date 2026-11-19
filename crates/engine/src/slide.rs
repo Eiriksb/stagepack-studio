@@ -358,7 +358,7 @@ fn positioned_layer(tag: &Tag, placing: Option<&Placing>, theme: &Theme, env: &m
         }
     }
     if tag.name == TERMINAL_TAG {
-        return (terminal_layer(tag, &place, theme, env, notices), LayerText::default());
+        return (terminal_layer(tag, &place, placing.is_some(), theme, env, notices), LayerText::default());
     }
     let ((w, h), drawing) = lay_out_positioned_tag(tag, (place.w, place.h), place.align, theme, env, notices);
     let rect = Rect { x: place.x.unwrap_or(0.0), y: place.y.unwrap_or(0.0), w, h };
@@ -403,8 +403,8 @@ fn positioned_layer(tag: &Tag, placing: Option<&Placing>, theme: &Theme, env: &m
 /// The layer of a terminal recording placed at `place`: its last screen, which it plays over
 /// when asked. It's drawn by the engine alone, so it has nothing of its own for export, which
 /// takes it as a picture of its screen.
-fn terminal_layer(tag: &Tag, place: &TagPlace, theme: &Theme, env: &mut LayoutEnv, notices: &mut Vec<Notice>) -> LayerSpec {
-    let ((w, h), items, stops, problem) = lay_out_terminal(tag, (place.w, place.h), theme, env);
+fn terminal_layer(tag: &Tag, place: &TagPlace, placing: bool, theme: &Theme, env: &mut LayoutEnv, notices: &mut Vec<Notice>) -> LayerSpec {
+    let ((w, h), items, stops, problem) = lay_out_terminal(tag, (place.w, place.h), placing, theme, env);
     if let Some(problem) = problem {
         add_notice(notices, problem);
     }

@@ -37,16 +37,20 @@ pub enum Making {
 /// recording is read whole, as the talk's small files are.
 #[doc(hidden)]
 pub fn make_one(job: StillJob, open: Option<LargeOpen>) -> Making {
+    if !job.reads_a_file() {
+        return Making::Made(job.make(None));
+    }
     let Some(open) = open else {
         return Making::Made(job.make(None));
     };
-    let opened = if job.is_terminal() {
-        open.read_recording()
-    } else if job.is_model() {
-        open.open_unless_saving()
-    } else {
-        open.open_for_still()
-    };
+    if job.is_terminal() {
+        return match open.read_recording() {
+            Ok(read) => Making::Made(job.make_recording(read)),
+            Err(NotOpened::Saving | NotOpened::NotUnpacked) => Making::Waits(job),
+            Err(NotOpened::Unreadable) => Making::Made(job.make(None)),
+        };
+    }
+    let opened = if job.is_model() { open.open_unless_saving() } else { open.open_for_still() };
     match opened {
         Ok(reader) => make_still_from(job, reader),
         Err(NotOpened::Unreadable) => Making::Made(job.make(None)),
@@ -67,7 +71,8 @@ pub fn make_still_from(job: StillJob, reader: HeldReader) -> Making {
 }
 
 /// Has `document`'s videos' stills made on background tasks, one at a time, as each is wanted,
-/// and taken in, the talk saying so with [`StillsTaken`]. Nothing runs while none is wanted. A
+/// and taken in, the talk saying so with [`StillsTaken`], and the terminal recordings' layers
+/// too long to draw on the window's thread drawn there. Nothing runs while none is wanted. A
 /// talk's stills are made once, whoever asks first.
 pub fn make_stills(document: &Entity<Document>, cx: &mut App) {
     if document.read(cx).stills_made_aside() {
@@ -94,6 +99,19 @@ pub fn make_stills(document: &Entity<Document>, cx: &mut App) {
                         }
                     }
                     Making::Waits(job) => document.still_waits(job),
+                });
+                if taken.is_err() {
+                    return;
+                }
+            }
+            let Ok(draws) = document.update(cx, |document, _| document.draw_jobs()) else { return };
+            for job in draws {
+                let drawn = cx.background_spawn(async move { job.draw() }).await;
+                let taken = document.update(cx, |document, cx| {
+                    if document.take_drawn(drawn) {
+                        cx.emit(StillsTaken);
+                        cx.notify();
+                    }
                 });
                 if taken.is_err() {
                     return;

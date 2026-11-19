@@ -417,14 +417,14 @@ fn a_recording_in_a_pack_is_read() {
     assert_eq!(deck.terminal_problem(0, layer.source.as_ref().unwrap()), None);
     // And aside, its file read as the talk's files are.
     let packed = open_packed(&pack).unwrap();
-    assert_eq!(recording_bytes(&packed, "assets/run.cast").as_deref(), Some(cast.as_slice()));
+    assert_eq!(recording_bytes(&packed, "assets/run.cast"), Ok(cast.clone()));
     let mut deck = Deck::open(Box::new(open_packed(&pack).unwrap()), Fonts::bundled_only(), source.to_string());
     deck.make_stills_aside(Arc::new(|| {}), Arc::new(|_: &str| None));
     assert!(deck.terminal_pending(0));
     let job = deck.still_jobs().pop().unwrap();
     let made = std::thread::spawn(move || {
-        let bytes = recording_bytes(&packed, job.path()).map(|bytes| Box::new(std::io::Cursor::new(bytes)) as Box<dyn ReadSeek>);
-        job.make(bytes)
+        let bytes = recording_bytes(&packed, job.path());
+        job.make_recording(bytes)
     })
     .join()
     .unwrap();
@@ -475,4 +475,195 @@ fn recordings_are_let_go_of_past_the_budget() {
     };
     assert_eq!(read_again(512 * 1024 * 1024), 0, "kept within the budget");
     assert_eq!(read_again(1), 1, "let go of past it, and read again");
+}
+
+#[test]
+fn a_file_too_large_to_be_a_recording_is_read_no_further_than_it_need_be() {
+    /// A file far larger than a recording can be, which can't be read in pieces, and must never be
+    /// read whole.
+    struct Huge;
+    impl TalkFiles for Huge {
+        fn read(&self, _: &str) -> Option<Vec<u8>> {
+            panic!("read whole")
+        }
+        fn open(&self, _: &str) -> Option<Box<dyn ReadSeek>> {
+            None
+        }
+        fn len(&self, _: &str) -> Option<u64> {
+            Some(200 * 1024 * 1024)
+        }
+    }
+    assert_eq!(recording_bytes(&Huge, "assets/run.cast"), Err(CantPlay::TooLarge));
+    // One that can be read in pieces is read a byte past the most a recording can be.
+    struct Pieces;
+    impl TalkFiles for Pieces {
+        fn read(&self, _: &str) -> Option<Vec<u8>> {
+            panic!("read whole")
+        }
+        fn open(&self, _: &str) -> Option<Box<dyn ReadSeek>> {
+            Some(Box::new(std::io::Cursor::new(vec![b'{'; 33 * 1024 * 1024])))
+        }
+        fn len(&self, _: &str) -> Option<u64> {
+            Some(33 * 1024 * 1024)
+        }
+    }
+    assert_eq!(recording_bytes(&Pieces, "assets/run.cast").map(|bytes| bytes.len()), Ok(slides_terminal::MOST_BYTES + 1));
+    assert_eq!(recording_bytes(&MapFiles(HashMap::new()), "assets/run.cast"), Err(CantPlay::CouldNotRead));
+}
+
+#[test]
+fn a_truecolour_gradient_keeps_its_colours() {
+    // 4,000 colours, a cell each, and 4,000 more underlines.
+    let mut out = String::new();
+    for row in 0..40u32 {
+        for col in 0..100u32 {
+            let (r, g, b) = ((col * 2) as u8, (row * 6) as u8, ((row * 100 + col) % 251) as u8);
+            out.push_str(&format!("\u{1b}[4;38;2;{b};{g};{r};48;2;{r};{g};{b}m "));
+        }
+        if row < 39 {
+            out.push_str("\r\n");
+        }
+    }
+    let cast = make_test_cast(100, 40, &[(0.1, "o", &out), (0.2, "o", "\u{1b}[?25l")]);
+    let mut deck = deck_of("<Terminal src=\"assets/run.cast\" x=\"0\" />\n", &[("assets/run.cast", cast)]);
+    let layer = terminal_layer(&mut deck, 0);
+    let colours: std::collections::HashSet<(u8, u8, u8)> = fills(&layer).into_iter().skip(1).map(|(_, colour)| colour).collect();
+    assert_eq!(colours.len(), 4000, "a fill for each colour");
+    for (row, col) in [(0u32, 0u32), (17, 33), (39, 99)] {
+        let colour = ((col * 2) as u8, (row * 6) as u8, ((row * 100 + col) % 251) as u8);
+        assert!(colours.contains(&colour), "{colour:?}");
+    }
+    let lines: std::collections::HashSet<(u8, u8, u8)> =
+        layer.items.iter().filter_map(|item| match item { DisplayItem::Stroke { color, .. } => Some((color.r, color.g, color.b)), _ => None }).collect();
+    assert_eq!(lines.len(), 4000, "an underline for each colour");
+}
+
+#[test]
+fn a_row_of_many_wide_characters_keeps_each_on_its_cells() {
+    // Thirty wide characters, each with a letter after, every one its own colour.
+    let row: String = (0..30u8).map(|at| format!("\u{1b}[38;5;{}m\u{4e2d}\u{1b}[38;5;{}m{}", 16 + at, 100 + at, (b'a' + at % 26) as char)).collect();
+    let cast = make_test_cast(100, 2, &[(0.1, "o", &row)]);
+    let mut deck = deck_of("<Terminal src=\"assets/run.cast\" x=\"0\" />\n", &[("assets/run.cast", cast)]);
+    let layer = terminal_layer(&mut deck, 0);
+    let cell = 18.0 * CELL_SHAPE;
+    let mut placed = Vec::new();
+    for item in &layer.items {
+        let DisplayItem::Text { text, x, .. } = item else { continue };
+        let run = text.buffer.layout_runs().next().unwrap();
+        placed.extend(run.glyphs.iter().map(|glyph| x + glyph.x));
+    }
+    assert_eq!(placed.len(), 60);
+    for (at, x) in placed.iter().enumerate() {
+        // Each wide character two cells on from the letter before it, and its letter after.
+        let cell_of = (at / 2) * 3 + if at % 2 == 0 { 0 } else { 2 };
+        assert!((x - cell_of as f32 * cell).abs() < 0.01, "glyph {at} at {x}, not on cell {cell_of}");
+    }
+}
+
+/// A screen of 200 by 60 full of letters, more than is drawn where it's asked for.
+fn full_screen() -> Vec<u8> {
+    let rows: Vec<String> = (0..60).map(|row| (0..200).map(|col| (b'a' + ((row + col) % 26) as u8) as char).collect()).collect();
+    make_test_cast(200, 60, &[(0.1, "o", &rows.join("\r\n"))])
+}
+
+#[test]
+fn a_screen_too_long_to_draw_here_is_drawn_aside() {
+    let source = "# One\n\n<Terminal src=\"assets/run.cast\" x=\"0\" y=\"0\" w=\"1920\" h=\"1080\" />\n";
+    let files = || MapFiles([("assets/run.cast".to_string(), full_screen())].into());
+    // As it's drawn where it's asked for, with nothing made aside.
+    let mut here = Deck::open(Box::new(files()), Fonts::bundled_only(), source.to_string());
+    let whole = here.layers(0, 1.0);
+    let mut deck = Deck::open(Box::new(files()), Fonts::bundled_only(), source.to_string());
+    let told = Arc::new(AtomicUsize::new(0));
+    let wanted = told.clone();
+    deck.make_stills_aside(Arc::new(move || {
+        wanted.fetch_add(1, Ordering::SeqCst);
+    }), Arc::new(|_: &str| None));
+    deck.specs(0);
+    let job = deck.still_jobs().pop().unwrap();
+    let made = std::thread::spawn(move || job.make_recording(Ok(full_screen()))).join().unwrap();
+    deck.take_still(made);
+    // Too much text to shape here, it's shaped aside, and shown as its plain panel meanwhile.
+    deck.layers(0, 1.0);
+    let mut jobs = deck.still_jobs();
+    assert_eq!(jobs.len(), 1);
+    let job = jobs.pop().unwrap();
+    assert!(job.is_terminal() && !job.reads_a_file());
+    deck.layers(0, 1.0);
+    assert!(deck.still_jobs().is_empty(), "once");
+    let made = std::thread::spawn(move || job.make(None)).join().unwrap();
+    assert!(!made.failed());
+    assert_eq!(deck.take_still(made), vec![0]);
+    let told_before = told.load(Ordering::SeqCst);
+    // Its plain panel stands in for it while it's drawn aside, which it's wanted, once.
+    let standing = deck.layers(0, 1.0);
+    let middle = |layers: &[Arc<Layer>]| {
+        let layer = layers.last().unwrap();
+        let pixel = layer.pixmap.pixel(layer.pixmap.width() / 2, layer.pixmap.height() / 2).unwrap();
+        (pixel.red(), pixel.green(), pixel.blue())
+    };
+    assert_eq!(middle(&standing), BACKGROUND, "the panel");
+    assert_eq!(told.load(Ordering::SeqCst), told_before + 1, "told it's wanted");
+    deck.layers(0, 1.0);
+    let jobs = deck.draw_jobs();
+    assert_eq!(jobs.len(), 1, "once");
+    assert!(deck.draw_jobs().is_empty());
+    // Drawn on another thread with fonts of its own, it's the same as drawn here.
+    let drawn = std::thread::spawn(move || jobs.into_iter().next().unwrap().draw()).join().unwrap();
+    assert_eq!(deck.take_drawn(drawn), vec![0]);
+    let layers = deck.layers(0, 1.0);
+    assert_eq!(layers.last().unwrap().pixmap.data(), whole.last().unwrap().pixmap.data(), "as drawn where it's asked for");
+    assert!(deck.draw_jobs().is_empty(), "and kept");
+    // Small, as in a thumbnail, its text isn't drawn at all, and it's drawn where it's asked for.
+    deck.layers(0, 0.1);
+    assert!(deck.draw_jobs().is_empty());
+}
+
+#[test]
+fn a_recording_being_resized_shows_its_picture_stretched() {
+    let source = "# One\n\n<Terminal src=\"assets/run.cast\" x=\"0\" y=\"0\" w=\"960\" h=\"540\" />\n";
+    let mut deck = Deck::open(Box::new(MapFiles([("assets/run.cast".to_string(), full_screen())].into())), Fonts::bundled_only(), source.to_string());
+    let drawn = deck.layers(0, 0.5).last().unwrap().clone();
+    let range = deck.terminals(0)[0].source.clone().unwrap();
+    for (frame, w) in [960.0f32, 1200.0, 1500.0].into_iter().enumerate() {
+        let rect = Rect { x: 100.0, y: 50.0, w, h: w * 9.0 / 16.0 };
+        deck.set_placing(0, vec![Placing { target: slides_format::Target::Tag(range.clone()), rect, rotate: 0.0 }]);
+        let shown = deck.layers(0, 0.5).last().unwrap().clone();
+        assert_eq!((shown.x, shown.y), (50, 25), "{frame}");
+        assert!(shown.pixmap.width().abs_diff((w * 0.5) as u32) <= 1, "{frame}: {} wide", shown.pixmap.width());
+        // Laid out as its panel alone meanwhile, and its picture stretched, not drawn again.
+        let layer = terminal_layer(&mut deck, 0);
+        assert_eq!(layer.rect, rect);
+        if frame == 0 {
+            assert!(Arc::ptr_eq(&shown.pixmap, &drawn.pixmap), "only moved, the same picture");
+        } else {
+            assert_eq!(layer.items.len(), 1, "{frame}: its panel");
+        }
+    }
+    // Let go, it's laid out and drawn as it is.
+    deck.clear_placing();
+    assert!(terminal_layer(&mut deck, 0).items.len() > 1);
+}
+
+#[test]
+fn cells_are_drawn_in_their_own_colours_and_text_only_where_it_can_be_read() {
+    // A blue cell, and a word.
+    let cast = make_test_cast(10, 2, &[(0.1, "o", "\u{1b}[44m \u{1b}[0m word\u{1b}[?25l")]);
+    let mut deck = deck_of("<Terminal src=\"assets/run.cast\" x=\"0\" y=\"0\" w=\"860\" h=\"360\" />\n", &[("assets/run.cast", cast)]);
+    let spec = terminal_layer(&mut deck, 0);
+    let row = 180.0;
+    let cell = row * CELL_SHAPE;
+    let layer = render_layer(&spec, 1.0, deck.fonts_mut());
+    let at = |x: f32, y: f32| {
+        let pixel = layer.pixmap.pixel(x as u32, y as u32).unwrap();
+        (pixel.red(), pixel.green(), pixel.blue())
+    };
+    let left = ((860.0 - 10.0 * cell) / 2.0f32).round();
+    assert_eq!(at(left + cell / 2.0, row / 2.0), (0x24, 0x72, 0xc8), "the blue cell");
+    assert_eq!(at(left + cell * 1.5, 2.0), BACKGROUND);
+    let text_pixels = |layer: &Layer| layer.pixmap.pixels().iter().filter(|pixel| pixel.red() > 0x60).count();
+    assert!(text_pixels(&layer) > 0, "the word is drawn");
+    // Small, as in a thumbnail, there's no text, only cells.
+    let small = render_layer(&spec, 0.01, deck.fonts_mut());
+    assert_eq!(text_pixels(&small), 0);
 }

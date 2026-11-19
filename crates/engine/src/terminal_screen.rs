@@ -36,13 +36,14 @@ const CELL_SHAPE: f32 = 0.6 / LINE_HEIGHT;
 const MONO: &str = "JetBrains Mono";
 /// The screen a recording is taken to have until its header has been read.
 const SCREEN_UNTIL_READ: (u16, u16) = (80, 24);
-/// The most text items a row is laid out as. A row of more runs than this is one text item of
-/// them all, as shaping each alone would take too long on a screen made of them; a wide
-/// character in it still stands alone, unless that would make too many again.
+/// The most runs a row is laid out as a text item each. In a row of more, the runs between wide
+/// characters are one text item, as shaping each alone would take too long on a screen made of
+/// them; each wide character still stands alone, as no font's is exactly two cells wide.
 const MOST_RUNS_A_ROW: usize = 32;
-/// The most colours a screen's backgrounds or underlines are drawn in, each colour one item. A
-/// screen of more has each of its colours drawn as the nearest of the 216 of the colour cube.
-const MOST_COLOURS: usize = 256;
+/// The most colours a screen's backgrounds or underlines are drawn in as they are, each colour one
+/// item. A screen of more has each of its colours drawn as the nearest of 4,096, sixteen levels
+/// of each of red, green and blue.
+const MOST_COLOURS: usize = 65_536;
 
 /// The size of a screen of `columns` and `rows` at its own size: [`TERMINAL_ROW`] units a row.
 fn own_size((columns, rows): (u16, u16)) -> (f32, f32) {
@@ -123,6 +124,8 @@ pub(crate) struct LaidScreen {
     lines: Vec<([u8; 3], Vec<Cells>)>,
     /// About how many bytes it holds.
     pub(crate) bytes: usize,
+    /// How many characters its text has.
+    pub(crate) glyphs: usize,
 }
 
 impl LaidScreen {
@@ -159,7 +162,7 @@ fn merged(row: u16, runs: &[Run]) -> CellText {
 
 /// The runs of a row as its text items: each alone if there are few enough, or else those
 /// between wide characters merged, each wide character standing alone, as no font's is exactly
-/// two cells wide; and if that's still too many, all of them as one.
+/// two cells wide.
 fn row_texts(row: u16, runs: Vec<Run>) -> Vec<CellText> {
     let alone = |run: &Run| CellText { row, col: run.from, spans: vec![Span { text: run.text.clone(), look: run.look }] };
     if runs.len() <= MOST_RUNS_A_ROW {
@@ -176,17 +179,16 @@ fn row_texts(row: u16, runs: Vec<Run>) -> Vec<CellText> {
         }
         texts.extend(wide.map(alone));
     }
-    if texts.len() > MOST_RUNS_A_ROW { vec![merged(row, &runs)] } else { texts }
+    texts
 }
 
-/// The nearest of the colour cube's levels to a channel.
-fn cube_level(channel: u8) -> u8 {
-    const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
-    LEVELS.into_iter().min_by_key(|level| level.abs_diff(channel)).unwrap_or(0)
+/// The nearest of sixteen levels, from none to all, to a channel.
+fn coarse_level(channel: u8) -> u8 {
+    ((u16::from(channel) + 8) / 17 * 17) as u8
 }
 
 /// Cells by their colour, in the order each colour was first seen: as each is, if there are few
-/// enough colours, or else each the nearest of the colour cube.
+/// enough colours, or else each the nearest of 4,096.
 fn by_colour(cells: Vec<([u8; 3], Cells)>) -> Vec<([u8; 3], Vec<Cells>)> {
     let mut colours: HashMap<[u8; 3], usize> = HashMap::new();
     let distinct = {
@@ -196,7 +198,7 @@ fn by_colour(cells: Vec<([u8; 3], Cells)>) -> Vec<([u8; 3], Vec<Cells>)> {
         }
         colours.len()
     };
-    let shown = |colour: [u8; 3]| if distinct > MOST_COLOURS { colour.map(cube_level) } else { colour };
+    let shown = |colour: [u8; 3]| if distinct > MOST_COLOURS { colour.map(coarse_level) } else { colour };
     let mut grouped: Vec<([u8; 3], Vec<Cells>)> = Vec::new();
     let mut at: HashMap<[u8; 3], usize> = HashMap::new();
     for (colour, cells) in cells {
@@ -291,7 +293,8 @@ pub(crate) fn lay_out_screen(screen: &Screen) -> LaidScreen {
             }
         }
     }
-    let mut laid = LaidScreen { columns: screen.width(), rows: screen.height(), fills: by_colour(fills), texts, lines: by_colour(lines), bytes: 0 };
+    let glyphs = texts.iter().flat_map(|text| &text.spans).map(|span| span.text.chars().count()).sum();
+    let mut laid = LaidScreen { columns: screen.width(), rows: screen.height(), fills: by_colour(fills), texts, lines: by_colour(lines), bytes: 0, glyphs };
     laid.bytes = laid.count();
     laid
 }
@@ -351,7 +354,24 @@ pub(crate) fn shape(laid: &LaidScreen, row: f32, fonts: &mut Fonts) -> Vec<Shape
 
 /// About how many bytes shaped text holds.
 pub(crate) fn shaped_bytes(shaped: &[ShapedText]) -> usize {
-    shaped.iter().map(|text| 256 + text.buffer.layout_runs().map(|run| run.text.len() + run.glyphs.len() * 96).sum::<usize>()).sum()
+    // Each glyph is held as it's shaped and as it's laid out, and the line's text with it.
+    let glyph = 2 * size_of::<cosmic_text::LayoutGlyph>() + 32;
+    shaped.iter().map(|text| 512 + text.buffer.layout_runs().map(|run| 2 * run.text.len() + run.glyphs.len() * glyph).sum::<usize>()).sum()
+}
+
+/// About how many bytes placed items hold: each item, and each path's points and verbs.
+pub(crate) fn placed_bytes(items: &[DisplayItem]) -> usize {
+    let path = |path: &tiny_skia::Path| size_of_val(path.points()) + path.verbs().len();
+    items
+        .iter()
+        .map(|item| {
+            size_of::<DisplayItem>()
+                + match item {
+                    DisplayItem::Fill { path: drawn, .. } | DisplayItem::Stroke { path: drawn, .. } => path(drawn),
+                    _ => 0,
+                }
+        })
+        .sum()
 }
 
 /// `laid` placed on `grid`, with its text `shaped` for the grid's rows: a fill for each background
@@ -405,8 +425,15 @@ pub fn screen_items(screen: &Screen, rect: Rect, fonts: &mut Fonts) -> Vec<Displ
 /// A terminal recording placed on a slide, laid out: the size of its box, for the sides `wanted`
 /// gives and the shape its header says its screen has for the rest, what it draws, how many
 /// times it stops, and why it can't be played if it can't. Until it's been read, it's a plain dark
-/// panel, and stops nowhere.
-pub(crate) fn lay_out_terminal(tag: &Tag, wanted: (Option<f32>, Option<f32>), theme: &Theme, env: &mut LayoutEnv) -> ((f32, f32), Vec<DisplayItem>, usize, Option<String>) {
+/// panel, and stops nowhere. One being resized, `placing`, is its panel alone: what's shown of it
+/// meanwhile is its picture as it was drawn, stretched, and it's laid out once it's let go.
+pub(crate) fn lay_out_terminal(
+    tag: &Tag,
+    wanted: (Option<f32>, Option<f32>),
+    placing: bool,
+    theme: &Theme,
+    env: &mut LayoutEnv,
+) -> ((f32, f32), Vec<DisplayItem>, usize, Option<String>) {
     let src = tag.attr("src").unwrap_or_default().trim();
     // One with no file is never looked for.
     let (still, screen_size) = if src.is_empty() { (None, None) } else {
@@ -419,6 +446,7 @@ pub(crate) fn lay_out_terminal(tag: &Tag, wanted: (Option<f32>, Option<f32>), th
         None => (placeholder_items(TERMINAL_NO_FILE, rect, theme, env.fonts), 0, Some(TERMINAL_NO_FILE.to_string())),
         Some(TerminalStill::Cannot(why)) => (placeholder_items(&why.to_string(), rect, theme, env.fonts), 0, Some(why.to_string())),
         Some(TerminalStill::Coming) => (panel(rect).into_iter().collect(), 0, None),
+        Some(TerminalStill::Laid(_, stops)) if placing => (panel(rect).into_iter().collect(), stops, None),
         Some(TerminalStill::Laid(_, stops)) => {
             let cells = env.pictures.terminal_items(src, rect, env.fonts).unwrap_or_else(|| Arc::from(Vec::new()));
             let items = panel(rect).into_iter().chain(cells.iter().cloned()).collect();

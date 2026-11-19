@@ -83,8 +83,60 @@ fn within_max_pixels(width: u32, height: u32) -> (u32, u32) {
 /// The pixmap holds everything the items draw, even outside `spec.rect`, though the layer
 /// still turns around the centre of `spec.rect`. A talk decides these numbers, so no
 /// rect, however absurd, may panic here.
+/// A terminal recording's text isn't drawn where its rows are less than this many device pixels
+/// high, as in a thumbnail: nothing could read it, and a screen of it is costly to draw.
+pub(crate) const TERMINAL_TEXT_ROW: f32 = 2.0;
+
 pub fn render_layer(spec: &LayerSpec, scale: f32, fonts: &mut Fonts) -> Layer {
-    draw_layer(spec, scale, |target, text, at| draw_text(target, text, fonts, at))
+    let terminal = spec.terminal.is_some();
+    draw_layer(spec, scale, |target, text, at| {
+        if terminal && text.buffer.metrics().line_height * scale < TERMINAL_TEXT_ROW {
+            return;
+        }
+        draw_text(target, text, fonts, at)
+    })
+}
+
+/// `drawn`, `spec`'s layer as it was drawn at `scale` before it was resized, stretched over where
+/// `spec` is drawn now: what's shown of a layer while it's being resized, when drawing it again
+/// each time would take too long.
+pub(crate) fn stretched_layer(drawn: &Layer, spec: &LayerSpec, scale: f32) -> Layer {
+    let Some((_, min_x, min_y, width, height)) = device_box(spec, scale) else {
+        return blank_layer();
+    };
+    let Some(mut pixmap) = Pixmap::new(width, height) else {
+        return blank_layer();
+    };
+    let stretch = Transform::from_scale(width as f32 / drawn.pixmap.width() as f32, height as f32 / drawn.pixmap.height() as f32);
+    // Only while it's being resized: the nearest pixel is quick, and soon drawn properly.
+    let paint = PixmapPaint { quality: FilterQuality::Nearest, ..PixmapPaint::default() };
+    pixmap.draw_pixmap(0, 0, drawn.pixmap.as_ref().as_ref(), &paint, stretch, None);
+    Layer { pixmap: Arc::new(pixmap), x: device_offset(min_x), y: device_offset(min_y) }
+}
+
+/// Where `spec` is drawn at `scale`: how it's placed and turned, in device pixels, and the corner
+/// and size of the pixmap that holds it, or nothing if its place makes no sense.
+fn device_box(spec: &LayerSpec, scale: f32) -> Option<(Transform, f32, f32, u32, u32)> {
+    let (x, y) = (spec.rect.x * scale, spec.rect.y * scale);
+    let (w, h) = (spec.rect.w * scale, spec.rect.h * scale);
+    let place = Transform::from_translate(x, y).pre_concat(Transform::from_rotate_at(spec.rotate, w / 2.0, h / 2.0));
+    let (left, top, right, bottom) = extent(spec);
+    let mut corners = [
+        Point::from_xy(left * scale, top * scale),
+        Point::from_xy(right * scale, top * scale),
+        Point::from_xy(right * scale, bottom * scale),
+        Point::from_xy(left * scale, bottom * scale),
+    ];
+    place.map_points(&mut corners);
+    if ![x, y, w, h].into_iter().chain(corners.iter().flat_map(|p| [p.x, p.y])).all(f32::is_finite) {
+        return None;
+    }
+    let min_x = corners.iter().map(|p| p.x).fold(f32::MAX, f32::min).floor();
+    let min_y = corners.iter().map(|p| p.y).fold(f32::MAX, f32::min).floor();
+    let max_x = corners.iter().map(|p| p.x).fold(f32::MIN, f32::max).ceil();
+    let max_y = corners.iter().map(|p| p.y).fold(f32::MIN, f32::max).ceil();
+    let (width, height) = within_max_pixels(pixmap_side(min_x, max_x), pixmap_side(min_y, max_y));
+    Some((place, min_x, min_y, width, height))
 }
 
 /// One of a video's pictures, `width` by `height` in straight BGRA, drawn as the layer of a
@@ -139,25 +191,11 @@ fn turned_picture_layer(width: u32, height: u32, bgra: &[u8], opaque: bool, rect
 
 /// Draws `spec` at `scale`, its text with `text`.
 fn draw_layer(spec: &LayerSpec, scale: f32, mut text: impl FnMut(&mut PixmapMut, &ShapedText, Transform)) -> Layer {
-    let (x, y) = (spec.rect.x * scale, spec.rect.y * scale);
-    let (w, h) = (spec.rect.w * scale, spec.rect.h * scale);
-    let place = Transform::from_translate(x, y).pre_concat(Transform::from_rotate_at(spec.rotate, w / 2.0, h / 2.0));
-    let (left, top, right, bottom) = extent(spec);
-    let mut corners = [
-        Point::from_xy(left * scale, top * scale),
-        Point::from_xy(right * scale, top * scale),
-        Point::from_xy(right * scale, bottom * scale),
-        Point::from_xy(left * scale, bottom * scale),
-    ];
-    place.map_points(&mut corners);
-    if ![x, y, w, h].into_iter().chain(corners.iter().flat_map(|p| [p.x, p.y])).all(f32::is_finite) {
+    // A terminal recording's cells are rectangles on whole slide units, which are filled quickly.
+    let cells = spec.terminal.is_some();
+    let Some((place, min_x, min_y, width, height)) = device_box(spec, scale) else {
         return blank_layer();
-    }
-    let min_x = corners.iter().map(|p| p.x).fold(f32::MAX, f32::min).floor();
-    let min_y = corners.iter().map(|p| p.y).fold(f32::MAX, f32::min).floor();
-    let max_x = corners.iter().map(|p| p.x).fold(f32::MIN, f32::max).ceil();
-    let max_y = corners.iter().map(|p| p.y).fold(f32::MIN, f32::max).ceil();
-    let (width, height) = within_max_pixels(pixmap_side(min_x, max_x), pixmap_side(min_y, max_y));
+    };
     let Some(mut pixmap) = Pixmap::new(width, height) else {
         return blank_layer();
     };
@@ -168,8 +206,12 @@ fn draw_layer(spec: &LayerSpec, scale: f32, mut text: impl FnMut(&mut PixmapMut,
     for item in &spec.items {
         match item {
             DisplayItem::Fill { path, color } => {
-                target.fill_path(path, &paint(*color), FillRule::Winding, at, None);
+                if !(cells && fill_cells(&mut target, path, *color, at)) {
+                    target.fill_path(path, &paint(*color), FillRule::Winding, at, None);
+                }
             }
+            // A terminal's underlines too thin to see, as its text is.
+            DisplayItem::Stroke { width, .. } if cells && width * scale < TERMINAL_TEXT_ROW / 16.0 => {}
             DisplayItem::Stroke { path, color, width } => {
                 let stroke = Stroke { width: *width, ..Stroke::default() };
                 target.stroke_path(path, &paint(*color), &stroke, at, None);
@@ -191,6 +233,51 @@ fn draw_layer(spec: &LayerSpec, scale: f32, mut text: impl FnMut(&mut PixmapMut,
         x: device_offset(min_x),
         y: device_offset(min_y),
     }
+}
+
+/// Fills the rectangles `path` is made of, a terminal recording's cells, with `color`, if `at` only
+/// scales and moves them and they're all rectangles: each pixel whose middle is in one is filled,
+/// so cells side by side meet with no gap and no seam. Says whether it did.
+fn fill_cells(target: &mut PixmapMut, path: &tiny_skia::Path, color: Color, at: Transform) -> bool {
+    if at.kx != 0.0 || at.ky != 0.0 || color.a != 255 {
+        return false;
+    }
+    let mut rects = Vec::with_capacity(path.len() / 5);
+    let mut corners: Vec<Point> = Vec::with_capacity(4);
+    for segment in path.segments() {
+        match segment {
+            tiny_skia::PathSegment::MoveTo(p) if corners.is_empty() => corners.push(p),
+            tiny_skia::PathSegment::LineTo(p) if !corners.is_empty() && corners.len() < 4 => corners.push(p),
+            tiny_skia::PathSegment::Close if corners.len() == 4 => {
+                let (xs, ys) = (corners.iter().map(|p| p.x), corners.iter().map(|p| p.y));
+                let (left, right) = (xs.clone().fold(f32::MAX, f32::min), xs.fold(f32::MIN, f32::max));
+                let (top, bottom) = (ys.clone().fold(f32::MAX, f32::min), ys.fold(f32::MIN, f32::max));
+                // Axis-aligned: each corner is on one of the edges both ways.
+                if !corners.iter().all(|p| (p.x == left || p.x == right) && (p.y == top || p.y == bottom)) {
+                    return false;
+                }
+                rects.push((left, top, right, bottom));
+                corners.clear();
+            }
+            _ => return false,
+        }
+    }
+    if !corners.is_empty() {
+        return false;
+    }
+    let (width, height) = (target.width() as f32, target.height() as f32);
+    let stride = target.width() as usize;
+    let pixel = ColorU8::from_rgba(color.r, color.g, color.b, 255).premultiply();
+    let pixels = target.pixels_mut();
+    let device = |v: f32, scale: f32, by: f32, most: f32| (v * scale + by).round().clamp(0.0, most) as usize;
+    for (left, top, right, bottom) in rects {
+        let (x0, x1) = (device(left, at.sx, at.tx, width), device(right, at.sx, at.tx, width));
+        let (y0, y1) = (device(top, at.sy, at.ty, height), device(bottom, at.sy, at.ty, height));
+        for row in y0..y1 {
+            pixels[row * stride + x0..row * stride + x1].fill(pixel);
+        }
+    }
+    true
 }
 
 /// Draws the layers over `target`, first to last.

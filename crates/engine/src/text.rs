@@ -165,6 +165,32 @@ impl Fonts {
     }
 }
 
+/// The fonts as they are now, to draw with on another thread: the same faces, by the same ids, so
+/// text shaped with the fonts it came from draws the same with these.
+#[derive(Clone)]
+pub struct FontsSeed {
+    db: fontdb::Database,
+    known: HashSet<fontdb::ID>,
+}
+
+impl Fonts {
+    /// These fonts as they are now, for another thread.
+    pub fn seed(&self) -> FontsSeed {
+        FontsSeed { db: self.system.db().clone(), known: self.known.clone() }
+    }
+}
+
+impl FontsSeed {
+    /// Fonts of the faces these were taken from.
+    pub fn fonts(self) -> Fonts {
+        Fonts {
+            system: FontSystem::new_with_locale_and_db_and_fallback("en-US".to_string(), self.db, EmojiFirst::new()),
+            cache: SwashCache::new(),
+            known: self.known,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct TextRun {
     pub text: String,

@@ -1018,7 +1018,9 @@ fn recording_talk_folder() -> tempfile::TempDir {
         if n > 0 {
             talk.push_str("---\n\n");
         }
-        talk.push_str(&format!("# Slide {n}\n\nSome **bold** words about run {n}.\n\n<Terminal src=\"assets/run{n}.cast\" x=\"900\" y=\"300\" w=\"960\" h=\"540\" />\n\n"));
+        // The busiest fills the slide, so that its text is drawn even at the window's scale.
+        let place = if n == RECORDING_SLIDES / 2 { "x=\"0\" y=\"0\" w=\"1920\" h=\"1080\"" } else { "x=\"900\" y=\"300\" w=\"960\" h=\"540\"" };
+        talk.push_str(&format!("# Slide {n}\n\nSome **bold** words about run {n}.\n\n<Terminal src=\"assets/run{n}.cast\" {place} />\n\n"));
     }
     std::fs::write(dir.path().join("slides.md"), talk).unwrap();
     std::fs::create_dir(dir.path().join("assets")).unwrap();
@@ -1029,14 +1031,23 @@ fn recording_talk_folder() -> tempfile::TempDir {
     dir
 }
 
-/// Takes in each still wanted, made as the window's background tasks make them, timing how long
-/// taking it in and drawing the slide again takes, as the window does: the slowest is given.
+/// Takes in each still wanted, made as the window's background tasks make them, and each layer
+/// wanted drawn aside, drawn as they draw them, timing how long taking it in and drawing the slide
+/// again takes on the window's thread: the slowest is given.
 fn take_recordings_in(doc: &mut Document) -> Duration {
     let mut slowest = Duration::ZERO;
     loop {
         let jobs = doc.still_jobs();
-        if jobs.is_empty() {
+        let draws = doc.draw_jobs();
+        if jobs.is_empty() && draws.is_empty() {
             return slowest;
+        }
+        for job in draws {
+            let drawn = job.draw();
+            let start = Instant::now();
+            doc.take_drawn(drawn);
+            doc.editor_layers(1280. / 1920.);
+            slowest = slowest.max(start.elapsed());
         }
         for (job, open) in jobs {
             let stagepack_studio::video_player::Making::Made(still) = stagepack_studio::video_player::make_one(job, open) else { panic!("a still waits") };
@@ -1116,11 +1127,11 @@ fn a_frame_of_a_drag_of_the_busiest_recording_is_quick() {
 }
 
 /// The busiest recording there is made larger a unit a frame: its text is shaped again only when
-/// its rows are another whole unit high, and laid out in the box at the rest. Its layout is timed,
-/// and so is drawing it, which every resized thing takes.
+/// its rows are another whole unit high, and laid out in the box at the rest, and what's shown is
+/// its picture as it was drawn, stretched, until the drag ends. Both are timed.
 #[test]
 #[ignore = "timing; run in release"]
-fn a_frame_of_a_resize_of_the_busiest_recording_lays_out_quickly() {
+fn a_frame_of_a_resize_of_the_busiest_recording_is_quick() {
     let dir = recording_talk_folder();
     let slide = RECORDING_SLIDES / 2;
     let (mut doc, _) = open_recording_talk(dir.path(), slide);
@@ -1141,6 +1152,24 @@ fn a_frame_of_a_resize_of_the_busiest_recording_lays_out_quickly() {
     laying.sort();
     drawing.sort();
     let median = laying[laying.len() / 2];
-    println!("median resize frame of the busiest recording: laid out in {median:?} (slowest {:?}), drawn in {:?}", laying.last().unwrap(), drawing[drawing.len() / 2]);
-    assert!(median < MOST_FOR_A_DRAG_FRAME, "laying it out took {median:?}");
+    let drawn = drawing[drawing.len() / 2];
+    println!("median resize frame of the busiest recording: laid out in {median:?} (slowest {:?}), drawn in {drawn:?} (slowest {:?})", laying.last().unwrap(), drawing.last().unwrap());
+    assert!(median + drawn < MOST_FOR_A_DRAG_FRAME, "a frame took {median:?} to lay out and {drawn:?} to draw");
+}
+
+/// The busiest recording's screen taken in, and its slide drawn again, as the window does once it's
+/// been read aside: the window waits on that no longer than on a keystroke.
+#[test]
+#[ignore = "timing; run in release"]
+fn the_busiest_recordings_screen_coming_in_is_quick() {
+    let dir = recording_talk_folder();
+    let (mut doc, slowest) = open_recording_talk(dir.path(), RECORDING_SLIDES / 2);
+    println!("the busiest recording's screen taken in and drawn: {slowest:?}");
+    assert!(slowest < MOST, "{slowest:?}");
+    // Drawn small, for the list of slides, its text isn't drawn.
+    let start = Instant::now();
+    doc.thumbnail(RECORDING_SLIDES / 2, 192);
+    let small = start.elapsed();
+    println!("the busiest recording's slide drawn small: {small:?}");
+    assert!(small < MOST, "{small:?}");
 }

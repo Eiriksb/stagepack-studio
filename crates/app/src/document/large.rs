@@ -409,14 +409,19 @@ impl LargeOpen {
     }
 
     /// The file read whole, as a terminal recording is: a small data file of the talk, read as any
-    /// is, from a pack compressed or not, and held among the talk's readers while it's read. Only a
-    /// byte more than a recording can be is read of one larger.
-    pub fn read_recording(self) -> Result<HeldReader, NotOpened> {
+    /// is, from a pack compressed or not, while held among the talk's readers. Only a byte more than
+    /// a recording can be is read of one larger. What can't be read says why, as a recording's
+    /// still says it; while a save replaces the pack, it isn't read.
+    pub fn read_recording(self) -> Result<Result<Vec<u8>, slides_terminal::CantPlay>, NotOpened> {
         let LargeOpen { files, path, readers, .. } = self;
-        readers.open(|| {
-            let bytes = slides_engine::recording_bytes(&*files, &path).ok_or(NotOpened::Unreadable)?;
-            Ok(Box::new(std::io::Cursor::new(bytes)) as Box<dyn slides_engine::ReadSeek>)
-        })
+        let mut read = Err(slides_terminal::CantPlay::CouldNotRead);
+        // Held while it's read, and let go of at once: what's read is all that's wanted of it.
+        let held = readers.open(|| {
+            read = slides_engine::recording_bytes(&*files, &path);
+            Ok(Box::new(std::io::Cursor::new(Vec::new())) as Box<dyn slides_engine::ReadSeek>)
+        })?;
+        drop(held);
+        Ok(read)
     }
 
     /// [`Self::open`] for reading a few headers on the window's thread: only a file read where it
@@ -712,6 +717,17 @@ impl Document {
         if let Some(wanted) = wanted {
             wanted();
         }
+    }
+
+    /// The layers wanted drawn aside since last asked: terminal recordings' screens too long to
+    /// draw on the window's thread. Each is drawn with [`slides_engine::DrawJob::draw`] on another.
+    pub fn draw_jobs(&mut self) -> Vec<slides_engine::DrawJob> {
+        self.deck.draw_jobs()
+    }
+
+    /// Takes in a layer drawn aside, and says whether a slide shows it, to be drawn again.
+    pub fn take_drawn(&mut self, drawn: slides_engine::DrawnLayer) -> bool {
+        !self.deck.take_drawn(drawn).is_empty()
     }
 
     /// Takes in a still made aside, and says whether a slide shows it: it's drawn again when

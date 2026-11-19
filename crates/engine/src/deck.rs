@@ -262,6 +262,65 @@ pub struct Deck {
     versions_made: u64,
     /// Where things on one slide are shown that their source doesn't say yet, and the slide.
     placing: Option<(usize, Vec<Placing>)>,
+    /// Layers wanted drawn aside, as they take too long to draw here, and those being drawn: by
+    /// slide, scale and key.
+    draw_jobs: Vec<DrawJob>,
+    drawing: HashSet<(usize, u32, LayerKey)>,
+}
+
+/// The most glyphs a terminal recording's layer has that are drawn on the thread asking for it,
+/// when stills are made aside: one with more is drawn aside, about a millisecond and a half of it.
+const MOST_GLYPHS_DRAWN_HERE: usize = 4_000;
+
+/// A layer to be drawn on another thread, with fonts of its own: a terminal recording's, whose
+/// screen of text takes too long to draw where it's asked for. See [`Deck::draw_jobs`].
+pub struct DrawJob {
+    slide: usize,
+    scale: u32,
+    key: LayerKey,
+    spec: LayerSpec,
+    fonts: crate::FontsSeed,
+}
+
+impl DrawJob {
+    /// Draws the layer: for a thread other than the window's.
+    pub fn draw(self) -> DrawnLayer {
+        let mut fonts = self.fonts.fonts();
+        let layer = Arc::new(render_layer(&self.spec, f32::from_bits(self.scale), &mut fonts));
+        DrawnLayer { slide: self.slide, scale: self.scale, key: self.key, layer }
+    }
+}
+
+/// A layer drawn aside, for [`Deck::take_drawn`] to take in.
+pub struct DrawnLayer {
+    slide: usize,
+    scale: u32,
+    key: LayerKey,
+    layer: Arc<Layer>,
+}
+
+/// How many glyphs of a terminal recording's layer are drawn at `scale`: those of rows tall
+/// enough for text to be drawn.
+fn glyphs_drawn(spec: &LayerSpec, scale: f32) -> usize {
+    spec.items
+        .iter()
+        .filter_map(|item| match item {
+            DisplayItem::Text { text, .. } if text.buffer.metrics().line_height * scale >= crate::render::TERMINAL_TEXT_ROW => {
+                Some(text.buffer.layout_runs().map(|run| run.glyphs.len()).sum::<usize>())
+            }
+            _ => None,
+        })
+        .sum()
+}
+
+/// What's shown of a terminal recording's layer while it's drawn aside: its layer as it was drawn
+/// before, stretched to where it is now, if there's one in `drawn`, or else its plain panel.
+fn standing_in(drawn: &Drawn, key: &LayerKey, spec: &LayerSpec, scale: f32, fonts: &mut Fonts) -> Arc<Layer> {
+    if let Some((layer, _)) = resized_layer(drawn, key, spec, scale) {
+        return layer;
+    }
+    let panel = LayerSpec { items: spec.items.iter().take(1).cloned().collect(), ..spec.clone() };
+    Arc::new(render_layer(&panel, scale, fonts))
 }
 
 /// The talk's settings, as far as they decide how a slide looks: not where they sit.
@@ -343,6 +402,8 @@ impl Deck {
             versions_made: slides.len() as u64,
             slides,
             placing: None,
+            draw_jobs: Vec::new(),
+            drawing: HashSet::new(),
         }
     }
 
@@ -1212,15 +1273,30 @@ impl Deck {
         }
         let mut by_key = HashMap::new();
         let mut ordered = Vec::with_capacity(laid.specs.len());
+        let aside = self.pictures.makes_aside();
+        let mut wanted = false;
         for (spec, key) in laid.specs.iter().zip(&laid.keys) {
             let layer = if spec.source.is_some() {
-                let layer = by_key
-                    .get(key)
-                    .or_else(|| drawn.by_key.get(key))
-                    .cloned()
-                    .unwrap_or_else(|| Arc::new(render_layer(spec, scale, &mut self.fonts)));
-                by_key.insert(key.clone(), layer.clone());
-                layer
+                match by_key.get(key).or_else(|| drawn.by_key.get(key)).cloned() {
+                    Some(layer) => {
+                        by_key.insert(key.clone(), layer.clone());
+                        layer
+                    }
+                    // A screen of text too long to draw here is drawn aside, and what stands in
+                    // for it meanwhile isn't kept as it.
+                    None if aside && spec.terminal.is_some() && glyphs_drawn(spec, scale) > MOST_GLYPHS_DRAWN_HERE => {
+                        if self.drawing.insert((index, scale.to_bits(), key.clone())) {
+                            self.draw_jobs.push(DrawJob { slide: index, scale: scale.to_bits(), key: key.clone(), spec: spec.clone(), fonts: self.fonts.seed() });
+                            wanted = true;
+                        }
+                        standing_in(drawn, key, spec, scale, &mut self.fonts)
+                    }
+                    None => {
+                        let layer = Arc::new(render_layer(spec, scale, &mut self.fonts));
+                        by_key.insert(key.clone(), layer.clone());
+                        layer
+                    }
+                }
             } else {
                 self.backgrounds
                     .entry((self.theme.clone(), scale.to_bits()))
@@ -1231,7 +1307,35 @@ impl Deck {
         }
         drawn.by_key = by_key;
         drawn.ordered = Some((moment, ordered.clone()));
+        if wanted {
+            self.pictures.tell_wanted();
+        }
         ordered
+    }
+
+    /// The layers wanted drawn aside since last asked, as stills are made: those of terminal
+    /// recordings whose screens take too long to draw on the thread asking for them. Until each is
+    /// taken in, with [`Self::take_drawn`], what it was drawn as before, stretched, or its plain
+    /// panel, stands in for it. Only while stills are made aside.
+    pub fn draw_jobs(&mut self) -> Vec<DrawJob> {
+        std::mem::take(&mut self.draw_jobs)
+    }
+
+    /// Takes in a layer drawn aside, and gives the slide it's on if it's still shown there, to be
+    /// drawn again.
+    pub fn take_drawn(&mut self, drawn: DrawnLayer) -> Vec<usize> {
+        let DrawnLayer { slide, scale, key, layer } = drawn;
+        self.drawing.remove(&(slide, scale, key.clone()));
+        let Some(state) = self.slides.get_mut(slide) else { return Vec::new() };
+        let at_moment = state.at_moment.as_ref().map(|(_, laid)| laid);
+        if !state.laid.iter().chain(at_moment).any(|laid| laid.keys.contains(&key)) {
+            return Vec::new();
+        }
+        let drawn = state.drawn.entry(scale).or_default();
+        drawn.by_key.insert(key, layer);
+        drawn.ordered = None;
+        drawn.placing_changed();
+        vec![slide]
     }
 
     /// Forgets how the slides furthest from slide `asked` are laid out, until the pictures in
@@ -1486,6 +1590,7 @@ impl Deck {
                     .or_else(|| drawn.placed_by_key.get(key))
                     .cloned()
                     .or_else(|| moved_layer(drawn, key, scale))
+                    .or_else(|| spec.terminal.as_ref().and_then(|_| resized_layer(drawn, key, spec, scale)))
                     .unwrap_or_else(|| {
                         let layer = Arc::new(render_layer(spec, scale, &mut self.fonts));
                         let at = DrawnAt::of(&layer, spec.rect.x, spec.rect.y);
@@ -1501,6 +1606,23 @@ impl Deck {
         self.keep_within_budget(index);
         ordered
     }
+}
+
+/// A terminal recording's layer of `drawn`, the slide's own, stretched over where `spec`, the same
+/// recording resized, now is: what's shown while it's being resized, as drawing a screen of text
+/// again at each step of a drag would take too long. It's drawn again once the drag ends.
+fn resized_layer(drawn: &Drawn, key: &LayerKey, spec: &LayerSpec, scale: f32) -> Option<(Arc<Layer>, DrawnAt)> {
+    let same = |other: &LayerKey| other.text == key.text && other.files_generation == key.files_generation && other.moment == key.moment;
+    let (other, own) = drawn.by_key.iter().find(|(other, _)| same(other))?;
+    // One of the same size and turn is only moved.
+    if other.place[2..] == key.place[2..] {
+        let (x, y) = (f32::from_bits(other.place[0]), f32::from_bits(other.place[1]));
+        let at = DrawnAt::of(own, x, y);
+        return Some((at.shown_at(&own.pixmap, spec.rect.x, spec.rect.y, scale), at));
+    }
+    let layer = Arc::new(crate::render::stretched_layer(own, spec, scale));
+    let at = DrawnAt::of(&layer, spec.rect.x, spec.rect.y);
+    Some((layer, at))
 }
 
 /// The terminal recordings among `specs`.
