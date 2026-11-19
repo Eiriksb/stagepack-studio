@@ -109,11 +109,13 @@ pub struct FactsRead {
 }
 
 impl FactsToRead {
-    /// Reads them, held among the talk's readers, within the limits a model is read with. A file
-    /// a pack holds compressed is read only once it's been unpacked, never unpacked just for this.
+    /// Reads them, held among the talk's readers, within the limits a model is read with. A video
+    /// a pack holds compressed is read only once it's been unpacked, never unpacked just for this;
+    /// a model, never more than 256 MB, is unpacked to read them, as it is to draw its still.
     pub fn read(self) -> FactsRead {
         let cant_read = if self.model { Known::Model(Err(slides_model::CantDraw::CouldNotRead)) } else { Known::Video(Err(slides_video::CantPlay::CouldNotRead)) };
-        let read = match self.open.map(LargeOpen::open_for_still) {
+        let open = if self.model { LargeOpen::open_unless_saving } else { LargeOpen::open_for_still };
+        let read = match self.open.map(open) {
             None | Some(Err(NotOpened::Unreadable)) => Some(cant_read),
             Some(Err(NotOpened::Saving | NotOpened::NotUnpacked)) => None,
             Some(Ok(reader)) => {
@@ -430,7 +432,72 @@ impl LargeOpen {
     }
 }
 
+/// The talk's files as an export reads them: a 3D model a pack holds compressed is unpacked to
+/// the cache to draw its still, as it is to turn it, as a model is never more than 256 MB.
+/// Everything else is read as the talk reads it.
+struct ModelsUnpacked {
+    files: Arc<dyn TalkFiles + Send + Sync>,
+    pack: PathBuf,
+    cache: Option<VideoCache>,
+    readers: Arc<Readers>,
+}
+
+impl ModelsUnpacked {
+    /// The model at `path`, unpacked from the pack to the cache, if it is one the pack holds.
+    fn unpacked(&self, path: &str) -> Option<Box<dyn slides_engine::ReadSeek>> {
+        let path = slides_engine::normalise(path).filter(|path| is_large_kind(path))?;
+        let ext = path.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase())?;
+        if !FileKind::Model.extensions().contains(&ext.as_str()) {
+            return None;
+        }
+        let cache = self.cache.clone().or_else(VideoCache::app)?;
+        // An export reads while no save replaces the pack: this stops only if one begins anyway.
+        let at = cache.unpacked(&self.pack, &path, self.readers.saving_now())?;
+        let file = large_files::open_plain(&at)?;
+        Some(Box::new(file))
+    }
+}
+
+impl TalkFiles for ModelsUnpacked {
+    fn read(&self, path: &str) -> Option<Vec<u8>> {
+        self.files.read(path)
+    }
+
+    fn open(&self, path: &str) -> Option<Box<dyn slides_engine::ReadSeek>> {
+        self.files.open(path).or_else(|| self.unpacked(path))
+    }
+
+    fn lies_at(&self, path: &str) -> Option<PathBuf> {
+        self.files.lies_at(path)
+    }
+
+    fn stamp(&self, path: &str) -> Option<(u64, std::time::SystemTime)> {
+        self.files.stamp(path)
+    }
+
+    fn len(&self, path: &str) -> Option<u64> {
+        self.files.len(path)
+    }
+
+    fn names_in(&self, folder: &str) -> Vec<String> {
+        self.files.names_in(folder)
+    }
+
+    fn never_changes(&self) -> bool {
+        self.files.never_changes()
+    }
+}
+
 impl Document {
+    /// The talk's files as an export reads them: in a pack, a 3D model the pack holds compressed
+    /// is unpacked to draw its still.
+    pub(crate) fn files_for_export(&self) -> Arc<dyn TalkFiles + Send + Sync> {
+        match self.pack() {
+            Some(pack) => Arc::new(ModelsUnpacked { files: self.files.clone(), pack, cache: self.large.cache.clone(), readers: self.large.readers.clone() }),
+            None => self.files.clone(),
+        }
+    }
+
     /// Copies large files added to the talk, such as videos, into `recovery`, the window's
     /// working copies, in its slot for the talk: until the talk is saved, that copy is the only
     /// one there is.
@@ -507,6 +574,12 @@ impl Document {
     /// a video has been opened to play, which may have unpacked it.
     pub fn still_waits(&mut self, job: StillJob) {
         self.large.stills_waiting.push(job);
+    }
+
+    /// How many stills couldn't be made yet, and wait to be given again: for tests.
+    #[doc(hidden)]
+    pub fn stills_waiting(&self) -> usize {
+        self.large.stills_waiting.len()
     }
 
     /// Gives again the stills that couldn't be made yet, telling what makes them, and lets the

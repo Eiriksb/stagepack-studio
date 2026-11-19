@@ -676,7 +676,7 @@ impl AudienceView {
         }
     }
 
-    /// Makes the stills that waited for a video to be unpacked to play.
+    /// Makes the stills that waited for a video to be unpacked to play, or a model to turn.
     fn videos_opened(&mut self, cx: &mut Context<Self>) {
         let document = self.show.read(cx).document.clone();
         document.update(cx, |document, cx| {

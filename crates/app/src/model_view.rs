@@ -36,43 +36,72 @@ const CLOSING_WITHIN: Duration = Duration::from_secs(10);
 
 // The app's one drawer.
 
-/// The drawer every model is drawn with, once one is wanted.
-static DRAWER: Mutex<Option<Drawer>> = Mutex::new(None);
+/// The drawer every model is drawn with, once one is wanted, and whether it's been closed for
+/// good, as the app quits: then no other is started, as one started after the close would be
+/// left running as the program ends.
+static DRAWER: Mutex<Drawing> = Mutex::new(Drawing { drawer: None, closed: false });
 /// The drawer being closed as the app quits, and the thread closing it.
 static CLOSING: Mutex<Option<std::thread::JoinHandle<bool>>> = Mutex::new(None);
+
+struct Drawing {
+    drawer: Option<Drawer>,
+    closed: bool,
+}
 
 fn lock<T>(held: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     held.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The app's drawer, started the first time a model is to be drawn: its device is made on its
-/// own thread, so this never waits.
-pub fn drawer() -> Drawer {
-    lock(&DRAWER).get_or_insert_with(Drawer::start).clone()
+/// own thread, so this never waits. `None` once it's been closed, as the app quits: nothing is
+/// drawn then.
+pub fn drawer() -> Option<Drawer> {
+    let mut drawing = lock(&DRAWER);
+    if drawing.closed {
+        return None;
+    }
+    Some(drawing.drawer.get_or_insert_with(Drawer::start).clone())
 }
 
-/// Draws with `drawer` from now on, as a test does to slow it down or take its adapter away. The
-/// drawer it replaces is closed off this thread, and given back for a test to wait on.
+/// Draws with `drawer` from now on, as a test does to slow it down or take its adapter away,
+/// even after the drawer was closed. The drawer it replaces is closed off this thread, and given
+/// back for a test to wait on.
 #[doc(hidden)]
 pub fn use_drawer(drawer: Drawer) -> Option<std::thread::JoinHandle<bool>> {
-    let old = lock(&DRAWER).replace(drawer)?;
+    let old = {
+        let mut drawing = lock(&DRAWER);
+        drawing.closed = false;
+        drawing.drawer.replace(drawer)?
+    };
     std::thread::Builder::new().name("closing a model drawer".into()).spawn(move || old.close(CLOSING_WITHIN)).ok()
+}
+
+/// Whether the app's drawer has been closed for good, as the app quits.
+fn closed_for_good() -> bool {
+    lock(&DRAWER).closed
+}
+
+/// Takes the app's drawer away for good: no other is started after.
+fn take_for_good() -> Option<Drawer> {
+    let mut drawing = lock(&DRAWER);
+    drawing.closed = true;
+    drawing.drawer.take()
 }
 
 /// Closes the app's drawer, if it has one, waiting up to `within` for its thread to let go of its
 /// device: true if it did, or there was none. It waits, so never on a window's thread while the
-/// window is in use. The next model to be drawn starts another.
+/// window is in use. No other is started after, as a test ends.
 pub fn close_drawer(within: Duration) -> bool {
-    let drawer = lock(&DRAWER).take();
-    drawer.is_none_or(|drawer| drawer.close(within))
+    take_for_good().is_none_or(|drawer| drawer.close(within))
 }
 
 /// Begins closing the app's drawer on a thread of its own, as the app quits, and gives what says
 /// when it's done. A program that ends while a graphics driver is letting go of a device can
-/// crash in the driver, so [`wait_closed`] waits for it once the windows are gone.
+/// crash in the driver, so [`wait_closed`] waits for it once the windows are gone. No other is
+/// started after: a still or a model being read as the app quits is told nothing can draw it.
 pub fn begin_closing() -> futures::channel::oneshot::Receiver<()> {
     let (done, closed) = futures::channel::oneshot::channel();
-    let Some(drawer) = lock(&DRAWER).take() else {
+    let Some(drawer) = take_for_good() else {
         done.send(()).ok();
         return closed;
     };
@@ -194,14 +223,19 @@ impl Seek for Shared {
 /// Draws the still of the model `reader` reads, seen from `view`, or framed whole with none,
 /// `width` by `height`, with the app's drawer: what the deck is given to draw stills with. It
 /// waits for the drawer, so it's for a background task. A model lost from the card before it's
-/// drawn is read and put on again once; lost again, it can't be drawn.
+/// drawn is read and put on again once; lost again, it can't be drawn. Once the drawer has been
+/// closed, as the app quits, nothing can draw it, and that's said without reading it.
 pub fn draw_still(reader: Box<dyn slides_engine::ReadSeek>, view: Option<View>, width: u32, height: u32) -> Result<Picture, CantDraw> {
+    if closed_for_good() {
+        return Err(CantDraw::NoAdapter);
+    }
     let reader = Shared(Arc::new(Mutex::new(reader)));
     let mut again = false;
     loop {
         let model = slides_model::read(Box::new(reader.clone()))?;
         let view = view.unwrap_or_else(|| View::framing(&model.facts));
-        let uploaded = Uploaded::new(drawer(), model);
+        let Some(drawer) = drawer() else { return Err(CantDraw::NoAdapter) };
+        let uploaded = Uploaded::new(drawer, model);
         match uploaded.draw(view, (width, height)).recv() {
             Ok(picture) => return Ok(picture),
             Err(NotDrawn::Cant(why)) => return Err(why),
@@ -243,14 +277,21 @@ pub(crate) fn read_model(open: LargeOpen) -> Reading {
 }
 
 /// Reads the model `reader` reads, held among the talk's readers, and puts it on the drawer's
-/// card. One that failed because a save let go of its file is read again after the save.
+/// card. One that failed because a save let go of its file is read again after the save. Once
+/// the drawer has been closed, as the app quits, nothing can draw it.
 #[doc(hidden)]
 pub fn read_model_from(reader: HeldReader) -> Reading {
+    if closed_for_good() {
+        return Reading::Cant(CantDraw::NoAdapter);
+    }
     let watch = reader.watch();
     match slides_model::read(Box::new(reader)) {
         Ok(model) => {
             let facts = model.facts;
-            Reading::Read(Uploaded::new(drawer(), model), facts)
+            match drawer() {
+                Some(drawer) => Reading::Read(Uploaded::new(drawer, model), facts),
+                None => Reading::Cant(CantDraw::NoAdapter),
+            }
         }
         // Only a save lets go of a file: one that failed otherwise can't be drawn.
         Err(_) if watch.is_let_go() => Reading::LetGo,

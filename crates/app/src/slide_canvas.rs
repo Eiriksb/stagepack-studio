@@ -33,8 +33,8 @@ pub struct VideoLetGo;
 /// Sent when a video playing here couldn't go on, saying why.
 pub struct VideoFailed(pub slides_video::CantPlay);
 
-/// Sent when a video has been opened to play: one a pack holds compressed is unpacked by then,
-/// and its still can be made.
+/// Sent when a video has been opened to play, or a model read to turn it: one a pack holds
+/// compressed is unpacked by then, and a still that waited for it can be made.
 pub struct VideoOpened;
 
 /// Sent when a model turned here can't be drawn, saying why.
@@ -492,11 +492,15 @@ impl SlideCanvas {
                 .update(cx, |canvas, cx| {
                     let Some((_, turner)) = canvas.turners.iter_mut().find(|(at, _)| *at == id) else { return };
                     let Some(reading) = reading.take() else { return };
+                    let read = matches!(reading, model_view::Reading::Read(..));
                     if let Some(why) = turner.read(reading) {
                         cx.emit(ModelFailed(why));
                     }
                     if turner.was_let_go() {
                         cx.emit(ModelLetGo);
+                    }
+                    if read {
+                        cx.emit(VideoOpened);
                     }
                     cx.notify();
                 })

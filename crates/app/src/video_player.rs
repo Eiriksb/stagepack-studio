@@ -27,16 +27,19 @@ impl EventEmitter<StillsTaken> for Document {}
 pub enum Making {
     Made(MadeStill),
     /// It couldn't be made yet: while a save replaces the pack, or before a video a pack holds
-    /// compressed is unpacked to play.
+    /// compressed is unpacked to play, or a model to turn.
     Waits(StillJob),
 }
 
-/// Makes `job`, reading the video with `open`: for a background task.
+/// Makes `job`, reading the video or the model with `open`: for a background task. A model a
+/// pack holds compressed is unpacked to draw it, as it is to turn it, as a model is never more
+/// than 256 MB; a video is read only once it's been unpacked to play.
 fn make_one(job: StillJob, open: Option<LargeOpen>) -> Making {
     let Some(open) = open else {
         return Making::Made(job.make(None));
     };
-    match open.open_for_still() {
+    let opened = if job.is_model() { open.open_unless_saving() } else { open.open_for_still() };
+    match opened {
         Ok(reader) => make_still_from(job, reader),
         Err(NotOpened::Unreadable) => Making::Made(job.make(None)),
         Err(NotOpened::Saving | NotOpened::NotUnpacked) => Making::Waits(job),

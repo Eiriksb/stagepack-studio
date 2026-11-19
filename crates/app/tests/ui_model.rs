@@ -585,6 +585,72 @@ fn a_save_in_place_lets_go_of_a_model_being_read(cx: &mut TestAppContext) {
     assert!(view_of(cx, &canvas, layer).is_some());
 }
 
+/// A pack made by another program, its talk of `source` and its `assets/box.glb`, `model`, both
+/// compressed, in `work`.
+fn compressed_pack(work: &std::path::Path, source: &str, model: &[u8]) -> std::path::PathBuf {
+    use std::io::Write as _;
+    let at = work.join("compressed.sptx");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&at).unwrap());
+    let deflated = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    zip.start_file("talk.json", deflated).unwrap();
+    zip.write_all(br#"{"format":1,"app":"another","entry":"slides.md"}"#).unwrap();
+    zip.start_file("slides.md", deflated).unwrap();
+    zip.write_all(source.as_bytes()).unwrap();
+    zip.start_file("assets/box.glb", deflated).unwrap();
+    zip.write_all(model).unwrap();
+    zip.finish().unwrap();
+    at
+}
+
+#[gpui_kit::test]
+fn a_model_a_pack_holds_compressed_is_drawn_read_and_exported(cx: &mut TestAppContext) {
+    use stagepack_studio::export::{ExportKind, run_export};
+    use stagepack_studio::large_files::{CACHE_LIMIT, VideoCache};
+    let Some(_alone) = alone("a_model_a_pack_holds_compressed_is_drawn_read_and_exported") else { return };
+    let work = tempfile::tempdir().unwrap();
+    let pack = compressed_pack(work.path(), &talk(), &box_model());
+    let mut document = Document::open_packed(&pack, Fonts::bundled_only()).unwrap();
+    document.use_video_cache(VideoCache::new(work.path().join("cache"), CACHE_LIMIT));
+    let typing = open_untitled_talk(cx, document, work.path());
+    // On open, its still is drawn: unpacked to the cache, as Turn would.
+    stills_made(&typing, cx);
+    let model = thing(&typing, cx, "<Model");
+    let problem = typing.document(cx).update(cx, |document, _| document.model_problem_on(0, &model.source));
+    assert_eq!(problem, None, "its still is drawn");
+    // Its facts show.
+    select_model(&typing, cx);
+    assert_eq!(facts(&typing, cx), "12 triangles");
+    // A PDF and a PowerPoint export draw it.
+    for kind in [ExportKind::Pdf, ExportKind::PowerPoint] {
+        let input = typing.document(cx).read_with(cx, |document, _| document.export_input());
+        let out = work.path().join(format!("talk.{}", kind.extension()));
+        let notices = run_export(input, kind, &out).unwrap();
+        assert!(notices.iter().any(|notice| notice == "1 model was exported as a picture."), "{kind:?}: {notices:?}");
+        assert!(notices.iter().all(|notice| !notice.contains("couldn't be read")), "{kind:?}: {notices:?}");
+    }
+}
+
+#[gpui_kit::test]
+fn a_still_waiting_for_its_model_is_made_once_turn_has_read_it(cx: &mut TestAppContext) {
+    let Some(_alone) = alone("a_still_waiting_for_its_model_is_made_once_turn_has_read_it") else { return };
+    let folder = talk_folder(&talk(), &box_model());
+    // A still of the model that couldn't be made yet, as one couldn't before its file was
+    // unpacked.
+    let mut other = Document::open(folder.path(), Fonts::bundled_only()).unwrap();
+    other.notices();
+    let (job, _) = other.still_jobs().pop().expect("its still is wanted");
+    assert!(job.is_model());
+    let typing = open_folder(cx, folder, None);
+    stills_made(&typing, cx);
+    let document = typing.document(cx);
+    document.update(cx, |document, _| document.still_waits(job));
+    cx.run_until_parked();
+    assert_eq!(document.read_with(cx, |document, _| document.stills_waiting()), 1, "nothing has tried it again yet");
+    // Turned, the model is read, which may have unpacked it: what waited is made then.
+    turn_selected(&typing, cx);
+    until(cx, typing.handle, "the still that waited", |cx| document.read_with(cx, |document, _| document.stills_waiting()) == 0);
+}
+
 // In the show.
 
 /// A show of a talk of `source` with the box, rehearsed, in both its windows.
@@ -832,13 +898,60 @@ fn the_drawer_lets_go_of_its_device_off_the_windows_thread_as_the_app_quits(cx: 
     assert_eq!(drawers(), 0);
     // The app closes it as it quits.
     cx.update(model_view::close_on_quit);
-    let drawer = model_view::drawer();
+    assert!(model_view::use_drawer(Drawer::start()).is_none(), "none was left to close");
+    let drawer = model_view::drawer().expect("a drawer given to draw with is used");
     assert!(ready(&drawer));
     drop(drawer);
     assert!(drawers() >= 1);
     cx.quit();
     assert!(model_view::wait_closed());
     assert_eq!(drawers(), 0);
+}
+
+/// How many threads of the process are a model drawer's: the driver's own take its name too.
+fn drawer_threads() -> usize {
+    std::fs::read_dir("/proc/self/task")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|task| std::fs::read_to_string(task.path().join("comm")).ok())
+        .filter(|name| name.trim_end() == "model drawer")
+        .count()
+}
+
+#[test]
+fn once_the_drawer_is_closing_nothing_starts_another() {
+    use stagepack_studio::large_files::Readers;
+    use stagepack_studio::model_view::Reading;
+    let Some(_alone) = alone("once_the_drawer_is_closing_nothing_starts_another") else { return };
+    assert!(ready(&model_view::drawer().expect("the drawer given")));
+    for close in [true, false] {
+        if close {
+            // As the app quits.
+            let closed = model_view::begin_closing();
+            assert!(model_view::wait_closed());
+            assert!(futures::executor::block_on(closed).is_ok());
+        } else {
+            // As a test ends.
+            if let Some(old) = model_view::use_drawer(Drawer::start()) {
+                assert!(old.join().unwrap());
+            }
+            assert!(model_view::close_drawer(Duration::from_secs(30)));
+        }
+        assert_eq!(drawer_threads(), 0, "closed");
+        // A still asked for after a long read, as one being made as the app quits is.
+        let began = Instant::now();
+        let drawn = model_view::draw_still(Box::new(std::io::Cursor::new(box_model())), None, 64, 36);
+        assert_eq!(drawn.err(), Some(slides_model::CantDraw::NoAdapter), "a plain answer");
+        assert!(began.elapsed() < Duration::from_secs(2), "at once: {:?}", began.elapsed());
+        // A model read to be turned.
+        let reader = Readers::default().open_for_test(|| Ok(Box::new(std::io::Cursor::new(box_model())))).unwrap();
+        assert!(matches!(model_view::read_model_from(reader), Reading::Cant(slides_model::CantDraw::NoAdapter)));
+        assert!(model_view::drawer().is_none());
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(drawer_threads(), 0, "no drawer was started again");
+        assert_eq!(scenes_held(), 0);
+    }
 }
 
 // A card that refuses, or keeps losing what's on it.
@@ -849,7 +962,7 @@ fn a_model_the_card_refuses_is_not_asked_for_again(cx: &mut TestAppContext) {
     let typing = editor(cx, &talk());
     let canvas = turn_selected(&typing, cx);
     drawn(cx, typing.handle, &canvas);
-    model_view::drawer().refuse_next_draw();
+    model_view::drawer().unwrap().refuse_next_draw();
     let model = thing(&typing, cx, "<Model");
     let from = middle(&typing, cx, &model) + point(px(-60.), px(40.));
     typing.drag(cx, from, from + point(px(40.), px(0.)));
@@ -876,14 +989,14 @@ fn a_model_lost_from_the_card_is_read_again_once(cx: &mut TestAppContext) {
     let from = middle(&typing, cx, &model) + point(px(-60.), px(40.));
     // Lost once, it's read again and drawn.
     let (made, _) = made_and_released(cx, &canvas);
-    model_view::drawer().lose_device();
+    model_view::drawer().unwrap().lose_device();
     typing.drag(cx, from, from + point(px(20.), px(0.)));
     until(cx, typing.handle, "drawn again", |cx| made_and_released(cx, &canvas).0 > made);
     assert_eq!(scenes_held(), 1);
     // Lost again as soon as it's put on the card again, with no picture between, it can't be
     // drawn here, and isn't read again.
     let put_on = model_view::models_put_on_card();
-    model_view::drawer().lose_device();
+    model_view::drawer().unwrap().lose_device();
     model_view::after_upload(Some(Box::new(|drawer: &Drawer| drawer.lose_device())));
     typing.drag(cx, from, from + point(px(20.), px(0.)));
     until(cx, typing.handle, "it can't be drawn", |cx| cx.read(|cx| canvas.read(cx).model_failures()) == vec![Some(slides_model::CantDraw::CardRefused)]);

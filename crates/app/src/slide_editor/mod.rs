@@ -300,11 +300,12 @@ impl SlideEditor {
             cx.emit(EditorEvent::Said(failed.0.to_string().into()));
         }));
         subscriptions.push(cx.subscribe(&canvas, |this, _, _: &ModelLetGo, cx| this.keep_playing_only_what_holds(cx)));
-        // A video opened to play may have been unpacked: a still that waited for that is made.
+        // A video opened to play, or a model read to turn, may have been unpacked: a still that
+        // waited for that is made.
         if let Some(document) = document.clone() {
             subscriptions.push(cx.subscribe(&canvas, move |_, _, _: &VideoOpened, cx| {
                 document.update(cx, |document, cx| {
-                    // The form reads a video's facts that waited for it to be unpacked.
+                    // The form reads the facts that waited for it to be unpacked.
                     if document.try_waiting_stills_again() {
                         cx.notify();
                     }
