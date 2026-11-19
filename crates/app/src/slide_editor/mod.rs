@@ -24,7 +24,7 @@ use crate::clipboard::{self, TextPaste};
 use crate::clipboard_tools::write_clipboard;
 use crate::document::{Beside, CellMove, Document, EditRefused};
 use crate::selection::{self, Thing};
-use crate::slide_canvas::{SLIDE_WIDTH, SlideCanvas, VideoFailed, VideoLetGo, VideoOpened, letterbox};
+use crate::slide_canvas::{ModelFailed, ModelLetGo, SLIDE_WIDTH, SlideCanvas, VideoFailed, VideoLetGo, VideoOpened, letterbox};
 use crate::insert::TEXT_BOX_SIZE;
 use crate::text_editing::{Composing, EditingText, clean_typed, one_line, utf16_slice};
 use crate::text_tools::{
@@ -103,6 +103,13 @@ pub fn step_badge_id(n: usize) -> String {
 pub const VIDEO_PLAY_ID: &str = "video-play";
 pub const VIDEO_STOP_ID: &str = "video-stop";
 
+/// The button in the middle of a 3D model selected that has it drawn live, to turn it by hand.
+pub const MODEL_TURN_ID: &str = "model-turn";
+/// While a model is turned: the button that writes the view shown into the talk, and the one
+/// that goes back to its still.
+pub const MODEL_SET_VIEW_ID: &str = "model-set-view";
+pub const MODEL_DONE_ID: &str = "model-done";
+
 /// The key context the editor's keys apply in, while text is being typed.
 pub const EDITOR_CONTEXT: &str = "SlideEditor";
 /// The key context the editor's keys apply in while a thing on the slide is selected and no
@@ -110,6 +117,8 @@ pub const EDITOR_CONTEXT: &str = "SlideEditor";
 pub const SELECTION_CONTEXT: &str = "SlideSelection";
 /// The key context added to [`SELECTION_CONTEXT`] while the one thing selected is a video.
 pub const VIDEO_CONTEXT: &str = "SlideVideo";
+/// The key context added to [`SELECTION_CONTEXT`] while the one thing selected is a 3D model.
+pub const MODEL_CONTEXT: &str = "SlideModel";
 
 /// How long the caret shows, and then doesn't, as it blinks.
 const BLINK: Duration = Duration::from_millis(500);
@@ -213,6 +222,10 @@ pub struct SlideEditor {
     painted: MarkColors,
     /// The video selected that was played, while it's let play.
     playing: Option<selecting::PlayingHere>,
+    /// The 3D model selected that's being turned, and its layer, while it's let turn.
+    turning: Option<(selecting::PlayingHere, usize)>,
+    /// Where the pointer was as a drag turning the model last moved it.
+    turn_drag: Option<Point<Pixels>>,
 
     /// Where the caret and any composition were last drawn, so that the system's input method
     /// is told when they move, and only then.
@@ -266,6 +279,7 @@ impl SlideEditor {
                 if !window.is_window_active() {
                     this.end_drag(cx);
                     this.stop_video(cx);
+                    this.stop_turning(cx);
                 }
             }),
         ];
@@ -280,6 +294,12 @@ impl SlideEditor {
         subscriptions.push(cx.subscribe(&canvas, |_, _, failed: &VideoFailed, cx| {
             cx.emit(EditorEvent::Said(failed.0.to_string().into()));
         }));
+        // So does a model that can't be drawn, and one whose file a save let go of is read again
+        // once that's done.
+        subscriptions.push(cx.subscribe(&canvas, |_, _, failed: &ModelFailed, cx| {
+            cx.emit(EditorEvent::Said(failed.0.to_string().into()));
+        }));
+        subscriptions.push(cx.subscribe(&canvas, |this, _, _: &ModelLetGo, cx| this.keep_playing_only_what_holds(cx)));
         // A video opened to play may have been unpacked: a still that waited for that is made.
         if let Some(document) = document.clone() {
             subscriptions.push(cx.subscribe(&canvas, move |_, _, _: &VideoOpened, cx| {
@@ -337,6 +357,8 @@ impl SlideEditor {
             show_steps: false,
             painted: MarkColors::default(),
             playing: None,
+            turning: None,
+            turn_drag: None,
             ime_place: None,
             _subscriptions: subscriptions,
         }

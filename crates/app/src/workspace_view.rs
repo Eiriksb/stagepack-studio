@@ -214,6 +214,8 @@ pub fn init(cx: &mut App) {
         theme.cursor_blink = theme.cursor_blink.with_idle_timeout(CARET_BLINKS_FOR);
     });
     bind_keys(cx);
+    // The drawer of 3D models lets go of its graphics device before the program ends.
+    crate::model_view::close_on_quit(cx);
 }
 
 /// The window's shortcuts, and a show's. [`init`] binds them.
@@ -881,10 +883,11 @@ impl WorkspaceView {
         }
         self.notices = notices;
         if let Some(layers) = layers {
-            let videos = document.update(cx, |document, _| document.videos_here());
+            let (videos, models) = document.update(cx, |document, _| (document.videos_here(), document.models_here()));
             self.slide_canvas.update(cx, |canvas, cx| {
                 canvas.set_layers(layers, cx);
                 canvas.place_videos(&videos, cx);
+                canvas.place_models(&models, cx);
             });
         }
         cx.notify();
@@ -1111,8 +1114,11 @@ impl WorkspaceView {
         if running {
             return;
         }
-        // The show plays the talk's videos: none plays here meanwhile.
-        self.slide_editor.update(cx, |editor, cx| editor.stop_video(cx));
+        // The show plays the talk's videos and turns its models: none does here meanwhile.
+        self.slide_editor.update(cx, |editor, cx| {
+            editor.stop_video(cx);
+            editor.stop_turning(cx);
+        });
         let this = cx.entity().downgrade();
         // Once this window is free again, as the show asks it which screen it's on.
         cx.defer(move |cx| {

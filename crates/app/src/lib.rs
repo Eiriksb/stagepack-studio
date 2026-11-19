@@ -20,6 +20,7 @@ pub mod large_files;
 pub mod inspector;
 pub mod layout_picker;
 pub mod markdown_panel;
+pub mod model_view;
 pub mod notes_panel;
 pub mod palette;
 pub mod permissions;

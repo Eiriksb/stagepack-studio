@@ -103,9 +103,27 @@ fn video_component() -> NativeComponent {
     NativeComponent { name: crate::elements::VIDEO_TAG, schema, render }
 }
 
+/// A 3D model on a slide, laid out by the engine itself as its still, as a video is.
+fn model_component() -> NativeComponent {
+    fn schema() -> ComponentSchema {
+        let models = ["glb", "ply"].map(String::from).to_vec();
+        let fields = vec![
+            PropField::new("src", PropKind::File(models), false),
+            PropField::new("turn", PropKind::Choice(vec!["auto".to_string()]), true),
+            PropField::new("view", PropKind::Text, true),
+            PropField::new("views", PropKind::Text, true),
+        ];
+        ComponentSchema::new(crate::elements::MODEL_TAG, fields, false)
+    }
+    fn render(_: &Props, _: &Ctx) -> Element {
+        Element::Empty
+    }
+    NativeComponent { name: crate::elements::MODEL_TAG, schema, render }
+}
+
 pub fn builtin_registry() -> Registry {
     let mut registry = Registry::default();
-    let components = [boxed::Box_component(), Shape_component(), Icon_component(), Picture_component(), crate::chart::Chart_component(), video_component()];
+    let components = [boxed::Box_component(), Shape_component(), Icon_component(), Picture_component(), crate::chart::Chart_component(), video_component(), model_component()];
     for component in components {
         registry.add(component);
     }

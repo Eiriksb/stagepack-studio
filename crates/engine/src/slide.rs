@@ -4,7 +4,7 @@ use slides_format::{Block, DEFAULT_LAYOUT, FlowPlace, Slide, Tag, Talk, Target};
 use tiny_skia::PathBuilder;
 use toolkit::{Color, Registry, Theme};
 
-use crate::elements::{VIDEO_TAG, lay_out_positioned_tag};
+use crate::elements::{MODEL_TAG, MOST_VIEWS, VIDEO_TAG, lay_out_positioned_tag, model_view, model_views};
 use crate::flow::{MAX_NOTICE_CHARS, flow_region, flow_region_each};
 use slides_components::shortened;
 use crate::timeline::{MAX_CLICK, RegionClick, read_region_timing, read_tag_timing, read_transition};
@@ -13,7 +13,7 @@ use crate::placeholder::placeholder_items;
 use crate::text_geometry::{LayerText, RegionBox};
 use crate::{
     Align, ComponentAsks, DisplayItem, Enter, Fonts, LayerSpec, LayoutDef, Moment, Notice, PictureCache, Rect, RegionDef, TalkComponents, TalkFiles, TextRun,
-    Transition, VideoOn, layout_by_name, shape_text,
+    Transition, VideoOn, ModelOn, layout_by_name, shape_text,
 };
 
 /// How wide and high a slide is, in slide units.
@@ -238,6 +238,7 @@ pub(crate) fn layout_slide_placed(talk: &Talk, index: usize, env: &mut LayoutEnv
                             is_title: is_title && step == 0,
                             varies,
                             video: None,
+                            model: None,
                         });
                         texts.push(LayerText { region: Some((region.name, rect)), ..piece.text });
                     }
@@ -248,7 +249,7 @@ pub(crate) fn layout_slide_placed(talk: &Talk, index: usize, env: &mut LayoutEnv
         }
         let (drawing, varies) = noting_asks(env, |env| flow_region(blocks, region, rect.w, &theme, env, &mut notices));
         let (items, native) = (drawing.items, drawing.native);
-        layers.push(LayerSpec { source: Some(source), rect, rotate, items, click, enter: timing.enter, native, is_title, varies, video: None });
+        layers.push(LayerSpec { source: Some(source), rect, rotate, items, click, enter: timing.enter, native, is_title, varies, video: None, model: None });
         texts.push(LayerText { region: Some((region.name, rect)), ..drawing.text });
     }
     for block in &slide.blocks {
@@ -363,6 +364,20 @@ fn positioned_layer(tag: &Tag, placing: Option<&Placing>, theme: &Theme, env: &m
         rect,
         rotate,
     });
+    let model = (tag.name == MODEL_TAG).then(|| {
+        let (views, left_out) = model_views(tag.attr("views"));
+        if left_out {
+            add_notice(notices, format!("Some of this 3D model's views can't be read, or there are more than {MOST_VIEWS}, so they're left out"));
+        }
+        ModelOn {
+            src: tag.attr("src").unwrap_or_default().trim().to_string(),
+            turn: read_turn(tag.attr("turn"), notices),
+            view: model_view(tag.attr("view")).ok().flatten(),
+            views,
+            rect,
+            rotate,
+        }
+    });
     let layer = LayerSpec {
         source: Some(tag.range.clone()),
         rect,
@@ -374,8 +389,31 @@ fn positioned_layer(tag: &Tag, placing: Option<&Placing>, theme: &Theme, env: &m
         is_title: false,
         varies: false,
         video,
+        model,
     };
     (layer, drawing.text)
+}
+
+/// Adds `text` to `notices`, shortened, unless it's there already.
+fn add_notice(notices: &mut Vec<Notice>, text: String) {
+    let notice = Notice(shortened(&text, MAX_NOTICE_CHARS));
+    if !notices.contains(&notice) {
+        notices.push(notice);
+    }
+}
+
+/// Whether a model's `turn` says to turn slowly on its own: `auto`. Left out, it stays still,
+/// and anything else says it stays still and is a notice.
+fn read_turn(value: Option<&str>, notices: &mut Vec<Notice>) -> bool {
+    let Some(value) = value else { return false };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => true,
+        "" | "none" | "no" => false,
+        _ => {
+            add_notice(notices, format!("A 3D model's turn can be auto, or left out to stay still, not {value}, so it stays still"));
+            false
+        }
+    }
 }
 
 /// Whether a video's `loop` says to go round again: written bare, or as `true`, `yes` or `1`.
@@ -557,6 +595,7 @@ pub(crate) fn empty_region_layer(region: &EmptyRegion, theme: &Theme, fonts: &mu
         is_title: false,
         varies: false,
         video: None,
+        model: None,
     }
 }
 
@@ -574,6 +613,7 @@ fn error_layer(slide: &Slide, message: &str, theme: &Theme, fonts: &mut Fonts) -
         is_title: false,
         varies: false,
         video: None,
+        model: None,
     }
 }
 
@@ -666,6 +706,7 @@ fn background(theme: &Theme) -> LayerSpec {
         is_title: false,
         varies: false,
         video: None,
+        model: None,
     }
 }
 

@@ -13,7 +13,7 @@ use toolkit::{Color, Ctx, CtxData, Element, Placed, Props, RenderInput, ShapeKin
 
 use crate::flow::{Content, Drawing, Flow, MAX_NOTICE_CHARS, TEXT_TAG, column, rounded_rect, rounded_rect_with};
 use slides_components::shortened;
-use crate::pictures::{Still, icon_pixmap};
+use crate::pictures::{ModelStill, Still, icon_pixmap, model_still_size};
 use crate::slide::{ALIGN_UNPLACED, MAX_SIZE, SLIDE_HEIGHT, SLIDE_WIDTH, is_positioned, placeholder_color};
 use crate::native::Semantic;
 use crate::talk_components::{Rendered, read_asset};
@@ -31,6 +31,19 @@ pub const VIDEO_NO_FILE: &str = "This video has no file. Insert a video to choos
 const POSTER_UNREAD: &str = "The picture named to show for this video can't be shown, so its first picture shows instead.";
 /// The side of the play mark on the panel of a video with no still.
 const PLAY_MARK: f32 = 96.0;
+
+/// The tag of a 3D model on a slide.
+pub(crate) const MODEL_TAG: &str = "Model";
+/// The size a model is drawn at when no size is written.
+pub(crate) const MODEL_ROOM: (f32, f32) = (960.0, 540.0);
+/// What's said of a model written in the text, not placed on the slide.
+pub const MODEL_IN_TEXT: &str = "This 3D model shows only when it's placed on the slide. Drag it out of the text to place it.";
+/// What's said of a model that names no file to draw.
+pub const MODEL_NO_FILE: &str = "This 3D model has no file. Insert a 3D model to choose one.";
+/// What's said of a model whose starting view can't be read.
+pub const MODEL_VIEW_UNREAD: &str = "This 3D model's starting view can't be read, so the whole model is shown from the front.";
+/// What a model's panel says while its still is drawn.
+const MODEL_COMING: &str = "3D model";
 
 const DEFAULT_WIDTH: f32 = 400.0;
 const DEFAULT_HEIGHT: f32 = 200.0;
@@ -156,6 +169,9 @@ pub(crate) fn lay_out_positioned_tag(
     let (natural, content) = if tag.name == VIDEO_TAG {
         let (natural, node) = flow.video(tag, true);
         (Some(natural), Some(node))
+    } else if tag.name == MODEL_TAG {
+        let (w, h) = box_size(wanted, Some(MODEL_ROOM));
+        (Some(MODEL_ROOM), Some(flow.model(tag, Some((w, h)))))
     } else {
         let element = flow.render_tag(tag, room);
         let natural = element.as_ref().and_then(|element| flow.natural_size(element));
@@ -244,6 +260,10 @@ impl Flow<'_, '_> {
         if tag.name == VIDEO_TAG {
             self.notice(VIDEO_IN_TEXT.to_string());
             return Some(self.video(tag, false).1);
+        }
+        if tag.name == MODEL_TAG {
+            self.notice(MODEL_IN_TEXT.to_string());
+            return Some(self.model(tag, None));
         }
         match self.render_tag(tag, (self.width, 0.0)) {
             Some(element) => self.tag_element(tag, &element, align, false),
@@ -423,6 +443,39 @@ impl Flow<'_, '_> {
             None => self.video_panel(size_of(natural.0, natural.1, false)),
         };
         (natural, node)
+    }
+
+    /// A 3D model's still: it drawn at its view, `size` units large, or a still of it drawn at
+    /// another size while that's made, or else a panel saying why it can't be drawn, or that it's
+    /// a model while it's drawn. Only a model placed on the slide, with a `size`, is drawn.
+    fn model(&mut self, tag: &Tag, size: Option<(f32, f32)>) -> NodeId {
+        let src = tag.attr("src").unwrap_or_default().trim();
+        let view = model_view(tag.attr("view"));
+        if view.is_err() {
+            self.notice(MODEL_VIEW_UNREAD.to_string());
+        }
+        let boxed = size.is_some();
+        let node_size = if boxed { size_of(0.0, 0.0, true) } else { size_of(MODEL_ROOM.0, MODEL_ROOM.1, false) };
+        let still = match size {
+            _ if src.is_empty() => {
+                self.notice(MODEL_NO_FILE.to_string());
+                None
+            }
+            None => None,
+            Some((w, h)) => Some(self.env.pictures.model_still(src, view.ok().flatten(), model_still_size(w, h), self.env.files)),
+        };
+        let label = match still {
+            Some(ModelStill::Drawn(still) | ModelStill::Coming(Some(still))) => {
+                return self.leaf(Style { size: node_size, ..Style::default() }, Content::Picture(still));
+            }
+            Some(ModelStill::Cannot(why)) => {
+                self.notice(why.to_string());
+                why.to_string()
+            }
+            _ if src.is_empty() => MODEL_NO_FILE.to_string(),
+            _ => MODEL_COMING.to_string(),
+        };
+        self.placeholder(label, node_size)
     }
 
     /// A plain panel in the theme's colours, with a play mark in the middle.
@@ -663,4 +716,29 @@ fn line_items(look: &ShapeLook, x: f32, y: f32, w: f32, h: f32, theme: &Theme) -
     }
     items.extend(line_path(start, shaft_end).map(|path| DisplayItem::Stroke { path, color, width }));
     items
+}
+
+/// The most views a model flies through, one a click.
+pub(crate) const MOST_VIEWS: usize = 256;
+
+/// The view a model's `view` says: `Ok(None)` if it says none, and `Err` if it can't be read.
+pub(crate) fn model_view(written: Option<&str>) -> Result<Option<slides_model::View>, ()> {
+    match written.map(str::trim).filter(|written| !written.is_empty()) {
+        None => Ok(None),
+        Some(written) => slides_model::View::parse(written).map(Some).ok_or(()),
+    }
+}
+
+/// The views a model's `views` says, each six numbers, set apart by semicolons or commas, and
+/// whether any couldn't be read or there were more than [`MOST_VIEWS`]: those are left out.
+pub(crate) fn model_views(written: Option<&str>) -> (Vec<slides_model::View>, bool) {
+    let mut views = Vec::new();
+    let mut left_out = false;
+    for written in written.unwrap_or_default().split([';', ',']).map(str::trim).filter(|written| !written.is_empty()) {
+        match slides_model::View::parse(written) {
+            Some(view) if views.len() < MOST_VIEWS => views.push(view),
+            _ => left_out = true,
+        }
+    }
+    (views, left_out)
 }

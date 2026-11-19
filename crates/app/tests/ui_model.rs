@@ -1,0 +1,899 @@
+//! A 3D model on a slide: its still, turning it by hand in the editor, and in the show turning on
+//! its own, by a drag and the wheel, and flying through its views on clicks; every way it stops,
+//! with its pictures and its place on the graphics card let go of; and the window never waiting
+//! for the drawer.
+//!
+//! Each test makes its own models, and draws them on the software adapter where there is one. A
+//! test skips, saying so, where this computer has no adapter at all. They run one at a time, as
+//! they share the app's one drawer and count the process's threads.
+
+#[path = "support/typing.rs"]
+mod typing;
+
+use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+use typing::*;
+
+use gpui_kit::test::TestWindowExt as _;
+use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, InputEvent as _, Modifiers, RenderImage, ScrollDelta, ScrollEvent, TestAppContext, VisualTestContext, point, px};
+use slides_engine::Fonts;
+use slides_model::{AdapterKind, Drawer, DrawerOptions, View};
+use stagepack_studio::document::Document;
+use stagepack_studio::model_view::{self, ORBIT_DEGREES_PER_SECOND, draws_asked, scenes_held};
+use stagepack_studio::present_view::{AudienceView, Presentation, PresenterView, start_show};
+use stagepack_studio::saving::SaveTarget;
+use stagepack_studio::slide_canvas::SlideCanvas;
+use stagepack_studio::slide_editor::{MODEL_DONE_ID, MODEL_SET_VIEW_ID, MODEL_TURN_ID};
+use stagepack_studio::workspace_view;
+
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+/// A test running alone, with the app's drawer on the software adapter, or on any there is. The
+/// drawer is closed as it ends, as a program that ends while a driver lets go of a device can
+/// crash in the driver.
+struct Alone(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+impl Drop for Alone {
+    fn drop(&mut self) {
+        let closed = model_view::close_drawer(Duration::from_secs(30));
+        if !std::thread::panicking() {
+            assert!(closed, "the drawer's thread never ended");
+        }
+    }
+}
+
+/// Waits for `drawer` to say whether it can draw.
+fn ready(drawer: &Drawer) -> bool {
+    let began = Instant::now();
+    loop {
+        if let Some(ready) = drawer.ready() {
+            return ready.is_ok();
+        }
+        assert!(began.elapsed() < Duration::from_secs(60), "the drawer never said whether it can draw");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Runs alone, drawing on the software adapter where there is one, else on any, else `None` after
+/// saying why `test` is skipped.
+fn alone(test: &str) -> Option<Alone> {
+    let alone = Alone(ONE_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    for options in [DrawerOptions { only: Some(AdapterKind::Software), ..DrawerOptions::default() }, DrawerOptions::default()] {
+        let drawer = Drawer::start_with(options);
+        let can = ready(&drawer);
+        if let Some(old) = model_view::use_drawer(drawer) {
+            assert!(old.join().unwrap(), "the drawer before let go of its device");
+        }
+        if can {
+            return Some(alone);
+        }
+    }
+    eprintln!("{test} skipped: no graphics adapter, not even a software one, can be had here.");
+    None
+}
+
+/// A box a unit a side standing on the ground: its faces along x red, along y green and along
+/// z, its front, blue.
+fn box_model() -> Vec<u8> {
+    slides_model::make_test_glb(slides_model::MadeGlb::Boxes)
+}
+
+/// Seen from the front, the box filling most of its middle.
+const FRONT: &str = "0 0 4 0 0.5 0";
+
+fn model_tag(more: &str) -> String {
+    format!("<Model src=\"assets/box.glb\" x=\"100\" y=\"100\" w=\"640\" h=\"360\" view=\"{FRONT}\"{more} />")
+}
+
+const BOX: &str = "<Box x=\"1000\" y=\"600\" w=\"300\" h=\"200\" fill=\"#888888\" />";
+
+/// One slide with the model and a box on it, then another.
+fn talk_with(more: &str) -> String {
+    format!("# Model\n\n{}\n\n{BOX}\n\n---\n\n# Two\n", model_tag(more))
+}
+
+fn talk() -> String {
+    talk_with("")
+}
+
+/// A folder holding a talk of `source`, and `model` as its `assets/box.glb`.
+fn talk_folder(source: &str, model: &[u8]) -> tempfile::TempDir {
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::write(folder.path().join("slides.md"), source).unwrap();
+    std::fs::create_dir(folder.path().join("assets")).unwrap();
+    std::fs::write(folder.path().join("assets/box.glb"), model).unwrap();
+    folder
+}
+
+/// The editor on a talk of `source` with the box, its stills drawn.
+fn editor(cx: &mut TestAppContext, source: &str) -> Typing {
+    let typing = open_folder(cx, talk_folder(source, &box_model()), None);
+    stills_made(&typing, cx);
+    typing
+}
+
+/// Waits, in real time, for `done`, delivering the frames the window asks for and drawing it
+/// meanwhile, as the drawer draws on a thread of its own.
+fn until(cx: &mut TestAppContext, window: AnyWindowHandle, what: &str, mut done: impl FnMut(&mut TestAppContext) -> bool) {
+    let began = Instant::now();
+    loop {
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        if done(cx) {
+            return;
+        }
+        assert!(began.elapsed() < Duration::from_secs(30), "waited too long for {what}");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// Waits for every still to be made, off the window's thread, and taken in.
+fn stills_made(typing: &Typing, cx: &mut TestAppContext) {
+    let document = typing.document(cx);
+    until(cx, typing.handle, "the stills", |cx| document.read_with(cx, |document, _| !document.stills_coming()));
+    typing.settle(cx);
+}
+
+fn editor_canvas(typing: &Typing, cx: &TestAppContext) -> Entity<SlideCanvas> {
+    cx.read(|cx| typing.view.read(cx).slide_canvas().clone())
+}
+
+/// The live picture each model on `canvas` shows now.
+fn pictures(cx: &TestAppContext, canvas: &Entity<SlideCanvas>) -> Vec<Option<std::sync::Arc<RenderImage>>> {
+    cx.read(|cx| canvas.read(cx).model_pictures())
+}
+
+fn made_and_released(cx: &TestAppContext, canvas: &Entity<SlideCanvas>) -> (usize, usize) {
+    cx.read(|cx| canvas.read(cx).model_images())
+}
+
+/// Where the model of `layer` on `canvas` is seen from now.
+fn view_of(cx: &TestAppContext, canvas: &Entity<SlideCanvas>, layer: usize) -> Option<View> {
+    cx.read(|cx| canvas.read(cx).model_view(layer))
+}
+
+/// The place of the model's layer on the slide shown.
+fn model_layer(typing: &Typing, cx: &mut TestAppContext) -> usize {
+    typing.document(cx).update(cx, |document, _| document.models_here())[0].layer
+}
+
+/// Which of red, green and blue is the most of the colour in the middle of `image`.
+fn most_in_the_middle(image: &RenderImage) -> usize {
+    let size = image.size(0);
+    let (width, height) = (size.width.0 as usize, size.height.0 as usize);
+    let bytes = image.as_bytes(0).expect("one picture");
+    let at = (height / 2 * width + width / 2) * 4;
+    let (r, g, b) = (bytes[at + 2], bytes[at + 1], bytes[at]);
+    [r, g, b].iter().enumerate().max_by_key(|(_, value)| **value).map(|(at, _)| at).unwrap()
+}
+
+/// How many threads the process has.
+fn thread_count() -> usize {
+    std::fs::read_dir("/proc/self/task").map(|tasks| tasks.count()).unwrap_or(0)
+}
+
+/// Selects the model, by a click a little way in from its corner, away from its buttons.
+fn select_model(typing: &Typing, cx: &mut TestAppContext) {
+    let model = thing(typing, cx, "<Model");
+    let at = typing.at(cx, model.rect.x + model.rect.w / 5., model.rect.y + model.rect.h / 5.);
+    typing.click(cx, at);
+    assert_eq!(selected(typing, cx).map(|(_, source)| source), Some(model.source));
+}
+
+/// Selects the model and turns it, and waits for its first live picture.
+fn turn_selected(typing: &Typing, cx: &mut TestAppContext) -> Entity<SlideCanvas> {
+    select_model(typing, cx);
+    click_on(typing, cx, MODEL_TURN_ID);
+    let canvas = editor_canvas(typing, cx);
+    until(cx, typing.handle, "the first live picture", |cx| pictures(cx, &canvas).first().is_some_and(Option::is_some));
+    canvas
+}
+
+/// Waits until no picture of a model is still to come from the drawer.
+fn drawn(cx: &mut TestAppContext, window: AnyWindowHandle, canvas: &Entity<SlideCanvas>) {
+    until(cx, window, "the picture asked for", |cx| !cx.read(|cx| canvas.read(cx).models_waiting()));
+}
+
+/// Moves the test clock on by `millis`, and delivers the frame the window asked for.
+fn next_frame(cx: &mut TestAppContext, window: AnyWindowHandle, millis: u64) {
+    cx.executor().advance_clock(Duration::from_millis(millis));
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        window.simulate_next_frame(cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+}
+
+/// A turn of the wheel by `lines` at `at` in `window`.
+fn wheel(cx: &mut TestAppContext, window: AnyWindowHandle, at: gpui_kit::Point<gpui_kit::Pixels>, lines: f32) {
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let event = ScrollEvent { position: at, delta: ScrollDelta::Lines(point(0., lines)), ..ScrollEvent::default() };
+        window.dispatch_event(event.to_platform_input(), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+/// Whether two angles are within a tenth of a degree, the way round.
+fn same_angle(a: f32, b: f32) -> bool {
+    let off = (a - b).rem_euclid(360.0);
+    off < 0.1 || off > 359.9
+}
+
+// In the editor.
+
+#[gpui_kit::test]
+fn turn_shows_live_pictures_and_done_goes_back_to_the_still(cx: &mut TestAppContext) {
+    let Some(_alone) = alone("turn_shows_live_pictures_and_done_goes_back_to_the_still") else { return };
+    let typing = editor(cx, &talk());
+    let canvas = editor_canvas(&typing, cx);
+    let still = cx.read(|cx| canvas.read(cx).images());
+    select_model(&typing, cx);
+    assert!(bounds_of(&typing, cx, MODEL_TURN_ID).is_some(), "Turn shows on the model selected");
+    assert!(bounds_of(&typing, cx, MODEL_DONE_ID).is_none());
+    let canvas = turn_selected(&typing, cx);
+    let shown = pictures(cx, &canvas)[0].clone().unwrap();
+    let size = shown.size(0);
+    let scale = cx.read(|cx| canvas.read(cx).scale()).unwrap();
+    assert!((size.width.0 as f32 - 640. * scale).abs() <= 1., "drawn as large as its box shows: {size:?}");
+    assert_eq!(most_in_the_middle(&shown), 2, "its blue front");
+    // While it turns, Set view and Done, not Turn.
+    assert!(bounds_of(&typing, cx, MODEL_SET_VIEW_ID).is_some());
+    assert!(bounds_of(&typing, cx, MODEL_DONE_ID).is_some());
+    assert!(bounds_of(&typing, cx, MODEL_TURN_ID).is_none());
+    click_on(&typing, cx, MODEL_DONE_ID);
+    typing.settle(cx);
+    assert!(pictures(cx, &canvas).is_empty(), "no picture over the still");
+    assert!(bounds_of(&typing, cx, MODEL_TURN_ID).is_some(), "Turn again");
+    let after = cx.read(|cx| canvas.read(cx).images());
+    assert!(still.iter().zip(&after).all(|(a, b)| a.id == b.id), "the still is the layer it was");
+    let (made, released) = made_and_released(cx, &canvas);
+    assert_eq!(made, released, "every live picture is released");
+    assert!(selected(&typing, cx).is_some(), "still selected");
+    // Space turns it too, and takes no typing.
+    typing.press(cx, "space");
+    assert_eq!(cx.read(|cx| canvas.read(cx).models_turned()).len(), 1);
+    typing.press(cx, "space");
+    assert!(cx.read(|cx| canvas.read(cx).models_turned()).is_empty());
+    assert!(typing.editing(cx).is_none());
+    assert_eq!(typing.source(cx), talk(), "nothing written");
+}
+
+#[gpui_kit::test]
+fn a_drag_turns_it_and_the_wheel_zooms(cx: &mut TestAppContext) {
+    let Some(_alone) = alone("a_drag_turns_it_and_the_wheel_zooms") else { return };
+    let typing = editor(cx, &talk());
+    let canvas = turn_selected(&typing, cx);
+    let layer = model_layer(&typing, cx);
+    let front = View::parse(FRONT).unwrap();
+    assert_eq!(view_of(cx, &canvas, layer), Some(front), "it starts at its view");
+    let before = thing(&typing, cx, "<Model");
+    let (made, _) = made_and_released(cx, &canvas);
+    // A drag to the right turns it round, as far as the pointer goes.
+    let from = middle(&typing, cx, &before) + point(px(-60.), px(40.));
+    typing.mouse_down(cx, from, 1, Modifiers::default());
+    typing.move_held(cx, from + point(px(50.), px(0.)), Modifiers::default());
+    typing.move_held(cx, from + point(px(100.), px(20.)), Modifiers::default());
+    typing.mouse_up(cx, from + point(px(100.), px(20.)), 1, Modifiers::default());
+    let turned = view_of(cx, &canvas, layer).unwrap();
+    assert!(same_angle(turned.yaw, -100. * model_view::DEGREES_PER_PIXEL), "{turned:?}");
+    assert!((turned.pitch - 20. * model_view::DEGREES_PER_PIXEL).abs() < 0.01, "{turned:?}");
+    assert_eq!(turned.distance, front.distance);
+    drawn(cx, typing.handle, &canvas);
+    assert!(made_and_released(cx, &canvas).0 > made, "drawn anew as it turned");
+    // The model wasn't moved, nor anything written.
+    assert_eq!(thing(&typing, cx, "<Model").rect, before.rect);
+    assert_eq!(typing.source(cx), talk());
+    // The wheel brings it nearer, and back.
+    let over = middle(&typing, cx, &before) + point(px(-60.), px(40.));
+    wheel(cx, typing.handle, over, 1.);
+    let nearer = view_of(cx, &canvas, layer).unwrap();
+    assert!((nearer.distance - front.distance * model_view::ZOOM_PER_STEP).abs() < 0.001, "{nearer:?}");
+    wheel(cx, typing.handle, over, -1.);
+    assert!((view_of(cx, &canvas, layer).unwrap().distance - front.distance).abs() < 0.001);
+    assert_eq!(typing.source(cx), talk());
+}
+
+#[gpui_kit::test]
+fn set_view_writes_six_numbers_as_one_step(cx: &mut TestAppContext) {
+    let Some(_alone) = alone("set_view_writes_six_numbers_as_one_step") else { return };
+    let typing = editor(cx, &talk());
+    let canvas = turn_selected(&typing, cx);
+    let model = thing(&typing, cx, "<Model");
+    let from = middle(&typing, cx, &model) + point(px(-60.), px(40.));
+    typing.drag(cx, from, from + point(px(100.), px(0.)));
+    drawn(cx, typing.handle, &canvas);
+    let before = typing.source(cx);
+    click_on(&typing, cx, MODEL_SET_VIEW_ID);
+    let written = typing.source(cx);
+    let view = format!("view=\"{}\"", View { yaw: 330., ..View::parse(FRONT).unwrap() });
+    assert_eq!(view, "view=\"330 0 4 0 0.5 0\"");
+    assert_eq!(written, before.replace(&format!("view=\"{FRONT}\""), &view), "only its view is written");
+    // It goes on turning, and one Undo takes the step back.
+    assert!(bounds_of(&typing, cx, MODEL_DONE_ID).is_some(), "it goes on being turned");
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), before);
+    typing.press(cx, "ctrl-shift-z");
+    assert_eq!(typing.source(cx), written);
+    // Its still is drawn at the view written.
+    stills_made(&typing, cx);
+    assert!(typing.document(cx).update(cx, |document, _| document.models_here())[0].on.view.is_some_and(|view| view.yaw == 330.));
+}
+
+/// Turns the model on a talk of `source`, does `leave`, and checks nothing goes on drawing for
+/// it: no live picture is left, every one made is released, it's off the card, nothing more is
+/// asked of the drawer, and no thread is left.
+fn left_by(cx: &mut TestAppContext, how: &str, source: &str, leave: impl FnOnce(Typing, &mut TestAppContext) -> Option<Typing>) {
+    let typing = editor(cx, source);
+    let before = thread_count();
+    {
+        let canvas = turn_selected(&typing, cx);
+        drawn(cx, typing.handle, &canvas);
+    }
+    assert_eq!(scenes_held(), 1, "{how}: it's on the card while it's turned");
+    let kept = leave(typing, cx);
+    if let Some(typing) = &kept {
+        typing.settle(cx);
+        let canvas = editor_canvas(typing, cx);
+        assert!(pictures(cx, &canvas).is_empty(), "{how}: no live picture is left");
+        let (made, released) = made_and_released(cx, &canvas);
+        assert_eq!(made, released, "{how}: every live picture is released");
+        assert!(bounds_of(typing, cx, MODEL_DONE_ID).is_none(), "{how}");
+    }
+    cx.run_until_parked();
+    assert_eq!(scenes_held(), 0, "{how}: it's let go of on the card");
+    let asked = draws_asked();
+    if let Some(typing) = &kept {
+        for _ in 0..20 {
+            next_frame(cx, typing.handle, 100);
+        }
+    }
+    assert_eq!(draws_asked(), asked, "{how}: nothing more is drawn");
+    assert!(thread_count() <= before, "{how}: no thread is left");
+}
+
+/// Closes every window but `typing`'s.
+fn close_others(typing: &Typing, cx: &mut TestAppContext) {
+    let others: Vec<AnyWindowHandle> =
+        cx.read(|cx| cx.windows()).into_iter().filter(|window| window.window_id() != typing.handle.window_id()).collect();
+    for window in others {
+        cx.update_window(window, |_, window, _| window.remove_window()).ok();
+    }
+    cx.run_until_parked();
+}
+
+#[gpui_kit::test]
+fn every_way_of_leaving_stops_the_drawing(cx: &mut TestAppContext) {
+    let Some(_alone) = alone("every_way_of_leaving_stops_the_drawing") else { return };
+    let talk = talk();
+    left_by(cx, "selecting something else", &talk, |typing, cx| {
+        let shape = thing(&typing, cx, "<Box");
+        let at = middle(&typing, cx, &shape);
+        typing.click(cx, at);
+        Some(typing)
+    });
+    let long_heading = talk.replace("# Model", "# Model, with a heading long enough to reach past it");
+    left_by(cx, "a click in the slide's words, to type there", &long_heading, |typing, cx| {
+        typing.click_text(cx, 0, pos(0, 48));
+        assert!(typing.editing(cx).is_some(), "typing in the heading");
+        Some(typing)
+    });
+    left_by(cx, "another slide", &talk, |typing, cx| {
+        typing.press(cx, "pagedown");
+        assert_eq!(typing.current(cx), 1);
+        Some(typing)
+    });
+    left_by(cx, "deleting the model", &talk, |typing, cx| {
+        typing.press(cx, "delete");
+        assert!(!typing.source(cx).contains("<Model"));
+        Some(typing)
+    });
+    left_by(cx, "a change to the talk from outside", &talk, |typing, cx| {
+        let changed = talk.replace("# Model", "# Changed");
+        typing.view.update(cx, |view, cx| view.reload_for_test(Some(changed), cx));
+        typing.settle(cx);
+        Some(typing)
+    });
+    left_by(cx, "the window losing the keyboard", &talk, |typing, cx| {
+        typing.with_window(cx, |window, _| window.activate_window());
+        cx.run_until_parked();
+        VisualTestContext::from_window(typing.handle, cx).deactivate_window();
+        Some(typing)
+    });
+    left_by(cx, "starting the show", &talk, |typing, cx| {
+        typing.press(cx, "shift-f5");
+        cx.run_until_parked();
+        assert!(cx.read(|cx| cx.windows().len()) > 1, "the show is on");
+        close_others(&typing, cx);
+        Some(typing)
+    });
+    left_by(cx, "closing the window", &talk, |typing, cx| {
+        let Typing { _folder, handle, view, .. } = typing;
+        drop(view);
+        cx.update_window(handle, |_, window, _| window.remove_window()).unwrap();
+        cx.run_until_parked();
+        None
+    });
+    // Undo of the model's insert.
+    let typing = editor(cx, "# Model\n\n---\n\n# Two\n");
+    typing.document(cx).update(cx, |document, cx| {
+        let place = [("src", "assets/box.glb"), ("x", "100"), ("y", "100"), ("w", "640"), ("h", "360")];
+        document.insert_tag("Insert model", "Model", &place, None).unwrap();
+        cx.notify();
+    });
+    stills_made(&typing, cx);
+    let canvas = turn_selected(&typing, cx);
+    drawn(cx, typing.handle, &canvas);
+    typing.press(cx, "ctrl-z");
+    assert!(!typing.source(cx).contains("<Model"), "undone");
+    typing.settle(cx);
+    assert!(pictures(cx, &canvas).is_empty());
+    let (made, released) = made_and_released(cx, &canvas);
+    assert_eq!(made, released);
+    assert_eq!(scenes_held(), 0);
+}
+
+#[gpui_kit::test]
+fn a_talk_of_ten_models_sits_idle(cx: &mut TestAppContext) {
+    let Some(_alone) = alone("a_talk_of_ten_models_sits_idle") else { return };
+    let source: Vec<String> = (0..10).map(|at| format!("# Slide {at}\n\n{}\n", model_tag(""))).collect();
+    let typing = editor(cx, &source.join("\n---\n\n"));
+    let canvas = editor_canvas(&typing, cx);
+    let idle = |typing: &Typing, cx: &mut TestAppContext, when: &str| {
+        typing.settle(cx);
+        cx.update_window(typing.handle, |_, window, cx| window.simulate_next_frame(cx)).unwrap();
+        let (threads, asked) = (thread_count(), draws_asked());
+        let (redrawn, _watching) = redraws(cx, &canvas);
+        let mut frames_asked = 0;
+        for _ in 0..80 {
+            cx.executor().advance_clock(Duration::from_millis(250));
+            cx.run_until_parked();
+            frames_asked += cx.update_window(typing.handle, |_, window, cx| window.simulate_next_frame(cx)).unwrap();
+        }
+        assert_eq!(redrawn.get(), 0, "{when}: nothing redraws");
+        assert_eq!(frames_asked, 0, "{when}: no frame is asked for");
+        assert_eq!(draws_asked(), asked, "{when}: nothing is drawn");
+        assert!(thread_count() <= threads, "{when}: no thread more");
+        assert_eq!(scenes_held(), 0, "{when}: nothing is on the card");
+    };
+    idle(&typing, cx, "none turned");
+    let canvas_turned = turn_selected(&typing, cx);
+    drawn(cx, typing.handle, &canvas_turned);
+    // Turned but not moving, it asks for nothing more.
+    let asked = draws_asked();
+    for _ in 0..10 {
+        next_frame(cx, typing.handle, 100);
+    }
+    assert_eq!(draws_asked(), asked, "a model turned but still draws nothing more");
+    click_on(&typing, cx, MODEL_DONE_ID);
+    idle(&typing, cx, "one turned and done");
+}
+
+#[gpui_kit::test]
+fn the_window_never_waits_for_the_drawer(cx: &mut TestAppContext) {
+    let Some(_alone) = alone("the_window_never_waits_for_the_drawer") else { return };
+    let typing = editor(cx, &talk());
+    // From now on the device takes two seconds to make.
+    let slow = Drawer::start_with(DrawerOptions { device_delay: Duration::from_secs(2), ..DrawerOptions::default() });
+    if let Some(old) = model_view::use_drawer(slow) {
+        assert!(old.join().unwrap());
+    }
+    select_model(&typing, cx);
+    let began = Instant::now();
+    click_on(&typing, cx, MODEL_TURN_ID);
+    let canvas = editor_canvas(&typing, cx);
+    let mut frames = 0;
+    let mut slowest = Duration::ZERO;
+    while pictures(cx, &canvas).first().is_none_or(Option::is_none) {
+        let frame = Instant::now();
+        cx.run_until_parked();
+        cx.update_window(typing.handle, |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        slowest = slowest.max(frame.elapsed());
+        frames += 1;
+        assert!(began.elapsed() < Duration::from_secs(60), "the picture never came");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(began.elapsed() >= Duration::from_millis(1500), "the picture came after the device: {:?}", began.elapsed());
+    // Many times, even on a loaded machine, where each frame takes longer.
+    assert!(frames >= 20, "the window drew {frames} times meanwhile");
+    assert!(slowest < Duration::from_millis(500), "a frame took {slowest:?}");
+    click_on(&typing, cx, MODEL_DONE_ID);
+    assert!(pictures(cx, &canvas).is_empty());
+}
+
+// The reader gate.
+
+fn packed(source: &str, work: &std::path::Path) -> (Document, std::path::PathBuf) {
+    let folder = talk_folder(source, &box_model());
+    let pack = work.join("talk.sptx");
+    let saved = Document::open(folder.path(), Fonts::bundled_only()).unwrap().save_as_job(SaveTarget::Packed(pack.clone())).run();
+    assert!(saved.is_ok());
+    (Document::open_packed(&pack, Fonts::bundled_only()).unwrap(), pack)
+}
+
+#[gpui_kit::test]
+fn a_save_in_place_lets_go_of_a_model_being_read(cx: &mut TestAppContext) {
+    let Some(_alone) = alone("a_save_in_place_lets_go_of_a_model_being_read") else { return };
+    use stagepack_studio::video_player::{Making, make_still_from};
+    let work = tempfile::tempdir().unwrap();
+    let (mut document, _) = packed(&talk(), work.path());
+    // Read to be turned as a save lets go of it: it's read again after the save.
+    let reader = document.open_large("assets/box.glb").unwrap().open_unless_saving().unwrap();
+    assert_eq!(document.begin_saving_the_pack(), 1);
+    assert!(model_view::read_model_from(reader).was_let_go(), "read again after the save, not said to be unreadable");
+    document.pack_save_ended();
+    // Its still being drawn as a save lets go of it.
+    document.notices();
+    let (job, open) = document.still_jobs().pop().expect("its still is wanted");
+    assert!(job.is_model());
+    let reader = open.unwrap().open_for_still().unwrap();
+    document.begin_saving_the_pack();
+    assert!(matches!(make_still_from(job, reader), Making::Waits(_)), "drawn again after the save");
+    document.pack_save_ended();
+    assert_eq!(scenes_held(), 0);
+
+    // Turned in a packed talk, the pack is let go of once it's read, and a save in place runs.
+    let (document, _) = packed(&talk(), work.path());
+    let typing = open_untitled_talk(cx, document, work.path());
+    stills_made(&typing, cx);
+    let canvas = turn_selected(&typing, cx);
+    let held = |typing: &Typing, cx: &TestAppContext| typing.document(cx).read_with(cx, |document, _| document.readers_held());
+    assert_eq!(held(&typing, cx), 0, "its file isn't held once it's read");
+    typing.press(cx, "ctrl-s");
+    wait(cx, 500);
+    typing.settle(cx);
+    assert_eq!(typing.status(cx).as_deref(), Some("Saved talk.sptx."));
+    // It goes on being turned.
+    let layer = model_layer(&typing, cx);
+    let model = thing(&typing, cx, "<Model");
+    let from = middle(&typing, cx, &model) + point(px(-60.), px(40.));
+    let (made, _) = made_and_released(cx, &canvas);
+    typing.drag(cx, from, from + point(px(30.), px(0.)));
+    drawn(cx, typing.handle, &canvas);
+    assert!(made_and_released(cx, &canvas).0 > made);
+    assert!(view_of(cx, &canvas, layer).is_some());
+}
+
+// In the show.
+
+/// A show of a talk of `source` with the box, rehearsed, in both its windows.
+struct Show {
+    _folder: tempfile::TempDir,
+    document: Entity<Document>,
+    show: Entity<Presentation>,
+    audience: AnyWindowHandle,
+    presenter: AnyWindowHandle,
+}
+
+impl Show {
+    fn settle(&self, cx: &mut TestAppContext) {
+        for window in [self.audience, self.presenter] {
+            for _ in 0..2 {
+                cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+                cx.run_until_parked();
+            }
+        }
+    }
+
+    fn canvas(&self, cx: &TestAppContext) -> Entity<SlideCanvas> {
+        let view: Entity<AudienceView> = cx.read(|cx| self.show.read(cx).audience()).expect("the audience's window").1;
+        cx.read(|cx| view.read(cx).current().clone())
+    }
+
+    fn presenters(&self, cx: &TestAppContext) -> Entity<SlideCanvas> {
+        let view: Entity<PresenterView> = cx.read(|cx| self.show.read(cx).presenter()).expect("the presenter's window").1;
+        cx.read(|cx| view.read(cx).current().clone())
+    }
+
+    fn press(&self, cx: &mut TestAppContext, key: &str) {
+        cx.simulate_keystrokes(self.audience, key);
+        self.settle(cx);
+    }
+
+    fn place(&self, cx: &TestAppContext) -> (usize, u32) {
+        let place = self.show.read_with(cx, |show, _| show.place());
+        (place.slide, place.step)
+    }
+
+    /// The place of the model's layer on the first slide.
+    fn model_layer(&self, cx: &mut TestAppContext) -> usize {
+        self.document.update(cx, |document, _| document.models_at(0, slides_engine::Moment::START))[0].layer
+    }
+
+    /// Where on the audience's window the slide's point (`x`, `y`) is.
+    fn at(&self, cx: &TestAppContext, x: f32, y: f32) -> gpui_kit::Point<gpui_kit::Pixels> {
+        let canvas = self.canvas(cx);
+        let slide = cx.read(|cx| canvas.read(cx).slide_bounds()).expect("the slide is drawn");
+        let unit = f32::from(slide.size.width) / 1920.;
+        slide.origin + point(px(x * unit), px(y * unit))
+    }
+
+    /// The model's live picture once it's come.
+    fn first_picture(&self, cx: &mut TestAppContext) -> Entity<SlideCanvas> {
+        let canvas = self.canvas(cx);
+        until(cx, self.audience, "the model's live picture", |cx| pictures(cx, &canvas).first().is_some_and(Option::is_some));
+        canvas
+    }
+
+    fn mouse(&self, cx: &mut TestAppContext, event: impl gpui_kit::InputEvent) {
+        cx.update_window(self.audience, |_, window, cx| {
+            window.render_frame(cx);
+            window.dispatch_event(event.to_platform_input(), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+
+    /// A drag on the audience's window from `from` by `by`.
+    fn drag(&self, cx: &mut TestAppContext, from: gpui_kit::Point<gpui_kit::Pixels>, by: gpui_kit::Point<gpui_kit::Pixels>) {
+        use gpui_kit::{MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
+        self.mouse(cx, MouseDownEvent { button: MouseButton::Left, position: from, modifiers: Modifiers::default(), click_count: 1, first_mouse: false });
+        for step in 1..=4 {
+            let at = from + point(by.x * (step as f32 / 4.), by.y * (step as f32 / 4.));
+            self.mouse(cx, MouseMoveEvent { position: at, pressed_button: Some(MouseButton::Left), modifiers: Modifiers::default() });
+        }
+        self.mouse(cx, MouseUpEvent { button: MouseButton::Left, position: from + by, modifiers: Modifiers::default(), click_count: 1 });
+        self.settle(cx);
+    }
+}
+
+fn rehearse(cx: &mut TestAppContext, source: &str) -> Show {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        workspace_view::bind_keys(cx);
+    });
+    let folder = talk_folder(source, &box_model());
+    let document = Document::open(folder.path(), Fonts::bundled_only()).unwrap();
+    let document = cx.new(|_| document);
+    let show = cx.update(|cx| start_show(document.clone(), true, cx));
+    let (audience, presenter) = cx.read(|cx| {
+        let show = show.read(cx);
+        (show.audience().expect("its window").0, show.presenter().expect("its window").0)
+    });
+    let show = Show { _folder: folder, document, show, audience, presenter };
+    show.settle(cx);
+    let document = show.document.clone();
+    until(cx, show.audience, "the stills", |cx| document.read_with(cx, |document, _| !document.stills_coming()));
+    show.settle(cx);
+    show
+}
+
+#[gpui_kit::test]
+fn in_the_show_auto_turns_and_a_drag_turns_it(cx: &mut TestAppContext) {
+    let Some(_alone) = alone("in_the_show_auto_turns_and_a_drag_turns_it") else { return };
+    let show = rehearse(cx, &talk_with(" turn=\"auto\""));
+    let canvas = show.first_picture(cx);
+    let layer = show.model_layer(cx);
+    let start = view_of(cx, &canvas, layer).unwrap();
+    // A turn a minute: six degrees a second.
+    for _ in 0..10 {
+        next_frame(cx, show.audience, 100);
+    }
+    let later = view_of(cx, &canvas, layer).unwrap();
+    let turned = (later.yaw - start.yaw).rem_euclid(360.);
+    assert!((turned - ORBIT_DEGREES_PER_SECOND).abs() < 0.5, "turned {turned} degrees in a second");
+    // The presenter sees its still.
+    assert!(pictures(cx, &show.presenters(cx)).is_empty(), "the presenter's window shows the still");
+    // A drag on it turns it, and isn't a click of the show's.
+    let before = view_of(cx, &canvas, layer).unwrap();
+    let on = show.at(cx, 300., 250.);
+    show.drag(cx, on, point(px(80.), px(0.)));
+    let dragged = view_of(cx, &canvas, layer).unwrap();
+    assert!(same_angle(dragged.yaw, before.yaw - 80. * model_view::DEGREES_PER_PIXEL), "{before:?} to {dragged:?}");
+    assert_eq!(show.place(cx), (0, 0), "the show stayed where it was");
+    // The wheel zooms it.
+    wheel(cx, show.audience, on, 2.);
+    assert!(view_of(cx, &canvas, layer).unwrap().distance < dragged.distance);
+    // The show's keys are its own still.
+    show.press(cx, "right");
+    assert_eq!(show.place(cx), (1, 0));
+}
+
+#[gpui_kit::test]
+fn clicks_fly_through_the_views(cx: &mut TestAppContext) {
+    let Some(_alone) = alone("clicks_fly_through_the_views") else { return };
+    let views = " views=\"90 0 4 0 0.5 0; 0 80 4 0 0.5 0\"";
+    let show = rehearse(cx, &talk_with(views));
+    let canvas = show.canvas(cx);
+    assert!(cx.read(|cx| canvas.read(cx).models_turned()).is_empty(), "standing still, it shows its still");
+    let layer = show.model_layer(cx);
+    let first = View::parse("90 0 4 0 0.5 0").unwrap();
+    let second = View::parse("0 80 4 0 0.5 0").unwrap();
+    // A click flies it to its first view, over a second.
+    show.press(cx, "right");
+    assert_eq!(show.place(cx), (0, 1), "a view is a click of its slide");
+    let canvas = show.first_picture(cx);
+    next_frame(cx, show.audience, 500);
+    let halfway = view_of(cx, &canvas, layer).unwrap();
+    assert!(halfway.yaw > 10. && halfway.yaw < 80., "on its way: {halfway:?}");
+    for _ in 0..6 {
+        next_frame(cx, show.audience, 100);
+    }
+    assert_eq!(view_of(cx, &canvas, layer), Some(first));
+    // A click with the mouse, off the model, flies it to the next.
+    let off = show.at(cx, 1500., 900.);
+    show.mouse(cx, gpui_kit::MouseDownEvent { button: gpui_kit::MouseButton::Left, position: off, modifiers: Modifiers::default(), click_count: 1, first_mouse: false });
+    show.mouse(cx, gpui_kit::MouseUpEvent { button: gpui_kit::MouseButton::Left, position: off, modifiers: Modifiers::default(), click_count: 1 });
+    show.settle(cx);
+    assert_eq!(show.place(cx), (0, 2));
+    for _ in 0..12 {
+        next_frame(cx, show.audience, 100);
+    }
+    assert_eq!(view_of(cx, &canvas, layer), Some(second));
+    // Back a click, it flies back.
+    show.press(cx, "left");
+    for _ in 0..12 {
+        next_frame(cx, show.audience, 100);
+    }
+    assert_eq!(view_of(cx, &canvas, layer), Some(first));
+    // Past its last view, the next slide.
+    show.press(cx, "right");
+    show.press(cx, "right");
+    assert_eq!(show.place(cx), (1, 0));
+}
+
+#[gpui_kit::test]
+fn leaving_the_slide_puts_it_back(cx: &mut TestAppContext) {
+    let Some(_alone) = alone("leaving_the_slide_puts_it_back") else { return };
+    let show = rehearse(cx, &talk());
+    let layer = show.model_layer(cx);
+    let on = show.at(cx, 300., 250.);
+    show.drag(cx, on, point(px(100.), px(0.)));
+    let canvas_now = show.first_picture(cx);
+    show.drag(cx, on, point(px(100.), px(0.)));
+    assert_ne!(view_of(cx, &canvas_now, layer), View::parse(FRONT), "turned by hand");
+    let asked = draws_asked();
+    show.press(cx, "right");
+    assert_eq!(show.place(cx), (1, 0));
+    cx.run_until_parked();
+    assert_eq!(scenes_held(), 0, "let go of once its slide is left");
+    for _ in 0..10 {
+        next_frame(cx, show.audience, 100);
+    }
+    assert!(draws_asked() <= asked + 1, "nothing drawn for a slide that isn't shown");
+    show.press(cx, "left");
+    assert_eq!(show.place(cx), (0, 0));
+    let canvas = show.canvas(cx);
+    assert!(cx.read(|cx| canvas.read(cx).models_turned()).is_empty(), "back at its still, at its view");
+    drop(canvas_now);
+    // Turning on its own, it starts again from its view.
+    drop(show);
+    let show = rehearse(cx, &talk_with(" turn=\"auto\""));
+    let canvas = show.first_picture(cx);
+    for _ in 0..20 {
+        next_frame(cx, show.audience, 100);
+    }
+    assert!(view_of(cx, &canvas, layer).unwrap().yaw > 5.);
+    show.press(cx, "right");
+    show.press(cx, "left");
+    let canvas = show.first_picture(cx);
+    let back = view_of(cx, &canvas, layer).unwrap();
+    assert!(back.yaw < 3. || back.yaw > 359., "from its view again: {back:?}");
+}
+
+// Quitting.
+
+#[gpui_kit::test]
+fn the_drawer_lets_go_of_its_device_off_the_windows_thread_as_the_app_quits(cx: &mut TestAppContext) {
+    let Some(_alone) = alone("the_drawer_lets_go_of_its_device_off_the_windows_thread_as_the_app_quits") else { return };
+    let _typing = editor(cx, &talk());
+    let drawers = || {
+        std::fs::read_dir("/proc/self/task")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|task| std::fs::read_to_string(task.path().join("comm")).ok())
+            .filter(|name| name.trim_end() == "model drawer")
+            .count()
+    };
+    // The driver's own threads take the drawer's name.
+    assert!(drawers() >= 1, "the drawer drew the still");
+    // Begun as the app quits, closing returns at once, and the drawer's thread ends.
+    let began = Instant::now();
+    let closed = model_view::begin_closing();
+    assert!(began.elapsed() < Duration::from_millis(50), "closing took {:?} on the window's thread", began.elapsed());
+    assert!(model_view::wait_closed(), "it let go of its device");
+    assert!(futures::executor::block_on(closed).is_ok());
+    assert_eq!(drawers(), 0);
+    // The app closes it as it quits.
+    cx.update(model_view::close_on_quit);
+    let drawer = model_view::drawer();
+    assert!(ready(&drawer));
+    drop(drawer);
+    assert!(drawers() >= 1);
+    cx.quit();
+    assert!(model_view::wait_closed());
+    assert_eq!(drawers(), 0);
+}
+
+// A card that refuses, or keeps losing what's on it.
+
+#[gpui_kit::test]
+fn a_model_the_card_refuses_is_not_asked_for_again(cx: &mut TestAppContext) {
+    let Some(_alone) = alone("a_model_the_card_refuses_is_not_asked_for_again") else { return };
+    let typing = editor(cx, &talk());
+    let canvas = turn_selected(&typing, cx);
+    drawn(cx, typing.handle, &canvas);
+    model_view::drawer().refuse_next_draw();
+    let model = thing(&typing, cx, "<Model");
+    let from = middle(&typing, cx, &model) + point(px(-60.), px(40.));
+    typing.drag(cx, from, from + point(px(40.), px(0.)));
+    drawn(cx, typing.handle, &canvas);
+    typing.settle(cx);
+    assert_eq!(typing.status(cx).as_deref(), Some(slides_model::CantDraw::CardRefused.to_string().as_str()), "it says why");
+    assert!(pictures(cx, &canvas)[0].is_none(), "its still shows");
+    // Turned on, it isn't asked for at that size again.
+    let asked = draws_asked();
+    typing.drag(cx, from, from + point(px(40.), px(0.)));
+    for _ in 0..10 {
+        next_frame(cx, typing.handle, 100);
+    }
+    assert_eq!(draws_asked(), asked, "not drawn and refused on every frame");
+}
+
+#[gpui_kit::test]
+fn a_model_lost_from_the_card_is_read_again_once(cx: &mut TestAppContext) {
+    let Some(_alone) = alone("a_model_lost_from_the_card_is_read_again_once") else { return };
+    let typing = editor(cx, &talk());
+    let canvas = turn_selected(&typing, cx);
+    drawn(cx, typing.handle, &canvas);
+    let model = thing(&typing, cx, "<Model");
+    let from = middle(&typing, cx, &model) + point(px(-60.), px(40.));
+    // Lost once, it's read again and drawn.
+    let (made, _) = made_and_released(cx, &canvas);
+    model_view::drawer().lose_device();
+    typing.drag(cx, from, from + point(px(20.), px(0.)));
+    until(cx, typing.handle, "drawn again", |cx| made_and_released(cx, &canvas).0 > made);
+    assert_eq!(scenes_held(), 1);
+    // Lost again as soon as it's put on the card again, with no picture between, it can't be
+    // drawn here, and isn't read again.
+    let put_on = model_view::models_put_on_card();
+    model_view::drawer().lose_device();
+    model_view::after_upload(Some(Box::new(|drawer: &Drawer| drawer.lose_device())));
+    typing.drag(cx, from, from + point(px(20.), px(0.)));
+    until(cx, typing.handle, "it can't be drawn", |cx| cx.read(|cx| canvas.read(cx).model_failures()) == vec![Some(slides_model::CantDraw::CardRefused)]);
+    model_view::after_upload(None);
+    assert_eq!(model_view::models_put_on_card(), put_on + 1, "read again once");
+    typing.settle(cx);
+    assert!(pictures(cx, &canvas)[0].is_none(), "its still shows");
+    let asked = draws_asked();
+    typing.drag(cx, from, from + point(px(20.), px(0.)));
+    for _ in 0..10 {
+        next_frame(cx, typing.handle, 100);
+    }
+    assert_eq!(draws_asked(), asked, "nothing more is asked of the drawer");
+}
+
+#[gpui_kit::test]
+fn a_model_in_a_turned_box_is_drawn_turned(cx: &mut TestAppContext) {
+    let Some(_alone) = alone("a_model_in_a_turned_box_is_drawn_turned") else { return };
+    let typing = editor(cx, &talk_with(" rotate=\"30\""));
+    let canvas = turn_selected(&typing, cx);
+    let shown = pictures(cx, &canvas)[0].clone().unwrap();
+    let scale = cx.read(|cx| canvas.read(cx).scale()).unwrap();
+    // Drawn turned, as the layer is: as big as the turned box.
+    let (sin, cos) = 30f32.to_radians().sin_cos();
+    let (w, h) = (640. * cos + 360. * sin, 640. * sin + 360. * cos);
+    let size = shown.size(0);
+    assert!((size.width.0 as f32 - w * scale).abs() <= 3., "{size:?} for {w} by {h} at {scale}");
+    assert!((size.height.0 as f32 - h * scale).abs() <= 3., "{size:?} for {w} by {h} at {scale}");
+    assert_eq!(most_in_the_middle(&shown), 2, "its blue front");
+    assert_eq!(shown.as_bytes(0).unwrap()[3], 0, "clear in its corners");
+    click_on(&typing, cx, MODEL_DONE_ID);
+    typing.settle(cx);
+    let (made, released) = made_and_released(cx, &canvas);
+    assert_eq!(made, released);
+}

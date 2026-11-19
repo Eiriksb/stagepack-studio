@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use slides_engine::{AddedFile, MadeStill, MeasureVideo, StillJob, StillWanted, VideoLayer, is_large_kind};
+use slides_engine::{AddedFile, MadeStill, MeasureVideo, ModelLayer, StillJob, StillWanted, VideoLayer, is_large_kind};
 
 use super::*;
 use crate::clipboard::{CopiedLarge, PastedLarge};
@@ -357,6 +357,7 @@ impl LargeCopy {
 
 /// A file of the talk's to read in pieces, found on the window's thread and opened on any other,
 /// as a video that a pack holds compressed is unpacked first.
+#[derive(Clone)]
 pub struct LargeOpen {
     files: Arc<dyn TalkFiles + Send + Sync>,
     path: String,
@@ -449,6 +450,8 @@ impl Document {
             slides_video::video_size(&mut reader).ok()
         });
         self.deck.make_stills_aside(wanted, measure);
+        // A model's still is drawn by the app's drawer, on what makes the stills.
+        self.deck.draw_models_with(Arc::new(crate::model_view::draw_still));
     }
 
     /// Notes what the talk's files are read from now, for what reads them off the window's thread.
@@ -631,6 +634,48 @@ impl Document {
     pub fn video_problem(&mut self, source: &std::ops::Range<usize>) -> Option<String> {
         let current = self.current();
         guarded(|| self.deck.video_problem(current, source)).ok().flatten()
+    }
+
+    /// The 3D models on the current slide, among the layers [`Self::editor_layers`] gives.
+    pub fn models_here(&mut self) -> Vec<ModelLayer> {
+        let current = self.current();
+        guarded(|| self.deck.models(current)).unwrap_or_default()
+    }
+
+    /// The 3D models on slide `index`, of those a show goes through, at `moment`, among the
+    /// layers [`Self::layers_at`] gives then.
+    pub fn models_at(&mut self, index: usize, moment: slides_engine::Moment) -> Vec<ModelLayer> {
+        guarded(|| self.deck.models_at(index, moment)).unwrap_or_default()
+    }
+
+    /// The one thing selected on the slide shown, if it's a 3D model placed on it.
+    pub fn selected_model(&mut self) -> Option<ModelLayer> {
+        let selected = self.selected()?.clone();
+        if selected.slide != self.current() || self.selection().is_none_or(|selection| selection.things.len() != 1) {
+            return None;
+        }
+        self.models_here().into_iter().find(|model| model.source.as_ref() == Some(&selected.source))
+    }
+
+    /// What's said of the one thing selected, if it's a 3D model that can't be drawn: why not,
+    /// that it has no file, or that one in the text shows only once it's placed.
+    pub fn selected_model_said(&mut self) -> Option<String> {
+        if let Some(model) = self.selected_model() {
+            let current = self.current();
+            let source = model.source?;
+            return guarded(|| self.deck.model_problem(current, &source)).ok().flatten();
+        }
+        let selected = self.selected()?.clone();
+        let one = self.selection().is_some_and(|selection| selection.things.len() == 1);
+        let tag = self.selected_tag().filter(|_| one && selected.slide == self.current())?;
+        (tag.name == "Model" && !slides_engine::is_positioned(tag)).then(|| slides_engine::MODEL_IN_TEXT.to_string())
+    }
+
+    /// Writes `view` as the starting view of the 3D model at `source` on the current slide, as
+    /// one step: only its `view` changes.
+    pub fn set_model_view(&mut self, source: std::ops::Range<usize>, view: slides_model::View) -> Result<Vec<usize>, EditRefused> {
+        let thing = crate::selection::Selected { slide: self.current(), source };
+        self.set_attr_of(&thing, "view", Some(&view.to_string()))
     }
 
     /// Where the talk's pack is, if it's kept in one.

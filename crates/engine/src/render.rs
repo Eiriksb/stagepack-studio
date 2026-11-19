@@ -92,6 +92,18 @@ pub fn render_layer(spec: &LayerSpec, scale: f32, fonts: &mut Fonts) -> Layer {
 /// which the window can't turn. `None` if the picture isn't that size.
 /// `from` is the pixmap the last picture was read into, filled again if it's this one's size.
 pub fn frame_layer(width: u32, height: u32, bgra: &[u8], rect: Rect, rotate: f32, scale: f32, from: &mut Option<Pixmap>) -> Option<Layer> {
+    turned_picture_layer(width, height, bgra, true, rect, rotate, scale, from)
+}
+
+/// A 3D model's picture, `width` by `height` in straight BGRA, clear where the model isn't,
+/// drawn as [`frame_layer`] draws a video's: for a model in a turned box.
+pub fn picture_layer(width: u32, height: u32, bgra: &[u8], rect: Rect, rotate: f32, scale: f32, from: &mut Option<Pixmap>) -> Option<Layer> {
+    turned_picture_layer(width, height, bgra, false, rect, rotate, scale, from)
+}
+
+/// A picture drawn turned with its box, `opaque` as a video's is, or with the alpha it has.
+#[allow(clippy::too_many_arguments)]
+fn turned_picture_layer(width: u32, height: u32, bgra: &[u8], opaque: bool, rect: Rect, rotate: f32, scale: f32, from: &mut Option<Pixmap>) -> Option<Layer> {
     if bgra.len() as u64 != u64::from(width) * u64::from(height) * 4 {
         return None;
     }
@@ -99,9 +111,9 @@ pub fn frame_layer(width: u32, height: u32, bgra: &[u8], rect: Rect, rotate: f32
         Some(kept) if (kept.width(), kept.height()) == (width, height) => kept,
         _ => Pixmap::new(width, height)?,
     };
-    // Opaque, so it needs no premultiplying.
     for (pixel, bgra) in picture.pixels_mut().iter_mut().zip(bgra.as_chunks::<4>().0) {
-        *pixel = ColorU8::from_rgba(bgra[2], bgra[1], bgra[0], 255).premultiply();
+        let alpha = if opaque { 255 } else { bgra[3] };
+        *pixel = ColorU8::from_rgba(bgra[2], bgra[1], bgra[0], alpha).premultiply();
     }
     let picture = Arc::new(picture);
     let item = DisplayItem::Picture { pixmap: picture.clone(), src: None, rect: Rect { x: 0.0, y: 0.0, w: rect.w, h: rect.h } };
@@ -116,6 +128,7 @@ pub fn frame_layer(width: u32, height: u32, bgra: &[u8], rect: Rect, rotate: f32
         is_title: false,
         varies: false,
         video: None,
+        model: None,
     };
     let layer = draw_layer(&spec, scale, |_, _, _| {});
     drop(spec);

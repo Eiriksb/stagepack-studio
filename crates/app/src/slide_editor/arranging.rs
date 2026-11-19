@@ -501,14 +501,16 @@ impl SlideEditor {
         let (Some(document), Some(scale)) = (self.document.clone(), self.canvas.read(cx).scale()) else {
             return;
         };
-        let (layers, message, videos) =
-            document.update(cx, |document, _| (document.editor_layers(scale), document.take_message(), document.videos_here()));
+        let (layers, message, videos, models) = document.update(cx, |document, _| {
+            (document.editor_layers(scale), document.take_message(), document.videos_here(), document.models_here())
+        });
         if let Some(message) = message {
             cx.emit(EditorEvent::Said(message.into()));
         }
         self.canvas.update(cx, |canvas, cx| {
             canvas.set_layers(layers, cx);
             canvas.place_videos(&videos, cx);
+            canvas.place_models(&models, cx);
         });
     }
 
