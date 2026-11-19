@@ -13,10 +13,13 @@ use resvg::usvg;
 use tiny_skia::{ColorU8, Pixmap, Transform};
 use toolkit::Color;
 
-use crate::TalkFiles;
+use crate::{ReadSeek, TalkFiles};
 
 /// The longest edge a picture is kept at.
 const MAX_EDGE: u32 = 4096;
+
+/// The longest edge a video's still is kept at: as large as a slide is shown, and no larger.
+const MAX_STILL_EDGE: u32 = 1920;
 
 /// What the pictures of a talk can add up to in memory, in pixel bytes, unless it's told otherwise.
 const DEFAULT_MEMORY_BUDGET: usize = 512 * 1024 * 1024;
@@ -88,12 +91,158 @@ pub struct PictureCache {
     /// The pixel bytes of the pictures held.
     bytes: usize,
     asked_for: u64,
+    /// The stills of the talk's videos, by the video's path in the talk.
+    stills: HashMap<String, CachedStill>,
+    /// The videos whose stills were asked for since [`Self::take_stills_asked`].
+    stills_asked: Vec<String>,
+    /// Where stills are decoded off the caller's thread, if they are.
+    aside: Option<Aside>,
 }
 
 impl Default for PictureCache {
     fn default() -> PictureCache {
-        PictureCache { pictures: HashMap::new(), memory_budget: DEFAULT_MEMORY_BUDGET, bytes: 0, asked_for: 0 }
+        PictureCache {
+            pictures: HashMap::new(),
+            memory_budget: DEFAULT_MEMORY_BUDGET,
+            bytes: 0,
+            asked_for: 0,
+            stills: HashMap::new(),
+            stills_asked: Vec::new(),
+            aside: None,
+        }
     }
+}
+
+/// What a video shows while it isn't playing.
+#[derive(Clone)]
+pub(crate) enum Still {
+    /// Its first picture, made no larger than a slide, and the video's own width and height.
+    Frame(Arc<Pixmap>, (u32, u32)),
+    /// Why it can't be played.
+    Cannot(slides_video::CantPlay),
+    /// Being made on another thread, with the video's own width and height if they're known.
+    Coming(Option<(u32, u32)>),
+}
+
+impl Still {
+    fn bytes(&self) -> usize {
+        match self {
+            Still::Frame(frame, _) => frame.data().len(),
+            _ => 0,
+        }
+    }
+}
+
+struct CachedStill {
+    still: Still,
+    /// What its file was when it was asked for, if the files can say.
+    version: Option<FileVersion>,
+    /// The value of `PictureCache::asked_for` when it was last asked for.
+    last_used: u64,
+}
+
+/// Told, on the thread laying a slide out, each time a still is wanted that's to be made aside.
+pub type StillWanted = Arc<dyn Fn() + Send + Sync>;
+
+/// Says how wide and high the video at a path in the talk is, from what its file says of itself,
+/// decoding nothing; `None` if that can't be known now.
+pub type MeasureVideo = Arc<dyn Fn(&str) -> Option<(u32, u32)> + Send + Sync>;
+
+/// A video's still the deck wants made, which can be made on any thread: see
+/// [`crate::Deck::still_jobs`].
+pub struct StillJob {
+    path: String,
+    version: Option<FileVersion>,
+}
+
+impl StillJob {
+    /// The path in the talk of the video whose still it is.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Makes the still from what `reader` reads, the video's file, or, with none, says it
+    /// couldn't be read. It decodes, so it's for a thread other than the window's.
+    pub fn make(self, reader: Option<Box<dyn ReadSeek>>) -> MadeStill {
+        MadeStill { path: self.path, version: self.version, still: make_still(reader) }
+    }
+}
+
+/// A still made aside, for [`crate::Deck::take_still`] to take in.
+pub struct MadeStill {
+    path: String,
+    version: Option<FileVersion>,
+    still: Still,
+}
+
+impl MadeStill {
+    /// Whether no still could be made: why is said once it's taken in.
+    pub fn failed(&self) -> bool {
+        matches!(self.still, Still::Cannot(_))
+    }
+
+    /// The still to be made again, as when its file was taken away while it was read.
+    pub fn again(self) -> StillJob {
+        StillJob { path: self.path, version: self.version }
+    }
+}
+
+/// Stills to be made aside, as the window's thread mustn't decode a video.
+struct Aside {
+    wanted: StillWanted,
+    measure: MeasureVideo,
+    jobs: Vec<StillJob>,
+}
+
+/// The version of a large file, found without reading it: its stamp, or else its length.
+fn large_file_version(path: &str, files: &dyn TalkFiles) -> Option<FileVersion> {
+    match files.stamp(path) {
+        Some((length, modified)) => Some(FileVersion::Stamp(length, modified)),
+        None => files.len(path).map(|length| FileVersion::Stamp(length, SystemTime::UNIX_EPOCH)),
+    }
+}
+
+thread_local! {
+    static STILLS_MADE_HERE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many videos' stills have been decoded on this thread, for tests that none is on the
+/// window's.
+#[doc(hidden)]
+pub fn stills_decoded_on_this_thread() -> usize {
+    STILLS_MADE_HERE.with(std::cell::Cell::get)
+}
+
+/// The still of the video `reader` reads, or why there's none: its first picture.
+fn make_still(reader: Option<Box<dyn ReadSeek>>) -> Still {
+    STILLS_MADE_HERE.with(|made| made.set(made.get() + 1));
+    let Some(reader) = reader else {
+        return Still::Cannot(slides_video::CantPlay::CouldNotRead);
+    };
+    let frame = slides_video::open(Box::new(reader)).and_then(|mut video| video.first_frame());
+    match frame {
+        Ok(frame) => match frame_pixmap(&frame) {
+            Some(pixmap) => Still::Frame(Arc::new(pixmap), (frame.width, frame.height)),
+            None => Still::Cannot(slides_video::CantPlay::Damaged),
+        },
+        Err(why) => Still::Cannot(why),
+    }
+}
+
+/// A video's picture as a pixmap, made smaller to [`MAX_STILL_EDGE`] if it's larger.
+fn frame_pixmap(frame: &slides_video::Frame) -> Option<Pixmap> {
+    let image = image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra.clone())?;
+    let mut image = image::DynamicImage::ImageRgba8(image);
+    if frame.width.max(frame.height) > MAX_STILL_EDGE {
+        image = image.thumbnail(MAX_STILL_EDGE, MAX_STILL_EDGE);
+    }
+    let image = image.to_rgba8();
+    let mut pixmap = Pixmap::new(image.width(), image.height())?;
+    // The picture is blue, green, red and opaque, so it needs no premultiplying.
+    for (pixel, bgra) in pixmap.pixels_mut().iter_mut().zip(image.pixels()) {
+        *pixel = ColorU8::from_rgba(bgra[2], bgra[1], bgra[0], 255).premultiply();
+    }
+    Some(pixmap)
 }
 
 impl PictureCache {
@@ -103,9 +252,99 @@ impl PictureCache {
     }
 
     /// Lets go of every picture, keeping the budget: they're read again when next asked for.
-    pub(crate) fn clear(&mut self) {
+    /// The stills of videos whose files in `files`, the talk's files now, are as they were stay:
+    /// a still takes decoding to make again.
+    pub(crate) fn files_replaced(&mut self, files: &dyn TalkFiles) {
         self.pictures.clear();
-        self.bytes = 0;
+        self.stills.retain(|path, cached| large_file_version(path, files) == cached.version);
+        self.bytes = self.stills.values().map(|cached| cached.still.bytes()).sum();
+    }
+
+    /// Leaves videos' stills to be made aside from now on, telling `wanted` each time one is
+    /// wanted: it's then among [`Self::still_jobs`], and until it's taken in, with
+    /// [`Self::take_still`], the video shows a plain panel, as large as `measure` says it is.
+    /// Stills already wanted stay wanted.
+    pub(crate) fn make_stills_aside(&mut self, wanted: StillWanted, measure: MeasureVideo) {
+        let jobs = self.aside.take().map(|aside| aside.jobs).unwrap_or_default();
+        self.aside = Some(Aside { wanted, measure, jobs });
+    }
+
+    /// The stills wanted to be made aside since last asked.
+    pub(crate) fn still_jobs(&mut self) -> Vec<StillJob> {
+        self.aside.as_mut().map(|aside| std::mem::take(&mut aside.jobs)).unwrap_or_default()
+    }
+
+    /// The still of the video at `path`, made once for each version of its file.
+    pub(crate) fn still(&mut self, path: &str, files: &dyn TalkFiles) -> Still {
+        self.stills_asked.push(path.to_string());
+        self.asked_for += 1;
+        let asked_for = self.asked_for;
+        if let Some(cached) = self.stills.get_mut(path) {
+            cached.last_used = asked_for;
+            return cached.still.clone();
+        }
+        let version = large_file_version(path, files);
+        let still = match &mut self.aside {
+            // A file that isn't there is known not to be read without decoding anything.
+            Some(_) if version.is_none() && files.len(path).is_none() => Still::Cannot(slides_video::CantPlay::CouldNotRead),
+            Some(aside) => {
+                aside.jobs.push(StillJob { path: path.to_string(), version: version.clone() });
+                (aside.wanted)();
+                Still::Coming((aside.measure)(path))
+            }
+            None => make_still(files.open(path)),
+        };
+        self.bytes += still.bytes();
+        self.stills.insert(path.to_string(), CachedStill { still: still.clone(), version, last_used: asked_for });
+        self.let_go_of_unused();
+        still
+    }
+
+    /// Why the video at `path` can't be played, if its still has been made and it can't.
+    pub(crate) fn still_problem(&self, path: &str) -> Option<slides_video::CantPlay> {
+        match self.stills.get(path)?.still {
+            Still::Cannot(why) => Some(why),
+            _ => None,
+        }
+    }
+
+    /// Takes in a still made aside, and gives the path of its video if it was still wanted:
+    /// one whose file has changed since it was asked for isn't, and is asked for again.
+    pub(crate) fn take_still(&mut self, made: MadeStill) -> Option<String> {
+        let cached = self.stills.get_mut(&made.path)?;
+        if !matches!(cached.still, Still::Coming(_)) || cached.version != made.version {
+            return None;
+        }
+        self.bytes += made.still.bytes();
+        cached.still = made.still;
+        self.let_go_of_unused();
+        Some(made.path)
+    }
+
+    /// Forgets every still whose video's file is no longer what it was, as when files are added:
+    /// one that couldn't be read may be there now.
+    pub(crate) fn drop_replaced_stills(&mut self, files: &dyn TalkFiles) {
+        let held = &mut self.bytes;
+        self.stills.retain(|path, cached| {
+            let same = large_file_version(path, files) == cached.version;
+            if !same {
+                *held -= cached.still.bytes();
+            }
+            same
+        });
+    }
+
+    /// Whether any still is still being made aside.
+    pub(crate) fn stills_coming(&self) -> bool {
+        self.stills.values().any(|cached| matches!(cached.still, Still::Coming(_)))
+    }
+
+    /// The videos whose stills were asked for since this was last asked.
+    pub(crate) fn take_stills_asked(&mut self) -> Vec<String> {
+        let mut asked = std::mem::take(&mut self.stills_asked);
+        asked.sort();
+        asked.dedup();
+        asked
     }
 
     /// The pixel bytes of the pictures in memory.
@@ -150,29 +389,43 @@ impl PictureCache {
     }
 
     /// While over budget, lets go of the pictures only this cache holds, oldest first.
+    /// A video's still only this holds is let go of by being forgotten: it's made again when
+    /// next asked for.
     pub(crate) fn let_go_of_unused(&mut self) {
         if !self.is_over_budget() {
             return;
         }
-        let mut unused: Vec<&mut CachedPicture> = self
+        let pictures = self
             .pictures
-            .values_mut()
-            .filter(|cached| cached.picture.as_ref().is_some_and(|picture| Arc::strong_count(picture) == 1))
-            .collect();
-        unused.sort_unstable_by_key(|cached| cached.last_used);
-        for cached in unused {
+            .iter()
+            .filter(|(_, cached)| cached.picture.as_ref().is_some_and(|picture| Arc::strong_count(picture) == 1))
+            .map(|(path, cached)| (cached.last_used, false, path.clone()));
+        let stills = self
+            .stills
+            .iter()
+            .filter(|(_, cached)| matches!(&cached.still, Still::Frame(frame, _) if Arc::strong_count(frame) == 1))
+            .map(|(path, cached)| (cached.last_used, true, path.clone()));
+        let mut unused: Vec<(u64, bool, String)> = pictures.chain(stills).collect();
+        unused.sort_unstable();
+        for (_, still, path) in unused {
             if self.bytes <= self.memory_budget {
                 break;
             }
-            self.bytes -= cached.bytes();
-            cached.picture = None;
+            if still {
+                if let Some(cached) = self.stills.remove(&path) {
+                    self.bytes -= cached.still.bytes();
+                }
+            } else if let Some(cached) = self.pictures.get_mut(&path) {
+                self.bytes -= cached.bytes();
+                cached.picture = None;
+            }
         }
     }
 
     /// Forgets every picture whose file is no longer the one that was read, and says
     /// whether there were any.
     pub(crate) fn drop_replaced(&mut self, files: &dyn TalkFiles) -> bool {
-        let before = self.pictures.len();
+        let before = (self.pictures.len(), self.stills.len());
         let held = &mut self.bytes;
         self.pictures.retain(|path, cached| {
             let same = FileVersion::of_file(path, files).as_ref() == Some(&cached.version);
@@ -181,7 +434,14 @@ impl PictureCache {
             }
             same
         });
-        self.pictures.len() != before
+        self.stills.retain(|path, cached| {
+            let same = large_file_version(path, files) == cached.version;
+            if !same {
+                *held -= cached.still.bytes();
+            }
+            same
+        });
+        (self.pictures.len(), self.stills.len()) != before
     }
 }
 

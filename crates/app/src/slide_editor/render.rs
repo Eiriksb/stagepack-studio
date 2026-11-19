@@ -42,6 +42,12 @@ impl Render for SlideEditor {
             Some((name, outline_corners(area.rect, area.rotate)))
         });
         let selecting = !outlines.is_empty() && !self.is_editing(cx);
+        // A video selected: a button in its middle that plays it, or stops it while it plays.
+        let video = match (selecting, self.document.clone()) {
+            (true, Some(document)) => document.update(cx, |document, _| document.selected_video()),
+            _ => None,
+        };
+        let video_playing = video.is_some() && self.video_playing(cx);
         // The lines what's dragged snaps to, while the button is down.
         let guides = self.guides().to_vec();
         // A thing being dragged out of the slide's text: a dashed line where it'll go.
@@ -137,6 +143,12 @@ impl Render for SlideEditor {
         painted.guides = shown(!guides.is_empty(), outline_color).or(painted.guides);
         painted.badge = shown(!badges.is_empty(), badge_color).or(painted.badge);
         painted.badge_words = shown(!badges.is_empty(), badge_text).or(painted.badge_words);
+        let video_button = video.as_ref().zip(placed).map(|(video, (slide, area))| {
+            let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
+            let rect = video.on.rect;
+            let middle = slide.origin + point(px((rect.x + rect.w / 2.) * unit), px((rect.y + rect.h / 2.) * unit));
+            in_editor(Bounds { origin: middle, size: size(px(0.), px(0.)) }, area).origin
+        });
         let lift_box = lift_outline.as_ref().and_then(|corners| Some((SharedString::from(LIFT_OUTLINE_ID), boxed(corners)?)));
         let frame_box = frame.as_ref().and_then(|(name, corners)| Some((SharedString::from(region_frame_id(name)), boxed(corners)?)));
         // Where the new box is in the editor, for whoever looks for it.
@@ -258,10 +270,16 @@ impl Render for SlideEditor {
         )
         .absolute()
         .size_full();
+        let key_context = match (selecting, video.is_some()) {
+            (true, true) => format!("{SELECTION_CONTEXT} {VIDEO_CONTEXT}"),
+            (true, false) => SELECTION_CONTEXT.to_string(),
+            (false, _) => EDITOR_CONTEXT.to_string(),
+        };
+        let (button_color, button_text) = (cx.theme().primary, cx.theme().primary_foreground);
         div()
             .id(SLIDE_EDITOR_ID)
             .test_support()
-            .key_context(if selecting { SELECTION_CONTEXT } else { EDITOR_CONTEXT })
+            .key_context(key_context.as_str())
             .track_focus(&self.focus_handle)
             .absolute()
             .size_full()
@@ -359,6 +377,7 @@ impl Render for SlideEditor {
             }))
             .on_action(cx.listener(|this, _: &DuplicateSelected, _, cx| this.duplicate(cx)))
             .on_action(cx.listener(|this, _: &SelectAllThings, window, cx| this.select_all_things(window, cx)))
+            .on_action(cx.listener(|this, _: &PlayOrStopVideo, _, cx| this.play_or_stop(cx)))
             .on_action(cx.listener(|this, _: &ToggleBold, _, cx| {
                 this.format(|edit| edit.toggle(StyleBit::Bold), cx)
             }))
@@ -397,6 +416,41 @@ impl Render for SlideEditor {
                     .w(bounds.size.width)
                     .h(bounds.size.height)
             }))
+            .when_some(video_button, |this, middle| {
+                let (id, label) = if video_playing { (VIDEO_STOP_ID, "Stop") } else { (VIDEO_PLAY_ID, "Play") };
+                this.child(
+                    div()
+                        .absolute()
+                        .left(middle.x)
+                        .top(middle.y)
+                        .child(
+                            div()
+                                .id(id)
+                                .test_support()
+                                .aria_label(label)
+                                .absolute()
+                                // Its middle at the video's.
+                                .left(px(-32.))
+                                .top(px(-16.))
+                                .w(px(64.))
+                                .h(px(32.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_md()
+                                .bg(button_color)
+                                .text_color(button_text)
+                                .text_sm()
+                                .cursor_pointer()
+                                // The press is the button's, not the slide's beneath it.
+                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.play_or_stop(cx);
+                                }))
+                                .child(label),
+                        ),
+                )
+            })
             .children(badges.into_iter().map(|(id, corner, words)| {
                 div()
                     .id(id)

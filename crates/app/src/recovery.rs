@@ -5,9 +5,12 @@
 //!
 //! Each talk has a folder named for the hash of its path, and each window that keeps a copy of
 //! it has a slot of its own in there: `<root>/<key>/<slot>/slides.md` and `about.json`, and the
-//! files added to the talk that the text uses, at `files/<path>`. A new presentation that was
-//! never saved has no path, so its folder is named for its id, and its about file says it's
-//! untitled, which is how [`Recovery::untitled`] finds it.
+//! files added to the talk that the text uses, at `files/<path>`. A large file, such as a video,
+//! is copied there as it's added, and held there by its path, never in memory: until the talk
+//! is saved, that copy is the only one, so the slot is never cleared or swept while a window
+//! holds it, and a file of the talk's is never let go of with the rest of the slot. A new
+//! presentation that was never saved has no path, so its folder is named for its id, and its
+//! about file says it's untitled, which is how [`Recovery::untitled`] finds it.
 //!
 //! A window holds its slot while it's open: within the app through a set of the live slots, and
 //! against any other running copy of the app through a lock on the file `held` in each of its
@@ -23,9 +26,9 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use slides_components::BuildEntry;
-use slides_engine::{open_packed, read_talk_text, write_atomically};
+use slides_engine::{AddedFile, is_large_kind, open_packed, read_talk_text, write_atomically};
 
-use crate::added_files::{FileKind, MAX_ADDED_BYTES, is_added_path};
+use crate::added_files::{FileKind, MAX_ADDED_BYTES, MAX_VIDEO_BYTES, is_added_path};
 use crate::document::{SLIDES_FILE, TalkPlace, UNTITLED_NAME, UntitledId};
 use crate::permissions::BuildPermissions;
 
@@ -107,6 +110,9 @@ pub struct Found {
     pub text: String,
     /// The files added to the talk that were kept with the text, by their path in the talk.
     pub files: Vec<(String, Arc<[u8]>)>,
+    /// The large files added to the talk that were kept with the text, such as videos, by their
+    /// path in the talk and where they lie in the working copy. They're never read here.
+    pub large: Vec<(String, PathBuf)>,
     /// The builds entered in the talk's index with those files, as a paste entered them. They
     /// were written by the app, but are read back as untrusted as anything else here.
     pub builds: Vec<BuildEntry>,
@@ -350,6 +356,23 @@ impl Recovery {
         files: &[(String, Arc<[u8]>)],
         builds: &[BuildEntry],
     ) -> io::Result<()> {
+        let files: Vec<(String, AddedFile)> = files.iter().map(|(path, bytes)| (path.clone(), AddedFile::Bytes(bytes.clone()))).collect();
+        self.keep_from(place, name, base_hash, text, &files, builds)
+    }
+
+    /// Keeps the working copy of the talk at `place` as [`Self::keep_named`] does, with `files`
+    /// held or lying on disk. One that lies on disk is kept in this slot where it lies already,
+    /// and isn't written again; one that lies elsewhere is linked here, or else copied a piece at
+    /// a time, never read whole.
+    pub(crate) fn keep_from(
+        &self,
+        place: &TalkPlace,
+        name: Option<&str>,
+        base_hash: &str,
+        text: &str,
+        files: &[(String, AddedFile)],
+        builds: &[BuildEntry],
+    ) -> io::Result<()> {
         if let Some((odd, _)) = files.iter().find(|(path, _)| !is_added_path(path)) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{odd:?} isn't a file added to a talk")));
         }
@@ -375,8 +398,8 @@ impl Recovery {
             },
         };
         let about = serde_json::to_vec_pretty(&about).map_err(io::Error::other)?;
-        for (path, bytes) in files {
-            keep_file(&folder, path, bytes)?;
+        for (path, file) in files {
+            keep_file(&folder, path, file)?;
         }
         let builds_file = folder.join(BUILDS_FILE);
         if builds.is_empty() {
@@ -398,11 +421,57 @@ impl Recovery {
     /// slot, as it's added. It's found with the next text kept, which brings it back; a slot that
     /// holds no text yet offers nothing.
     pub fn keep_file(&self, place: &TalkPlace, path: &str, bytes: &[u8]) -> io::Result<()> {
+        self.keep_added(place, path, &AddedFile::Bytes(Arc::from(bytes)))
+    }
+
+    /// Keeps `file`, the file added to the talk at `place` whose path in it is `path`, held or
+    /// lying on disk, in this slot, as [`Self::keep_file`] does.
+    pub(crate) fn keep_added(&self, place: &TalkPlace, path: &str, file: &AddedFile) -> io::Result<()> {
         if !is_added_path(path) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{path:?} isn't a file added to a talk")));
         }
         let folder = self.slot_folder(&canonical(place))?;
-        keep_file(&folder, path, bytes)
+        keep_file(&folder, path, file)
+    }
+
+    /// The folder in this slot for the talk at `place` that the files added to it are kept in,
+    /// made if it isn't there, and held, as a working copy's slot is, for as long as this window
+    /// is: where a large file is copied to as it's added.
+    pub fn large_folder(&self, place: &TalkPlace) -> io::Result<PathBuf> {
+        let folder = self.slot_folder(&canonical(place))?;
+        let files = folder.join(FILES_FOLDER);
+        for made in [files.clone(), files.join(FileKind::Video.folder())] {
+            refuse_link(&made)?;
+            create_private(&made)?;
+            refuse_link(&made)?;
+            make_private(&made)?;
+        }
+        Ok(files)
+    }
+
+    /// Whether `path` is in the folder the working copies are kept in, as the system resolves it.
+    pub fn holds(&self, path: &Path) -> bool {
+        let (Ok(root), Ok(path)) = (self.root.canonicalize(), path.canonicalize()) else {
+            return false;
+        };
+        path.starts_with(root)
+    }
+
+    /// The file lying at `from`, taken into this slot for the talk at `place` as the file at
+    /// `path` in the talk: linked, or else copied a piece at a time. Where it lies now is given.
+    /// A copy from last time is brought back this way, so that it's this window's own, whatever
+    /// becomes of last time's.
+    pub fn take_in(&self, place: &TalkPlace, path: &str, from: &Path) -> io::Result<PathBuf> {
+        if take_in_fails(&self.root) {
+            return Err(io::Error::other("taking it in was refused, for a test"));
+        }
+        if !is_added_path(path) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{path:?} isn't a file added to a talk")));
+        }
+        let len = std::fs::symlink_metadata(from)?.len();
+        let folder = self.slot_folder(&canonical(place))?;
+        keep_file(&folder, path, &AddedFile::At(from.to_path_buf(), len))?;
+        Ok(folder.join(FILES_FOLDER).join(path))
     }
 
     /// This slot's folder for the talk at the canonical path `talk`, made if it isn't there, and
@@ -433,6 +502,75 @@ impl Recovery {
             live.let_go(&folder);
         }
         remove_slot(&folder);
+    }
+
+    /// Removes this slot's working copy of the talk at `place` as [`Self::clear`] does, but for
+    /// the files kept in it that `keep` says are still the talk's, such as a video added that no
+    /// save has written: until one is, it's the only copy there is. Each file is asked about as
+    /// it would be removed, so one put in place meanwhile stays, and while anything in the slot
+    /// is kept, or has room kept for it as it's copied in, the slot stays, held, with nothing in
+    /// it but those.
+    pub fn clear_keeping(&self, place: &TalkPlace, keep: &dyn Keeping) {
+        self.clear_keeping_between(place, keep, &|| {});
+    }
+
+    /// [`Self::clear_keeping`], doing `between` once it has begun and before it looks at what's
+    /// kept, as a copy running on another thread may. For tests.
+    #[doc(hidden)]
+    pub fn clear_keeping_between(&self, place: &TalkPlace, keep: &dyn Keeping, between: &dyn Fn()) {
+        let folder = self.root.join(key(&canonical(place))).join(&self.slot);
+        let files = folder.join(FILES_FOLDER);
+        between();
+        // Whether to take the whole slot is decided, and done, while no copy can be given room
+        // in it; one given room after makes the slot's folders again.
+        let mut cleared = false;
+        keep.while_held(&mut |keep| {
+            let any_kept = keep.keeps_any_under(&folder) || files_kept_in(&files).iter().any(|file| keep.keeps(file));
+            if !any_kept {
+                self.clear(place);
+                cleared = true;
+            }
+        });
+        if cleared {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(&folder) else { return };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name == HELD_FILE || name == FILES_FOLDER {
+                continue;
+            }
+            remove_entry(&entry.path());
+        }
+        let Ok(folders) = std::fs::read_dir(&files) else { return };
+        for kind_folder in folders.flatten() {
+            let path = kind_folder.path();
+            if !kind_folder.file_type().is_ok_and(|kind| kind.is_dir()) {
+                remove_entry(&path);
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&path) else { continue };
+            for entry in entries.flatten() {
+                // Asked now, not from a list made before: what's put in place meanwhile stays.
+                if !keep.keeps(&entry.path()) {
+                    remove_entry(&entry.path());
+                }
+            }
+            // Only when nothing is left in it, and nothing is about to be copied into it.
+            if !keep.keeps_any_under(&path) {
+                std::fs::remove_dir(&path).ok();
+            }
+        }
+    }
+
+    /// Removes `found`, as [`Self::discard`] does, unless a file the talk holds lies in its slot,
+    /// as one brought back from it does until it's taken into this window's own: whether it went.
+    pub fn discard_keeping(&self, found: &Found, keep: &dyn Keeping) -> bool {
+        if keep.keeps_any_under(&found.slot) {
+            return false;
+        }
+        self.discard(found);
+        true
     }
 
     /// Removes `found`, a working copy found with [`Self::find`], whichever slot it's in, unless
@@ -557,6 +695,12 @@ impl Recovery {
     /// Removes the working copies of the new presentation `id` that say they're its, but those
     /// an open window holds.
     pub fn discard_untitled(&self, id: UntitledId) {
+        self.discard_untitled_keeping(id, &KeepNothing);
+    }
+
+    /// [`Self::discard_untitled`], but for a slot a file of the talk's that `keep` says is held
+    /// lies in.
+    pub fn discard_untitled_keeping(&self, id: UntitledId, keep: &dyn Keeping) {
         let place = TalkPlace::Untitled(id);
         let Some(key_folder) = self.key_folder(&place) else {
             return;
@@ -565,7 +709,7 @@ impl Recovery {
         for slot in slots(&key_folder) {
             let its = read_about(&slot).is_some_and(|(about, _)| about.talk == talk && says_it_is(&about, &place));
             // Looked at again just before it goes, as a window may have come to hold it.
-            if its && !is_held(&slot, &live_slots().clone()) {
+            if its && !keep.keeps_any_under(&slot) && !is_held(&slot, &live_slots().clone()) {
                 remove_slot(&slot);
             }
         }
@@ -601,6 +745,66 @@ impl Recovery {
                 }
             }
         }
+    }
+}
+
+/// What a slot that's cleared keeps of the files in it.
+pub trait Keeping {
+    /// Whether the file at `file` is to stay.
+    fn keeps(&self, file: &Path) -> bool;
+    /// Whether anything under `folder` is to stay, there already or being copied there.
+    fn keeps_any_under(&self, folder: &Path) -> bool;
+    /// Does `f` with what's to stay as it is now, which nothing is added to until `f` is done.
+    fn while_held(&self, f: &mut dyn FnMut(&dyn Keeping));
+}
+
+/// Keeps nothing.
+pub struct KeepNothing;
+
+impl Keeping for KeepNothing {
+    fn keeps(&self, _: &Path) -> bool {
+        false
+    }
+
+    fn keeps_any_under(&self, _: &Path) -> bool {
+        false
+    }
+
+    fn while_held(&self, f: &mut dyn FnMut(&dyn Keeping)) {
+        f(self);
+    }
+}
+
+/// The working copies' folders tests have taking a file in fail in, with how often it was tried.
+static TAKE_IN_FAILS: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
+
+/// Has [`Recovery::take_in`] fail for the working copies under `root`, as on a disk that can
+/// neither link nor copy. For tests.
+#[doc(hidden)]
+pub fn set_take_in_fails_for_test(root: &Path, fails: bool) {
+    let mut failing = TAKE_IN_FAILS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    failing.retain(|(at, _)| at != root);
+    if fails {
+        failing.push((root.to_path_buf(), 0));
+    }
+}
+
+/// How often taking a file in was tried under `root` since [`set_take_in_fails_for_test`]. For
+/// tests.
+#[doc(hidden)]
+pub fn take_in_tries_for_test(root: &Path) -> usize {
+    TAKE_IN_FAILS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter().find(|(at, _)| at == root).map_or(0, |(_, tries)| *tries)
+}
+
+/// Whether taking a file in under `root` is to fail, for a test, counting the try.
+fn take_in_fails(root: &Path) -> bool {
+    let mut failing = TAKE_IN_FAILS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match failing.iter_mut().find(|(at, _)| at == root) {
+        Some((_, tries)) => {
+            *tries += 1;
+            true
+        }
+        None => false,
     }
 }
 
@@ -660,6 +864,7 @@ fn newest_of(place: &TalkPlace, slots: Vec<PathBuf>) -> Option<Found> {
     Some(Found {
         text,
         files: kept_files(&slot),
+        large: kept_large(&slot),
         builds: kept_builds(&slot),
         base_matches,
         when,
@@ -667,8 +872,10 @@ fn newest_of(place: &TalkPlace, slots: Vec<PathBuf>) -> Option<Found> {
     })
 }
 
-/// Keeps `bytes`, the file added to the talk at `path`, in the working copy's `slot`.
-fn keep_file(slot: &Path, path: &str, bytes: &[u8]) -> io::Result<()> {
+/// Keeps `file`, the file added to the talk at `path`, in the working copy's `slot`. One that
+/// lies on disk is kept where it lies if that's here already, and otherwise linked here, or else
+/// copied a piece at a time; either way it's put in place only once it's whole.
+fn keep_file(slot: &Path, path: &str, file: &AddedFile) -> io::Result<()> {
     let files = slot.join(FILES_FOLDER);
     let (folder, _) = path.split_once('/').expect("an added file's path is in a folder");
     let folder = files.join(folder);
@@ -678,11 +885,78 @@ fn keep_file(slot: &Path, path: &str, bytes: &[u8]) -> io::Result<()> {
         refuse_link(made)?;
         make_private(made)?;
     }
-    let file = slot.join(FILES_FOLDER).join(path);
-    if read_small(&file, MAX_ADDED_BYTES as u64).is_some_and(|kept| kept == bytes) {
-        return Ok(());
+    let target = slot.join(FILES_FOLDER).join(path);
+    match file {
+        AddedFile::Bytes(bytes) => {
+            if read_small(&target, MAX_ADDED_BYTES as u64).is_some_and(|kept| *kept == **bytes) {
+                return Ok(());
+            }
+            write_private(&target, bytes)
+        }
+        AddedFile::At(from, len) => {
+            if *from == target || same_file(from, &target) {
+                return Ok(());
+            }
+            link_or_copy(from, *len, &target)
+        }
     }
-    write_private(&file, bytes)
+}
+
+/// Whether `a` and `b` are the one file, a link to it included, as far as the system can tell.
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let (Ok(a), Ok(b)) = (std::fs::metadata(a), std::fs::symlink_metadata(b)) else { return false };
+        b.is_file() && a.dev() == b.dev() && a.ino() == b.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
+    }
+}
+
+/// Puts the file at `from`, which holds `len` bytes, at `target` as well: a link to it, or else a
+/// copy made a piece at a time, in place of whatever is there. Either is made beside it first.
+fn link_or_copy(from: &Path, len: u64, target: &Path) -> io::Result<()> {
+    let name = target.file_name().ok_or_else(|| io::Error::other("no file name"))?.to_string_lossy().into_owned();
+    let beside = target.with_file_name(format!(".{name}.{}.{}.link", std::process::id(), random_name()));
+    if std::fs::hard_link(from, &beside).is_err() {
+        // A disk that can't link, such as one formatted FAT, or another disk.
+        let never = std::sync::atomic::AtomicBool::new(false);
+        let quiet = |_: u64, _: u64| {};
+        let told = crate::large_files::Told { progress: &quiet, before: 0, total: len };
+        let source = crate::large_files::LargeSource::File(from.to_path_buf());
+        let looked = source.look().map_err(io::Error::other)?;
+        crate::large_files::copy_to(&source, looked, &beside, &told, &never, crate::large_files::CopyFor::WorkingCopy).map_err(io::Error::other)?;
+    }
+    let placed = std::fs::rename(&beside, target);
+    if placed.is_err() {
+        std::fs::remove_file(&beside).ok();
+    }
+    placed
+}
+
+/// The plain files in `files`, a slot's folder of files added, one folder down, by where they lie.
+fn files_kept_in(files: &Path) -> Vec<PathBuf> {
+    let Ok(folders) = std::fs::read_dir(files) else { return Vec::new() };
+    folders
+        .flatten()
+        .filter(|folder| folder.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|folder| std::fs::read_dir(folder.path()).ok())
+        .flat_map(|entries| entries.flatten().map(|entry| entry.path()))
+        .collect()
+}
+
+/// Removes what's at `path`: a folder and all in it, or anything else, a link itself rather than
+/// what it leads to.
+fn remove_entry(path: &Path) {
+    let is_folder = std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir());
+    if is_folder {
+        std::fs::remove_dir_all(path).ok();
+    } else {
+        std::fs::remove_file(path).ok();
+    }
 }
 
 /// The files added to the talk kept in the working copy's `slot`: plain files only, with names a
@@ -692,8 +966,7 @@ fn kept_files(slot: &Path) -> Vec<(String, Arc<[u8]>)> {
     if refuse_link(&files).is_err() {
         return Vec::new();
     }
-    let folders: BTreeSet<&str> =
-        [FileKind::Picture, FileKind::Data, FileKind::ComponentSource, FileKind::ComponentBuild].map(FileKind::folder).into();
+    let folders: BTreeSet<&str> = FileKind::ALL.map(FileKind::folder).into();
     let mut kept = Vec::new();
     for folder in folders {
         let folder_path = files.join(folder);
@@ -707,7 +980,8 @@ fn kept_files(slot: &Path) -> Vec<(String, Arc<[u8]>)> {
             let Some(name) = entry.file_name().to_str().map(|name| format!("{folder}/{name}")) else {
                 continue;
             };
-            if !is_added_path(&name) {
+            // A large file is never read: it's brought back by where it lies.
+            if !is_added_path(&name) || is_large_kind(&name) {
                 continue;
             }
             // `read_small` reads only a plain file, and not through a link.
@@ -716,6 +990,32 @@ fn kept_files(slot: &Path) -> Vec<(String, Arc<[u8]>)> {
             }
         }
     }
+    kept.sort();
+    kept
+}
+
+/// The large files added to the talk kept in the working copy's `slot`, by their path in the talk
+/// and where they lie, without reading them: plain files only, not links, with names a file
+/// added to a talk can have, each no bigger than a video can be, as the disk says. One that was
+/// being copied in when the app stopped lies under a name of its own, and isn't one of these.
+fn kept_large(slot: &Path) -> Vec<(String, PathBuf)> {
+    let files = slot.join(FILES_FOLDER);
+    let folder = files.join(FileKind::Video.folder());
+    if refuse_link(&files).is_err() || refuse_link(&folder).is_err() {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(&folder) else {
+        return Vec::new();
+    };
+    let mut kept: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = format!("{}/{}", FileKind::Video.folder(), entry.file_name().to_str()?);
+            let meta = std::fs::symlink_metadata(entry.path()).ok()?;
+            let fits = is_added_path(&name) && is_large_kind(&name) && meta.is_file() && meta.len() <= MAX_VIDEO_BYTES;
+            fits.then(|| (name, entry.path()))
+        })
+        .collect();
     kept.sort();
     kept
 }

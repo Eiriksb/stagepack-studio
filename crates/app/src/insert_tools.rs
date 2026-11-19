@@ -1,4 +1,4 @@
-//! The Insert tab's tools: Picture, the Shapes list, Text box, Icon, Table and Component. What
+//! The Insert tab's tools: Picture, Video, the Shapes list, Text box, Icon, Table and Component. What
 //! they put on the slide is [`crate::insert`]'s and [`crate::document::Document`]'s; the window
 //! does what they ask. Icon opens the [`IconPicker`], whose pick the window hears of, Table the
 //! [`TableGrid`], whose square clicked asks for a table that size, and Component the
@@ -17,6 +17,8 @@ use crate::ribbon::group;
 use crate::table_tools::TableGrid;
 
 pub const INSERT_PICTURE_ID: &str = "insert-picture";
+/// The Video tool, which asks for a video file to put on the slide.
+pub const INSERT_VIDEO_ID: &str = "insert-video";
 /// The Shapes button, which lists the shapes.
 pub const INSERT_SHAPES_ID: &str = "insert-shapes";
 pub const INSERT_TEXT_BOX_ID: &str = "insert-text-box";
@@ -27,7 +29,7 @@ pub const INSERT_TABLE_ID: &str = "insert-table";
 /// The Component tool, which opens the list of components.
 pub const INSERT_COMPONENT_ID: &str = "insert-component";
 
-actions!(insert_tools, [InsertPicture, InsertTextBox]);
+actions!(insert_tools, [InsertPicture, InsertVideo, InsertTextBox]);
 
 /// Puts a shape of kind `kind`, the talk's name for it, on the slide.
 #[derive(Clone, PartialEq, Debug, Action)]
@@ -85,6 +87,17 @@ pub fn insert_tab(
                     .tooltip("Put a picture from a file on the slide")
                     .disabled(!has_talk)
                     .on_click(|_, window, cx| window.dispatch_action(InsertPicture.boxed_clone(), cx))
+                    .into_any_element(),
+            ],
+            cx,
+        ),
+        group(
+            "Video",
+            vec![
+                tool(INSERT_VIDEO_ID, Icons::Video, "Video")
+                    .tooltip("Put a video from a file on the slide")
+                    .disabled(!has_talk)
+                    .on_click(|_, window, cx| window.dispatch_action(InsertVideo.boxed_clone(), cx))
                     .into_any_element(),
             ],
             cx,

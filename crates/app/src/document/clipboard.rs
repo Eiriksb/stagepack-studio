@@ -1,7 +1,7 @@
 //! Copying and pasting slides and things, and the files they bring with them.
 
 use super::*;
-use crate::clipboard;
+use crate::clipboard::{self, LargeCopied};
 
 /// What a paste that brought files with it has to say of them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -16,6 +16,13 @@ pub struct Brought {
     pub built_in: bool,
     /// A component the slide shows came as a build without its source, so it couldn't be brought.
     pub component_left_out: bool,
+    /// How many large files it uses, carried by where they lie, weren't copied in, as whoever
+    /// pasted said not to.
+    pub large_left_out: usize,
+    /// How many large files it uses were gone, or changed, by the time it was pasted.
+    pub large_gone: usize,
+    /// Why a large file it uses couldn't be copied in, if one couldn't.
+    pub large_refused: Option<NotAdded>,
     /// The stems of the builds that came without their sources.
     builds_alone: Vec<String>,
 }
@@ -33,13 +40,18 @@ impl Brought {
     }
 
     /// The one thing to say of it, if any: a different component first, then one with a
-    /// built-in's name, then files too big, then pictures left out, then a component left out.
+    /// built-in's name, then files too big, then videos gone, then why one couldn't be copied in,
+    /// then videos not copied, then
+    /// pictures left out, then a component left out.
     pub fn said(&self) -> Option<String> {
         let said = |is: bool, sentence: &str| is.then(|| sentence.to_string());
         self.different
             .clone()
             .or_else(|| said(self.built_in, clipboard::BUILT_IN_NAME))
             .or_else(|| said(self.too_large, clipboard::FILES_TOO_LARGE))
+            .or_else(|| (self.large_gone > 0).then(|| clipboard::large_gone(self.large_gone)))
+            .or_else(|| self.large_refused.map(|why| why.to_string()))
+            .or_else(|| (self.large_left_out > 0).then(|| clipboard::large_left_out(self.large_left_out)))
             .or_else(|| said(self.left_out, clipboard::MISSING_PICTURES))
             .or_else(|| said(self.component_left_out, clipboard::MISSING_COMPONENT))
     }
@@ -196,6 +208,23 @@ impl Document {
             return (Vec::new(), brought);
         };
         let carried = CarriedFiles(&files.files);
+        // A large file is copied in before the paste, by the window, or left out: here it's only
+        // named as it was copied in.
+        let mut renames = Vec::new();
+        for large in &files.large {
+            if !guarded(|| talk_uses(&pasted, &carried, &large.path)).unwrap_or(false) {
+                continue;
+            }
+            match &large.copied {
+                LargeCopied::To(path) if *path != large.path => renames.push((large.path.clone(), path.clone())),
+                LargeCopied::To(_) => {}
+                LargeCopied::Gone => brought.large_gone += 1,
+                LargeCopied::Refused(why) => {
+                    brought.large_refused.get_or_insert(*why);
+                }
+                LargeCopied::Declined | LargeCopied::NotYet => brought.large_left_out += 1,
+            }
+        }
         let used: Vec<bool> = files.files.iter().map(|file| guarded(|| talk_uses(&pasted, &carried, &file.path)).unwrap_or(false)).collect();
         let files: Vec<PastedFile> = files.files.into_iter().zip(used).filter_map(|(file, used)| used.then_some(file)).collect();
         // What `text` names that wasn't pasted, which nothing added may come to be.
@@ -205,7 +234,6 @@ impl Document {
             .filter(|name| !files.iter().any(|file| file.path == *name))
             .map(|name| name.to_ascii_lowercase())
             .collect();
-        let mut renames = Vec::new();
         let (components, others): (Vec<PastedFile>, Vec<PastedFile>) = files.into_iter().partition(|file| file.kind.is_component());
         for file in others {
             let name = file.path.split_once('/').map_or(file.path.as_str(), |(_, name)| name).to_string();
@@ -285,7 +313,8 @@ impl Document {
                 if copied.len() > MAX_CLIPBOARD_FILES || total > MAX_CLIPBOARD_FILES_BYTES {
                     return copied;
                 }
-                let copyable = crate::clipboard::pasted_kind(&path).is_some()
+                // A large file is carried by where it lies: see `Document::large_for_copy`.
+                let copyable = crate::clipboard::pasted_kind(&path).is_some_and(|kind| !kind.is_large())
                     && files.len(&path).is_some_and(|len| len <= MAX_ADDED_BYTES as u64)
                     && guarded(|| talk_uses(&talk, files, &path)).unwrap_or(false);
                 let Some(bytes) = copyable.then(|| files.read(&path)).flatten() else {
@@ -313,6 +342,16 @@ impl Document {
         let text = texts.join("\n\n");
         let files = self.files_for_copy(&text);
         Ok((text, files))
+    }
+
+    /// Which of the large files `files` carries `text`, a pasted slide's or thing's, uses, by
+    /// their place among them: those a paste copies in first.
+    pub fn large_to_bring(&self, text: &str, files: &PastedFiles) -> Vec<usize> {
+        let Ok(pasted) = guarded(|| parse_talk(text)) else {
+            return Vec::new();
+        };
+        let carried = CarriedFiles(&files.files);
+        (0..files.large.len()).filter(|&at| guarded(|| talk_uses(&pasted, &carried, &files.large[at].path)).unwrap_or(false)).collect()
     }
 
     /// Puts the things `markdown` holds, perhaps from another talk, on the current slide, with

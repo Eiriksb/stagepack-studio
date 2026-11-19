@@ -446,6 +446,7 @@ mod tests {
             native: vec![element.clone()],
             is_title: false,
             varies: false,
+            video: None,
         };
         let pkg: SharedPackage = Rc::new(RefCell::new(Package::default()));
         let mut media = MediaStore::default();

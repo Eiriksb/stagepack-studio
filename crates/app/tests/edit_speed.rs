@@ -1,5 +1,10 @@
-//! How long a keystroke takes on a long talk, before anything is drawn. Only meaningful in a
-//! release build: `scripts/cargo-safe.sh test --release -p stagepack-studio --test edit_speed -- --ignored`.
+//! How long a keystroke takes on a long talk, before anything is drawn, and on a talk of videos;
+//! how long opening that talk takes; and what a video playing costs the window's thread. Only
+//! meaningful in a release build:
+//! `scripts/cargo-safe.sh test --release -p stagepack-studio --test edit_speed -- --ignored`.
+
+#[path = "support/typing.rs"]
+mod typing;
 
 use std::time::{Duration, Instant};
 
@@ -239,10 +244,23 @@ fn drag_frames_on(
     std::fs::write(dir.path().join("slides.md"), &talk).unwrap();
     let mut doc = Document::open(dir.path(), Fonts::bundled_only()).unwrap();
     let slide = doc.slide_count() - 1;
+    drag_frames_of(&mut doc, &talk, slide, 60, others, by, more)
+}
+
+/// [`drag_frames_on`] for the `count` things on slide `slide` of `doc`, a talk of `talk`.
+fn drag_frames_of(
+    doc: &mut Document,
+    talk: &str,
+    slide: usize,
+    count: usize,
+    others: impl Fn(&[(Thing, Placed)]) -> Vec<Rect>,
+    by: impl Fn(usize) -> (f32, f32),
+    more: impl Fn(&mut Document),
+) -> (Duration, Duration, usize, usize) {
     doc.go_to(slide);
     assert!(doc.select_all_things());
     let starts: Vec<(Thing, Placed)> = doc.selected_boxes().into_iter().map(|(thing, rect, rotate)| (thing, Placed { rect, rotate })).collect();
-    assert_eq!(starts.len(), 60);
+    assert_eq!(starts.len(), count);
     // The window's scale: a slide 1280 pixels wide.
     let scale = 1280. / 1920.;
     doc.editor_layers(scale);
@@ -258,10 +276,10 @@ fn drag_frames_on(
         doc.preview_places(&places);
         let layers = doc.editor_layers(scale);
         let layout = doc.text_layout(slide);
-        more(&mut doc);
+        more(doc);
         times.push(start.elapsed());
-        assert!(layers.len() > 60, "frame {frame}: the heading and the sixty");
-        assert_eq!(layout.elements().len(), 60);
+        assert!(layers.len() > count, "frame {frame}: the heading and the {count}");
+        assert_eq!(layout.elements().len(), count);
         snapped_frames += usize::from(!snapped.guides.is_empty());
         held += usize::from(last.as_ref() == Some(&places));
         last = Some(places);
@@ -422,4 +440,244 @@ fn a_step_on_sixty_things_is_quick() {
         println!("median {what} of sixty things on a {SLIDES}-slide talk: {median:?} (slowest {:?})", times.last().unwrap());
         assert!(median < MOST_FOR_SIXTY, "{what} of sixty things took {median:?}");
     }
+}
+
+/// How many slides, each holding a video, the talk of videos has.
+const VIDEO_SLIDES: usize = 20;
+
+/// A talk of [`VIDEO_SLIDES`] slides, each a heading, some words and a list, with a video beside
+/// them when `with_videos`.
+fn video_talk(with_videos: bool) -> String {
+    let mut talk = String::from("---\ntitle: A talk of videos\n---\n\n");
+    for n in 0..VIDEO_SLIDES {
+        if n > 0 {
+            talk.push_str("---\n\n");
+        }
+        talk.push_str(&format!("# Slide {n}\n\nSome **bold** words about clip {n}.\n\n- the first thing\n- the second thing\n\n"));
+        if with_videos {
+            talk.push_str(&format!("<Video src=\"assets/clip{n}.mp4\" x=\"1000\" y=\"300\" w=\"800\" h=\"450\" />\n\n"));
+        }
+    }
+    talk
+}
+
+/// A folder holding [`video_talk`], and with videos, its twenty videos: each 1280 by 720, a
+/// second long, its pictures one colour of its own. Made pictures of one colour each are far
+/// easier to decode than filmed ones.
+fn video_talk_folder(with_videos: bool) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("slides.md"), video_talk(with_videos)).unwrap();
+    if with_videos {
+        std::fs::create_dir(dir.path().join("assets")).unwrap();
+        for n in 0..VIDEO_SLIDES {
+            let colour = [(n * 12) as u8, 200 - (n * 9) as u8, 40 + (n * 7) as u8, 255];
+            let clip = slides_video::make_test_video(1280, 720, 30, 30, |_| colour.repeat(1280 * 720));
+            std::fs::write(dir.path().join(format!("assets/clip{n}.mp4")), clip).unwrap();
+        }
+    }
+    dir
+}
+
+/// Makes every still wanted, one after another, as the window's background tasks do, and says
+/// how many were made.
+fn make_stills_now(doc: &mut Document) -> usize {
+    let mut made = 0;
+    loop {
+        let jobs = doc.still_jobs();
+        if jobs.is_empty() {
+            return made;
+        }
+        for (job, open) in jobs {
+            let Ok(reader) = open.expect("the video's file").open_for_still() else { panic!("the video doesn't open") };
+            let stagepack_studio::video_player::Making::Made(still) = stagepack_studio::video_player::make_still_from(job, reader) else {
+                panic!("a still waits");
+            };
+            assert!(!still.failed(), "a still couldn't be made");
+            doc.take_still(still);
+            made += 1;
+        }
+    }
+}
+
+/// The talk of videos opened as the window opens it, its stills made, and shown at slide `slide`.
+fn open_video_talk(dir: &std::path::Path, slide: usize) -> Document {
+    let mut doc = Document::open(dir, Fonts::bundled_only()).unwrap();
+    doc.make_stills_aside(std::sync::Arc::new(|| {}));
+    for index in 0..doc.slide_count() {
+        doc.thumbnail(index, 192);
+    }
+    doc.go_to(slide);
+    doc.editor_layers(1280. / 1920.);
+    assert_eq!(make_stills_now(&mut doc), VIDEO_SLIDES, "a still for each video");
+    doc
+}
+
+/// A letter typed on a slide of a talk of twenty videos, none playing, beside its video.
+#[test]
+#[ignore = "timing; run in release"]
+fn a_keystroke_on_a_talk_of_twenty_videos_is_quick() {
+    let dir = video_talk_folder(true);
+    let slide = VIDEO_SLIDES / 2;
+    let mut doc = open_video_talk(dir.path(), slide);
+    let flows = text_flows(doc.talk(), slide);
+    let body = flows.iter().position(|flow| flow.place == FlowPlace::Region("body".into())).expect("the slide has words");
+    let words: usize = flows[body].paras[0].spans.iter().map(|span| span.text.len()).sum();
+    assert!(doc.begin_text(slide, body, Pos { para: 0, offset: words }));
+    doc.text_layout(slide);
+    let mut times = Vec::with_capacity(KEYSTROKES);
+    for key in 0..KEYSTROKES {
+        let letter = if key % 6 == 5 { " " } else { "a" };
+        let start = Instant::now();
+        doc.apply_text(|edit| edit.insert(letter)).unwrap();
+        let head = doc.text().unwrap().edit.selection.head;
+        assert!(doc.text_layout(slide).caret(body, head).is_some());
+        doc.editor_layers(1280. / 1920.);
+        times.push(start.elapsed());
+    }
+    assert!(doc.still_jobs().is_empty(), "typing beside a video doesn't make its still again");
+    times.sort();
+    let median = times[times.len() / 2];
+    println!("median keystroke on a talk of {VIDEO_SLIDES} videos: {median:?} (slowest {:?})", times.last().unwrap());
+    assert!(median < MOST, "a keystroke took {median:?}");
+}
+
+/// A video dragged about its slide, on a talk of twenty videos, none playing.
+#[test]
+#[ignore = "timing; run in release"]
+fn a_frame_of_a_drag_of_a_video_is_quick() {
+    let dir = video_talk_folder(true);
+    let slide = VIDEO_SLIDES / 2;
+    let mut doc = open_video_talk(dir.path(), slide);
+    let talk = doc.source().to_string();
+    let away = |starts: &[(Thing, Placed)]| starts.iter().map(|(_, placed)| Rect { x: placed.rect.x + 5000., y: placed.rect.y + 5000., ..bounds(placed) }).collect();
+    let (median, slowest, _, _) = drag_frames_of(&mut doc, &talk, slide, 1, away, here_and_there, |doc| {
+        assert!(doc.still_jobs().is_empty(), "a video moved keeps its still");
+    });
+    println!("median drag frame of a video on a talk of {VIDEO_SLIDES} videos: {median:?} (slowest {slowest:?})");
+    assert!(median < MOST_FOR_A_DRAG_FRAME, "a drag frame took {median:?}");
+}
+
+/// Opening a talk of twenty videos, as the window does: the talk read, every slide drawn small
+/// for the list of slides and the first drawn for the editor, a video shown as a plain panel
+/// until its still is made aside. That takes under half a second more than the same talk without
+/// its videos. Making the twenty stills after, one after another, is timed too.
+#[test]
+#[ignore = "timing; run in release"]
+fn opening_a_talk_of_twenty_videos_is_quick() {
+    let (plain, videos) = (video_talk_folder(false), video_talk_folder(true));
+    let open = |dir: &std::path::Path| {
+        let start = Instant::now();
+        let mut doc = Document::open(dir, Fonts::bundled_only()).unwrap();
+        doc.make_stills_aside(std::sync::Arc::new(|| {}));
+        for index in 0..doc.slide_count() {
+            assert!(doc.thumbnail(index, 192).is_some());
+        }
+        doc.editor_layers(1280. / 1920.);
+        (start.elapsed(), doc)
+    };
+    let (mut without, mut with, mut stills) = (Vec::new(), Vec::new(), Vec::new());
+    for _ in 0..5 {
+        without.push(open(plain.path()).0);
+        let (took, mut doc) = open(videos.path());
+        with.push(took);
+        let start = Instant::now();
+        assert_eq!(make_stills_now(&mut doc), VIDEO_SLIDES);
+        for index in 0..doc.slide_count() {
+            assert!(doc.thumbnail(index, 192).is_some());
+        }
+        stills.push(start.elapsed());
+    }
+    for times in [&mut without, &mut with, &mut stills] {
+        times.sort();
+    }
+    let (without, with, stills) = (without[2], with[2], stills[2]);
+    println!(
+        "opening a talk of {VIDEO_SLIDES} slides: {without:?} without videos, {with:?} with one on each; \
+         its {VIDEO_SLIDES} stills made after in {stills:?} (made videos, each picture one colour)"
+    );
+    assert!(with < without + Duration::from_millis(500), "opening took {with:?}, against {without:?} without videos");
+}
+
+/// A video 1920 by 1080, thirty pictures a second, played in the editor for 300 pictures, each
+/// waited for and shown in turn: how long the window's thread takes to take each picture from
+/// the decoding and make it the window's image, and how long the whole frame drawn with it takes.
+/// The window here draws nothing to a screen, so painting the picture isn't in it. The made
+/// video's pictures are one colour each, far easier to decode than filmed ones, which only the
+/// decoding's own thread feels.
+#[gpui_kit::test]
+#[ignore = "timing; run in release"]
+fn a_1080p_video_plays_to_the_canvas_quickly(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::AppContext as _;
+    use gpui_kit::test::TestWindowExt as _;
+    use stagepack_studio::slide_editor::VIDEO_PLAY_ID;
+    const FRAMES: u32 = 300;
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::write(folder.path().join("slides.md"), "# Played\n\n<Video src=\"assets/clip.mp4\" x=\"0\" y=\"0\" w=\"1920\" h=\"1080\" />\n").unwrap();
+    std::fs::create_dir(folder.path().join("assets")).unwrap();
+    let clip = slides_video::make_test_video(1920, 1080, FRAMES, 30, |at| [(at % 256) as u8, (255 - at % 256) as u8, 128, 255].repeat(1920 * 1080));
+    std::fs::write(folder.path().join("assets/clip.mp4"), clip).unwrap();
+    let typing = typing::open_folder(cx, folder, None);
+    let handle = typing.handle;
+    let draw = |cx: &mut gpui_kit::TestAppContext| {
+        cx.run_until_parked();
+        let start = Instant::now();
+        cx.update_window(handle, |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        start.elapsed()
+    };
+    let until = |cx: &mut gpui_kit::TestAppContext, what: &str, done: &dyn Fn(&mut gpui_kit::TestAppContext) -> bool| {
+        let began = Instant::now();
+        while !done(cx) {
+            draw(cx);
+            assert!(began.elapsed() < Duration::from_secs(30), "waited too long for {what}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    let document = typing.document(cx);
+    until(cx, "the still", &|cx| document.read_with(cx, |document, _| !document.stills_coming()));
+    typing.settle(cx);
+    let video = typing::thing(&typing, cx, "<Video");
+    let at = typing.at(cx, video.rect.x + video.rect.w / 5., video.rect.y + video.rect.h / 5.);
+    typing.click(cx, at);
+    typing::click_on(&typing, cx, VIDEO_PLAY_ID);
+    let canvas = cx.read(|cx| typing.view.read(cx).slide_canvas().clone());
+    let made = |cx: &gpui_kit::TestAppContext| cx.read(|cx| canvas.read(cx).video_images().0);
+    until(cx, "the first picture", &|cx| made(cx) >= 1);
+    let (mut taking, mut frames) = (Vec::new(), Vec::new());
+    let mut shown = made(cx);
+    while shown < FRAMES as usize {
+        // The next picture decoded, or the video done.
+        until(cx, "a picture decoded", &|cx| cx.read(|cx| canvas.read(cx).videos_queued().iter().all(|queued| *queued >= 1) || canvas.read(cx).playing_videos().is_empty()));
+        if cx.read(|cx| canvas.read(cx).playing_videos().is_empty()) {
+            break;
+        }
+        // A thirtieth of a second, a hair over, so that each picture is due in turn and none is skipped.
+        cx.executor().advance_clock(Duration::from_micros(33_334));
+        let took = draw(cx);
+        let now = made(cx);
+        if now > shown {
+            taking.push(cx.read(|cx| canvas.read(cx).last_video_advance()));
+            frames.push(took);
+        }
+        shown = now;
+    }
+    let (made, released) = cx.read(|cx| canvas.read(cx).video_images());
+    assert!(made >= FRAMES as usize - 1, "{made} of {FRAMES} pictures shown");
+    assert!(released + 1 >= made, "{made} made and {released} released");
+    taking.sort();
+    frames.sort();
+    let at = |times: &[Duration], part: f64| times[((times.len() - 1) as f64 * part).round() as usize];
+    println!(
+        "a 1920 by 1080 video played for {} pictures: taking each picture to the window, median {:?}, 99th percentile {:?}; \
+         the whole frame drawn with it, median {:?}, 99th percentile {:?} (made pictures, one colour each)",
+        taking.len(),
+        at(&taking, 0.5),
+        at(&taking, 0.99),
+        at(&frames, 0.5),
+        at(&frames, 0.99)
+    );
+    assert!(at(&taking, 0.5) < MOST_FOR_A_DRAG_FRAME, "taking a picture took {:?}", at(&taking, 0.5));
 }

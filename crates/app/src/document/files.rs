@@ -8,6 +8,23 @@ impl Document {
         self.files.len(path).is_some()
     }
 
+    /// What lists the talk's pictures, by their paths, in name order, as its files are now:
+    /// those a video's still can be. It reads the talk's folder, so it's for another thread.
+    pub fn picture_files(&self) -> impl FnOnce() -> Vec<String> + Send + 'static {
+        let files = self.files.clone();
+        move || {
+            let pictures = FileKind::Picture.extensions();
+            files
+                .names_in(FileKind::Picture.folder())
+                .into_iter()
+                .filter(|path| {
+                    let extension = path.rsplit_once('.').map(|(_, extension)| extension.to_ascii_lowercase());
+                    extension.is_some_and(|extension| pictures.contains(&extension.as_str()))
+                })
+                .collect()
+        }
+    }
+
     /// Adds `bytes` to the talk as a file of `kind`, named as like `suggested` as is safe, and
     /// returns its path in the talk, as the text names it. A file the talk has with the same
     /// bytes, saved or added, is that file. A name it has already is numbered, but a component's
@@ -45,7 +62,8 @@ impl Document {
         added_files::read_outside(path)
     }
 
-    /// The files added to the talk that its text uses and no save has written yet, for a save.
+    /// The files added to the talk that its text uses and no save has written yet, held in
+    /// memory: those but the large files, which lie on disk.
     pub fn added_files(&self) -> Vec<(String, Arc<[u8]>)> {
         let talk = self.talk();
         self.pending
@@ -57,12 +75,22 @@ impl Document {
 
     /// The files a save writes besides the text: those added to the talk that its text uses and
     /// no save has written yet, and for an untitled talk the files it was made with that its
-    /// text uses. A file its text no longer uses is never written.
-    pub fn files_to_write(&self) -> Vec<(String, Arc<[u8]>)> {
+    /// text uses. A file its text no longer uses is never written. A large file, such as a
+    /// video, is given by where it lies, never its bytes.
+    pub fn files_to_write(&self) -> Vec<(String, AddedFile)> {
         let talk = self.talk();
-        let mut files: Vec<(String, Arc<[u8]>)> =
-            self.untitled_files.iter().filter(|(path, _)| talk_uses(talk, &*self.files, path)).cloned().collect();
-        files.extend(self.added_files());
+        let mut files: Vec<(String, AddedFile)> = self
+            .untitled_files
+            .iter()
+            .filter(|(path, _)| talk_uses(talk, &*self.files, path))
+            .map(|(path, bytes)| (path.clone(), AddedFile::Bytes(bytes.clone())))
+            .collect();
+        files.extend(
+            self.pending
+                .iter()
+                .filter(|path| talk_uses(talk, &*self.files, path))
+                .filter_map(|path| Some((path.clone(), self.added.file(path)?))),
+        );
         files
     }
 
@@ -72,9 +100,16 @@ impl Document {
         !self.files.names_in(FileKind::ComponentSource.folder()).is_empty()
     }
 
-    /// The files added to the talk that no save has written, used or not, for its working copy.
+    /// The files added to the talk that no save has written, used or not, held in memory: those
+    /// but the large files, which lie on disk.
     pub fn unsaved_files(&self) -> Vec<(String, Arc<[u8]>)> {
         self.pending.iter().filter_map(|path| Some((path.clone(), self.added.get(path)?))).collect()
+    }
+
+    /// The files added to the talk that no save has written, used or not, for its working copy:
+    /// held, or, for a large file, by where it lies.
+    pub fn unsaved_added(&self) -> Vec<(String, AddedFile)> {
+        self.pending.iter().filter_map(|path| Some((path.clone(), self.added.file(path)?))).collect()
     }
 
     /// Changes each time a file is added to the talk.

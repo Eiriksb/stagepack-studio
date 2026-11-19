@@ -18,8 +18,8 @@ use crate::text_geometry::{LayerText, RegionBox, TextLayout};
 use crate::timeline::MAX_CLICK;
 use crate::render::device_offset;
 use crate::{
-    ComponentAsks, ComponentInfo, DisplayItem, Fonts, Layer, LayerSpec, LayerTiming, LayoutEnv, Moment, PictureCache, Placing, SlideTimeline,
-    SchemaLoad, TalkComponents, TalkFiles, Transition, builtin_registry, compose, render_layer, talk_theme,
+    ComponentAsks, ComponentInfo, DisplayItem, Fonts, Layer, LayerSpec, LayerTiming, LayoutEnv, Moment, MadeStill, PictureCache, Placing,
+    SlideTimeline, SchemaLoad, MeasureVideo, StillJob, StillWanted, TalkComponents, TalkFiles, Transition, VideoLayer, builtin_registry, compose, render_layer, talk_theme,
 };
 
 /// How many scales of one slide are kept drawn. A zoom or a resize asks for many in a row.
@@ -111,6 +111,8 @@ struct Laid {
     transition: Transition,
     /// Whether it shows a picture from a file of the talk, and so holds that picture in memory.
     holds_pictures: bool,
+    /// The videos whose stills it shows, or the panel shown while one is made.
+    stills: Vec<String>,
     asks: ComponentAsks,
     /// Where each layer's text is, beside `specs`.
     texts: Vec<LayerText>,
@@ -462,7 +464,7 @@ impl Deck {
         self.clear_placing();
         self.files = Rc::from(files);
         self.components = TalkComponents::scan_for(self.files.clone(), &self.registry);
-        self.pictures.clear();
+        self.pictures.files_replaced(&*self.files);
         self.files_generation += 1;
         for slide in &mut self.slides {
             slide.laid = None;
@@ -487,6 +489,7 @@ impl Deck {
     /// to find it by. Its components are looked at again too. Pictures read already are kept.
     pub fn files_added(&mut self) -> Vec<usize> {
         self.components.rescan(&self.registry);
+        self.pictures.drop_replaced_stills(&*self.files);
         self.files_generation += 1;
         let talk = self.talk.clone();
         self.take_talk(talk, true, Matching::ByPlace)
@@ -605,6 +608,95 @@ impl Deck {
     /// out on. The slide being asked for keeps its pictures, however much they take alone.
     pub fn set_picture_budget(&mut self, bytes: usize) {
         self.pictures.set_memory_budget(bytes);
+    }
+
+    /// Leaves videos' stills to be made aside from now on, as the window's thread mustn't decode
+    /// a video: `wanted` is told, on the thread laying a slide out, each time one is wanted, and
+    /// [`Self::still_jobs`] then gives it, to be made on another thread and taken in with
+    /// [`Self::take_still`]. Until then a video shows a plain panel, as large as `measure`, which
+    /// decodes nothing, says the video is. Without this, a still is made on the thread that lays
+    /// its slide out.
+    pub fn make_stills_aside(&mut self, wanted: StillWanted, measure: MeasureVideo) {
+        self.pictures.make_stills_aside(wanted, measure);
+    }
+
+    /// The stills wanted to be made aside since last asked.
+    pub fn still_jobs(&mut self) -> Vec<StillJob> {
+        self.pictures.still_jobs()
+    }
+
+    /// Takes in a still made aside, and returns the slides showing it, which are laid out again
+    /// when next asked for.
+    pub fn take_still(&mut self, made: MadeStill) -> Vec<usize> {
+        let Some(made) = self.pictures.take_still(made) else {
+            return Vec::new();
+        };
+        let mut changed = Vec::new();
+        for (index, slide) in self.slides.iter_mut().enumerate() {
+            let at_moment = slide.at_moment.as_ref().map(|(_, laid)| laid);
+            let shows = slide.laid.iter().chain(at_moment).chain(&slide.placed).any(|laid| laid.stills.contains(&made));
+            if !shows {
+                continue;
+            }
+            slide.laid = None;
+            slide.at_moment = None;
+            slide.placed = None;
+            slide.thumbnail = None;
+            for scale in slide.drawn.values_mut() {
+                scale.slide_changed();
+            }
+            self.versions_made += 1;
+            slide.version = self.versions_made;
+            changed.push(index);
+        }
+        for index in &changed {
+            self.slides_holding_pictures.remove(index);
+        }
+        changed
+    }
+
+    /// Whether any video's still is being made aside.
+    pub fn stills_coming(&self) -> bool {
+        self.pictures.stills_coming()
+    }
+
+    /// The plain sentence saying why the video at `source` on slide `index` can't be played, if
+    /// it's a video and its still has been tried and it can't. It's among the slide's notices too.
+    pub fn video_problem(&mut self, index: usize, source: &std::ops::Range<usize>) -> Option<String> {
+        if index >= self.slides.len() {
+            return None;
+        }
+        let src = self.specs(index).iter().find(|spec| spec.source.as_ref() == Some(source))?.video.as_ref()?.src.clone();
+        self.pictures.still_problem(&src).map(|why| why.to_string())
+    }
+
+    /// Whether the video `src`, with the still `poster` names if it names one, is drawn as a
+    /// picture once its slide is laid out: its first picture, or that still, could be shown.
+    /// What laying the slide out found is what's said: ask once it's laid out. A still made and
+    /// let go of since, to keep within the budget, was a picture.
+    pub fn video_shows_a_picture(&mut self, src: &str, poster: Option<&str>) -> bool {
+        let src = src.trim();
+        let made = !src.is_empty() && self.pictures.still_problem(src).is_none();
+        let poster = poster.map(str::trim).filter(|poster| !poster.is_empty());
+        made || poster.is_some_and(|poster| self.pictures.get(poster, &*self.files).is_some())
+    }
+
+    /// The videos on slide `index` in its whole state, among its layers as `specs` and `layers`
+    /// give them, with the deck's placing.
+    pub fn videos(&mut self, index: usize) -> Vec<VideoLayer> {
+        if index >= self.slides.len() {
+            return Vec::new();
+        }
+        videos_of(self.specs(index))
+    }
+
+    /// The videos on slide `index` at `moment`, among its layers as `layers_at` gives them then.
+    pub fn videos_at(&mut self, index: usize, moment: Moment) -> Vec<VideoLayer> {
+        if index >= self.slides.len() {
+            return Vec::new();
+        }
+        let moment = self.ensure_laid_at(index, moment);
+        videos_of(&self.slides[index].laid_at(moment).specs)
     }
 
     /// The pixel bytes of the talk's pictures in memory. A picture many slides show counts once.
@@ -1163,20 +1255,21 @@ impl Deck {
     }
 
     fn lay_out_placed(&mut self, index: usize, moment: Moment, placing: &[Placing]) -> Laid {
+        self.pictures.take_stills_asked();
         let laid = self.with_layout_env(moment, |talk, env| layout_slide_placed(talk, index, env, placing));
+        let stills = self.pictures.take_stills_asked();
         let keys = laid.layers.iter().map(|spec| self.layer_key(index, moment, spec)).collect();
         let notices = laid.notices.into_iter().map(|notice| notice.0).collect();
-        let holds_pictures = laid
-            .layers
-            .iter()
-            .flat_map(|spec| &spec.items)
-            .any(|item| matches!(item, DisplayItem::Picture { src: Some(_), .. }));
+        // A video's still counts as a picture of the talk's.
+        let holds_pictures = !stills.is_empty()
+            || laid.layers.iter().flat_map(|spec| &spec.items).any(|item| matches!(item, DisplayItem::Picture { src: Some(_), .. }));
         Laid {
             specs: laid.layers,
             keys,
             notices,
             transition: laid.transition,
             holds_pictures,
+            stills,
             asks: laid.asks,
             texts: laid.texts,
             empty_regions: laid.empty_regions,
@@ -1254,6 +1347,10 @@ impl Deck {
                     if (rect.w, rect.h) == (spec.rect.w, spec.rect.h) {
                         spec.rect = rect;
                         spec.rotate = rotate;
+                        if let Some(video) = &mut spec.video {
+                            video.rect = rect;
+                            video.rotate = rotate;
+                        }
                         laid.keys[at].place = place_bits(spec);
                     } else {
                         laid_again.push((at, range.clone(), placing.clone()));
@@ -1263,6 +1360,7 @@ impl Deck {
         }
         for (at, range, placing) in laid_again {
             let Some((spec, text)) = self.with_layout_env(moment, |talk, env| placed_tag_layer(talk, index, &range, &placing, env)) else { continue };
+            laid.stills.extend(self.pictures.take_stills_asked());
             laid.keys[at] = self.layer_key(index, moment, &spec);
             laid.specs[at] = spec;
             laid.texts[at] = text;
@@ -1318,6 +1416,15 @@ impl Deck {
         self.keep_within_budget(index);
         ordered
     }
+}
+
+/// The videos among `specs`.
+fn videos_of(specs: &[LayerSpec]) -> Vec<VideoLayer> {
+    specs
+        .iter()
+        .enumerate()
+        .filter_map(|(layer, spec)| Some(VideoLayer { layer, source: spec.source.clone(), click: spec.click, on: spec.video.clone()? }))
+        .collect()
 }
 
 impl SlideState {

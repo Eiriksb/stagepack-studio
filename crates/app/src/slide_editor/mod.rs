@@ -24,7 +24,7 @@ use crate::clipboard::{self, TextPaste};
 use crate::clipboard_tools::write_clipboard;
 use crate::document::{Beside, CellMove, Document, EditRefused};
 use crate::selection::{self, Thing};
-use crate::slide_canvas::{SLIDE_WIDTH, SlideCanvas, letterbox};
+use crate::slide_canvas::{SLIDE_WIDTH, SlideCanvas, VideoFailed, VideoLetGo, VideoOpened, letterbox};
 use crate::insert::TEXT_BOX_SIZE;
 use crate::text_editing::{Composing, EditingText, clean_typed, one_line, utf16_slice};
 use crate::text_tools::{
@@ -99,11 +99,17 @@ pub fn step_badge_id(n: usize) -> String {
     format!("step-badge-{n}")
 }
 
+/// The button in the middle of a video selected that plays it, and that stops it while it plays.
+pub const VIDEO_PLAY_ID: &str = "video-play";
+pub const VIDEO_STOP_ID: &str = "video-stop";
+
 /// The key context the editor's keys apply in, while text is being typed.
 pub const EDITOR_CONTEXT: &str = "SlideEditor";
 /// The key context the editor's keys apply in while a thing on the slide is selected and no
 /// text is being typed.
 pub const SELECTION_CONTEXT: &str = "SlideSelection";
+/// The key context added to [`SELECTION_CONTEXT`] while the one thing selected is a video.
+pub const VIDEO_CONTEXT: &str = "SlideVideo";
 
 /// How long the caret shows, and then doesn't, as it blinks.
 const BLINK: Duration = Duration::from_millis(500);
@@ -205,6 +211,8 @@ pub struct SlideEditor {
     show_steps: bool,
     /// The colours the marks over the slide were last drawn in.
     painted: MarkColors,
+    /// The video selected that was played, while it's let play.
+    playing: Option<selecting::PlayingHere>,
 
     /// Where the caret and any composition were last drawn, so that the system's input method
     /// is told when they move, and only then.
@@ -253,16 +261,34 @@ impl SlideEditor {
                     this.end_editing(false, window, cx)
                 }
             }),
-            // The window losing the keyboard ends a drag, writing nothing.
+            // The window losing the keyboard ends a drag, writing nothing, and stops a video.
             cx.observe_window_activation(window, |this, window, cx| {
                 if !window.is_window_active() {
                     this.end_drag(cx);
+                    this.stop_video(cx);
                 }
             }),
         ];
         if let Some(document) = &document {
             subscriptions.push(cx.observe_in(document, window, |this, _, window, cx| {
                 this.document_changed(window, cx)
+            }));
+        }
+        // A save let go of the file of the video playing: it's opened again once that's done.
+        subscriptions.push(cx.subscribe(&canvas, |this, _, _: &VideoLetGo, cx| this.keep_playing_only_what_holds(cx)));
+        // A video that couldn't go on says why.
+        subscriptions.push(cx.subscribe(&canvas, |_, _, failed: &VideoFailed, cx| {
+            cx.emit(EditorEvent::Said(failed.0.to_string().into()));
+        }));
+        // A video opened to play may have been unpacked: a still that waited for that is made.
+        if let Some(document) = document.clone() {
+            subscriptions.push(cx.subscribe(&canvas, move |_, _, _: &VideoOpened, cx| {
+                document.update(cx, |document, cx| {
+                    // The form reads a video's facts that waited for it to be unpacked.
+                    if document.try_waiting_stills_again() {
+                        cx.notify();
+                    }
+                });
             }));
         }
         // A shortcut pressed while the system composes ends the composition, before anything
@@ -310,6 +336,7 @@ impl SlideEditor {
             menu_on: None,
             show_steps: false,
             painted: MarkColors::default(),
+            playing: None,
             ime_place: None,
             _subscriptions: subscriptions,
         }
@@ -405,6 +432,7 @@ impl SlideEditor {
                 self.away.focus(window, cx);
             }
         }
+        self.keep_playing_only_what_holds(cx);
         self.tell_selection(cx);
         cx.notify();
     }

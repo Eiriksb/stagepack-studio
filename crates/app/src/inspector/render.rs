@@ -22,6 +22,7 @@ impl Render for Inspector {
             }
         };
         self.follow_talk(&values, window, cx);
+        let (facts, video_problem) = self.video_said(cx);
         for image in self.retired.drain(..) {
             window.drop_image(image).ok();
         }
@@ -107,6 +108,28 @@ impl Render for Inspector {
                         .text_sm()
                         .text_color(muted)
                         .child(message),
+                )
+            })
+            .when_some(facts.map(SharedString::from), |this, facts| {
+                this.child(
+                    div()
+                        .id(INSPECTOR_VIDEO_FACTS_ID)
+                        .test_support()
+                        .aria_label(facts.clone())
+                        .text_sm()
+                        .text_color(muted)
+                        .child(facts),
+                )
+            })
+            .when_some(video_problem.map(SharedString::from), |this, problem| {
+                this.child(
+                    div()
+                        .id(INSPECTOR_VIDEO_PROBLEM_ID)
+                        .test_support()
+                        .aria_label(problem.clone())
+                        .text_sm()
+                        .text_color(cx.theme().danger)
+                        .child(problem),
                 )
             })
             .children(table)

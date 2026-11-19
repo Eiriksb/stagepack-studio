@@ -1,22 +1,50 @@
-//! Putting things on the slide from the window: pictures chosen in the system's dialog, dropped
-//! on the slide or pasted, shapes and text boxes from the Insert tab.
+//! Putting things on the slide from the window: pictures and videos chosen in the system's
+//! dialog, dropped on the slide or pasted, shapes and text boxes from the Insert tab.
 
 use super::*;
-use crate::added_files::{MAX_ADDED_BYTES, NotAdded};
+use crate::added_files::{FileKind, MAX_ADDED_BYTES, NotAdded};
+use crate::clipboard::{LargeCopied, PastedFiles};
 use crate::clipboard_tools::ClipboardThing;
-use crate::document::InsertFailed;
+use crate::document::{InsertFailed, LargeCopy};
 use crate::insert::{ICON_SIZE, INSERT_ICON};
+use crate::large_files::{LargeSource, ask_before_copying, ask_to_copy};
+use slides_video::CantPlay;
 
-/// What the window says when a file that isn't a picture is dropped on the slide.
-pub const ONLY_PICTURES: &str = "Only pictures can be dropped on a slide.";
+/// What the window says when a file that isn't a picture or a video is dropped on the slide.
+pub const ONLY_PICTURES: &str = "Only pictures and videos can be dropped on a slide.";
 /// What the window says when the dialog to choose pictures couldn't be shown.
 pub const DIALOG_FAILED: &str = "The file chooser couldn't be opened.";
 /// The most files a drop, a paste of files, or the dialog puts on the slide.
 pub const MOST_DROPPED: usize = 20;
 /// What the window says when more files than that were dropped or chosen.
-pub const ONLY_THE_FIRST: &str = "Only the first 20 pictures were added.";
+pub const ONLY_THE_FIRST: &str = "Only the first 20 files were added.";
 /// What a picture pasted from the clipboard is named, as like as is safe.
 const PASTED_PICTURE: &str = "pasted-picture.png";
+/// What the status line says while a video is copied into the talk.
+const COPYING_VIDEO: &str = "Copying video";
+
+/// A video waiting to be copied in, from the file at `path`, and put on slide `slide`, the slide
+/// shown when it was asked for.
+pub(super) struct WaitingVideo {
+    path: PathBuf,
+    slide: usize,
+}
+
+/// Why a large file wasn't copied in: what's said of it, and whether it was cancelled.
+struct NotCopied {
+    said: String,
+    cancelled: bool,
+}
+
+/// What pastes, once the large files a paste carries are copied in, or not.
+type Paste = Box<dyn FnOnce(&mut WorkspaceView, PastedFiles, &mut Context<WorkspaceView>)>;
+
+/// A paste waiting to be told whether to copy the large files it carries into the talk.
+struct WaitingPaste {
+    copies: Vec<(usize, LargeCopy)>,
+    files: PastedFiles,
+    paste: Paste,
+}
 
 impl WorkspaceView {
     /// Asks for pictures in the system's dialog, and puts each on the slide.
@@ -48,34 +76,148 @@ impl WorkspaceView {
         .detach();
     }
 
+    /// Asks for videos in the system's dialog, and puts each on the slide.
+    pub(super) fn ask_for_videos(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.document.is_none() {
+            return;
+        }
+        let chosen = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Insert".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            match chosen.await {
+                Ok(Ok(Some(paths))) => {
+                    this.update(cx, |this, cx| this.chosen_videos(paths, cx)).ok();
+                }
+                Ok(Err(_)) => {
+                    this.update(cx, |this, cx| this.say(DIALOG_FAILED, cx)).ok();
+                }
+                _ => {}
+            }
+        })
+        .detach();
+    }
+
     /// Puts the pictures in the files at `paths` on the slide, each in turn, one step each, as
     /// the dialog to choose them gives them, the first [`MOST_DROPPED`] of them. What isn't a
-    /// picture is said, and left out.
+    /// picture is said, and left out. A video among them is copied in, and put on the slide
+    /// once it's there.
     pub fn chosen_pictures(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         self.insert_files(paths, false, cx);
     }
 
-    /// Puts the pictures in the files at `paths`, dropped on the slide from outside the app, on
-    /// it, each in turn, one step each, the first [`MOST_DROPPED`] of them. A file that isn't a
-    /// picture is said, and left out.
+    /// Puts the videos in the files at `paths`, as the Video tool's dialog gives them, the first
+    /// [`MOST_DROPPED`] of them, on the slide, each once it's copied into the talk, the status
+    /// line showing how far that's got. A file that isn't a video is said, and left out.
+    pub fn chosen_videos(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let more = paths.len() > MOST_DROPPED;
+        for path in paths.into_iter().take(MOST_DROPPED) {
+            if is_video(&path) {
+                self.insert_video_file(path, cx);
+            } else {
+                self.say(CantPlay::NotAVideo.to_string(), cx);
+            }
+        }
+        if more {
+            self.say_later(ONLY_THE_FIRST, cx);
+        }
+    }
+
+    /// Puts the pictures and videos in the files at `paths`, dropped on the slide from outside
+    /// the app, on it, each in turn, one step each, the first [`MOST_DROPPED`] of them. A file
+    /// that's neither is said, and left out.
     pub(super) fn dropped(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         self.insert_files(paths, true, cx);
     }
 
-    /// Puts the pictures in the first [`MOST_DROPPED`] of the files at `paths` on the slide, and
-    /// says if there were more.
+    /// Puts the pictures and videos in the first [`MOST_DROPPED`] of the files at `paths` on the
+    /// slide, and says if there were more. A picture goes on at once; a video once it's copied in.
     fn insert_files(&mut self, paths: Vec<PathBuf>, dropped: bool, cx: &mut Context<Self>) {
         let more = paths.len() > MOST_DROPPED;
         for path in paths.iter().take(MOST_DROPPED) {
-            self.insert_file(path, dropped, cx);
+            if is_video(path) {
+                self.insert_video_file(path.clone(), cx);
+            } else {
+                self.insert_file(path, dropped, cx);
+            }
         }
         if more {
-            // After the status line has heard what's selected, so that this is what it says.
-            cx.spawn(async move |this, cx| {
-                this.update(cx, |this, cx| this.say(ONLY_THE_FIRST, cx)).ok();
-            })
-            .detach();
+            self.say_later(ONLY_THE_FIRST, cx);
         }
+    }
+
+    /// Puts `said` on the status line once the line has heard what's selected, so that this is
+    /// what it says: once the videos being copied in are all in, if any are.
+    fn say_later(&mut self, said: &'static str, cx: &mut Context<Self>) {
+        if self.video_copying {
+            self.said_after_videos = Some(said);
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            this.update(cx, |this, cx| this.say(said, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// Copies the video in the file at `path`, from outside the talk, into it, the status line
+    /// showing how far that's got, with a Cancel, and then puts it on the slide shown now, at its
+    /// own size, selected: that slide is shown again then, as any edit shows its slide. Videos are copied one at a time,
+    /// in the order they were asked for. Its headers are looked at first, off the window's
+    /// thread: a file that isn't a video is said, and nothing is copied. Cancelled or refused,
+    /// nothing is put on the slide; cancelled, the videos waiting after it aren't copied either.
+    fn insert_video_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(document) = &self.document else {
+            return;
+        };
+        let slide = document.read(cx).current();
+        self.videos_waiting.push_back(WaitingVideo { path, slide });
+        self.copy_next_video(cx);
+    }
+
+    /// Copies in the next video waiting, unless one is being copied. In a window closing, none is.
+    fn copy_next_video(&mut self, cx: &mut Context<Self>) {
+        if self.video_copying {
+            return;
+        }
+        if self.is_closing_window() {
+            self.videos_waiting.clear();
+            self.said_after_videos = None;
+            return;
+        }
+        let Some(WaitingVideo { path, slide }) = self.videos_waiting.pop_front() else {
+            if let Some(said) = self.said_after_videos.take() {
+                self.say_later(said, cx);
+            }
+            return;
+        };
+        self.video_copying = true;
+        let finished = move |this: &mut Self, copied: Result<(String, (u32, u32)), NotCopied>, cx: &mut Context<Self>| {
+            this.video_copying = false;
+            match copied {
+                Ok((name, size)) => {
+                    this.edit(|document| document.insert_video_on(slide, name, size), cx);
+                    // Its Delete and its arrow keys are the slide's, as a picture's are once it's put on.
+                    let (window, view) = (this.window_handle, cx.weak_entity());
+                    cx.defer(move |cx| {
+                        window
+                            .update(cx, |_, window, cx| view.update(cx, |view, cx| view.keyboard_to_the_slide(window, cx)).ok())
+                            .ok();
+                    });
+                }
+                Err(NotCopied { said, cancelled }) => {
+                    if cancelled {
+                        this.videos_waiting.clear();
+                        this.said_after_videos = None;
+                    }
+                    this.say(said, cx);
+                }
+            }
+            this.copy_next_video(cx);
+        };
+        self.copy_in_looked_at(FileKind::Video, path, video_shape, finished, cx);
     }
 
     /// Puts the picture in the file at `path`, from outside the talk, on the slide.
@@ -126,6 +268,216 @@ impl WorkspaceView {
         }
     }
 
+    /// Copies the large file at `path`, of `kind`, such as a video, into the talk on a background
+    /// task, the status line showing how far it's got, with a Cancel, and then hands its path in
+    /// the talk to `then`. Why it wasn't copied is said instead, and a copy cancelled or refused
+    /// leaves nothing.
+    pub fn copy_in_large_file(
+        &mut self,
+        kind: FileKind,
+        path: PathBuf,
+        then: impl FnOnce(&mut Self, String, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let finished = move |this: &mut Self, copied: Result<(String, ()), NotCopied>, cx: &mut Context<Self>| match copied {
+            Ok((path, ())) => then(this, path, cx),
+            Err(why) => this.say(why.said, cx),
+        };
+        self.copy_in_looked_at(kind, path, |_| Ok(()), finished, cx);
+    }
+
+    /// [`Self::copy_in_large_file`], looking at the file with `look` first, on the same
+    /// background task, before anything is copied: what it finds is handed to `finished` with
+    /// the path, or why the file wasn't copied: `look` refused it, or the copy was refused or
+    /// cancelled. Whatever comes of it, `finished` hears of it once, unless the window has gone.
+    fn copy_in_looked_at<Found: Send + 'static>(
+        &mut self,
+        kind: FileKind,
+        path: PathBuf,
+        look: impl FnOnce(&Path) -> Result<Found, String> + Send + 'static,
+        finished: impl FnOnce(&mut Self, Result<(String, Found), NotCopied>, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        let looked_at = path.clone();
+        let suggested = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+        let copy = match document.read(cx).large_copy(kind, &suggested, LargeSource::File(path), None) {
+            Ok(copy) => copy,
+            Err(why) => return finished(self, Err(NotCopied { said: why.to_string(), cancelled: false }), cx),
+        };
+        let meter = self.start_progress(COPYING_VIDEO, true, cx);
+        let running = meter.clone();
+        let start = move |_: &mut Self, cx: &mut Context<Self>| cx.spawn(async move |this, cx| {
+            let copied = cx
+                .background_spawn(async move {
+                    // Refused, the copy is dropped, and with it the room kept for it.
+                    let found = look(&looked_at)?;
+                    Ok::<_, String>((found, copy.run(&|done, total| running.tell(done, total), running.stop())))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                // Stopped, by its Cancel or the window closing, it counts as cancelled however it
+                // came back: nothing waiting after it is copied.
+                let stopped = meter.stop.load(std::sync::atomic::Ordering::SeqCst);
+                this.end_progress(&meter, cx);
+                let (found, copied) = match copied {
+                    Ok(copied) => copied,
+                    Err(said) => return finished(this, Err(NotCopied { said, cancelled: stopped }), cx),
+                };
+                let taken = document.update(cx, |document, cx| {
+                    let taken = document.take_large_copy(copied);
+                    cx.notify();
+                    taken
+                });
+                let copied = match taken {
+                    Ok(path) => Ok((path, found)),
+                    Err(why) => Err(NotCopied { said: why.to_string(), cancelled: stopped || why == NotAdded::Cancelled }),
+                };
+                finished(this, copied, cx);
+            })
+            .ok();
+        })
+        .detach();
+        self.start_work(false, start, cx);
+    }
+
+    /// Copies the large files `files` carries that `markdown`, a pasted thing's or slide's, uses
+    /// into the talk first, then pastes with `paste`, each marked with what became of it. One
+    /// that's gone, or changed, since it was copied isn't copied. More than
+    /// [`ask_before_copying`] is copied only once whoever pasted says to; told not to, the paste
+    /// goes on without them. Cancelled while they're copied, nothing is pasted, and nothing is
+    /// left.
+    pub(super) fn bring_large_first(
+        &mut self,
+        markdown: &str,
+        mut files: PastedFiles,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        paste: impl FnOnce(&mut Self, PastedFiles, &mut Context<Self>) + 'static,
+    ) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        let mut copies = Vec::new();
+        for at in document.read(cx).large_to_bring(markdown, &files) {
+            match document.read(cx).large_copy_for_paste(&files.large[at]) {
+                Ok(copy) => copies.push((at, copy)),
+                // Not where the copy said, or not as it was.
+                Err(NotAdded::Unreadable | NotAdded::Changed) => files.large[at].copied = LargeCopied::Gone,
+                Err(why) => files.large[at].copied = LargeCopied::Refused(why),
+            }
+        }
+        if copies.is_empty() {
+            return paste(self, files, cx);
+        }
+        let bytes: u64 = copies.iter().map(|(_, copy)| copy.len()).sum();
+        let waiting = WaitingPaste { copies, files, paste: Box::new(paste) };
+        if bytes <= ask_before_copying() {
+            return self.copy_large_then(waiting, cx);
+        }
+        if window.has_active_dialog(cx) {
+            // Nothing is asked while another question is up, so nothing is pasted.
+            return self.say(crate::clipboard::ANSWER_FIRST, cx);
+        }
+        let asked = ask_to_copy(waiting.copies.len(), bytes);
+        let waiting = std::rc::Rc::new(std::cell::RefCell::new(Some(waiting)));
+        let view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let answer = |copy: bool| {
+                let (view, waiting) = (view.clone(), waiting.clone());
+                move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                    window.close_dialog(cx);
+                    let Some(mut waiting) = waiting.borrow_mut().take() else { return };
+                    view.update(cx, |view, cx| {
+                        if copy {
+                            view.copy_large_then(waiting, cx);
+                        } else {
+                            for (at, _) in std::mem::take(&mut waiting.copies) {
+                                waiting.files.large[at].copied = LargeCopied::Declined;
+                            }
+                            (waiting.paste)(view, waiting.files, cx);
+                        }
+                    })
+                    .ok();
+                }
+            };
+            let cancelled = waiting.clone();
+            dialog
+                .title("Copy the video?")
+                // Escape, a click beside it, or its close button: nothing is pasted.
+                .on_cancel(move |_, _, _| {
+                    cancelled.borrow_mut().take();
+                    true
+                })
+                .child(asked.clone())
+                .footer(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(Button::new(DONT_COPY_LARGE_ID).ghost().label("Don't copy").on_click(answer(false)))
+                        .child(Button::new(COPY_LARGE_ID).primary().label("Copy").on_click(answer(true))),
+                )
+        });
+    }
+
+    /// Copies the large files `waiting` holds into the talk on a background task, the status line
+    /// showing how far it's got, with a Cancel, then pastes as it says.
+    fn copy_large_then(&mut self, waiting: WaitingPaste, cx: &mut Context<Self>) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        let WaitingPaste { copies, mut files, paste } = waiting;
+        let meter = self.start_progress(COPYING_VIDEO, true, cx);
+        let running = meter.clone();
+        let start = move |_: &mut Self, cx: &mut Context<Self>| cx.spawn(async move |this, cx| {
+            let copied = cx
+                .background_spawn(async move {
+                    let total: u64 = copies.iter().map(|(_, copy)| copy.len()).sum();
+                    let mut before = 0u64;
+                    let mut copied = Vec::new();
+                    for (at, copy) in copies {
+                        let len = copy.len();
+                        // A copy that hashes first counts its bytes twice: told as a share of its own.
+                        let told = |done: u64, of: u64| {
+                            let share = (u128::from(done) * u128::from(len)).checked_div(u128::from(of)).unwrap_or(0) as u64;
+                            running.tell(before + share, total);
+                        };
+                        let one = copy.run(&told, running.stop());
+                        before += len;
+                        let cancelled = one.refused() == Some(NotAdded::Cancelled);
+                        copied.push((at, one));
+                        if cancelled {
+                            break;
+                        }
+                    }
+                    copied
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.end_progress(&meter, cx);
+                if copied.iter().any(|(_, one)| one.refused() == Some(NotAdded::Cancelled)) {
+                    // Dropped, what was copied goes with it.
+                    drop(copied);
+                    return this.say(NotAdded::Cancelled.to_string(), cx);
+                }
+                for (at, one) in copied {
+                    let taken = document.update(cx, |document, _| document.take_large_copy(one));
+                    files.large[at].copied = match taken {
+                        Ok(path) => LargeCopied::To(path),
+                        Err(NotAdded::Changed) => LargeCopied::Gone,
+                        Err(why) => LargeCopied::Refused(why),
+                    };
+                }
+                paste(this, files, cx);
+            })
+            .ok();
+        })
+        .detach();
+        self.start_work(false, start, cx);
+    }
+
     /// Gives the slide the keyboard once a thing just put on it is selected there, from
     /// wherever it was, so that the next keys type in it or take it away. Left in the list of
     /// slides, Delete would take the whole slide away.
@@ -157,6 +509,27 @@ impl WorkspaceView {
         if let Some(document) = &self.document {
             document.update(cx, |_, cx| cx.notify());
         }
+    }
+}
+
+/// Whether the file at `path` is named as a video is.
+fn is_video(path: &Path) -> bool {
+    let extension = path.extension().map(|extension| extension.to_string_lossy().to_ascii_lowercase());
+    extension.is_some_and(|extension| FileKind::Video.extensions().contains(&extension.as_str()))
+}
+
+/// The size of the video in the file at `path`, outside the talk, from its headers alone, or why
+/// it isn't one, as a file with no video track isn't: for a background task. A video whose size
+/// can't be read, as one damaged or of a kind that isn't played, is still a video, and says why
+/// once it's on the slide: it's given the room a video's put in.
+fn video_shape(path: &Path) -> Result<(u32, u32), String> {
+    let mut file = std::fs::File::open(path).map_err(|_| NotAdded::Unreadable.to_string())?;
+    match slides_video::video_size(&mut file) {
+        Ok(size) => Ok(size),
+        // A file with no pictures in it is no video.
+        Err(CantPlay::NotAVideo | CantPlay::NoPicture) => Err(CantPlay::NotAVideo.to_string()),
+        Err(CantPlay::CouldNotRead) => Err(NotAdded::Unreadable.to_string()),
+        Err(_) => Ok((crate::insert::VIDEO_ROOM.0 as u32, crate::insert::VIDEO_ROOM.1 as u32)),
     }
 }
 

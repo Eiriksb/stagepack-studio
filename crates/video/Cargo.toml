@@ -1,0 +1,25 @@
+[package]
+name = "slides-video"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Makes small videos with the same library's encoder, for tests here and in the other crates.
+make = ["dep:bytes"]
+
+[dependencies]
+# Builds Cisco's decoder from source. Where `nasm` is installed it also builds the decoder's
+# assembly, which is faster; where it isn't, as on the machine this was written on, it falls
+# back to the same decoder in C alone. `OPENH264_NO_ASM` set while building makes every machine
+# build the C alone.
+openh264 = { workspace = true }
+mp4 = { workspace = true }
+yuvutils-rs = { workspace = true }
+# The type the container writer takes a sample's bytes in, at the version it uses.
+bytes = { version = "=1.12.1", optional = true }
+
+[dev-dependencies]
+# The tests make their own videos.
+slides-video = { path = ".", features = ["make"] }
+proptest = "1"

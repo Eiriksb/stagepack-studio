@@ -40,9 +40,12 @@ impl WorkspaceView {
         let text = std::mem::take(&mut found.text);
         let files = found.files.clone();
         let builds = found.builds.clone();
+        let large = found.large.clone();
         let recovered = document.update(cx, |document, cx| {
             let recovered = document.recover_with_builds(text.clone(), files, builds);
             if recovered.is_ok() {
+                // Taken into this window's own working copy, whatever becomes of last time's.
+                document.bring_back_large(large);
                 // A show of the talk has to know.
                 cx.notify();
             }
@@ -73,7 +76,34 @@ impl WorkspaceView {
 
     /// Closes the window once the changes to the working copies asked for are made: they'd
     /// be lost with it.
-    fn close_after_working_copies(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn close_after_working_copies(&mut self, cx: &mut Context<Self>) {
+        if self.closing_for_good {
+            return;
+        }
+        // A copy still running has no use now: it stops, and what it copied goes with it.
+        if !self.close_anyway && !self.finish_closing {
+            self.stop_before_closing();
+        }
+        self.close_when_idle = false;
+        // Nothing of the working copy goes while a save may be reading it, or until the talk is
+        // marked saved, nor while a copy stopped may still be writing to it: the window finishes
+        // closing once they've ended.
+        if self.close_waits() {
+            if self.save_waits() && !self.finish_closing {
+                self.say(CLOSING_AFTER_SAVE, cx);
+            }
+            self.finish_closing = true;
+            return;
+        }
+        self.finish_closing = false;
+        self.closing_for_good = true;
+        self.log_order("working copy let go");
+        self.working_copies.update(cx, |copies, cx| copies.let_go_closing(cx));
+        self.close_once_settled(cx);
+    }
+
+    /// Closes the window once the changes to the working copies asked for are made.
+    fn close_once_settled(&mut self, cx: &mut Context<Self>) {
         let settled = self.working_copies.update(cx, |copies, _| copies.settled());
         cx.spawn(async move |this, cx| {
             settled.await;
@@ -85,6 +115,8 @@ impl WorkspaceView {
     /// Does what the saving said to, once an event of its own has been taken in.
     fn follow(&mut self, effect: Effect, cx: &mut Context<Self>) {
         match effect {
+            // Nothing more is saved once the window is closing: the person said not to.
+            Effect::StartSave if self.is_closing_window() => self.save_flow = SaveFlow::Idle,
             Effect::StartSave => self.start_save(cx),
             Effect::Reload => {
                 if let Some(folder) = &self.talk_folder {
@@ -110,6 +142,9 @@ impl WorkspaceView {
     /// Saves the talk where it's kept, on a background task. An untitled talk is kept nowhere
     /// yet, so this is Save As for it.
     pub(super) fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_closing_window() {
+            return self.say(CLOSING_AFTER_SAVE, cx);
+        }
         let Some(document) = &self.document else {
             return;
         };
@@ -148,6 +183,9 @@ impl WorkspaceView {
     pub(super) fn ask_to_save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.document.is_none() {
             return;
+        }
+        if self.is_closing_window() {
+            return self.say(CLOSING_AFTER_SAVE, cx);
         }
         if window.has_active_dialog(cx) {
             // Nothing is asked, so nothing waits on an answer.
@@ -250,6 +288,12 @@ impl WorkspaceView {
                 }
             };
             this.update(cx, |this, cx| {
+                // Closed without saving while the dialog was up: nothing is saved, as the person
+                // said, and the working copy it would read from may be going.
+                if this.is_closing_window() {
+                    this.save_flow = SaveFlow::Idle;
+                    return;
+                }
                 // Typing may have gone on while the dialog was up.
                 this.settle_typing(cx);
                 let Some(document) = this.document.clone() else {
@@ -275,15 +319,56 @@ impl WorkspaceView {
         .detach();
     }
 
-    /// Runs `job`, which saves to the place called `name`, on a background task.
+    /// Runs `job`, which saves to the place called `name`, on a background task. One that moves a
+    /// large file shows how far it's got on the status line, with a Cancel. One that replaces the
+    /// talk's pack lets go of every reader of it first, as nothing may hold it open meanwhile.
     fn run_save(&mut self, job: SaveJob, name: String, cx: &mut Context<Self>) {
-        self.say(format!("{} {name}…", SAVING.doing), cx);
-        cx.spawn(async move |this, cx| {
-            let outcome = cx.background_spawn(async move { job.run() }).await;
-            this.update(cx, |this, cx| this.finish_save(outcome, name, cx))
+        // Nothing more is saved once the window is closing.
+        if self.is_closing_window() {
+            self.save_flow = SaveFlow::Idle;
+            return;
+        }
+        let mut job = job;
+        if job.replaces_the_pack()
+            && let Some(document) = &self.document
+        {
+            // Nothing of the talk is opened until the save is done.
+            let document = document.read(cx);
+            let let_go = document.begin_saving_the_pack();
+            // What's being opened as it begins is waited for in the save's own work, not here.
+            job = job.reading_back(let_go > 0).waiting_for_opens(document.readers());
+        }
+        let meter = job.moves_large().then(|| self.start_progress(format!("{} {name}", SAVING.doing), false, cx));
+        if meter.is_none() {
+            self.say(format!("{} {name}…", SAVING.doing), cx);
+        }
+        let running = meter.clone();
+        self.saves_running += 1;
+        let start = move |_: &mut Self, cx: &mut Context<Self>| {
+            cx.spawn(async move |this, cx| {
+                let outcome = cx
+                    .background_spawn(async move {
+                        match running {
+                            Some(meter) => job.run_with(&|done, total| meter.tell(done, total), meter.stop()),
+                            None => job.run(),
+                        }
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.log_order("write done");
+                    this.saves_running = this.saves_running.saturating_sub(1);
+                    if let Some(meter) = &meter {
+                        this.end_progress(meter, cx);
+                    }
+                    this.finish_save(outcome, name, cx);
+                    // A window closing that waited for the save closes now.
+                    this.closing_may_go_on(cx);
+                })
                 .ok();
-        })
-        .detach();
+            })
+            .detach();
+        };
+        self.start_work(true, start, cx);
     }
 
     fn finish_save(
@@ -310,6 +395,7 @@ impl WorkspaceView {
                 let made_here = first && !document.read(cx).holds_component_source();
                 document.update(cx, |document, cx| {
                     document.saved(saved);
+                    self.log_order("marked saved");
                     cx.notify();
                 });
                 // What it kept is in the file now. Anything edited since is kept again.
@@ -324,6 +410,12 @@ impl WorkspaceView {
             Err(SaveError::ChangedOutside(theirs)) => (SaveOutcome::ChangedOutside, Some(theirs)),
             Err(problem) => (SaveOutcome::Failed(problem.to_string()), None),
         };
+        // Whatever came of it, and once the talk follows what was saved, its files can be opened
+        // again: everything the save let go of, or held back, is opened again.
+        document.update(cx, |document, cx| {
+            document.pack_save_ended();
+            cx.notify();
+        });
         let still_unsaved = document.read(cx).has_unsaved_changes();
         for effect in self.save_flow.finished(outcome, still_unsaved) {
             match effect {
@@ -412,6 +504,18 @@ impl WorkspaceView {
         if self.working_copies.read(cx).is_closing() {
             return true;
         }
+        if self.finish_closing {
+            // Closing already, once what it waits for has ended. Asked again, it no longer waits
+            // for copies it stopped, though it does for a save.
+            self.close_anyway = true;
+            self.closing_may_go_on(cx);
+            return false;
+        }
+        // A copy into the talk running is stopped first, and the window closes once it has ended.
+        // Asked again meanwhile, it goes ahead without waiting for it.
+        if self.stop_before_closing() {
+            return false;
+        }
         for effect in self.save_flow.ask_close(unsaved) {
             match effect {
                 Effect::Close => return self.close_now_or_once_settled(cx),
@@ -429,18 +533,25 @@ impl WorkspaceView {
     /// Whether the window, with nothing unsaved, can close now. If changes to the working
     /// copies are still to be made, it closes itself once they are.
     fn close_now_or_once_settled(&mut self, cx: &mut Context<Self>) -> bool {
-        // Back to what's saved within the wait: the copy still there goes first.
-        if self.working_copies.read(cx).holds_a_copy()
-            && let Some(document) = &self.document
-        {
-            let place = document.read(cx).place().clone();
-            self.working_copies
-                .update(cx, |copies, cx| copies.let_go(place, cx));
+        // A save running may be reading what the working copy holds: the window closes once it
+        // has ended, and been taken in.
+        if self.closing_for_good {
+            return false;
         }
-        // A change to the working copies still to be made, such as the clear after a save,
-        // would be lost with the window.
-        if self.working_copies.read(cx).has_jobs() {
+        if self.close_waits() {
             self.close_after_working_copies(cx);
+            return false;
+        }
+        // Back to what's saved within the wait: the copy still there goes first, and with it any
+        // video added that the talk no longer uses.
+        self.log_order("working copy let go");
+        self.working_copies.update(cx, |copies, cx| copies.let_go_closing(cx));
+        // A change to the working copies still to be made, such as the clear after a save,
+        // would be lost with the window: it closes itself once that's made. Otherwise whatever
+        // asked closes it, which may also think better of it.
+        if self.working_copies.read(cx).has_jobs() {
+            self.closing_for_good = true;
+            self.close_once_settled(cx);
             return false;
         }
         true
@@ -449,6 +560,10 @@ impl WorkspaceView {
     /// Takes in the answer to the dialog asking before the window closes. For an untitled talk,
     /// Save asks where first.
     fn answer_close(&mut self, answer: CloseAnswer, window: &mut Window, cx: &mut Context<Self>) {
+        if answer == CloseAnswer::Cancel {
+            // Not closing after all: a close asked for later waits for copies again.
+            self.close_anyway = false;
+        }
         let untitled = self.document.as_ref().is_some_and(|document| document.read(cx).is_untitled());
         let effects = if untitled {
             self.save_flow.answer_close_untitled(answer)
@@ -500,8 +615,12 @@ impl WorkspaceView {
     /// Closes this window, once nothing else is using it.
     fn close_window(&mut self, cx: &mut Context<Self>) {
         let window = self.window_handle;
+        let log = self.order_log.clone();
         cx.defer(move |cx| {
             window.update(cx, |_, window, _| window.remove_window()).ok();
+            if let Some(log) = log {
+                log.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push("window closed");
+            }
         });
     }
 

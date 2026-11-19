@@ -346,11 +346,11 @@ fn block_at<'a>(blocks: &'a [Block], range: &Range<usize>) -> Option<&'a Block> 
     })
 }
 
-/// Whether `block` is a thing that keeps its proportions: a picture or an icon.
+/// Whether `block` is a thing that keeps its proportions: a picture, an icon or a video.
 fn keeps_shape(block: &Block) -> bool {
     match block {
         Block::Picture { .. } => true,
-        Block::Tag(tag) => tag.name == PICTURE_TAG || tag.name == ICON_TAG,
+        Block::Tag(tag) => tag.name == PICTURE_TAG || tag.name == ICON_TAG || tag.name == crate::elements::VIDEO_TAG,
         _ => false,
     }
 }

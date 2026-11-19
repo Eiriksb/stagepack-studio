@@ -4,7 +4,7 @@ use slides_format::{Block, DEFAULT_LAYOUT, FlowPlace, Slide, Tag, Talk, Target};
 use tiny_skia::PathBuilder;
 use toolkit::{Color, Registry, Theme};
 
-use crate::elements::lay_out_positioned_tag;
+use crate::elements::{VIDEO_TAG, lay_out_positioned_tag};
 use crate::flow::{MAX_NOTICE_CHARS, flow_region, flow_region_each};
 use slides_components::shortened;
 use crate::timeline::{MAX_CLICK, RegionClick, read_region_timing, read_tag_timing, read_transition};
@@ -13,7 +13,7 @@ use crate::placeholder::placeholder_items;
 use crate::text_geometry::{LayerText, RegionBox};
 use crate::{
     Align, ComponentAsks, DisplayItem, Enter, Fonts, LayerSpec, LayoutDef, Moment, Notice, PictureCache, Rect, RegionDef, TalkComponents, TalkFiles, TextRun,
-    Transition, layout_by_name, shape_text,
+    Transition, VideoOn, layout_by_name, shape_text,
 };
 
 /// How wide and high a slide is, in slide units.
@@ -237,6 +237,7 @@ pub(crate) fn layout_slide_placed(talk: &Talk, index: usize, env: &mut LayoutEnv
                             // A slide has one title, so only the first piece is it.
                             is_title: is_title && step == 0,
                             varies,
+                            video: None,
                         });
                         texts.push(LayerText { region: Some((region.name, rect)), ..piece.text });
                     }
@@ -247,7 +248,7 @@ pub(crate) fn layout_slide_placed(talk: &Talk, index: usize, env: &mut LayoutEnv
         }
         let (drawing, varies) = noting_asks(env, |env| flow_region(blocks, region, rect.w, &theme, env, &mut notices));
         let (items, native) = (drawing.items, drawing.native);
-        layers.push(LayerSpec { source: Some(source), rect, rotate, items, click, enter: timing.enter, native, is_title, varies });
+        layers.push(LayerSpec { source: Some(source), rect, rotate, items, click, enter: timing.enter, native, is_title, varies, video: None });
         texts.push(LayerText { region: Some((region.name, rect)), ..drawing.text });
     }
     for block in &slide.blocks {
@@ -354,18 +355,44 @@ fn positioned_layer(tag: &Tag, placing: Option<&Placing>, theme: &Theme, env: &m
         }
     }
     let ((w, h), drawing) = lay_out_positioned_tag(tag, (place.w, place.h), place.align, theme, env, notices);
+    let rect = Rect { x: place.x.unwrap_or(0.0), y: place.y.unwrap_or(0.0), w, h };
+    let rotate = place.rotate.unwrap_or(0.0);
+    let video = (tag.name == VIDEO_TAG).then(|| VideoOn {
+        src: tag.attr("src").unwrap_or_default().trim().to_string(),
+        looped: read_loop(tag.attr("loop"), notices),
+        rect,
+        rotate,
+    });
     let layer = LayerSpec {
         source: Some(tag.range.clone()),
-        rect: Rect { x: place.x.unwrap_or(0.0), y: place.y.unwrap_or(0.0), w, h },
-        rotate: place.rotate.unwrap_or(0.0),
+        rect,
+        rotate,
         items: drawing.items,
         click: place.click,
         enter: place.enter,
         native: drawing.native,
         is_title: false,
         varies: false,
+        video,
     };
     (layer, drawing.text)
+}
+
+/// Whether a video's `loop` says to go round again: written bare, or as `true`, `yes` or `1`.
+/// `false`, `no` and `0` say not to, and anything else says not to and is a notice.
+fn read_loop(value: Option<&str>, notices: &mut Vec<Notice>) -> bool {
+    let Some(value) = value else { return false };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "true" | "yes" | "1" => true,
+        "false" | "no" | "0" => false,
+        _ => {
+            let notice = Notice(shortened(&format!("A video's loop can be yes or no, not {value}, so it plays once"), MAX_NOTICE_CHARS));
+            if !notices.contains(&notice) {
+                notices.push(notice);
+            }
+            false
+        }
+    }
 }
 
 /// Whether the text of any of `blocks`, at any depth, has an inline `<Text>` tag that asks for
@@ -529,6 +556,7 @@ pub(crate) fn empty_region_layer(region: &EmptyRegion, theme: &Theme, fonts: &mu
         native: Vec::new(),
         is_title: false,
         varies: false,
+        video: None,
     }
 }
 
@@ -545,6 +573,7 @@ fn error_layer(slide: &Slide, message: &str, theme: &Theme, fonts: &mut Fonts) -
         native: vec![placeholder_element(message, rect, theme)],
         is_title: false,
         varies: false,
+        video: None,
     }
 }
 
@@ -636,6 +665,7 @@ fn background(theme: &Theme) -> LayerSpec {
         native: Vec::new(),
         is_title: false,
         varies: false,
+        video: None,
     }
 }
 

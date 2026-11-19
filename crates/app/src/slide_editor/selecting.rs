@@ -2,6 +2,7 @@
 //! of them.
 
 use super::*;
+use crate::document::LargeOpen;
 
 impl SlideEditor {
     /// What's selected, if it's on the slide shown.
@@ -13,11 +14,88 @@ impl SlideEditor {
             .cloned()
     }
 
-    /// What the status line says of what's selected on the slide shown.
-    fn said_of_selection(&self, cx: &App) -> Option<SharedString> {
+    /// What the status line says of what's selected on the slide shown: of a video that can't be
+    /// played, why not, too.
+    fn said_of_selection(&self, cx: &mut App) -> Option<SharedString> {
         let selection = self.selection_here(cx)?;
-        let talk = self.document.as_ref()?.read(cx).talk();
-        selection::said_of_selection(talk, &selection).map(SharedString::from)
+        let document = self.document.clone()?;
+        let said = selection::said_of_selection(document.read(cx).talk(), &selection)?;
+        let problem = document.update(cx, |document, _| document.selected_video_said());
+        Some(match problem {
+            Some(problem) => format!("{said}. {problem}").into(),
+            None => said.into(),
+        })
+    }
+
+    /// Plays the video selected, from its start, or stops it while it plays, as its button and
+    /// Space do. With no video selected, the key goes on.
+    pub(super) fn play_or_stop(&mut self, cx: &mut Context<Self>) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        let Some(video) = document.update(cx, |document, _| document.selected_video()) else {
+            cx.propagate();
+            return;
+        };
+        if self.video_playing(cx) {
+            self.stop_video(cx);
+            return;
+        }
+        self.stop_video(cx);
+        let Some(source) = video.source.clone() else { return };
+        let opened = document.read(cx).open_large(&video.on.src);
+        let Some(opened) = opened else {
+            let said = document.update(cx, |document, _| document.selected_video_said());
+            let said = said.unwrap_or_else(|| slides_video::CantPlay::CouldNotRead.to_string());
+            cx.emit(EditorEvent::Said(said.into()));
+            return;
+        };
+        let (slide, talk) = {
+            let document = document.read(cx);
+            (document.current(), talk_hash(document.source()))
+        };
+        self.canvas.update(cx, |canvas, cx| canvas.play(video.layer, video.on, opened, cx));
+        self.playing = Some(PlayingHere { slide, source, talk });
+        cx.notify();
+    }
+
+    /// Whether the video selected is playing, or being opened to.
+    pub(super) fn video_playing(&self, cx: &App) -> bool {
+        self.playing.is_some() && !self.canvas.read(cx).playing_videos().is_empty()
+    }
+
+    /// Stops the video played, if one was, showing its still again.
+    pub fn stop_video(&mut self, cx: &mut Context<Self>) {
+        if self.playing.take().is_some() {
+            self.canvas.update(cx, |canvas, cx| canvas.stop_videos(cx));
+            cx.notify();
+        }
+    }
+
+    /// Stops the video played unless it's still the one thing selected, on the slide it was
+    /// played on, with the talk's text as it was; and opens it again once a save that let go of
+    /// its file is done.
+    pub(super) fn keep_playing_only_what_holds(&mut self, cx: &mut Context<Self>) {
+        let (Some(playing), Some(document)) = (self.playing.clone(), self.document.clone()) else {
+            return;
+        };
+        let holds = document.update(cx, |document, _| {
+            document.current() == playing.slide
+                && talk_hash(document.source()) == playing.talk
+                && document.selected_video().is_some_and(|video| video.source.as_ref() == Some(&playing.source))
+        });
+        if !holds {
+            self.stop_video(cx);
+            return;
+        }
+        let waiting = self.canvas.read(cx).videos_let_go();
+        if !waiting.is_empty() && !document.read(cx).saving_the_pack() {
+            let mut opened: Vec<(String, LargeOpen)> =
+                waiting.into_iter().filter_map(|src| Some((src.clone(), document.read(cx).open_large(&src)?))).collect();
+            self.canvas.update(cx, |canvas, cx| {
+                canvas.open_videos_again(|src| opened.iter().position(|(at, _)| at == src).map(|at| opened.swap_remove(at).1), cx)
+            });
+        }
     }
 
     /// Tells the status line what's selected, once that's changed, or that it's let go of.
@@ -221,6 +299,22 @@ impl SlideEditor {
                 .is_some_and(|selection| selection.slide == slide && selection.things.len() > 1 && selection.things.contains(thing))
         })
     }
+}
+
+/// The video selected that was played: the slide it's on, where it's written, and the talk's
+/// text then, by its hash.
+#[derive(Clone)]
+pub(super) struct PlayingHere {
+    slide: usize,
+    source: Range<usize>,
+    talk: u64,
+}
+
+fn talk_hash(text: &str) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// How far inside a cell of a table, in slide units, a click is on the cell rather than on the

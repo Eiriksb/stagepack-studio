@@ -50,6 +50,10 @@ impl Inspector {
                 if shape.message.is_none() && is_positioned(&tag) {
                     shape.specs.extend(Spec::place());
                 }
+                if tag.name == "Video" && shape.message.is_none() {
+                    let pictures = self.talk_pictures(&document, pick, cx);
+                    video_form(&mut shape, &tag, pictures);
+                }
                 shape.tag = Some(tag.name.clone());
                 Some(tag)
             }
@@ -59,6 +63,29 @@ impl Inspector {
             Values(shape.specs.iter().filter_map(|spec| Some((spec.attr.clone(), tag.attr(&spec.attr)?.to_string()))).collect())
         });
         Some((shape, Subject::Thing(selected), values))
+    }
+
+    /// The talk's pictures, for a video's still, as last read: they're read again off the
+    /// window's thread for each thing picked, and each time a file is added to the talk, and the
+    /// panel is drawn again once they're in.
+    fn talk_pictures(&mut self, document: &Entity<Document>, pick: u64, cx: &mut Context<Self>) -> Vec<String> {
+        let wanted = (pick, document.read(cx).files_added_stamp());
+        if self.pictures.read_for != Some(wanted) && self.pictures.reading != Some(wanted) {
+            self.pictures.reading = Some(wanted);
+            let read = document.read(cx).picture_files();
+            cx.spawn(async move |this, cx| {
+                let found = cx.background_spawn(async move { read() }).await;
+                this.update(cx, |this, cx| {
+                    if this.pictures.reading == Some(wanted) {
+                        this.pictures = Pictures { read_for: Some(wanted), reading: None, found };
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+        self.pictures.found.clone()
     }
 
     /// What the panel shows for several things selected on the slide shown, which is how many,
@@ -175,6 +202,21 @@ impl Inspector {
                     }));
                     Widget::Choice { select, choices }
                 }
+                Kind::Still(pictures) => {
+                    let first = Choice { value: String::new(), title: FIRST_FRAME.into() };
+                    let choices: Vec<Choice> = std::iter::once(first)
+                        .chain(pictures.iter().map(|path| Choice { value: path.clone(), title: file_name(path).to_string().into() }))
+                        .collect();
+                    let select = cx.new(|cx| SelectState::new(choices.clone(), None, window, cx));
+                    let attr = spec.attr.clone();
+                    subscriptions.push(cx.subscribe_in(&select, window, move |this, _, event: &SelectEvent<Vec<Choice>>, window, cx| {
+                        let SelectEvent::Confirm(Some(value)) = event else {
+                            return;
+                        };
+                        this.choose(&attr, value, window, cx);
+                    }));
+                    Widget::Choice { select, choices }
+                }
                 Kind::File(_) => Widget::File,
                 Kind::Icon => {
                     let picker = cx.new(|cx| IconPicker::new(window, cx));
@@ -230,6 +272,8 @@ impl Inspector {
                     }
                 }
                 Widget::Choice { select, choices } => {
+                    // A video with no still of its own shows its first frame.
+                    let value = if matches!(field.spec.kind, Kind::Still(_)) { Some(value.unwrap_or_default()) } else { value };
                     // An unknown value of a choice that has to be given draws as its first.
                     let at = value
                         .and_then(|value| choices.iter().position(|choice| choice.value == value))
@@ -243,6 +287,23 @@ impl Inspector {
             }
         }
     }
+}
+
+/// A video's form, from what its component's arguments gave: its still is chosen from
+/// `pictures`, the talk's, or its first frame, and its file is named above its fields.
+fn video_form(shape: &mut Shape, tag: &slides_format::Tag, mut pictures: Vec<String>) {
+    // One written by hand that isn't among them is still shown, as it's named.
+    if let Some(poster) = tag.attr("poster").filter(|poster| !poster.trim().is_empty() && !pictures.iter().any(|picture| picture == poster)) {
+        pictures.push(poster.to_string());
+    }
+    for spec in &mut shape.specs {
+        if spec.attr == "poster" {
+            spec.kind = Kind::Still(pictures.clone());
+        }
+    }
+    let src = tag.attr("src").unwrap_or_default().trim();
+    // One with no file says so below, in place of its name.
+    shape.message = (!src.is_empty()).then(|| file_name(src).to_string());
 }
 
 /// How big a table with `rows` is, as the Insert tab's grid counts: the heading row's columns,

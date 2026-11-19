@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/app", "crates/components", "crates/engine", "crates/format", "crates/pdf", "crates/pptx", "crates/toolkit", "crates/toolkit-macros"]
+members = ["crates/app", "crates/components", "crates/engine", "crates/format", "crates/pdf", "crates/pptx", "crates/toolkit", "crates/toolkit-macros", "crates/video"]
 
 [workspace.package]
 edition = "2024"
@@ -10,6 +10,10 @@ license = "MIT"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+# The video decoder, its container and its colour conversion, as the video spike used them.
+openh264 = "=0.9.10"
+mp4 = "=0.14.0"
+yuvutils-rs = "=0.8.3"
 
 # Debug info for GPUI is what makes builds use the most memory.
 [profile.dev.package."*"]

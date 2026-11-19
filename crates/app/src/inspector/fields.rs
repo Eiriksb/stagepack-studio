@@ -48,6 +48,8 @@ pub enum Kind {
     File(Vec<String>),
     /// Which of the bundled icons, chosen from the icon picker.
     Icon,
+    /// A video's still: its first frame, or one of these pictures of the talk's, by their paths.
+    Still(Vec<String>),
 }
 
 /// A setting as the form shows it: the attribute it writes, its label, its kind, whether it can
@@ -89,6 +91,9 @@ impl Spec {
         })
     }
 }
+
+/// What a video's still field calls its first frame, which is written as no still at all.
+pub const FIRST_FRAME: &str = "First frame";
 
 /// One choice of a choice field: the value written, and what it's called.
 #[derive(Clone)]

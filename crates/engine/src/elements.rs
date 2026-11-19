@@ -13,11 +13,24 @@ use toolkit::{Color, Ctx, CtxData, Element, Placed, Props, RenderInput, ShapeKin
 
 use crate::flow::{Content, Drawing, Flow, MAX_NOTICE_CHARS, TEXT_TAG, column, rounded_rect, rounded_rect_with};
 use slides_components::shortened;
-use crate::pictures::icon_pixmap;
-use crate::slide::{ALIGN_UNPLACED, MAX_SIZE, SLIDE_HEIGHT, SLIDE_WIDTH, is_positioned};
+use crate::pictures::{Still, icon_pixmap};
+use crate::slide::{ALIGN_UNPLACED, MAX_SIZE, SLIDE_HEIGHT, SLIDE_WIDTH, is_positioned, placeholder_color};
 use crate::native::Semantic;
 use crate::talk_components::{Rendered, read_asset};
 use crate::{Align, DisplayItem, LayoutEnv, NativeContent, Notice, PLACEMENT_ATTRS, PathStep, RegionDef, layout_by_name};
+
+/// The tag of a video on a slide.
+pub(crate) const VIDEO_TAG: &str = "Video";
+/// The room a video's own size is fitted within, when no size is written.
+const VIDEO_ROOM: (f32, f32) = (960.0, 540.0);
+/// What's said of a video written in the text, not placed on the slide.
+pub const VIDEO_IN_TEXT: &str = "This video plays only when it's placed on the slide. Drag it out of the text to place it.";
+/// What's said of a video that names no file to play.
+pub const VIDEO_NO_FILE: &str = "This video has no file. Insert a video to choose one.";
+/// What's said of a video whose named still can't be shown.
+const POSTER_UNREAD: &str = "The picture named to show for this video can't be shown, so its first picture shows instead.";
+/// The side of the play mark on the panel of a video with no still.
+const PLAY_MARK: f32 = 96.0;
 
 const DEFAULT_WIDTH: f32 = 400.0;
 const DEFAULT_HEIGHT: f32 = 200.0;
@@ -140,13 +153,19 @@ pub(crate) fn lay_out_positioned_tag(
     let room = (wanted.0.unwrap_or(POSITIONED_ROOM), wanted.1.unwrap_or(0.0));
     let mut flow = Flow::new(positioned_tag_region(), room.0, theme, env, notices);
     flow.box_align = align;
-    let element = flow.render_tag(tag, room);
-    let natural = element.as_ref().and_then(|element| flow.natural_size(element));
-    let (w, h) = box_size(wanted, natural);
-    let content = match element {
-        Some(element) => flow.tag_element(tag, &element, align.unwrap_or(Align::Left), true),
-        None => Some(flow.placeholder(tag.name.clone(), size_of(0.0, 0.0, true))),
+    let (natural, content) = if tag.name == VIDEO_TAG {
+        let (natural, node) = flow.video(tag, true);
+        (Some(natural), Some(node))
+    } else {
+        let element = flow.render_tag(tag, room);
+        let natural = element.as_ref().and_then(|element| flow.natural_size(element));
+        let content = match element {
+            Some(element) => flow.tag_element(tag, &element, align.unwrap_or(Align::Left), true),
+            None => Some(flow.placeholder(tag.name.clone(), size_of(0.0, 0.0, true))),
+        };
+        (natural, content)
     };
+    let (w, h) = box_size(wanted, natural);
     let content = if flow.over_budget() { Some(flow.too_much()) } else { content };
     let style = Style {
         size: Size { width: length(w), height: length(h) },
@@ -221,6 +240,10 @@ impl Flow<'_, '_> {
         }
         if tag.attr("align").is_some() {
             self.notice(ALIGN_UNPLACED.to_string());
+        }
+        if tag.name == VIDEO_TAG {
+            self.notice(VIDEO_IN_TEXT.to_string());
+            return Some(self.video(tag, false).1);
         }
         match self.render_tag(tag, (self.width, 0.0)) {
             Some(element) => self.tag_element(tag, &element, align, false),
@@ -358,6 +381,80 @@ impl Flow<'_, '_> {
         }
     }
 
+    /// A video's still: the picture its `poster` names, if that can be read, or else its first
+    /// picture, or else a plain panel with a play mark, while that's made or if it can't be.
+    /// Why it can't be played is a notice. Its own size is given too, fitted within
+    /// [`VIDEO_ROOM`], or the room itself while that isn't known.
+    fn video(&mut self, tag: &Tag, boxed: bool) -> ((f32, f32), NodeId) {
+        let src = tag.attr("src").unwrap_or_default().trim();
+        // One with no file is never looked for.
+        let still = if src.is_empty() { Still::Cannot(slides_video::CantPlay::CouldNotRead) } else { self.env.pictures.still(src, self.env.files) };
+        match &still {
+            Still::Cannot(_) if src.is_empty() => self.notice(VIDEO_NO_FILE.to_string()),
+            Still::Cannot(why) => self.notice(why.to_string()),
+            Still::Frame(..) | Still::Coming(_) => {}
+        }
+        let poster = tag.attr("poster").map(str::trim).filter(|poster| !poster.is_empty());
+        let poster = poster.and_then(|poster| {
+            let picture = self.env.pictures.get(poster, self.env.files);
+            if picture.is_none() {
+                self.notice(POSTER_UNREAD.to_string());
+            }
+            picture
+        });
+        let own = match &still {
+            Still::Frame(_, size) | Still::Coming(Some(size)) => Some(*size),
+            Still::Coming(None) | Still::Cannot(_) => None,
+        };
+        let natural = match own {
+            Some((w, h)) => fitted(w as f32, h as f32),
+            None => poster.as_ref().map_or(VIDEO_ROOM, |poster| fitted(poster.width() as f32, poster.height() as f32)),
+        };
+        let picture = match still {
+            Still::Frame(frame, _) => poster.or(Some(frame)),
+            Still::Cannot(_) | Still::Coming(_) => poster,
+        };
+        let node = match picture {
+            Some(picture) => {
+                let size = if boxed { size_of(0.0, 0.0, true) } else { size_of(natural.0, natural.1, false) };
+                self.leaf(Style { size, ..Style::default() }, Content::Picture(picture))
+            }
+            None if boxed => self.video_panel(size_when_empty(0.0, 0.0, true)),
+            None => self.video_panel(size_of(natural.0, natural.1, false)),
+        };
+        (natural, node)
+    }
+
+    /// A plain panel in the theme's colours, with a play mark in the middle.
+    fn video_panel(&mut self, size: Size<Dimension>) -> NodeId {
+        let triangle = vec![
+            PathStep::Move(PLAY_MARK * 0.25, PLAY_MARK * 0.15),
+            PathStep::Line(PLAY_MARK * 0.85, PLAY_MARK * 0.5),
+            PathStep::Line(PLAY_MARK * 0.25, PLAY_MARK * 0.85),
+            PathStep::Close,
+        ];
+        let mark_look = PathLook { steps: triangle, fill: Some(self.theme.background), stroke: None, stroke_width: 0.0 };
+        let mark_size = Size { width: length(PLAY_MARK), height: length(PLAY_MARK) };
+        let mark = self.leaf(Style { size: mark_size, flex_shrink: 0.0, ..Style::default() }, Content::Path(mark_look));
+        let look = ShapeLook {
+            kind: ShapeKind::Rect,
+            fill: Some(placeholder_color(self.theme)),
+            outline: None,
+            outline_width: 0.0,
+            radius: 0.0,
+            centered: true,
+        };
+        let style = Style {
+            size,
+            flex_direction: FlexDirection::Column,
+            justify_content: JustifyContent::CENTER,
+            align_items: AlignItems::CENTER,
+            overflow: taffy::Point { x: taffy::Overflow::Hidden, y: taffy::Overflow::Hidden },
+            ..Style::default()
+        };
+        self.node_with_content(style, &[mark], Content::Shape(look))
+    }
+
     fn icon(&mut self, name: &str, size: f32, color: Option<Color>, align: Align) -> NodeId {
         let size = icon_side(size);
         let box_size = Size { width: length(size), height: length(size) };
@@ -484,6 +581,16 @@ pub(crate) fn path_items(look: &PathLook, x: f32, y: f32) -> Vec<DisplayItem> {
     let fill = look.fill.map(|color| DisplayItem::Fill { path: path.clone(), color });
     let stroke = look.stroke.map(|color| DisplayItem::Stroke { path, color, width: look.stroke_width });
     fill.into_iter().chain(stroke).collect()
+}
+
+/// A size made no larger than [`VIDEO_ROOM`], keeping its shape.
+fn fitted(w: f32, h: f32) -> (f32, f32) {
+    let (room_w, room_h) = VIDEO_ROOM;
+    if w <= 0.0 || h <= 0.0 {
+        return VIDEO_ROOM;
+    }
+    let scale = (room_w / w).min(room_h / h).min(1.0);
+    (w * scale, h * scale)
 }
 
 fn icon_side(size: f32) -> f32 {

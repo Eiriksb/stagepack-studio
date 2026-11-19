@@ -26,6 +26,9 @@ impl SlideEditor {
         if let Some(message) = message {
             cx.emit(EditorEvent::Said(message.into()));
         }
+        // Whatever the work changed: typing begun changes nothing of the talk, so isn't followed
+        // as an edit is, but lets go of the video selected, which then stops.
+        self.keep_playing_only_what_holds(cx);
         match made {
             Ok(changed) => {
                 if !changed.is_empty() {

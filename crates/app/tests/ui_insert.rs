@@ -34,7 +34,7 @@ const TALK: &str = "---\ntitle: T\n---\n\n# One\n\nSome words\n\n---\n\n# Two\n"
 /// Where the first slide's content ends, and where what's inserted on it goes.
 const END_OF_ONE: &str = "Some words";
 const NOT_A_PICTURE: &str = "That file isn't a picture this app can show.";
-const ONLY_PICTURES: &str = "Only pictures can be dropped on a slide.";
+const ONLY_PICTURES: &str = "Only pictures and videos can be dropped on a slide.";
 
 /// A picture `width` by `height`, all `rgba`, in `format`.
 fn encoded(width: u32, height: u32, rgba: [u8; 4], format: image::ImageFormat) -> Vec<u8> {
@@ -1217,7 +1217,7 @@ fn more_than_twenty_dropped_files_take_the_first_twenty(cx: &mut TestAppContext)
     drop_at(&typing, cx, &paths, middle);
     assert_eq!(typing.source(cx).matches("<Picture").count(), 20);
     assert_eq!(typing.status(cx).as_deref(), Some(ONLY_THE_FIRST));
-    assert_eq!(ONLY_THE_FIRST, "Only the first 20 pictures were added.");
+    assert_eq!(ONLY_THE_FIRST, "Only the first 20 files were added.");
     // Said when the dialog itself can't be shown: no picture was chosen to be opened.
     assert_eq!(DIALOG_FAILED, "The file chooser couldn't be opened.");
 }

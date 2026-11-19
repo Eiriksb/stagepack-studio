@@ -6,14 +6,14 @@ use std::time::{Duration, Instant};
 use gpui_kit::component::{ActiveTheme as _, TitleBar, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use slides_engine::{Enter, LayerTiming, Moment, Transition};
+use slides_engine::{Enter, LayerTiming, Moment, Transition, VideoLayer};
 
-use crate::document::Document;
+use crate::document::{Document, LargeOpen};
 use crate::present::{
     ENTER_SECONDS, MOMENTS_PER_SECOND, Moved, Place, ScreenInfo, Session, TRANSITION_SECONDS,
     WindowPlan, choose_windows, clock_text, layer_look, moment_time, slide_looks,
 };
-use crate::slide_canvas::{ScaleChanged, SlideCanvas};
+use crate::slide_canvas::{ScaleChanged, SlideCanvas, VideoLetGo, VideoOpened};
 use crate::workspace_view::APP_ID;
 
 pub const AUDIENCE_ID: &str = "audience";
@@ -421,9 +421,12 @@ pub struct AudienceView {
     drawn_time: f32,
     /// The wait for the next moment of a slide that moves.
     next_moment: Option<Task<()>>,
+    /// The slide whose videos were last started, which start again from their start once it's
+    /// left and shown again.
+    videos_of: Option<usize>,
     rehearsing: bool,
     focus_handle: FocusHandle,
-    _watching: [Subscription; 3],
+    _watching: [Subscription; 7],
 }
 
 impl AudienceView {
@@ -443,6 +446,12 @@ impl AudienceView {
             cx.subscribe(&leaving, |this, _, _: &ScaleChanged, cx| {
                 this.show_place(cx)
             }),
+            // A save let go of the file of a video playing: it's opened again once that's done.
+            cx.subscribe(&current, |this, _, _: &VideoLetGo, cx| this.show_place(cx)),
+            cx.subscribe(&leaving, |this, _, _: &VideoLetGo, cx| this.show_place(cx)),
+            // A video opened to play may have been unpacked: a still that waited for that is made.
+            cx.subscribe(&current, |this, _, _: &VideoOpened, cx| this.videos_opened(cx)),
+            cx.subscribe(&leaving, |this, _, _: &VideoOpened, cx| this.videos_opened(cx)),
         ];
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
@@ -455,6 +464,7 @@ impl AudienceView {
             moves: false,
             drawn_time: 0.0,
             next_moment: None,
+            videos_of: None,
             rehearsing,
             focus_handle,
             _watching: watching,
@@ -464,6 +474,58 @@ impl AudienceView {
     /// The canvas of the slide the show is on.
     pub fn current(&self) -> &Entity<SlideCanvas> {
         &self.current
+    }
+
+    /// Plays the videos of the show's place: each video on its slide that's there at its step,
+    /// one with a click once that's reached, and nothing else. On a slide come to, every video
+    /// starts from its start, and none plays on the slide left.
+    fn play_videos(&mut self, document: &Entity<Document>, place: Place, time: f32, cx: &mut Context<Self>) {
+        let moment = Moment {
+            step: place.step,
+            time,
+        };
+        let videos: Vec<VideoLayer> = document.update(cx, |document, _| {
+            let slide = document.shown_slide(place.slide);
+            document.videos_at(slide, moment)
+        });
+        let wanted: Vec<VideoLayer> = videos
+            .into_iter()
+            .filter(|video| video.click.is_none_or(|click| click <= place.step))
+            .collect();
+        let afresh = self.videos_of != Some(place.slide);
+        self.videos_of = Some(place.slide);
+        if afresh {
+            // The slide left keeps its videos' last pictures while it goes.
+            self.leaving.update(cx, |canvas, cx| canvas.hold_videos(cx));
+        }
+        // Only the videos to be opened are looked for, and one whose file a save let go of is
+        // opened again once the save is done.
+        let saving = document.read(cx).saving_the_pack();
+        let waiting = if saving { Vec::new() } else { self.current.read(cx).videos_let_go() };
+        let to_open: Vec<String> = self.current.read(cx).videos_to_open(&wanted, afresh).into_iter().map(|video| video.on.src.clone()).collect();
+        let mut opened: Vec<(String, LargeOpen)> = to_open
+            .iter()
+            .chain(&waiting)
+            .filter_map(|src| Some((src.clone(), document.read(cx).open_large(src)?)))
+            .collect();
+        let mut take = move |src: &str| {
+            let at = opened.iter().position(|(file, _)| file == src)?;
+            Some(opened.swap_remove(at).1)
+        };
+        self.current.update(cx, |canvas, cx| {
+            canvas.show_videos(&wanted, afresh, &mut take, cx);
+            canvas.open_videos_again(&mut take, cx);
+        });
+    }
+
+    /// Makes the stills that waited for a video to be unpacked to play.
+    fn videos_opened(&mut self, cx: &mut Context<Self>) {
+        let document = self.show.read(cx).document.clone();
+        document.update(cx, |document, cx| {
+            if document.try_waiting_stills_again() {
+                cx.notify();
+            }
+        });
     }
 
     /// The canvas of the slide being left, while a transition is holding on to one.
@@ -487,6 +549,7 @@ impl AudienceView {
         self.moves = self.show.update(cx, |show, cx| show.slide_moves(cx));
         self.timings = show_on(&self.current, &document, place, time, cx);
         self.drawn_time = time;
+        self.play_videos(&document, place, time, cx);
         if let Some((arrival, _)) = arrival {
             // It has this already, unless the window has just changed size.
             show_on(
@@ -536,6 +599,7 @@ impl AudienceView {
             canvas.set_slide_look(outgoing, cx);
             if arrival.is_none() {
                 canvas.set_layers(Vec::new(), cx);
+                canvas.stop_videos(cx);
             }
         });
         if arrival.is_some() || revealing.is_some() {
@@ -908,6 +972,8 @@ pub fn start_show(
     cx: &mut App,
 ) -> Entity<Presentation> {
     let (audience_options, presenter_options) = plan_windows(rehearsing, cx);
+    // A show of a talk no window shows makes its stills itself.
+    crate::video_player::make_stills(&document, cx);
     let show = cx.new(|cx| Presentation::new(document, cx));
     let audience = gpui_kit::open_window(audience_options, cx, |window, cx| {
         cx.new(|cx| AudienceView::new(show.clone(), rehearsing, window, cx))
