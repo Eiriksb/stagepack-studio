@@ -328,6 +328,24 @@ fn set_view_writes_six_numbers_as_one_step(cx: &mut TestAppContext) {
     assert!(typing.document(cx).update(cx, |document, _| document.models_here())[0].on.view.is_some_and(|view| view.yaw == 330.));
 }
 
+/// A view turned to by hand is written as one put on a slide is: its angles to a thousandth of a
+/// degree and its distance to four figures, not with every figure a drag's sums leave.
+#[test]
+fn a_view_turned_to_by_hand_is_written_with_a_few_figures() {
+    let folder = talk_folder(&talk(), &box_model());
+    let mut document = Document::open(folder.path(), Fonts::bundled_only()).unwrap();
+    let source = |document: &Document| {
+        let text = document.source();
+        let at = text.find("<Model").unwrap();
+        at..at + text[at..].find("/>").unwrap() + 2
+    };
+    let turned = View { yaw: 320.999_45, pitch: 26.000_08, distance: 15.515_446, target: [0.0, 0.500_002, 0.0] };
+    document.set_model_view(source(&document), turned).unwrap();
+    assert!(document.source().contains("view=\"320.999 26 15.52 0 0.5 0\""), "{}", document.source());
+    document.add_model_view(source(&document), turned).unwrap();
+    assert!(document.source().contains("views=\"320.999 26 15.52 0 0.5 0\""), "{}", document.source());
+}
+
 /// Turns the model on a talk of `source`, does `leave`, and checks nothing goes on drawing for
 /// it: no live picture is left, every one made is released, it's off the card, nothing more is
 /// asked of the drawer, and no thread is left.

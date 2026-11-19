@@ -726,17 +726,19 @@ impl Document {
     }
 
     /// Writes `view` as the starting view of the 3D model at `source` on the current slide, as
-    /// one step: only its `view` changes.
+    /// one step, with as few figures as a view put on a slide has: only its `view` changes.
     pub fn set_model_view(&mut self, source: std::ops::Range<usize>, view: slides_model::View) -> Result<Vec<usize>, EditRefused> {
         let thing = crate::selection::Selected { slide: self.current(), source };
-        self.set_attr_of(&thing, "view", Some(&view.to_string()))
+        self.set_attr_of(&thing, "view", Some(&crate::insert::written_view(view).to_string()))
     }
 
     /// Adds `view` to the views of the 3D model at `source` on the current slide, after those it
     /// has, as one step: only its `views` changes, and what's written there stays as it was,
-    /// with `; ` and the view after it. One with as many as a model can have takes no more.
+    /// with `; ` and the view after it, with as few figures as a view put on a slide has. One
+    /// with as many as a model can have takes no more.
     pub fn add_model_view(&mut self, source: std::ops::Range<usize>, view: slides_model::View) -> Result<Vec<usize>, EditRefused> {
         let thing = crate::selection::Selected { slide: self.current(), source };
+        let view = crate::insert::written_view(view);
         let written = slides_format::find_tag(self.talk(), thing.slide, &thing.source)
             .ok_or(EditRefused::CouldNotBeMade)?
             .attr("views")
