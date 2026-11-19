@@ -13,7 +13,7 @@ use gltf::json::mesh::{Mode, Primitive, Semantic};
 use gltf::json::validation::Checked;
 use gltf::json::{self, Root};
 
-use crate::image_size::{Picture, checked_size, picture_kind};
+use crate::image_size::{Picture, Size, checked_size, picture_kind};
 use crate::limits::*;
 use crate::maths::{self, Matrix};
 use crate::{CantDraw, Mesh, Model, ModelFacts, ModelKind, ReadSeek, Texture, bounds_of, read_at};
@@ -47,8 +47,20 @@ struct TextureAt {
     at: u64,
     len: u64,
     kind: Picture,
-    width: u32,
-    height: u32,
+    size: Size,
+}
+
+impl TextureAt {
+    /// The most memory decoding it may take at once: its bytes as stored, the picture as RGBA,
+    /// and for a JPEG, the decoder's own working, taken as two bytes for each number stored.
+    fn decoding(&self) -> u64 {
+        let pixels = u64::from(self.size.width) * u64::from(self.size.height);
+        let working = match self.kind {
+            Picture::Png => 0,
+            Picture::Jpeg => pixels * u64::from(self.size.channels) * 2,
+        };
+        self.len + pixels * 4 + working
+    }
 }
 
 /// What a description says is to be drawn, all of it checked.
@@ -311,16 +323,18 @@ fn placed(root: &Root) -> Result<Vec<Part>, CantDraw> {
         }
     };
     let mut parts = Vec::new();
-    let mut visited = 0u64;
+    // Counted as nodes are put on the stack, not as they're taken off, so a node holding many
+    // others can't fill memory before the count is checked.
+    let mut pushed = starts.len() as u64;
+    if pushed > MOST_PLACES {
+        return Err(CantDraw::TooLarge);
+    }
+    // The nodes from the scene down to the one being looked at, to find a node holding itself.
+    let mut path: Vec<usize> = Vec::with_capacity(MOST_DEPTH + 1);
     let mut stack: Vec<(usize, Matrix, usize)> = starts.into_iter().rev().map(|node| (node, maths::IDENTITY, 0)).collect();
     while let Some((index, above, depth)) = stack.pop() {
-        visited += 1;
-        if visited > MOST_PLACES {
-            return Err(CantDraw::TooLarge);
-        }
-        if depth > MOST_DEPTH {
-            return Err(CantDraw::Damaged);
-        }
+        path.truncate(depth);
+        path.push(index);
         let node = root.nodes.get(index).ok_or(CantDraw::Damaged)?;
         let own = match node.matrix {
             Some(matrix) => matrix,
@@ -341,7 +355,22 @@ fn placed(root: &Root) -> Result<Vec<Part>, CantDraw> {
             }
             parts.extend((0..primitives).map(|primitive| Part { mesh: mesh.value(), primitive, place, textured: false }));
         }
-        for child in node.children.iter().flatten().rev() {
+        let children = node.children.as_deref().unwrap_or_default();
+        if children.is_empty() {
+            continue;
+        }
+        if children.iter().any(|child| path.contains(&child.value())) {
+            // A node holding itself, or one that holds it.
+            return Err(CantDraw::Damaged);
+        }
+        if depth + 1 > MOST_DEPTH {
+            return Err(CantDraw::Damaged);
+        }
+        pushed += children.len() as u64;
+        if pushed > MOST_PLACES {
+            return Err(CantDraw::TooLarge);
+        }
+        for child in children.iter().rev() {
             stack.push((child.value(), place, depth + 1));
         }
     }
@@ -447,8 +476,12 @@ fn texture_at(reader: &mut dyn ReadSeek, glb: &Glb, index: usize) -> Result<Opti
         }
         read_at(reader, at + from, n)
     };
-    let (width, height) = checked_size(kind, len, &mut peek)?;
-    Ok(Some(TextureAt { image: index, at, len, kind, width, height }))
+    let size = checked_size(kind, len, &mut peek)?;
+    let texture = TextureAt { image: index, at, len, kind, size };
+    if texture.decoding() > MOST_DECODING {
+        return Err(CantDraw::TooLarge);
+    }
+    Ok(Some(texture))
 }
 
 pub(crate) fn read(reader: &mut dyn ReadSeek, len: u64) -> Result<Model, CantDraw> {
@@ -659,27 +692,97 @@ fn made_normals(positions: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
     sums.into_iter().map(|sum| maths::unit(sum).unwrap_or([0.0, 0.0, 1.0])).collect()
 }
 
-/// Decodes the one texture, its size from its header already checked against the limits.
+/// Decodes the one texture, its size from its header already checked against the limits and
+/// the memory decoding it takes. The picture is decoded straight into the RGBA it's kept as,
+/// with fewer numbers to a pixel at first, then spread out in place, so no second copy is made.
 fn decode(reader: &mut dyn ReadSeek, at: &TextureAt) -> Result<Texture, CantDraw> {
     let bytes = read_at(reader, at.at, at.len)?;
-    let format = match at.kind {
-        Picture::Png => image::ImageFormat::Png,
-        Picture::Jpeg => image::ImageFormat::Jpeg,
+    let (width, height) = (at.size.width, at.size.height);
+    let pixels = width as usize * height as usize;
+    let (mut rgba, channels) = match at.kind {
+        Picture::Png => decode_png(&bytes, at.size)?,
+        Picture::Jpeg => decode_jpeg(&bytes, at.size, at.decoding())?,
     };
-    let mut decoder = image::ImageReader::with_format(Cursor::new(&bytes), format);
+    spread(&mut rgba[..pixels * 4], channels);
+    Ok(Texture { width, height, rgba })
+}
+
+/// A PNG as 8 bits a number, at the start of a buffer large enough for it as RGBA, and how many
+/// numbers it has to a pixel. Sixteen bits a number are made eight as each row is read, so a
+/// picture of 16 bits never takes more than one of 8.
+fn decode_png(bytes: &[u8], size: Size) -> Result<(Vec<u8>, usize), CantDraw> {
+    let mut decoder = png::Decoder::new_with_limits(Cursor::new(bytes), png::Limits { bytes: 32 * 1024 * 1024 });
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().map_err(png_refusal)?;
+    let info = reader.info();
+    if (info.width, info.height) != (size.width, size.height) {
+        return Err(CantDraw::Damaged);
+    }
+    let (colour, depth) = reader.output_color_type();
+    if depth != png::BitDepth::Eight {
+        return Err(CantDraw::Damaged);
+    }
+    let channels = colour.samples();
+    let needed = reader.output_buffer_size().ok_or(CantDraw::TooLarge)?;
+    let mut rgba = vec![0; size.width as usize * size.height as usize * 4];
+    if channels > 4 || needed > rgba.len() {
+        return Err(CantDraw::Damaged);
+    }
+    reader.next_frame(&mut rgba[..needed]).map_err(png_refusal)?;
+    Ok((rgba, channels))
+}
+
+fn png_refusal(why: png::DecodingError) -> CantDraw {
+    match why {
+        png::DecodingError::LimitsExceeded => CantDraw::TooLarge,
+        _ => CantDraw::Damaged,
+    }
+}
+
+/// A JPEG, as `decode_png` gives a PNG.
+fn decode_jpeg(bytes: &[u8], size: Size, most: u64) -> Result<(Vec<u8>, usize), CantDraw> {
+    use image::ImageDecoder;
+    let mut decoder = image::codecs::jpeg::JpegDecoder::new(Cursor::new(bytes)).map_err(|_| CantDraw::Damaged)?;
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MOST_TEXTURE_SIDE);
     limits.max_image_height = Some(MOST_TEXTURE_SIDE);
-    // Room for the picture at its widest kind of pixel, and the decoder's own working.
-    limits.max_alloc = Some(u64::from(at.width) * u64::from(at.height) * 8 + 16 * 1024 * 1024);
-    decoder.limits(limits);
-    let picture = decoder.decode().map_err(|why| match why {
+    limits.max_alloc = Some(most);
+    decoder.set_limits(limits).map_err(|_| CantDraw::TooLarge)?;
+    if decoder.dimensions() != (size.width, size.height) {
+        return Err(CantDraw::Damaged);
+    }
+    let channels = match decoder.color_type() {
+        image::ColorType::L8 => 1,
+        image::ColorType::La8 => 2,
+        image::ColorType::Rgb8 => 3,
+        image::ColorType::Rgba8 => 4,
+        _ => return Err(CantDraw::KindNotDrawn),
+    };
+    let needed = usize::try_from(decoder.total_bytes()).map_err(|_| CantDraw::TooLarge)?;
+    let mut rgba = vec![0; size.width as usize * size.height as usize * 4];
+    if needed != rgba.len() / 4 * channels {
+        return Err(CantDraw::Damaged);
+    }
+    decoder.read_image(&mut rgba[..needed]).map_err(|why| match why {
         image::ImageError::Limits(_) => CantDraw::TooLarge,
         _ => CantDraw::Damaged,
     })?;
-    if (picture.width(), picture.height()) != (at.width, at.height) {
-        return Err(CantDraw::Damaged);
+    Ok((rgba, channels))
+}
+
+/// Spreads pixels of `channels` numbers each, packed at the start of `rgba`, out to four each,
+/// working from the end so nothing is written over before it's read.
+fn spread(rgba: &mut [u8], channels: usize) {
+    let pixels = rgba.len() / 4;
+    for pixel in (0..pixels).rev() {
+        let from = pixel * channels;
+        let to = pixel * 4;
+        let colour = match channels {
+            1 => [rgba[from], rgba[from], rgba[from], 255],
+            2 => [rgba[from], rgba[from], rgba[from], rgba[from + 1]],
+            3 => [rgba[from], rgba[from + 1], rgba[from + 2], 255],
+            _ => [rgba[from], rgba[from + 1], rgba[from + 2], rgba[from + 3]],
+        };
+        rgba[to..to + 4].copy_from_slice(&colour);
     }
-    let picture = picture.into_rgba8();
-    Ok(Texture { width: at.width, height: at.height, rgba: picture.into_raw() })
 }

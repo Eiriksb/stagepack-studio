@@ -52,7 +52,7 @@ impl fmt::Display for CantDraw {
                 "This kind of model can't be drawn here. A model of meshes saved as one file (.glb), or a point cloud (.ply), can."
             }
             CantDraw::TooLarge => {
-                "This model is too large to draw here. It can be 256 MB, 4 million triangles, 20 million points and a picture of 8,192 pixels a side at most."
+                "This model is too large or has too many parts to draw here. Models of up to 256 MB, 4 million triangles or 20 million points can be drawn."
             }
             CantDraw::CouldNotRead => "This model couldn't be read.",
             CantDraw::NoAdapter => {
@@ -78,9 +78,9 @@ pub struct ModelFacts {
     /// Counting each time a mesh is placed in the model.
     pub triangles: u64,
     pub points: u64,
-    /// The lowest and highest corners of a box around the whole model, in its own units. A
-    /// point cloud's header doesn't say where its points lie, so for one these are known only
-    /// once it's read, and `facts` gives a box of nothing at the origin.
+    /// The lowest and highest corners of a box around the whole model, in its own units. A point
+    /// cloud's header doesn't say where its points lie, so `facts` gives one a box of nothing at
+    /// the origin: use `read(...).facts` for a cloud's.
     pub bounds: ([f32; 3], [f32; 3]),
 }
 
