@@ -1885,7 +1885,7 @@ fn a_model_over_the_limit_is_refused_in_words() {
     // A video of that size is no trouble: the limits are each kind's own.
     let long_video = work.path().join("long.mp4");
     std::fs::File::create(&long_video).unwrap().set_len(stagepack_studio::added_files::MAX_MODEL_BYTES + 1).unwrap();
-    assert_ne!(document.large_copy(FileKind::Video, "long.mp4", LargeSource::File(long_video), None).err(), Some(NotAdded::VideoTooLarge));
+    assert_eq!(document.add_large_file(FileKind::Video, "long.mp4", &long_video, &no_progress, &never()).as_deref(), Ok("assets/long.mp4"));
     // A model's bytes aren't added as a small file's are.
     assert_eq!(document.add_file(FileKind::Model, "ship.glb", vec![0; 100]), Err(NotAdded::NotThatKind));
 }
@@ -1934,7 +1934,10 @@ fn a_file_named_glb_that_is_text_is_refused_before_copying() {
         assert!(NotAdded::NotAModel.to_string().contains("3D model"));
     }
     assert!(files_under(&root).iter().all(|name| !name.contains(".glb") && !name.contains(".ply")), "{:?}", files_under(&root));
-    // What starts as a model does is taken in, whichever kind it is.
+    // What starts as a model does is taken in, whichever kind it is, whichever line end a point cloud has.
+    let crlf = work.path().join("windows.ply");
+    std::fs::write(&crlf, "ply\r\nformat ascii 1.0\r\nend_header\r\n").unwrap();
+    assert_eq!(document.add_large_file(FileKind::Model, "windows.ply", &crlf, &no_progress, &never()).as_deref(), Ok("assets/windows.ply"));
     let ply = work.path().join("cloud.ply");
     std::fs::write(&ply, "ply\nformat ascii 1.0\nelement vertex 0\nend_header\n").unwrap();
     assert_eq!(document.add_large_file(FileKind::Model, "cloud.ply", &ply, &no_progress, &never()).as_deref(), Ok("assets/cloud.ply"));
@@ -1944,4 +1947,58 @@ fn a_file_named_glb_that_is_text_is_refused_before_copying() {
     let video = patterned(work.path(), "clip.mp4", 1000, 34);
     assert_eq!(document.add_large_file(FileKind::Model, "clip.mp4", &video, &no_progress, &never()), Err(NotAdded::NotThatKind));
     assert_eq!(document.add_large_file(FileKind::Video, "ship.glb", &glb, &no_progress, &never()), Err(NotAdded::NotThatKind));
+}
+
+#[test]
+fn files_of_one_kind_or_many_are_called_by_their_word() {
+    use stagepack_studio::large_files::noun_of_kinds;
+    assert_eq!(noun_of_kinds([FileKind::Model, FileKind::Model]), "model");
+    assert_eq!(noun_of_kinds([FileKind::Video]), "video");
+    assert_eq!(noun_of_kinds([FileKind::Video, FileKind::Model]), "file");
+}
+
+/// A folder talk whose one slide shows a model, held in its assets.
+fn talk_with_model(from: &Path) -> tempfile::TempDir {
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::create_dir(folder.path().join("assets")).unwrap();
+    std::fs::copy(from, folder.path().join("assets/ship.glb")).unwrap();
+    std::fs::write(folder.path().join("slides.md"), format!("# From\n\n{MODEL}\n")).unwrap();
+    folder
+}
+
+#[gpui_kit::test]
+fn a_model_not_copied_or_gone_is_said_when_it_is_pasted(cx: &mut TestAppContext) {
+    set_up();
+    let work = tempfile::tempdir().unwrap();
+    let from = a_model(work.path(), "ship.glb", TWIN, 35);
+    let source = talk_with_model(&from);
+    let root = work.path().join("root");
+    // Declined: pasted without it, and that's said.
+    let typing = open_untitled_talk(cx, untitled(), &root);
+    paste_in(&typing, cx, copied_model_from(source.path()));
+    click_on(&typing, cx, DONT_COPY_LARGE_ID);
+    cx.run_until_parked();
+    typing.settle(cx);
+    assert!(typing.source(cx).contains("<Model"));
+    assert_eq!(typing.status(cx), Some(clipboard::models_left_out(1)));
+    // The talk it came from is gone by the time it's pasted.
+    let item = copied_model_from(source.path());
+    std::fs::remove_file(source.path().join("assets/ship.glb")).unwrap();
+    let typing = open_untitled_talk(cx, untitled(), &root);
+    paste_in(&typing, cx, item);
+    assert_eq!(typing.status(cx), Some(clipboard::models_gone(1)));
+}
+
+#[test]
+fn videos_and_models_left_out_are_both_said() {
+    let mut brought = stagepack_studio::document::Brought::default();
+    brought.large_gone = 1;
+    brought.models_gone = 2;
+    let said = brought.said().unwrap();
+    assert!(said.contains(&clipboard::large_gone(1)) && said.contains(&clipboard::models_gone(2)), "{said}");
+    let mut brought = stagepack_studio::document::Brought::default();
+    brought.large_left_out = 2;
+    brought.models_left_out = 1;
+    let said = brought.said().unwrap();
+    assert!(said.contains(&clipboard::large_left_out(2)) && said.contains(&clipboard::models_left_out(1)), "{said}");
 }

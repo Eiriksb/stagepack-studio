@@ -29,11 +29,7 @@ fn copying(noun: &str) -> String {
 /// What the files being copied by `copies` are called, in one word: their kind's if they're all of
 /// one, otherwise a plain "file".
 fn noun_of(copies: &[(usize, LargeCopy)]) -> &'static str {
-    let first = copies.first().map(|(_, copy)| copy.kind());
-    match first {
-        Some(kind) if copies.iter().all(|(_, copy)| copy.kind() == kind) => kind.noun(),
-        _ => "file",
-    }
+    crate::large_files::noun_of_kinds(copies.iter().map(|(_, copy)| copy.kind()))
 }
 
 /// A video waiting to be copied in, from the file at `path`, and put on slide `slide`, the slide

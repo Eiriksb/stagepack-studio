@@ -185,7 +185,12 @@ impl std::fmt::Display for NotAdded {
 impl NotAdded {
     /// Why a file of `kind` over its most was refused.
     pub fn too_large(kind: FileKind) -> NotAdded {
-        if kind == FileKind::Model { NotAdded::ModelTooLarge } else { NotAdded::VideoTooLarge }
+        match kind {
+            FileKind::Model => NotAdded::ModelTooLarge,
+            FileKind::Video => NotAdded::VideoTooLarge,
+            // Not kinds that can be large: only asked of those that can.
+            FileKind::Picture | FileKind::Data | FileKind::ComponentSource | FileKind::ComponentBuild => NotAdded::TooLarge,
+        }
     }
 }
 

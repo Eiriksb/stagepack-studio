@@ -170,6 +170,16 @@ pub fn ask_to_copy_of(count: usize, bytes: u64, noun: &str) -> String {
     format!("Copy {files}, {} MB, into this presentation?", megabytes.max(1))
 }
 
+/// What files of `kinds` are called, in one word: their kind's if they're all of one, otherwise a
+/// plain "file".
+pub fn noun_of_kinds(kinds: impl IntoIterator<Item = FileKind>) -> &'static str {
+    let mut kinds = kinds.into_iter();
+    match kinds.next() {
+        Some(first) if kinds.all(|kind| kind == first) => first.noun(),
+        _ => "file",
+    }
+}
+
 /// Where the bytes of a large file to copy come from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LargeSource {

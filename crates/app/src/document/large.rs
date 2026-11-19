@@ -751,7 +751,7 @@ impl Document {
     }
 
     /// Where `large`, as a clipboard says, is copied from, if it lies where a large file of a talk
-    /// can, under a video's name, at the path the copy gives it: in a talk's folder, beside its
+    /// can, under a large file's name, at the path the copy gives it: in a talk's folder, beside its
     /// `slides.md`; in the working copies, in a slot's folder of files; or in a pack, under that
     /// path. A file on disk is copied from where the system resolves it to, links and all.
     fn may_bring(&self, large: &PastedLarge) -> Option<LargeSource> {

@@ -446,7 +446,7 @@ fn pasted_files(files: Vec<JsonFile>, too_large: bool) -> PastedFiles {
     pasted
 }
 
-/// `file`, a large file carried by where it lies, as a paste takes it: its path is a video's, as
+/// `file`, a large file carried by where it lies, as a paste takes it: its path is a large file's, as
 /// [`pasted_kind`] says, it lies at an absolute path, in a pack under that same path if in one,
 /// and it says it's no bigger than a video can be. Whether it's anywhere a talk's file can be is
 /// asked when it's copied in.
