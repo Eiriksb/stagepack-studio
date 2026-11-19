@@ -471,7 +471,8 @@ pub(crate) fn hash_in(files: &dyn TalkFiles, path: &str, stop: &AtomicBool) -> O
     hash_of(files.open(path)?, &Told { progress: &quiet, before: 0, total: 0 }, stop)
 }
 
-/// A reader, until it's let go of, and whether a save let go of it.
+/// A reader, until it's let go of, and whether a save let go of it. The flag is set first, so a
+/// read going on as the save begins lets go of the reader itself as soon as it's done.
 struct Slot {
     reader: Mutex<Option<Box<dyn ReadSeek>>>,
     let_go: Arc<AtomicBool>,
@@ -513,6 +514,9 @@ pub struct Readers {
     held: Mutex<Vec<Weak<Slot>>>,
     /// Whether any was let go of since the talk was last saved.
     let_go: AtomicBool,
+    /// Those let go of while they were being read, which a save waits for before it replaces
+    /// the pack.
+    letting_go: Mutex<Vec<Weak<Slot>>>,
     gate: Mutex<Gate>,
     /// Told when the save is done, or no file is being opened any more.
     changed: std::sync::Condvar,
@@ -609,16 +613,22 @@ impl Readers {
     }
 
     /// Lets go of every reader held: each closes what it reads, and reads nothing more. How many
-    /// there were is given.
+    /// there were is given. It never waits: one being read now, which on a share that's gone may
+    /// take for ever, lets go of itself once that read is done, and a save waits for that in its
+    /// own work, with [`Self::wait_for_opens`].
     pub(crate) fn let_go(&self) -> usize {
         let all = std::mem::take(&mut *self.held());
         let mut let_go = 0;
-        for reader in all.iter().filter_map(Weak::upgrade) {
-            let taken = reader.reader().take().is_some();
-            if taken {
-                reader.let_go.store(true, Ordering::SeqCst);
+        for slot in all.iter().filter_map(Weak::upgrade) {
+            if slot.let_go.swap(true, Ordering::SeqCst) {
+                continue;
             }
-            let_go += usize::from(taken);
+            let_go += 1;
+            match slot.reader.try_lock() {
+                Ok(mut reader) => drop(reader.take()),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => drop(poisoned.into_inner().take()),
+                Err(std::sync::TryLockError::WouldBlock) => self.letting_go().push(Arc::downgrade(&slot)),
+            }
         }
         if let_go > 0 {
             self.let_go.store(true, Ordering::SeqCst);
@@ -635,14 +645,35 @@ impl Readers {
         self.let_go()
     }
 
-    /// Waits until nothing is being opened: what was being opened as the save began is let go of
-    /// as soon as it is. For the save's own work, before it replaces the pack, never for the
-    /// window's thread.
+    fn letting_go(&self) -> std::sync::MutexGuard<'_, Vec<Weak<Slot>>> {
+        self.letting_go.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Waits until nothing is being opened, and every reader let go of while it was being read
+    /// is closed: what was being opened as the save began is let go of as soon as it is. For the
+    /// save's own work, before it replaces the pack, never for the window's thread.
     /// Stops waiting if `stop`, the save's own Cancel, is set.
     pub(crate) fn wait_for_opens(&self, stop: &AtomicBool) {
         let mut gate = self.gate();
         while gate.opening > 0 && !stop.load(Ordering::SeqCst) {
             gate = self.changed.wait_timeout(gate, std::time::Duration::from_millis(50)).unwrap_or_else(|poisoned| poisoned.into_inner()).0;
+        }
+        drop(gate);
+        loop {
+            // Each closed here if its read is done and it hasn't closed itself yet.
+            self.letting_go().retain(|slot| {
+                let Some(slot) = slot.upgrade() else { return false };
+                match slot.reader.try_lock() {
+                    Ok(mut reader) => drop(reader.take()),
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => drop(poisoned.into_inner().take()),
+                    Err(std::sync::TryLockError::WouldBlock) => return true,
+                }
+                false
+            });
+            if self.letting_go().is_empty() || stop.load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
@@ -692,7 +723,13 @@ impl Readers {
 
     /// How many readers are held, and not let go of.
     pub(crate) fn count(&self) -> usize {
-        self.held().iter().filter_map(Weak::upgrade).filter(|reader| reader.reader().is_some()).count()
+        self.held().iter().filter_map(Weak::upgrade).filter(|slot| !slot.let_go.load(Ordering::SeqCst)).count()
+    }
+
+    /// `reader`, held among these, for tests.
+    #[doc(hidden)]
+    pub fn hold_for_test(&self, reader: Box<dyn ReadSeek>) -> HeldReader {
+        self.hold(reader)
     }
 }
 
@@ -703,7 +740,7 @@ pub struct HeldReader(Held);
 impl HeldReader {
     /// Whether it was let go of.
     pub fn is_let_go(&self) -> bool {
-        self.0.reader().is_none()
+        self.0.let_go.load(Ordering::SeqCst)
     }
 
     /// Something that tells whether a save let go of this reader, once it's been handed on.
@@ -711,11 +748,20 @@ impl HeldReader {
         ReaderWatch(self.0.let_go.clone())
     }
 
+    /// Runs `f` on the reader, unless it was let go of. One let go of while `f` ran, as a save
+    /// began, is closed here once it's done, as the window's thread never waits for a read.
     fn with<T>(&mut self, f: impl FnOnce(&mut dyn ReadSeek) -> io::Result<T>) -> io::Result<T> {
-        match &mut *self.0.reader() {
-            Some(reader) => f(&mut **reader),
-            None => Err(io::Error::other(LET_GO)),
+        let mut reader = self.0.reader();
+        if self.0.let_go.load(Ordering::SeqCst) {
+            drop(reader.take());
+            return Err(io::Error::other(LET_GO));
         }
+        let Some(open) = &mut *reader else { return Err(io::Error::other(LET_GO)) };
+        let done = f(&mut **open);
+        if self.0.let_go.load(Ordering::SeqCst) {
+            drop(reader.take());
+        }
+        done
     }
 }
 

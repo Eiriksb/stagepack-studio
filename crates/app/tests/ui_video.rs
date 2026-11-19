@@ -1856,3 +1856,107 @@ fn a_videos_facts_are_read_once_and_the_oldest_let_go_of() {
     assert!(!document.try_waiting_stills_again(), "and none waits now");
     document.pack_save_ended();
 }
+
+// What the final review found.
+
+/// A reader whose first read waits until `release` is told, or three seconds, as a share that
+/// has gone away does; and says when it was dropped.
+struct Stuck {
+    started: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+    dropped: std::sync::Arc<Mutex<Option<std::time::SystemTime>>>,
+}
+
+impl std::io::Read for Stuck {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let _ = self.started.send(());
+        let _ = self.release.recv_timeout(Duration::from_secs(3));
+        Ok(buf.len().min(1))
+    }
+}
+
+impl std::io::Seek for Stuck {
+    fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
+        Ok(0)
+    }
+}
+
+impl Drop for Stuck {
+    fn drop(&mut self) {
+        *self.dropped.lock().unwrap() = Some(std::time::SystemTime::now());
+    }
+}
+
+#[gpui_kit::test]
+fn a_save_pressed_during_a_read_never_waits_on_the_windows_thread(cx: &mut TestAppContext) {
+    let _alone = alone();
+    use std::io::Read as _;
+    let work = tempfile::tempdir().unwrap();
+    let (document, pack) = packed(&talk(), &clip(3, 10), work.path());
+    let typing = open_untitled_talk(cx, document, work.path());
+    stills_made(&typing, cx);
+    let readers = typing.document(cx).read_with(cx, |document, _| document.readers());
+    let (started, reading) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let dropped = std::sync::Arc::new(Mutex::new(None));
+    let mut held = readers.hold_for_test(Box::new(Stuck { started, release: released, dropped: dropped.clone() }));
+    // A read, part way, on a thread of its own.
+    let reader = std::thread::spawn(move || {
+        let first = held.read(&mut [0; 4]).map_err(|_| ());
+        let after = held.read(&mut [0; 4]).map_err(|_| ());
+        (first, after, held.is_let_go())
+    });
+    reading.recv().unwrap();
+    let pressed = Instant::now();
+    typing.with_window(cx, |window, cx| window.press("ctrl-s", cx));
+    assert!(pressed.elapsed() < Duration::from_secs(1), "the window waited {:?}", pressed.elapsed());
+    assert!(typing.document(cx).read_with(cx, |document, _| document.saving_the_pack()));
+    // The read ends a moment later, and the save goes on once it's let go of.
+    let ending = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        release.send(()).unwrap();
+    });
+    wait(cx, 500);
+    typing.settle(cx);
+    ending.join().unwrap();
+    assert_eq!(typing.status(cx).as_deref(), Some("Saved talk.sptx."));
+    assert_eq!(reader.join().unwrap(), (Ok(1), Err(()), true), "the read in progress ended, and nothing more was read");
+    let dropped = dropped.lock().unwrap().expect("the reader was closed");
+    assert!(std::fs::metadata(&pack).unwrap().modified().unwrap() >= dropped, "the pack was replaced after the reader closed");
+    assert_eq!(typing.document(cx).read_with(cx, |document, _| document.readers_held()), 0);
+}
+
+#[test]
+fn a_save_waiting_on_a_read_can_be_cancelled() {
+    let _alone = alone();
+    use std::io::Read as _;
+    let work = tempfile::tempdir().unwrap();
+    let (mut document, pack) = packed(&talk(), &clip(3, 10), work.path());
+    let before = std::fs::read(&pack).unwrap();
+    let readers = document.readers();
+    let (started, reading) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let dropped = std::sync::Arc::new(Mutex::new(None));
+    let mut held = readers.hold_for_test(Box::new(Stuck { started, release: released, dropped: dropped.clone() }));
+    let reader = std::thread::spawn(move || held.read(&mut [0; 4]).is_ok());
+    reading.recv().unwrap();
+    assert_eq!(document.begin_saving_the_pack(), 1, "let go of, though it's being read");
+    let job = document.save_job().waiting_for_opens(readers.clone());
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saving = {
+        let stop = stop.clone();
+        std::thread::spawn(move || job.run_with(&|_, _| {}, &stop))
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(!saving.is_finished(), "the save waits for the read");
+    let cancelled = Instant::now();
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let saved = saving.join().unwrap();
+    assert!(cancelled.elapsed() < Duration::from_millis(500), "{:?}", cancelled.elapsed());
+    assert!(saved.is_err(), "cancelled, nothing written");
+    assert_eq!(std::fs::read(&pack).unwrap(), before);
+    release.send(()).unwrap();
+    assert!(reader.join().unwrap(), "the read in progress ended as it would have");
+    assert!(dropped.lock().unwrap().is_some(), "and closed what it read");
+    document.pack_save_ended();
+}
