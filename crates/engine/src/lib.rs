@@ -14,6 +14,7 @@ mod placeholder;
 mod render;
 mod slide;
 mod talk_components;
+mod terminal_screen;
 mod text;
 mod text_geometry;
 mod timeline;
@@ -40,6 +41,7 @@ pub use slide::*;
 pub use talk_components::{
     COMPONENTS_FOLDER, ComponentInfo, ComponentState, MAX_ASSETS_REMEMBERED, MAX_COMPONENTS, MAX_INDEX_BYTES, MAX_SOURCE_BYTES, SLIDE_RENDER_BUDGET, SchemaLoad, TalkComponents,
 };
+pub use terminal_screen::{TERMINAL_IN_TEXT, TERMINAL_NO_FILE, TERMINAL_ROW, screen_items};
 pub use text::*;
 pub use text_geometry::{CaretRect, ElementBox, Hit, LineMove, PlacedPara, RegionBox, SelectionRects, TextLayout};
 pub use timeline::*;

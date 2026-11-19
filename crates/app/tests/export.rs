@@ -519,3 +519,28 @@ fn the_export_says_how_many_models() {
         assert!(notices.iter().any(|notice| notice == "Slide 1: This file isn't a 3D model."), "{kind:?}: {notices:?}");
     }
 }
+
+#[test]
+fn the_export_says_how_many_terminal_recordings() {
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::create_dir(folder.path().join("assets")).unwrap();
+    std::fs::write(folder.path().join("assets/run.cast"), slides_terminal::make_test_cast(40, 6, &[(0.1, "o", "$ make\r\ndone\r\n")])).unwrap();
+    std::fs::write(folder.path().join("assets/words.cast"), b"these are words, not a recording").unwrap();
+    let one = "<Terminal src=\"assets/run.cast\" x=\"100\" y=\"100\" w=\"640\" h=\"360\" />\n";
+    let broken = "<Terminal src=\"assets/words.cast\" x=\"900\" y=\"100\" w=\"640\" h=\"360\" />\n";
+    for kind in [ExportKind::PowerPoint, ExportKind::Pdf] {
+        let said = |source: String| {
+            let input = ExportInput { source, files: Arc::new(FolderFiles::new(folder.path().to_path_buf())), talk_fonts: Vec::new() };
+            let (_dir, out) = target(&format!("talk.{}", kind.extension()));
+            run_export(input, kind, &out).unwrap()
+        };
+        let counted = |notices: &[String]| notices.iter().filter(|notice| notice.contains("exported as")).cloned().collect::<Vec<String>>();
+        let notices = said(format!("# One\n\n{one}\n---\n\n# Two\n\n{one}{broken}"));
+        assert_eq!(counted(&notices), ["2 terminal recordings were exported as their last screen."], "{kind:?}: {notices:?}");
+        assert!(notices.iter().any(|notice| notice == "Slide 2: This file isn't a terminal recording."), "{kind:?}: {notices:?}");
+        let notices = said(format!("# One\n\n{one}"));
+        assert_eq!(counted(&notices), ["1 terminal recording was exported as its last screen."], "{kind:?}: {notices:?}");
+        let notices = said(format!("# One\n\n{broken}"));
+        assert!(counted(&notices).is_empty(), "{kind:?}: {notices:?}");
+    }
+}

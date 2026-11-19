@@ -45,6 +45,8 @@ pub struct LayerSpec {
     pub video: Option<VideoOn>,
     /// The 3D model this layer is the still of, which is drawn live over it when it's turned.
     pub model: Option<ModelOn>,
+    /// The terminal recording this layer is the last screen of, which plays over it when asked.
+    pub terminal: Option<TerminalOn>,
 }
 
 /// A video among a slide's layers: the place of its layer among them, where its tag is written,
@@ -97,4 +99,25 @@ pub struct ModelOn {
     pub views: Vec<slides_model::View>,
     pub rect: Rect,
     pub rotate: f32,
+}
+
+/// A terminal recording among a slide's layers: the place of its layer among them, where its tag
+/// is written, the click it appears on, and what it plays.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TerminalLayer {
+    pub layer: usize,
+    pub source: Option<Range<usize>>,
+    pub click: Option<u32>,
+    pub on: TerminalOn,
+}
+
+/// A terminal recording on a slide: the file it plays, where it plays, as its layer is placed,
+/// and how many times it stops until the next click, once its file has been read: none until
+/// then, or if it can't be played.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TerminalOn {
+    pub src: String,
+    pub rect: Rect,
+    pub rotate: f32,
+    pub stops: usize,
 }

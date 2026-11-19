@@ -19,7 +19,7 @@ use crate::timeline::MAX_CLICK;
 use crate::render::device_offset;
 use crate::{
     ComponentAsks, ComponentInfo, DisplayItem, Fonts, Layer, LayerSpec, LayerTiming, LayoutEnv, Moment, MadeStill, PictureCache, Placing,
-    SlideTimeline, SchemaLoad, MeasureVideo, StillJob, StillWanted, TalkComponents, TalkFiles, Transition, VideoLayer, DrawModel, ModelLayer, builtin_registry, compose, render_layer, talk_theme,
+    SlideTimeline, SchemaLoad, MeasureVideo, StillJob, StillWanted, TalkComponents, TalkFiles, TerminalLayer, Transition, VideoLayer, DrawModel, ModelLayer, builtin_registry, compose, render_layer, talk_theme,
 };
 
 /// How many scales of one slide are kept drawn. A zoom or a resize asks for many in a row.
@@ -136,10 +136,12 @@ impl Laid {
     }
 
     /// The most clicks its layers or components ask for. A 3D model takes a click for each of
-    /// its views, after the click it appears on.
+    /// its views, after the click it appears on, and a terminal recording one for each of its
+    /// stops.
     fn steps(&self) -> u32 {
         let views = self.specs.iter().filter_map(|spec| Some(spec.click.unwrap_or(0) + spec.model.as_ref()?.views.len() as u32));
-        let clicks = self.specs.iter().filter_map(|spec| spec.click).chain(views).max().unwrap_or(0);
+        let stops = self.specs.iter().filter_map(|spec| Some(spec.click.unwrap_or(0).saturating_add(spec.terminal.as_ref()?.stops.min(MAX_CLICK as usize) as u32)));
+        let clicks = self.specs.iter().filter_map(|spec| spec.click).chain(views).chain(stops).max().unwrap_or(0);
         clicks.max(self.asks.steps).min(MAX_CLICK)
     }
 }
@@ -692,6 +694,29 @@ impl Deck {
         }
         let size = crate::pictures::model_still_size(on.rect.w, on.rect.h);
         self.pictures.model_problem(&on.src, on.view, size).map(|why| why.to_string())
+    }
+
+    /// The plain sentence saying why the terminal recording at `source` on slide `index` can't be
+    /// played, if it's a recording and it's been read and can't be, or it has no file. It's among
+    /// the slide's notices too.
+    pub fn terminal_problem(&mut self, index: usize, source: &std::ops::Range<usize>) -> Option<String> {
+        if index >= self.slides.len() {
+            return None;
+        }
+        let src = self.specs(index).iter().find(|spec| spec.source.as_ref() == Some(source))?.terminal.as_ref()?.src.clone();
+        if src.is_empty() {
+            return Some(crate::TERMINAL_NO_FILE.to_string());
+        }
+        self.pictures.terminal_problem(&src).map(|why| why.to_string())
+    }
+
+    /// The terminal recordings on slide `index` in its whole state, among its layers as `specs`
+    /// and `layers` give them, with the deck's placing.
+    pub fn terminals(&mut self, index: usize) -> Vec<TerminalLayer> {
+        if index >= self.slides.len() {
+            return Vec::new();
+        }
+        terminals_of(self.specs(index))
     }
 
     /// The 3D models on slide `index` in its whole state, among its layers as `specs` and
@@ -1397,6 +1422,10 @@ impl Deck {
                             model.rect = rect;
                             model.rotate = rotate;
                         }
+                        if let Some(terminal) = &mut spec.terminal {
+                            terminal.rect = rect;
+                            terminal.rotate = rotate;
+                        }
                         laid.keys[at].place = place_bits(spec);
                     } else {
                         laid_again.push((at, range.clone(), placing.clone()));
@@ -1462,6 +1491,15 @@ impl Deck {
         self.keep_within_budget(index);
         ordered
     }
+}
+
+/// The terminal recordings among `specs`.
+fn terminals_of(specs: &[LayerSpec]) -> Vec<TerminalLayer> {
+    specs
+        .iter()
+        .enumerate()
+        .filter_map(|(layer, spec)| Some(TerminalLayer { layer, source: spec.source.clone(), click: spec.click, on: spec.terminal.clone()? }))
+        .collect()
 }
 
 /// The 3D models among `specs`.

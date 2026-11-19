@@ -121,9 +121,21 @@ fn model_component() -> NativeComponent {
     NativeComponent { name: crate::elements::MODEL_TAG, schema, render }
 }
 
+/// A terminal recording on a slide, laid out by the engine itself as its last screen.
+fn terminal_component() -> NativeComponent {
+    fn schema() -> ComponentSchema {
+        let fields = vec![PropField::new("src", PropKind::File(vec!["cast".to_string()]), false)];
+        ComponentSchema::new(crate::terminal_screen::TERMINAL_TAG, fields, false)
+    }
+    fn render(_: &Props, _: &Ctx) -> Element {
+        Element::Empty
+    }
+    NativeComponent { name: crate::terminal_screen::TERMINAL_TAG, schema, render }
+}
+
 pub fn builtin_registry() -> Registry {
     let mut registry = Registry::default();
-    let components = [boxed::Box_component(), Shape_component(), Icon_component(), Picture_component(), crate::chart::Chart_component(), video_component(), model_component()];
+    let components = [boxed::Box_component(), Shape_component(), Icon_component(), Picture_component(), crate::chart::Chart_component(), video_component(), model_component(), terminal_component()];
     for component in components {
         registry.add(component);
     }

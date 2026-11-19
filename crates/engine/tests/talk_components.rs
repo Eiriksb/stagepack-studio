@@ -970,7 +970,7 @@ fn the_components_available_are_the_built_ins_and_the_talks_own() {
     let files = talk_with_hello("<Hello />\n", answering("Hello", &text_answer("Hi")));
     files.put("components/apple.rs", source("Apple"));
     let deck = open(&files);
-    assert_eq!(deck.available_components(), ["Apple", "Box", "Chart", "Hello", "Icon", "Model", "Picture", "Shape", "Video"]);
+    assert_eq!(deck.available_components(), ["Apple", "Box", "Chart", "Hello", "Icon", "Model", "Picture", "Shape", "Terminal", "Video"]);
 }
 
 // What a click on a placed component lands on.

@@ -492,3 +492,28 @@ fn an_empty_line_exports_the_same_in_either_spelling() {
     assert_eq!(new, slide("**<Text></Text>**"));
     assert!(!new.contains('\u{a0}') && !new.contains("&#160;") && !new.contains("nbsp"), "no space is written for it: {new}");
 }
+
+#[test]
+fn a_terminal_recording_is_a_picture_of_its_last_screen() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("assets")).unwrap();
+    let cast = slides_terminal::make_test_cast(40, 6, &[(0.1, "o", "$ echo hi\r\nhi\r\n$ ")]);
+    std::fs::write(dir.path().join("assets/run.cast"), cast).unwrap();
+    let out = export_from(dir.path(), "# One\n\n<Terminal src=\"assets/run.cast\" x=\"100\" y=\"200\" w=\"960\" h=\"540\" rotate=\"10\" click=\"1\" />\n");
+    let slide = part(&out.bytes, "ppt/slides/slide1.xml");
+    assert_eq!(slide.matches("<p:pic>").count(), 1, "{slide}");
+    assert!(slide.contains(r#"<a:xfrm rot="600000">"#) && slide.contains("<p:par>"), "turned as the slide turns it, and on its click: {slide}");
+    let media: Vec<String> = names(&out.bytes).into_iter().filter(|n| n.starts_with("ppt/media/")).collect();
+    assert_eq!(media.len(), 1, "{media:?}");
+    let mut png = Vec::new();
+    archive(&out.bytes).by_name(&media[0]).unwrap().read_to_end(&mut png).unwrap();
+    let picture = tiny_skia::Pixmap::decode_png(&png).unwrap();
+    assert!((1920..=1921).contains(&picture.width()) && (1080..=1081).contains(&picture.height()), "drawn at twice its size: {} by {}", picture.width(), picture.height());
+    let corner = picture.pixel(4, 4).unwrap();
+    assert_eq!((corner.red(), corner.green(), corner.blue()), (0x18, 0x18, 0x18), "the screen's own dark background");
+    // One that can't be read is a picture of its panel.
+    std::fs::write(dir.path().join("assets/run.cast"), b"just some words").unwrap();
+    let out = export_from(dir.path(), "# One\n\n<Terminal src=\"assets/run.cast\" x=\"100\" y=\"200\" w=\"960\" h=\"540\" />\n");
+    assert_eq!(part(&out.bytes, "ppt/slides/slide1.xml").matches("<p:pic>").count(), 1);
+    assert!(out.notices.iter().any(|notice| notice.contains("This file isn't a terminal recording.")), "{:?}", out.notices);
+}

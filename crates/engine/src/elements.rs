@@ -136,7 +136,7 @@ fn along_column(align: Align) -> Option<AlignSelf> {
 
 /// The size of a positioned tag that gives `wanted` of its sides. A side it leaves out
 /// comes from the element's natural size, kept in proportion to the side it gave.
-fn box_size(wanted: (Option<f32>, Option<f32>), natural: Option<(f32, f32)>) -> (f32, f32) {
+pub(crate) fn box_size(wanted: (Option<f32>, Option<f32>), natural: Option<(f32, f32)>) -> (f32, f32) {
     let (w, h) = match (wanted, natural) {
         ((Some(w), Some(h)), _) => (w, h),
         ((Some(w), None), Some((natural_w, natural_h))) => (w, w * natural_h / natural_w),
@@ -264,6 +264,10 @@ impl Flow<'_, '_> {
         if tag.name == MODEL_TAG {
             self.notice(MODEL_IN_TEXT.to_string());
             return Some(self.model(tag, None));
+        }
+        if tag.name == crate::terminal_screen::TERMINAL_TAG {
+            self.notice(crate::TERMINAL_IN_TEXT.to_string());
+            return Some(self.block_placeholder(crate::terminal_screen::TERMINAL_LABEL.to_string()));
         }
         match self.render_tag(tag, (self.width, 0.0)) {
             Some(element) => self.tag_element(tag, &element, align, false),

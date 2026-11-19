@@ -294,3 +294,19 @@ fn a_pdf_of_a_talk_with_every_slide_hidden_still_has_its_pages() {
     let Some(info) = run("pdfinfo", &[&pdf]) else { return };
     assert!(info.contains("Pages:           2"), "{info}");
 }
+
+#[test]
+fn a_pdf_has_the_screens_text() {
+    let cast = slides_terminal::make_test_cast(40, 6, &[(0.1, "o", "$ echo \u{1b}[32mstagepacked\u{1b}[0m\r\n"), (0.4, "o", "stagepacked\r\n$ ")]);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("assets")).unwrap();
+    std::fs::write(dir.path().join("assets/run.cast"), cast).unwrap();
+    let source = "# One\n\n<Terminal src=\"assets/run.cast\" x=\"100\" y=\"300\" w=\"960\" h=\"540\" />\n";
+    let mut deck = Deck::open(Box::new(FolderFiles::new(dir.path().to_path_buf())), Fonts::bundled_only(), source.to_string());
+    let pdf = write_to(&mut deck, dir.path(), "terminal.pdf");
+    let Some(text) = run("pdftotext", &[&pdf, "-"]) else { return };
+    assert!(text.contains("echo stagepacked") && text.matches("stagepacked").count() == 2, "the screen's text is text: {text}");
+    // And looks as the slide does.
+    let Some(difference) = page_difference(&mut deck, &pdf, 1, dir.path()) else { return };
+    assert!(difference < 6.0, "{difference}");
+}

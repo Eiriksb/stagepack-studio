@@ -129,6 +129,7 @@ fn turned_picture_layer(width: u32, height: u32, bgra: &[u8], opaque: bool, rect
         varies: false,
         video: None,
         model: None,
+        terminal: None,
     };
     let layer = draw_layer(&spec, scale, |_, _, _| {});
     drop(spec);
