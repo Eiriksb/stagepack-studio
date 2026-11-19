@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// A tag's attributes, each its name and its value.
+type Attrs<'a> = &'a [(&'a str, &'a str)];
+
 impl Document {
     /// Puts a `name` tag with `attrs`, and `body` inside it if it's given, on the current slide,
     /// after its content and before its notes, as one step named `label`, and selects it. It's
@@ -31,16 +34,17 @@ impl Document {
         size: (f32, f32),
         body: Option<&str>,
     ) -> Result<Vec<usize>, EditRefused> {
-        self.insert_sized_on(self.current, label, name, attrs, size, body)
+        self.insert_sized_on(self.current, label, name, (attrs, &[]), size, body)
     }
 
-    /// [`Self::insert_sized`] on slide `slide`, which is shown then, as any edit shows its slide.
+    /// [`Self::insert_sized`] on slide `slide`, which is shown then, as any edit shows its slide,
+    /// with `attrs` before the place and `after` behind it.
     fn insert_sized_on(
         &mut self,
         slide: usize,
         label: &'static str,
         name: &str,
-        attrs: &[(&str, &str)],
+        (attrs, after): (Attrs<'_>, Attrs<'_>),
         size: (f32, f32),
         body: Option<&str>,
     ) -> Result<Vec<usize>, EditRefused> {
@@ -52,6 +56,7 @@ impl Document {
         let place = [insert::whole(x), insert::whole(y), insert::whole(size.0.max(1.0)), insert::whole(size.1.max(1.0))];
         let mut all: Vec<(&str, &str)> = attrs.to_vec();
         all.extend(["x", "y", "w", "h"].into_iter().zip(place.iter().map(String::as_str)));
+        all.extend_from_slice(after);
         let text = tag_text(&NewTag { name, attrs: &all, body }).ok_or(EditRefused::CouldNotBeMade)?;
         self.insert_texts_on(slide, label, &[text], tidied, None)
     }
@@ -207,7 +212,24 @@ impl Document {
     /// video selected. A slide that's gone since is the one shown.
     pub fn insert_video_on(&mut self, slide: usize, name: String, size: (u32, u32)) -> Result<Vec<usize>, EditRefused> {
         let slide = if slide < self.talk().slides.len() { slide } else { self.current };
-        self.insert_sized_on(slide, INSERT_VIDEO, "Video", &[("src", &name)], insert::video_size(size), None)
+        self.insert_sized_on(slide, INSERT_VIDEO, "Video", (&[("src", &name)], &[]), insert::video_size(size), None)
+    }
+
+    /// Puts the 3D model `name`, a file of the talk's, on the current slide as
+    /// [`Self::insert_sized`] does, as one step named "Insert 3D model": [`insert::MODEL_SIZE`]
+    /// big, seen from `view`, written after its place, if it's given.
+    pub fn insert_model(&mut self, name: String, view: Option<slides_model::View>) -> Result<Vec<usize>, EditRefused> {
+        self.insert_model_on(self.current, name, view)
+    }
+
+    /// [`Self::insert_model`] on slide `slide`, as when it was asked for there and the copy ended
+    /// after another was shown: that slide is shown again, with the model selected. A slide
+    /// that's gone since is the one shown.
+    pub fn insert_model_on(&mut self, slide: usize, name: String, view: Option<slides_model::View>) -> Result<Vec<usize>, EditRefused> {
+        let slide = if slide < self.talk().slides.len() { slide } else { self.current };
+        let view = view.map(|view| insert::written_view(view).to_string());
+        let after: Vec<(&str, &str)> = view.iter().map(|view| ("view", view.as_str())).collect();
+        self.insert_sized_on(slide, INSERT_MODEL, "Model", (&[("src", &name)], &after), insert::MODEL_SIZE, None)
     }
 
     /// Puts a table of `columns` columns and `rows` rows under its heading row, every cell empty,

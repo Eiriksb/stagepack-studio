@@ -17,6 +17,8 @@ pub const LINE_SIZE: (f32, f32) = (480.0, 120.0);
 pub const TEXT_BOX_SIZE: (f32, f32) = (640.0, 200.0);
 /// The most room a new video takes: it's its own size, made smaller to fit in this.
 pub const VIDEO_ROOM: (f32, f32) = (960.0, 540.0);
+/// The size of a new 3D model, which has no shape of its own on the slide.
+pub const MODEL_SIZE: (f32, f32) = (960.0, 540.0);
 /// How thick a new line or arrow is drawn.
 const LINE_WIDTH: &str = "6";
 
@@ -28,6 +30,7 @@ pub const INSERT_ICON: &str = "Insert icon";
 pub const INSERT_TABLE: &str = "Insert table";
 pub const INSERT_COMPONENT: &str = "Insert component";
 pub const INSERT_VIDEO: &str = "Insert video";
+pub const INSERT_MODEL: &str = "Insert 3D model";
 
 /// How big a new icon is, as its `size` is written: its width and its height.
 pub const ICON_SIZE: &str = "128";
@@ -44,6 +47,17 @@ pub fn video_size(size: (u32, u32)) -> (f32, f32) {
     }
     let scale = (VIDEO_ROOM.0 / w).min(VIDEO_ROOM.1 / h).min(1.0);
     (w * scale, h * scale)
+}
+
+/// `view` as a new model's starting view is written: each number to a thousandth, so that a
+/// person can read it.
+pub fn written_view(view: slides_model::View) -> slides_model::View {
+    // One too large to scale is left as it is.
+    let rounded = |v: f32| Some((v * 1000.0).round() / 1000.0).filter(|r| r.is_finite()).unwrap_or(v);
+    let view = view.cleaned();
+    // A distance rounded to nothing would be no view.
+    let distance = if rounded(view.distance) > 0.0 { rounded(view.distance) } else { view.distance };
+    slides_model::View { yaw: rounded(view.yaw), pitch: rounded(view.pitch), distance, target: view.target.map(rounded) }
 }
 
 /// The top-left corner, in slide units, of a new thing of `size`: centred on the slide, moved

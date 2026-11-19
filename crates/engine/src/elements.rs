@@ -719,7 +719,7 @@ fn line_items(look: &ShapeLook, x: f32, y: f32, w: f32, h: f32, theme: &Theme) -
 }
 
 /// The most views a model flies through, one a click.
-pub(crate) const MOST_VIEWS: usize = 256;
+pub const MOST_VIEWS: usize = 256;
 
 /// The view a model's `view` says: `Ok(None)` if it says none, and `Err` if it can't be read.
 pub(crate) fn model_view(written: Option<&str>) -> Result<Option<slides_model::View>, ()> {

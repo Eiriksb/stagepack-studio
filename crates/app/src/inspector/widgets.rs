@@ -44,8 +44,8 @@ impl Inspector {
                     .checked(checked)
                     .accessibility_label(label.clone())
                     .on_click(cx.listener(move |this, checked: &bool, _, cx| {
-                        let value = if *checked { "true" } else { "false" };
-                        this.write(&attr, Some(value), cx).ok();
+                        let value = labels::written_flag(this.form_tag(), *checked);
+                        this.write(&attr, value, cx).ok();
                         cx.notify();
                     }))
                     .into_any_element()

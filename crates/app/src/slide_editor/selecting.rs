@@ -121,9 +121,38 @@ impl SlideEditor {
         }
     }
 
+    /// The model being turned, by where it is in the talk, if one is.
+    pub fn model_turned(&self) -> Option<std::ops::Range<usize>> {
+        self.turning.as_ref().map(|(turning, _)| turning.source.clone())
+    }
+
     /// Writes the view the model turned is shown from into the talk, as its starting view, as
     /// one step. It goes on being turned.
     pub(super) fn set_view(&mut self, cx: &mut Context<Self>) {
+        self.write_turned(|document, source, view| document.set_model_view(source, view), cx);
+    }
+
+    /// Adds the view the model turned is shown from to its views, after those it has, as one
+    /// step: one more click in the show. It goes on being turned. One with as many views as it
+    /// can have says so.
+    pub fn add_view(&mut self, cx: &mut Context<Self>) {
+        self.write_turned(|document, source, view| document.add_model_view(source, view), cx);
+    }
+
+    /// Takes away every view of the model turned but its starting one, as one step. It goes on
+    /// being turned.
+    pub fn clear_views(&mut self, cx: &mut Context<Self>) {
+        self.write_turned(|document, source, _| document.clear_model_views(source), cx);
+    }
+
+    /// Makes the change `write` makes to the model turned, at where it is in the talk and with
+    /// the view it's shown from, as one step. Written by this, the change is no reason to stop
+    /// turning it.
+    fn write_turned(
+        &mut self,
+        write: impl FnOnce(&mut Document, std::ops::Range<usize>, slides_model::View) -> Result<Vec<usize>, EditRefused>,
+        cx: &mut Context<Self>,
+    ) {
         let (Some((turning, layer)), Some(document)) = (self.turning.clone(), self.document.clone()) else {
             return;
         };
@@ -131,7 +160,7 @@ impl SlideEditor {
             return;
         };
         let written = document.update(cx, |document, cx| {
-            let written = document.set_model_view(turning.source.clone(), view);
+            let written = write(document, turning.source.clone(), view);
             cx.notify();
             written.map(|_| (document.selected_model(), talk_hash(document.source())))
         });

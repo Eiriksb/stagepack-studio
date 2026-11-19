@@ -1519,7 +1519,7 @@ fn a_file_that_is_not_a_video_says_so_and_inserts_nothing(cx: &mut TestAppContex
     assert_eq!(typing.status(cx).as_deref(), Some(NOT_A_VIDEO));
     // Dropped, as any file that isn't a picture or a video.
     drop_on_slide(&typing, cx, &[notes]);
-    assert_eq!(typing.status(cx).as_deref(), Some("Only pictures and videos can be dropped on a slide."));
+    assert_eq!(typing.status(cx).as_deref(), Some("Only pictures, videos and 3D models can be dropped on a slide."));
     drop_on_slide(&typing, cx, &[words]);
     assert_eq!(typing.status(cx).as_deref(), Some(NOT_A_VIDEO));
     assert_eq!(typing.source(cx), PLAIN_TALK);

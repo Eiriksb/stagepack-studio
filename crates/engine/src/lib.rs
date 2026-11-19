@@ -25,7 +25,7 @@ pub mod chart_parts {
     pub use crate::chart::{Axis, ChartData, axis_for, parse_csv, parse_inline, plot_area, series_color};
 }
 pub use deck::Deck;
-pub use elements::{MODEL_IN_TEXT, MODEL_NO_FILE, MODEL_VIEW_UNREAD, VIDEO_IN_TEXT, VIDEO_NO_FILE};
+pub use elements::{MODEL_IN_TEXT, MODEL_NO_FILE, MODEL_VIEW_UNREAD, MOST_VIEWS as MOST_MODEL_VIEWS, VIDEO_IN_TEXT, VIDEO_NO_FILE};
 /// A drawn picture, such as a slide's thumbnail.
 pub use tiny_skia::Pixmap;
 pub use display::*;

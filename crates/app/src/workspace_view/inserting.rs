@@ -1,5 +1,5 @@
-//! Putting things on the slide from the window: pictures and videos chosen in the system's
-//! dialog, dropped on the slide or pasted, shapes and text boxes from the Insert tab.
+//! Putting things on the slide from the window: pictures, videos and 3D models chosen in the
+//! system's dialog, dropped on the slide or pasted, shapes and text boxes from the Insert tab.
 
 use super::*;
 use crate::added_files::{FileKind, MAX_ADDED_BYTES, NotAdded};
@@ -8,10 +8,12 @@ use crate::clipboard_tools::ClipboardThing;
 use crate::document::{InsertFailed, LargeCopy};
 use crate::insert::{ICON_SIZE, INSERT_ICON};
 use crate::large_files::{LargeSource, ask_before_copying, ask_to_copy_of};
+use slides_model::{CantDraw, ModelKind, View};
 use slides_video::CantPlay;
 
-/// What the window says when a file that isn't a picture or a video is dropped on the slide.
-pub const ONLY_PICTURES: &str = "Only pictures and videos can be dropped on a slide.";
+/// What the window says when a file that isn't a picture, a video or a 3D model is dropped on the
+/// slide.
+pub const ONLY_PICTURES: &str = "Only pictures, videos and 3D models can be dropped on a slide.";
 /// What the window says when the dialog to choose pictures couldn't be shown.
 pub const DIALOG_FAILED: &str = "The file chooser couldn't be opened.";
 /// The most files a drop, a paste of files, or the dialog puts on the slide.
@@ -32,11 +34,19 @@ fn noun_of(copies: &[(usize, LargeCopy)]) -> &'static str {
     crate::large_files::noun_of_kinds(copies.iter().map(|(_, copy)| copy.kind()))
 }
 
-/// A video waiting to be copied in, from the file at `path`, and put on slide `slide`, the slide
-/// shown when it was asked for.
-pub(super) struct WaitingVideo {
+/// A video or a 3D model, of `kind`, waiting to be copied in, from the file at `path`, and put on
+/// slide `slide`, the slide shown when it was asked for.
+pub(super) struct WaitingLarge {
+    kind: FileKind,
     path: PathBuf,
     slide: usize,
+}
+
+/// What looking at a large file before it's copied in found: a video's size, or the view a
+/// model is framed whole from, if one could be found.
+enum Found {
+    Video((u32, u32)),
+    Model(Option<View>),
 }
 
 /// Why a large file wasn't copied in: what's said of it, and whether it was cancelled.
@@ -110,6 +120,33 @@ impl WorkspaceView {
         .detach();
     }
 
+    /// Asks for 3D models in the system's dialog, and puts each on the slide.
+    pub(super) fn ask_for_models(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.document.is_none() {
+            return;
+        }
+        // The system's dialog can't be told which kinds to show: a file that isn't a model is
+        // said once it's chosen.
+        let chosen = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Insert".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            match chosen.await {
+                Ok(Ok(Some(paths))) => {
+                    this.update(cx, |this, cx| this.chosen_models(paths, cx)).ok();
+                }
+                Ok(Err(_)) => {
+                    this.update(cx, |this, cx| this.say(DIALOG_FAILED, cx)).ok();
+                }
+                _ => {}
+            }
+        })
+        .detach();
+    }
+
     /// Puts the pictures in the files at `paths` on the slide, each in turn, one step each, as
     /// the dialog to choose them gives them, the first [`MOST_DROPPED`] of them. What isn't a
     /// picture is said, and left out. A video among them is copied in, and put on the slide
@@ -124,8 +161,8 @@ impl WorkspaceView {
     pub fn chosen_videos(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         let more = paths.len() > MOST_DROPPED;
         for path in paths.into_iter().take(MOST_DROPPED) {
-            if is_video(&path) {
-                self.insert_video_file(path, cx);
+            if is_kind(&path, FileKind::Video) {
+                self.insert_large_file(FileKind::Video, path, cx);
             } else {
                 self.say(CantPlay::NotAVideo.to_string(), cx);
             }
@@ -135,20 +172,39 @@ impl WorkspaceView {
         }
     }
 
-    /// Puts the pictures and videos in the files at `paths`, dropped on the slide from outside
-    /// the app, on it, each in turn, one step each, the first [`MOST_DROPPED`] of them. A file
-    /// that's neither is said, and left out.
+    /// Puts the 3D models in the files at `paths`, as the Model tool's dialog gives them, the
+    /// first [`MOST_DROPPED`] of them, on the slide, each once it's copied into the talk, framed
+    /// whole, the status line showing how far that's got. A file that isn't a model is said, and
+    /// left out.
+    pub fn chosen_models(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let more = paths.len() > MOST_DROPPED;
+        for path in paths.into_iter().take(MOST_DROPPED) {
+            if is_kind(&path, FileKind::Model) {
+                self.insert_large_file(FileKind::Model, path, cx);
+            } else {
+                self.say(CantDraw::NotAModel.to_string(), cx);
+            }
+        }
+        if more {
+            self.say_later(ONLY_THE_FIRST, cx);
+        }
+    }
+
+    /// Puts the pictures, videos and 3D models in the files at `paths`, dropped on the slide from
+    /// outside the app, on it, each in turn, one step each, the first [`MOST_DROPPED`] of them. A
+    /// file that's none of them is said, and left out.
     pub(super) fn dropped(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         self.insert_files(paths, true, cx);
     }
 
-    /// Puts the pictures and videos in the first [`MOST_DROPPED`] of the files at `paths` on the
-    /// slide, and says if there were more. A picture goes on at once; a video once it's copied in.
+    /// Puts the pictures, videos and 3D models in the first [`MOST_DROPPED`] of the files at
+    /// `paths` on the slide, and says if there were more. A picture goes on at once; a video or a
+    /// model once it's copied in.
     fn insert_files(&mut self, paths: Vec<PathBuf>, dropped: bool, cx: &mut Context<Self>) {
         let more = paths.len() > MOST_DROPPED;
         for path in paths.iter().take(MOST_DROPPED) {
-            if is_video(path) {
-                self.insert_video_file(path.clone(), cx);
+            if let Some(kind) = [FileKind::Video, FileKind::Model].into_iter().find(|kind| is_kind(path, *kind)) {
+                self.insert_large_file(kind, path.clone(), cx);
             } else {
                 self.insert_file(path, dropped, cx);
             }
@@ -159,10 +215,10 @@ impl WorkspaceView {
     }
 
     /// Puts `said` on the status line once the line has heard what's selected, so that this is
-    /// what it says: once the videos being copied in are all in, if any are.
+    /// what it says: once the videos and models being copied in are all in, if any are.
     fn say_later(&mut self, said: &'static str, cx: &mut Context<Self>) {
-        if self.video_copying {
-            self.said_after_videos = Some(said);
+        if self.large_copying {
+            self.said_after_large = Some(said);
             return;
         }
         cx.spawn(async move |this, cx| {
@@ -171,43 +227,51 @@ impl WorkspaceView {
         .detach();
     }
 
-    /// Copies the video in the file at `path`, from outside the talk, into it, the status line
-    /// showing how far that's got, with a Cancel, and then puts it on the slide shown now, at its
-    /// own size, selected: that slide is shown again then, as any edit shows its slide. Videos are copied one at a time,
-    /// in the order they were asked for. Its headers are looked at first, off the window's
-    /// thread: a file that isn't a video is said, and nothing is copied. Cancelled or refused,
-    /// nothing is put on the slide; cancelled, the videos waiting after it aren't copied either.
-    fn insert_video_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    /// Copies the video or the 3D model, of `kind`, in the file at `path`, from outside the talk,
+    /// into it, the status line showing how far that's got, with a Cancel, and then puts it on
+    /// the slide shown now, selected: that slide is shown again then, as any edit shows its
+    /// slide. A video goes on at its own size, and a model framed whole. They're copied one at a
+    /// time, in the order they were asked for. The file is looked at first, off the window's
+    /// thread: one that isn't of its kind is said, and nothing is copied. Cancelled or refused,
+    /// nothing is put on the slide; cancelled, the files waiting after it aren't copied either.
+    fn insert_large_file(&mut self, kind: FileKind, path: PathBuf, cx: &mut Context<Self>) {
         let Some(document) = &self.document else {
             return;
         };
         let slide = document.read(cx).current();
-        self.videos_waiting.push_back(WaitingVideo { path, slide });
-        self.copy_next_video(cx);
+        self.large_waiting.push_back(WaitingLarge { kind, path, slide });
+        self.copy_next_large(cx);
     }
 
-    /// Copies in the next video waiting, unless one is being copied. In a window closing, none is.
-    fn copy_next_video(&mut self, cx: &mut Context<Self>) {
-        if self.video_copying {
+    /// Copies in the next video or model waiting, unless one is being copied. In a window
+    /// closing, none is.
+    fn copy_next_large(&mut self, cx: &mut Context<Self>) {
+        if self.large_copying {
             return;
         }
         if self.is_closing_window() {
-            self.videos_waiting.clear();
-            self.said_after_videos = None;
+            self.large_waiting.clear();
+            self.said_after_large = None;
             return;
         }
-        let Some(WaitingVideo { path, slide }) = self.videos_waiting.pop_front() else {
-            if let Some(said) = self.said_after_videos.take() {
+        let Some(WaitingLarge { kind, path, slide }) = self.large_waiting.pop_front() else {
+            if let Some(said) = self.said_after_large.take() {
                 self.say_later(said, cx);
             }
             return;
         };
-        self.video_copying = true;
-        let finished = move |this: &mut Self, copied: Result<(String, (u32, u32)), NotCopied>, cx: &mut Context<Self>| {
-            this.video_copying = false;
+        self.large_copying = true;
+        let finished = move |this: &mut Self, copied: Result<(String, Found), NotCopied>, cx: &mut Context<Self>| {
+            this.large_copying = false;
             match copied {
-                Ok((name, size)) => {
-                    this.edit(|document| document.insert_video_on(slide, name, size), cx);
+                Ok((name, found)) => {
+                    this.edit(
+                        |document| match found {
+                            Found::Video(size) => document.insert_video_on(slide, name, size),
+                            Found::Model(view) => document.insert_model_on(slide, name, view),
+                        },
+                        cx,
+                    );
                     // Its Delete and its arrow keys are the slide's, as a picture's are once it's put on.
                     let (window, view) = (this.window_handle, cx.weak_entity());
                     cx.defer(move |cx| {
@@ -218,15 +282,18 @@ impl WorkspaceView {
                 }
                 Err(NotCopied { said, cancelled }) => {
                     if cancelled {
-                        this.videos_waiting.clear();
-                        this.said_after_videos = None;
+                        this.large_waiting.clear();
+                        this.said_after_large = None;
                     }
                     this.say(said, cx);
                 }
             }
-            this.copy_next_video(cx);
+            this.copy_next_large(cx);
         };
-        self.copy_in_looked_at(FileKind::Video, path, video_shape, finished, cx);
+        match kind {
+            FileKind::Model => self.copy_in_looked_at(kind, path, |path| model_framing(path).map(Found::Model), finished, cx),
+            _ => self.copy_in_looked_at(kind, path, |path| video_shape(path).map(Found::Video), finished, cx),
+        }
     }
 
     /// Puts the picture in the file at `path`, from outside the talk, on the slide.
@@ -522,10 +589,32 @@ impl WorkspaceView {
     }
 }
 
-/// Whether the file at `path` is named as a video is.
-fn is_video(path: &Path) -> bool {
+/// Whether the file at `path` is named as a file of `kind` is.
+fn is_kind(path: &Path, kind: FileKind) -> bool {
     let extension = path.extension().map(|extension| extension.to_string_lossy().to_ascii_lowercase());
-    extension.is_some_and(|extension| FileKind::Video.extensions().contains(&extension.as_str()))
+    extension.is_some_and(|extension| kind.extensions().contains(&extension.as_str()))
+}
+
+/// The view the 3D model in the file at `path`, outside the talk, is seen whole from, or why it
+/// isn't a model: for a background task. A mesh's is found from its headers alone; a point
+/// cloud's header doesn't say where its points lie, so a cloud is read whole, within the limits
+/// a model is read with. A model that can't be drawn, as one damaged or too large, is still a
+/// model, and says why once it's on the slide: it's given no view, and is framed whole whenever
+/// it can be drawn.
+fn model_framing(path: &Path) -> Result<Option<View>, String> {
+    let open = || std::fs::File::open(path).map(|file| Box::new(std::io::BufReader::new(file)) as Box<dyn slides_model::ReadSeek>);
+    let file = open().map_err(|_| NotAdded::Unreadable.to_string())?;
+    let facts = match slides_model::facts(file) {
+        Ok(facts) => facts,
+        Err(CantDraw::NotAModel) => return Err(CantDraw::NotAModel.to_string()),
+        Err(CantDraw::CouldNotRead) => return Err(NotAdded::Unreadable.to_string()),
+        Err(_) => return Ok(None),
+    };
+    if facts.kind == ModelKind::Mesh {
+        return Ok(Some(View::framing(&facts)));
+    }
+    let file = open().map_err(|_| NotAdded::Unreadable.to_string())?;
+    Ok(slides_model::read(file).ok().map(|model| View::framing(&model.facts)))
 }
 
 /// The size of the video in the file at `path`, outside the talk, from its headers alone, or why

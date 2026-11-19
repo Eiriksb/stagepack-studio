@@ -59,6 +59,8 @@ pub enum EditRefused {
     NotAList,
     /// The area chosen has nothing in it, so nothing it comes in with would show.
     EmptyArea,
+    /// A 3D model has as many views as it can have.
+    TooManyViews,
 }
 
 impl std::fmt::Display for EditRefused {
@@ -100,6 +102,7 @@ impl std::fmt::Display for EditRefused {
             EditRefused::TooManySteps => "This slide has as many clicks as it can have.",
             EditRefused::NotAList => "Select an area that holds a list to show it one item at a time.",
             EditRefused::EmptyArea => "Type something in it first.",
+            EditRefused::TooManyViews => "This 3D model has as many views as it can have.",
         })
     }
 }

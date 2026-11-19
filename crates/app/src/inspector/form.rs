@@ -54,6 +54,9 @@ impl Inspector {
                     let pictures = self.talk_pictures(&document, pick, cx);
                     video_form(&mut shape, &tag, pictures);
                 }
+                if tag.name == "Model" && shape.message.is_none() {
+                    named_by_its_file(&mut shape, &tag);
+                }
                 shape.tag = Some(tag.name.clone());
                 Some(tag)
             }
@@ -301,8 +304,13 @@ fn video_form(shape: &mut Shape, tag: &slides_format::Tag, mut pictures: Vec<Str
             spec.kind = Kind::Still(pictures.clone());
         }
     }
+    named_by_its_file(shape, tag);
+}
+
+/// Names the file of a video's or a model's form above its fields. One with no file says so
+/// below, in place of its name.
+fn named_by_its_file(shape: &mut Shape, tag: &slides_format::Tag) {
     let src = tag.attr("src").unwrap_or_default().trim();
-    // One with no file says so below, in place of its name.
     shape.message = (!src.is_empty()).then(|| file_name(src).to_string());
 }
 

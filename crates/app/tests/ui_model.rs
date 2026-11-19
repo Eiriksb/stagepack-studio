@@ -960,3 +960,489 @@ fn a_still_lost_from_the_card_twice_cannot_be_drawn() {
     assert_eq!(drawn.map(|picture| (picture.width, picture.height)).ok(), Some((64, 36)));
     assert_eq!(scenes_held(), 0);
 }
+
+// Putting a model on a slide, and its form.
+
+const PLAIN_TALK: &str = "# One\n\nSome words\n\n---\n\n# Two\n";
+const NOT_A_MODEL: &str = "This file isn't a 3D model.";
+
+/// The box, framed whole, as it's put in the middle of the slide.
+const INSERTED: &str = "<Model src=\"assets/box.glb\" x=\"480\" y=\"270\" w=\"960\" h=\"540\" view=\"0 20 3.681 0 0.5 0\" />";
+
+/// What [`PLAIN_TALK`] says once `inserted` is put after its first slide's content.
+fn with_inserted(inserted: &str) -> String {
+    PLAIN_TALK.replacen("Some words", &format!("Some words\n\n{inserted}"), 1)
+}
+
+/// A folder talk of `source` in a window that keeps its working copies under `root`, so that a
+/// model can be copied in.
+fn copying_editor(cx: &mut TestAppContext, source: &str, root: &std::path::Path) -> Typing {
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::write(folder.path().join("slides.md"), source).unwrap();
+    open_folder(cx, folder, Some(stagepack_studio::recovery::Recovery::new(root.join("recovery"))))
+}
+
+/// A file named `name` holding `bytes` in `dir`, outside any talk.
+fn outside(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+/// Hands `paths` to the window as the Model tool's dialog would, and lets the copies run.
+fn choose_models(typing: &Typing, cx: &mut TestAppContext, paths: Vec<std::path::PathBuf>) {
+    let view = typing.view.clone();
+    cx.update(|cx| view.update(cx, |view, cx| view.chosen_models(paths, cx)));
+    cx.run_until_parked();
+    typing.settle(cx);
+}
+
+/// Drops `paths` from outside the app on the middle of the slide, and lets the copies run.
+fn drop_on_slide(typing: &Typing, cx: &mut TestAppContext, paths: &[std::path::PathBuf]) {
+    let at = typing.at(cx, 960., 540.);
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        let paths = gpui_kit::ExternalPaths(paths.iter().cloned().collect());
+        window.dispatch_event(gpui_kit::FileDropEvent::Entered { position: at, paths }.to_platform_input(), cx);
+        window.dispatch_event(gpui_kit::FileDropEvent::Pending { position: at }.to_platform_input(), cx);
+        window.dispatch_event(gpui_kit::FileDropEvent::Submit { position: at }.to_platform_input(), cx);
+        window.render_frame(cx);
+    });
+    cx.run_until_parked();
+    typing.settle(cx);
+}
+
+fn selected_text(typing: &Typing, cx: &TestAppContext) -> Option<String> {
+    let source = typing.source(cx);
+    selected(typing, cx).map(|(_, range)| source[range].to_string())
+}
+
+fn can_undo(typing: &Typing, cx: &TestAppContext) -> bool {
+    typing.document(cx).read_with(cx, |document, _| document.can_undo())
+}
+
+fn png(width: u32, height: u32, rgba: [u8; 4]) -> Vec<u8> {
+    let picture = image::RgbaImage::from_pixel(width, height, image::Rgba(rgba));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(picture).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+    bytes.into_inner()
+}
+
+/// The model's tag, as the talk has it now.
+fn the_tag(typing: &Typing, cx: &mut TestAppContext) -> String {
+    let source = typing.source(cx);
+    let at = source.find("<Model").unwrap();
+    let end = at + source[at..].find("/>").unwrap() + 2;
+    source[at..end].to_string()
+}
+
+/// The inspector of `typing`'s window.
+fn inspector(typing: &Typing, cx: &TestAppContext) -> Entity<stagepack_studio::inspector::Inspector> {
+    cx.read(|cx| typing.view.read(cx).inspector().clone())
+}
+
+/// The words of the element `id`, if it's there.
+fn label_of(typing: &Typing, cx: &mut TestAppContext, id: &str) -> Option<String> {
+    let id = gpui_kit::SharedString::from(id.to_string());
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        window.try_find(id).and_then(|found| found.label().map(str::to_string))
+    })
+}
+
+/// Whether the element `id` is there and can be clicked.
+fn enabled(typing: &Typing, cx: &mut TestAppContext, id: &str) -> bool {
+    let id = gpui_kit::SharedString::from(id.to_string());
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        window.try_find(id).is_some_and(|found| found.disabled() != Some(true))
+    })
+}
+
+/// Waits for the form's line of facts, read off the window's thread, to say something.
+fn facts(typing: &Typing, cx: &mut TestAppContext) -> String {
+    use stagepack_studio::inspector::INSPECTOR_MODEL_FACTS_ID;
+    let mut said = None;
+    until(cx, typing.handle, "the model's facts", |cx| {
+        said = typing.with_window(cx, |window, cx| {
+            window.render_frame(cx);
+            window.try_find(INSPECTOR_MODEL_FACTS_ID).and_then(|found| found.label().map(str::to_string))
+        });
+        said.is_some()
+    });
+    said.unwrap()
+}
+
+fn shown(typing: &Typing, cx: &mut TestAppContext, name: &str) -> Option<String> {
+    typing.settle(cx);
+    let inspector = inspector(typing, cx);
+    cx.read(|cx| inspector.read(cx).shown(name, cx))
+}
+
+/// Goes to slide `index`, from wherever the window is.
+fn go_to_slide(typing: &Typing, cx: &mut TestAppContext, index: usize) {
+    while typing.current(cx) < index {
+        typing.press(cx, "pagedown");
+    }
+    while typing.current(cx) > index {
+        typing.press(cx, "pageup");
+    }
+    assert_eq!(typing.current(cx), index);
+}
+
+#[gpui_kit::test]
+fn the_insert_tab_has_model(cx: &mut TestAppContext) {
+    let typing = open(cx, PLAIN_TALK);
+    click_on(&typing, cx, stagepack_studio::ribbon::TAB_INSERT_ID);
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        let model = window.find(stagepack_studio::insert_tools::INSERT_MODEL_ID);
+        assert_eq!(model.label(), Some("Model"));
+        assert!(model.visible());
+    });
+}
+
+#[gpui_kit::test]
+fn a_chosen_model_is_copied_in_and_put_on_the_slide_framed(cx: &mut TestAppContext) {
+    let Some(_alone) = alone("a_chosen_model_is_copied_in_and_put_on_the_slide_framed") else { return };
+    let work = tempfile::tempdir().unwrap();
+    let typing = copying_editor(cx, PLAIN_TALK, work.path());
+    let from = outside(work.path(), "Box.GLB", &box_model());
+    choose_models(&typing, cx, vec![from]);
+    assert_eq!(typing.source(cx), with_inserted(INSERTED));
+    assert_eq!(selected_text(&typing, cx).as_deref(), Some(INSERTED));
+    assert_eq!(typing.status(cx).as_deref(), Some("Model selected"));
+    assert!(typing.document(cx).read_with(cx, |document, _| document.has_file("assets/box.glb")));
+    // Framed whole, as the view written says.
+    let facts = slides_model::facts(Box::new(std::io::Cursor::new(box_model()))).unwrap();
+    assert_eq!(stagepack_studio::insert::written_view(View::framing(&facts)).to_string(), "0 20 3.681 0 0.5 0");
+    // One step, which Undo takes away.
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), PLAIN_TALK);
+    assert!(!can_undo(&typing, cx), "it was one step");
+
+    // A point cloud is framed from its points, which its header doesn't say where they lie.
+    let cloud = slides_model::make_test_ply(500, true);
+    let from = outside(work.path(), "cloud.ply", &cloud);
+    choose_models(&typing, cx, vec![from]);
+    let read = slides_model::read(Box::new(std::io::Cursor::new(cloud))).unwrap().facts;
+    let framed = stagepack_studio::insert::written_view(View::framing(&read));
+    assert!(the_tag(&typing, cx).contains(&format!("view=\"{framed}\"")), "{}", the_tag(&typing, cx));
+    let header = slides_model::facts(Box::new(std::io::Cursor::new(slides_model::make_test_ply(500, true)))).unwrap();
+    assert_ne!(framed, stagepack_studio::insert::written_view(View::framing(&header)), "not from the header's box of nothing");
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), PLAIN_TALK);
+
+    // What isn't a model says so, and nothing is put on the slide or copied.
+    for (name, bytes) in [("words.glb", b"these are words, not a model".to_vec()), ("empty.ply", Vec::new()), ("notes.txt", b"words".to_vec())] {
+        let from = outside(work.path(), name, &bytes);
+        choose_models(&typing, cx, vec![from]);
+        assert_eq!(typing.source(cx), PLAIN_TALK, "{name}");
+        assert_eq!(typing.status(cx).as_deref(), Some(NOT_A_MODEL), "{name}");
+    }
+    assert!(!can_undo(&typing, cx));
+}
+
+#[gpui_kit::test]
+fn a_dropped_model_is_inserted_among_dropped_pictures(cx: &mut TestAppContext) {
+    let Some(_alone) = alone("a_dropped_model_is_inserted_among_dropped_pictures") else { return };
+    let work = tempfile::tempdir().unwrap();
+    let typing = copying_editor(cx, PLAIN_TALK, work.path());
+    // A file that's none of them is said, in words that name a model too. (Dropped first: in a
+    // test window, a drop after a key press doesn't reach the slide.)
+    let notes = outside(work.path(), "notes.txt", b"words");
+    drop_on_slide(&typing, cx, &[notes]);
+    assert_eq!(typing.status(cx).as_deref(), Some("Only pictures, videos and 3D models can be dropped on a slide."));
+    let words = outside(work.path(), "words.glb", b"these are words, not a model");
+    drop_on_slide(&typing, cx, &[words]);
+    assert_eq!(typing.status(cx).as_deref(), Some(NOT_A_MODEL));
+    assert_eq!(typing.source(cx), PLAIN_TALK);
+
+    let red = outside(work.path(), "red.png", &png(100, 100, [255, 0, 0, 255]));
+    let model = outside(work.path(), "box.glb", &box_model());
+    let blue = outside(work.path(), "blue.png", &png(100, 100, [0, 0, 255, 255]));
+    drop_on_slide(&typing, cx, &[red, model.clone(), blue]);
+    let source = typing.source(cx);
+    assert_eq!(source.matches("<Picture").count(), 2, "{source}");
+    assert_eq!(source.matches("<Model src=\"assets/box.glb\"").count(), 1, "{source}");
+    // Each its own step.
+    for _ in 0..3 {
+        typing.press(cx, "ctrl-z");
+    }
+    assert_eq!(typing.source(cx), PLAIN_TALK);
+    assert!(!can_undo(&typing, cx));
+
+    // Its path pasted is a drop.
+    cx.write_to_clipboard(gpui_kit::ClipboardItem {
+        entries: vec![gpui_kit::ClipboardEntry::ExternalPaths(gpui_kit::ExternalPaths([model].into_iter().collect()))],
+    });
+    click_on(&typing, cx, stagepack_studio::clipboard_tools::PASTE_ID);
+    cx.run_until_parked();
+    typing.settle(cx);
+    assert_eq!(typing.source(cx).matches("<Model").count(), 1, "{}", typing.source(cx));
+}
+
+#[gpui_kit::test]
+fn the_form_says_how_big_and_sets_turning(cx: &mut TestAppContext) {
+    use stagepack_studio::inspector::{INSPECTOR_MESSAGE_ID, INSPECTOR_MODEL_PROBLEM_ID, field_id};
+    let Some(_alone) = alone("the_form_says_how_big_and_sets_turning") else { return };
+    let typing = editor(cx, &talk());
+    select_model(&typing, cx);
+    assert_eq!(facts(&typing, cx), "12 triangles");
+    assert_eq!(label_of(&typing, cx, INSPECTOR_MESSAGE_ID).as_deref(), Some("box.glb"), "its file, by its name");
+    assert_eq!(label_of(&typing, cx, INSPECTOR_MODEL_PROBLEM_ID), None, "it's drawn");
+    let form = inspector(&typing, cx);
+    let labels = cx.read(|cx| form.read(cx).labels());
+    assert_eq!(labels, ["Turns on its own", "Left", "Top", "Width", "Height", "Turn"]);
+
+    // Turns on its own, ticked and unticked, each one step.
+    assert_eq!(shown(&typing, cx, "turn").as_deref(), Some("false"));
+    let before = typing.source(cx);
+    click_on(&typing, cx, gpui_kit::SharedString::from(field_id("turn")));
+    assert!(the_tag(&typing, cx).contains("turn=\"auto\""), "{}", the_tag(&typing, cx));
+    assert_eq!(shown(&typing, cx, "turn").as_deref(), Some("true"));
+    click_on(&typing, cx, gpui_kit::SharedString::from(field_id("turn")));
+    assert!(!the_tag(&typing, cx).contains("turn"), "{}", the_tag(&typing, cx));
+    assert_eq!(typing.source(cx), before);
+    typing.press(cx, "ctrl-z");
+    assert!(the_tag(&typing, cx).contains("turn=\"auto\""));
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), before);
+    // The facts were read once.
+    assert_eq!(facts(&typing, cx), "12 triangles");
+
+    // A point cloud says how many points.
+    let folder = talk_folder(&talk().replace("box.glb", "cloud.ply"), &box_model());
+    std::fs::write(folder.path().join("assets/cloud.ply"), slides_model::make_test_ply(1500, false)).unwrap();
+    let typing = open_folder(cx, folder, None);
+    stills_made(&typing, cx);
+    select_model(&typing, cx);
+    assert_eq!(facts(&typing, cx), "1,500 points");
+}
+
+#[test]
+fn a_models_size_reads_as_words() {
+    use slides_model::ModelKind::{Mesh, Points};
+    use stagepack_studio::inspector::model_facts;
+    assert_eq!(model_facts(Mesh, 42_000, 0), "42,000 triangles");
+    assert_eq!(model_facts(Mesh, 1, 0), "1 triangle");
+    assert_eq!(model_facts(Mesh, 0, 0), "No triangles");
+    assert_eq!(model_facts(Mesh, 999_999, 0), "999,999 triangles");
+    assert_eq!(model_facts(Points, 0, 1_200_000), "1.2 million points");
+    assert_eq!(model_facts(Points, 0, 2_000_000), "2 million points");
+    assert_eq!(model_facts(Points, 0, 20_000_000), "20 million points");
+    assert_eq!(model_facts(Points, 0, 1), "1 point");
+    assert_eq!(model_facts(Points, 0, 999), "999 points");
+}
+
+#[gpui_kit::test]
+fn add_this_view_and_clear_views_each_one_step(cx: &mut TestAppContext) {
+    use stagepack_studio::inspector::{INSPECTOR_ADD_VIEW_ID, INSPECTOR_CLEAR_VIEWS_ID, INSPECTOR_MODEL_VIEWS_ID};
+    let Some(_alone) = alone("add_this_view_and_clear_views_each_one_step") else { return };
+    let typing = editor(cx, &talk());
+    select_model(&typing, cx);
+    assert_eq!(label_of(&typing, cx, INSPECTOR_MODEL_VIEWS_ID).as_deref(), Some("No views"));
+    // Only while it's turned is there a view to add, and with none, none to clear.
+    assert!(!enabled(&typing, cx, INSPECTOR_ADD_VIEW_ID));
+    assert!(!enabled(&typing, cx, INSPECTOR_CLEAR_VIEWS_ID));
+    let canvas = turn_selected(&typing, cx);
+    assert!(enabled(&typing, cx, INSPECTOR_ADD_VIEW_ID));
+    let model = thing(&typing, cx, "<Model");
+    let from = middle(&typing, cx, &model) + point(px(-60.), px(40.));
+    typing.drag(cx, from, from + point(px(100.), px(0.)));
+    drawn(cx, typing.handle, &canvas);
+    let before = typing.source(cx);
+    click_on(&typing, cx, INSPECTOR_ADD_VIEW_ID);
+    let one = typing.source(cx);
+    assert!(the_tag(&typing, cx).ends_with(" views=\"330 0 4 0 0.5 0\" />"), "{}", the_tag(&typing, cx));
+    assert_eq!(label_of(&typing, cx, INSPECTOR_MODEL_VIEWS_ID).as_deref(), Some("1 view"));
+    assert!(bounds_of(&typing, cx, MODEL_DONE_ID).is_some(), "it goes on being turned");
+    // Another, after the first.
+    typing.drag(cx, from, from + point(px(100.), px(0.)));
+    drawn(cx, typing.handle, &canvas);
+    click_on(&typing, cx, INSPECTOR_ADD_VIEW_ID);
+    assert!(the_tag(&typing, cx).contains(" views=\"330 0 4 0 0.5 0; 300 0 4 0 0.5 0\""), "{}", the_tag(&typing, cx));
+    assert_eq!(label_of(&typing, cx, INSPECTOR_MODEL_VIEWS_ID).as_deref(), Some("2 views"));
+    let two = typing.source(cx);
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), one, "one step");
+    typing.press(cx, "ctrl-shift-z");
+    assert_eq!(typing.source(cx), two);
+    // Cleared, as one step.
+    assert!(enabled(&typing, cx, INSPECTOR_CLEAR_VIEWS_ID));
+    click_on(&typing, cx, INSPECTOR_CLEAR_VIEWS_ID);
+    assert_eq!(typing.source(cx), before);
+    assert_eq!(label_of(&typing, cx, INSPECTOR_MODEL_VIEWS_ID).as_deref(), Some("No views"));
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), two);
+    assert!(bounds_of(&typing, cx, MODEL_DONE_ID).is_none(), "an Undo is no change of its own: it stops being turned");
+
+    // A model with as many views as it can hold takes no more, and says so.
+    let full = vec![FRONT; 256].join("; ");
+    let typing = editor(cx, &talk_with(&format!(" views=\"{full}\"")));
+    select_model(&typing, cx);
+    assert_eq!(label_of(&typing, cx, INSPECTOR_MODEL_VIEWS_ID).as_deref(), Some("256 views"));
+    turn_selected(&typing, cx);
+    let before = typing.source(cx);
+    click_on(&typing, cx, INSPECTOR_ADD_VIEW_ID);
+    assert_eq!(typing.source(cx), before);
+    assert_eq!(typing.status(cx).as_deref(), Some("This 3D model has as many views as it can have."));
+    click_on(&typing, cx, MODEL_DONE_ID);
+}
+
+/// Whether `after` differs from `before` only in what was at `range`, give or take the blank
+/// lines around it.
+fn only_its_bytes(before: &str, after: &str, range: &std::ops::Range<usize>) -> bool {
+    let (head, tail) = (before[..range.start].trim_end(), before[range.end..].trim_start());
+    after.starts_with(head) && after.ends_with(tail) && after.len() >= head.len() + tail.len()
+}
+
+#[gpui_kit::test]
+fn a_hand_written_model_reads_or_says_why(cx: &mut TestAppContext) {
+    use stagepack_studio::inspector::INSPECTOR_MODEL_PROBLEM_ID;
+    let Some(_alone) = alone("a_hand_written_model_reads_or_says_why") else { return };
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::create_dir(folder.path().join("assets")).unwrap();
+    std::fs::write(folder.path().join("assets/box.glb"), box_model()).unwrap();
+    std::fs::write(folder.path().join("assets/words.glb"), b"these are words, not a model").unwrap();
+    // A model lying beside the talk, which it can't reach.
+    let beside = tempfile::tempdir().unwrap();
+    std::fs::write(beside.path().join("outside.glb"), box_model()).unwrap();
+    let outside = format!("../{}/outside.glb", beside.path().file_name().unwrap().to_string_lossy());
+    assert!(folder.path().join(&outside).exists());
+    let place = "x=\"100\" y=\"100\" w=\"640\" h=\"360\"";
+    let many = vec![FRONT; 1000].join("; ");
+    let views_left_out = "Some of this 3D model's views can't be read, or there are more than 256, so they're left out";
+    let cases: Vec<(String, Option<&str>)> = vec![
+        ("<Model src=\"assets/box.glb\" />".to_string(), Some(slides_engine::MODEL_IN_TEXT)),
+        ("<Model src=\"assets/box.glb\" x=\"100\" y=\"100\" />".to_string(), None),
+        (format!("<Model src=\"assets/gone.glb\" {place} />"), Some("This model couldn't be read.")),
+        (format!("<Model src=\"{outside}\" {place} />"), Some("This model couldn't be read.")),
+        (format!("<Model src=\"assets/words.glb\" {place} />"), Some(NOT_A_MODEL)),
+        (format!("<Model src=\"assets/box.glb\" view=\"garbage\" {place} />"), Some(slides_engine::MODEL_VIEW_UNREAD)),
+        (format!("<Model src=\"assets/box.glb\" view=\"NaN 0 4 0 0.5 0\" {place} />"), Some(slides_engine::MODEL_VIEW_UNREAD)),
+        (format!("<Model src=\"assets/box.glb\" views=\"{many}\" {place} />"), Some(views_left_out)),
+        (format!("<Model {place} />"), Some(slides_engine::MODEL_NO_FILE)),
+    ];
+    let slides: Vec<String> = cases.iter().enumerate().map(|(at, (tag, _))| format!("# Case {at}\n\n{tag}\n\nAfter\n")).collect();
+    std::fs::write(folder.path().join("slides.md"), slides.join("\n---\n\n")).unwrap();
+    let typing = open_folder(cx, folder, None);
+    stills_made(&typing, cx);
+    for (at, (tag, why)) in cases.iter().enumerate() {
+        go_to_slide(&typing, cx, at);
+        stills_made(&typing, cx);
+        let notices = label_of(&typing, cx, workspace_view::NOTICES_ID).unwrap_or_default();
+        match why {
+            Some(why) => assert!(notices.contains(why), "case {at}: {notices:?}"),
+            None => assert!(!notices.contains("can't"), "case {at}: {notices:?}"),
+        }
+        // Drawn: the still, or a panel.
+        let model = thing(&typing, cx, "<Model");
+        assert!(model.rect.w > 0. && model.rect.h > 0., "case {at}: {:?}", model.rect);
+        let placed = tag.contains(" x=");
+        let at_in = if placed { (model.rect.x + model.rect.w / 5., model.rect.y + model.rect.h / 5.) } else { (model.rect.x + model.rect.w / 2., model.rect.y + model.rect.h / 2.) };
+        let point = typing.at(cx, at_in.0, at_in.1);
+        typing.click(cx, point);
+        assert_eq!(selected(&typing, cx).map(|(_, source)| source), Some(model.source.clone()), "case {at}");
+        let status = typing.status(cx).unwrap_or_default();
+        assert!(status.starts_with("Model selected"), "case {at}: {status}");
+        let problem = label_of(&typing, cx, INSPECTOR_MODEL_PROBLEM_ID);
+        if matches!(why, Some(why) if why.starts_with("This")) {
+            assert_eq!(problem.as_deref(), *why, "case {at}: the form says why too");
+        }
+        let named = label_of(&typing, cx, stagepack_studio::inspector::INSPECTOR_MESSAGE_ID);
+        assert_eq!(named.is_some(), tag.contains("src="), "case {at}: its file is named if it has one: {named:?}");
+        let before = typing.source(cx);
+        if placed {
+            typing.press(cx, "right");
+            let after = typing.source(cx);
+            assert_ne!(after, before, "case {at}: moved");
+            assert!(only_its_bytes(&before, &after, &model.source), "case {at}: {after}");
+            typing.press(cx, "ctrl-z");
+            assert_eq!(typing.source(cx), before, "case {at}");
+            let point = typing.at(cx, at_in.0, at_in.1);
+            typing.click(cx, point);
+        }
+        typing.press(cx, "delete");
+        let after = typing.source(cx);
+        assert!(only_its_bytes(&before, &after, &model.source), "case {at}: {after}");
+        assert_eq!(after.matches("<Model").count(), cases.len() - 1, "case {at}");
+        typing.press(cx, "ctrl-z");
+        assert_eq!(typing.source(cx), before, "case {at}");
+    }
+}
+
+/// Every word the window shows that a person reads: what each thing is called, the status
+/// line, the notices, and what the form's fields show.
+fn words_shown(typing: &Typing, cx: &mut TestAppContext) -> Vec<String> {
+    use gpui_kit::test::TestQueryExt as _;
+    let mut words: Vec<String> = typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        window
+            .elements()
+            .into_iter()
+            .filter(|element| !format!("{:?}", element.path()).contains(workspace_view::MARKDOWN_ID))
+            .filter_map(|element| element.label().map(str::to_string))
+            .collect()
+    });
+    let inspector = inspector(typing, cx);
+    let fields = cx.read(|cx| {
+        let inspector = inspector.read(cx);
+        ["turn", "view", "views", "src"].iter().filter_map(|name| inspector.shown(name, cx)).chain(inspector.labels()).collect::<Vec<_>>()
+    });
+    words.extend(fields);
+    words
+}
+
+/// Whether `words` show code: a tag, a folder of the talk's, a model's file name other than as
+/// the form names its file, a kind of file's name without the plain words beside it, or a view's
+/// six numbers.
+fn shows_code(words: &str, file_name: bool) -> bool {
+    let plain = words.contains("saved as one file (.glb)") || words.contains("point cloud (.ply)");
+    let lower = words.to_ascii_lowercase();
+    let format = ["glTF", "GLB", "PLY"].iter().any(|name| words.contains(name)) || lower.contains(".glb") || lower.contains(".ply");
+    let numbers = words.split_whitespace().filter(|word| word.parse::<f32>().is_ok()).count() >= 6;
+    words.contains('<') || words.contains("assets/") || (format && !file_name && !plain) || numbers
+}
+
+#[gpui_kit::test]
+fn nothing_about_a_model_shows_code(cx: &mut TestAppContext) {
+    use stagepack_studio::inspector::INSPECTOR_MESSAGE_ID;
+    let Some(_alone) = alone("nothing_about_a_model_shows_code") else { return };
+    let work = tempfile::tempdir().unwrap();
+    let typing = copying_editor(cx, PLAIN_TALK, work.path());
+    let from = outside(work.path(), "box.glb", &box_model());
+    choose_models(&typing, cx, vec![from]);
+    stills_made(&typing, cx);
+    facts(&typing, cx);
+    let message = label_of(&typing, cx, INSPECTOR_MESSAGE_ID);
+    assert_eq!(message.as_deref(), Some("box.glb"));
+    let shown = words_shown(&typing, cx);
+    for said in ["Model selected", "12 triangles", "box.glb", "Turns on its own", "No views", "Add this view", "Clear views"] {
+        assert!(shown.iter().any(|words| words == said), "{said:?} among {shown:?}");
+    }
+    for words in shown {
+        let file_name = Some(&words) == message.as_ref() && !words.contains('/');
+        assert!(!shows_code(&words, file_name), "{words:?}");
+    }
+
+    // One that isn't a model, and one that needs files beside it.
+    let needs_others = slides_model::glb_from(r#"{"asset":{"version":"2.0"},"buffers":[{"uri":"other.bin","byteLength":4}]}"#, &[]);
+    for (bytes, why) in [
+        (b"these are words, not a model".to_vec(), NOT_A_MODEL),
+        (needs_others, "This model needs other files kept beside it, so it can't be drawn. A model saved as one file (.glb) with everything inside it can."),
+    ] {
+        let typing = open_folder(cx, talk_folder(&talk(), &bytes), None);
+        stills_made(&typing, cx);
+        select_model(&typing, cx);
+        let message = label_of(&typing, cx, INSPECTOR_MESSAGE_ID);
+        let shown = words_shown(&typing, cx);
+        assert!(shown.iter().any(|words| words.contains(why)), "{why:?} among {shown:?}");
+        for words in shown {
+            let file_name = Some(&words) == message.as_ref() && !words.contains('/');
+            assert!(!shows_code(&words, file_name), "{words:?}");
+        }
+    }
+    assert!(shows_code("Only GLB files", false));
+    assert!(shows_code("0 20 3.681 0 0.5 0", false));
+}
