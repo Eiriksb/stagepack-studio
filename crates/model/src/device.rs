@@ -57,35 +57,38 @@ pub(crate) struct Gpu {
     pub queue: wgpu::Queue,
     pub kind: AdapterKind,
     pub limits: wgpu::Limits,
+    /// The largest buffer a model is held in.
+    pub most_buffer: u64,
     /// How many samples a pixel is drawn with: 4 where the adapter can, smoothing edges.
     pub samples: u32,
-    /// Set when the device is lost or says something went wrong: it's made again before the
-    /// next draw.
-    broken: Arc<AtomicBool>,
+    /// Set when the device is lost: it's made again before the next draw. An error the device
+    /// reports about what was asked of it doesn't set it.
+    lost: Arc<AtomicBool>,
 }
 
 impl Gpu {
-    pub fn broken(&self) -> bool {
-        self.broken.load(Ordering::Acquire)
+    pub fn lost(&self) -> bool {
+        self.lost.load(Ordering::Acquire)
     }
 
     /// Takes the device as lost: it's made again before the next draw.
-    pub fn set_broken(&self) {
-        self.broken.store(true, Ordering::Release);
+    pub fn set_lost(&self) {
+        self.lost.store(true, Ordering::Release);
     }
 
     /// Loses the device, as a card being reset or its driver updated would.
+    #[cfg(feature = "test-hooks")]
     pub fn lose(&self) {
-        self.set_broken();
+        self.set_lost();
         self.device.destroy();
     }
 }
 
-/// The graphics libraries made for the card, tried first.
+/// The graphics libraries made for the card.
 const NATIVE: wgpu::Backends = wgpu::Backends::VULKAN.union(wgpu::Backends::DX12).union(wgpu::Backends::METAL);
 
-/// GL, tried only where no library made for the card finds an adapter: opening it at all can
-/// cost a driver's own threads and a wait as the program ends.
+/// GL, looked at only where the libraries made for the card find no card: opening it at all
+/// can cost a driver's own threads and a wait as the program ends.
 const FALLBACK: wgpu::Backends = wgpu::Backends::GL;
 
 fn instance(backends: wgpu::Backends) -> wgpu::Instance {
@@ -96,26 +99,46 @@ fn instance(backends: wgpu::Backends) -> wgpu::Instance {
     wgpu::Instance::new(description)
 }
 
-/// The adapters `instance` finds, best first.
-fn adapters(instance: &wgpu::Instance, backends: wgpu::Backends) -> Vec<wgpu::Adapter> {
-    let mut adapters = pollster::block_on(instance.enumerate_adapters(backends));
-    adapters.sort_by_key(|adapter| AdapterKind::of(adapter.get_info().device_type).rank());
-    adapters
+/// Whether a picture can be drawn on `adapter` and copied back from it.
+fn can_draw(adapter: &wgpu::Adapter) -> bool {
+    let colour = adapter.get_texture_format_features(COLOUR).allowed_usages;
+    let depth = adapter.get_texture_format_features(DEPTH).allowed_usages;
+    colour.contains(wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC) && depth.contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
 }
 
-/// The kinds of adapter this computer has, best first. This waits for the graphics library, a
-/// second or more: never call it on a window's thread.
-pub fn adapter_kinds() -> Vec<AdapterKind> {
-    let mut kinds = Vec::new();
+/// The adapters that can draw, best first: by kind, a discrete card, then an integrated one,
+/// then a software one, and a library made for the card before GL. GL is looked at only when the
+/// libraries made for the card find nothing but software, so a card only GL reaches is still
+/// used. Each adapter comes with its instance, which must outlive it.
+fn adapters() -> Vec<(wgpu::Instance, wgpu::Adapter)> {
+    let mut found = Vec::new();
     for backends in [NATIVE, FALLBACK] {
-        for adapter in adapters(&instance(backends), backends) {
-            let kind = AdapterKind::of(adapter.get_info().device_type);
-            if !kinds.contains(&kind) {
-                kinds.push(kind);
+        let instance = instance(backends);
+        for adapter in pollster::block_on(instance.enumerate_adapters(backends)) {
+            if can_draw(&adapter) {
+                found.push((instance.clone(), adapter));
             }
         }
-        if !kinds.is_empty() {
+        let hardware = found.iter().any(|(_, adapter)| AdapterKind::of(adapter.get_info().device_type) != AdapterKind::Software);
+        if hardware {
             break;
+        }
+    }
+    found.sort_by_key(|(_, adapter)| {
+        let info = adapter.get_info();
+        (AdapterKind::of(info.device_type).rank(), info.backend == wgpu::Backend::Gl)
+    });
+    found
+}
+
+/// The kinds of adapter this computer has that can draw, best first. This waits for the
+/// graphics library, a second or more: never call it on a window's thread.
+pub fn adapter_kinds() -> Vec<AdapterKind> {
+    let mut kinds = Vec::new();
+    for (_, adapter) in adapters() {
+        let kind = AdapterKind::of(adapter.get_info().device_type);
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
         }
     }
     kinds
@@ -123,17 +146,7 @@ pub fn adapter_kinds() -> Vec<AdapterKind> {
 
 /// A device on the best adapter there is, or on the best of kind `only`.
 pub(crate) fn make(only: Option<AdapterKind>) -> Result<Gpu, CantDraw> {
-    for backends in [NATIVE, FALLBACK] {
-        if let Some(gpu) = make_with(backends, only) {
-            return Ok(gpu);
-        }
-    }
-    Err(CantDraw::NoAdapter)
-}
-
-fn make_with(backends: wgpu::Backends, only: Option<AdapterKind>) -> Option<Gpu> {
-    let instance = instance(backends);
-    for adapter in adapters(&instance, backends) {
+    for (_instance, adapter) in adapters() {
         let kind = AdapterKind::of(adapter.get_info().device_type);
         if only.is_some_and(|only| only != kind) {
             continue;
@@ -146,14 +159,16 @@ fn make_with(backends: wgpu::Backends, only: Option<AdapterKind>) -> Option<Gpu>
             ..Default::default()
         };
         let Ok((device, queue)) = pollster::block_on(adapter.request_device(&description)) else { continue };
-        let broken = Arc::new(AtomicBool::new(false));
-        let lost = broken.clone();
-        device.set_device_lost_callback(move |_, _| lost.store(true, Ordering::Release));
-        let failed = broken.clone();
-        device.on_uncaptured_error(Arc::new(move |_| failed.store(true, Ordering::Release)));
+        let lost = Arc::new(AtomicBool::new(false));
+        let theirs = lost.clone();
+        device.set_device_lost_callback(move |_, _| theirs.store(true, Ordering::Release));
+        // Errors are caught where the work is asked for; one that gets past is let go, rather
+        // than ending the program as the library would.
+        device.on_uncaptured_error(Arc::new(|_| {}));
         let four = |format| adapter.get_texture_format_features(format).flags.sample_count_supported(4);
         let samples = if four(COLOUR) && four(DEPTH) { 4 } else { 1 };
-        return Some(Gpu { device, queue, kind, limits, samples, broken });
+        let most_buffer = limits.max_buffer_size;
+        return Ok(Gpu { device, queue, kind, limits, samples, lost, most_buffer });
     }
-    None
+    Err(CantDraw::NoAdapter)
 }

@@ -5,7 +5,6 @@
 
 use std::io::Cursor;
 use std::path::PathBuf;
-use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use slides_model::*;
@@ -49,11 +48,15 @@ fn wait_ready(drawer: &Drawer) -> Result<AdapterKind, CantDraw> {
 /// A drawer on the software adapter where there is one, else on any, else `None` after saying
 /// why the test is skipped.
 fn drawer(test: &str) -> Option<Closing> {
-    let software = start(DrawerOptions { only: Some(AdapterKind::Software), ..DrawerOptions::default() });
+    drawer_with(test, DrawerOptions::default())
+}
+
+fn drawer_with(test: &str, options: DrawerOptions) -> Option<Closing> {
+    let software = start(DrawerOptions { only: Some(AdapterKind::Software), ..options.clone() });
     if wait_ready(&software).is_ok() {
         return Some(software);
     }
-    let any = start(DrawerOptions::default());
+    let any = start(options);
     match wait_ready(&any) {
         Ok(_) => Some(any),
         Err(why) => {
@@ -71,7 +74,7 @@ fn boxes() -> Model {
     model(make_test_glb(MadeGlb::Boxes))
 }
 
-fn picture(receiver: Receiver<Result<Picture, CantDraw>>) -> Result<Picture, CantDraw> {
+fn picture(receiver: Answer) -> Result<Picture, NotDrawn> {
     receiver.recv_timeout(Duration::from_secs(60)).expect("the drawer answered")
 }
 
@@ -154,6 +157,11 @@ fn a_view_reads_back_as_written() {
         assert_eq!(back.yaw, view.yaw);
         assert_eq!(back.distance, view.distance);
     }
+    // A view that isn't made of numbers is written as one that is.
+    let nonsense = View { yaw: f32::NAN, pitch: f32::INFINITY, distance: -1.0, target: [f32::NAN, 1.0, f32::NEG_INFINITY] };
+    assert_eq!(nonsense.to_string(), "0 0 1 0 1 0");
+    let between = View::between(nonsense, View { yaw: 90.0, ..nonsense }, 0.5);
+    assert!(View::parse(&between.to_string()).is_some(), "{between}");
     for bad in [
         "",
         "1 2 3",
@@ -334,7 +342,7 @@ fn with_no_adapter_a_model_is_a_panel_and_says_why() {
     let scene = drawer.upload(boxes());
     let view = View::framing(&boxes().facts);
     for _ in 0..2 {
-        assert_eq!(picture(drawer.draw(&scene, view, 64, 36)).unwrap_err(), CantDraw::NoAdapter);
+        assert_eq!(picture(drawer.draw(&scene, view, 64, 36)).unwrap_err(), NotDrawn::Cant(CantDraw::NoAdapter));
     }
     assert_eq!(
         CantDraw::NoAdapter.to_string(),
@@ -344,18 +352,140 @@ fn with_no_adapter_a_model_is_a_panel_and_says_why() {
 
 #[test]
 fn a_lost_device_is_made_again() {
-    let Some(drawer) = drawer("a_lost_device_is_made_again") else { return };
+    let quick = DrawerOptions { retry_after: Duration::from_millis(50), ..DrawerOptions::default() };
+    let Some(drawer) = drawer_with("a_lost_device_is_made_again", quick) else { return };
+    let model = || boxes();
+    let view = View::framing(&model().facts);
+    let mut scene = drawer.upload(model());
+    let before = picture(drawer.draw(&scene, view, 120, 90)).expect("drawn");
+    let kind = drawer.ready();
+    assert_eq!(drawer.devices_made(), 1);
+    for again in 1..=2 {
+        drawer.lose_device();
+        // The model went with the device: it's to be uploaded again, to the device made anew.
+        assert_eq!(picture(drawer.draw(&scene, view, 120, 90)).unwrap_err(), NotDrawn::UploadAgain);
+        assert_eq!(drawer.devices_made(), 1 + again);
+        assert_eq!(drawer.ready(), kind);
+        scene = drawer.upload(model());
+        let after = picture(drawer.draw(&scene, view, 120, 90)).expect("drawn again on a new device");
+        assert_eq!(covered(&after), covered(&before));
+    }
+
+    // Making it again fails: nothing can be drawn until a later try makes one.
+    drawer.fail_making(2);
+    drawer.lose_device();
+    assert_eq!(picture(drawer.draw(&scene, view, 120, 90)).unwrap_err(), NotDrawn::Cant(CantDraw::NoAdapter));
+    assert_eq!(drawer.ready(), Some(Err(CantDraw::NoAdapter)));
+    // Asked again at once, it waits before trying again.
+    assert_eq!(picture(drawer.draw(&scene, view, 120, 90)).unwrap_err(), NotDrawn::Cant(CantDraw::NoAdapter));
+    // The second try fails too, and the wait before the next doubles.
+    std::thread::sleep(Duration::from_millis(60));
+    assert_eq!(picture(drawer.draw(&scene, view, 120, 90)).unwrap_err(), NotDrawn::Cant(CantDraw::NoAdapter));
+    std::thread::sleep(Duration::from_millis(60));
+    assert_eq!(picture(drawer.draw(&scene, view, 120, 90)).unwrap_err(), NotDrawn::Cant(CantDraw::NoAdapter), "the wait doubled");
+    std::thread::sleep(Duration::from_millis(60));
+    assert_eq!(picture(drawer.draw(&scene, view, 120, 90)).unwrap_err(), NotDrawn::UploadAgain);
+    assert_eq!(drawer.devices_made(), 4);
+    assert_eq!(drawer.ready(), kind);
+    let scene = drawer.upload(model());
+    let after = picture(drawer.draw(&scene, view, 120, 90)).expect("drawn once a device could be made");
+    assert_eq!(covered(&after), covered(&before));
+}
+
+#[test]
+fn what_is_too_large_for_the_device_says_so_and_keeps_the_device() {
+    let Some(drawer) = drawer("what_is_too_large_for_the_device_says_so_and_keeps_the_device") else { return };
     let model = boxes();
     let view = View::framing(&model.facts);
     let scene = drawer.upload(model);
-    let before = picture(drawer.draw(&scene, view, 120, 90)).expect("drawn");
-    let kind = drawer.ready();
-    for _ in 0..2 {
-        drawer.lose_device();
-        let after = picture(drawer.draw(&scene, view, 120, 90)).expect("drawn again on a new device");
-        assert_eq!(covered(&after), covered(&before));
-        assert_eq!(drawer.ready(), kind);
+    for (width, height) in [(8192, 8192), (100_000, 10)] {
+        assert_eq!(picture(drawer.draw(&scene, view, width, height)).unwrap_err(), NotDrawn::Cant(CantDraw::TooLarge));
     }
+    assert!(picture(drawer.draw(&scene, view, 64, 36)).is_ok());
+    assert_eq!(drawer.devices_made(), 1, "a picture too large isn't a lost device");
+
+    // A device whose buffers can't hold even one triangle: the model is too large, and stays so.
+    let Some(tiny) = drawer_with("what_is_too_large_for_the_device_says_so_and_keeps_the_device", DrawerOptions { most_buffer: Some(8), ..DrawerOptions::default() }) else { return };
+    let scene = tiny.upload(boxes());
+    for _ in 0..2 {
+        assert_eq!(picture(tiny.draw(&scene, view, 64, 36)).unwrap_err(), NotDrawn::Cant(CantDraw::TooLarge));
+    }
+    assert_eq!(tiny.devices_made(), 1);
+    assert_eq!(tiny.ready().map(|r| r.is_ok()), Some(true));
+}
+
+#[test]
+fn a_model_too_large_for_one_buffer_is_held_in_several() {
+    let Some(whole) = drawer("a_model_too_large_for_one_buffer_is_held_in_several") else { return };
+    let small = DrawerOptions { most_buffer: Some(4096), ..DrawerOptions::default() };
+    let Some(split) = drawer_with("a_model_too_large_for_one_buffer_is_held_in_several", small) else { return };
+    // A grid of 441 corners and 800 triangles, and a cloud of 2,000 points, each many times 4 KB.
+    for model in [model(make_test_glb(MadeGlb::Grid { cells: 20, texture: 64, jpeg: false })), model_of_cloud(2000)] {
+        let view = View::framing(&model.facts);
+        let a = picture(whole.draw(&whole.upload(model.clone()), view, 160, 120)).expect("drawn");
+        let b = picture(split.draw(&split.upload(model), view, 160, 120)).expect("drawn in pieces");
+        assert_eq!(covered(&a), covered(&b));
+        let differ = a.bgra.iter().zip(&b.bgra).filter(|(x, y)| x.abs_diff(**y) > 2).count();
+        assert!(differ < a.bgra.len() / 100, "{differ} bytes differ");
+    }
+}
+
+#[test]
+fn a_model_of_one_point_or_far_out_is_drawn() {
+    let Some(drawer) = drawer("a_model_of_one_point_or_far_out_is_drawn") else { return };
+    for at in [[5.0, 5.0, 5.0], [1e30, -1e30, 1e30]] {
+        let facts = ModelFacts { kind: ModelKind::Points, triangles: 0, points: 1, bounds: (at, at) };
+        let model = Model {
+            meshes: Vec::new(),
+            points: Some(Points { positions: vec![at], colours: vec![[255, 0, 0, 255]] }),
+            texture: None,
+            facts,
+        };
+        let view = View::framing(&facts);
+        assert!(View::parse(&view.to_string()).is_some(), "{view}");
+        let scene = drawer.upload(model);
+        let picture = picture(drawer.draw(&scene, view, 64, 64)).expect("drawn");
+        if at[0] == 5.0 {
+            assert!((30..34).any(|x| (30..34).any(|y| alpha(&picture, x, y) > 0)), "the point is in the middle");
+        }
+    }
+    // Bounds as wide as numbers go still frame a model with a distance that can be written.
+    let wide = ModelFacts { kind: ModelKind::Mesh, triangles: 1, points: 0, bounds: ([-3e38; 3], [3e38; 3]) };
+    let view = View::framing(&wide);
+    assert!(view.distance.is_finite() && view.distance > 0.0, "{view}");
+    assert_eq!(view.target, [0.0; 3]);
+}
+
+#[test]
+fn only_the_newest_picture_of_a_scene_is_drawn() {
+    let slow = DrawerOptions { device_delay: Duration::from_millis(300), ..DrawerOptions::default() };
+    let Some(drawer) = drawer_with("only_the_newest_picture_of_a_scene_is_drawn", slow) else { return };
+    let model = boxes();
+    let view = View::framing(&model.facts);
+    let scene = drawer.upload(model);
+    let other = drawer.upload(boxes());
+    let third = drawer.upload(boxes());
+    // Asked for while the device is being made, these wait together.
+    let busy = drawer.draw(&third, view, 1600, 900);
+    let first = drawer.draw(&scene, view, 64, 36);
+    let dropped = drawer.draw(&other, view, 64, 36);
+    drop(dropped);
+    let second = drawer.draw(&scene, View { yaw: 10.0, ..view }, 64, 36);
+    let elsewhere = drawer.draw(&other, view, 64, 36);
+    assert!(picture(busy).is_ok());
+    assert_eq!(picture(first).unwrap_err(), NotDrawn::Replaced);
+    assert!(picture(second).is_ok());
+    assert!(picture(elsewhere).is_ok(), "another scene's picture isn't replaced");
+}
+
+#[test]
+fn a_closed_drawer_says_so() {
+    let drawer = Drawer::start_with(DrawerOptions { only: Some(AdapterKind::Software), ..DrawerOptions::default() });
+    let ready = wait_ready(&drawer);
+    let scene = drawer.upload(boxes());
+    assert!(drawer.clone().close(Duration::from_secs(30)));
+    assert_eq!(drawer.ready(), Some(Err(CantDraw::NoAdapter)), "was {ready:?}");
+    assert_eq!(picture(drawer.draw(&scene, View::framing(&boxes().facts), 32, 18)).unwrap_err(), NotDrawn::Closed);
 }
 
 #[test]
@@ -379,7 +509,8 @@ fn draw_never_blocks_the_caller() {
     let started = Instant::now();
     let second = drawer.draw(&scene, View { yaw: 20.0, ..view }, 1600, 900);
     assert!(started.elapsed() < Duration::from_millis(1), "took {:?} while a draw ran", started.elapsed());
-    assert!(picture(first).is_ok());
+    // Asked for at once, the first may be replaced by the second before it's begun.
+    assert!(matches!(picture(first), Ok(_) | Err(NotDrawn::Replaced)));
     assert!(picture(second).is_ok());
 }
 
@@ -407,7 +538,7 @@ fn two_drawers_do_not_fight() {
     }
     // A scene belongs to the drawer it was uploaded to.
     let scene = one.upload(boxes());
-    assert!(picture(two.draw(&scene, View::framing(&boxes().facts), 32, 18)).is_err());
+    assert_eq!(picture(two.draw(&scene, View::framing(&boxes().facts), 32, 18)).unwrap_err(), NotDrawn::UploadAgain);
 }
 
 /// The median and the 99th percentile of `times`.

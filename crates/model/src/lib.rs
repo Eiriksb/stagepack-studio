@@ -29,7 +29,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 #[cfg(feature = "draw")]
 pub use device::{AdapterKind, adapter_kinds};
 #[cfg(feature = "draw")]
-pub use draw::{Drawer, DrawerOptions, Scene};
+pub use draw::{Answer, Drawer, DrawerOptions, MOST_RETRY, NotDrawn, Scene};
 pub use limits::*;
 #[cfg(feature = "make")]
 pub use make::{BOX_COLOURS, GRID_COLOURS, MadeGlb, glb_from, glb_parts, make_test_glb, make_test_ply};

@@ -10,6 +10,9 @@ make = ["dep:serde_json"]
 # Draws a model off-screen with a graphics device of its own. Kept apart so that what only
 # reads a model, as the engine does, never builds a graphics library.
 draw = ["dep:wgpu", "dep:pollster"]
+# Lets tests here and in the other crates lose a drawer's device, fail to make one, delay it,
+# or hold a model in small buffers.
+test-hooks = ["draw"]
 
 [dependencies]
 # The glTF description only: its JSON read into types. Nothing that opens files, follows a
@@ -32,6 +35,6 @@ pollster = { version = "=0.4.0", optional = true }
 
 [dev-dependencies]
 # The tests make their own models.
-slides-model = { path = ".", features = ["make", "draw"] }
+slides-model = { path = ".", features = ["make", "draw", "test-hooks"] }
 serde_json = { workspace = true }
 proptest = "1"

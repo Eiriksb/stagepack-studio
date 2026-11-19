@@ -33,16 +33,21 @@ impl View {
     /// lie: give this the bounds from `read(...).facts` for a cloud. A box of nothing, or one
     /// that isn't made of numbers, is framed as a sphere of radius 1 round its middle.
     pub fn framing(facts: &ModelFacts) -> View {
-        let (low, high) = facts.bounds;
-        let mut target = [0, 1, 2].map(|i| (low[i] + high[i]) / 2.0);
-        if !target.iter().all(|v| v.is_finite()) {
-            target = [0.0; 3];
-        }
-        let half = [0, 1, 2].map(|i| (high[i] - low[i]) / 2.0);
-        let radius = (half[0] * half[0] + half[1] * half[1] + half[2] * half[2]).sqrt();
-        let radius = if radius.is_finite() && radius > f32::MIN_POSITIVE * 1e6 { radius } else { 1.0 };
+        let (target, radius) = sphere(facts.bounds);
         let distance = radius / (Self::FIELD_OF_VIEW / 2.0).to_radians().sin() * FRAMING_ROOM;
         View { yaw: 0.0, pitch: FRAMING_PITCH, distance, target }
+    }
+
+    /// This view with any number that isn't one made plain: an angle of nothing, a distance of
+    /// 1, a target at the origin.
+    pub fn cleaned(self) -> View {
+        let or = |v: f32, instead: f32| if v.is_finite() { v } else { instead };
+        View {
+            yaw: or(self.yaw, 0.0),
+            pitch: or(self.pitch, 0.0),
+            distance: if self.distance.is_finite() && self.distance > 0.0 { self.distance } else { 1.0 },
+            target: self.target.map(|v| or(v, 0.0)),
+        }
     }
 
     /// Reads the six numbers `yaw pitch distance x y z`, as `Display` writes them. Every number
@@ -66,6 +71,7 @@ impl View {
     /// The view `t` of the way from `a` to `b`, `t` from 0 to 1: starting and ending gently,
     /// turning the short way round, and zooming evenly however far it goes.
     pub fn between(a: View, b: View, t: f32) -> View {
+        let (a, b) = (a.cleaned(), b.cleaned());
         if t.is_nan() || t <= 0.0 {
             return a;
         }
@@ -79,8 +85,9 @@ impl View {
             yaw: a.yaw + turn * s,
             pitch: a.pitch + (b.pitch - a.pitch) * s,
             distance: if distance.is_finite() && distance > 0.0 { distance } else { a.distance + (b.distance - a.distance) * s },
-            target: [0, 1, 2].map(|i| a.target[i] + (b.target[i] - a.target[i]) * s),
+            target: [0, 1, 2].map(|i| a.target[i] * (1.0 - s) + b.target[i] * s),
         }
+        .cleaned()
     }
 
     /// Where the eye is.
@@ -92,14 +99,35 @@ impl View {
     }
 }
 
+/// The middle of `bounds` and the radius of a sphere round them. A box of nothing, or one that
+/// isn't made of numbers, is a sphere of radius 1; one too large to hold is held as large as
+/// can be. Worked out by halves and scaled, so that no step overflows.
+pub(crate) fn sphere((low, high): ([f32; 3], [f32; 3])) -> ([f32; 3], f32) {
+    let mut middle = [0, 1, 2].map(|i| low[i] / 2.0 + high[i] / 2.0);
+    if !middle.iter().all(|v| v.is_finite()) {
+        middle = [0.0; 3];
+    }
+    let half = [0, 1, 2].map(|i| high[i] / 2.0 - low[i] / 2.0);
+    let largest = half.iter().fold(0.0f32, |most, v| most.max(v.abs()));
+    let radius = if largest.is_finite() && largest > 0.0 {
+        let sum: f32 = half.iter().map(|v| (v / largest) * (v / largest)).sum();
+        (largest * sum.sqrt()).min(f32::MAX / 8.0)
+    } else {
+        0.0
+    };
+    (middle, if radius > f32::MIN_POSITIVE * 1e6 { radius } else { 1.0 })
+}
+
 /// How far up or down the eye is raised when drawing: straight up or down, the way up can't be
 /// told.
 pub(crate) const MOST_PITCH: f32 = 89.9;
 
-/// Writes the six numbers, each as briefly as reads back the same, with no minus on a nothing.
+/// Writes the six numbers, each as briefly as reads back the same, with no minus on a nothing,
+/// and any that isn't a number made plain as `cleaned` does, so what's written always reads.
 impl fmt::Display for View {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let numbers = [self.yaw, self.pitch, self.distance, self.target[0], self.target[1], self.target[2]];
+        let view = self.cleaned();
+        let numbers = [view.yaw, view.pitch, view.distance, view.target[0], view.target[1], view.target[2]];
         for (i, number) in numbers.into_iter().enumerate() {
             if i > 0 {
                 f.write_str(" ")?;

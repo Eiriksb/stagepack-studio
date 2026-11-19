@@ -1,33 +1,66 @@
 //! The drawer: a thread of its own with a graphics device of its own, drawing models off-screen
 //! and reading the pictures back. Asking it for anything returns at once; every wait on the
-//! graphics card happens on its thread. A device lost is made again, and every model uploaded
-//! to it uploaded again, on the next draw.
+//! graphics card happens on its thread. A model is let go of once it's on the card; a device
+//! lost is made again on the next draw, and each model on it must then be uploaded again.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::fmt;
+use std::ops::Deref;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::device::{self, AdapterKind, COLOUR, DEPTH, Gpu};
 use crate::maths::{cross, minus, unit};
-use crate::view::MOST_PITCH;
+use crate::view::{MOST_PITCH, sphere};
 use crate::{CantDraw, Model, ModelFacts, Picture, View};
 
 /// How a drawer is made.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct DrawerOptions {
     /// Draws only on an adapter of this kind; on the best there is when `None`.
     pub only: Option<AdapterKind>,
+    /// How long after failing to make a device it's tried again, at first: each time it fails
+    /// again the wait doubles, up to `MOST_RETRY`.
+    pub retry_after: Duration,
     /// For tests: finds no adapter at all, as a computer with no graphics would.
+    #[cfg(feature = "test-hooks")]
     pub no_adapter: bool,
     /// For tests: makes the device this much later, as a slow one would be.
+    #[cfg(feature = "test-hooks")]
     pub device_delay: Duration,
+    /// For tests: holds a model in buffers of at most this many bytes, as a device that allows
+    /// only small ones would.
+    #[cfg(feature = "test-hooks")]
+    pub most_buffer: Option<u64>,
 }
+
+impl Default for DrawerOptions {
+    fn default() -> DrawerOptions {
+        DrawerOptions {
+            only: None,
+            retry_after: Duration::from_secs(2),
+            #[cfg(feature = "test-hooks")]
+            no_adapter: false,
+            #[cfg(feature = "test-hooks")]
+            device_delay: Duration::ZERO,
+            #[cfg(feature = "test-hooks")]
+            most_buffer: None,
+        }
+    }
+}
+
+/// The longest wait before trying again to make a device.
+pub const MOST_RETRY: Duration = Duration::from_secs(120);
 
 /// How long the drawer waits for the card to finish a picture before taking the device as lost.
 const MOST_WAIT: Duration = Duration::from_secs(20);
+
+/// The most samples a picture is drawn with, all its pixels counted: 4,096 by 4,096 pixels of 4
+/// samples each. Beyond it a picture is too large to draw.
+const MOST_SAMPLES: u64 = 64 * 1024 * 1024;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -37,8 +70,51 @@ fn next_id() -> u64 {
 
 type Ready = Arc<Mutex<Option<Result<AdapterKind, CantDraw>>>>;
 
+fn say(ready: &Ready, now: Result<AdapterKind, CantDraw>) {
+    *ready.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
+}
+
+/// Why a drawer gave no picture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotDrawn {
+    /// It can't be drawn here: no device can be had, or the model or the picture is too large
+    /// for the device there is.
+    Cant(CantDraw),
+    /// The model isn't on this drawer's device: the device was lost and made again, it was made
+    /// after the model was uploaded, or the scene was uploaded to another drawer. Read the model
+    /// again and upload it to this drawer.
+    UploadAgain,
+    /// A newer picture of the same scene was asked for before this one was begun.
+    Replaced,
+    /// The drawer was closed, or its thread has ended.
+    Closed,
+}
+
+impl From<CantDraw> for NotDrawn {
+    fn from(why: CantDraw) -> NotDrawn {
+        NotDrawn::Cant(why)
+    }
+}
+
+impl fmt::Display for NotDrawn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NotDrawn::Cant(why) => why.fmt(f),
+            NotDrawn::UploadAgain => f.write_str("The model is being read again to be drawn."),
+            NotDrawn::Replaced => f.write_str("A newer picture of the model was asked for."),
+            NotDrawn::Closed => f.write_str("Models are no longer being drawn."),
+        }
+    }
+}
+
+impl std::error::Error for NotDrawn {}
+
 /// Draws models off-screen, on a thread of its own with a device of its own. One is enough for
-/// an app; copies of it share the one thread. The thread ends when the last copy is dropped.
+/// an app; copies of it share the one thread.
+///
+/// Call `close` before the program ends. Dropping the last copy ends the thread too, but
+/// without waiting for it, and a program that ends while a graphics driver is letting go of a
+/// device can crash in the driver.
 #[derive(Clone)]
 pub struct Drawer {
     shared: Arc<Shared>,
@@ -50,6 +126,9 @@ struct Shared {
     ready: Ready,
     /// Says, by closing, that the thread has ended and let go of its device.
     ended: Mutex<Receiver<()>>,
+    /// How many devices the thread has made.
+    #[cfg(feature = "test-hooks")]
+    made: Arc<AtomicU32>,
 }
 
 impl Drop for Shared {
@@ -79,11 +158,45 @@ impl Drop for Scene {
     }
 }
 
+/// Where a picture asked for comes: receive from it as from any receiver. Dropping it before
+/// the picture is begun means it isn't drawn.
+pub struct Answer {
+    receiver: Receiver<Result<Picture, NotDrawn>>,
+    _wanted: Arc<()>,
+}
+
+impl Deref for Answer {
+    type Target = Receiver<Result<Picture, NotDrawn>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.receiver
+    }
+}
+
+struct Asked {
+    scene: u64,
+    view: View,
+    width: u32,
+    height: u32,
+    answer: Sender<Result<Picture, NotDrawn>>,
+    /// Held by the `Answer` too: alone, the answer is no longer wanted.
+    wanted: Arc<()>,
+}
+
+impl Asked {
+    fn wanted(&self) -> bool {
+        Arc::strong_count(&self.wanted) > 1
+    }
+}
+
 enum Job {
     Upload(u64, Box<Model>),
     Release(u64),
-    Draw { scene: u64, view: View, width: u32, height: u32, answer: Sender<Result<Picture, CantDraw>> },
+    Draw(Asked),
+    #[cfg(feature = "test-hooks")]
     Lose,
+    #[cfg(feature = "test-hooks")]
+    FailMaking(u32),
     Stop,
 }
 
@@ -97,22 +210,33 @@ impl Drawer {
     pub fn start_with(options: DrawerOptions) -> Drawer {
         let (jobs, receiver) = mpsc::channel();
         let ready: Ready = Arc::new(Mutex::new(None));
-        let theirs = ready.clone();
+        let made = Arc::new(AtomicU32::new(0));
         let (ending, ended) = mpsc::channel();
-        let started = std::thread::Builder::new().name("model drawer".into()).spawn(move || run(options, receiver, theirs, ending));
+        let thread = Thread { ready: ready.clone(), made: made.clone(), _ending: ending };
+        let started = std::thread::Builder::new().name("model drawer".into()).spawn(move || run(options, receiver, thread));
         if started.is_err() {
-            *ready.lock().unwrap_or_else(|e| e.into_inner()) = Some(Err(CantDraw::NoAdapter));
+            say(&ready, Err(CantDraw::NoAdapter));
         }
-        Drawer { shared: Arc::new(Shared { id: next_id(), jobs, ready, ended: Mutex::new(ended) }) }
+        Drawer {
+            shared: Arc::new(Shared {
+                id: next_id(),
+                jobs,
+                ready,
+                ended: Mutex::new(ended),
+                #[cfg(feature = "test-hooks")]
+                made,
+            }),
+        }
     }
 
-    /// `None` while the device is being made; then the kind of adapter drawn with, or why
-    /// nothing can be.
+    /// `None` while the device is first being made; then the kind of adapter drawn with, or
+    /// `NoAdapter` while none can be had, and once the drawer is closed or its thread has ended.
     pub fn ready(&self) -> Option<Result<AdapterKind, CantDraw>> {
         *self.shared.ready.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Uploads `model` to the drawer's device, on the drawer's thread.
+    /// Uploads `model` to the drawer's device, on the drawer's thread. The model is let go of
+    /// once it's on the card, or at once if there's no device to put it on.
     pub fn upload(&self, model: Model) -> Scene {
         let id = next_id();
         let facts = model.facts;
@@ -121,24 +245,26 @@ impl Drawer {
     }
 
     /// Draws `scene` seen from `view` into a picture `width` by `height`, with depth and a
-    /// simple light, and reads it back. The answer comes on the receiver; this never waits.
-    pub fn draw(&self, scene: &Scene, view: View, width: u32, height: u32) -> Receiver<Result<Picture, CantDraw>> {
+    /// simple light, and reads it back. The answer comes on what this returns; this never waits.
+    /// Only the newest picture asked for of a scene is drawn: one asked for earlier and not yet
+    /// begun is answered `Replaced`.
+    pub fn draw(&self, scene: &Scene, view: View, width: u32, height: u32) -> Answer {
         let (answer, receiver) = mpsc::channel();
+        let wanted = Arc::new(());
+        let asking = Answer { receiver, _wanted: wanted.clone() };
         if scene.drawer != self.shared.id {
-            // A scene is only on the device of the drawer it was uploaded to.
-            let _ = answer.send(Err(CantDraw::CouldNotRead));
-        } else if let Err(mpsc::SendError(Job::Draw { answer, .. })) =
-            self.shared.jobs.send(Job::Draw { scene: scene.id, view, width, height, answer })
+            let _ = answer.send(Err(NotDrawn::UploadAgain));
+        } else if let Err(mpsc::SendError(Job::Draw(asked))) =
+            self.shared.jobs.send(Job::Draw(Asked { scene: scene.id, view, width, height, answer, wanted }))
         {
-            let _ = answer.send(Err(CantDraw::NoAdapter));
+            let _ = asked.answer.send(Err(NotDrawn::Closed));
         }
-        receiver
+        asking
     }
 
     /// Ends the drawer's thread, for every copy of this drawer, and waits up to `within` for it to
-    /// let go of its device: true if it did. A program ending while a device is being let go of
-    /// can crash in the graphics driver, so call this before the program ends; it waits, so
-    /// never call it on a window's thread while the window is in use.
+    /// let go of its device: true if it did. Call this before the program ends (see `Drawer`);
+    /// it waits, so never call it on a window's thread while the window is in use.
     pub fn close(self, within: Duration) -> bool {
         let _ = self.shared.jobs.send(Job::Stop);
         let ended = self.shared.ended.lock().unwrap_or_else(|e| e.into_inner());
@@ -146,61 +272,125 @@ impl Drawer {
     }
 
     /// For tests: loses the device, as a card being reset would. The next draw makes it again.
+    #[cfg(feature = "test-hooks")]
     pub fn lose_device(&self) {
         let _ = self.shared.jobs.send(Job::Lose);
     }
+
+    /// For tests: the next `times` tries to make a device fail.
+    #[cfg(feature = "test-hooks")]
+    pub fn fail_making(&self, times: u32) {
+        let _ = self.shared.jobs.send(Job::FailMaking(times));
+    }
+
+    /// For tests: how many devices the drawer has made.
+    #[cfg(feature = "test-hooks")]
+    pub fn devices_made(&self) -> u32 {
+        self.shared.made.load(Ordering::Acquire)
+    }
 }
 
-fn run(options: DrawerOptions, jobs: Receiver<Job>, ready: Ready, ending: Sender<()>) {
-    // Dropped last, once the device has been let go of.
-    let _ending = ending;
-    std::thread::sleep(options.device_delay);
-    let mut drawing = Drawing { only: options.only, card: None, scenes: HashMap::new(), ready };
-    if !options.no_adapter {
-        drawing.make();
+/// What the thread shares with the drawer. Dropped as the thread ends, after its device has
+/// been let go of: it then says nothing can be drawn, and that the thread has ended.
+struct Thread {
+    ready: Ready,
+    made: Arc<AtomicU32>,
+    _ending: Sender<()>,
+}
+
+impl Drop for Thread {
+    fn drop(&mut self) {
+        say(&self.ready, Err(CantDraw::NoAdapter));
     }
-    drawing.say_ready();
-    while let Ok(job) = jobs.recv() {
-        match job {
-            Job::Upload(id, model) => {
-                let kept = match &drawing.card {
-                    Some(card) => Kept { on_card: upload_guarded(card, &model), model: *model },
-                    // With no device, and none to be made, the model is never drawn: only that
-                    // it's there is kept.
-                    None => Kept { model: Model { meshes: Vec::new(), points: None, texture: None, facts: model.facts }, on_card: None },
-                };
-                drawing.scenes.insert(id, kept);
+}
+
+fn run(options: DrawerOptions, jobs: Receiver<Job>, thread: Thread) {
+    #[cfg(feature = "test-hooks")]
+    let (no_adapter, delay, most_buffer) = (options.no_adapter, options.device_delay, options.most_buffer);
+    #[cfg(not(feature = "test-hooks"))]
+    let (no_adapter, delay, most_buffer) = (false, Duration::ZERO, None);
+    std::thread::sleep(delay);
+    let mut drawing = Drawing {
+        only: options.only,
+        card: None,
+        scenes: HashMap::new(),
+        thread: &thread,
+        no_adapter,
+        most_buffer,
+        failing: 0,
+        first_retry: options.retry_after,
+        retry_after: options.retry_after,
+        next_try: Instant::now(),
+    };
+    drawing.make();
+    let mut pending = VecDeque::new();
+    loop {
+        if pending.is_empty() {
+            match jobs.recv() {
+                Ok(job) => pending.push_back(job),
+                Err(_) => break,
             }
+        }
+        while let Ok(job) = jobs.try_recv() {
+            pending.push_back(job);
+        }
+        let Some(job) = pending.pop_front() else { continue };
+        match job {
+            Job::Upload(id, model) => drawing.upload(id, *model),
             Job::Release(id) => {
                 drawing.scenes.remove(&id);
             }
-            Job::Draw { scene, view, width, height, answer } => {
-                let _ = answer.send(drawing.draw(scene, view, width, height));
+            Job::Draw(asked) => {
+                if !asked.wanted() {
+                    continue;
+                }
+                let newer = pending.iter().any(|job| matches!(job, Job::Draw(later) if later.scene == asked.scene && later.wanted()));
+                let answer = if newer { Err(NotDrawn::Replaced) } else { drawing.draw(asked.scene, asked.view, asked.width, asked.height) };
+                let _ = asked.answer.send(answer);
             }
+            #[cfg(feature = "test-hooks")]
             Job::Lose => {
                 if let Some(card) = &drawing.card {
                     card.gpu.lose();
                 }
             }
+            #[cfg(feature = "test-hooks")]
+            Job::FailMaking(times) => drawing.failing = times,
             Job::Stop => break,
+        }
+    }
+    // Every answer still waiting is told the drawer is closed.
+    for job in pending {
+        if let Job::Draw(asked) = job {
+            let _ = asked.answer.send(Err(NotDrawn::Closed));
         }
     }
 }
 
 /// What the drawer's thread holds.
-struct Drawing {
+struct Drawing<'a> {
     only: Option<AdapterKind>,
-    /// The device and what's made on it, or `None` where none can be had.
+    /// The device and what's made on it, or `None` while none can be had.
     card: Option<Card>,
-    scenes: HashMap<u64, Kept>,
-    ready: Ready,
+    scenes: HashMap<u64, OnDevice>,
+    thread: &'a Thread,
+    /// For tests: making a device always fails, or fails this many more times.
+    no_adapter: bool,
+    most_buffer: Option<u64>,
+    failing: u32,
+    /// When to try again to make a device, and how long to wait after that if it fails again.
+    first_retry: Duration,
+    retry_after: Duration,
+    next_try: Instant,
 }
 
-/// A model, kept so that it can be uploaded again to a device made after one was lost.
-struct Kept {
-    model: Model,
-    /// `None` until it's uploaded to the device there is now.
-    on_card: Option<Result<OnCard, CantDraw>>,
+/// Where a scene's model is.
+enum OnDevice {
+    On(OnCard),
+    /// On no device: it must be uploaded again.
+    Gone,
+    /// It can't be drawn on this device, and isn't tried again.
+    Cant(CantDraw),
 }
 
 struct Card {
@@ -208,90 +398,125 @@ struct Card {
     kit: Kit,
 }
 
-/// Why a picture wasn't drawn: the device failed, or it can't be drawn on this one.
+/// Why a picture wasn't drawn: the device was lost, or what was asked can't be drawn on it.
 enum Failure {
     Lost,
     Cant(CantDraw),
 }
 
-impl Drawing {
+impl Drawing<'_> {
+    /// Tries to make a device, saying whether one can draw.
     fn make(&mut self) {
         self.card = None;
-        let only = self.only;
-        if let Ok(Ok(gpu)) = catch_unwind(move || device::make(only))
-            && let Ok(kit) = catch_unwind(AssertUnwindSafe(|| Kit::new(&gpu)))
-        {
-            self.card = Some(Card { gpu, kit });
+        let fail = self.no_adapter || self.failing > 0;
+        self.failing = self.failing.saturating_sub(1);
+        if !fail {
+            let only = self.only;
+            if let Ok(Ok(mut gpu)) = catch_unwind(move || device::make(only))
+                && let Ok(kit) = catch_unwind(AssertUnwindSafe(|| Kit::new(&gpu)))
+            {
+                if let Some(most) = self.most_buffer {
+                    gpu.most_buffer = gpu.most_buffer.min(most);
+                }
+                self.thread.made.fetch_add(1, Ordering::AcqRel);
+                self.card = Some(Card { gpu, kit });
+            }
+        }
+        match &self.card {
+            Some(card) => {
+                self.retry_after = self.first_retry;
+                say(&self.thread.ready, Ok(card.gpu.kind));
+            }
+            None => {
+                self.next_try = Instant::now() + self.retry_after;
+                self.retry_after = (self.retry_after * 2).min(MOST_RETRY);
+                say(&self.thread.ready, Err(CantDraw::NoAdapter));
+            }
         }
     }
 
-    fn say_ready(&self) {
-        let ready = self.card.as_ref().map(|card| card.gpu.kind).ok_or(CantDraw::NoAdapter);
-        *self.ready.lock().unwrap_or_else(|e| e.into_inner()) = Some(ready);
-    }
-
-    /// Makes the device again if it was lost, uploading every model again when it's next drawn.
+    /// Makes the device again if it was lost, or if none could be made and it's time to try
+    /// again. A model on a device lost is gone with it.
     fn mend(&mut self) {
-        if self.card.as_ref().is_some_and(|card| card.gpu.broken()) {
-            for kept in self.scenes.values_mut() {
-                kept.on_card = None;
+        let lost = self.card.as_ref().is_some_and(|card| card.gpu.lost());
+        if lost {
+            self.card = None;
+            for on in self.scenes.values_mut() {
+                if matches!(on, OnDevice::On(_)) {
+                    *on = OnDevice::Gone;
+                }
             }
             self.make();
-            self.say_ready();
-            if self.card.is_none() {
-                for kept in self.scenes.values_mut() {
-                    kept.model = Model { meshes: Vec::new(), points: None, texture: None, facts: kept.model.facts };
-                }
-            }
+        } else if self.card.is_none() && Instant::now() >= self.next_try {
+            self.make();
         }
     }
 
-    fn draw(&mut self, scene: u64, view: View, width: u32, height: u32) -> Result<Picture, CantDraw> {
-        if !self.scenes.contains_key(&scene) {
-            return Err(CantDraw::CouldNotRead);
-        }
-        // Once to draw, and once more on a device made again if it was lost while drawing.
-        for _ in 0..2 {
-            self.mend();
-            let Some(card) = &mut self.card else { return Err(CantDraw::NoAdapter) };
-            let most = card.gpu.limits.max_texture_dimension_2d;
-            if width > most || height > most {
-                return Err(CantDraw::TooLarge);
-            }
-            if width == 0 || height == 0 {
-                return Ok(Picture { width, height, bgra: Vec::new(), drawing: Duration::ZERO, reading_back: Duration::ZERO });
-            }
-            let Some(kept) = self.scenes.get_mut(&scene) else { return Err(CantDraw::CouldNotRead) };
-            if kept.on_card.is_none() {
-                kept.on_card = upload_guarded(card, &kept.model);
-            }
-            match &kept.on_card {
-                Some(Ok(on_card)) => {
-                    match catch_unwind(AssertUnwindSafe(|| render(&card.gpu, &mut card.kit, on_card, view, width, height))) {
-                        Ok(Ok(picture)) => return Ok(picture),
-                        Ok(Err(Failure::Cant(why))) => return Err(why),
-                        Ok(Err(Failure::Lost)) | Err(_) => card.gpu.set_broken(),
-                    }
+    fn upload(&mut self, id: u64, model: Model) {
+        self.mend();
+        let on = match &self.card {
+            Some(card) => match catch_unwind(AssertUnwindSafe(|| scoped(&card.gpu, || upload(card, &model)))) {
+                Ok(Ok(on_card)) => OnDevice::On(on_card),
+                Ok(Err(Failure::Cant(why))) => OnDevice::Cant(why),
+                Ok(Err(Failure::Lost)) | Err(_) => {
+                    card.gpu.set_lost();
+                    OnDevice::Gone
                 }
-                Some(Err(why)) => return Err(*why),
-                // Uploading found the device lost.
-                None => card.gpu.set_broken(),
+            },
+            None => OnDevice::Gone,
+        };
+        self.scenes.insert(id, on);
+    }
+
+    fn draw(&mut self, scene: u64, view: View, width: u32, height: u32) -> Result<Picture, NotDrawn> {
+        self.mend();
+        let Some(card) = &mut self.card else { return Err(CantDraw::NoAdapter.into()) };
+        let on_card = match self.scenes.get(&scene) {
+            Some(OnDevice::On(on_card)) => on_card,
+            Some(OnDevice::Cant(why)) => return Err((*why).into()),
+            Some(OnDevice::Gone) | None => return Err(NotDrawn::UploadAgain),
+        };
+        let most = card.gpu.limits.max_texture_dimension_2d;
+        let row = u64::from(width * 4).next_multiple_of(u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
+        if width > most
+            || height > most
+            || u64::from(width) * u64::from(height) * u64::from(card.gpu.samples) > MOST_SAMPLES
+            || row * u64::from(height) > card.gpu.limits.max_buffer_size
+        {
+            return Err(CantDraw::TooLarge.into());
+        }
+        if width == 0 || height == 0 {
+            return Ok(Picture { width, height, bgra: Vec::new(), drawing: Duration::ZERO, reading_back: Duration::ZERO });
+        }
+        let Card { gpu, kit } = card;
+        match catch_unwind(AssertUnwindSafe(|| scoped(gpu, || render(gpu, kit, on_card, view, width, height)))) {
+            Ok(Ok(picture)) => Ok(picture),
+            Ok(Err(Failure::Cant(why))) => Err(why.into()),
+            Ok(Err(Failure::Lost)) | Err(_) => {
+                gpu.set_lost();
+                // Made again now, so that the model can be uploaded again at once.
+                self.mend();
+                Err(NotDrawn::UploadAgain)
             }
         }
-        Err(CantDraw::NoAdapter)
     }
 }
 
-/// Uploads `model`: `None` if the device was found lost doing it.
-fn upload_guarded(card: &Card, model: &Model) -> Option<Result<OnCard, CantDraw>> {
-    match catch_unwind(AssertUnwindSafe(|| upload(card, model))) {
-        Ok(Ok(on_card)) if !card.gpu.broken() => Some(Ok(on_card)),
-        Ok(Err(Failure::Cant(why))) => Some(Err(why)),
-        _ => {
-            card.gpu.set_broken();
-            None
-        }
+/// Does `work`, an error the device reports about it said as what was asked being too large
+/// for this device, and the device found lost as that.
+fn scoped<T>(gpu: &Gpu, work: impl FnOnce() -> Result<T, Failure>) -> Result<T, Failure> {
+    let validation = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let memory = gpu.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let internal = gpu.device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let result = work();
+    let errors = [internal.pop(), memory.pop(), validation.pop()].map(pollster::block_on);
+    if gpu.lost() {
+        return Err(Failure::Lost);
     }
+    if errors.iter().any(Option::is_some) {
+        return Err(Failure::Cant(CantDraw::TooLarge));
+    }
+    result
 }
 
 /// The pipelines and pictures a device draws with.
@@ -305,7 +530,9 @@ struct Kit {
     frame_group: wgpu::BindGroup,
     /// Coloured from for a mesh with no texture.
     white: wgpu::BindGroup,
-    targets: Option<Targets>,
+    /// For the last two sizes drawn, the newest first: a picture in the editor and one in the
+    /// show needn't make each other's again.
+    targets: Vec<Targets>,
 }
 
 /// What a picture of one size is drawn into and read back through.
@@ -448,13 +675,16 @@ impl Kit {
             frame,
             frame_group,
             white,
-            targets: None,
+            targets: Vec::new(),
         }
     }
 
     fn targets(&mut self, gpu: &Gpu, width: u32, height: u32) -> &Targets {
-        if self.targets.as_ref().is_none_or(|t| (t.width, t.height) != (width, height)) {
-            self.targets = None;
+        if let Some(at) = self.targets.iter().position(|t| (t.width, t.height) == (width, height)) {
+            let targets = self.targets.remove(at);
+            self.targets.insert(0, targets);
+        } else {
+            self.targets.truncate(1);
             let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
             let texture = |label, format, samples, usage| {
                 gpu.device.create_texture(&wgpu::TextureDescriptor {
@@ -480,9 +710,9 @@ impl Kit {
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            self.targets = Some(Targets { width, height, many, colour, colour_view, depth, read_back, row });
+            self.targets.insert(0, Targets { width, height, many, colour, colour_view, depth, read_back, row });
         }
-        self.targets.as_ref().expect("just made")
+        &self.targets[0]
     }
 }
 
@@ -518,7 +748,8 @@ fn texture_group(gpu: &Gpu, layout: &wgpu::BindGroupLayout, sampler: &wgpu::Samp
 /// A model on the device.
 struct OnCard {
     meshes: Vec<MeshOnCard>,
-    points: Option<(wgpu::Buffer, u32)>,
+    /// A cloud's points, in as many buffers as the device needs, each with how many it holds.
+    points: Vec<(wgpu::Buffer, u32)>,
     texture: Option<wgpu::BindGroup>,
     /// The middle of the model and the radius of a sphere round it, so that nothing of it is cut
     /// off by being too near or too far.
@@ -526,10 +757,11 @@ struct OnCard {
     radius: f32,
 }
 
+/// A mesh, or as much of one as fits a buffer.
 struct MeshOnCard {
     vertices: wgpu::Buffer,
-    indices: wgpu::Buffer,
-    count: u32,
+    /// Its triangles, in as many buffers as the device needs, each with how many indices it holds.
+    indices: Vec<(wgpu::Buffer, u32)>,
     textured: bool,
     double_sided: bool,
 }
@@ -538,12 +770,12 @@ struct MeshOnCard {
 /// device's memory a piece at a time rather than made whole first.
 fn filled(gpu: &Gpu, label: &str, count: usize, stride: usize, usage: wgpu::BufferUsages, fill: impl Fn(usize, &mut [u8])) -> Result<wgpu::Buffer, Failure> {
     let size = count as u64 * stride as u64;
-    if size > gpu.limits.max_buffer_size {
+    if size > gpu.most_buffer || size == 0 {
         return Err(Failure::Cant(CantDraw::TooLarge));
     }
     let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: true });
     {
-        let mut mapped = buffer.slice(..).get_mapped_range_mut().map_err(|_| Failure::Lost)?;
+        let mut mapped = buffer.slice(..).get_mapped_range_mut().map_err(|_| Failure::Cant(CantDraw::TooLarge))?;
         let each = (PIECE / stride).max(1);
         let mut piece = vec![0u8; each * stride];
         for first in (0..count).step_by(each) {
@@ -559,6 +791,40 @@ fn filled(gpu: &Gpu, label: &str, count: usize, stride: usize, usage: wgpu::Buff
     Ok(buffer)
 }
 
+/// The triangles of `indices`, into `vertices` positions, in parts that each use at most `most`
+/// positions and `most` indices: each part's positions, as places in the whole, and its
+/// triangles, as places in those. A triangle naming a position past the end is left out.
+fn split(indices: &[u32], vertices: usize, most: usize) -> Vec<(Vec<u32>, Vec<u32>)> {
+    let most = most.max(3);
+    let unused = u32::MAX;
+    let mut local = vec![unused; vertices];
+    let mut parts = Vec::new();
+    let mut part: (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+    for triangle in indices.as_chunks::<3>().0 {
+        if triangle.iter().any(|&v| v as usize >= vertices) {
+            continue;
+        }
+        let new = triangle.iter().filter(|&&v| local[v as usize] == unused).count();
+        if part.0.len() + new > most || part.1.len() + 3 > most {
+            for &v in &part.0 {
+                local[v as usize] = unused;
+            }
+            parts.push(std::mem::take(&mut part));
+        }
+        for &v in triangle {
+            if local[v as usize] == unused {
+                local[v as usize] = part.0.len() as u32;
+                part.0.push(v);
+            }
+            part.1.push(local[v as usize]);
+        }
+    }
+    if !part.1.is_empty() {
+        parts.push(part);
+    }
+    parts
+}
+
 /// How much of a buffer is made at a time before it's put on the device.
 const PIECE: usize = 64 * 1024;
 
@@ -570,34 +836,49 @@ fn put(to: &mut [u8], values: &[f32]) {
 
 fn upload(card: &Card, model: &Model) -> Result<OnCard, Failure> {
     let gpu = &card.gpu;
+    let most_vertices = (gpu.most_buffer / MESH_STRIDE) as usize;
+    let most_indices = ((gpu.most_buffer / 4) as usize / 3 * 3).max(3);
+    let index_buffer = |indices: &[u32]| {
+        let buffer = filled(gpu, "mesh indices", indices.len(), 4, wgpu::BufferUsages::INDEX, |i, bytes| {
+            bytes.copy_from_slice(&indices[i].to_ne_bytes());
+        })?;
+        Ok::<_, Failure>((buffer, indices.len() as u32))
+    };
     let mut meshes = Vec::new();
     for mesh in &model.meshes {
-        if mesh.indices.is_empty() || mesh.positions.is_empty() {
+        if mesh.indices.len() < 3 || mesh.positions.is_empty() {
             continue;
         }
-        let count = u32::try_from(mesh.indices.len()).map_err(|_| Failure::Cant(CantDraw::TooLarge))?;
-        let vertices = filled(gpu, "mesh", mesh.positions.len(), MESH_STRIDE as usize, wgpu::BufferUsages::VERTEX, |i, corner| {
+        let corner = |i: usize, corner: &mut [u8]| {
             put(&mut corner[0..12], &mesh.positions[i]);
             put(&mut corner[12..24], mesh.normals.get(i).unwrap_or(&[0.0, 0.0, 1.0]));
             put(&mut corner[24..32], mesh.texture_coords.get(i).unwrap_or(&[0.0, 0.0]));
             put(&mut corner[32..48], mesh.colours.get(i).unwrap_or(&[1.0; 4]));
-        })?;
-        let indices = filled(gpu, "mesh indices", mesh.indices.len(), 4, wgpu::BufferUsages::INDEX, |i, bytes| {
-            bytes.copy_from_slice(&mesh.indices[i].to_ne_bytes());
-        })?;
-        meshes.push(MeshOnCard { vertices, indices, count, textured: mesh.textured, double_sided: mesh.double_sided });
-    }
-    let points = match &model.points {
-        Some(points) if !points.positions.is_empty() => {
-            let count = u32::try_from(points.positions.len()).map_err(|_| Failure::Cant(CantDraw::TooLarge))?;
-            let buffer = filled(gpu, "points", points.positions.len(), POINT_STRIDE as usize, wgpu::BufferUsages::VERTEX, |i, point| {
-                put(&mut point[0..12], &points.positions[i]);
-                point[12..16].copy_from_slice(points.colours.get(i).unwrap_or(&[255; 4]));
-            })?;
-            Some((buffer, count))
+        };
+        let on = |vertices, indices| MeshOnCard { vertices, indices, textured: mesh.textured, double_sided: mesh.double_sided };
+        if mesh.positions.len() <= most_vertices {
+            let vertices = filled(gpu, "mesh", mesh.positions.len(), MESH_STRIDE as usize, wgpu::BufferUsages::VERTEX, corner)?;
+            let indices = mesh.indices.chunks(most_indices).map(index_buffer).collect::<Result<_, _>>()?;
+            meshes.push(on(vertices, indices));
+        } else {
+            for (whole, local) in split(&mesh.indices, mesh.positions.len(), most_vertices.min(most_indices)) {
+                let vertices = filled(gpu, "mesh", whole.len(), MESH_STRIDE as usize, wgpu::BufferUsages::VERTEX, |i, to| corner(whole[i] as usize, to))?;
+                meshes.push(on(vertices, vec![index_buffer(&local)?]));
+            }
         }
-        _ => None,
-    };
+    }
+    let mut points = Vec::new();
+    if let Some(cloud) = &model.points {
+        let each = (gpu.most_buffer / POINT_STRIDE).max(1) as usize;
+        for first in (0..cloud.positions.len()).step_by(each) {
+            let count = each.min(cloud.positions.len() - first);
+            let buffer = filled(gpu, "points", count, POINT_STRIDE as usize, wgpu::BufferUsages::VERTEX, |i, point| {
+                put(&mut point[0..12], &cloud.positions[first + i]);
+                point[12..16].copy_from_slice(cloud.colours.get(first + i).unwrap_or(&[255; 4]));
+            })?;
+            points.push((buffer, count as u32));
+        }
+    }
     let texture = match &model.texture {
         Some(texture) if meshes.iter().any(|mesh| mesh.textured) => {
             let most = gpu.limits.max_texture_dimension_2d;
@@ -611,13 +892,7 @@ fn upload(card: &Card, model: &Model) -> Result<OnCard, Failure> {
         }
         _ => None,
     };
-    let (low, high) = model.facts.bounds;
-    let mut middle = [0, 1, 2].map(|i| (low[i] + high[i]) / 2.0);
-    let half = [0, 1, 2].map(|i| (high[i] - low[i]) / 2.0);
-    let mut radius = (half[0] * half[0] + half[1] * half[1] + half[2] * half[2]).sqrt();
-    if !middle.iter().all(|v| v.is_finite()) || !radius.is_finite() {
-        (middle, radius) = ([0.0; 3], 1.0);
-    }
+    let (middle, radius) = sphere(model.facts.bounds);
     Ok(OnCard { meshes, points, texture, middle, radius })
 }
 
@@ -628,15 +903,9 @@ fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
 }
 
 /// The view and projection, by columns, and where the light comes from in the model's space.
-fn frame(view: View, middle: [f32; 3], radius: f32, width: u32, height: u32) -> (Matrix, [f32; 3]) {
-    let distance = if view.distance.is_finite() && view.distance > 0.0 { view.distance } else { 1.0 };
-    let target = if view.target.iter().all(|v| v.is_finite()) { view.target } else { middle };
-    let view = View {
-        yaw: if view.yaw.is_finite() { view.yaw } else { 0.0 },
-        pitch: if view.pitch.is_finite() { view.pitch.clamp(-MOST_PITCH, MOST_PITCH) } else { 0.0 },
-        distance,
-        target,
-    };
+fn frame(view: View, middle: [f32; 3], radius: f32, width: u32, height: u32) -> Option<(Matrix, [f32; 3])> {
+    let view = View { pitch: view.pitch.clamp(-MOST_PITCH, MOST_PITCH), ..view.cleaned() };
+    let (target, distance) = (view.target, view.distance);
     let eye = view.eye();
     let forward = unit(minus(target, eye)).unwrap_or([0.0, 0.0, -1.0]);
     let side = unit(cross(forward, [0.0, 1.0, 0.0])).unwrap_or([1.0, 0.0, 0.0]);
@@ -650,8 +919,9 @@ fn frame(view: View, middle: [f32; 3], radius: f32, width: u32, height: u32) -> 
     // Near and far enough to hold the whole of the model's sphere, from wherever the eye is.
     let from_middle = minus(middle, eye);
     let reach = dot(from_middle, from_middle).sqrt();
-    let far = (reach + radius * 1.05).max(distance * 1e-3).max(1e-6);
-    let near = (reach - radius * 1.05).max(far * 1e-4);
+    // Always far enough apart to tell depths in between, whatever the sphere's size.
+    let far = (reach + radius * 1.05).max(distance * 1e-3).clamp(1e-6, 1e30);
+    let near = (reach - radius * 1.05).clamp(far * 1e-4, far * 0.5);
     let focal = 1.0 / (View::FIELD_OF_VIEW / 2.0).to_radians().tan();
     let shorter = width.min(height) as f32;
     let (sx, sy) = (focal * shorter / width as f32, focal * shorter / height as f32);
@@ -672,23 +942,28 @@ fn frame(view: View, middle: [f32; 3], radius: f32, width: u32, height: u32) -> 
     let light = [-0.25, 0.35, 1.0];
     let size = dot(light, light).sqrt();
     let light = [0, 1, 2].map(|i| (side[i] * light[0] + up[i] * light[1] - forward[i] * light[2]) / size);
-    (both, light)
+    // A view too far out to work out leaves nothing to draw.
+    (both.iter().chain(&light).all(|v| v.is_finite())).then_some((both, light))
 }
 
+/// Waits for the card to finish what was submitted: a card that doesn't within `MOST_WAIT` is
+/// taken as lost.
 fn wait(gpu: &Gpu, submitted: wgpu::SubmissionIndex) -> Result<(), Failure> {
-    gpu.device.poll(wgpu::PollType::Wait { submission_index: Some(submitted), timeout: Some(MOST_WAIT) }).map_err(|_| Failure::Lost)?;
-    if gpu.broken() { Err(Failure::Lost) } else { Ok(()) }
+    if gpu.device.poll(wgpu::PollType::Wait { submission_index: Some(submitted), timeout: Some(MOST_WAIT) }).is_err() {
+        gpu.set_lost();
+    }
+    if gpu.lost() { Err(Failure::Lost) } else { Ok(()) }
 }
 
 fn render(gpu: &Gpu, kit: &mut Kit, on_card: &OnCard, view: View, width: u32, height: u32) -> Result<Picture, Failure> {
     let started = Instant::now();
-    let (matrix, light) = frame(view, on_card.middle, on_card.radius, width, height);
+    let (matrix, light) = frame(view, on_card.middle, on_card.radius, width, height).ok_or(Failure::Cant(CantDraw::TooLarge))?;
     let mut bytes = [0u8; FRAME_BYTES as usize];
     put(&mut bytes[0..64], &matrix);
     put(&mut bytes[64..80], &[light[0], light[1], light[2], 0.0]);
     gpu.queue.write_buffer(&kit.frame, 0, &bytes);
     kit.targets(gpu, width, height);
-    let targets = kit.targets.as_ref().expect("just made");
+    let targets = &kit.targets[0];
 
     let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("draw") });
     {
@@ -717,11 +992,15 @@ fn render(gpu: &Gpu, kit: &mut Kit, on_card: &OnCard, view: View, width: u32, he
             let texture = on_card.texture.as_ref().filter(|_| mesh.textured).unwrap_or(&kit.white);
             pass.set_bind_group(1, texture, &[]);
             pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..mesh.count, 0, 0..1);
+            for (indices, count) in &mesh.indices {
+                pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..*count, 0, 0..1);
+            }
         }
-        if let Some((points, count)) = &on_card.points {
+        if !on_card.points.is_empty() {
             pass.set_pipeline(&kit.points);
+        }
+        for (points, count) in &on_card.points {
             pass.set_vertex_buffer(0, points.slice(..));
             pass.draw(0..*count, 0..1);
         }
@@ -746,11 +1025,11 @@ fn render(gpu: &Gpu, kit: &mut Kit, on_card: &OnCard, view: View, width: u32, he
     });
     wait(gpu, submitted)?;
     if is_mapped.try_recv() != Ok(true) {
-        return Err(Failure::Lost);
+        return Err(Failure::Cant(CantDraw::TooLarge));
     }
     let mut bgra = vec![0u8; width as usize * height as usize * 4];
     {
-        let view = targets.read_back.slice(..).get_mapped_range().map_err(|_| Failure::Lost)?;
+        let view = targets.read_back.slice(..).get_mapped_range().map_err(|_| Failure::Cant(CantDraw::TooLarge))?;
         let threads = if gpu.kind.copies_on_threads() { std::thread::available_parallelism().map_or(4, |n| n.get()).min(8) } else { 1 };
         copy_rows(&view, targets.row as usize, width as usize, &mut bgra, threads);
     }
