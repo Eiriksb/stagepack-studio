@@ -931,6 +931,7 @@ fn each_refusal_reads_in_plain_words() {
         CantDraw::TooLarge,
         CantDraw::CouldNotRead,
         CantDraw::NoAdapter,
+        CantDraw::CardRefused,
     ];
     let said: Vec<String> = all.iter().map(|why| why.to_string()).collect();
     for words in &said {
