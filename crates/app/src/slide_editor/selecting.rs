@@ -139,12 +139,6 @@ impl SlideEditor {
         self.write_turned(|document, source, view| document.add_model_view(source, view), cx);
     }
 
-    /// Takes away every view of the model turned but its starting one, as one step. It goes on
-    /// being turned.
-    pub fn clear_views(&mut self, cx: &mut Context<Self>) {
-        self.write_turned(|document, source, _| document.clear_model_views(source), cx);
-    }
-
     /// Makes the change `write` makes to the model turned, at where it is in the talk and with
     /// the view it's shown from, as one step. Written by this, the change is no reason to stop
     /// turning it.

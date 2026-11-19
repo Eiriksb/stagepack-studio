@@ -731,7 +731,7 @@ pub(crate) fn model_view(written: Option<&str>) -> Result<Option<slides_model::V
 
 /// The views a model's `views` says, each six numbers, set apart by semicolons or commas, and
 /// whether any couldn't be read or there were more than [`MOST_VIEWS`]: those are left out.
-pub(crate) fn model_views(written: Option<&str>) -> (Vec<slides_model::View>, bool) {
+pub fn model_views(written: Option<&str>) -> (Vec<slides_model::View>, bool) {
     let mut views = Vec::new();
     let mut left_out = false;
     for written in written.unwrap_or_default().split([';', ',']).map(str::trim).filter(|written| !written.is_empty()) {

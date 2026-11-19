@@ -36,7 +36,7 @@ impl Inspector {
                             .small()
                             .label("Clear views")
                             .disabled(!written)
-                            .on_click(cx.listener(move |this, _, _, cx| this.clear_views(turned, cx))),
+                            .on_click(cx.listener(|this, _, _, cx| this.clear_views(cx))),
                     ),
             )
             .into_any_element()

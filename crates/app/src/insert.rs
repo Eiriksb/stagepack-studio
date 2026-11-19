@@ -49,15 +49,18 @@ pub fn video_size(size: (u32, u32)) -> (f32, f32) {
     (w * scale, h * scale)
 }
 
-/// `view` as a new model's starting view is written: each number to a thousandth, so that a
-/// person can read it.
+/// `view` as a new model's starting view is written, so that a person can read it: its angles
+/// to a thousandth of a degree, and its distance and the point it looks at to four figures of
+/// the distance, however large or small the model is.
 pub fn written_view(view: slides_model::View) -> slides_model::View {
-    // One too large to scale is left as it is.
-    let rounded = |v: f32| Some((v * 1000.0).round() / 1000.0).filter(|r| r.is_finite()).unwrap_or(v);
     let view = view.cleaned();
+    let places = |scale: f32| (3 - scale.log10().floor() as i32).clamp(0, 12) as usize;
+    // Written as decimals and read back, each prints as it was written.
+    let rounded = |v: f32, places: usize| format!("{v:.places$}").parse::<f32>().ok().filter(|r| r.is_finite()).unwrap_or(v);
+    let near = places(view.distance);
     // A distance rounded to nothing would be no view.
-    let distance = if rounded(view.distance) > 0.0 { rounded(view.distance) } else { view.distance };
-    slides_model::View { yaw: rounded(view.yaw), pitch: rounded(view.pitch), distance, target: view.target.map(rounded) }
+    let distance = Some(rounded(view.distance, near)).filter(|d| *d > 0.0).unwrap_or(view.distance);
+    slides_model::View { yaw: rounded(view.yaw, 3), pitch: rounded(view.pitch, 3), distance, target: view.target.map(|v| rounded(v, near)) }
 }
 
 /// The top-left corner, in slide units, of a new thing of `size`: centred on the slide, moved
@@ -123,4 +126,18 @@ pub fn hex(color: Color) -> String {
 /// A whole number of slide units, as a place or a size is written.
 pub fn whole(value: f32) -> String {
     format!("{}", value.round().max(0.0) as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slides_model::View;
+
+    #[test]
+    fn a_written_view_keeps_four_figures_of_its_distance() {
+        let view = |distance: f32, target: f32| View { yaw: 12.34567, pitch: 20.0, distance, target: [target, -target, 0.0] };
+        assert_eq!(written_view(view(3.680_629, 0.5)).to_string(), "12.346 20 3.681 0.5 -0.5 0");
+        assert_eq!(written_view(view(0.002_345_67, 0.000_123_456)).to_string(), "12.346 20 0.002346 0.000123 -0.000123 0");
+        assert_eq!(written_view(view(12_345.678, 1_234.567)).to_string(), "12.346 20 12346 1235 -1235 0");
+    }
 }

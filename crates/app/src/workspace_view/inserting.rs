@@ -8,6 +8,7 @@ use crate::clipboard_tools::ClipboardThing;
 use crate::document::{InsertFailed, LargeCopy};
 use crate::insert::{ICON_SIZE, INSERT_ICON};
 use crate::large_files::{LargeSource, ask_before_copying, ask_to_copy_of};
+use std::sync::Arc;
 use slides_model::{CantDraw, ModelKind, View};
 use slides_video::CantPlay;
 
@@ -43,10 +44,10 @@ pub(super) struct WaitingLarge {
 }
 
 /// What looking at a large file before it's copied in found: a video's size, or the view a
-/// model is framed whole from, if one could be found.
+/// model is framed whole from.
 enum Found {
     Video((u32, u32)),
-    Model(Option<View>),
+    Model(View),
 }
 
 /// Why a large file wasn't copied in: what's said of it, and whether it was cancelled.
@@ -268,7 +269,7 @@ impl WorkspaceView {
                     this.edit(
                         |document| match found {
                             Found::Video(size) => document.insert_video_on(slide, name, size),
-                            Found::Model(view) => document.insert_model_on(slide, name, view),
+                            Found::Model(view) => document.insert_model_on(slide, name, Some(view)),
                         },
                         cx,
                     );
@@ -291,8 +292,8 @@ impl WorkspaceView {
             this.copy_next_large(cx);
         };
         match kind {
-            FileKind::Model => self.copy_in_looked_at(kind, path, |path| model_framing(path).map(Found::Model), finished, cx),
-            _ => self.copy_in_looked_at(kind, path, |path| video_shape(path).map(Found::Video), finished, cx),
+            FileKind::Model => self.copy_in_looked_at(kind, path, |path, meter| model_framing(path, meter).map(Found::Model), finished, cx),
+            _ => self.copy_in_looked_at(kind, path, |path, _| video_shape(path).map(Found::Video), finished, cx),
         }
     }
 
@@ -359,18 +360,19 @@ impl WorkspaceView {
             Ok((path, ())) => then(this, path, cx),
             Err(why) => this.say(why.said, cx),
         };
-        self.copy_in_looked_at(kind, path, |_| Ok(()), finished, cx);
+        self.copy_in_looked_at(kind, path, |_, _| Ok(()), finished, cx);
     }
 
     /// [`Self::copy_in_large_file`], looking at the file with `look` first, on the same
-    /// background task, before anything is copied: what it finds is handed to `finished` with
-    /// the path, or why the file wasn't copied: `look` refused it, or the copy was refused or
-    /// cancelled. Whatever comes of it, `finished` hears of it once, unless the window has gone.
+    /// background task, before anything is copied, with the copy's meter to tell how far it's got
+    /// and to see whether it's been stopped: what it finds is handed to `finished` with the path,
+    /// or why the file wasn't copied: `look` refused it, or the copy was refused or cancelled.
+    /// Whatever comes of it, `finished` hears of it once, unless the window has gone.
     fn copy_in_looked_at<Found: Send + 'static>(
         &mut self,
         kind: FileKind,
         path: PathBuf,
-        look: impl FnOnce(&Path) -> Result<Found, String> + Send + 'static,
+        look: impl FnOnce(&Path, &Arc<Meter>) -> Result<Found, String> + Send + 'static,
         finished: impl FnOnce(&mut Self, Result<(String, Found), NotCopied>, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) {
@@ -389,7 +391,7 @@ impl WorkspaceView {
             let copied = cx
                 .background_spawn(async move {
                     // Refused, the copy is dropped, and with it the room kept for it.
-                    let found = look(&looked_at)?;
+                    let found = look(&looked_at, &running)?;
                     Ok::<_, String>((found, copy.run(&|done, total| running.tell(done, total), running.stop())))
                 })
                 .await;
@@ -595,26 +597,71 @@ fn is_kind(path: &Path, kind: FileKind) -> bool {
     extension.is_some_and(|extension| kind.extensions().contains(&extension.as_str()))
 }
 
-/// The view the 3D model in the file at `path`, outside the talk, is seen whole from, or why it
-/// isn't a model: for a background task. A mesh's is found from its headers alone; a point
+/// The view the 3D model in the file at `path`, outside the talk, is seen whole from, or why
+/// it's refused: for a background task. A mesh's is found from its headers alone; a point
 /// cloud's header doesn't say where its points lie, so a cloud is read whole, within the limits
-/// a model is read with. A model that can't be drawn, as one damaged or too large, is still a
-/// model, and says why once it's on the slide: it's given no view, and is framed whole whenever
-/// it can be drawn.
-fn model_framing(path: &Path) -> Result<Option<View>, String> {
-    let open = || std::fs::File::open(path).map(|file| Box::new(std::io::BufReader::new(file)) as Box<dyn slides_model::ReadSeek>);
-    let file = open().map_err(|_| NotAdded::Unreadable.to_string())?;
-    let facts = match slides_model::facts(file) {
-        Ok(facts) => facts,
-        Err(CantDraw::NotAModel) => return Err(CantDraw::NotAModel.to_string()),
-        Err(CantDraw::CouldNotRead) => return Err(NotAdded::Unreadable.to_string()),
-        Err(_) => return Ok(None),
+/// a model is read with, `meter` told how far that's got. A file that isn't a model, or that no
+/// computer could draw, as one damaged, too large or needing other files, is refused before
+/// anything is copied, saying why. Stopped by `meter`, by its Cancel or the window closing, the
+/// read stops, and it's cancelled.
+fn model_framing(path: &Path, meter: &Arc<Meter>) -> Result<View, String> {
+    let open = || {
+        let file = std::fs::File::open(path).map_err(|_| NotAdded::Unreadable.to_string())?;
+        let len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        let reader = Watched { inner: std::io::BufReader::new(file), meter: meter.clone(), len };
+        Ok::<_, String>(Box::new(reader) as Box<dyn slides_model::ReadSeek>)
     };
+    let said = |why: CantDraw| {
+        if meter.stop().load(std::sync::atomic::Ordering::SeqCst) {
+            return NotAdded::Cancelled.to_string();
+        }
+        match why {
+            CantDraw::CouldNotRead => NotAdded::Unreadable.to_string(),
+            why => why.to_string(),
+        }
+    };
+    let facts = slides_model::facts(open()?).map_err(said)?;
     if facts.kind == ModelKind::Mesh {
-        return Ok(Some(View::framing(&facts)));
+        return Ok(View::framing(&facts));
     }
-    let file = open().map_err(|_| NotAdded::Unreadable.to_string())?;
-    Ok(slides_model::read(file).ok().map(|model| View::framing(&model.facts)))
+    let model = slides_model::read(open()?).map_err(said)?;
+    Ok(View::framing(&model.facts))
+}
+
+/// A model's file read before it's copied in, telling `meter` how far the read has got, and
+/// failing once `meter` is stopped.
+struct Watched {
+    inner: std::io::BufReader<std::fs::File>,
+    meter: Arc<Meter>,
+    len: u64,
+}
+
+impl Watched {
+    fn stopped(&self) -> std::io::Result<()> {
+        if self.meter.stop().load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "stopped"));
+        }
+        Ok(())
+    }
+}
+
+impl std::io::Read for Watched {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::Seek as _;
+        self.stopped()?;
+        let read = self.inner.read(buf)?;
+        if let Ok(at) = self.inner.stream_position() {
+            self.meter.tell(at.min(self.len), self.len);
+        }
+        Ok(read)
+    }
+}
+
+impl std::io::Seek for Watched {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.stopped()?;
+        self.inner.seek(to)
+    }
 }
 
 /// The size of the video in the file at `path`, outside the talk, from its headers alone, or why

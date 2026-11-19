@@ -49,6 +49,13 @@ impl Inspector {
                 }
                 if shape.message.is_none() && is_positioned(&tag) {
                     shape.specs.extend(Spec::place());
+                    // A model is turned by hand and turns on its own, so how its box is turned on
+                    // the slide is called something else.
+                    if tag.name == "Model"
+                        && let Some(spec) = shape.specs.iter_mut().find(|spec| spec.place && spec.attr == "rotate")
+                    {
+                        spec.label = ROTATION.to_string();
+                    }
                 }
                 if tag.name == "Video" && shape.message.is_none() {
                     let pictures = self.talk_pictures(&document, pick, cx);
@@ -291,6 +298,10 @@ impl Inspector {
         }
     }
 }
+
+/// What a 3D model's form calls how its box is turned on the slide, which other things' forms
+/// call Turn.
+const ROTATION: &str = "Rotation";
 
 /// A video's form, from what its component's arguments gave: its still is chosen from
 /// `pictures`, the talk's, or its first frame, and its file is named above its fields.

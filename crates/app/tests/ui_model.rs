@@ -1133,14 +1133,28 @@ fn a_chosen_model_is_copied_in_and_put_on_the_slide_framed(cx: &mut TestAppConte
     typing.press(cx, "ctrl-z");
     assert_eq!(typing.source(cx), PLAIN_TALK);
 
-    // What isn't a model says so, and nothing is put on the slide or copied.
-    for (name, bytes) in [("words.glb", b"these are words, not a model".to_vec()), ("empty.ply", Vec::new()), ("notes.txt", b"words".to_vec())] {
+    // What isn't a model, or is one no computer could draw, says why, and nothing is put on the
+    // slide or copied.
+    let cut = box_model()[..200].to_vec();
+    let needs_others = slides_model::glb_from(r#"{"asset":{"version":"2.0"},"buffers":[{"uri":"other.bin","byteLength":4}]}"#, &[]);
+    let damaged = slides_model::CantDraw::Damaged.to_string();
+    let needs = slides_model::CantDraw::NeedsOtherFiles.to_string();
+    let cases = [
+        ("words.glb", b"these are words, not a model".to_vec(), NOT_A_MODEL),
+        ("empty.ply", Vec::new(), NOT_A_MODEL),
+        ("notes.txt", b"words".to_vec(), NOT_A_MODEL),
+        ("cut.glb", cut, damaged.as_str()),
+        ("others.glb", needs_others, needs.as_str()),
+    ];
+    for (name, bytes, why) in cases {
         let from = outside(work.path(), name, &bytes);
         choose_models(&typing, cx, vec![from]);
         assert_eq!(typing.source(cx), PLAIN_TALK, "{name}");
-        assert_eq!(typing.status(cx).as_deref(), Some(NOT_A_MODEL), "{name}");
+        assert_eq!(typing.status(cx).as_deref(), Some(why), "{name}");
     }
     assert!(!can_undo(&typing, cx));
+    let kept: Vec<String> = files_under(&work.path().join("recovery")).into_iter().filter(|name| name.ends_with(".glb") || name.ends_with(".ply")).collect();
+    assert!(kept.iter().all(|name| name.ends_with("box.glb") || name.ends_with("cloud.ply")), "nothing refused was copied: {kept:?}");
 }
 
 #[gpui_kit::test]
@@ -1193,7 +1207,7 @@ fn the_form_says_how_big_and_sets_turning(cx: &mut TestAppContext) {
     assert_eq!(label_of(&typing, cx, INSPECTOR_MODEL_PROBLEM_ID), None, "it's drawn");
     let form = inspector(&typing, cx);
     let labels = cx.read(|cx| form.read(cx).labels());
-    assert_eq!(labels, ["Turns on its own", "Left", "Top", "Width", "Height", "Turn"]);
+    assert_eq!(labels, ["Turns on its own", "Left", "Top", "Width", "Height", "Rotation"], "its box turned on the slide is no turning of the model");
 
     // Turns on its own, ticked and unticked, each one step.
     assert_eq!(shown(&typing, cx, "turn").as_deref(), Some("false"));
@@ -1288,6 +1302,17 @@ fn add_this_view_and_clear_views_each_one_step(cx: &mut TestAppContext) {
     assert_eq!(typing.source(cx), before);
     assert_eq!(typing.status(cx).as_deref(), Some("This 3D model has as many views as it can have."));
     click_on(&typing, cx, MODEL_DONE_ID);
+
+    // What's written is kept as it was, the view added after it; and Clear views while it's
+    // turned clears them, as the form writes any setting.
+    let typing = editor(cx, &talk_with(&format!(" views=\"{FRONT} ,\"")));
+    select_model(&typing, cx);
+    turn_selected(&typing, cx);
+    click_on(&typing, cx, INSPECTOR_ADD_VIEW_ID);
+    assert!(the_tag(&typing, cx).contains(&format!(" views=\"{FRONT} , {FRONT}\"")), "{}", the_tag(&typing, cx));
+    click_on(&typing, cx, INSPECTOR_CLEAR_VIEWS_ID);
+    assert!(!the_tag(&typing, cx).contains("views"), "{}", the_tag(&typing, cx));
+    assert_eq!(typing.source(cx), talk());
 }
 
 /// Whether `after` differs from `before` only in what was at `range`, give or take the blank
@@ -1445,4 +1470,71 @@ fn nothing_about_a_model_shows_code(cx: &mut TestAppContext) {
     }
     assert!(shows_code("Only GLB files", false));
     assert!(shows_code("0 20 3.681 0 0.5 0", false));
+}
+
+/// Every file under `root`, by its path.
+fn files_under(root: &std::path::Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut folders = vec![root.to_path_buf()];
+    while let Some(folder) = folders.pop() {
+        for entry in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                folders.push(path);
+            } else {
+                found.push(path.display().to_string());
+            }
+        }
+    }
+    found
+}
+
+#[gpui_kit::test]
+fn a_model_goes_on_the_slide_it_was_asked_for_on(cx: &mut TestAppContext) {
+    let Some(_alone) = alone("a_model_goes_on_the_slide_it_was_asked_for_on") else { return };
+    let work = tempfile::tempdir().unwrap();
+    let typing = copying_editor(cx, PLAIN_TALK, work.path());
+    let from = outside(work.path(), "box.glb", &box_model());
+    let view = typing.view.clone();
+    cx.update(|cx| view.update(cx, |view, cx| view.chosen_models(vec![from], cx)));
+    // The next slide is shown before the copy ends.
+    let document = typing.document(cx);
+    cx.update(|cx| document.update(cx, |document, cx| {
+        document.go_to(1);
+        cx.notify();
+    }));
+    assert_eq!(typing.current(cx), 1);
+    cx.run_until_parked();
+    typing.settle(cx);
+    assert_eq!(typing.source(cx), with_inserted(INSERTED), "on the first slide");
+    // Shown again, as any edit shows its slide, with it selected.
+    assert_eq!(typing.current(cx), 0);
+    assert_eq!(selected_text(&typing, cx).as_deref(), Some(INSERTED));
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), PLAIN_TALK);
+}
+
+#[gpui_kit::test]
+fn a_cancelled_model_copy_inserts_nothing(cx: &mut TestAppContext) {
+    let Some(_alone) = alone("a_cancelled_model_copy_inserts_nothing") else { return };
+    let work = tempfile::tempdir().unwrap();
+    let typing = copying_editor(cx, PLAIN_TALK, work.path());
+    // A point cloud, which is read whole to frame it before it's copied: Cancel stops that too.
+    let from = outside(work.path(), "cloud.ply", &slides_model::make_test_ply(2000, true));
+    let view = typing.view.clone();
+    cx.update(|cx| view.update(cx, |view, cx| view.chosen_models(vec![from], cx)));
+    let label = typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        let label = window.find(workspace_view::PROGRESS_ID).label().map(str::to_string);
+        window.click(workspace_view::CANCEL_PROGRESS_ID, cx);
+        label
+    });
+    assert_eq!(label.as_deref(), Some("Copying model… 0%"));
+    cx.run_until_parked();
+    typing.settle(cx);
+    assert_eq!(typing.source(cx), PLAIN_TALK);
+    assert!(!can_undo(&typing, cx));
+    assert_eq!(typing.status(cx).as_deref(), Some("The copy was cancelled, so nothing was added."));
+    let root = work.path().join("recovery");
+    assert!(files_under(&root).iter().all(|name| !name.ends_with(".ply")), "{:?}", files_under(&root));
 }

@@ -445,16 +445,10 @@ impl Inspector {
         }
     }
 
-    /// Takes away the views of the 3D model the form is for: through what turns it, while it's
-    /// turned, so that it goes on being turned.
-    fn clear_views(&mut self, turned: bool, cx: &mut Context<Self>) {
-        let editor = self.workspace.upgrade().map(|workspace| workspace.read(cx).slide_editor().clone());
-        match editor {
-            Some(editor) if turned => editor.update(cx, |editor, cx| editor.clear_views(cx)),
-            _ => {
-                self.write("views", None, cx).ok();
-            }
-        }
+    /// Takes away the views of the 3D model the form is for, as any setting is written: one
+    /// being turned goes back to its still.
+    fn clear_views(&mut self, cx: &mut Context<Self>) {
+        self.write("views", None, cx).ok();
         cx.notify();
     }
 
@@ -498,11 +492,9 @@ struct ModelViews {
     turned: bool,
 }
 
-/// How many views a model whose `views` is `written` flies through, as the engine reads them:
-/// those that can be read, at most [`slides_engine::MOST_MODEL_VIEWS`].
+/// How many views a model whose `views` is `written` flies through, as the engine reads them.
 fn views_of(written: Option<&str>) -> usize {
-    let views = written.unwrap_or_default().split([';', ',']).map(str::trim).filter(|view| !view.is_empty());
-    views.filter(|view| slides_model::View::parse(view).is_some()).take(slides_engine::MOST_MODEL_VIEWS).count()
+    slides_engine::read_model_views(written).0.len()
 }
 
 /// The kind of file `path` is, for a field that takes `extensions`, if it's one it takes and one

@@ -733,8 +733,8 @@ impl Document {
     }
 
     /// Adds `view` to the views of the 3D model at `source` on the current slide, after those it
-    /// has, as one step: only its `views` changes. One with as many as a model can have, written
-    /// or not, takes no more.
+    /// has, as one step: only its `views` changes, and what's written there stays as it was,
+    /// with `; ` and the view after it. One with as many as a model can have takes no more.
     pub fn add_model_view(&mut self, source: std::ops::Range<usize>, view: slides_model::View) -> Result<Vec<usize>, EditRefused> {
         let thing = crate::selection::Selected { slide: self.current(), source };
         let written = slides_format::find_tag(self.talk(), thing.slide, &thing.source)
@@ -742,20 +742,17 @@ impl Document {
             .attr("views")
             .map(str::to_string)
             .unwrap_or_default();
-        let mut views: Vec<&str> = written.split([';', ',']).map(str::trim).filter(|view| !view.is_empty()).collect();
+        let (views, _) = slides_engine::read_model_views(Some(&written));
         if views.len() >= slides_engine::MOST_MODEL_VIEWS {
             return Err(EditRefused::TooManyViews);
         }
-        let view = view.to_string();
-        views.push(&view);
-        self.set_attr_of(&thing, "views", Some(&views.join("; ")))
-    }
-
-    /// Takes away every view of the 3D model at `source` on the current slide, but its starting
-    /// one, as one step.
-    pub fn clear_model_views(&mut self, source: std::ops::Range<usize>) -> Result<Vec<usize>, EditRefused> {
-        let thing = crate::selection::Selected { slide: self.current(), source };
-        self.set_attr_of(&thing, "views", None)
+        let kept = written.trim_end();
+        let added = match kept.chars().last() {
+            None => view.to_string(),
+            Some(';' | ',') => format!("{kept} {view}"),
+            Some(_) => format!("{kept}; {view}"),
+        };
+        self.set_attr_of(&thing, "views", Some(&added))
     }
 
     /// Where the talk's pack is, if it's kept in one.
