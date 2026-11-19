@@ -393,7 +393,7 @@ impl SlideEditor {
     }
 
     pub(super) fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.drag_turning(event.position, cx) {
+        if self.drag_turning(event, cx) {
             return;
         }
         if self.drag.is_some() {

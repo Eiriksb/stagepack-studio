@@ -671,6 +671,12 @@ impl Document {
         (tag.name == "Model" && !slides_engine::is_positioned(tag)).then(|| slides_engine::MODEL_IN_TEXT.to_string())
     }
 
+    /// Why the 3D model at `source` on slide `index` can't be drawn, in a plain sentence, if its
+    /// still has been tried and it can't.
+    pub fn model_problem_on(&mut self, index: usize, source: &std::ops::Range<usize>) -> Option<String> {
+        guarded(|| self.deck.model_problem(index, source)).ok().flatten()
+    }
+
     /// Writes `view` as the starting view of the 3D model at `source` on the current slide, as
     /// one step: only its `view` changes.
     pub fn set_model_view(&mut self, source: std::ops::Range<usize>, view: slides_model::View) -> Result<Vec<usize>, EditRefused> {

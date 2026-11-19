@@ -755,6 +755,10 @@ fn leaving_the_slide_puts_it_back(cx: &mut TestAppContext) {
     let canvas_now = show.first_picture(cx);
     show.drag(cx, on, point(px(100.), px(0.)));
     assert_ne!(view_of(cx, &canvas_now, layer), View::parse(FRONT), "turned by hand");
+    // Its last view drawn: a picture asked for during the drag may be of a view before the last,
+    // so the last is asked for once that's come, and waited for too.
+    drawn(cx, show.audience, &canvas_now);
+    drawn(cx, show.audience, &canvas_now);
     let asked = draws_asked();
     show.press(cx, "right");
     assert_eq!(show.place(cx), (1, 0));
@@ -763,7 +767,7 @@ fn leaving_the_slide_puts_it_back(cx: &mut TestAppContext) {
     for _ in 0..10 {
         next_frame(cx, show.audience, 100);
     }
-    assert!(draws_asked() <= asked + 1, "nothing drawn for a slide that isn't shown");
+    assert_eq!(draws_asked(), asked, "nothing drawn for a slide that isn't shown");
     show.press(cx, "left");
     assert_eq!(show.place(cx), (0, 0));
     let canvas = show.canvas(cx);
@@ -896,4 +900,63 @@ fn a_model_in_a_turned_box_is_drawn_turned(cx: &mut TestAppContext) {
     typing.settle(cx);
     let (made, released) = made_and_released(cx, &canvas);
     assert_eq!(made, released);
+}
+
+#[gpui_kit::test]
+fn a_model_turning_on_its_own_that_cannot_be_drawn_asks_for_no_frames(cx: &mut TestAppContext) {
+    let Some(_alone) = alone("a_model_turning_on_its_own_that_cannot_be_drawn_asks_for_no_frames") else { return };
+    // Its still is drawn while there's an adapter; then there's none.
+    let source = format!("# One\n\n---\n\n# Model\n\n{}\n", model_tag(" turn=\"auto\""));
+    let show = rehearse(cx, &source);
+    let no_adapter = Drawer::start_with(DrawerOptions { no_adapter: true, ..DrawerOptions::default() });
+    assert!(!ready(&no_adapter));
+    if let Some(old) = model_view::use_drawer(no_adapter) {
+        assert!(old.join().unwrap());
+    }
+    show.press(cx, "right");
+    let canvas = show.canvas(cx);
+    until(cx, show.audience, "it can't be drawn", |cx| {
+        cx.read(|cx| canvas.read(cx).model_failures()) == vec![Some(slides_model::CantDraw::NoAdapter)]
+    });
+    show.settle(cx);
+    cx.update_window(show.audience, |_, window, cx| window.simulate_next_frame(cx)).unwrap();
+    let asked = draws_asked();
+    let mut frames_asked = 0;
+    for _ in 0..40 {
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        frames_asked += cx.update_window(show.audience, |_, window, cx| {
+            let asked = window.simulate_next_frame(cx);
+            window.render_frame(cx);
+            asked
+        })
+        .unwrap();
+    }
+    assert_eq!(frames_asked, 0, "no frame is asked for once it can't be drawn");
+    assert_eq!(draws_asked(), asked, "and nothing more is asked of the drawer");
+    assert!(pictures(cx, &canvas)[0].is_none(), "its still shows");
+}
+
+#[test]
+fn a_still_lost_from_the_card_twice_cannot_be_drawn() {
+    let Some(_alone) = alone("a_still_lost_from_the_card_twice_cannot_be_drawn") else { return };
+    // Lost from the card each time it's put there.
+    model_view::after_upload(Some(Box::new(|drawer: &Drawer| drawer.lose_device())));
+    let put_on = model_view::models_put_on_card();
+    let drawn = model_view::draw_still(Box::new(std::io::Cursor::new(box_model())), None, 64, 36);
+    model_view::after_upload(None);
+    assert_eq!(drawn.err(), Some(slides_model::CantDraw::CardRefused));
+    assert_eq!(model_view::models_put_on_card(), put_on + 2, "read and put on again once");
+    // Lost only the first time, it's drawn.
+    let lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let once = lost.clone();
+    model_view::after_upload(Some(Box::new(move |drawer: &Drawer| {
+        if !once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            drawer.lose_device();
+        }
+    })));
+    let drawn = model_view::draw_still(Box::new(std::io::Cursor::new(box_model())), None, 64, 36);
+    model_view::after_upload(None);
+    assert_eq!(drawn.map(|picture| (picture.width, picture.height)).ok(), Some((64, 36)));
+    assert_eq!(scenes_held(), 0);
 }

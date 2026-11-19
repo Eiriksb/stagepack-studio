@@ -168,10 +168,15 @@ impl SlideEditor {
     }
 
     /// Turns the model by as far as the pointer has moved, while a drag turns it: true if one does.
-    pub(super) fn drag_turning(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+    /// A drag whose button was let go of unheard ends.
+    pub(super) fn drag_turning(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) -> bool {
         let (Some(from), Some((_, layer))) = (self.turn_drag, self.turning.clone()) else {
             return false;
         };
+        if event.pressed_button != Some(MouseButton::Left) {
+            return self.release_turning(cx);
+        }
+        let position = event.position;
         let (dx, dy) = (f32::from(position.x - from.x), f32::from(position.y - from.y));
         self.turn_drag = Some(position);
         self.canvas.update(cx, |canvas, cx| canvas.turn_by(layer, dx, dy, cx));

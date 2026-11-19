@@ -429,8 +429,9 @@ pub struct AudienceView {
     /// back to their views once it's left.
     models: Vec<ModelLayer>,
     models_of: Option<usize>,
-    /// A drag on a model: its layer, and where the pointer last was.
-    turn_drag: Option<(usize, Point<Pixels>)>,
+    /// A press on a model: the model, where the pointer last was, and whether it has moved, which
+    /// has the model drawn live and turned.
+    turn_drag: Option<(ModelLayer, Point<Pixels>, bool)>,
     /// Whether the press last let go of turned a model, so that it's no click of the show's.
     turned: bool,
     rehearsing: bool,
@@ -584,8 +585,18 @@ impl AudienceView {
         self.models = models;
     }
 
-    /// Has `model` drawn live on the slide shown, from `aim`, turning on its own if it does.
+    /// Has `model` drawn live on the slide shown, from `aim`, turning on its own if it does. One
+    /// whose still already says it can't be drawn isn't read.
     fn turn_model(&mut self, document: &Entity<Document>, model: &ModelLayer, aim: Aim, cx: &mut Context<Self>) {
+        let Some(source) = model.source.clone() else { return };
+        let slide = self.slide;
+        let problem = document.update(cx, |document, _| {
+            let slide = document.shown_slide(slide);
+            document.model_problem_on(slide, &source)
+        });
+        if problem.is_some() {
+            return;
+        }
         let Some(open) = document.read(cx).open_large(&model.on.src) else { return };
         let (layer, on) = (model.layer, model.on.clone());
         self.current.update(cx, |canvas, cx| canvas.turn_model(layer, on.clone(), open, on.turn, aim, cx));
@@ -606,27 +617,29 @@ impl AudienceView {
     /// The model on the slide shown at `position`, drawn live, being so now if it wasn't.
     fn live_model_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> Option<usize> {
         let model = self.model_at(position, cx)?;
-        if self.current.read(cx).model_aim(model.layer).is_none() {
-            let document = self.show.read(cx).document.clone();
-            let place = self.show.read(cx).session.place();
-            self.turn_model(&document, &model, aim_at(&model, place.step), cx);
-        }
+        self.make_live(&model, cx);
         Some(model.layer)
     }
 
-    /// A press on a model begins turning it by hand.
+    /// Has `model` drawn live, if it isn't.
+    fn make_live(&mut self, model: &ModelLayer, cx: &mut Context<Self>) {
+        if self.current.read(cx).model_aim(model.layer).is_none() {
+            let document = self.show.read(cx).document.clone();
+            let place = self.show.read(cx).session.place();
+            self.turn_model(&document, model, aim_at(model, place.step), cx);
+        }
+    }
+
+    /// A press on a model may begin turning it by hand: once it moves. A plain click on it is a
+    /// click of the show's, and draws nothing.
     fn press(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
         self.turned = false;
-        self.turn_drag = None;
-        if let Some(layer) = self.live_model_at(event.position, cx) {
-            self.turn_drag = Some((layer, event.position));
-            self.current.update(cx, |canvas, cx| canvas.hold_model(layer, true, cx));
-        }
+        self.turn_drag = self.model_at(event.position, cx).map(|model| (model, event.position, false));
     }
 
     /// A drag on a model turns it, and isn't a click of the show's.
     fn drag(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
-        let Some((layer, from)) = self.turn_drag else { return };
+        let Some((model, from, moved)) = self.turn_drag.clone() else { return };
         if event.pressed_button != Some(MouseButton::Left) {
             self.let_go(cx);
             return;
@@ -635,15 +648,20 @@ impl AudienceView {
         if dx == 0.0 && dy == 0.0 {
             return;
         }
+        let layer = model.layer;
+        if !moved {
+            self.make_live(&model, cx);
+            self.current.update(cx, |canvas, cx| canvas.hold_model(layer, true, cx));
+        }
         self.turned = true;
-        self.turn_drag = Some((layer, event.position));
+        self.turn_drag = Some((model, event.position, true));
         self.current.update(cx, |canvas, cx| canvas.turn_by(layer, dx, dy, cx));
     }
 
     /// The button let go of ends a drag on a model.
     fn let_go(&mut self, cx: &mut Context<Self>) {
-        if let Some((layer, _)) = self.turn_drag.take() {
-            self.current.update(cx, |canvas, cx| canvas.hold_model(layer, false, cx));
+        if let Some((model, _, true)) = self.turn_drag.take() {
+            self.current.update(cx, |canvas, cx| canvas.hold_model(model.layer, false, cx));
         }
     }
 

@@ -292,8 +292,6 @@ pub struct Turner {
     /// The place of the model's layer among the canvas's layers.
     pub(crate) layer: usize,
     pub(crate) on: ModelOn,
-    /// What its file is read with, again after the card lost it.
-    open: Option<LargeOpen>,
     state: State,
     /// The view it starts at, once it's known: the one written, or else the one that frames it.
     home: Option<View>,
@@ -321,6 +319,8 @@ pub struct Turner {
     upload_again: u32,
     /// The size the drawer couldn't draw it at, which isn't asked for again.
     refused: Option<(u32, u32)>,
+    /// The size it's drawn at as the window last drew it.
+    size: Option<(u32, u32)>,
     /// Whether a picture is being turned with its box off the window's thread.
     turning: bool,
     turned_from: Arc<Mutex<Option<Pixmap>>>,
@@ -337,18 +337,18 @@ pub(crate) struct Advanced {
     pub turning: Option<Turning>,
     /// Why it can't be drawn, if that's just been found.
     pub failed: Option<CantDraw>,
-    /// Whether its file is to be read again, the card having lost it.
-    pub read_again: Option<LargeOpen>,
+    /// Whether its file is to be read again, the card having lost it: from where the talk is
+    /// now, which whatever turns it gives, as after a save that let go of it.
+    pub read_again: bool,
 }
 
 impl Turner {
-    /// A turner of `on`, the model of layer `layer`, being read with `open`: starting at its
-    /// home view, and turning on its own if `orbits`.
-    pub(crate) fn reading(layer: usize, on: ModelOn, open: LargeOpen, orbits: bool) -> Turner {
+    /// A turner of `on`, the model of layer `layer`, being read: starting at its home view, and
+    /// turning on its own if `orbits`.
+    pub(crate) fn reading(layer: usize, on: ModelOn, orbits: bool) -> Turner {
         Turner {
             layer,
             on,
-            open: Some(open),
             state: State::Reading,
             home: None,
             base: None,
@@ -364,6 +364,7 @@ impl Turner {
             shown: None,
             upload_again: 0,
             refused: None,
+            size: None,
             turning: false,
             turned_from: Arc::default(),
         }
@@ -413,9 +414,8 @@ impl Turner {
         }
     }
 
-    /// Reads it again, with `open`, as a save that let go of its file is done.
-    pub(crate) fn reading_again(&mut self, open: LargeOpen) {
-        self.open = Some(open);
+    /// Reads it again, as a save that let go of its file is done, or once the card lost it.
+    pub(crate) fn reading_again(&mut self) {
         self.state = State::Reading;
         self.asked = None;
     }
@@ -449,8 +449,10 @@ impl Turner {
     }
 
     /// Whether it wants the window to draw again soon: its view moving, or a picture to come.
+    /// One the drawer can't draw at the size it's shown at wants nothing.
     pub(crate) fn wants_frames(&self) -> bool {
-        matches!(self.state, State::Ready(_)) && (self.is_moving() || self.asked.is_some())
+        let refused = self.size.is_some() && self.refused == self.size;
+        matches!(self.state, State::Ready(_)) && (self.asked.is_some() || (self.is_moving() && !refused))
     }
 
     /// Whether a picture asked for of the drawer is still to come.
@@ -560,30 +562,33 @@ impl Turner {
                     }
                 }
                 Err(NotDrawn::UploadAgain) if self.upload_again == 0 => {
-                    // The card lost it: it's read again, once.
+                    // The card lost it: it's read again, once, from where the talk is now.
                     self.upload_again += 1;
-                    self.state = State::Reading;
-                    advanced.read_again = self.open.clone();
+                    self.state = State::LetGo;
+                    advanced.read_again = true;
                 }
                 // Lost again with no picture between: it can't be drawn here.
                 Err(NotDrawn::UploadAgain) => advanced.failed = Some(self.fail(CantDraw::CardRefused, &mut advanced.replaced)),
-                Err(NotDrawn::Cant(why)) => {
-                    // Not asked for at this size again.
+                // Too large for the card, or refused by it: not asked for at this size again.
+                Err(NotDrawn::Cant(why @ (CantDraw::TooLarge | CantDraw::CardRefused))) => {
                     self.refused = Some(size);
                     advanced.replaced = self.shown.take().map(|shown| shown.image);
                     advanced.failed = Some(why);
                 }
+                // Not to be drawn at any size: no adapter, or the model itself.
+                Err(NotDrawn::Cant(why)) => advanced.failed = Some(self.fail(why, &mut advanced.replaced)),
                 Err(NotDrawn::Replaced) => {}
                 Err(NotDrawn::Closed) => advanced.failed = Some(self.fail(CantDraw::NoAdapter, &mut advanced.replaced)),
             }
         }
         let view = self.view_at(now);
         self.seen = view;
-        if let (State::Ready(uploaded), None, Some(view), Some(scale), false) = (&self.state, &self.asked, view, scale, self.turning) {
-            let size = picture_size(self.on.rect, scale);
-            if self.drawn != Some((view, size)) && self.refused != Some(size) {
-                self.asked = Some((uploaded.draw(view, size), view, size));
-            }
+        self.size = scale.map(|scale| picture_size(self.on.rect, scale));
+        if let (State::Ready(uploaded), None, Some(view), Some(size), false) = (&self.state, &self.asked, view, self.size, self.turning)
+            && self.drawn != Some((view, size))
+            && self.refused != Some(size)
+        {
+            self.asked = Some((uploaded.draw(view, size), view, size));
         }
         advanced
     }

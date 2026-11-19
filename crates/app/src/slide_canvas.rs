@@ -40,8 +40,9 @@ pub struct VideoOpened;
 /// Sent when a model turned here can't be drawn, saying why.
 pub struct ModelFailed(pub CantDraw);
 
-/// Sent when a save has let go of the file of a model being read here: whatever turns it reads it
-/// again, with [`SlideCanvas::read_models_again`], once the save is done.
+/// Sent when a save has let go of the file of a model being read here, or the graphics card lost
+/// it: whatever turns it reads it again, from where the talk is now, with
+/// [`SlideCanvas::read_models_again`], once any save is done.
 pub struct ModelLetGo;
 
 #[derive(Clone)]
@@ -470,7 +471,7 @@ impl SlideCanvas {
     /// Draws the model `on`, of layer `layer`, live over its layer, reading it with `open`, from
     /// its home view, or from `aim`; turning on its own if `orbits`.
     pub fn turn_model(&mut self, layer: usize, on: ModelOn, open: LargeOpen, orbits: bool, aim: Aim, cx: &mut Context<Self>) {
-        let mut turner = Turner::reading(layer, on, open.clone(), orbits);
+        let mut turner = Turner::reading(layer, on, orbits);
         turner.start_at(aim);
         self.turners_made += 1;
         let id = self.turners_made;
@@ -596,19 +597,21 @@ impl SlideCanvas {
         Some(self.turners.iter().find(|(_, turner)| turner.layer == layer)?.1.aim())
     }
 
-    /// The files of the models whose files a save let go of, waiting to be read again.
+    /// The files of the models waiting to be read again, as a save let go of them or the card
+    /// lost them.
     pub fn models_let_go(&self) -> Vec<String> {
         self.turners.iter().filter(|(_, turner)| turner.was_let_go()).map(|(_, turner)| turner.on.src.clone()).collect()
     }
 
-    /// Reads again, with what `open` gives for its file, each model whose file a save let go of.
+    /// Reads again, with what `open` gives for its file, each model whose file a save let go of,
+    /// or that the card lost.
     /// One `open` gives nothing for waits on.
     pub fn read_models_again(&mut self, mut open: impl FnMut(&str) -> Option<LargeOpen>, cx: &mut Context<Self>) {
         let waiting: Vec<u64> = self.turners.iter().filter(|(_, turner)| turner.was_let_go()).map(|(id, _)| *id).collect();
         for id in waiting {
             let Some((_, turner)) = self.turners.iter_mut().find(|(at, _)| *at == id) else { continue };
             let Some(opened) = open(&turner.on.src) else { continue };
-            turner.reading_again(opened.clone());
+            turner.reading_again();
             self.read_model(id, opened, cx);
         }
     }
@@ -646,20 +649,20 @@ impl SlideCanvas {
         let now = cx.background_executor().now();
         let mut wanted = false;
         let mut turnings = Vec::new();
-        let mut reads = Vec::new();
+        let mut let_go = false;
         for (id, turner) in &mut self.turners {
             let advanced = turner.advance(now, self.scale);
             self.models_made += usize::from(advanced.made);
             self.retired_models.extend(advanced.replaced);
             turnings.extend(advanced.turning.map(|turning| (*id, turning)));
-            reads.extend(advanced.read_again.map(|open| (*id, open)));
+            let_go |= advanced.read_again;
             if let Some(why) = advanced.failed {
                 cx.emit(ModelFailed(why));
             }
             wanted |= turner.wants_frames();
         }
-        for (id, open) in reads {
-            self.read_model(id, open, cx);
+        if let_go {
+            cx.emit(ModelLetGo);
         }
         for (id, turning) in turnings {
             cx.spawn(async move |canvas, cx| {

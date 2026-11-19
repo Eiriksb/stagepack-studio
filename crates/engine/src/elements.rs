@@ -735,9 +735,14 @@ pub(crate) fn model_views(written: Option<&str>) -> (Vec<slides_model::View>, bo
     let mut views = Vec::new();
     let mut left_out = false;
     for written in written.unwrap_or_default().split([';', ',']).map(str::trim).filter(|written| !written.is_empty()) {
+        // Those past the most aren't read.
+        if views.len() == MOST_VIEWS {
+            left_out = true;
+            break;
+        }
         match slides_model::View::parse(written) {
-            Some(view) if views.len() < MOST_VIEWS => views.push(view),
-            _ => left_out = true,
+            Some(view) => views.push(view),
+            None => left_out = true,
         }
     }
     (views, left_out)
