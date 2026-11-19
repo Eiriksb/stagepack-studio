@@ -13,7 +13,7 @@ use std::time::SystemTime;
 use sha2::{Digest as _, Sha256};
 use slides_engine::{PackError, ReadSeek, TalkFiles, open_packed, write_new_atomically_with};
 
-use crate::added_files::{MAX_VIDEO_BYTES, NotAdded};
+use crate::added_files::{FileKind, MAX_MODEL_BYTES, MAX_VIDEO_BYTES, NotAdded};
 
 /// A paste that would copy more than this into the talk asks first.
 pub const ASK_BEFORE_COPYING: u64 = 256 * 1024 * 1024;
@@ -160,9 +160,24 @@ pub fn progress_words(doing: &str, done: u64, total: u64) -> String {
 
 /// What a paste asks before it copies `count` videos of `bytes` in all into the talk.
 pub fn ask_to_copy(count: usize, bytes: u64) -> String {
+    ask_to_copy_of(count, bytes, "video")
+}
+
+/// What a paste asks before it copies `count` files, called `noun`, `bytes` in all, into the talk.
+pub fn ask_to_copy_of(count: usize, bytes: u64, noun: &str) -> String {
     let megabytes = bytes.saturating_add(500_000) / 1_000_000;
-    let videos = if count == 1 { "1 video".to_string() } else { format!("{count} videos") };
-    format!("Copy {videos}, {} MB, into this presentation?", megabytes.max(1))
+    let files = if count == 1 { format!("1 {noun}") } else { format!("{count} {noun}s") };
+    format!("Copy {files}, {} MB, into this presentation?", megabytes.max(1))
+}
+
+/// What files of `kinds` are called, in one word: their kind's if they're all of one, otherwise a
+/// plain "file".
+pub fn noun_of_kinds(kinds: impl IntoIterator<Item = FileKind>) -> &'static str {
+    let mut kinds = kinds.into_iter();
+    match kinds.next() {
+        Some(first) if kinds.all(|kind| kind == first) => first.noun(),
+        _ => "file",
+    }
 }
 
 /// Where the bytes of a large file to copy come from.
@@ -186,6 +201,11 @@ impl LargeSource {
     /// Looks at it, without reading it: a regular file, or a file a pack holds, of no more than
     /// [`MAX_VIDEO_BYTES`]. For a file in a pack, it's when the pack last changed.
     pub(crate) fn look(&self) -> Result<Looked, NotAdded> {
+        self.look_as(None)
+    }
+
+    /// [`Self::look`], where the file is to be a file of `kind`, which sets how large it can be.
+    pub(crate) fn look_as(&self, kind: Option<FileKind>) -> Result<Looked, NotAdded> {
         let looked = match self {
             LargeSource::File(path) => {
                 // Asked first, as opening a named pipe waits until something writes to it.
@@ -201,8 +221,9 @@ impl LargeSource {
                 Looked { len, modified: metadata.modified().ok() }
             }
         };
-        if looked.len > MAX_VIDEO_BYTES {
-            return Err(NotAdded::VideoTooLarge);
+        let kind = kind.unwrap_or(FileKind::Video);
+        if looked.len > kind.max_bytes().min(MAX_VIDEO_BYTES) {
+            return Err(NotAdded::too_large(kind));
         }
         Ok(looked)
     }
@@ -233,6 +254,32 @@ fn open_regular(path: &Path) -> Option<std::fs::File> {
     }
     let file = options.open(path).ok()?;
     file.metadata().ok()?.is_file().then_some(file)
+}
+
+/// Whether the file `source` names, to be the talk's file at `path`, starts as a 3D model of the
+/// kind its extension says. Only its first few bytes are read. A file that can't be opened, or a
+/// compressed one in a pack, isn't judged here: the copy finds it changed, or the model's reader
+/// refuses it.
+pub(crate) fn starts_as_model(source: &LargeSource, path: &str) -> bool {
+    let Some((_, ext)) = path.rsplit_once('.') else { return false };
+    let mut head = [0u8; crate::added_files::MODEL_HEAD_BYTES];
+    let read = match source {
+        LargeSource::File(from) => open_regular(from).map(|file| read_head(file, &mut head)),
+        LargeSource::InPack { pack, entry } => open_packed(pack).ok().and_then(|files| files.open(entry)).map(|from| read_head(from, &mut head)),
+    };
+    read.is_none_or(|got| crate::added_files::model_head_fits(ext, &head[..got]))
+}
+
+/// Reads up to the length of `head` from the start of `from`, and says how much there was.
+fn read_head(mut from: impl Read, head: &mut [u8]) -> usize {
+    let mut got = 0;
+    while got < head.len() {
+        match from.read(&mut head[got..]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got += n,
+        }
+    }
+    got
 }
 
 /// The plain file at `path`, opened to read, unless it's a link or anything but a file. Where the
@@ -798,6 +845,35 @@ impl Seek for HeldReader {
     }
 }
 
+/// The most the pack's `entry` is unpacked to: a 3D model's limit for a model, and for a video
+/// what the pack itself holds a large file to.
+fn most_unpacked(entry: &str) -> u64 {
+    let ext = entry.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()).unwrap_or_default();
+    if FileKind::Model.extensions().contains(&ext.as_str()) { MAX_MODEL_BYTES } else { u64::MAX }
+}
+
+/// What's written through it, `left` bytes at most: one more is refused, and what's being
+/// written is given up.
+struct Capped<'a> {
+    to: &'a mut dyn Write,
+    left: u64,
+}
+
+impl Write for Capped<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.len() as u64 > self.left {
+            return Err(io::Error::other("more than it can hold"));
+        }
+        let n = self.to.write(buf)?;
+        self.left -= n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.to.flush()
+    }
+}
+
 /// Where videos a pack holds compressed are unpacked to, to be read in pieces: such a pack is
 /// made by another program, as this app stores a video as it is. It holds [`CACHE_LIMIT`] at
 /// most, the files used longest ago going first.
@@ -820,9 +896,15 @@ impl VideoCache {
 
     /// The file the pack at `pack` holds as `entry`, unpacked here, a piece at a time, if it
     /// isn't already. The file is named for the pack, as it is now, and the entry, so a pack
-    /// that changes is unpacked again.
+    /// that changes is unpacked again. A 3D model is never unpacked past the most a model can
+    /// be, whatever its entry says it holds: one that says more is refused before anything is
+    /// written, and one that inflates past what it says stops there, leaving nothing.
     pub(crate) fn unpacked(&self, pack: &Path, entry: &str, stop: &AtomicBool) -> Option<PathBuf> {
         let (at, files, len) = self.place_for(pack, entry)?;
+        let most = most_unpacked(entry);
+        if len > most {
+            return None;
+        }
         if std::fs::symlink_metadata(&at).is_ok_and(|there| there.is_file() && there.len() == len) {
             // Used now: it goes after those used longer ago.
             let mut options = std::fs::OpenOptions::new();
@@ -841,7 +923,7 @@ impl VideoCache {
         if !has_room(&self.folder, len) {
             return None;
         }
-        let written = write_new_atomically_with(&at, |file| files.copy_entry(entry, file, &|_, _| {}, stop));
+        let written = write_new_atomically_with(&at, |file| files.copy_entry(entry, &mut Capped { to: file, left: most }, &|_, _| {}, stop));
         match written {
             Ok(()) => {}
             // Unpacked by another window meanwhile: taken only if it's a plain file, as long.

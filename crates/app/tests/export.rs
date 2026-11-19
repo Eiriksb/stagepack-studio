@@ -395,3 +395,127 @@ fn the_export_says_how_many() {
     let notices = run_export(input, ExportKind::Pdf, &out).unwrap();
     assert!(notices.iter().any(|notice| notice == "1 video was exported as a picture."), "{notices:?}");
 }
+
+// 3D models, which PowerPoint and PDF get as their stills.
+
+static MODELS_ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A test drawing models, alone, as they share the app's one drawer, which is closed as it ends:
+/// a program that ends while a driver lets go of a device can crash in the driver.
+struct DrawingModels(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+impl Drop for DrawingModels {
+    fn drop(&mut self) {
+        let closed = stagepack_studio::model_view::close_drawer(std::time::Duration::from_secs(30));
+        if !std::thread::panicking() {
+            assert!(closed, "the drawer's thread never ended");
+        }
+    }
+}
+
+/// Draws models alone, on the software adapter where there is one, else on any, else `None` after
+/// saying why `test` is skipped.
+fn drawing_models(test: &str) -> Option<DrawingModels> {
+    use slides_model::{AdapterKind, Drawer, DrawerOptions};
+    let alone = DrawingModels(MODELS_ONE_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    for options in [DrawerOptions { only: Some(AdapterKind::Software), ..DrawerOptions::default() }, DrawerOptions::default()] {
+        let drawer = Drawer::start_with(options);
+        let began = std::time::Instant::now();
+        let can = loop {
+            if let Some(ready) = drawer.ready() {
+                break ready.is_ok();
+            }
+            assert!(began.elapsed() < std::time::Duration::from_secs(60), "the drawer never said whether it can draw");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        if let Some(old) = stagepack_studio::model_view::use_drawer(drawer) {
+            assert!(old.join().unwrap(), "the drawer before let go of its device");
+        }
+        if can {
+            return Some(alone);
+        }
+    }
+    eprintln!("{test} skipped: no graphics adapter, not even a software one, can be had here.");
+    None
+}
+
+/// A talk folder of `source`, holding the made box as `assets/box.glb`, and its export input.
+fn with_model(source: &str, model: &[u8]) -> (tempfile::TempDir, ExportInput) {
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::create_dir(folder.path().join("assets")).unwrap();
+    std::fs::write(folder.path().join("assets/box.glb"), model).unwrap();
+    let input = ExportInput {
+        source: source.to_string(),
+        files: Arc::new(FolderFiles::new(folder.path().to_path_buf())),
+        talk_fonts: Vec::new(),
+    };
+    (folder, input)
+}
+
+fn box_model() -> Vec<u8> {
+    slides_model::make_test_glb(slides_model::MadeGlb::Boxes)
+}
+
+/// The box seen from the front, its blue face filling the middle of its still.
+const ONE_MODEL: &str = "# Model\n\n<Model src=\"assets/box.glb\" x=\"100\" y=\"100\" w=\"640\" h=\"360\" view=\"0 0 4 0 0.5 0\" />\n";
+
+#[test]
+fn a_model_is_a_picture_in_the_pdf_and_in_powerpoint() {
+    let Some(_alone) = drawing_models("a_model_is_a_picture_in_the_pdf_and_in_powerpoint") else { return };
+    let (_folder, input) = with_model(ONE_MODEL, &box_model());
+    let (_dir, out) = target("talk.pptx");
+    run_export(input, ExportKind::PowerPoint, &out).unwrap();
+    assert!(slide_xml(&out, 1).contains("<p:pic>"), "{}", slide_xml(&out, 1));
+    let pictures = pptx_pictures(&out);
+    assert_eq!(pictures.len(), 1);
+    // Its blue front, not the plain panel.
+    let middle = pictures[0].get_pixel(pictures[0].width() / 2, pictures[0].height() / 2).0;
+    assert!(middle[2] > middle[0] + 60 && middle[2] > middle[1] + 60, "blue: {middle:?}");
+
+    let (_folder, input) = with_model(ONE_MODEL, &box_model());
+    let (_dir, pdf) = target("talk.pdf");
+    run_export(input, ExportKind::Pdf, &pdf).unwrap();
+    assert!(holds(&std::fs::read(&pdf).unwrap(), b"/Subtype/Image"), "the still is a picture");
+
+    // One that can't be drawn is its panel, and no picture, and says why.
+    let (_folder, input) = with_model(ONE_MODEL, b"these are words, not a model");
+    let (_dir, out) = target("talk.pptx");
+    let notices = run_export(input, ExportKind::PowerPoint, &out).unwrap();
+    assert!(pptx_pictures(&out).is_empty());
+    assert!(notices.iter().any(|notice| notice == "Slide 1: This file isn't a 3D model."), "{notices:?}");
+}
+
+#[test]
+fn the_export_says_how_many_models() {
+    let Some(_alone) = drawing_models("the_export_says_how_many_models") else { return };
+    let two = format!("{ONE_MODEL}\n---\n\n{}", ONE_MODEL.replace("# Model", "# Again"));
+    for kind in [ExportKind::PowerPoint, ExportKind::Pdf] {
+        let said = |source: &str| {
+            let (_folder, input) = with_model(source, &box_model());
+            let (_dir, out) = target(&format!("talk.{}", kind.extension()));
+            run_export(input, kind, &out).unwrap()
+        };
+        let notices = said(&two);
+        let counted: Vec<&String> = notices.iter().filter(|notice| notice.contains("exported as")).collect();
+        assert_eq!(counted, ["2 models were exported as pictures."], "{kind:?}: {notices:?}");
+        let notices = said(ONE_MODEL);
+        assert!(notices.iter().any(|notice| notice == "1 model was exported as a picture."), "{kind:?}: {notices:?}");
+        let notices = said(TALK);
+        assert!(notices.iter().all(|notice| !notice.contains("exported as")), "{kind:?}: {notices:?}");
+    }
+    // One that can't be drawn is its panel, and isn't counted: its own notice says why. Videos
+    // are counted apart.
+    let mixed = format!(
+        "{ONE_MODEL}\n<Model src=\"assets/words.glb\" x=\"900\" y=\"100\" w=\"640\" h=\"360\" />\n\n<Video src=\"assets/clip.mp4\" x=\"100\" y=\"600\" w=\"640\" h=\"360\" />\n"
+    );
+    for kind in [ExportKind::PowerPoint, ExportKind::Pdf] {
+        let (folder, input) = with_model(&mixed, &box_model());
+        std::fs::write(folder.path().join("assets/words.glb"), b"these are words, not a model").unwrap();
+        std::fs::write(folder.path().join("assets/clip.mp4"), blue_clip()).unwrap();
+        let (_dir, out) = target(&format!("talk.{}", kind.extension()));
+        let notices = run_export(input, kind, &out).unwrap();
+        let counted: Vec<&String> = notices.iter().filter(|notice| notice.contains("exported as")).collect();
+        assert_eq!(counted, ["1 video was exported as a picture.", "1 model was exported as a picture."], "{kind:?}: {notices:?}");
+        assert!(notices.iter().any(|notice| notice == "Slide 1: This file isn't a 3D model."), "{kind:?}: {notices:?}");
+    }
+}

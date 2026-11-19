@@ -4,7 +4,7 @@
 use toolkit::{PropField, PropKind};
 
 /// A built-in component's settings, by argument, in the order they're shown, with their labels.
-const BUILT_INS: [(&str, &[(&str, &str)]); 6] = [
+const BUILT_INS: [(&str, &[(&str, &str)]); 7] = [
     ("Shape", &[("kind", "Shape"), ("fill", "Fill"), ("outline", "Outline"), ("outline-width", "Outline width")]),
     (
         "Box",
@@ -19,6 +19,7 @@ const BUILT_INS: [(&str, &[(&str, &str)]); 6] = [
     ("Icon", &[("name", "Icon"), ("size", "Size"), ("color", "Colour")]),
     ("Picture", &[("src", "Picture")]),
     ("Video", &[("loop", "Loop"), ("poster", "Still picture")]),
+    ("Model", &[("turn", "Turns on its own")]),
     (
         "Chart",
         &[
@@ -32,9 +33,14 @@ const BUILT_INS: [(&str, &[(&str, &str)]); 6] = [
     ),
 ];
 
-/// The built-ins' arguments the form leaves out: `(tag, argument)`. A video's file is named
-/// above its fields, and a new one is put on the slide from the Insert tab.
-const LEFT_OUT: [(&str, &str); 1] = [("Video", "src")];
+/// The built-ins' arguments the form leaves out: `(tag, argument)`. A video's or a model's file
+/// is named above its fields, and a new one is put on the slide from the Insert tab; a model's
+/// views are set by turning it, and counted under its fields.
+const LEFT_OUT: [(&str, &str); 4] = [("Video", "src"), ("Model", "src"), ("Model", "view"), ("Model", "views")];
+
+/// The built-ins' arguments that are ticked or not, though they take a word: `(tag, argument)`.
+/// A model's `turn` is `auto`, ticked, or left out.
+const FLAGS: [(&str, &str); 1] = [("Model", "turn")];
 
 /// The built-ins' arguments that are colours, though they take them as text, so that one the
 /// toolkit can't read is no colour rather than black: `(tag, argument)`.
@@ -69,7 +75,12 @@ pub fn ordered(tag: &str, props: &[PropField]) -> Vec<(PropField, String)> {
         .filter_map(|(name, label)| {
             let prop = props.iter().find(|prop| prop.name == *name)?;
             let colour = COLOURS.contains(&(tag, prop.name.as_str())) && prop.kind == PropKind::Text;
-            let prop = if colour { PropField::new(prop.name.clone(), PropKind::Color, prop.optional) } else { prop.clone() };
+            let flag = FLAGS.contains(&(tag, prop.name.as_str()));
+            let prop = match () {
+                _ if colour => PropField::new(prop.name.clone(), PropKind::Color, prop.optional),
+                _ if flag => PropField::new(prop.name.clone(), PropKind::Flag, prop.optional),
+                _ => prop.clone(),
+            };
             Some((prop, label.to_string()))
         })
         .collect();
@@ -82,11 +93,65 @@ pub fn ordered(tag: &str, props: &[PropField]) -> Vec<(PropField, String)> {
 }
 
 /// Whether `value`, what `tag` has as a yes-or-no setting, says yes. A video's `loop` says yes
-/// written bare, or as `true`, `yes` or `1`, as the engine reads it; anything else's only as `true`.
+/// written bare, or as `true`, `yes` or `1`, and a model's `turn` as `auto`, as the engine reads
+/// them; anything else's only as `true`.
 pub fn says_yes(tag: &str, value: Option<&str>) -> bool {
     match value {
         Some(value) if tag == "Video" => matches!(value.trim().to_ascii_lowercase().as_str(), "" | "true" | "yes" | "1"),
+        Some(value) if tag == "Model" => value.trim().eq_ignore_ascii_case("auto"),
         value => value == Some("true"),
+    }
+}
+
+/// What a yes-or-no setting of `tag` is written as, ticked if `yes`, or `None` to leave it out:
+/// a model turns on its own as `auto`, and stays still with none.
+pub fn written_flag(tag: &str, yes: bool) -> Option<&'static str> {
+    match (tag, yes) {
+        ("Model", true) => Some("auto"),
+        ("Model", false) => None,
+        (_, true) => Some("true"),
+        (_, false) => Some("false"),
+    }
+}
+
+/// What the form says of a 3D model of `kind`, of `triangles` or `points`: "42,000 triangles",
+/// or "1.2 million points".
+pub fn model_facts(kind: slides_model::ModelKind, triangles: u64, points: u64) -> String {
+    let (count, one) = match kind {
+        slides_model::ModelKind::Mesh => (triangles, "triangle"),
+        slides_model::ModelKind::Points => (points, "point"),
+    };
+    match count {
+        0 => format!("No {one}s"),
+        1 => format!("1 {one}"),
+        count if count < 1_000_000 => format!("{} {one}s", with_commas(count)),
+        count => {
+            let tenths = (count + 50_000) / 100_000;
+            let millions = if tenths % 10 == 0 { (tenths / 10).to_string() } else { format!("{}.{}", tenths / 10, tenths % 10) };
+            format!("{millions} million {one}s")
+        }
+    }
+}
+
+/// `count` with a comma between each three figures: "42,000".
+fn with_commas(count: u64) -> String {
+    let figures = count.to_string();
+    let mut written = String::new();
+    for (at, figure) in figures.chars().enumerate() {
+        if at > 0 && (figures.len() - at).is_multiple_of(3) {
+            written.push(',');
+        }
+        written.push(figure);
+    }
+    written
+}
+
+/// What the form says of `views` views: "No views", "1 view", "3 views".
+pub fn views_counted(views: usize) -> String {
+    match views {
+        0 => "No views".to_string(),
+        1 => "1 view".to_string(),
+        views => format!("{views} views"),
     }
 }
 
@@ -177,6 +242,25 @@ mod tests {
         assert!(!says_yes("Video", None));
         assert!(says_yes("Chart", Some("true")));
         assert!(!says_yes("Chart", Some("yes")), "a component's own say");
+    }
+
+    #[test]
+    fn a_models_form_ticks_turning_and_leaves_its_file_and_views_out() {
+        let props = [
+            PropField::new("src", PropKind::File(vec!["glb".into()]), false),
+            PropField::new("turn", PropKind::Choice(vec!["auto".into()]), true),
+            PropField::new("view", PropKind::Text, true),
+            PropField::new("views", PropKind::Text, true),
+        ];
+        let ordered = ordered("Model", &props);
+        let labels: Vec<&str> = ordered.iter().map(|(_, label)| label.as_str()).collect();
+        assert_eq!(labels, ["Turns on its own"]);
+        assert_eq!(ordered[0].0.kind, PropKind::Flag);
+        assert!(says_yes("Model", Some("auto")) && says_yes("Model", Some(" AUTO ")));
+        assert!(!says_yes("Model", None) && !says_yes("Model", Some("true")));
+        assert_eq!((written_flag("Model", true), written_flag("Model", false)), (Some("auto"), None));
+        assert_eq!((written_flag("Video", true), written_flag("Video", false)), (Some("true"), Some("false")));
+        assert_eq!([0, 1, 256].map(views_counted), ["No views", "1 view", "256 views"]);
     }
 
     #[test]

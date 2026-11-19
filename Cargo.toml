@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/app", "crates/components", "crates/engine", "crates/format", "crates/pdf", "crates/pptx", "crates/toolkit", "crates/toolkit-macros", "crates/video"]
+members = ["crates/app", "crates/components", "crates/engine", "crates/format", "crates/pdf", "crates/pptx", "crates/toolkit", "crates/toolkit-macros", "crates/video", "crates/model"]
 
 [workspace.package]
 edition = "2024"
@@ -14,7 +14,13 @@ thiserror = "2"
 openh264 = "=0.9.10"
 mp4 = "=0.14.0"
 yuvutils-rs = "=0.8.3"
+# A 3D model's description, as the 3D spike used it, without its own file and picture reading.
+gltf = { version = "=1.4.1", default-features = false }
 
 # Debug info for GPUI is what makes builds use the most memory.
 [profile.dev.package."*"]
 debug = false
+
+# Pictures in a model are decoded within the time a model is read in, even in a build for tests.
+[profile.dev.package.zune-jpeg]
+opt-level = 3

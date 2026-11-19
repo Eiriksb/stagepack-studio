@@ -45,7 +45,7 @@ use colors::color_of;
 use fields::{Choice, FIRST_FRAME, Kind, Spec, Typed, file_name, number_typed, stepped, text_typed};
 
 pub use fields::{BOTH_QUOTES, NOT_A_NUMBER, NOT_WHOLE};
-pub use labels::video_facts;
+pub use labels::{model_facts, video_facts};
 
 pub const INSPECTOR_ID: &str = "inspector";
 /// What names the thing selected, at the top of the panel.
@@ -58,6 +58,17 @@ pub const INSPECTOR_CHOOSE_FILE_ID: &str = "inspector-choose-file";
 pub const INSPECTOR_VIDEO_FACTS_ID: &str = "inspector-video-facts";
 /// The sentence saying why a video selected can't be played, if it can't.
 pub const INSPECTOR_VIDEO_PROBLEM_ID: &str = "inspector-video-problem";
+/// The line saying how many triangles or points a 3D model selected has, read off the window's
+/// thread.
+pub const INSPECTOR_MODEL_FACTS_ID: &str = "inspector-model-facts";
+/// The sentence saying why a 3D model selected can't be drawn, if it can't.
+pub const INSPECTOR_MODEL_PROBLEM_ID: &str = "inspector-model-problem";
+/// The line saying how many views a 3D model selected has, one a click in the show.
+pub const INSPECTOR_MODEL_VIEWS_ID: &str = "inspector-model-views";
+/// The button that adds the view a 3D model being turned is shown from to its views.
+pub const INSPECTOR_ADD_VIEW_ID: &str = "inspector-add-view";
+/// The button that takes away a 3D model's views.
+pub const INSPECTOR_CLEAR_VIEWS_ID: &str = "inspector-clear-views";
 /// The button that puts an area selected back where its layout has it.
 pub const INSPECTOR_PUT_BACK_ID: &str = "inspector-put-back";
 
@@ -376,6 +387,71 @@ impl Inspector {
         (facts, problem)
     }
 
+    /// What the form says of the 3D model it's for, if it's for one: how many triangles or
+    /// points it has, once that's been read off the window's thread from its headers, once for
+    /// each version of its file; why it can't be drawn, if it can't; and its views.
+    fn model_said(&mut self, cx: &mut Context<Self>) -> ModelSaid {
+        let (Some(form), Some(document)) = (&self.form, self.document.clone()) else {
+            return ModelSaid::default();
+        };
+        let Subject::Thing(target) = &form.target else {
+            return ModelSaid::default();
+        };
+        let target = target.clone();
+        if form.shape.tag.as_deref() != Some("Model") {
+            return ModelSaid::default();
+        }
+        let turned = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).slide_editor().read(cx).model_turned())
+            .is_some_and(|turned| turned == target.source);
+        let written = self.talk_attr("views", cx);
+        let views = Some(ModelViews { count: views_of(written.as_deref()), written: written.is_some(), turned });
+        let src = self.talk_attr("src", cx).map(|src| src.trim().to_string()).filter(|src| !src.is_empty());
+        let Some(src) = src else {
+            return ModelSaid { facts: None, problem: Some(slides_engine::MODEL_NO_FILE.to_string()), views };
+        };
+        let (known, to_read, problem) = document.update(cx, |document, _| {
+            let known = document.model_facts(&src);
+            let to_read = if known.is_none() { document.model_facts_to_read(&src) } else { None };
+            let problem = if target.slide == document.current() { document.selected_model_said() } else { None };
+            (known, to_read, problem)
+        });
+        if let Some(to_read) = to_read {
+            let document = document.downgrade();
+            cx.spawn(async move |this, cx| {
+                let read = cx.background_spawn(async move { to_read.read() }).await;
+                let known = document.update(cx, |document, _| document.take_model_facts(read)).unwrap_or(false);
+                if known {
+                    this.update(cx, |_, cx| cx.notify()).ok();
+                }
+            })
+            .detach();
+        }
+        let facts = known.and_then(Result::ok).map(|facts| labels::model_facts(facts.kind, facts.triangles, facts.points));
+        // One drawn, but not from the view written, says that too.
+        let view = self.talk_attr("view", cx).filter(|view| !view.trim().is_empty());
+        let unread = view.is_some_and(|view| slides_model::View::parse(&view).is_none()).then(|| slides_engine::MODEL_VIEW_UNREAD.to_string());
+        let problem = problem.or_else(|| known.and_then(Result::err).map(|why| why.to_string())).or(unread);
+        ModelSaid { facts, problem, views }
+    }
+
+    /// Adds the view the 3D model the form is for is shown from, while it's turned, to its views.
+    fn add_view(&mut self, cx: &mut Context<Self>) {
+        if let Some(workspace) = self.workspace.upgrade() {
+            let editor = workspace.read(cx).slide_editor().clone();
+            editor.update(cx, |editor, cx| editor.add_view(cx));
+        }
+    }
+
+    /// Takes away the views of the 3D model the form is for, as any setting is written: one
+    /// being turned goes back to its still.
+    fn clear_views(&mut self, cx: &mut Context<Self>) {
+        self.write("views", None, cx).ok();
+        cx.notify();
+    }
+
     /// The tag of the thing the form is for, if it's one.
     fn form_tag(&self) -> &str {
         self.form.as_ref().and_then(|form| form.shape.tag.as_deref()).unwrap_or_default()
@@ -398,6 +474,27 @@ impl Inspector {
             Subject::Several => None,
         }
     }
+}
+
+/// What the form says of a 3D model.
+#[derive(Default)]
+struct ModelSaid {
+    facts: Option<String>,
+    problem: Option<String>,
+    views: Option<ModelViews>,
+}
+
+/// How many views a 3D model has, whether it has any written, read or not, and whether it's
+/// being turned, so that the view it's shown from can be added.
+struct ModelViews {
+    count: usize,
+    written: bool,
+    turned: bool,
+}
+
+/// How many views a model whose `views` is `written` flies through, as the engine reads them.
+fn views_of(written: Option<&str>) -> usize {
+    slides_engine::read_model_views(written).0.len()
 }
 
 /// The kind of file `path` is, for a field that takes `extensions`, if it's one it takes and one

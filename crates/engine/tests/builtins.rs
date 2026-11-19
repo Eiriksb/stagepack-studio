@@ -1481,3 +1481,262 @@ fn stills_count_in_the_picture_budget() {
         assert!(deck.picture_bytes() <= 3 * one, "slide {slide}: {} bytes held", deck.picture_bytes());
     }
 }
+
+// 3D models.
+
+/// A drawer that waits, once a test is done with it, for its thread to let go of its device: a
+/// program ending while a driver lets go of one can crash in the driver.
+struct Closing(Option<slides_model::Drawer>);
+
+impl Drop for Closing {
+    fn drop(&mut self) {
+        if let Some(drawer) = self.0.take() {
+            assert!(drawer.close(std::time::Duration::from_secs(30)), "the drawer's thread never ended");
+        }
+    }
+}
+
+impl Closing {
+    fn drawer(&self) -> slides_model::Drawer {
+        self.0.clone().expect("not yet closed")
+    }
+}
+
+/// A drawer on the software adapter where there is one, else on any, else `None` after saying
+/// why `test` is skipped.
+fn model_drawer(test: &str) -> Option<Closing> {
+    use slides_model::{AdapterKind, Drawer, DrawerOptions};
+    let ready = |drawer: &Drawer| {
+        let began = std::time::Instant::now();
+        loop {
+            if let Some(ready) = drawer.ready() {
+                return ready;
+            }
+            assert!(began.elapsed() < std::time::Duration::from_secs(60), "the drawer never said whether it can draw");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    let software = Closing(Some(Drawer::start_with(DrawerOptions { only: Some(AdapterKind::Software), ..DrawerOptions::default() })));
+    if ready(&software.drawer()).is_ok() {
+        return Some(software);
+    }
+    drop(software);
+    let any = Closing(Some(Drawer::start()));
+    match ready(&any.drawer()) {
+        Ok(_) => Some(any),
+        Err(why) => {
+            eprintln!("{test} skipped: no graphics adapter, not even a software one, can be had here. {why}");
+            None
+        }
+    }
+}
+
+/// What draws a model's still with `drawer`, as the app's does.
+fn drawing_with(drawer: slides_model::Drawer) -> DrawModel {
+    std::sync::Arc::new(move |reader, view, width, height| {
+        let model = slides_model::read(Box::new(reader))?;
+        let view = view.unwrap_or_else(|| slides_model::View::framing(&model.facts));
+        let scene = drawer.upload(model);
+        drawer.draw(&scene, view, width, height).recv().map_err(|why| match why {
+            slides_model::NotDrawn::Cant(why) => why,
+            _ => slides_model::CantDraw::NoAdapter,
+        })
+    })
+}
+
+/// A box a unit a side, its faces along x red, along y green and along z blue.
+fn box_model() -> Vec<u8> {
+    slides_model::make_test_glb(slides_model::MadeGlb::Boxes)
+}
+
+/// A deck of a talk of `source`, its files `files`, drawing its models' stills with `draw`.
+fn model_deck(source: &str, files: &[(&str, Vec<u8>)], draw: Option<DrawModel>) -> Deck {
+    let files = MapFiles(files.iter().map(|(path, bytes)| (path.to_string(), bytes.clone())).collect());
+    let mut deck = Deck::open(Box::new(files), Fonts::bundled_only(), format!("# One\n\n{source}"));
+    if let Some(draw) = draw {
+        deck.draw_models_with(draw);
+    }
+    deck
+}
+
+fn model_layer(deck: &mut Deck) -> LayerSpec {
+    deck.specs(0).iter().find(|spec| spec.model.is_some()).expect("the model has a layer").clone()
+}
+
+/// Which of red, green and blue is the most of the colour in the middle of `pixmap`.
+fn most_in_the_middle(pixmap: &tiny_skia::Pixmap) -> usize {
+    let (r, g, b) = middle_of(pixmap);
+    [r, g, b].iter().enumerate().max_by_key(|(_, value)| **value).map(|(at, _)| at).unwrap()
+}
+
+#[test]
+fn a_models_still_is_drawn_at_its_view() {
+    let Some(closing) = model_drawer("a_models_still_is_drawn_at_its_view") else { return };
+    let files = [("assets/box.glb", box_model())];
+    let front = "0 0 4 0 0.5 0";
+    let source = format!("<Model src=\"assets/box.glb\" x=\"100\" y=\"50\" w=\"640\" h=\"360\" view=\"{front}\" />\n");
+    let mut deck = model_deck(&source, &files, Some(drawing_with(closing.drawer())));
+    let layer = model_layer(&mut deck);
+    let (pixmap, rect) = picture_of(&layer);
+    assert_eq!(rect, Rect { x: 0.0, y: 0.0, w: 640.0, h: 360.0 });
+    assert_eq!((pixmap.width(), pixmap.height()), (640, 360), "drawn a pixel a unit");
+    assert_eq!(most_in_the_middle(pixmap), 2, "the front, blue: {:?}", middle_of(pixmap));
+    assert_eq!(pixmap.pixel(0, 0).unwrap().alpha(), 0, "clear where the model isn't");
+    let on = layer.model.as_ref().unwrap();
+    assert_eq!(on.src, "assets/box.glb");
+    assert_eq!(on.view, slides_model::View::parse(front));
+    assert!(!on.turn);
+    assert!(on.views.is_empty());
+    assert_eq!((on.rect, on.rotate), (layer.rect, layer.rotate));
+    assert_eq!(layer.rect, Rect { x: 100.0, y: 50.0, w: 640.0, h: 360.0 });
+    assert!(deck.notices(0).is_empty(), "{:?}", deck.notices(0));
+    assert_eq!(deck.model_problem(0, layer.source.as_ref().unwrap()), None);
+
+    // Seen from the right, its red side shows; it turns, and has two views to fly to.
+    let source = "<Model src=\"assets/box.glb\" x=\"0\" w=\"320\" h=\"180\" view=\"90 0 4 0 0.5 0\" turn=\"auto\" views=\"0 0 4 0 0.5 0; 0 80 4 0 0.5 0\" />\n";
+    let mut deck = model_deck(source, &files, Some(drawing_with(closing.drawer())));
+    let layer = model_layer(&mut deck);
+    assert_eq!(most_in_the_middle(picture_of(&layer).0), 0, "the side, red: {:?}", middle_of(picture_of(&layer).0));
+    let on = layer.model.as_ref().unwrap();
+    assert!(on.turn);
+    assert_eq!(on.views.len(), 2);
+    assert_eq!(on.views[1].pitch, 80.0);
+    assert_eq!(deck.models(0).len(), 1);
+    assert_eq!(deck.models(0)[0].on, *on);
+    assert_eq!(deck.timeline(0).steps, 2, "a click for each view");
+
+    // With no size it's 960 by 540; with no view the whole of it is seen, framed.
+    let mut deck = model_deck("<Model src=\"assets/box.glb\" x=\"0\" />\n", &files, Some(drawing_with(closing.drawer())));
+    let layer = model_layer(&mut deck);
+    assert_eq!((layer.rect.w, layer.rect.h), (960.0, 540.0));
+    let (pixmap, _) = picture_of(&layer);
+    assert_eq!(pixmap.pixel(pixmap.width() / 2, pixmap.height() / 2).unwrap().alpha(), 255, "the model is in the middle");
+    assert_eq!(layer.model.as_ref().unwrap().view, None);
+}
+
+#[test]
+fn a_model_that_cannot_be_read_draws_a_panel_and_says_why() {
+    // Something that draws nothing: what it's asked to draw is read, and what can't be read says so.
+    let reads_only: DrawModel = std::sync::Arc::new(|reader, _, _, _| slides_model::read(Box::new(reader)).and(Err(slides_model::CantDraw::NoAdapter)));
+    let source = "<Model src=\"assets/box.glb\" x=\"0\" w=\"640\" h=\"360\" />\n";
+    let no_adapter = "This computer can't draw 3D models here. The slide shows a still when it's presented somewhere that can.";
+    for (bytes, draw, why) in [
+        (Some(b"just some words".to_vec()), Some(reads_only.clone()), "This file isn't a 3D model."),
+        (None, Some(reads_only.clone()), "This model couldn't be read."),
+        (Some(box_model()[..100].to_vec()), Some(reads_only.clone()), "This model is damaged, so it can't be drawn."),
+        // Nothing can draw it, here or with nothing given to draw with.
+        (Some(box_model()), Some(reads_only.clone()), no_adapter),
+        (Some(box_model()), None, no_adapter),
+    ] {
+        let files: Vec<(&str, Vec<u8>)> = bytes.into_iter().map(|bytes| ("assets/box.glb", bytes)).collect();
+        let mut deck = model_deck(source, &files, draw);
+        let layer = model_layer(&mut deck);
+        assert!(!has_picture(&layer), "{why}");
+        assert_eq!(text_of(&layer), why, "the panel says why");
+        assert!(layer.model.is_some(), "it's still a model: {why}");
+        assert!(deck.notices(0).iter().any(|notice| notice == why), "{why}: {:?}", deck.notices(0));
+        assert_eq!(deck.model_problem(0, layer.source.as_ref().unwrap()).as_deref(), Some(why));
+    }
+    // Anything else has no problem to tell of.
+    let mut deck = model_deck(source, &[], None);
+    assert_eq!(deck.model_problem(0, &(0..5)), None);
+
+    // No file, a view that can't be read, a turn that isn't auto, views that can't be read, and
+    // one in the text: each is said plainly.
+    for (source, said) in [
+        ("<Model x=\"0\" w=\"640\" h=\"360\" />\n", MODEL_NO_FILE.to_string()),
+        ("<Model src=\"assets/box.glb\" x=\"0\" w=\"64\" h=\"36\" view=\"1 2 three\" />\n", MODEL_VIEW_UNREAD.to_string()),
+        ("<Model src=\"assets/box.glb\" x=\"0\" w=\"64\" h=\"36\" view=\"0 0 NaN 0 0 0\" />\n", MODEL_VIEW_UNREAD.to_string()),
+        ("<Model src=\"assets/box.glb\" x=\"0\" w=\"64\" h=\"36\" turn=\"fast\" />\n", "A 3D model's turn can be auto, or left out to stay still, not fast, so it stays still".to_string()),
+        ("<Model src=\"assets/box.glb\" x=\"0\" w=\"64\" h=\"36\" views=\"0 0 4 0 0 0; nonsense\" />\n", "Some of this 3D model's views can't be read, or there are more than 256, so they're left out".to_string()),
+        ("<Model src=\"assets/box.glb\" />\n", MODEL_IN_TEXT.to_string()),
+    ] {
+        let mut deck = model_deck(source, &[("assets/box.glb", box_model())], Some(reads_only.clone()));
+        assert!(deck.notices(0).contains(&said), "{source}: {:?}", deck.notices(0));
+    }
+    let mut deck = model_deck("<Model src=\"assets/box.glb\" x=\"0\" w=\"64\" h=\"36\" views=\"0 0 4 0 0 0; nonsense, 1 2 3 4 5 6\" />\n", &[], None);
+    assert_eq!(model_layer(&mut deck).model.unwrap().views.len(), 2, "those that read are kept");
+    let mut deck = model_deck("<Model src=\"assets/box.glb\" />\n", &[], None);
+    assert!(deck.specs(0).iter().all(|spec| spec.model.is_none()), "one in the text isn't drawn");
+}
+
+#[test]
+fn a_talk_of_ten_models_opens_reading_only_their_headers() {
+    // Large enough that reading one whole would show.
+    let model = slides_model::make_test_glb(slides_model::MadeGlb::Grid { cells: 200, texture: 512, jpeg: false });
+    assert!(model.len() >= 1024 * 1024, "{} bytes", model.len());
+    let paths: Vec<String> = (0..10).map(|at| format!("assets/model{at}.glb")).collect();
+    let talk: Vec<String> = paths.iter().map(|path| format!("# Slide\n\n<Model src=\"{path}\" x=\"0\" w=\"640\" h=\"360\" />\n")).collect();
+    let read = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let files = CountingFiles { files: paths.iter().map(|path| (path.clone(), model.clone())).collect(), read: read.clone() };
+    let mut deck = Deck::open(Box::new(files), Fonts::bundled_only(), talk.join("\n---\n\n"));
+    let drawn = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = drawn.clone();
+    // Draws a picture of one colour, as no adapter is needed to make one aside.
+    deck.draw_models_with(std::sync::Arc::new(move |_, _, width, height| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(slides_model::Picture { width, height, bgra: [0, 0, 255, 255].repeat((width * height) as usize), drawing: Default::default(), reading_back: Default::default() })
+    }));
+    let wanted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let told = wanted.clone();
+    deck.make_stills_aside(
+        std::sync::Arc::new(move || {
+            told.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }),
+        std::sync::Arc::new(|_: &str| None),
+    );
+    for slide in 0..10 {
+        assert!(deck.layers(slide, 0.25).len() >= 2);
+        deck.thumbnail(slide, 160);
+        assert!(deck.notices(slide).is_empty(), "nothing said while it's drawn: {:?}", deck.notices(slide));
+    }
+    for (path, bytes) in read.lock().unwrap().iter() {
+        assert!(!path.ends_with("whole") && *bytes <= 64 * 1024, "{path}: {bytes} bytes read");
+    }
+    assert_eq!(drawn.load(std::sync::atomic::Ordering::SeqCst), 0, "nothing drawn on the thread laying out");
+    assert!(deck.stills_coming());
+    assert_eq!(wanted.load(std::sync::atomic::Ordering::SeqCst), 10);
+    let jobs = deck.still_jobs();
+    assert_eq!(jobs.len(), 10, "one still each, thumbnails included");
+    assert!(jobs.iter().all(StillJob::is_model));
+    // Made on another thread, a still is taken in and its slide shown again.
+    let version = deck.slide_version(3);
+    let job = jobs.into_iter().find(|job| job.path() == "assets/model3.glb").unwrap();
+    let bytes = model.clone();
+    let made = std::thread::spawn(move || job.make(Some(Box::new(std::io::Cursor::new(bytes))))).join().unwrap();
+    assert!(!made.failed());
+    assert_eq!(deck.take_still(made), vec![3]);
+    assert_ne!(deck.slide_version(3), version);
+    let layer = deck.specs(3).iter().find(|spec| spec.model.is_some()).unwrap().clone();
+    assert!(close_to(middle_of(picture_of(&layer).0), (255, 0, 0)), "{:?}", middle_of(picture_of(&layer).0));
+    assert_eq!(drawn.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_model_resized_shows_its_still_until_the_new_one_is_drawn() {
+    // Files that can say how long each is, as a talk's on disk can.
+    let files = CountingFiles { files: [("assets/box.glb".to_string(), box_model())].into(), read: Default::default() };
+    let talk = "# One\n\n<Model src=\"assets/box.glb\" x=\"0\" w=\"640\" h=\"360\" />\n";
+    let mut deck = Deck::open(Box::new(files), Fonts::bundled_only(), talk.to_string());
+    deck.draw_models_with(std::sync::Arc::new(|_, _, width, height| {
+        Ok(slides_model::Picture { width, height, bgra: [0, 0, 255, 255].repeat((width * height) as usize), drawing: Default::default(), reading_back: Default::default() })
+    }));
+    deck.make_stills_aside(std::sync::Arc::new(|| {}), std::sync::Arc::new(|_: &str| None));
+    deck.specs(0);
+    let job = deck.still_jobs().pop().unwrap();
+    let made = job.make(Some(Box::new(std::io::Cursor::new(box_model()))));
+    deck.take_still(made);
+    assert_eq!(picture_of(&model_layer(&mut deck)).0.width(), 640);
+    // Resized, the still drawn before shows, stretched, while the new one is drawn; one wanted
+    // at a size passed through isn't drawn.
+    for w in [700, 800] {
+        let source = talk.replace("w=\"640\" h=\"360\"", &format!("w=\"{w}\" h=\"360\""));
+        deck.update(source);
+        assert_eq!(picture_of(&model_layer(&mut deck)).0.width(), 640, "{w}");
+    }
+    let jobs = deck.still_jobs();
+    assert_eq!(jobs.len(), 1, "only the newest size is drawn");
+    let made = jobs.into_iter().next().unwrap().make(Some(Box::new(std::io::Cursor::new(box_model()))));
+    deck.take_still(made);
+    assert_eq!(picture_of(&model_layer(&mut deck)).0.width(), 800);
+}

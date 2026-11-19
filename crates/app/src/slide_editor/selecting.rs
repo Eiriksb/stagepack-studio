@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::document::LargeOpen;
+use crate::model_view::inside_turned;
 
 impl SlideEditor {
     /// What's selected, if it's on the slide shown.
@@ -20,7 +21,7 @@ impl SlideEditor {
         let selection = self.selection_here(cx)?;
         let document = self.document.clone()?;
         let said = selection::said_of_selection(document.read(cx).talk(), &selection)?;
-        let problem = document.update(cx, |document, _| document.selected_video_said());
+        let problem = document.update(cx, |document, _| document.selected_video_said().or_else(|| document.selected_model_said()));
         Some(match problem {
             Some(problem) => format!("{said}. {problem}").into(),
             None => said.into(),
@@ -42,6 +43,7 @@ impl SlideEditor {
             return;
         }
         self.stop_video(cx);
+        self.stop_turning(cx);
         let Some(source) = video.source.clone() else { return };
         let opened = document.read(cx).open_large(&video.on.src);
         let Some(opened) = opened else {
@@ -72,10 +74,200 @@ impl SlideEditor {
         }
     }
 
+    /// Has the 3D model selected drawn live, to be turned by hand, or goes back to its still
+    /// while it's turned, as its buttons and Space do. With no model selected, the key goes on.
+    /// One whose still already says it can't be drawn isn't read: why is said again.
+    pub(super) fn turn_or_stop(&mut self, cx: &mut Context<Self>) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        let Some(model) = document.update(cx, |document, _| document.selected_model()) else {
+            cx.propagate();
+            return;
+        };
+        if self.turning.is_some() {
+            self.stop_turning(cx);
+            return;
+        }
+        self.stop_video(cx);
+        let Some(source) = model.source.clone() else { return };
+        if let Some(said) = document.update(cx, |document, _| document.selected_model_said()) {
+            cx.emit(EditorEvent::Said(said.into()));
+            return;
+        }
+        let opened = document.read(cx).open_large(&model.on.src);
+        let Some(opened) = opened else {
+            let said = document.update(cx, |document, _| document.selected_model_said());
+            let said = said.unwrap_or_else(|| slides_model::CantDraw::CouldNotRead.to_string());
+            cx.emit(EditorEvent::Said(said.into()));
+            return;
+        };
+        let (slide, talk) = {
+            let document = document.read(cx);
+            (document.current(), talk_hash(document.source()))
+        };
+        let layer = model.layer;
+        self.canvas.update(cx, |canvas, cx| canvas.turn_model(layer, model.on, opened, false, crate::model_view::Aim::Home, cx));
+        self.turning = Some((PlayingHere { slide, source, talk }, layer));
+        cx.notify();
+    }
+
+    /// Whether the model selected is being turned.
+    pub(super) fn model_turning(&self) -> bool {
+        self.turning.is_some()
+    }
+
+    /// Goes back to the still of the model turned, if one was.
+    pub fn stop_turning(&mut self, cx: &mut Context<Self>) {
+        self.turn_drag = None;
+        if self.turning.take().is_some() {
+            self.canvas.update(cx, |canvas, cx| canvas.stop_models(cx));
+            cx.notify();
+        }
+    }
+
+    /// The model being turned, by where it is in the talk, if one is.
+    pub fn model_turned(&self) -> Option<std::ops::Range<usize>> {
+        self.turning.as_ref().map(|(turning, _)| turning.source.clone())
+    }
+
+    /// Writes the view the model turned is shown from into the talk, as its starting view, as
+    /// one step. It goes on being turned.
+    pub(super) fn set_view(&mut self, cx: &mut Context<Self>) {
+        self.write_turned(|document, source, view| document.set_model_view(source, view), cx);
+    }
+
+    /// Adds the view the model turned is shown from to its views, after those it has, as one
+    /// step: one more click in the show. It goes on being turned. One with as many views as it
+    /// can have says so.
+    pub fn add_view(&mut self, cx: &mut Context<Self>) {
+        self.write_turned(|document, source, view| document.add_model_view(source, view), cx);
+    }
+
+    /// Makes the change `write` makes to the model turned, at where it is in the talk and with
+    /// the view it's shown from, as one step. Written by this, the change is no reason to stop
+    /// turning it.
+    fn write_turned(
+        &mut self,
+        write: impl FnOnce(&mut Document, std::ops::Range<usize>, slides_model::View) -> Result<Vec<usize>, EditRefused>,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some((turning, layer)), Some(document)) = (self.turning.clone(), self.document.clone()) else {
+            return;
+        };
+        let Some(view) = self.canvas.read(cx).model_view(layer) else {
+            return;
+        };
+        let written = document.update(cx, |document, cx| {
+            let written = write(document, turning.source.clone(), view);
+            cx.notify();
+            written.map(|_| (document.selected_model(), talk_hash(document.source())))
+        });
+        match written {
+            // Written by this, the change is no reason to stop.
+            Ok((Some(model), talk)) => {
+                let Some(source) = model.source else { return };
+                self.turning = Some((PlayingHere { slide: turning.slide, source, talk }, model.layer));
+            }
+            Ok((None, _)) => self.stop_turning(cx),
+            Err(refused) => cx.emit(EditorEvent::Said(refused.to_string().into())),
+        }
+        cx.notify();
+    }
+
+    /// Starts a drag turning the model, if one is being turned and the press at `position` is on
+    /// it: true if it did.
+    pub(super) fn press_turning(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        let (Some((_, layer)), Some(document)) = (self.turning.clone(), self.document.clone()) else {
+            return false;
+        };
+        let Some(model) = document.update(cx, |document, _| document.selected_model()) else {
+            return false;
+        };
+        let Some((x, y)) = self.slide_units(position, cx) else {
+            return false;
+        };
+        if !inside_turned(model.on.rect, model.on.rotate, (x, y)) {
+            return false;
+        }
+        self.turn_drag = Some(position);
+        self.canvas.update(cx, |canvas, cx| canvas.hold_model(layer, true, cx));
+        true
+    }
+
+    /// Turns the model by as far as the pointer has moved, while a drag turns it: true if one does.
+    /// A drag whose button was let go of unheard ends.
+    pub(super) fn drag_turning(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) -> bool {
+        let (Some(from), Some((_, layer))) = (self.turn_drag, self.turning.clone()) else {
+            return false;
+        };
+        if event.pressed_button != Some(MouseButton::Left) {
+            return self.release_turning(cx);
+        }
+        let position = event.position;
+        let (dx, dy) = (f32::from(position.x - from.x), f32::from(position.y - from.y));
+        self.turn_drag = Some(position);
+        self.canvas.update(cx, |canvas, cx| canvas.turn_by(layer, dx, dy, cx));
+        true
+    }
+
+    /// Ends a drag turning the model: true if one did.
+    pub(super) fn release_turning(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(_) = self.turn_drag.take() else {
+            return false;
+        };
+        if let Some((_, layer)) = self.turning.clone() {
+            self.canvas.update(cx, |canvas, cx| canvas.hold_model(layer, false, cx));
+        }
+        true
+    }
+
+    /// Zooms the model turned by the wheel's `steps`, if the pointer at `position` is on it.
+    pub(super) fn wheel_turning(&mut self, position: Point<Pixels>, steps: f32, cx: &mut Context<Self>) -> bool {
+        let (Some((_, layer)), Some(document)) = (self.turning.clone(), self.document.clone()) else {
+            return false;
+        };
+        let Some(model) = document.update(cx, |document, _| document.selected_model()) else {
+            return false;
+        };
+        let on = self.slide_units(position, cx).is_some_and(|at| inside_turned(model.on.rect, model.on.rotate, at));
+        if on {
+            self.canvas.update(cx, |canvas, cx| canvas.zoom_by(layer, steps, cx));
+        }
+        on
+    }
+
+    /// Stops the model turned unless it's still the one thing selected, on the slide it was
+    /// turned on, with the talk's text as it was; and reads it again once a save that let go of
+    /// its file is done.
+    fn keep_turning_only_what_holds(&mut self, cx: &mut Context<Self>) {
+        let (Some((turning, _)), Some(document)) = (self.turning.clone(), self.document.clone()) else {
+            return;
+        };
+        let holds = document.update(cx, |document, _| {
+            document.current() == turning.slide
+                && talk_hash(document.source()) == turning.talk
+                && document.selected_model().is_some_and(|model| model.source.as_ref() == Some(&turning.source))
+        });
+        if !holds {
+            self.stop_turning(cx);
+            return;
+        }
+        let waiting = self.canvas.read(cx).models_let_go();
+        if !waiting.is_empty() && !document.read(cx).saving_the_pack() {
+            let mut opened: Vec<(String, LargeOpen)> =
+                waiting.into_iter().filter_map(|src| Some((src.clone(), document.read(cx).open_large(&src)?))).collect();
+            self.canvas.update(cx, |canvas, cx| {
+                canvas.read_models_again(|src| opened.iter().position(|(at, _)| at == src).map(|at| opened.swap_remove(at).1), cx)
+            });
+        }
+    }
+
     /// Stops the video played unless it's still the one thing selected, on the slide it was
     /// played on, with the talk's text as it was; and opens it again once a save that let go of
-    /// its file is done.
+    /// its file is done. So for a model turned.
     pub(super) fn keep_playing_only_what_holds(&mut self, cx: &mut Context<Self>) {
+        self.keep_turning_only_what_holds(cx);
         let (Some(playing), Some(document)) = (self.playing.clone(), self.document.clone()) else {
             return;
         };

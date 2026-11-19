@@ -2,6 +2,47 @@
 
 use super::*;
 
+impl Inspector {
+    /// A 3D model's views, one a click in the show: how many there are, a button adding the view
+    /// it's shown from while it's turned, and one taking them away.
+    fn views_group(&self, views: ModelViews, cx: &mut Context<Self>) -> AnyElement {
+        let ModelViews { count, written, turned } = views;
+        let counted = SharedString::from(labels::views_counted(count));
+        v_flex()
+            .gap_1()
+            .child(div().pt_2().text_xs().font_weight(FontWeight::SEMIBOLD).child("Views"))
+            .child(
+                div()
+                    .id(INSPECTOR_MODEL_VIEWS_ID)
+                    .test_support()
+                    .aria_label(counted.clone())
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(counted),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new(INSPECTOR_ADD_VIEW_ID)
+                            .small()
+                            .label("Add this view")
+                            .tooltip("Turn the model, then add the view it's shown from: each click in the show goes on to the next")
+                            .disabled(!turned)
+                            .on_click(cx.listener(|this, _, _, cx| this.add_view(cx))),
+                    )
+                    .child(
+                        Button::new(INSPECTOR_CLEAR_VIEWS_ID)
+                            .small()
+                            .label("Clear views")
+                            .disabled(!written)
+                            .on_click(cx.listener(|this, _, _, cx| this.clear_views(cx))),
+                    ),
+            )
+            .into_any_element()
+    }
+}
+
 impl Render for Inspector {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let subject = self.subject(cx);
@@ -23,6 +64,7 @@ impl Render for Inspector {
         };
         self.follow_talk(&values, window, cx);
         let (facts, video_problem) = self.video_said(cx);
+        let model = self.model_said(cx);
         for image in self.retired.drain(..) {
             window.drop_image(image).ok();
         }
@@ -132,8 +174,31 @@ impl Render for Inspector {
                         .child(problem),
                 )
             })
+            .when_some(model.facts.map(SharedString::from), |this, facts| {
+                this.child(
+                    div()
+                        .id(INSPECTOR_MODEL_FACTS_ID)
+                        .test_support()
+                        .aria_label(facts.clone())
+                        .text_sm()
+                        .text_color(muted)
+                        .child(facts),
+                )
+            })
+            .when_some(model.problem.map(SharedString::from), |this, problem| {
+                this.child(
+                    div()
+                        .id(INSPECTOR_MODEL_PROBLEM_ID)
+                        .test_support()
+                        .aria_label(problem.clone())
+                        .text_sm()
+                        .text_color(cx.theme().danger)
+                        .child(problem),
+                )
+            })
             .children(table)
             .children(settings)
+            .when_some(model.views, |this, views| this.child(self.views_group(views, cx)))
             .when(!place.is_empty(), |this| {
                 this.child(div().pt_2().text_xs().font_weight(FontWeight::SEMIBOLD).child("Place"))
                     .children(place)

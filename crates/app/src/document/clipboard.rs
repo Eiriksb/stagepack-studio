@@ -21,6 +21,9 @@ pub struct Brought {
     pub large_left_out: usize,
     /// How many large files it uses were gone, or changed, by the time it was pasted.
     pub large_gone: usize,
+    /// How many of those weren't copied in, and how many were gone, that are 3D models.
+    pub models_left_out: usize,
+    pub models_gone: usize,
     /// Why a large file it uses couldn't be copied in, if one couldn't.
     pub large_refused: Option<NotAdded>,
     /// The stems of the builds that came without their sources.
@@ -40,18 +43,24 @@ impl Brought {
     }
 
     /// The one thing to say of it, if any: a different component first, then one with a
-    /// built-in's name, then files too big, then videos gone, then why one couldn't be copied in,
-    /// then videos not copied, then
+    /// built-in's name, then files too big, then videos and models gone (both, if both), then why
+    /// one couldn't be copied in, then videos and models not copied (both, if both), then
     /// pictures left out, then a component left out.
     pub fn said(&self) -> Option<String> {
         let said = |is: bool, sentence: &str| is.then(|| sentence.to_string());
+        // What's said of videos, then of models, each if there are any.
+        let both = |videos: usize, of_videos: fn(usize) -> String, models: usize, of_models: fn(usize) -> String| {
+            let sentences: Vec<String> =
+                [(videos > 0).then(|| of_videos(videos)), (models > 0).then(|| of_models(models))].into_iter().flatten().collect();
+            (!sentences.is_empty()).then(|| sentences.join(" "))
+        };
         self.different
             .clone()
             .or_else(|| said(self.built_in, clipboard::BUILT_IN_NAME))
             .or_else(|| said(self.too_large, clipboard::FILES_TOO_LARGE))
-            .or_else(|| (self.large_gone > 0).then(|| clipboard::large_gone(self.large_gone)))
+            .or_else(|| both(self.large_gone, clipboard::large_gone, self.models_gone, clipboard::models_gone))
             .or_else(|| self.large_refused.map(|why| why.to_string()))
-            .or_else(|| (self.large_left_out > 0).then(|| clipboard::large_left_out(self.large_left_out)))
+            .or_else(|| both(self.large_left_out, clipboard::large_left_out, self.models_left_out, clipboard::models_left_out))
             .or_else(|| said(self.left_out, clipboard::MISSING_PICTURES))
             .or_else(|| said(self.component_left_out, clipboard::MISSING_COMPONENT))
     }
@@ -218,10 +227,12 @@ impl Document {
             match &large.copied {
                 LargeCopied::To(path) if *path != large.path => renames.push((large.path.clone(), path.clone())),
                 LargeCopied::To(_) => {}
+                LargeCopied::Gone if large.kind == FileKind::Model => brought.models_gone += 1,
                 LargeCopied::Gone => brought.large_gone += 1,
                 LargeCopied::Refused(why) => {
                     brought.large_refused.get_or_insert(*why);
                 }
+                LargeCopied::Declined | LargeCopied::NotYet if large.kind == FileKind::Model => brought.models_left_out += 1,
                 LargeCopied::Declined | LargeCopied::NotYet => brought.large_left_out += 1,
             }
         }

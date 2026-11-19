@@ -7,9 +7,11 @@ use std::sync::Arc;
 
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::*;
-use slides_engine::{Layer, Rect, VideoLayer, VideoOn, to_bgra_frame};
+use slides_engine::{Layer, ModelLayer, ModelOn, Rect, VideoLayer, VideoOn, to_bgra_frame};
+use slides_model::{CantDraw, View};
 
 use crate::document::LargeOpen;
+use crate::model_view::{self, Aim, Turner};
 use crate::present::{LayerLook, SlideLook};
 use crate::video_player::{Placed, Player, Shown, Turning, discard, open_and_play};
 
@@ -31,9 +33,17 @@ pub struct VideoLetGo;
 /// Sent when a video playing here couldn't go on, saying why.
 pub struct VideoFailed(pub slides_video::CantPlay);
 
-/// Sent when a video has been opened to play: one a pack holds compressed is unpacked by then,
-/// and its still can be made.
+/// Sent when a video has been opened to play, or a model read to turn it: one a pack holds
+/// compressed is unpacked by then, and a still that waited for it can be made.
 pub struct VideoOpened;
+
+/// Sent when a model turned here can't be drawn, saying why.
+pub struct ModelFailed(pub CantDraw);
+
+/// Sent when a save has let go of the file of a model being read here, or the graphics card lost
+/// it: whatever turns it reads it again, from where the talk is now, with
+/// [`SlideCanvas::read_models_again`], once any save is done.
+pub struct ModelLetGo;
 
 #[derive(Clone)]
 struct Sprite {
@@ -41,9 +51,9 @@ struct Sprite {
     image: Arc<RenderImage>,
 }
 
-/// A layer to paint, how far below its place it is, and the pictures of videos over it, each
-/// with where its layer is now.
-type RunSprite = (Sprite, f32, Vec<(Shown, Rect)>);
+/// A layer to paint, how far below its place it is, whether it's painted itself, and the
+/// pictures of videos and models over it, each with where its layer is now.
+type RunSprite = (Sprite, f32, bool, Vec<(Shown, Rect)>);
 
 /// Showing layers next to each other that share an opacity. Each sprite comes with how far
 /// below its place it is, in slide units, and the pictures of the videos playing over it.
@@ -81,11 +91,28 @@ pub struct SlideCanvas {
     last_advance: std::time::Duration,
     /// When the counts were last written out, and what they were then: see [`COUNTS_TO_STDERR`].
     counted: Option<(std::time::Instant, usize, usize, usize)>,
+    /// The models drawn live over their layers, each with a number of its own.
+    turners: Vec<(u64, Turner)>,
+    turners_made: u64,
+    /// The models waiting to be read, in turn, as one at a time is: a show arriving on a slide
+    /// of several reads them one after another, not all at once.
+    models_to_read: std::collections::VecDeque<(u64, LargeOpen)>,
+    /// How many models are being read now, and the most there have been at once.
+    models_reading: usize,
+    most_models_read_at_once: usize,
+    /// Live pictures of models no longer shown, which the next paint releases.
+    retired_models: Vec<Arc<RenderImage>>,
+    /// How many live pictures of models have been made to show, and released, in all.
+    models_made: usize,
+    models_released: Rc<Cell<usize>>,
+    /// When the models' counts were last written out, and what they were then.
+    models_counted: Option<(std::time::Instant, usize, usize)>,
 }
 
 /// Set, to anything, to have a window playing a video write how many of its pictures were
-/// shown, skipped and released each second to the standard error: for checking by hand how
-/// smoothly a video plays on a computer.
+/// shown, skipped and released each second to the standard error, and one turning a 3D model how
+/// many of its pictures were drawn and shown, and released: for checking by hand how smoothly a
+/// video plays or a model turns on a computer.
 pub const COUNTS_TO_STDERR: &str = "STUDIO_VIDEO_COUNTS";
 
 fn counts_wanted() -> bool {
@@ -97,6 +124,8 @@ impl EventEmitter<ScaleChanged> for SlideCanvas {}
 impl EventEmitter<VideoLetGo> for SlideCanvas {}
 impl EventEmitter<VideoOpened> for SlideCanvas {}
 impl EventEmitter<VideoFailed> for SlideCanvas {}
+impl EventEmitter<ModelFailed> for SlideCanvas {}
+impl EventEmitter<ModelLetGo> for SlideCanvas {}
 
 impl SlideCanvas {
     /// A canvas with a line around its slide, for the editor. A show's has none.
@@ -448,6 +477,267 @@ impl SlideCanvas {
         self.counted = Some((now, made, skipped, released));
     }
 
+    /// Draws the model `on`, of layer `layer`, live over its layer, reading it with `open`, from
+    /// its home view, or from `aim`; turning on its own if `orbits`.
+    pub fn turn_model(&mut self, layer: usize, on: ModelOn, open: LargeOpen, orbits: bool, aim: Aim, cx: &mut Context<Self>) {
+        let mut turner = Turner::reading(layer, on, orbits);
+        turner.start_at(aim);
+        self.turners_made += 1;
+        let id = self.turners_made;
+        self.turners.push((id, turner));
+        self.read_model(id, open, cx);
+    }
+
+    /// Reads the model of turner `id` with `open` on a background task, and puts it on the
+    /// card, once those asked for before it are read: one at a time. What comes of one stopped
+    /// meanwhile, or of the canvas gone, is let go of; one stopped before its turn isn't read.
+    fn read_model(&mut self, id: u64, open: LargeOpen, cx: &mut Context<Self>) {
+        self.models_to_read.push_back((id, open));
+        self.read_next_model(cx);
+        cx.notify();
+    }
+
+    /// Reads the next model waiting, unless one is being read.
+    fn read_next_model(&mut self, cx: &mut Context<Self>) {
+        if self.models_reading > 0 {
+            return;
+        }
+        let Some((id, open)) = self.next_model_to_read() else { return };
+        self.models_reading += 1;
+        self.most_models_read_at_once = self.most_models_read_at_once.max(self.models_reading);
+        cx.spawn(async move |canvas, cx| {
+            let reading = cx.background_spawn(async move { model_view::read_model(open) }).await;
+            let mut reading = Some(reading);
+            canvas
+                .update(cx, |canvas, cx| {
+                    canvas.models_reading -= 1;
+                    if let Some((_, turner)) = canvas.turners.iter_mut().find(|(at, _)| *at == id)
+                        && let Some(reading) = reading.take()
+                    {
+                        let read = matches!(reading, model_view::Reading::Read(..));
+                        if let Some(why) = turner.read(reading) {
+                            cx.emit(ModelFailed(why));
+                        }
+                        if turner.was_let_go() {
+                            cx.emit(ModelLetGo);
+                        }
+                        if read {
+                            cx.emit(VideoOpened);
+                        }
+                    }
+                    canvas.read_next_model(cx);
+                    cx.notify();
+                })
+                .ok();
+            // A model no one turns any more leaves the card here.
+            drop(reading);
+        })
+        .detach();
+    }
+
+    /// The next model waiting to be read whose turner is still here.
+    fn next_model_to_read(&mut self) -> Option<(u64, LargeOpen)> {
+        while let Some((id, open)) = self.models_to_read.pop_front() {
+            if self.turners.iter().any(|(at, _)| *at == id) {
+                return Some((id, open));
+            }
+        }
+        None
+    }
+
+    /// Stops drawing every model live: each shows its still again.
+    pub fn stop_models(&mut self, cx: &mut Context<Self>) {
+        if self.turners.is_empty() {
+            return;
+        }
+        for (_, mut turner) in std::mem::take(&mut self.turners) {
+            self.retired_models.extend(turner.take_shown());
+        }
+        cx.notify();
+    }
+
+    /// Follows the models among the layers as they're placed now: one still over its layer is
+    /// drawn where the layer is, and one whose layer shows something else, or nothing, stops.
+    pub fn place_models(&mut self, models: &[ModelLayer], cx: &mut Context<Self>) {
+        let mut gone = Vec::new();
+        for (id, turner) in &mut self.turners {
+            match models.iter().find(|model| model.layer == turner.layer && model.on.src == turner.on.src) {
+                Some(model) if model.on != turner.on => {
+                    turner.place(model.on.clone());
+                    cx.notify();
+                }
+                Some(_) => {}
+                None => gone.push(*id),
+            }
+        }
+        self.turners.retain_mut(|(id, turner)| {
+            let keep = !gone.contains(id);
+            if !keep {
+                self.retired_models.extend(turner.take_shown());
+            }
+            keep
+        });
+        if !gone.is_empty() {
+            cx.notify();
+        }
+    }
+
+    /// The layers whose models are drawn live here.
+    pub fn models_turned(&self) -> Vec<usize> {
+        self.turners.iter().map(|(_, turner)| turner.layer).collect()
+    }
+
+    fn turner(&mut self, layer: usize) -> Option<&mut Turner> {
+        self.turners.iter_mut().find(|(_, turner)| turner.layer == layer).map(|(_, turner)| turner)
+    }
+
+    /// Turns the model of layer `layer`, if it's drawn live, as a drag of `dx` by `dy` pixels does.
+    pub fn turn_by(&mut self, layer: usize, dx: f32, dy: f32, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        if let Some(turner) = self.turner(layer) {
+            turner.turn_by(dx, dy, now);
+            cx.notify();
+        }
+    }
+
+    /// Holds the model of layer `layer`, as a drag on it begins, or lets go of it.
+    pub fn hold_model(&mut self, layer: usize, held: bool, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        if let Some(turner) = self.turner(layer) {
+            turner.hold(held, now);
+            cx.notify();
+        }
+    }
+
+    /// Brings the model of layer `layer` nearer by `steps` of the wheel.
+    pub fn zoom_by(&mut self, layer: usize, steps: f32, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        if let Some(turner) = self.turner(layer) {
+            turner.zoom_by(steps, now);
+            cx.notify();
+        }
+    }
+
+    /// Flies the model of layer `layer` to `aim`, over a second.
+    pub fn fly_model(&mut self, layer: usize, aim: Aim, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        if let Some(turner) = self.turner(layer) {
+            turner.fly_to(aim, now);
+            cx.notify();
+        }
+    }
+
+    /// Where the model of layer `layer` is seen from now, if it's drawn live and read.
+    pub fn model_view(&self, layer: usize) -> Option<View> {
+        self.turners.iter().find(|(_, turner)| turner.layer == layer)?.1.view()
+    }
+
+    /// Where the show has the model of layer `layer` go, if it's drawn live.
+    pub fn model_aim(&self, layer: usize) -> Option<Aim> {
+        Some(self.turners.iter().find(|(_, turner)| turner.layer == layer)?.1.aim())
+    }
+
+    /// The files of the models waiting to be read again, as a save let go of them or the card
+    /// lost them.
+    pub fn models_let_go(&self) -> Vec<String> {
+        self.turners.iter().filter(|(_, turner)| turner.was_let_go()).map(|(_, turner)| turner.on.src.clone()).collect()
+    }
+
+    /// Reads again, with what `open` gives for its file, each model whose file a save let go of,
+    /// or that the card lost.
+    /// One `open` gives nothing for waits on.
+    pub fn read_models_again(&mut self, mut open: impl FnMut(&str) -> Option<LargeOpen>, cx: &mut Context<Self>) {
+        let waiting: Vec<u64> = self.turners.iter().filter(|(_, turner)| turner.was_let_go()).map(|(id, _)| *id).collect();
+        for id in waiting {
+            let Some((_, turner)) = self.turners.iter_mut().find(|(at, _)| *at == id) else { continue };
+            let Some(opened) = open(&turner.on.src) else { continue };
+            turner.reading_again();
+            self.read_model(id, opened, cx);
+        }
+    }
+
+    /// Why each model drawn live here can't be drawn, if it can't, in order.
+    pub fn model_failures(&self) -> Vec<Option<CantDraw>> {
+        self.turners.iter().map(|(_, turner)| turner.failed()).collect()
+    }
+
+    /// The live picture each model drawn here shows now, in the order they were started.
+    #[doc(hidden)]
+    pub fn model_pictures(&self) -> Vec<Option<Arc<RenderImage>>> {
+        self.turners.iter().map(|(_, turner)| turner.shown().map(|shown| shown.image.clone())).collect()
+    }
+
+    /// Whether any model drawn here waits for a picture from the drawer.
+    #[doc(hidden)]
+    pub fn models_waiting(&self) -> bool {
+        self.turners.iter().any(|(_, turner)| turner.waiting())
+    }
+
+    /// The most models that have been read at once here.
+    #[doc(hidden)]
+    pub fn most_models_read_at_once(&self) -> usize {
+        self.most_models_read_at_once
+    }
+
+    /// How many live pictures of models have been made to show, and how many released, in all.
+    #[doc(hidden)]
+    pub fn model_images(&self) -> (usize, usize) {
+        (self.models_made, self.models_released.get())
+    }
+
+    /// Takes in the pictures of models that have come, asks for the next of each whose view has
+    /// changed, and asks the window for another frame while any view moves or a picture is to
+    /// come. A turned model's picture is turned on a background task.
+    fn advance_models(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.turners.is_empty() {
+            // The next to turn is counted from its start.
+            self.models_counted = None;
+            return;
+        }
+        if counts_wanted()
+            && let Some(line) = model_counts(&mut self.models_counted, std::time::Instant::now(), self.models_made, self.models_released.get())
+        {
+            eprintln!("{line}");
+        }
+        let now = cx.background_executor().now();
+        let mut wanted = false;
+        let mut turnings = Vec::new();
+        let mut let_go = false;
+        for (id, turner) in &mut self.turners {
+            let advanced = turner.advance(now, self.scale);
+            self.models_made += usize::from(advanced.made);
+            self.retired_models.extend(advanced.replaced);
+            turnings.extend(advanced.turning.map(|turning| (*id, turning)));
+            let_go |= advanced.read_again;
+            if let Some(why) = advanced.failed {
+                cx.emit(ModelFailed(why));
+            }
+            wanted |= turner.wants_frames();
+        }
+        if let_go {
+            cx.emit(ModelLetGo);
+        }
+        for (id, turning) in turnings {
+            cx.spawn(async move |canvas, cx| {
+                let shown = cx.background_spawn(async move { turning.turn() }).await;
+                canvas
+                    .update(cx, |canvas, cx| {
+                        let made = shown.is_some();
+                        if let Some((_, turner)) = canvas.turners.iter_mut().find(|(at, _)| *at == id) {
+                            canvas.models_made += usize::from(made);
+                            canvas.retired_models.extend(turner.turned(shown));
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+            })
+            .detach();
+        }
+        if wanted {
+            window.request_animation_frame();
+        }
+    }
+
     /// The image of every layer, first to last, hidden ones included.
     pub fn images(&self) -> Vec<Arc<RenderImage>> {
         self.sprites
@@ -484,13 +774,21 @@ impl SlideCanvas {
             if !look.visible {
                 continue;
             }
-            let over = self
+            let over: Vec<(Shown, Rect)> = self
                 .players
                 .iter()
                 .filter(|(_, player)| player.layer == index)
                 .filter_map(|(_, player)| Some((player.shown()?.clone(), player.on.rect)))
                 .collect();
-            let sprite = (sprite.clone(), look.offset_y, over);
+            let model: Vec<(Shown, Rect)> = self
+                .turners
+                .iter()
+                .filter(|(_, turner)| turner.layer == index)
+                .filter_map(|(_, turner)| Some((turner.shown()?.clone(), turner.on.rect)))
+                .collect();
+            // A model drawn live shows in place of its still, which would show through around it.
+            let still = model.is_empty();
+            let sprite = (sprite.clone(), look.offset_y, still, over.into_iter().chain(model).collect());
             match runs.last_mut() {
                 Some(run) if run.opacity == look.opacity => run.sprites.push(sprite),
                 _ => runs.push(Run {
@@ -543,7 +841,7 @@ fn paint_sprites(
     let to_window = drawn_at.map_or(1.0, |drawn_at| scale / drawn_at) / scale_factor;
     let width = f32::from(slide.size.width);
     let unit = width / SLIDE_WIDTH;
-    for (Sprite { layer, image }, offset_y, over) in sprites {
+    for (Sprite { layer, image }, offset_y, painted, over) in sprites {
         let place = Bounds {
             origin: slide.origin
                 + point(
@@ -557,9 +855,11 @@ fn paint_sprites(
         };
         // Clipped to the slide, so that a layer on the move stays off the bars beside it.
         // An image too large for the GPU is refused. The rest of the slide still shows.
-        window
-            .paint_image(slide, place, Corners::default(), image, 0, false)
-            .ok();
+        if painted {
+            window
+                .paint_image(slide, place, Corners::default(), image, 0, false)
+                .ok();
+        }
         // A video playing over the layer, where the layer is and moving as it does.
         for (shown, rect) in over {
             let place = match shown.placed {
@@ -595,9 +895,12 @@ fn paint_sprites(
 impl Render for SlideCanvas {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.advance_videos(window, cx);
+        self.advance_models(window, cx);
         let retired = std::mem::take(&mut self.retired);
         let frames = std::mem::take(&mut self.retired_frames);
         let released = self.frames_released.clone();
+        let model_pictures = std::mem::take(&mut self.retired_models);
+        let models_released = self.models_released.clone();
         let edge_color = self.framed.then(|| cx.theme().border);
         let this = cx.entity().downgrade();
         // A child of its own, as it has to happen even with no layer showing.
@@ -610,6 +913,10 @@ impl Render for SlideCanvas {
                 for image in frames {
                     window.drop_image(image).ok();
                     released.set(released.get() + 1);
+                }
+                for image in model_pictures {
+                    window.drop_image(image).ok();
+                    models_released.set(models_released.get() + 1);
                 }
                 if let Some((slide, scale)) = fit(area, window.scale_factor()) {
                     if let Some(color) = edge_color {
@@ -643,5 +950,46 @@ impl Render for SlideCanvas {
             .opacity(opacity)
             .child(housekeeping)
             .children(runs)
+    }
+}
+
+/// What a window turning models writes of their live pictures, drawn and shown, and released,
+/// `made` and `released` in all now: nothing the first time, which `counted` begins counting
+/// from, and then once a second at most, counting afresh from each time it's written.
+fn model_counts(counted: &mut Option<(std::time::Instant, usize, usize)>, now: std::time::Instant, made: usize, released: usize) -> Option<String> {
+    let Some((then, made_then, released_then)) = *counted else {
+        *counted = Some((now, made, released));
+        return None;
+    };
+    let seconds = now.duration_since(then).as_secs_f64();
+    if seconds < 1.0 {
+        return None;
+    }
+    *counted = Some((now, made, released));
+    Some(format!("model pictures in {seconds:.2} s: {} drawn and shown, {} released", made - made_then, released - released_then))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::model_counts;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn model_counts_are_written_once_a_second_at_most() {
+        let mut counted = None;
+        let start = Instant::now();
+        // The first time a model turns, counting begins.
+        assert_eq!(model_counts(&mut counted, start, 4, 2), None);
+        assert_eq!(model_counts(&mut counted, start + Duration::from_millis(500), 8, 6), None);
+        assert_eq!(
+            model_counts(&mut counted, start + Duration::from_millis(1100), 12, 11).as_deref(),
+            Some("model pictures in 1.10 s: 8 drawn and shown, 9 released")
+        );
+        // Counted afresh from then.
+        assert_eq!(model_counts(&mut counted, start + Duration::from_millis(1900), 20, 19), None);
+        assert_eq!(
+            model_counts(&mut counted, start + Duration::from_millis(2200), 20, 20).as_deref(),
+            Some("model pictures in 1.10 s: 8 drawn and shown, 9 released")
+        );
     }
 }

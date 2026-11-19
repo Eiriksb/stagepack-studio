@@ -1,7 +1,8 @@
 //! Writing a talk out for other programs, and handing a file over to Stagepack.
 //!
 //! An export builds a deck of its own from [`ExportInput`], so it can run on a background
-//! thread and share nothing with the window but the talk's files.
+//! thread and share nothing with the window but the talk's files. Its 3D models are drawn as
+//! stills there, by the app's drawer.
 
 use std::io::Write as _;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -80,17 +81,21 @@ fn make(input: ExportInput, kind: ExportKind) -> Result<(Vec<u8>, Vec<String>), 
         fonts.load_talk_font(font);
     }
     let mut deck = Deck::open(Box::new(files.clone()), fonts, source);
+    // Drawn here and now, on this thread, as each slide is laid out.
+    deck.draw_models_with(Arc::new(crate::model_view::draw_still));
     match kind {
         ExportKind::PowerPoint => {
             let PptxOutput { bytes, mut notices } = write_pptx(&mut deck, &files)?;
             let every: Vec<usize> = (0..deck.slide_count()).collect();
             notices.extend(videos_as_pictures(videos_on(&mut deck, &every)));
+            notices.extend(models_as_pictures(models_on(&mut deck, &every)));
             Ok((bytes, notices))
         }
         ExportKind::Pdf => {
             let bytes = write_pdf(&mut deck)?;
             let shown = deck.shown_slides().to_vec();
             let videos = videos_on(&mut deck, &shown);
+            let models = models_on(&mut deck, &shown);
             let mut notices: Vec<String> = shown
                 .into_iter()
                 .flat_map(|index| {
@@ -100,6 +105,7 @@ fn make(input: ExportInput, kind: ExportKind) -> Result<(Vec<u8>, Vec<String>), 
                 })
                 .collect();
             notices.extend(videos_as_pictures(videos));
+            notices.extend(models_as_pictures(models));
             Ok((bytes, notices))
         }
     }
@@ -133,6 +139,32 @@ fn videos_as_pictures(videos: usize) -> Option<String> {
         0 => None,
         1 => Some("1 video was exported as a picture.".to_string()),
         videos => Some(format!("{videos} videos were exported as pictures.")),
+    }
+}
+
+/// How many 3D models placed on slides `slides` of `deck`'s talk were drawn as a picture, their
+/// still: one that can't be drawn is its plain panel, and says so in its own notice, and one in
+/// the text is a panel saying it's drawn once it's placed. Asked once the slides are laid out.
+fn models_on(deck: &mut Deck, slides: &[usize]) -> usize {
+    let mut drawn = 0;
+    for &index in slides {
+        for model in deck.models(index) {
+            let Some(source) = model.source else { continue };
+            if deck.model_problem(index, &source).is_none() {
+                drawn += 1;
+            }
+        }
+    }
+    drawn
+}
+
+/// What an export says of the `models` it holds, which PowerPoint and PDF get as their stills:
+/// nothing, if there are none.
+fn models_as_pictures(models: usize) -> Option<String> {
+    match models {
+        0 => None,
+        1 => Some("1 model was exported as a picture.".to_string()),
+        models => Some(format!("{models} models were exported as pictures.")),
     }
 }
 

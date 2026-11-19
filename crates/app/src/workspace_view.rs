@@ -31,7 +31,7 @@ use crate::document::{Document, EditRefused, OpenProblem, Reload, SLIDES_FILE, T
 use crate::export::{self, ExportKind, stagepack_executable};
 use crate::icon_picker::{self, IconPicked, IconPicker};
 use crate::palette::InsertComponent;
-use crate::insert_tools::{InsertPicture, InsertShape, InsertTextBox, InsertVideo};
+use crate::insert_tools::{InsertModel, InsertPicture, InsertShape, InsertTextBox, InsertVideo};
 use crate::layout_picker::SetLayout;
 use crate::inspector::{self, Inspector};
 use crate::markdown_panel::MarkdownPanel;
@@ -64,7 +64,7 @@ mod inserting;
 mod saving;
 mod starting;
 
-pub use inserting::{DIALOG_FAILED, ONLY_PICTURES, ONLY_THE_FIRST};
+pub use inserting::{DIALOG_FAILED, ONLY_PICTURES, ONLY_THE_FIRST, StopsFraming, stop_framing_after};
 pub use starting::{open_start_window, open_untitled_ids, refresh_start_screens};
 
 pub const CANVAS_ID: &str = "canvas";
@@ -214,6 +214,8 @@ pub fn init(cx: &mut App) {
         theme.cursor_blink = theme.cursor_blink.with_idle_timeout(CARET_BLINKS_FOR);
     });
     bind_keys(cx);
+    // The drawer of 3D models lets go of its graphics device before the program ends.
+    crate::model_view::close_on_quit(cx);
 }
 
 /// The window's shortcuts, and a show's. [`init`] binds them.
@@ -363,12 +365,12 @@ pub struct WorkspaceView {
     status: Option<SharedString>,
     /// Work that moves a large file, while it goes on, the newest last.
     progressing: Vec<Progressing>,
-    /// Videos dropped, pasted or chosen, waiting to be copied in, one at a time in turn, and
-    /// whether one is being copied now.
-    videos_waiting: std::collections::VecDeque<inserting::WaitingVideo>,
-    video_copying: bool,
-    /// What to say once the videos waiting are all in, as that more files were dropped than go on.
-    said_after_videos: Option<&'static str>,
+    /// Videos and 3D models dropped, pasted or chosen, waiting to be copied in, one at a time in
+    /// turn, and whether one is being copied now.
+    large_waiting: std::collections::VecDeque<inserting::WaitingLarge>,
+    large_copying: bool,
+    /// What to say once the files waiting are all in, as that more files were dropped than go on.
+    said_after_large: Option<&'static str>,
     /// Whether the window is to close once the copies it stopped as it was closed have ended.
     close_when_idle: bool,
     /// How many saves are running, which a window closing waits for before it lets anything of
@@ -682,9 +684,9 @@ impl WorkspaceView {
             notices,
             status: None,
             progressing: Vec::new(),
-            videos_waiting: std::collections::VecDeque::new(),
-            video_copying: false,
-            said_after_videos: None,
+            large_waiting: std::collections::VecDeque::new(),
+            large_copying: false,
+            said_after_large: None,
             close_when_idle: false,
             saves_running: 0,
             finish_closing: false,
@@ -881,10 +883,11 @@ impl WorkspaceView {
         }
         self.notices = notices;
         if let Some(layers) = layers {
-            let videos = document.update(cx, |document, _| document.videos_here());
+            let (videos, models) = document.update(cx, |document, _| (document.videos_here(), document.models_here()));
             self.slide_canvas.update(cx, |canvas, cx| {
                 canvas.set_layers(layers, cx);
                 canvas.place_videos(&videos, cx);
+                canvas.place_models(&models, cx);
             });
         }
         cx.notify();
@@ -1111,8 +1114,11 @@ impl WorkspaceView {
         if running {
             return;
         }
-        // The show plays the talk's videos: none plays here meanwhile.
-        self.slide_editor.update(cx, |editor, cx| editor.stop_video(cx));
+        // The show plays the talk's videos and turns its models: none does here meanwhile.
+        self.slide_editor.update(cx, |editor, cx| {
+            editor.stop_video(cx);
+            editor.stop_turning(cx);
+        });
         let this = cx.entity().downgrade();
         // Once this window is free again, as the show asks it which screen it's on.
         cx.defer(move |cx| {
@@ -1811,6 +1817,7 @@ impl Render for WorkspaceView {
             }))
             .on_action(cx.listener(|this, _: &InsertPicture, window, cx| this.ask_for_pictures(window, cx)))
             .on_action(cx.listener(|this, _: &InsertVideo, window, cx| this.ask_for_videos(window, cx)))
+            .on_action(cx.listener(|this, _: &InsertModel, window, cx| this.ask_for_models(window, cx)))
             .on_action(cx.listener(|this, action: &InsertShape, window, cx| {
                 this.insert_shape(action.kind, cx);
                 this.keyboard_to_the_slide(window, cx);

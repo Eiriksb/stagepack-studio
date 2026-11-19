@@ -49,10 +49,20 @@ impl Inspector {
                 }
                 if shape.message.is_none() && is_positioned(&tag) {
                     shape.specs.extend(Spec::place());
+                    // A model is turned by hand and turns on its own, so how its box is turned on
+                    // the slide is called something else.
+                    if tag.name == "Model"
+                        && let Some(spec) = shape.specs.iter_mut().find(|spec| spec.place && spec.attr == "rotate")
+                    {
+                        spec.label = ROTATION.to_string();
+                    }
                 }
                 if tag.name == "Video" && shape.message.is_none() {
                     let pictures = self.talk_pictures(&document, pick, cx);
                     video_form(&mut shape, &tag, pictures);
+                }
+                if tag.name == "Model" && shape.message.is_none() {
+                    named_by_its_file(&mut shape, &tag);
                 }
                 shape.tag = Some(tag.name.clone());
                 Some(tag)
@@ -289,6 +299,10 @@ impl Inspector {
     }
 }
 
+/// What a 3D model's form calls how its box is turned on the slide, which other things' forms
+/// call Turn.
+const ROTATION: &str = "Rotation";
+
 /// A video's form, from what its component's arguments gave: its still is chosen from
 /// `pictures`, the talk's, or its first frame, and its file is named above its fields.
 fn video_form(shape: &mut Shape, tag: &slides_format::Tag, mut pictures: Vec<String>) {
@@ -301,8 +315,13 @@ fn video_form(shape: &mut Shape, tag: &slides_format::Tag, mut pictures: Vec<Str
             spec.kind = Kind::Still(pictures.clone());
         }
     }
+    named_by_its_file(shape, tag);
+}
+
+/// Names the file of a video's or a model's form above its fields. One with no file says so
+/// below, in place of its name.
+fn named_by_its_file(shape: &mut Shape, tag: &slides_format::Tag) {
     let src = tag.attr("src").unwrap_or_default().trim();
-    // One with no file says so below, in place of its name.
     shape.message = (!src.is_empty()).then(|| file_name(src).to_string());
 }
 

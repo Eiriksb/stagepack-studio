@@ -6,14 +6,15 @@ use std::time::{Duration, Instant};
 use gpui_kit::component::{ActiveTheme as _, TitleBar, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use slides_engine::{Enter, LayerTiming, Moment, Transition, VideoLayer};
+use slides_engine::{Enter, LayerTiming, ModelLayer, Moment, Transition, VideoLayer};
 
 use crate::document::{Document, LargeOpen};
 use crate::present::{
     ENTER_SECONDS, MOMENTS_PER_SECOND, Moved, Place, ScreenInfo, Session, TRANSITION_SECONDS,
     WindowPlan, choose_windows, clock_text, layer_look, moment_time, slide_looks,
 };
-use crate::slide_canvas::{ScaleChanged, SlideCanvas, VideoLetGo, VideoOpened};
+use crate::model_view::{Aim, aim_at, inside_turned};
+use crate::slide_canvas::{ModelLetGo, ScaleChanged, SlideCanvas, VideoLetGo, VideoOpened};
 use crate::workspace_view::APP_ID;
 
 pub const AUDIENCE_ID: &str = "audience";
@@ -424,9 +425,18 @@ pub struct AudienceView {
     /// The slide whose videos were last started, which start again from their start once it's
     /// left and shown again.
     videos_of: Option<usize>,
+    /// The models on the show's place, and the slide whose models were last shown, which go
+    /// back to their views once it's left.
+    models: Vec<ModelLayer>,
+    models_of: Option<usize>,
+    /// A press on a model: the model, where the pointer last was, and whether it has moved, which
+    /// has the model drawn live and turned.
+    turn_drag: Option<(ModelLayer, Point<Pixels>, bool)>,
+    /// Whether the press last let go of turned a model, so that it's no click of the show's.
+    turned: bool,
     rehearsing: bool,
     focus_handle: FocusHandle,
-    _watching: [Subscription; 7],
+    _watching: [Subscription; 9],
 }
 
 impl AudienceView {
@@ -452,6 +462,9 @@ impl AudienceView {
             // A video opened to play may have been unpacked: a still that waited for that is made.
             cx.subscribe(&current, |this, _, _: &VideoOpened, cx| this.videos_opened(cx)),
             cx.subscribe(&leaving, |this, _, _: &VideoOpened, cx| this.videos_opened(cx)),
+            // A save let go of the file of a model being read: it's read again once that's done.
+            cx.subscribe(&current, |this, _, _: &ModelLetGo, cx| this.show_place(cx)),
+            cx.subscribe(&leaving, |this, _, _: &ModelLetGo, cx| this.show_place(cx)),
         ];
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
@@ -465,6 +478,10 @@ impl AudienceView {
             drawn_time: 0.0,
             next_moment: None,
             videos_of: None,
+            models: Vec::new(),
+            models_of: None,
+            turn_drag: None,
+            turned: false,
             rehearsing,
             focus_handle,
             _watching: watching,
@@ -518,7 +535,148 @@ impl AudienceView {
         });
     }
 
-    /// Makes the stills that waited for a video to be unpacked to play.
+    /// Draws live the models of the show's place that move: each that turns on its own, and
+    /// each a click has sent to one of its views, which flies there. On a slide come to, every
+    /// model is back at its view, and none is drawn live on the slide left.
+    fn show_models(&mut self, document: &Entity<Document>, place: Place, time: f32, cx: &mut Context<Self>) {
+        let moment = Moment {
+            step: place.step,
+            time,
+        };
+        let models: Vec<ModelLayer> = document.update(cx, |document, _| {
+            let slide = document.shown_slide(place.slide);
+            document.models_at(slide, moment)
+        });
+        let models: Vec<ModelLayer> = models.into_iter().filter(|model| model.click.is_none_or(|click| click <= place.step)).collect();
+        let afresh = self.models_of != Some(place.slide);
+        self.models_of = Some(place.slide);
+        if afresh {
+            self.turn_drag = None;
+            self.leaving.update(cx, |canvas, cx| canvas.stop_models(cx));
+            self.current.update(cx, |canvas, cx| canvas.stop_models(cx));
+        }
+        self.current.update(cx, |canvas, cx| canvas.place_models(&models, cx));
+        for model in &models {
+            let aim = aim_at(model, place.step);
+            let shown = self.current.read(cx).model_aim(model.layer);
+            match shown {
+                Some(shown) if shown != aim => self.current.update(cx, |canvas, cx| canvas.fly_model(model.layer, aim, cx)),
+                Some(_) => {}
+                // Shown at its view, and turning on its own if it does; one a click sends on
+                // flies there from its view.
+                None if model.on.turn || aim != Aim::Home => {
+                    let start = if afresh { aim } else { Aim::Home };
+                    self.turn_model(document, model, start, cx);
+                    if !afresh {
+                        self.current.update(cx, |canvas, cx| canvas.fly_model(model.layer, aim, cx));
+                    }
+                }
+                None => {}
+            }
+        }
+        // One whose file a save let go of is read again once the save is done.
+        let waiting = if document.read(cx).saving_the_pack() { Vec::new() } else { self.current.read(cx).models_let_go() };
+        if !waiting.is_empty() {
+            let mut opened: Vec<(String, LargeOpen)> = waiting.iter().filter_map(|src| Some((src.clone(), document.read(cx).open_large(src)?))).collect();
+            self.current.update(cx, |canvas, cx| {
+                canvas.read_models_again(|src| opened.iter().position(|(at, _)| at == src).map(|at| opened.swap_remove(at).1), cx)
+            });
+        }
+        self.models = models;
+    }
+
+    /// Has `model` drawn live on the slide shown, from `aim`, turning on its own if it does. One
+    /// whose still already says it can't be drawn isn't read.
+    fn turn_model(&mut self, document: &Entity<Document>, model: &ModelLayer, aim: Aim, cx: &mut Context<Self>) {
+        let Some(source) = model.source.clone() else { return };
+        let slide = self.slide;
+        let problem = document.update(cx, |document, _| {
+            let slide = document.shown_slide(slide);
+            document.model_problem_on(slide, &source)
+        });
+        if problem.is_some() {
+            return;
+        }
+        let Some(open) = document.read(cx).open_large(&model.on.src) else { return };
+        let (layer, on) = (model.layer, model.on.clone());
+        self.current.update(cx, |canvas, cx| canvas.turn_model(layer, on.clone(), open, on.turn, aim, cx));
+    }
+
+    /// The model on the slide shown at `position`, in the window, if there's one there.
+    fn model_at(&self, position: Point<Pixels>, cx: &App) -> Option<ModelLayer> {
+        let slide = self.current.read(cx).slide_bounds()?;
+        let unit = f32::from(slide.size.width) / slides_engine::SLIDE_WIDTH;
+        if unit <= 0.0 {
+            return None;
+        }
+        let at = (f32::from(position.x - slide.origin.x) / unit, f32::from(position.y - slide.origin.y) / unit);
+        // The one in front.
+        self.models.iter().rev().find(|model| inside_turned(model.on.rect, model.on.rotate, at)).cloned()
+    }
+
+    /// The model on the slide shown at `position`, drawn live, being so now if it wasn't.
+    fn live_model_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> Option<usize> {
+        let model = self.model_at(position, cx)?;
+        self.make_live(&model, cx);
+        Some(model.layer)
+    }
+
+    /// Has `model` drawn live, if it isn't.
+    fn make_live(&mut self, model: &ModelLayer, cx: &mut Context<Self>) {
+        if self.current.read(cx).model_aim(model.layer).is_none() {
+            let document = self.show.read(cx).document.clone();
+            let place = self.show.read(cx).session.place();
+            self.turn_model(&document, model, aim_at(model, place.step), cx);
+        }
+    }
+
+    /// A press on a model may begin turning it by hand: once it moves. A plain click on it is a
+    /// click of the show's, and draws nothing.
+    fn press(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        self.turned = false;
+        self.turn_drag = self.model_at(event.position, cx).map(|model| (model, event.position, false));
+    }
+
+    /// A drag on a model turns it, and isn't a click of the show's.
+    fn drag(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some((model, from, moved)) = self.turn_drag.clone() else { return };
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.let_go(cx);
+            return;
+        }
+        let (dx, dy) = (f32::from(event.position.x - from.x), f32::from(event.position.y - from.y));
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
+        let layer = model.layer;
+        if !moved {
+            self.make_live(&model, cx);
+            self.current.update(cx, |canvas, cx| canvas.hold_model(layer, true, cx));
+        }
+        self.turned = true;
+        self.turn_drag = Some((model, event.position, true));
+        self.current.update(cx, |canvas, cx| canvas.turn_by(layer, dx, dy, cx));
+    }
+
+    /// The button let go of ends a drag on a model.
+    fn let_go(&mut self, cx: &mut Context<Self>) {
+        if let Some((model, _, true)) = self.turn_drag.take() {
+            self.current.update(cx, |canvas, cx| canvas.hold_model(model.layer, false, cx));
+        }
+    }
+
+    /// The wheel over a model brings it nearer, or takes it further away.
+    fn wheel(&mut self, event: &ScrollEvent, window: &Window, cx: &mut Context<Self>) {
+        let steps = f32::from(event.delta.pixel_delta(window.line_height()).y) / f32::from(window.line_height());
+        if steps == 0.0 {
+            return;
+        }
+        if let Some(layer) = self.live_model_at(event.position, cx) {
+            self.current.update(cx, |canvas, cx| canvas.zoom_by(layer, steps, cx));
+        }
+    }
+
+    /// Makes the stills that waited for a video to be unpacked to play, or a model to turn.
     fn videos_opened(&mut self, cx: &mut Context<Self>) {
         let document = self.show.read(cx).document.clone();
         document.update(cx, |document, cx| {
@@ -550,6 +708,7 @@ impl AudienceView {
         self.timings = show_on(&self.current, &document, place, time, cx);
         self.drawn_time = time;
         self.play_videos(&document, place, time, cx);
+        self.show_models(&document, place, time, cx);
         if let Some((arrival, _)) = arrival {
             // It has this already, unless the window has just changed size.
             show_on(
@@ -600,6 +759,7 @@ impl AudienceView {
             if arrival.is_none() {
                 canvas.set_layers(Vec::new(), cx);
                 canvas.stop_videos(cx);
+                canvas.stop_models(cx);
             }
         });
         if arrival.is_some() || revealing.is_some() {
@@ -626,7 +786,15 @@ impl Render for AudienceView {
                     .flex_1()
                     .min_h_0()
                     .w_full()
+                    // A press on a model turns it, the wheel zooms it, and neither is a click.
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, cx| this.press(event, cx)))
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| this.drag(event, cx)))
+                    .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, cx| this.let_go(cx)))
+                    .on_scroll(cx.listener(|this, event: &ScrollEvent, window, cx| this.wheel(event, window, cx)))
                     .on_click(cx.listener(|this, _, _, cx| {
+                        if std::mem::take(&mut this.turned) {
+                            return;
+                        }
                         this.show.update(cx, |show, cx| show.next(cx));
                     }))
                     .child(self.leaving.clone())

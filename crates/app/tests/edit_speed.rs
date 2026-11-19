@@ -1,7 +1,11 @@
-//! How long a keystroke takes on a long talk, before anything is drawn, and on a talk of videos;
-//! how long opening that talk takes; and what a video playing costs the window's thread. Only
-//! meaningful in a release build:
+//! How long a keystroke takes on a long talk, before anything is drawn, and on a talk of videos
+//! and one of 3D models; how long opening those talks takes; and what a video playing and a model
+//! turning cost the window's thread. Only meaningful in a release build:
 //! `scripts/cargo-safe.sh test --release -p stagepack-studio --test edit_speed -- --ignored`.
+//!
+//! The models are drawn on the best graphics adapter there is, or with `ADAPTER=discrete`,
+//! `integrated` or `software` on that kind alone. A test of models skips, saying so, where there's
+//! none.
 
 #[path = "support/typing.rs"]
 mod typing;
@@ -680,4 +684,301 @@ fn a_1080p_video_plays_to_the_canvas_quickly(cx: &mut gpui_kit::TestAppContext) 
         at(&frames, 0.99)
     );
     assert!(at(&taking, 0.5) < MOST_FOR_A_DRAG_FRAME, "taking a picture took {:?}", at(&taking, 0.5));
+}
+
+/// How many slides, each holding a model, the talk of models has.
+const MODEL_SLIDES: usize = 10;
+
+/// Model tests one at a time, as they share the app's one drawer.
+static MODELS_ALONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A test of models running alone, the app's drawer closed as it ends, as a program that ends
+/// while a driver lets go of a device can crash in the driver.
+struct ModelsAlone(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+impl Drop for ModelsAlone {
+    fn drop(&mut self) {
+        let closed = stagepack_studio::model_view::close_drawer(Duration::from_secs(30));
+        if !std::thread::panicking() {
+            assert!(closed, "the drawer's thread never ended");
+        }
+    }
+}
+
+/// Runs alone with the app's drawer on the adapter `ADAPTER` names, or the best there is with
+/// none, and says which; or `None`, after saying why `test` is skipped. An `ADAPTER` it doesn't
+/// know stops the test, saying so.
+fn models_alone(test: &str) -> Option<ModelsAlone> {
+    use slides_model::{AdapterKind, Drawer, DrawerOptions};
+    let alone = ModelsAlone(MODELS_ALONE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    let only = match std::env::var("ADAPTER") {
+        Err(std::env::VarError::NotPresent) => None,
+        Ok(kind) if kind.is_empty() => None,
+        Ok(kind) if kind == "discrete" => Some(AdapterKind::Discrete),
+        Ok(kind) if kind == "integrated" => Some(AdapterKind::Integrated),
+        Ok(kind) if kind == "software" => Some(AdapterKind::Software),
+        // Not the best there is in its place, which would time another card under its name.
+        other => panic!("ADAPTER is {other:?}: it can be discrete, integrated or software, or left unset for the best there is"),
+    };
+    let drawer = Drawer::start_with(DrawerOptions { only, ..DrawerOptions::default() });
+    let began = Instant::now();
+    let ready = loop {
+        if let Some(ready) = drawer.ready() {
+            break ready;
+        }
+        assert!(began.elapsed() < Duration::from_secs(60), "the drawer never said whether it can draw");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    if let Some(old) = stagepack_studio::model_view::use_drawer(drawer) {
+        assert!(old.join().unwrap(), "the drawer before let go of its device");
+    }
+    match ready {
+        Ok(kind) => {
+            println!("{test}: models drawn on a {kind:?} adapter");
+            Some(alone)
+        }
+        Err(why) => {
+            println!("{test} skipped: {why}");
+            None
+        }
+    }
+}
+
+/// The model on slide `n` of the talk of models: a textured grid of 20,000 triangles on even
+/// slides, and a box of three materials on odd ones.
+fn made_model(n: usize) -> Vec<u8> {
+    if n.is_multiple_of(2) {
+        slides_model::make_test_glb(slides_model::MadeGlb::Grid { cells: 100, texture: 512, jpeg: n.is_multiple_of(4) })
+    } else {
+        slides_model::make_test_glb(slides_model::MadeGlb::Boxes)
+    }
+}
+
+/// A talk of [`MODEL_SLIDES`] slides, each a heading, some words and a list, with a model beside
+/// them when `with_models`.
+fn model_talk(with_models: bool) -> String {
+    let mut talk = String::from("---\ntitle: A talk of models\n---\n\n");
+    for n in 0..MODEL_SLIDES {
+        if n > 0 {
+            talk.push_str("---\n\n");
+        }
+        talk.push_str(&format!("# Slide {n}\n\nSome **bold** words about model {n}.\n\n- the first thing\n- the second thing\n\n"));
+        if with_models {
+            talk.push_str(&format!("<Model src=\"assets/model{n}.glb\" x=\"1000\" y=\"300\" w=\"800\" h=\"450\" view=\"30 20 4 0 0.5 0\" />\n\n"));
+        }
+    }
+    talk
+}
+
+/// A folder holding [`model_talk`], and with models, its ten models.
+fn model_talk_folder(with_models: bool) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("slides.md"), model_talk(with_models)).unwrap();
+    if with_models {
+        std::fs::create_dir(dir.path().join("assets")).unwrap();
+        for n in 0..MODEL_SLIDES {
+            std::fs::write(dir.path().join(format!("assets/model{n}.glb")), made_model(n)).unwrap();
+        }
+    }
+    dir
+}
+
+/// The talk of models opened as the window opens it, its stills drawn, and shown at slide `slide`.
+fn open_model_talk(dir: &std::path::Path, slide: usize) -> Document {
+    let mut doc = Document::open(dir, Fonts::bundled_only()).unwrap();
+    doc.make_stills_aside(std::sync::Arc::new(|| {}));
+    for index in 0..doc.slide_count() {
+        doc.thumbnail(index, 192);
+    }
+    doc.go_to(slide);
+    doc.editor_layers(1280. / 1920.);
+    assert_eq!(make_stills_now(&mut doc), MODEL_SLIDES, "a still for each model");
+    doc
+}
+
+/// A letter typed on a slide of a talk of ten models, none turned, beside its model.
+#[test]
+#[ignore = "timing; run in release"]
+fn a_keystroke_on_a_talk_of_ten_models_is_quick() {
+    let Some(_alone) = models_alone("a_keystroke_on_a_talk_of_ten_models_is_quick") else { return };
+    let dir = model_talk_folder(true);
+    let slide = MODEL_SLIDES / 2;
+    let mut doc = open_model_talk(dir.path(), slide);
+    let asked = stagepack_studio::model_view::draws_asked();
+    let flows = text_flows(doc.talk(), slide);
+    let body = flows.iter().position(|flow| flow.place == FlowPlace::Region("body".into())).expect("the slide has words");
+    let words: usize = flows[body].paras[0].spans.iter().map(|span| span.text.len()).sum();
+    assert!(doc.begin_text(slide, body, Pos { para: 0, offset: words }));
+    doc.text_layout(slide);
+    let mut times = Vec::with_capacity(KEYSTROKES);
+    for key in 0..KEYSTROKES {
+        let letter = if key % 6 == 5 { " " } else { "a" };
+        let start = Instant::now();
+        doc.apply_text(|edit| edit.insert(letter)).unwrap();
+        let head = doc.text().unwrap().edit.selection.head;
+        assert!(doc.text_layout(slide).caret(body, head).is_some());
+        doc.editor_layers(1280. / 1920.);
+        times.push(start.elapsed());
+    }
+    assert!(doc.still_jobs().is_empty(), "typing beside a model doesn't draw its still again");
+    assert_eq!(stagepack_studio::model_view::draws_asked(), asked, "nothing is drawn while typing");
+    times.sort();
+    let median = times[times.len() / 2];
+    println!("median keystroke on a talk of {MODEL_SLIDES} models: {median:?} (slowest {:?})", times.last().unwrap());
+    assert!(median < MOST, "a keystroke took {median:?}");
+}
+
+/// A model dragged about its slide, on a talk of ten models, none turned.
+#[test]
+#[ignore = "timing; run in release"]
+fn a_frame_of_a_drag_of_a_model_is_quick() {
+    let Some(_alone) = models_alone("a_frame_of_a_drag_of_a_model_is_quick") else { return };
+    let dir = model_talk_folder(true);
+    let slide = MODEL_SLIDES / 2;
+    let mut doc = open_model_talk(dir.path(), slide);
+    let talk = doc.source().to_string();
+    let asked = stagepack_studio::model_view::draws_asked();
+    let away = |starts: &[(Thing, Placed)]| starts.iter().map(|(_, placed)| Rect { x: placed.rect.x + 5000., y: placed.rect.y + 5000., ..bounds(placed) }).collect();
+    let (median, slowest, _, _) = drag_frames_of(&mut doc, &talk, slide, 1, away, here_and_there, |doc| {
+        assert!(doc.still_jobs().is_empty(), "a model moved keeps its still");
+    });
+    assert_eq!(stagepack_studio::model_view::draws_asked(), asked, "nothing is drawn while it's dragged");
+    println!("median drag frame of a model on a talk of {MODEL_SLIDES} models: {median:?} (slowest {slowest:?})");
+    assert!(median < MOST_FOR_A_DRAG_FRAME, "a drag frame took {median:?}");
+}
+
+/// Opening a talk of ten models, as the window does: the talk read, every slide drawn small for
+/// the list of slides and the first drawn for the editor, a model shown as a plain panel until
+/// its still is drawn aside. That takes under half a second more than the same talk without its
+/// models, and draws nothing. Drawing the ten stills after, one after another, is timed too.
+#[test]
+#[ignore = "timing; run in release"]
+fn opening_a_talk_of_ten_models_is_quick() {
+    let Some(_alone) = models_alone("opening_a_talk_of_ten_models_is_quick") else { return };
+    let (plain, models) = (model_talk_folder(false), model_talk_folder(true));
+    let open = |dir: &std::path::Path| {
+        let start = Instant::now();
+        let mut doc = Document::open(dir, Fonts::bundled_only()).unwrap();
+        doc.make_stills_aside(std::sync::Arc::new(|| {}));
+        for index in 0..doc.slide_count() {
+            assert!(doc.thumbnail(index, 192).is_some());
+        }
+        doc.editor_layers(1280. / 1920.);
+        (start.elapsed(), doc)
+    };
+    let (mut without, mut with, mut stills) = (Vec::new(), Vec::new(), Vec::new());
+    for _ in 0..5 {
+        without.push(open(plain.path()).0);
+        let asked = stagepack_studio::model_view::draws_asked();
+        let (took, mut doc) = open(models.path());
+        assert_eq!(stagepack_studio::model_view::draws_asked(), asked, "opening draws nothing");
+        with.push(took);
+        let start = Instant::now();
+        assert_eq!(make_stills_now(&mut doc), MODEL_SLIDES);
+        for index in 0..doc.slide_count() {
+            assert!(doc.thumbnail(index, 192).is_some());
+        }
+        stills.push(start.elapsed());
+    }
+    for times in [&mut without, &mut with, &mut stills] {
+        times.sort();
+    }
+    let (without, with, stills) = (without[2], with[2], stills[2]);
+    println!(
+        "opening a talk of {MODEL_SLIDES} slides: {without:?} without models, {with:?} with one on each; \
+         its {MODEL_SLIDES} stills drawn after in {stills:?}"
+    );
+    assert!(with < without + Duration::from_millis(500), "opening took {with:?}, against {without:?} without models");
+}
+
+/// A textured grid of a million triangles, turning on its own in the show, for 300 of its
+/// pictures, each waited for and shown in turn: how long each frame the window draws takes its
+/// thread, the view moved on, the newest picture taken in and the next asked for. The drawing and
+/// the read-back are on the drawer's thread, and making the picture the window's image on a
+/// background task. The window here draws nothing to a screen, so painting the picture isn't in
+/// it.
+#[gpui_kit::test]
+#[ignore = "timing; run in release"]
+fn a_model_turning_for_300_pictures_leaves_the_window_free(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::AppContext as _;
+    use gpui_kit::test::TestWindowExt as _;
+    use stagepack_studio::present_view::start_show;
+    const PICTURES: usize = 300;
+    let Some(_alone) = models_alone("a_model_turning_for_300_pictures_leaves_the_window_free") else { return };
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        stagepack_studio::workspace_view::bind_keys(cx);
+    });
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::write(
+        folder.path().join("slides.md"),
+        "# Turned\n\n<Model src=\"assets/terrain.glb\" x=\"0\" y=\"0\" w=\"1920\" h=\"1080\" turn=\"auto\" view=\"0 30 3.5 0 0 0\" />\n",
+    )
+    .unwrap();
+    std::fs::create_dir(folder.path().join("assets")).unwrap();
+    let terrain = slides_model::make_test_glb(slides_model::MadeGlb::Grid { cells: 707, texture: 2048, jpeg: true });
+    std::fs::write(folder.path().join("assets/terrain.glb"), terrain).unwrap();
+    let document = cx.new(|_| Document::open(folder.path(), Fonts::bundled_only()).unwrap());
+    let show = cx.update(|cx| start_show(document.clone(), false, cx));
+    let (audience, view) = cx.read(|cx| show.read(cx).audience()).expect("the audience's window");
+    let draw = |cx: &mut gpui_kit::TestAppContext| {
+        cx.run_until_parked();
+        let start = Instant::now();
+        cx.update_window(audience, |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let took = start.elapsed();
+        cx.run_until_parked();
+        took
+    };
+    let canvas_now = |cx: &gpui_kit::TestAppContext| cx.read(|cx| view.read(cx).current().clone());
+    let began = Instant::now();
+    while canvas_now(cx).read_with(cx, |canvas, _| canvas.model_images().0) == 0 {
+        draw(cx);
+        assert!(began.elapsed() < Duration::from_secs(60), "the first picture never came");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let canvas = canvas_now(cx);
+    let made = |cx: &gpui_kit::TestAppContext| canvas.read_with(cx, |canvas, _| canvas.model_images().0);
+    // Every frame drawn, and those that showed a new picture.
+    let (mut frames, mut showing) = (Vec::new(), Vec::new());
+    let began = Instant::now();
+    let first = made(cx);
+    while made(cx) < first + PICTURES {
+        // A sixtieth of a second on: the view moves on, and the next picture is asked for.
+        cx.executor().advance_clock(Duration::from_micros(16_667));
+        let before = made(cx);
+        loop {
+            let took = draw(cx);
+            frames.push(took);
+            if made(cx) > before {
+                showing.push(took);
+                break;
+            }
+            assert!(began.elapsed() < Duration::from_secs(300), "waited too long for a picture");
+            std::thread::sleep(Duration::from_micros(500));
+        }
+    }
+    let took = began.elapsed();
+    let pictures = made(cx) - first;
+    let (made, released) = canvas.read_with(cx, |canvas, _| canvas.model_images());
+    assert!(released + 1 >= made, "{made} made and {released} released");
+    frames.sort();
+    showing.sort();
+    let at = |times: &[Duration], part: f64| times[((times.len() - 1) as f64 * part).round() as usize];
+    println!(
+        "a million-triangle model turning for {pictures} pictures in {took:?}: of the {} frames the window drew, those showing a \
+         new picture took its thread a median {:?}, 99th percentile {:?}; every frame, median {:?}, 99th percentile {:?}, slowest {:?}",
+        frames.len(),
+        at(&showing, 0.5),
+        at(&showing, 0.99),
+        at(&frames, 0.5),
+        at(&frames, 0.99),
+        frames.last().unwrap()
+    );
+    assert!(at(&showing, 0.5) < MOST_FOR_A_DRAG_FRAME, "a frame took {:?}", at(&showing, 0.5));
+    cx.update_window(audience, |_, window, _| window.remove_window()).ok();
+    cx.run_until_parked();
 }

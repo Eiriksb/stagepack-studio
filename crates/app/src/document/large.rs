@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use slides_engine::{AddedFile, MadeStill, MeasureVideo, StillJob, StillWanted, VideoLayer, is_large_kind};
+use slides_engine::{AddedFile, MadeStill, MeasureVideo, ModelLayer, StillJob, StillWanted, VideoLayer, is_large_kind};
 
 use super::*;
 use crate::clipboard::{CopiedLarge, PastedLarge};
@@ -51,13 +51,13 @@ pub(crate) struct LargeHome {
     stills_waiting: Vec<StillJob>,
     /// What a talk's file is read from, as things are now, for what reads off the window's thread.
     opening: Arc<Mutex<Opening>>,
-    /// What's known of each video, by its path, and the version of its file it was read from,
-    /// at most [`MOST_FACTS`] of them, each numbered as it was asked for.
+    /// What's known of each video and 3D model, by its path, and the version of its file it was
+    /// read from, at most [`MOST_FACTS`] of them, each numbered as it was asked for.
     facts: BTreeMap<String, (Option<FileStamp>, Facts, u64)>,
     facts_asked: u64,
 }
 
-/// The most videos whose facts are kept: the one asked for longest ago goes first.
+/// The most videos and models whose facts are kept: the one asked for longest ago goes first.
 const MOST_FACTS: usize = 256;
 
 /// A file's length and when it was last changed, which tell a new version of it. A file the
@@ -65,14 +65,21 @@ const MOST_FACTS: usize = 256;
 /// or one added and kept in the working copy, and is told by its length alone.
 type FileStamp = (u64, std::time::SystemTime);
 
-/// What's known of a video's facts.
+/// What's known of a video's or a model's facts.
 enum Facts {
     /// They're being read.
     Reading,
     /// They couldn't be read yet: while a save replaced the pack, or before a video a pack holds
     /// compressed is unpacked to play.
     Waiting,
-    Known(Result<VideoFacts, slides_video::CantPlay>),
+    Known(Known),
+}
+
+/// A video's facts or a model's, or why there are none.
+#[derive(Clone, Copy)]
+enum Known {
+    Video(Result<VideoFacts, slides_video::CantPlay>),
+    Model(Result<slides_model::ModelFacts, slides_model::CantDraw>),
 }
 
 /// What the form says of a video: how long it is, in seconds, and its size, in pixels, as it's shown.
@@ -82,34 +89,41 @@ pub struct VideoFacts {
     pub size: (u32, u32),
 }
 
-/// A video's facts, to be read off the window's thread, as the whole of its index is read:
-/// see [`Document::video_facts_to_read`].
+/// A video's facts, or a model's, to be read off the window's thread, as the whole of a video's
+/// index is read and a model's description: see [`Document::video_facts_to_read`] and
+/// [`Document::model_facts_to_read`].
 pub struct FactsToRead {
     path: String,
     version: Option<FileStamp>,
     open: Option<LargeOpen>,
+    model: bool,
 }
 
-/// What came of reading a video's facts, for [`Document::take_video_facts`] to take in.
+/// What came of reading a video's or a model's facts, for [`Document::take_video_facts`] or
+/// [`Document::take_model_facts`] to take in.
 pub struct FactsRead {
     path: String,
     version: Option<FileStamp>,
     /// `None` if they couldn't be read yet.
-    read: Option<Result<VideoFacts, slides_video::CantPlay>>,
+    read: Option<Known>,
 }
 
 impl FactsToRead {
-    /// Reads them, held among the talk's readers. A video a pack holds compressed is read only
-    /// once it's been unpacked to play, never unpacked just for this.
+    /// Reads them, held among the talk's readers, within the limits a model is read with. A video
+    /// a pack holds compressed is read only once it's been unpacked, never unpacked just for this;
+    /// a model, never more than 256 MB, is unpacked to read them, as it is to draw its still.
     pub fn read(self) -> FactsRead {
-        let read = match self.open.map(LargeOpen::open_for_still) {
-            None | Some(Err(NotOpened::Unreadable)) => Some(Err(slides_video::CantPlay::CouldNotRead)),
+        let cant_read = if self.model { Known::Model(Err(slides_model::CantDraw::CouldNotRead)) } else { Known::Video(Err(slides_video::CantPlay::CouldNotRead)) };
+        let open = if self.model { LargeOpen::open_unless_saving } else { LargeOpen::open_for_still };
+        let read = match self.open.map(open) {
+            None | Some(Err(NotOpened::Unreadable)) => Some(cant_read),
             Some(Err(NotOpened::Saving | NotOpened::NotUnpacked)) => None,
             Some(Ok(reader)) => {
                 let watch = reader.watch();
-                match facts_of(reader) {
+                let read = if self.model { Known::Model(slides_model::facts(Box::new(reader))) } else { Known::Video(facts_of(reader)) };
+                match read {
                     // A save let go of its file: they're read again after it.
-                    Err(_) if watch.is_let_go() => None,
+                    Known::Video(Err(_)) | Known::Model(Err(_)) if watch.is_let_go() => None,
                     read => Some(read),
                 }
             }
@@ -262,6 +276,8 @@ pub struct LargeCopy {
     looked: Looked,
     /// Its path in the talk.
     path: String,
+    /// What kind of file it is.
+    kind: FileKind,
     /// The working copy's folder of files.
     folder: PathBuf,
     /// The files of the talk with as many bytes, and their hashes if they're known.
@@ -303,6 +319,11 @@ impl LargeCopy {
         self.looked.len
     }
 
+    /// What kind of file it copies.
+    pub fn kind(&self) -> FileKind {
+        self.kind
+    }
+
     /// Whether it copies nothing at all.
     pub fn is_empty(&self) -> bool {
         self.looked.len == 0
@@ -313,10 +334,14 @@ impl LargeCopy {
     /// is hashed first, and one with the same hash is the file: nothing is copied. Room on the
     /// disk is looked for before anything is copied. Stopped, or failing, nothing is left.
     pub fn run(self, progress: &dyn Fn(u64, u64), stop: &AtomicBool) -> CopiedIn {
-        let LargeCopy { source, looked, path, folder, candidates, files, mut claim, recovery, place } = self;
+        let LargeCopy { source, looked, path, kind, folder, candidates, files, mut claim, recovery, place } = self;
         let hashing = !candidates.is_empty();
         let total = if hashing { looked.len.saturating_mul(2) } else { looked.len };
         let outcome = (|| {
+            // A model that doesn't start as one does is refused before a byte of it is copied.
+            if kind == FileKind::Model && !large_files::starts_as_model(&source, &path) {
+                return Err(NotAdded::NotAModel);
+            }
             if hashing {
                 let hash = large_files::hash_source(&source, looked, &Told { progress, before: 0, total }, stop)?;
                 for (there, known) in &candidates {
@@ -346,6 +371,7 @@ impl LargeCopy {
 
 /// A file of the talk's to read in pieces, found on the window's thread and opened on any other,
 /// as a video that a pack holds compressed is unpacked first.
+#[derive(Clone)]
 pub struct LargeOpen {
     files: Arc<dyn TalkFiles + Send + Sync>,
     path: String,
@@ -406,7 +432,72 @@ impl LargeOpen {
     }
 }
 
+/// The talk's files as an export reads them: a 3D model a pack holds compressed is unpacked to
+/// the cache to draw its still, as it is to turn it, as a model is never more than 256 MB.
+/// Everything else is read as the talk reads it.
+struct ModelsUnpacked {
+    files: Arc<dyn TalkFiles + Send + Sync>,
+    pack: PathBuf,
+    cache: Option<VideoCache>,
+    readers: Arc<Readers>,
+}
+
+impl ModelsUnpacked {
+    /// The model at `path`, unpacked from the pack to the cache, if it is one the pack holds.
+    fn unpacked(&self, path: &str) -> Option<Box<dyn slides_engine::ReadSeek>> {
+        let path = slides_engine::normalise(path).filter(|path| is_large_kind(path))?;
+        let ext = path.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase())?;
+        if !FileKind::Model.extensions().contains(&ext.as_str()) {
+            return None;
+        }
+        let cache = self.cache.clone().or_else(VideoCache::app)?;
+        // An export reads while no save replaces the pack: this stops only if one begins anyway.
+        let at = cache.unpacked(&self.pack, &path, self.readers.saving_now())?;
+        let file = large_files::open_plain(&at)?;
+        Some(Box::new(file))
+    }
+}
+
+impl TalkFiles for ModelsUnpacked {
+    fn read(&self, path: &str) -> Option<Vec<u8>> {
+        self.files.read(path)
+    }
+
+    fn open(&self, path: &str) -> Option<Box<dyn slides_engine::ReadSeek>> {
+        self.files.open(path).or_else(|| self.unpacked(path))
+    }
+
+    fn lies_at(&self, path: &str) -> Option<PathBuf> {
+        self.files.lies_at(path)
+    }
+
+    fn stamp(&self, path: &str) -> Option<(u64, std::time::SystemTime)> {
+        self.files.stamp(path)
+    }
+
+    fn len(&self, path: &str) -> Option<u64> {
+        self.files.len(path)
+    }
+
+    fn names_in(&self, folder: &str) -> Vec<String> {
+        self.files.names_in(folder)
+    }
+
+    fn never_changes(&self) -> bool {
+        self.files.never_changes()
+    }
+}
+
 impl Document {
+    /// The talk's files as an export reads them: in a pack, a 3D model the pack holds compressed
+    /// is unpacked to draw its still.
+    pub(crate) fn files_for_export(&self) -> Arc<dyn TalkFiles + Send + Sync> {
+        match self.pack() {
+            Some(pack) => Arc::new(ModelsUnpacked { files: self.files.clone(), pack, cache: self.large.cache.clone(), readers: self.large.readers.clone() }),
+            None => self.files.clone(),
+        }
+    }
+
     /// Copies large files added to the talk, such as videos, into `recovery`, the window's
     /// working copies, in its slot for the talk: until the talk is saved, that copy is the only
     /// one there is.
@@ -438,6 +529,8 @@ impl Document {
             slides_video::video_size(&mut reader).ok()
         });
         self.deck.make_stills_aside(wanted, measure);
+        // A model's still is drawn by the app's drawer, on what makes the stills.
+        self.deck.draw_models_with(Arc::new(crate::model_view::draw_still));
     }
 
     /// Notes what the talk's files are read from now, for what reads them off the window's thread.
@@ -483,6 +576,12 @@ impl Document {
         self.large.stills_waiting.push(job);
     }
 
+    /// How many stills couldn't be made yet, and wait to be given again: for tests.
+    #[doc(hidden)]
+    pub fn stills_waiting(&self) -> usize {
+        self.large.stills_waiting.len()
+    }
+
     /// Gives again the stills that couldn't be made yet, telling what makes them, and lets the
     /// videos' facts that couldn't be read yet be read: whether any had waited is given, for the
     /// form to be drawn again, and read them.
@@ -498,6 +597,24 @@ impl Document {
     /// or why it can't be played. `None` until they've been read, with
     /// [`Self::video_facts_to_read`].
     pub fn video_facts(&self, path: &str) -> Option<Result<VideoFacts, slides_video::CantPlay>> {
+        match self.known_facts(path)? {
+            Known::Video(known) => Some(known),
+            Known::Model(_) => None,
+        }
+    }
+
+    /// What's known of the 3D model at `path`, a file of the talk's, as its file is now: what its
+    /// headers say it is, or why it can't be drawn. `None` until they've been read, with
+    /// [`Self::model_facts_to_read`].
+    pub fn model_facts(&self, path: &str) -> Option<Result<slides_model::ModelFacts, slides_model::CantDraw>> {
+        match self.known_facts(path)? {
+            Known::Model(known) => Some(known),
+            Known::Video(_) => None,
+        }
+    }
+
+    /// What's known of the file at `path`, as it is now.
+    fn known_facts(&self, path: &str) -> Option<Known> {
         let key = slides_engine::normalise(path).unwrap_or_else(|| path.to_string());
         match self.large.facts.get(&key)? {
             (version, Facts::Known(known), _) if *version == self.file_stamp(&key) => Some(*known),
@@ -508,18 +625,36 @@ impl Document {
     /// The facts of the video at `path` to be read, on another thread, if they're neither known
     /// for its file as it is now nor being read or waiting to be: they're read once a version.
     pub fn video_facts_to_read(&mut self, path: &str) -> Option<FactsToRead> {
+        self.facts_to_read(path, false)
+    }
+
+    /// The facts of the 3D model at `path` to be read, on another thread, from its headers alone,
+    /// as [`Self::video_facts_to_read`] gives a video's.
+    pub fn model_facts_to_read(&mut self, path: &str) -> Option<FactsToRead> {
+        self.facts_to_read(path, true)
+    }
+
+    /// The facts of the video, or the model if `model`, at `path` to be read. Those known of the
+    /// other kind, as of a file named by a video and a model both, are read again as this kind.
+    fn facts_to_read(&mut self, path: &str, model: bool) -> Option<FactsToRead> {
         let key = slides_engine::normalise(path).unwrap_or_else(|| path.to_string());
         let version = self.file_stamp(&key);
         let asked = self.large.facts.get(&key).is_some_and(|(held, facts, _)| match facts {
             Facts::Reading | Facts::Waiting => true,
-            Facts::Known(_) => *held == version,
+            Facts::Known(known) => *held == version && matches!(known, Known::Model(_)) == model,
         });
         if asked {
             return None;
         }
         self.keep_facts(key.clone(), version, Facts::Reading);
         let open = self.open_large(&key);
-        Some(FactsToRead { path: key, version, open })
+        Some(FactsToRead { path: key, version, open, model })
+    }
+
+    /// Takes in a model's facts, read off the window's thread, as [`Self::take_video_facts`]
+    /// takes in a video's.
+    pub fn take_model_facts(&mut self, read: FactsRead) -> bool {
+        self.take_video_facts(read)
     }
 
     /// Takes in a video's facts, read off the window's thread, and says whether they're known
@@ -622,6 +757,79 @@ impl Document {
         guarded(|| self.deck.video_problem(current, source)).ok().flatten()
     }
 
+    /// The 3D models on the current slide, among the layers [`Self::editor_layers`] gives.
+    pub fn models_here(&mut self) -> Vec<ModelLayer> {
+        let current = self.current();
+        guarded(|| self.deck.models(current)).unwrap_or_default()
+    }
+
+    /// The 3D models on slide `index`, of those a show goes through, at `moment`, among the
+    /// layers [`Self::layers_at`] gives then.
+    pub fn models_at(&mut self, index: usize, moment: slides_engine::Moment) -> Vec<ModelLayer> {
+        guarded(|| self.deck.models_at(index, moment)).unwrap_or_default()
+    }
+
+    /// The one thing selected on the slide shown, if it's a 3D model placed on it.
+    pub fn selected_model(&mut self) -> Option<ModelLayer> {
+        let selected = self.selected()?.clone();
+        if selected.slide != self.current() || self.selection().is_none_or(|selection| selection.things.len() != 1) {
+            return None;
+        }
+        self.models_here().into_iter().find(|model| model.source.as_ref() == Some(&selected.source))
+    }
+
+    /// What's said of the one thing selected, if it's a 3D model that can't be drawn: why not,
+    /// that it has no file, or that one in the text shows only once it's placed.
+    pub fn selected_model_said(&mut self) -> Option<String> {
+        if let Some(model) = self.selected_model() {
+            let current = self.current();
+            let source = model.source?;
+            return guarded(|| self.deck.model_problem(current, &source)).ok().flatten();
+        }
+        let selected = self.selected()?.clone();
+        let one = self.selection().is_some_and(|selection| selection.things.len() == 1);
+        let tag = self.selected_tag().filter(|_| one && selected.slide == self.current())?;
+        (tag.name == "Model" && !slides_engine::is_positioned(tag)).then(|| slides_engine::MODEL_IN_TEXT.to_string())
+    }
+
+    /// Why the 3D model at `source` on slide `index` can't be drawn, in a plain sentence, if its
+    /// still has been tried and it can't.
+    pub fn model_problem_on(&mut self, index: usize, source: &std::ops::Range<usize>) -> Option<String> {
+        guarded(|| self.deck.model_problem(index, source)).ok().flatten()
+    }
+
+    /// Writes `view` as the starting view of the 3D model at `source` on the current slide, as
+    /// one step, with as few figures as a view put on a slide has: only its `view` changes.
+    pub fn set_model_view(&mut self, source: std::ops::Range<usize>, view: slides_model::View) -> Result<Vec<usize>, EditRefused> {
+        let thing = crate::selection::Selected { slide: self.current(), source };
+        self.set_attr_of(&thing, "view", Some(&crate::insert::written_view(view).to_string()))
+    }
+
+    /// Adds `view` to the views of the 3D model at `source` on the current slide, after those it
+    /// has, as one step: only its `views` changes, and what's written there stays as it was,
+    /// with `; ` and the view after it, with as few figures as a view put on a slide has. One
+    /// with as many as a model can have takes no more.
+    pub fn add_model_view(&mut self, source: std::ops::Range<usize>, view: slides_model::View) -> Result<Vec<usize>, EditRefused> {
+        let thing = crate::selection::Selected { slide: self.current(), source };
+        let view = crate::insert::written_view(view);
+        let written = slides_format::find_tag(self.talk(), thing.slide, &thing.source)
+            .ok_or(EditRefused::CouldNotBeMade)?
+            .attr("views")
+            .map(str::to_string)
+            .unwrap_or_default();
+        let (views, _) = slides_engine::read_model_views(Some(&written));
+        if views.len() >= slides_engine::MOST_MODEL_VIEWS {
+            return Err(EditRefused::TooManyViews);
+        }
+        let kept = written.trim_end();
+        let added = match kept.chars().last() {
+            None => view.to_string(),
+            Some(';' | ',') => format!("{kept} {view}"),
+            Some(_) => format!("{kept}; {view}"),
+        };
+        self.set_attr_of(&thing, "views", Some(&added))
+    }
+
     /// Where the talk's pack is, if it's kept in one.
     fn pack(&self) -> Option<PathBuf> {
         match &self.place {
@@ -662,7 +870,7 @@ impl Document {
         if !kind.is_large() {
             return Err(NotAdded::NotThatKind);
         }
-        let looked = from.look()?;
+        let looked = from.look_as(Some(kind))?;
         if expected.is_some_and(|expected| expected != looked) {
             return Err(NotAdded::Changed);
         }
@@ -687,7 +895,7 @@ impl Document {
         drop(spoken_for);
         let claim = Claim { to, spoken_for: self.large.spoken_for.clone(), made: false };
         let (recovery, place) = (recovery.clone(), self.place.clone());
-        Ok(LargeCopy { source: from, looked, path, folder, candidates, files: self.files.clone(), claim, recovery, place })
+        Ok(LargeCopy { source: from, looked, path, kind, folder, candidates, files: self.files.clone(), claim, recovery, place })
     }
 
     /// The last part of [`Self::add_large_file`], on the window's thread: the file copied becomes
@@ -740,11 +948,11 @@ impl Document {
     }
 
     /// Where `large`, as a clipboard says, is copied from, if it lies where a large file of a talk
-    /// can, under a video's name, at the path the copy gives it: in a talk's folder, beside its
+    /// can, under a large file's name, at the path the copy gives it: in a talk's folder, beside its
     /// `slides.md`; in the working copies, in a slot's folder of files; or in a pack, under that
     /// path. A file on disk is copied from where the system resolves it to, links and all.
     fn may_bring(&self, large: &PastedLarge) -> Option<LargeSource> {
-        let named = large.kind.is_large() && added_files::is_added_path(&large.path) && is_large_kind(&large.path);
+        let named = large.kind.is_large() && added_files::kind_of_path(&large.path) == Some(large.kind) && is_large_kind(&large.path);
         if !named {
             return None;
         }
@@ -773,10 +981,10 @@ impl Document {
             return Vec::new();
         };
         let files = &*self.files;
-        files
-            .names_in(FileKind::Video.folder())
+        added_files::large_folders()
             .into_iter()
-            .filter(|path| is_large_kind(path) && crate::clipboard::pasted_kind(path) == Some(FileKind::Video))
+            .flat_map(|folder| files.names_in(folder))
+            .filter(|path| is_large_kind(path) && crate::clipboard::pasted_kind(path).is_some_and(FileKind::is_large))
             .filter(|path| guarded(|| talk_uses(&talk, files, path)).unwrap_or(false))
             .filter_map(|path| {
                 let source = match (files.lies_at(&path), &self.place) {
@@ -786,7 +994,7 @@ impl Document {
                     }
                     (None, _) => return None,
                 };
-                let looked = source.look().ok()?;
+                let looked = source.look_as(crate::clipboard::pasted_kind(&path)).ok()?;
                 Some(CopiedLarge { path, source, looked })
             })
             .collect()
@@ -875,10 +1083,15 @@ impl Document {
         let mut any = false;
         let mut clashed = false;
         for (path, at) in large {
-            if !added_files::is_added_path(&path) || !is_large_kind(&path) {
+            let Some(kind) = added_files::kind_of_path(&path).filter(|kind| kind.is_large()) else {
+                continue;
+            };
+            if !is_large_kind(&path) {
                 continue;
             }
-            let Some(len) = std::fs::symlink_metadata(&at).ok().filter(std::fs::Metadata::is_file).map(|meta| meta.len()) else {
+            let Some(len) =
+                std::fs::symlink_metadata(&at).ok().filter(std::fs::Metadata::is_file).map(|meta| meta.len()).filter(|len| *len <= kind.max_bytes())
+            else {
                 continue;
             };
             if self.added.lies_at(&path).is_some_and(|lies| lies == at) {
@@ -927,6 +1140,6 @@ impl Document {
 
     /// Whether the talk's own files, as last saved, hold a large file.
     pub(crate) fn holds_large(&self) -> bool {
-        self.own_files.names_in(FileKind::Video.folder()).iter().any(|path| is_large_kind(path))
+        added_files::large_folders().into_iter().any(|folder| self.own_files.names_in(folder).iter().any(|path| is_large_kind(path)))
     }
 }

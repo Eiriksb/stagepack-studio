@@ -43,6 +43,8 @@ pub struct LayerSpec {
     pub varies: bool,
     /// The video this layer is the still of, which plays over it when asked.
     pub video: Option<VideoOn>,
+    /// The 3D model this layer is the still of, which is drawn live over it when it's turned.
+    pub model: Option<ModelOn>,
 }
 
 /// A video among a slide's layers: the place of its layer among them, where its tag is written,
@@ -72,4 +74,27 @@ pub struct Layer {
     pub pixmap: Arc<tiny_skia::Pixmap>,
     pub x: i32,
     pub y: i32,
+}
+
+/// A 3D model among a slide's layers: the place of its layer among them, where its tag is
+/// written, the click it appears on, and what it shows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelLayer {
+    pub layer: usize,
+    pub source: Option<Range<usize>>,
+    pub click: Option<u32>,
+    pub on: ModelOn,
+}
+
+/// A 3D model on a slide: the file it's drawn from, whether it turns slowly on its own, the
+/// view it starts at, or `None` to be framed whole, the views each click goes on to, and where
+/// it's drawn, as its layer is placed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelOn {
+    pub src: String,
+    pub turn: bool,
+    pub view: Option<slides_model::View>,
+    pub views: Vec<slides_model::View>,
+    pub rect: Rect,
+    pub rotate: f32,
 }

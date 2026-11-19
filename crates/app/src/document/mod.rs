@@ -26,7 +26,7 @@ use crate::added_files::{self, FileKind, MAX_ADDED_BYTES, NotAdded, Placed, talk
 use crate::clipboard::{CopiedFile, MAX_CLIPBOARD_FILES, MAX_CLIPBOARD_FILES_BYTES, PastedFile, PastedFiles};
 use crate::export::ExportInput;
 use crate::history::{History, RunId, one_edit};
-use crate::insert::{self, INSERT_COMPONENT, INSERT_PICTURE, INSERT_SHAPE, INSERT_TABLE, INSERT_TEXT_BOX, INSERT_VIDEO, TEXT_BOX_SIZE};
+use crate::insert::{self, INSERT_COMPONENT, INSERT_MODEL, INSERT_PICTURE, INSERT_SHAPE, INSERT_TABLE, INSERT_TEXT_BOX, INSERT_VIDEO, TEXT_BOX_SIZE};
 use crate::palette::{self, COMPONENT_SIZE, LISTED_BUILT_INS};
 pub use crate::palette::PaletteEntry;
 use crate::present::TalkShape;

@@ -19,7 +19,7 @@ use crate::timeline::MAX_CLICK;
 use crate::render::device_offset;
 use crate::{
     ComponentAsks, ComponentInfo, DisplayItem, Fonts, Layer, LayerSpec, LayerTiming, LayoutEnv, Moment, MadeStill, PictureCache, Placing,
-    SlideTimeline, SchemaLoad, MeasureVideo, StillJob, StillWanted, TalkComponents, TalkFiles, Transition, VideoLayer, builtin_registry, compose, render_layer, talk_theme,
+    SlideTimeline, SchemaLoad, MeasureVideo, StillJob, StillWanted, TalkComponents, TalkFiles, Transition, VideoLayer, DrawModel, ModelLayer, builtin_registry, compose, render_layer, talk_theme,
 };
 
 /// How many scales of one slide are kept drawn. A zoom or a resize asks for many in a row.
@@ -135,9 +135,11 @@ impl Laid {
         self.specs.iter().map(|spec| LayerTiming { click: spec.click, enter: spec.enter }).collect()
     }
 
-    /// The most clicks its layers or components ask for.
+    /// The most clicks its layers or components ask for. A 3D model takes a click for each of
+    /// its views, after the click it appears on.
     fn steps(&self) -> u32 {
-        let clicks = self.specs.iter().filter_map(|spec| spec.click).max().unwrap_or(0);
+        let views = self.specs.iter().filter_map(|spec| Some(spec.click.unwrap_or(0) + spec.model.as_ref()?.views.len() as u32));
+        let clicks = self.specs.iter().filter_map(|spec| spec.click).chain(views).max().unwrap_or(0);
         clicks.max(self.asks.steps).min(MAX_CLICK)
     }
 }
@@ -668,6 +670,46 @@ impl Deck {
         }
         let src = self.specs(index).iter().find(|spec| spec.source.as_ref() == Some(source))?.video.as_ref()?.src.clone();
         self.pictures.still_problem(&src).map(|why| why.to_string())
+    }
+
+    /// Draws the talk's 3D models' stills with `draw` from now on: the engine draws no 3D of its
+    /// own. Until it's given something to draw with, a model is a panel saying it can't be drawn
+    /// here. With stills made aside, `draw` is called by [`StillJob::make`], on whatever thread
+    /// makes them.
+    pub fn draw_models_with(&mut self, draw: DrawModel) {
+        self.pictures.draw_models_with(draw);
+    }
+
+    /// The plain sentence saying why the 3D model at `source` on slide `index` can't be drawn, if
+    /// it's a model and its still has been tried and it can't. It's among the slide's notices too.
+    pub fn model_problem(&mut self, index: usize, source: &std::ops::Range<usize>) -> Option<String> {
+        if index >= self.slides.len() {
+            return None;
+        }
+        let on = self.specs(index).iter().find(|spec| spec.source.as_ref() == Some(source))?.model.clone()?;
+        if on.src.is_empty() {
+            return Some(crate::MODEL_NO_FILE.to_string());
+        }
+        let size = crate::pictures::model_still_size(on.rect.w, on.rect.h);
+        self.pictures.model_problem(&on.src, on.view, size).map(|why| why.to_string())
+    }
+
+    /// The 3D models on slide `index` in its whole state, among its layers as `specs` and
+    /// `layers` give them, with the deck's placing.
+    pub fn models(&mut self, index: usize) -> Vec<ModelLayer> {
+        if index >= self.slides.len() {
+            return Vec::new();
+        }
+        models_of(self.specs(index))
+    }
+
+    /// The 3D models on slide `index` at `moment`, among its layers as `layers_at` gives them then.
+    pub fn models_at(&mut self, index: usize, moment: Moment) -> Vec<ModelLayer> {
+        if index >= self.slides.len() {
+            return Vec::new();
+        }
+        let moment = self.ensure_laid_at(index, moment);
+        models_of(&self.slides[index].laid_at(moment).specs)
     }
 
     /// Whether the video `src`, with the still `poster` names if it names one, is drawn as a
@@ -1351,6 +1393,10 @@ impl Deck {
                             video.rect = rect;
                             video.rotate = rotate;
                         }
+                        if let Some(model) = &mut spec.model {
+                            model.rect = rect;
+                            model.rotate = rotate;
+                        }
                         laid.keys[at].place = place_bits(spec);
                     } else {
                         laid_again.push((at, range.clone(), placing.clone()));
@@ -1416,6 +1462,15 @@ impl Deck {
         self.keep_within_budget(index);
         ordered
     }
+}
+
+/// The 3D models among `specs`.
+fn models_of(specs: &[LayerSpec]) -> Vec<ModelLayer> {
+    specs
+        .iter()
+        .enumerate()
+        .filter_map(|(layer, spec)| Some(ModelLayer { layer, source: spec.source.clone(), click: spec.click, on: spec.model.clone()? }))
+        .collect()
 }
 
 /// The videos among `specs`.

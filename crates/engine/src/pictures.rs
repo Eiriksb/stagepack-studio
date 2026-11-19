@@ -13,6 +13,8 @@ use resvg::usvg;
 use tiny_skia::{ColorU8, Pixmap, Transform};
 use toolkit::Color;
 
+use slides_model::{CantDraw, View};
+
 use crate::{ReadSeek, TalkFiles};
 
 /// The longest edge a picture is kept at.
@@ -97,6 +99,10 @@ pub struct PictureCache {
     stills_asked: Vec<String>,
     /// Where stills are decoded off the caller's thread, if they are.
     aside: Option<Aside>,
+    /// The stills of the talk's 3D models, each drawn at its view and size.
+    model_stills: HashMap<ModelKey, CachedModelStill>,
+    /// What draws a model's still, if anything can: the engine itself can't.
+    draw_model: Option<DrawModel>,
 }
 
 impl Default for PictureCache {
@@ -109,6 +115,8 @@ impl Default for PictureCache {
             stills: HashMap::new(),
             stills_asked: Vec::new(),
             aside: None,
+            model_stills: HashMap::new(),
+            draw_model: None,
         }
     }
 }
@@ -148,43 +156,155 @@ pub type StillWanted = Arc<dyn Fn() + Send + Sync>;
 /// decoding nothing; `None` if that can't be known now.
 pub type MeasureVideo = Arc<dyn Fn(&str) -> Option<(u32, u32)> + Send + Sync>;
 
-/// A video's still the deck wants made, which can be made on any thread: see
+/// Draws the 3D model `reader` reads, seen from a view, or from where the whole of it is seen
+/// with none, into a picture of the width and height given, or says why it can't. It reads the
+/// whole model and waits for it to be drawn, so it's for a thread other than the window's. The
+/// engine draws no 3D itself: what it's given does.
+pub type DrawModel = Arc<dyn Fn(Box<dyn ReadSeek>, Option<View>, u32, u32) -> Result<slides_model::Picture, CantDraw> + Send + Sync>;
+
+/// A video's or a 3D model's still the deck wants made, which can be made on any thread: see
 /// [`crate::Deck::still_jobs`].
 pub struct StillJob {
     path: String,
     version: Option<FileVersion>,
+    /// What's drawn of a model, if it's a model's still.
+    model: Option<ModelWanted>,
+}
+
+/// The still of a model wanted: where it's seen from, how large it's drawn, and what draws it.
+#[derive(Clone)]
+struct ModelWanted {
+    key: ModelKey,
+    view: Option<View>,
+    draw: Option<DrawModel>,
 }
 
 impl StillJob {
-    /// The path in the talk of the video whose still it is.
+    /// The path in the talk of the video or model whose still it is.
     pub fn path(&self) -> &str {
         &self.path
     }
 
-    /// Makes the still from what `reader` reads, the video's file, or, with none, says it
-    /// couldn't be read. It decodes, so it's for a thread other than the window's.
-    pub fn make(self, reader: Option<Box<dyn ReadSeek>>) -> MadeStill {
-        MadeStill { path: self.path, version: self.version, still: make_still(reader) }
+    /// Whether it's a 3D model's still, drawn rather than decoded.
+    pub fn is_model(&self) -> bool {
+        self.model.is_some()
     }
+
+    /// Makes the still from what `reader` reads, the video's or model's file, or, with none,
+    /// says it couldn't be read. It decodes, or draws, so it's for a thread other than the
+    /// window's.
+    pub fn make(self, reader: Option<Box<dyn ReadSeek>>) -> MadeStill {
+        let still = match &self.model {
+            Some(wanted) => Made::Model(make_model_still(reader, wanted)),
+            None => Made::Video(make_still(reader)),
+        };
+        MadeStill { path: self.path, version: self.version, model: self.model, still }
+    }
+}
+
+/// What came of making a still.
+enum Made {
+    Video(Still),
+    Model(ModelStill),
 }
 
 /// A still made aside, for [`crate::Deck::take_still`] to take in.
 pub struct MadeStill {
     path: String,
     version: Option<FileVersion>,
-    still: Still,
+    model: Option<ModelWanted>,
+    still: Made,
 }
 
 impl MadeStill {
     /// Whether no still could be made: why is said once it's taken in.
     pub fn failed(&self) -> bool {
-        matches!(self.still, Still::Cannot(_))
+        matches!(self.still, Made::Video(Still::Cannot(_)) | Made::Model(ModelStill::Cannot(_)))
     }
 
     /// The still to be made again, as when its file was taken away while it was read.
     pub fn again(self) -> StillJob {
-        StillJob { path: self.path, version: self.version }
+        StillJob { path: self.path, version: self.version, model: self.model }
     }
+}
+
+/// What a 3D model shows while it isn't being turned.
+#[derive(Clone)]
+pub(crate) enum ModelStill {
+    /// It drawn at its view.
+    Drawn(Arc<Pixmap>),
+    /// Why it can't be drawn.
+    Cannot(CantDraw),
+    /// Being drawn on another thread, with a still of it drawn before, at another size, to show
+    /// meanwhile, if there is one.
+    Coming(Option<Arc<Pixmap>>),
+}
+
+impl ModelStill {
+    fn bytes(&self) -> usize {
+        match self {
+            ModelStill::Drawn(still) => still.data().len(),
+            _ => 0,
+        }
+    }
+}
+
+/// Which still of a model: its file, the view it's seen from as written, or nothing for the one
+/// it's framed by, and the size it's drawn at, in pixels.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ModelKey {
+    path: String,
+    view: String,
+    size: (u32, u32),
+}
+
+struct CachedModelStill {
+    still: ModelStill,
+    version: Option<FileVersion>,
+    last_used: u64,
+}
+
+/// The longest edge a model's still is drawn at: as large as a slide is shown, and no larger.
+const MAX_MODEL_STILL_EDGE: f32 = 1920.0;
+
+/// The size in pixels a model's still is drawn at for a box `w` by `h` in slide units: a pixel
+/// a unit, made smaller to [`MAX_MODEL_STILL_EDGE`], and a pixel a side at least.
+pub(crate) fn model_still_size(w: f32, h: f32) -> (u32, u32) {
+    let (w, h) = (if w.is_finite() { w.max(1.0) } else { 1.0 }, if h.is_finite() { h.max(1.0) } else { 1.0 });
+    let scale = (MAX_MODEL_STILL_EDGE / w.max(h)).min(1.0);
+    let side = |length: f32| ((length * scale).round() as u32).max(1);
+    (side(w), side(h))
+}
+
+/// The still of the model `reader` reads, as `wanted` says, or why there's none.
+fn make_model_still(reader: Option<Box<dyn ReadSeek>>, wanted: &ModelWanted) -> ModelStill {
+    let Some(reader) = reader else {
+        return ModelStill::Cannot(CantDraw::CouldNotRead);
+    };
+    let Some(draw) = &wanted.draw else {
+        return ModelStill::Cannot(CantDraw::NoAdapter);
+    };
+    let (width, height) = wanted.key.size;
+    let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| draw(reader, wanted.view, width, height))).unwrap_or(Err(CantDraw::Damaged));
+    match drawn {
+        Ok(picture) => match model_pixmap(&picture) {
+            Some(pixmap) => ModelStill::Drawn(Arc::new(pixmap)),
+            None => ModelStill::Cannot(CantDraw::Damaged),
+        },
+        Err(why) => ModelStill::Cannot(why),
+    }
+}
+
+/// A model's picture, straight-alpha BGRA, as a pixmap.
+fn model_pixmap(picture: &slides_model::Picture) -> Option<Pixmap> {
+    if picture.bgra.len() as u64 != u64::from(picture.width) * u64::from(picture.height) * 4 {
+        return None;
+    }
+    let mut pixmap = Pixmap::new(picture.width, picture.height)?;
+    for (pixel, bgra) in pixmap.pixels_mut().iter_mut().zip(picture.bgra.as_chunks::<4>().0) {
+        *pixel = ColorU8::from_rgba(bgra[2], bgra[1], bgra[0], bgra[3]).premultiply();
+    }
+    Some(pixmap)
 }
 
 /// Stills to be made aside, as the window's thread mustn't decode a video.
@@ -257,7 +377,8 @@ impl PictureCache {
     pub(crate) fn files_replaced(&mut self, files: &dyn TalkFiles) {
         self.pictures.clear();
         self.stills.retain(|path, cached| large_file_version(path, files) == cached.version);
-        self.bytes = self.stills.values().map(|cached| cached.still.bytes()).sum();
+        self.model_stills.retain(|key, cached| large_file_version(&key.path, files) == cached.version);
+        self.bytes = self.stills.values().map(|cached| cached.still.bytes()).sum::<usize>() + self.model_stills.values().map(|cached| cached.still.bytes()).sum::<usize>();
     }
 
     /// Leaves videos' stills to be made aside from now on, telling `wanted` each time one is
@@ -288,7 +409,7 @@ impl PictureCache {
             // A file that isn't there is known not to be read without decoding anything.
             Some(_) if version.is_none() && files.len(path).is_none() => Still::Cannot(slides_video::CantPlay::CouldNotRead),
             Some(aside) => {
-                aside.jobs.push(StillJob { path: path.to_string(), version: version.clone() });
+                aside.jobs.push(StillJob { path: path.to_string(), version: version.clone(), model: None });
                 (aside.wanted)();
                 Still::Coming((aside.measure)(path))
             }
@@ -311,14 +432,98 @@ impl PictureCache {
     /// Takes in a still made aside, and gives the path of its video if it was still wanted:
     /// one whose file has changed since it was asked for isn't, and is asked for again.
     pub(crate) fn take_still(&mut self, made: MadeStill) -> Option<String> {
-        let cached = self.stills.get_mut(&made.path)?;
-        if !matches!(cached.still, Still::Coming(_)) || cached.version != made.version {
-            return None;
+        let MadeStill { path, version, model, still } = made;
+        match (still, model) {
+            (Made::Video(still), _) => {
+                let cached = self.stills.get_mut(&path)?;
+                if !matches!(cached.still, Still::Coming(_)) || cached.version != version {
+                    return None;
+                }
+                self.bytes += still.bytes();
+                cached.still = still;
+            }
+            (Made::Model(still), Some(wanted)) => {
+                let cached = self.model_stills.get_mut(&wanted.key)?;
+                if !matches!(cached.still, ModelStill::Coming(_)) || cached.version != version {
+                    return None;
+                }
+                self.bytes += still.bytes();
+                cached.still = still;
+            }
+            (Made::Model(_), None) => return None,
         }
-        self.bytes += made.still.bytes();
-        cached.still = made.still;
         self.let_go_of_unused();
-        Some(made.path)
+        Some(path)
+    }
+
+    /// Draws models' stills with `draw` from now on. Those that couldn't be drawn as nothing
+    /// could draw them are drawn when next asked for.
+    pub(crate) fn draw_models_with(&mut self, draw: DrawModel) {
+        self.draw_model = Some(draw);
+        self.model_stills.retain(|_, cached| !matches!(cached.still, ModelStill::Cannot(CantDraw::NoAdapter)));
+    }
+
+    /// The still of the model at `path` seen from `view`, written as `view_text`, or framed with
+    /// none, drawn `size` pixels: made once for each version of its file, view and size. While
+    /// it's made aside, a still of it drawn before at another size shows.
+    pub(crate) fn model_still(&mut self, path: &str, view: Option<View>, size: (u32, u32), files: &dyn TalkFiles) -> ModelStill {
+        self.stills_asked.push(path.to_string());
+        self.asked_for += 1;
+        let asked_for = self.asked_for;
+        let view_text = view.map(|view| view.to_string()).unwrap_or_default();
+        let key = ModelKey { path: path.to_string(), view: view_text, size };
+        if let Some(cached) = self.model_stills.get_mut(&key) {
+            cached.last_used = asked_for;
+            return cached.still.clone();
+        }
+        let version = large_file_version(path, files);
+        let wanted = ModelWanted { key: key.clone(), view, draw: self.draw_model.clone() };
+        let still = match &mut self.aside {
+            // A file that isn't there is known not to be read without reading anything.
+            Some(_) if version.is_none() && files.len(path).is_none() => ModelStill::Cannot(CantDraw::CouldNotRead),
+            Some(aside) => {
+                // One of the same view still being made at another size isn't wanted now, as when
+                // the model is being resized: it's asked for again if it's wanted after all.
+                let older: Vec<ModelKey> = self
+                    .model_stills
+                    .iter()
+                    .filter(|(other, cached)| other.path == key.path && other.view == key.view && matches!(cached.still, ModelStill::Coming(_)))
+                    .map(|(other, _)| other.clone())
+                    .collect();
+                for other in &older {
+                    self.model_stills.remove(other);
+                }
+                aside.jobs.retain(|job| job.model.as_ref().is_none_or(|model| !older.contains(&model.key)));
+                aside.jobs.push(StillJob { path: path.to_string(), version: version.clone(), model: Some(wanted) });
+                (aside.wanted)();
+                let before = self
+                    .model_stills
+                    .iter()
+                    .filter(|(other, cached)| other.path == key.path && cached.version == version)
+                    .filter_map(|(other, cached)| match &cached.still {
+                        ModelStill::Drawn(still) => Some((other.view == key.view, cached.last_used, still.clone())),
+                        _ => None,
+                    })
+                    .max_by_key(|(same_view, last_used, _)| (*same_view, *last_used))
+                    .map(|(_, _, still)| still);
+                ModelStill::Coming(before)
+            }
+            None => make_model_still(files.open(path), &wanted),
+        };
+        self.bytes += still.bytes();
+        self.model_stills.insert(key, CachedModelStill { still: still.clone(), version, last_used: asked_for });
+        self.let_go_of_unused();
+        still
+    }
+
+    /// Why the model at `path`, seen from `view` and drawn `size` pixels, can't be drawn, if its
+    /// still has been tried and it can't.
+    pub(crate) fn model_problem(&self, path: &str, view: Option<View>, size: (u32, u32)) -> Option<CantDraw> {
+        let key = ModelKey { path: path.to_string(), view: view.map(|view| view.to_string()).unwrap_or_default(), size };
+        match self.model_stills.get(&key)?.still {
+            ModelStill::Cannot(why) => Some(why),
+            _ => None,
+        }
     }
 
     /// Forgets every still whose video's file is no longer what it was, as when files are added:
@@ -332,11 +537,19 @@ impl PictureCache {
             }
             same
         });
+        self.model_stills.retain(|key, cached| {
+            let same = large_file_version(&key.path, files) == cached.version;
+            if !same {
+                *held -= cached.still.bytes();
+            }
+            same
+        });
     }
 
     /// Whether any still is still being made aside.
     pub(crate) fn stills_coming(&self) -> bool {
         self.stills.values().any(|cached| matches!(cached.still, Still::Coming(_)))
+            || self.model_stills.values().any(|cached| matches!(cached.still, ModelStill::Coming(_)))
     }
 
     /// The videos whose stills were asked for since this was last asked.
@@ -407,6 +620,22 @@ impl PictureCache {
             .map(|(path, cached)| (cached.last_used, true, path.clone()));
         let mut unused: Vec<(u64, bool, String)> = pictures.chain(stills).collect();
         unused.sort_unstable();
+        // A model's still only this holds is forgotten too, the oldest first.
+        let mut models: Vec<(u64, ModelKey)> = self
+            .model_stills
+            .iter()
+            .filter(|(_, cached)| matches!(&cached.still, ModelStill::Drawn(still) if Arc::strong_count(still) == 1))
+            .map(|(key, cached)| (cached.last_used, key.clone()))
+            .collect();
+        models.sort_unstable_by_key(|(last_used, _)| *last_used);
+        for (_, key) in models {
+            if self.bytes <= self.memory_budget {
+                break;
+            }
+            if let Some(cached) = self.model_stills.remove(&key) {
+                self.bytes -= cached.still.bytes();
+            }
+        }
         for (_, still, path) in unused {
             if self.bytes <= self.memory_budget {
                 break;
@@ -425,7 +654,7 @@ impl PictureCache {
     /// Forgets every picture whose file is no longer the one that was read, and says
     /// whether there were any.
     pub(crate) fn drop_replaced(&mut self, files: &dyn TalkFiles) -> bool {
-        let before = (self.pictures.len(), self.stills.len());
+        let before = (self.pictures.len(), self.stills.len() + self.model_stills.len());
         let held = &mut self.bytes;
         self.pictures.retain(|path, cached| {
             let same = FileVersion::of_file(path, files).as_ref() == Some(&cached.version);
@@ -441,7 +670,14 @@ impl PictureCache {
             }
             same
         });
-        (self.pictures.len(), self.stills.len()) != before
+        self.model_stills.retain(|key, cached| {
+            let same = large_file_version(&key.path, files) == cached.version;
+            if !same {
+                *held -= cached.still.bytes();
+            }
+            same
+        });
+        (self.pictures.len(), self.stills.len() + self.model_stills.len()) != before
     }
 }
 

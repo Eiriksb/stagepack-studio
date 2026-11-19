@@ -238,7 +238,7 @@ impl Document {
     pub fn export_input(&self) -> ExportInput {
         ExportInput {
             source: self.source().to_string(),
-            files: self.files.clone(),
+            files: self.files_for_export(),
             talk_fonts: self.talk_fonts.clone(),
         }
     }

@@ -25,7 +25,7 @@ pub mod chart_parts {
     pub use crate::chart::{Axis, ChartData, axis_for, parse_csv, parse_inline, plot_area, series_color};
 }
 pub use deck::Deck;
-pub use elements::{VIDEO_IN_TEXT, VIDEO_NO_FILE};
+pub use elements::{MODEL_IN_TEXT, MODEL_NO_FILE, MODEL_VIEW_UNREAD, MOST_VIEWS as MOST_MODEL_VIEWS, VIDEO_IN_TEXT, model_views as read_model_views, VIDEO_NO_FILE};
 /// A drawn picture, such as a slide's thumbnail.
 pub use tiny_skia::Pixmap;
 pub use display::*;
@@ -34,7 +34,7 @@ pub use highlight::*;
 pub use layouts::*;
 pub use native::*;
 pub use packed::*;
-pub use pictures::{MadeStill, MeasureVideo, PictureCache, PictureFormat, stills_decoded_on_this_thread, StillJob, StillWanted, icon_names, icon_preview, picture_as_png, picture_format};
+pub use pictures::{DrawModel, MadeStill, MeasureVideo, PictureCache, PictureFormat, stills_decoded_on_this_thread, StillJob, StillWanted, icon_names, icon_preview, picture_as_png, picture_format};
 pub use render::*;
 pub use slide::*;
 pub use talk_components::{
