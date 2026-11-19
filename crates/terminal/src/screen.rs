@@ -25,7 +25,7 @@
 //! string, every query, the bell, and every other mode and sequence.
 //!
 //! What a screen is fed costs work, counted as it's done: a character, a row moved, a cell
-//! copied or cleared. Once a screen has done more than a recording may cost, about two seconds
+//! copied or cleared. Once a screen has done more than a recording may cost, about a second
 //! of it, it does nothing more, and says so: a recording made to keep a computer busy is too
 //! large to play rather than a wait.
 
@@ -134,16 +134,18 @@ pub fn rgb(colour: Colour, foreground: bool) -> [u8; 3] {
     }
 }
 
-/// The most work a screen does before it stops: up to about a second and a half of it in a
-/// release build, at the costliest kind of work. What programs ordinarily write costs 20 to 40 a
-/// byte, so the largest recording of it is well within this.
-pub const MOST_WORK: u64 = 2_000_000_000;
+/// The most work a screen does before it stops: about three quarters of a second of it in a
+/// release build at the costliest kinds of work, a second and a quarter at the slowest measured.
+/// What programs ordinarily write costs 25 to 40 a byte, so the largest recording of it is
+/// within this on the largest screen.
+pub const MOST_WORK: u64 = 1_500_000_000;
 /// What each kind of work costs, a cell copied costing one: a character read, a row moved, a row
 /// shared or let go, a row made, and a cell cleared or shifted. They were measured in a release
-/// build on the laptop this was written on, where each costs up to about 0.8 ns a unit.
+/// build on the laptop this was written on, where most kinds cost up to half a nanosecond a
+/// unit, and none more than about 0.8.
 const CHAR_WORK: u64 = 24;
 const ROW_MOVED: u64 = 1;
-pub(crate) const ROW_SHARED: u64 = 16;
+pub(crate) const ROW_SHARED: u64 = 32;
 const ROW_MADE: u64 = 64;
 const CELL_CLEARED: u64 = 2;
 /// How many blank rows, one for each background colour, are kept to share.
@@ -163,18 +165,39 @@ struct Pen {
     lines: bool,
 }
 
+/// A row of a screen: its cells, and whether they've been made its own since it was last
+/// blank or shared. That's the screen's own account, so the work of writing to a row is the
+/// same however the row came to be shared with a screen kept as it was.
+#[derive(Clone)]
+struct Line {
+    cells: Row,
+    owned: bool,
+}
+
+impl Line {
+    fn shared(cells: Row) -> Line {
+        Line { cells, owned: false }
+    }
+}
+
 /// One of the two screens a program may write on: its rows, and the cursor saved on it.
 #[derive(Clone)]
 struct Grid {
-    rows: Vec<Row>,
+    rows: Vec<Line>,
     saved: Pen,
+}
+
+impl Grid {
+    fn blank(blank: &Row, height: u16) -> Grid {
+        Grid { rows: vec![Line::shared(blank.clone()); usize::from(height)], saved: Pen::default() }
+    }
 }
 
 impl PartialEq for Grid {
     fn eq(&self, other: &Self) -> bool {
         self.saved == other.saved
             && self.rows.len() == other.rows.len()
-            && self.rows.iter().zip(&other.rows).all(|(a, b)| Arc::ptr_eq(a, b) || a == b)
+            && self.rows.iter().zip(&other.rows).all(|(a, b)| Arc::ptr_eq(&a.cells, &b.cells) || a.cells == b.cells)
     }
 }
 
@@ -200,6 +223,9 @@ pub struct Screen {
     blanks: Vec<Row>,
     /// The work done so far.
     work: u64,
+    /// How many cells the rows made so far hold, whatever made them: a measure of the memory
+    /// taken since, for the player's account of what it keeps.
+    made: u64,
 }
 
 /// Two screens are the same if they show the same and go on the same; the work each took
@@ -252,7 +278,7 @@ impl Screen {
         Screen {
             width,
             height,
-            main: Grid { rows: vec![blank.clone(); usize::from(height)], saved: Pen::default() },
+            main: Grid::blank(&blank, height),
             alternate: None,
             on_alternate: false,
             pen: Pen::default(),
@@ -264,6 +290,7 @@ impl Screen {
             parser: Parser::default(),
             blanks: vec![blank],
             work: 0,
+            made: u64::from(width),
         }
     }
 
@@ -277,7 +304,7 @@ impl Screen {
 
     /// The cell at this column and row, or nothing off the screen.
     pub fn cell(&self, col: u16, row: u16) -> Option<&Cell> {
-        self.grid().rows.get(usize::from(row))?.get(usize::from(col))
+        self.grid().rows.get(usize::from(row))?.cells.get(usize::from(col))
     }
 
     /// Where the cursor is, as column and row, or nothing while it's hidden.
@@ -287,7 +314,7 @@ impl Screen {
 
     /// Each row's cells, top to bottom; each row is as wide as the screen.
     pub fn rows(&self) -> impl Iterator<Item = &[Cell]> {
-        self.grid().rows.iter().map(|row| &**row)
+        self.grid().rows.iter().map(|row| &*row.cells)
     }
 
     /// Whether the screen has done more work than a recording may cost, and so stopped: what
@@ -301,9 +328,27 @@ impl Screen {
         self.work
     }
 
-    /// Every row of both screens, as held.
+    /// Every row of both screens, and the blank rows kept to share, as held.
     pub(crate) fn held_rows(&self) -> impl Iterator<Item = &Row> {
-        self.main.rows.iter().chain(self.alternate.iter().flat_map(|grid| &grid.rows))
+        let grids = self.main.rows.iter().chain(self.alternate.iter().flat_map(|grid| &grid.rows));
+        grids.map(|row| &row.cells).chain(&self.blanks)
+    }
+
+    /// How many rows both screens have.
+    pub(crate) fn places(&self) -> u64 {
+        u64::from(self.height) * if self.alternate.is_some() { 2 } else { 1 }
+    }
+
+    /// How many cells the rows made own: what writing to them again would copy, once they're
+    /// shared.
+    pub(crate) fn owned_cells(&self) -> u64 {
+        let grids = self.main.rows.iter().chain(self.alternate.iter().flat_map(|grid| &grid.rows));
+        grids.filter(|row| row.owned).count() as u64 * u64::from(self.width)
+    }
+
+    /// The cells of all the rows made so far.
+    pub(crate) fn made(&self) -> u64 {
+        self.made
     }
 
     fn charge(&mut self, work: u64) {
@@ -366,31 +411,32 @@ impl Screen {
 
     /// Fits rows to the screen's size, the first `dropped` going. Rows that were blank, one of
     /// `old_blanks`, are blank again at the new width.
-    fn resize_rows(&mut self, rows: &mut Vec<Row>, dropped: u16, old_blanks: &[Row]) {
+    fn resize_rows(&mut self, rows: &mut Vec<Line>, dropped: u16, old_blanks: &[Row]) {
         let (width, height) = (usize::from(self.width), usize::from(self.height));
         self.charge(ROW_SHARED * rows.len() as u64);
         rows.drain(..usize::from(dropped).min(rows.len()));
         rows.truncate(height);
-        if !old_blanks.is_empty() || rows.first().is_some_and(|row| row.len() != width) {
+        if !old_blanks.is_empty() || rows.first().is_some_and(|row| row.cells.len() != width) {
             for row in rows.iter_mut() {
-                if let Some(blank) = old_blanks.iter().find(|blank| Arc::ptr_eq(blank, row)) {
-                    *row = self.blank_cells(blank[0].style.bg);
+                if let Some(blank) = old_blanks.iter().find(|blank| Arc::ptr_eq(blank, &row.cells)) {
+                    *row = Line::shared(self.blank_cells(blank[0].style.bg));
                     continue;
                 }
-                self.charge(ROW_MADE + 4 * width as u64);
-                let mut cells: Row = row.iter().copied().chain(std::iter::repeat(Cell::default())).take(width).collect();
+                self.charge(ROW_MADE + 6 * width as u64);
+                self.made += width as u64;
+                let mut cells: Row = row.cells.iter().copied().chain(std::iter::repeat(Cell::default())).take(width).collect();
                 // A wide character cut in half by the new edge goes.
                 if let Some(last) = Arc::get_mut(&mut cells).and_then(|cells| cells.last_mut())
                     && last.wide == Wide::Left
                 {
                     *last = halved(*last);
                 }
-                *row = cells;
+                *row = Line { cells, owned: true };
             }
         }
         let blank = self.blank_cells(Colour::Default);
         self.charge(ROW_SHARED * height.saturating_sub(rows.len()) as u64);
-        rows.resize(height, blank);
+        rows.resize(height, Line::shared(blank));
     }
 
     fn grid(&self) -> &Grid {
@@ -414,6 +460,7 @@ impl Screen {
             Some(found) => self.blanks[..=found].rotate_right(1),
             None => {
                 self.charge(ROW_MADE + CELL_CLEARED * u64::from(self.width));
+                self.made += u64::from(self.width);
                 let blank: Row = vec![self.erased_with(bg); usize::from(self.width)].into();
                 self.blanks.insert(0, blank);
                 self.blanks.truncate(BLANKS_KEPT);
@@ -431,12 +478,20 @@ impl Screen {
         Cell { style: Style { bg, ..Style::default() }, ..Cell::default() }
     }
 
-    /// A row's cells to change, copied first if they're shared.
+    /// A row's cells to change, made its own first: copied if they're shared.
     fn row_mut(&mut self, row: u16) -> &mut [Cell] {
-        if Arc::strong_count(&self.grid().rows[usize::from(row)]) > 1 {
-            self.charge(ROW_MADE + u64::from(self.width));
+        let width = u64::from(self.width);
+        let line = &self.grid().rows[usize::from(row)];
+        let (owned, shared) = (line.owned, Arc::strong_count(&line.cells) > 1);
+        if !owned {
+            self.charge(ROW_MADE + width);
         }
-        Arc::make_mut(&mut self.grid_mut().rows[usize::from(row)])
+        if shared {
+            self.made += width;
+        }
+        let line = &mut self.grid_mut().rows[usize::from(row)];
+        line.owned = true;
+        Arc::make_mut(&mut line.cells)
     }
 
     fn print(&mut self, c: char) {
@@ -500,7 +555,7 @@ impl Screen {
             return;
         };
         let mut col = usize::from(col);
-        if self.grid().rows[usize::from(self.pen.row)][col].wide == Wide::Right && col > 0 {
+        if self.grid().rows[usize::from(self.pen.row)].cells[col].wide == Wide::Right && col > 0 {
             col -= 1;
         }
         let cells = self.row_mut(self.pen.row);
@@ -584,7 +639,7 @@ impl Screen {
             0..count
         };
         for row in &mut region[coming] {
-            *row = blank.clone();
+            *row = Line::shared(blank.clone());
         }
     }
 
@@ -617,8 +672,8 @@ impl Screen {
         let from = from.min(to);
         let mut shared = 0;
         for row in &mut self.grid_mut().rows[from..to] {
-            if !Arc::ptr_eq(row, &blank) {
-                *row = blank.clone();
+            if !Arc::ptr_eq(&row.cells, &blank) {
+                *row = Line::shared(blank.clone());
                 shared += 1;
             }
         }
@@ -814,7 +869,7 @@ impl Screen {
         if alternate && self.alternate.is_none() {
             let blank = self.blank_cells(Colour::Default);
             self.charge(ROW_SHARED * u64::from(self.height));
-            self.alternate = Some(Grid { rows: vec![blank; usize::from(self.height)], saved: Pen::default() });
+            self.alternate = Some(Grid::blank(&blank, self.height));
         }
         self.on_alternate = alternate;
         self.wrap_next = false;

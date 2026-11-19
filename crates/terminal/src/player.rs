@@ -2,9 +2,11 @@
 //! at marks, so going back starts again from near where it's going rather than from the start.
 //!
 //! A kept screen shares its rows with the screen played until they change, so keeping one costs
-//! its rows' places and the rows changed since the last kept. One is kept only once the work
-//! done since the last is at least what keeping it costs, so keeping costs no more than playing,
-//! and going back plays again no more than that work.
+//! its rows' places, and later a copy of each row written again. One is kept only once the work
+//! done since the last kept is at least that, and at least the spacing between those kept, so
+//! keeping costs no more than playing. When too many are kept, every other one goes and the
+//! spacing doubles, so those kept stay spread evenly through the work, and going back plays
+//! again only a share of it. Keeping has its own limit of work besides.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -12,8 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::CantPlay;
-use crate::cast::{MOST_LENGTH, Recording, What, played};
-use crate::screen::{Cell, ROW_SHARED, Screen};
+use crate::cast::{Recording, What, played};
+use crate::screen::{Cell, MOST_WORK, ROW_SHARED, Screen};
 
 /// How often, in played time, the screen is kept as it was.
 pub const KEPT_EVERY: Duration = Duration::from_secs(10);
@@ -24,7 +26,13 @@ pub const MOST_KEPT_BYTES: usize = 100_000_000;
 
 /// What a kept screen holds besides its rows, and what each row's place costs.
 const KEPT_OVERHEAD: usize = 256;
-const ROW_PLACE: usize = size_of::<Arc<[Cell]>>();
+const ROW_PLACE: usize = size_of::<Arc<[Cell]>>() + 8;
+/// The work of keeping each row's place: sharing it, letting it go, and counting it when kept
+/// screens go.
+const PLACE_WORK: u64 = 3 * ROW_SHARED;
+/// Work enough that the screen is kept after it whether a stop or ten seconds have come or not,
+/// so going back never plays again much more: about fifteen milliseconds of it.
+const KEPT_ANYWAY: u64 = 20_000_000;
 
 /// The screen as it was after a number of events.
 struct Kept {
@@ -51,8 +59,10 @@ pub struct Player {
     /// Screens as they were, by the events played; the first is the screen as it starts.
     kept: Vec<Kept>,
     kept_bytes: usize,
-    /// How often a screen is kept; it grows when too many have been.
-    every: Duration,
+    /// The least work between kept screens; it doubles each time too many have been kept.
+    spacing: u64,
+    /// The work keeping has done; past the most a screen may do, no more are kept.
+    keeping: u64,
 }
 
 /// Never set: for playing that isn't to be stopped.
@@ -79,7 +89,8 @@ impl Player {
             played: 0,
             kept: vec![first],
             kept_bytes: 0,
-            every: KEPT_EVERY,
+            spacing: 0,
+            keeping: 0,
         };
         player.kept_bytes = player.count_kept();
         player
@@ -148,51 +159,41 @@ impl Player {
         Some(if screen.too_costly() { Err(CantPlay::TooLarge) } else { Ok(screen) })
     }
 
-    /// Plays the next event, keeping the screen as it is after it if it's due.
+    /// Plays the next event, keeping the screen as it is after it if it's due and paid for.
     fn step(&mut self) {
         let what = &self.recording.events[self.played].what;
         apply(&mut self.screen, what);
         let at = self.times[self.played];
         self.played += 1;
         let Some(latest) = self.kept.last() else { return };
-        if self.played <= latest.events {
+        if self.played <= latest.events || self.keeping > MOST_WORK {
+            return;
+        }
+        let work = self.screen.work().saturating_sub(latest.screen.work());
+        let places = self.screen.places();
+        let least = (PLACE_WORK * places).max(self.spacing);
+        if work < least {
             return;
         }
         let mark = matches!(what, What::Mark(_));
-        if !mark && at < latest.at.saturating_add(self.every) {
+        if !mark && at < latest.at.saturating_add(KEPT_EVERY) && work < KEPT_ANYWAY.max(self.spacing) {
             return;
         }
-        // Keeping costs at least sharing each row; the rows changed since are found only once
-        // the work done would pay for that.
-        let work = self.screen.work().saturating_sub(latest.screen.work());
-        if work < ROW_SHARED * self.screen.held_rows().count() as u64 {
+        // Each row written to again once it's shared is copied.
+        let copies = self.screen.owned_cells();
+        if work < least + copies {
             return;
         }
-        let (bytes, cost) = self.cost(latest);
-        if work >= cost {
-            self.keep(at, mark, bytes);
-        }
-    }
-
-    /// What keeping the screen as it is would cost: the bytes it would hold, its rows' places
-    /// and the rows not held by the last kept, and the work of keeping it, sharing each row and
-    /// later copying those changed.
-    fn cost(&self, latest: &Kept) -> (usize, u64) {
-        let held: HashSet<*const Cell> = latest.screen.held_rows().map(|row| row.as_ptr()).collect();
-        let (mut bytes, mut work) = (KEPT_OVERHEAD, 0);
-        for row in self.screen.held_rows() {
-            bytes += ROW_PLACE;
-            work += ROW_SHARED;
-            if !held.contains(&row.as_ptr()) {
-                bytes += size_of_val::<[Cell]>(row);
-                work += row.len() as u64;
-            }
-        }
-        (bytes, work)
+        // The rows made since, though no more than the screen holds: those made and let go
+        // since are gone.
+        let made = self.screen.made().saturating_sub(latest.screen.made()).min(places * u64::from(self.screen.width()));
+        let bytes = KEPT_OVERHEAD + places as usize * ROW_PLACE + made as usize * size_of::<Cell>();
+        self.keeping = self.keeping.saturating_add(PLACE_WORK * places + copies);
+        self.keep(at, mark, bytes);
     }
 
     /// All the kept screens hold, in bytes, each row counted once however many share it.
-    fn count_kept(&self) -> usize {
+    fn count_kept(&mut self) -> usize {
         let mut rows = HashSet::new();
         let mut bytes = 0;
         for kept in &self.kept {
@@ -204,23 +205,25 @@ impl Player {
                 }
             }
         }
+        self.keeping = self.keeping.saturating_add(PLACE_WORK * rows.len() as u64);
         bytes
     }
 
     /// Keeps the screen as it is, first keeping fewer of those kept before if there'd be too
     /// many.
-    fn keep(&mut self, at: Duration, mark: bool, cost: usize) {
-        while self.kept.len() >= MOST_KEPT_SCREENS || self.kept_bytes + cost > MOST_KEPT_BYTES {
+    fn keep(&mut self, at: Duration, mark: bool, bytes: usize) {
+        while self.kept.len() >= MOST_KEPT_SCREENS || self.kept_bytes + bytes > MOST_KEPT_BYTES {
             if !self.thin(true) && !self.thin(false) {
                 return;
             }
         }
-        self.kept_bytes += cost;
+        self.kept_bytes += bytes;
         self.kept.push(Kept { events: self.played, at, mark, screen: self.screen.clone() });
     }
 
     /// Lets every other kept screen go, only those kept by time if `by_time`, and if any went,
-    /// keeps them half as often from now on. The first is always kept. Says whether any went.
+    /// keeps them twice as far apart from now on. The first is always kept. Says whether any
+    /// went.
     fn thin(&mut self, by_time: bool) -> bool {
         let before = self.kept.len();
         let mut second = false;
@@ -234,7 +237,9 @@ impl Player {
         if self.kept.len() == before {
             return false;
         }
-        self.every = self.every.saturating_mul(2).min(MOST_LENGTH);
+        let first = self.kept.first().map_or(0, |kept| kept.screen.work());
+        let last = self.kept.last().map_or(0, |kept| kept.screen.work());
+        self.spacing = self.spacing.saturating_mul(2).max(last.saturating_sub(first) / self.kept.len() as u64);
         self.kept_bytes = self.count_kept();
         true
     }

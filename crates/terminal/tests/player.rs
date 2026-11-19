@@ -196,6 +196,57 @@ fn many_marks_on_the_largest_screen_are_quick() {
     }
 }
 
+/// A recording on the largest screen with every cell of both screens written, then `unit`
+/// written and a mark made, `times` times, a thousandth of a second apart.
+fn stop_after_stop(unit: &str, times: usize) -> Arc<Recording> {
+    let mut lines: Vec<(f64, &str, String)> = vec![
+        (0.0, "o", "y".repeat(500 * 200)),
+        (0.0, "o", format!("\u{1b}[?1049h{}", "x".repeat(500 * 200))),
+    ];
+    for i in 0..times {
+        let at = i as f64 * 0.001;
+        lines.push((at, "o", unit.to_owned()));
+        lines.push((at, "m", String::new()));
+    }
+    let lines: Vec<(f64, &str, &str)> = lines.iter().map(|(at, code, text)| (*at, *code, text.as_str())).collect();
+    Arc::new(read(&make_test_cast(500, 200, &lines)).unwrap())
+}
+
+/// Plays a recording to its end and back to marks here and there, each within a second, the
+/// screen the same whichever way it's reached, and says whether it was too costly.
+fn quick_both_ways(recording: &Arc<Recording>) -> bool {
+    let started = Instant::now();
+    let last = Player::new(recording.clone()).last();
+    assert!(started.elapsed() < Duration::from_secs(1), "the last screen took {:?}", started.elapsed());
+    let mut player = Player::new(recording.clone());
+    let started = Instant::now();
+    let costly = player.screen_at(recording.length).too_costly();
+    assert!(started.elapsed() < Duration::from_secs(1), "playing to the end took {:?}", started.elapsed());
+    assert_eq!(last.is_err(), costly, "the last screen and the end disagree");
+    let marks = recording.marks.len();
+    for mark in [marks / 2, marks / 3, 1, marks - 1, marks / 7] {
+        let at = recording.marks[mark].at;
+        player.screen_at(recording.length);
+        let started = Instant::now();
+        let back = player.screen_at(at).clone();
+        assert!(started.elapsed() < Duration::from_secs(1), "back to mark {mark} took {:?}", started.elapsed());
+        if mark != marks / 7 {
+            assert_eq!(back, *Player::new(recording.clone()).screen_at(at), "mark {mark}");
+        }
+    }
+    costly
+}
+
+#[test]
+#[cfg_attr(debug_assertions, ignore = "this checks how quick a release build is")]
+fn costly_output_between_stops_is_quick_both_ways() {
+    // The screen erased in two colours before each of 499,000 stops: too costly to play, and
+    // said so the same both ways.
+    assert!(quick_both_ways(&stop_after_stop("\u{9b}41m\u{9b}2J\u{9b}42m\u{9b}2J", 499_000)));
+    // A row and a half of characters before each of 100,000 stops: within the limit.
+    assert!(!quick_both_ways(&stop_after_stop(&"z".repeat(270), 100_000)));
+}
+
 #[test]
 #[cfg_attr(debug_assertions, ignore = "this plays as much as the most costly recording")]
 fn a_recording_too_costly_to_play_says_so() {
