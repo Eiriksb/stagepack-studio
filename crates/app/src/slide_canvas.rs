@@ -99,11 +99,14 @@ pub struct SlideCanvas {
     /// How many live pictures of models have been made to show, and released, in all.
     models_made: usize,
     models_released: Rc<Cell<usize>>,
+    /// When the models' counts were last written out, and what they were then.
+    models_counted: Option<(std::time::Instant, usize, usize)>,
 }
 
 /// Set, to anything, to have a window playing a video write how many of its pictures were
-/// shown, skipped and released each second to the standard error: for checking by hand how
-/// smoothly a video plays on a computer.
+/// shown, skipped and released each second to the standard error, and one turning a 3D model how
+/// many of its pictures were drawn and shown, and released: for checking by hand how smoothly a
+/// video plays or a model turns on a computer.
 pub const COUNTS_TO_STDERR: &str = "STUDIO_VIDEO_COUNTS";
 
 fn counts_wanted() -> bool {
@@ -644,7 +647,14 @@ impl SlideCanvas {
     /// come. A turned model's picture is turned on a background task.
     fn advance_models(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.turners.is_empty() {
+            // The next to turn is counted from its start.
+            self.models_counted = None;
             return;
+        }
+        if counts_wanted()
+            && let Some(line) = model_counts(&mut self.models_counted, std::time::Instant::now(), self.models_made, self.models_released.get())
+        {
+            eprintln!("{line}");
         }
         let now = cx.background_executor().now();
         let mut wanted = false;
@@ -897,5 +907,46 @@ impl Render for SlideCanvas {
             .opacity(opacity)
             .child(housekeeping)
             .children(runs)
+    }
+}
+
+/// What a window turning models writes of their live pictures, drawn and shown, and released,
+/// `made` and `released` in all now: nothing the first time, which `counted` begins counting
+/// from, and then once a second at most, counting afresh from each time it's written.
+fn model_counts(counted: &mut Option<(std::time::Instant, usize, usize)>, now: std::time::Instant, made: usize, released: usize) -> Option<String> {
+    let Some((then, made_then, released_then)) = *counted else {
+        *counted = Some((now, made, released));
+        return None;
+    };
+    let seconds = now.duration_since(then).as_secs_f64();
+    if seconds < 1.0 {
+        return None;
+    }
+    *counted = Some((now, made, released));
+    Some(format!("model pictures in {seconds:.2} s: {} drawn and shown, {} released", made - made_then, released - released_then))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::model_counts;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn model_counts_are_written_once_a_second_at_most() {
+        let mut counted = None;
+        let start = Instant::now();
+        // The first time a model turns, counting begins.
+        assert_eq!(model_counts(&mut counted, start, 4, 2), None);
+        assert_eq!(model_counts(&mut counted, start + Duration::from_millis(500), 8, 6), None);
+        assert_eq!(
+            model_counts(&mut counted, start + Duration::from_millis(1100), 12, 11).as_deref(),
+            Some("model pictures in 1.10 s: 8 drawn and shown, 9 released")
+        );
+        // Counted afresh from then.
+        assert_eq!(model_counts(&mut counted, start + Duration::from_millis(1900), 20, 19), None);
+        assert_eq!(
+            model_counts(&mut counted, start + Duration::from_millis(2200), 20, 20).as_deref(),
+            Some("model pictures in 1.10 s: 8 drawn and shown, 9 released")
+        );
     }
 }
