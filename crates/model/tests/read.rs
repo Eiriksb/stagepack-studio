@@ -134,6 +134,11 @@ fn grid() -> &'static [u8] {
     GRID.get_or_init(|| make_test_glb(MadeGlb::Grid { cells: 8, texture: 64, jpeg: false }))
 }
 
+fn jpeg_grid() -> &'static [u8] {
+    static GRID: OnceLock<Vec<u8>> = OnceLock::new();
+    GRID.get_or_init(|| make_test_glb(MadeGlb::Grid { cells: 2, texture: 16, jpeg: true }))
+}
+
 fn boxes() -> &'static [u8] {
     static BOXES: OnceLock<Vec<u8>> = OnceLock::new();
     BOXES.get_or_init(|| make_test_glb(MadeGlb::Boxes))
@@ -173,6 +178,77 @@ fn with_texture(picture: &[u8]) -> Vec<u8> {
         json["images"][0]["bufferView"] = json!(json["bufferViews"].as_array().unwrap().len() - 1);
         json["buffers"][0]["byteLength"] = json!(bin.len());
     })
+}
+
+/// The made grid with `picture` as its texture, followed by `pad` bytes of nothing kept in the
+/// same part of the file: the start of the file, as far as the picture's end, and its length.
+fn padded_texture(picture: &[u8], pad: u64) -> (Vec<u8>, u64) {
+    assert_eq!(pad % 4, 0);
+    let glb = with_texture(picture);
+    let (text, bin) = glb_parts(&glb).unwrap();
+    let mut json: Value = serde_json::from_str(&text).unwrap();
+    let view = json["images"][0]["bufferView"].as_u64().unwrap() as usize;
+    let view = &mut json["bufferViews"][view];
+    // The picture ends the made data, but for padding to four.
+    let offset = view["byteOffset"].as_u64().unwrap() as usize;
+    assert!(bin.len() - (offset + picture.len()) < 4);
+    view["byteLength"] = json!((bin.len() - offset) as u64 + pad);
+    json["buffers"][0]["byteLength"] = json!(bin.len() as u64 + pad);
+    let mut start = glb_from(&json.to_string(), &bin);
+    // The block of data, and the whole file, are as long as the nothing after it makes them.
+    let total = u32::from_le_bytes(start[8..12].try_into().unwrap()) + pad as u32;
+    start[8..12].copy_from_slice(&total.to_le_bytes());
+    let described = u32::from_le_bytes(start[12..16].try_into().unwrap()) as usize;
+    let bin_at = 20 + described;
+    let bin_len = u32::from_le_bytes(start[bin_at..bin_at + 4].try_into().unwrap()) + pad as u32;
+    start[bin_at..bin_at + 4].copy_from_slice(&bin_len.to_le_bytes());
+    let len = u64::from(total);
+    (start, len)
+}
+
+/// A progressive JPEG of `width` by `height`, of one colour, grey or with three numbers to a
+/// pixel at full size each (4:4:4): its first scan the average of every block, then one scan
+/// of the rest for each number, every block of which is nothing.
+fn progressive_jpeg(width: u16, height: u16, components: u8) -> Vec<u8> {
+    let mut out = vec![0xFF, 0xD8];
+    let part = |out: &mut Vec<u8>, marker: u8, body: &[u8]| {
+        out.extend_from_slice(&[0xFF, marker]);
+        out.extend_from_slice(&(body.len() as u16 + 2).to_be_bytes());
+        out.extend_from_slice(body);
+    };
+    part(&mut out, 0xDB, &[[0u8].as_slice(), &[1; 64]].concat());
+    let mut frame = vec![8];
+    frame.extend_from_slice(&height.to_be_bytes());
+    frame.extend_from_slice(&width.to_be_bytes());
+    frame.push(components);
+    for id in 1..=components {
+        frame.extend_from_slice(&[id, 0x11, 0]);
+    }
+    part(&mut out, 0xC2, &frame);
+    // Two codes in each table: the shortest, `0`, for no difference and for the end of a block.
+    let counts = [[1u8, 1].as_slice(), &[0; 14]].concat();
+    part(&mut out, 0xC4, &[[0x00].as_slice(), &counts, &[0, 1], &[0x10], &counts, &[0x00, 0x01]].concat());
+    let blocks = (u64::from(width).div_ceil(8) * u64::from(height).div_ceil(8)) as usize;
+    let coded = |bits: usize| {
+        let mut bytes = vec![0u8; bits.div_ceil(8)];
+        if !bits.is_multiple_of(8) {
+            *bytes.last_mut().unwrap() = 0xFF >> (bits % 8);
+        }
+        bytes
+    };
+    let mut scan = vec![components];
+    for id in 1..=components {
+        scan.extend_from_slice(&[id, 0x00]);
+    }
+    scan.extend_from_slice(&[0, 0, 0]);
+    part(&mut out, 0xDA, &scan);
+    out.extend_from_slice(&coded(blocks * components as usize));
+    for id in 1..=components {
+        part(&mut out, 0xDA, &[1, id, 0x00, 1, 63, 0]);
+        out.extend_from_slice(&coded(blocks));
+    }
+    out.extend_from_slice(&[0xFF, 0xD9]);
+    out
 }
 
 /// A PNG of 4 by 4, 16 bits a number, RGBA, all orange.
@@ -333,7 +409,7 @@ fn damage() -> impl Strategy<Value = Damage> {
 /// One of the made models, damaged. Random bytes come after the start of a model of its kind,
 /// or alone.
 fn damaged(damage: &Damage, which: usize) -> Vec<u8> {
-    let made = [grid(), boxes(), cloud(), text_cloud()];
+    let made = [grid(), boxes(), cloud(), text_cloud(), jpeg_grid()];
     let mut bytes = made[which % made.len()].to_vec();
     match damage {
         Damage::Random(random) => {
@@ -354,7 +430,7 @@ fn damaged(damage: &Damage, which: usize) -> Vec<u8> {
             return out;
         }
         Damage::RandomData(random) => {
-            let glb = [grid(), boxes()][which % 2];
+            let glb = [grid(), boxes(), jpeg_grid()][which % 3];
             let (text, bin) = glb_parts(glb).unwrap();
             let bin: Vec<u8> = random.iter().copied().cycle().take(bin.len()).collect();
             return glb_from(&text, &bin);
@@ -464,6 +540,34 @@ fn any_bytes_read_or_say_why_named_cases() {
     let marked = with_texture(&marked);
     assert!(facts(reader(marked.clone())).is_ok());
     assert!(matches!(facts_and_read(marked).map(|m| m.texture.map(|t| (t.width, t.height))), Ok(Some((32, 32))) | Err(CantDraw::Damaged)));
+
+    // A progressive JPEG of 4:4:4 colour, the kind that takes the most to decode, just within
+    // what may be taken, and one a little larger, refused before it's decoded. Each is a few
+    // hundred kilobytes, as they're one colour.
+    let started = Instant::now();
+    let near = with_texture(&progressive_jpeg(5400, 5400, 3));
+    let texture = facts_and_read(near).unwrap().texture.unwrap();
+    assert_eq!((texture.width, texture.height), (5400, 5400));
+    assert!(texture_colour(&texture, 2700, 2700).iter().take(3).all(|v| v.abs_diff(128) <= 2), "{:?}", texture_colour(&texture, 2700, 2700));
+    drop(texture);
+    eprintln!("A progressive JPEG of 5,400 a side took {:?}.", started.elapsed());
+    let over = with_texture(&progressive_jpeg(5600, 5600, 3));
+    assert_eq!(facts(reader(over.clone())).err(), Some(CantDraw::TooLarge));
+    assert_eq!(facts_and_read(over).err(), Some(CantDraw::TooLarge));
+    // Grey takes less, so may be larger.
+    let grey = facts_and_read(with_texture(&progressive_jpeg(7000, 7000, 1))).unwrap().texture.unwrap();
+    assert_eq!(texture_colour(&grey, 10, 10)[3], 255);
+    drop(grey);
+    // A small JPEG followed by 240 MB kept beside it: only the picture is read.
+    let small = progressive_jpeg(16, 16, 3);
+    let (start, len) = padded_texture(&small, 240_000_000);
+    let padded = || Box::new(Virtual::new(&start, len));
+    PEAK.store(IN_USE.load(Ordering::Relaxed), Ordering::Relaxed);
+    assert!(facts(padded()).is_ok());
+    let texture = read(padded()).unwrap().texture.unwrap();
+    assert_eq!((texture.width, texture.height), (16, 16));
+    check_memory();
+    assert!(PEAK.load(Ordering::Relaxed) - IN_USE.load(Ordering::Relaxed) < 16 * 1024 * 1024);
 
     // A billion vertices said in a header of a kilobyte.
     let mut billion = b"ply\nformat binary_little_endian 1.0\nelement vertex 1000000000\nproperty float x\nproperty float y\nproperty float z\nend_header\n".to_vec();
@@ -663,7 +767,14 @@ fn nothing_outside_the_file_is_read() {
     }
     let beside = folder.join("x.bin").to_string_lossy().into_owned();
     let picture = folder.join("x.png").to_string_lossy().into_owned();
-    let was = std::env::current_dir().unwrap();
+    /// Puts the working folder back however the test ends.
+    struct Back(std::path::PathBuf);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+    let back = Back(std::env::current_dir().unwrap());
     std::env::set_current_dir(&inner).unwrap();
 
     let buffer = |uri: &str| {
@@ -707,7 +818,7 @@ fn nothing_outside_the_file_is_read() {
             assert_eq!(count.past_end.load(Ordering::Relaxed), 0);
         }
     }
-    std::env::set_current_dir(was).unwrap();
+    drop(back);
     for (path, contents) in &planted {
         assert_eq!(&std::fs::read(path).unwrap(), contents);
     }
@@ -723,11 +834,12 @@ fn nothing_outside_the_file_is_read() {
     // The reading has no way of its own to open a file or reach the network: it's only given
     // the one reader.
     // Its source names none of the ways a program reaches files, the network or other
-    // programs, in any form: `std::fs::read`, `use std::{fs, io}`, `fs::File` and the rest.
+    // programs, in any form: `std::fs::read`, `use std::{fs, io}`, `fs::File`, the picture
+    // library's `image::open` and the rest.
     let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let forbidden = [
         "fs", "File", "OpenOptions", "DirBuilder", "read_dir", "net", "TcpStream", "UdpSocket", "process", "Command", "env",
-        "set_current_dir", "include_bytes", "include_str", "libc", "mmap",
+        "set_current_dir", "include_bytes", "include_str", "libc", "mmap", "open", "ImageReader", "load_from_memory",
     ];
     let mut looked = 0;
     let mut folders = vec![source];

@@ -13,7 +13,7 @@ use gltf::json::mesh::{Mode, Primitive, Semantic};
 use gltf::json::validation::Checked;
 use gltf::json::{self, Root};
 
-use crate::image_size::{Picture, Size, checked_size, picture_kind};
+use crate::image_size::{Picture, Size, checked_size, jpeg_needed, picture_kind};
 use crate::limits::*;
 use crate::maths::{self, Matrix};
 use crate::{CantDraw, Mesh, Model, ModelFacts, ModelKind, ReadSeek, Texture, bounds_of, read_at};
@@ -56,8 +56,12 @@ impl TextureAt {
     fn decoding(&self) -> u64 {
         let pixels = u64::from(self.size.width) * u64::from(self.size.height);
         let working = match self.kind {
+            // Rows only.
             Picture::Png => 0,
-            Picture::Jpeg => pixels * u64::from(self.size.channels) * 2,
+            // Measured: a progressive JPEG keeps two bytes for each number of each pixel while
+            // it's decoded, and a little more, here allowed as 4 MB; one not progressive keeps
+            // less.
+            Picture::Jpeg => pixels * u64::from(self.size.channels) * 2 + 4 * 1024 * 1024,
         };
         self.len + pixels * 4 + working
     }
@@ -98,7 +102,7 @@ fn u32_at(bytes: &[u8], at: usize) -> u32 {
 }
 
 /// Reads the file's header and description, and finds where its data lies.
-fn open(reader: &mut dyn ReadSeek, len: u64) -> Result<Glb, CantDraw> {
+fn description(reader: &mut dyn ReadSeek, len: u64) -> Result<Glb, CantDraw> {
     if len < 20 {
         return Err(CantDraw::Damaged);
     }
@@ -245,7 +249,7 @@ fn buffer_at(glb: &Glb, index: usize) -> Result<(u64, u64), CantDraw> {
 /// Checks the whole description, works out every part to be drawn and where, and finds the one
 /// texture and its size.
 fn plan(reader: &mut dyn ReadSeek, len: u64) -> Result<Plan, CantDraw> {
-    let glb = open(reader, len)?;
+    let glb = description(reader, len)?;
     let root = &glb.root;
     // Anything outside the file is refused before anything else is looked at.
     if root.buffers.iter().any(|buffer| buffer.uri.is_some()) || root.images.iter().any(|image| image.uri.is_some()) {
@@ -696,12 +700,23 @@ fn made_normals(positions: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
 /// the memory decoding it takes. The picture is decoded straight into the RGBA it's kept as,
 /// with fewer numbers to a pixel at first, then spread out in place, so no second copy is made.
 fn decode(reader: &mut dyn ReadSeek, at: &TextureAt) -> Result<Texture, CantDraw> {
-    let bytes = read_at(reader, at.at, at.len)?;
+    let bytes = match at.kind {
+        Picture::Png => read_at(reader, at.at, at.len)?,
+        Picture::Jpeg => {
+            let len = at.len;
+            jpeg_needed(len, &mut |from, n| {
+                if from.checked_add(n).is_none_or(|end| end > len) {
+                    return Err(CantDraw::Damaged);
+                }
+                read_at(reader, at.at + from, n)
+            })?
+        }
+    };
     let (width, height) = (at.size.width, at.size.height);
     let pixels = width as usize * height as usize;
     let (mut rgba, channels) = match at.kind {
         Picture::Png => decode_png(&bytes, at.size)?,
-        Picture::Jpeg => decode_jpeg(&bytes, at.size, at.decoding())?,
+        Picture::Jpeg => decode_jpeg(&bytes, at.size)?,
     };
     spread(&mut rgba[..pixels * 4], channels);
     Ok(Texture { width, height, rgba })
@@ -739,34 +754,35 @@ fn png_refusal(why: png::DecodingError) -> CantDraw {
     }
 }
 
-/// A JPEG, as `decode_png` gives a PNG.
-fn decode_jpeg(bytes: &[u8], size: Size, most: u64) -> Result<(Vec<u8>, usize), CantDraw> {
-    use image::ImageDecoder;
-    let mut decoder = image::codecs::jpeg::JpegDecoder::new(Cursor::new(bytes)).map_err(|_| CantDraw::Damaged)?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MOST_TEXTURE_SIDE);
-    limits.max_image_height = Some(MOST_TEXTURE_SIDE);
-    limits.max_alloc = Some(most);
-    decoder.set_limits(limits).map_err(|_| CantDraw::TooLarge)?;
-    if decoder.dimensions() != (size.width, size.height) {
+/// A JPEG, as `decode_png` gives a PNG. The decoder reads the stored bytes where they are,
+/// without a copy of its own.
+fn decode_jpeg(bytes: &[u8], size: Size) -> Result<(Vec<u8>, usize), CantDraw> {
+    use zune_jpeg::zune_core::bytestream::ZCursor;
+    use zune_jpeg::zune_core::colorspace::ColorSpace;
+    use zune_jpeg::zune_core::options::DecoderOptions;
+    let options = DecoderOptions::default()
+        .set_strict_mode(false)
+        .set_max_width(MOST_TEXTURE_SIDE as usize)
+        .set_max_height(MOST_TEXTURE_SIDE as usize);
+    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(bytes), options);
+    decoder.decode_headers().map_err(|_| CantDraw::Damaged)?;
+    if decoder.dimensions() != Some((size.width as usize, size.height as usize)) {
         return Err(CantDraw::Damaged);
     }
-    let channels = match decoder.color_type() {
-        image::ColorType::L8 => 1,
-        image::ColorType::La8 => 2,
-        image::ColorType::Rgb8 => 3,
-        image::ColorType::Rgba8 => 4,
-        _ => return Err(CantDraw::KindNotDrawn),
+    let (out, channels) = match decoder.input_colorspace() {
+        Some(ColorSpace::Luma) => (ColorSpace::Luma, 1),
+        Some(ColorSpace::LumaA) => (ColorSpace::LumaA, 2),
+        Some(ColorSpace::RGBA) => (ColorSpace::RGBA, 4),
+        Some(_) => (ColorSpace::RGB, 3),
+        None => return Err(CantDraw::Damaged),
     };
-    let needed = usize::try_from(decoder.total_bytes()).map_err(|_| CantDraw::TooLarge)?;
+    decoder.set_options(decoder.options().jpeg_set_out_colorspace(out));
+    let needed = decoder.output_buffer_size().ok_or(CantDraw::Damaged)?;
     let mut rgba = vec![0; size.width as usize * size.height as usize * 4];
     if needed != rgba.len() / 4 * channels {
         return Err(CantDraw::Damaged);
     }
-    decoder.read_image(&mut rgba[..needed]).map_err(|why| match why {
-        image::ImageError::Limits(_) => CantDraw::TooLarge,
-        _ => CantDraw::Damaged,
-    })?;
+    decoder.decode_into(&mut rgba[..needed]).map_err(|_| CantDraw::Damaged)?;
     Ok((rgba, channels))
 }
 

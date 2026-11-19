@@ -17,6 +17,9 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 # PNG decoded a row at a time, 16 bits a number made 8 as it's read; the version the picture
 # library uses.
 png = "=0.18.1"
+# JPEG decoded from the stored bytes where they lie, without the copy the picture library makes
+# of them first; the version the picture library uses.
+zune-jpeg = "=0.5.15"
 serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]

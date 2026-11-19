@@ -124,3 +124,81 @@ fn jpeg_size(len: u64, peek: &mut dyn FnMut(u64, u64) -> Result<Vec<u8>, CantDra
     }
     Err(CantDraw::Damaged)
 }
+
+/// Of a JPEG of `len` bytes, only what's needed to decode its picture, read a piece at a time:
+/// its tables, its frame and its scans, up to its end. What else is kept in a JPEG (notes,
+/// colour profiles, a smaller copy of the picture, anything after its end) is left out, so
+/// neither its size nor the decoder's copies of it count against the memory decoding takes.
+pub(crate) fn jpeg_needed(len: u64, read: &mut dyn FnMut(u64, u64) -> Result<Vec<u8>, CantDraw>) -> Result<Vec<u8>, CantDraw> {
+    const PIECE: u64 = 64 * 1024;
+    let mut out = vec![0xFF, 0xD8];
+    let mut at = 2;
+    let mut parts = 0;
+    while len - at >= 2 {
+        let head = read(at, 2)?;
+        if head[0] != 0xFF {
+            return Err(CantDraw::Damaged);
+        }
+        let marker = head[1];
+        if marker == 0xFF {
+            at += 1;
+            continue;
+        }
+        parts += 1;
+        if parts > MOST_JPEG_PARTS {
+            return Err(CantDraw::Damaged);
+        }
+        if marker == 0xD9 {
+            break;
+        }
+        if matches!(marker, 0x01 | 0xD0..=0xD7) {
+            out.extend_from_slice(&head);
+            at += 2;
+            continue;
+        }
+        if len - at < 4 {
+            return Err(CantDraw::Damaged);
+        }
+        let part = u64::from(u16::from_be_bytes(read(at + 2, 2)?.try_into().map_err(|_| CantDraw::Damaged)?));
+        if part < 2 || len - at - 2 < part {
+            return Err(CantDraw::Damaged);
+        }
+        // Kept: everything but notes and kept data (APP1 to APP13, APP15, comments). The
+        // first and fourteenth, which say how its colours are stored, are kept.
+        let left_out = matches!(marker, 0xE1..=0xED | 0xEF | 0xFE);
+        if !left_out {
+            out.extend_from_slice(&read(at, 2 + part)?);
+        }
+        at += 2 + part;
+        if marker == 0xDA {
+            // A scan: its coded data runs to the next marker that isn't a restart.
+            loop {
+                let n = PIECE.min(len - at);
+                if n == 0 {
+                    break;
+                }
+                let piece = read(at, n)?;
+                let marker_at = (0..piece.len().saturating_sub(1))
+                    .find(|&i| piece[i] == 0xFF && !matches!(piece[i + 1], 0x00 | 0xD0..=0xD7));
+                match marker_at {
+                    Some(i) => {
+                        out.extend_from_slice(&piece[..i]);
+                        at += i as u64;
+                        break;
+                    }
+                    None => {
+                        // A last byte that may start a marker is looked at again with what
+                        // follows it.
+                        let keep = if piece.len() > 1 && piece[piece.len() - 1] == 0xFF && at + n < len { n - 1 } else { n };
+                        out.extend_from_slice(&piece[..keep as usize]);
+                        at += keep;
+                    }
+                }
+            }
+        }
+    }
+    out.extend_from_slice(&[0xFF, 0xD9]);
+    // Room grown for it is given back before the picture is decoded beside it.
+    out.shrink_to_fit();
+    Ok(out)
+}

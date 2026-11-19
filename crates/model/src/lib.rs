@@ -52,7 +52,7 @@ impl fmt::Display for CantDraw {
                 "This kind of model can't be drawn here. A model of meshes saved as one file (.glb), or a point cloud (.ply), can."
             }
             CantDraw::TooLarge => {
-                "This model is too large or has too many parts to draw here. Models of up to 256 MB, 4 million triangles or 20 million points can be drawn."
+                "This model is too large or has too many parts to draw here. Models of up to 256 MB, 4 million triangles and 20 million points can be drawn."
             }
             CantDraw::CouldNotRead => "This model couldn't be read.",
             CantDraw::NoAdapter => {

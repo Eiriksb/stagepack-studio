@@ -7139,6 +7139,7 @@ dependencies = [
  "proptest",
  "serde_json",
  "slides-model",
+ "zune-jpeg 0.5.15",
 ]
 
 [[package]]

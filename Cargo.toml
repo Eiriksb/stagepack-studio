@@ -20,3 +20,7 @@ gltf = { version = "=1.4.1", default-features = false }
 # Debug info for GPUI is what makes builds use the most memory.
 [profile.dev.package."*"]
 debug = false
+
+# Pictures in a model are decoded within the time a model is read in, even in a build for tests.
+[profile.dev.package.zune-jpeg]
+opt-level = 3
