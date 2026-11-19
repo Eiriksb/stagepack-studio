@@ -108,7 +108,20 @@ The branch hasn't been pushed or merged yet. Once it's in `main`, this check sta
 
 - **A portrait phone video lays out and plays sideways.** The turn a phone writes in the file isn't read.
 - **A video in a pack whose videos are compressed** (made by another program) shows a plain panel and no length until it has been played once, when it is unpacked to the cache folder.
-- **The window's thread opens a video's file to read its size**, 64 KB at most, when its slide is laid out, and Save waits on the window's thread for a read already under way on a reader's slot. On a network share that has gone away, an open can block.
+- **The window's thread opens a video's file to read its size**, 64 KB at most, when its slide is laid out. On a network share that has gone away, the open itself can block. (Save no longer waits on the window's thread for a read under way: fixed after the final review, in 4a1d19a.)
 - **A pack with one damaged entry no longer opens at all**, where before the rest of it did.
 - **The H.264 licence, for the owner.** H.264 is patented. Cisco pays the licence for its own prebuilt OpenH264 library, not for copies built from source, as this one is. Before a public release the owner should choose between downloading Cisco's library at first use (which would use the network), shipping without H.264 and playing only free formats, or taking legal advice. Until then it's built from source.
 - **Not in this plan:** sound; trimming or cropping a video; other kinds of video than H.264 in MP4; the system's own decoders; putting the video itself into PowerPoint.
+
+## The final review
+
+A reviewer read the whole branch at adb3891 in a copy of its own, ran the engine's and the video crate's tests, eight of the app's suites (the video, large-file, recovery, untitled, clipboard, export and added-file tests among them), the video crate's random-bytes properties at 3,000 cases and the random editing session at 150, and wrote a throwaway test to prove what it suspected. It followed lost work with large files across the tasks: the write, the talk marked saved and the working copy cleared stay in that order on every path it traced, a save that fails or is cancelled clears nothing, and a copy stopped or dropped takes only its own file away. It found nothing that loses work, crashes, or reads or writes outside the talk. It asked for two fixes that matter and seven small ones, and the one fix wave made them:
+
+- **A video whose last picture has no time of its own was refused** as damaged, so it showed only a panel. Some programs write files that way. Such a last picture is now given one frame; a time further past the end is still refused, which keeps the earlier fix of a looped video freezing. (dd96f43)
+- **Save waited on the window's thread for a video's read in progress**, so a read from a network share that had gone away froze the window. The window's thread no longer waits; the save's own background work does, and its Cancel works while it waits. (4a1d19a)
+- **Smaller:** a window closing no longer starts a save from an open Save As dialog or another queued copy; Cancel in the close dialog now cancels a close that was waiting for a save; a refused video file is closed before the save goes on; a packed talk holding a video is opened again after each save in place, so the replaced pack's disk space is freed; a file is opened in a way a named pipe swapped in can't hang; and a file changed while it's copied says to try again. (3b9af08)
+
+At 3b9af08, `scripts/cargo-safe.sh test --workspace` passed: 2,419 tests, 0 failed, 30 ignored, and clippy gave no warnings. The video crate's properties at 2,000 cases, the video tests three runs in a row, the random session and the release timing tests passed: a keystroke on the talk of twenty videos takes 3.0 ms at the median, and a drag frame 0.19 ms. A second reviewer checked the wave, re-traced the whole of the save's reader gate, and found every finding met and nothing new broken. The window wasn't run again after the wave, so its fixes have been seen in tests only.
+
+The smaller findings, the notes for plan G2 and the questions for the owner are in `docs/superpowers/plans/2026-11-18-live-content-plan-g1-decisions.md`.
+
