@@ -600,15 +600,14 @@ fn is_kind(path: &Path, kind: FileKind) -> bool {
 /// The view the 3D model in the file at `path`, outside the talk, is seen whole from, or why
 /// it's refused: for a background task. A mesh's is found from its headers alone; a point
 /// cloud's header doesn't say where its points lie, so a cloud is read whole, within the limits
-/// a model is read with, `meter` told how far that's got. A file that isn't a model, or that no
+/// a model is read with; the bar shows only the copy that follows. A file that isn't a model, or that no
 /// computer could draw, as one damaged, too large or needing other files, is refused before
 /// anything is copied, saying why. Stopped by `meter`, by its Cancel or the window closing, the
 /// read stops, and it's cancelled.
 fn model_framing(path: &Path, meter: &Arc<Meter>) -> Result<View, String> {
     let open = || {
         let file = std::fs::File::open(path).map_err(|_| NotAdded::Unreadable.to_string())?;
-        let len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-        let reader = Watched { inner: std::io::BufReader::new(file), meter: meter.clone(), len };
+        let reader = Watched { inner: std::io::BufReader::new(file), meter: meter.clone(), read: 0 };
         Ok::<_, String>(Box::new(reader) as Box<dyn slides_model::ReadSeek>)
     };
     let said = |why: CantDraw| {
@@ -628,18 +627,35 @@ fn model_framing(path: &Path, meter: &Arc<Meter>) -> Result<View, String> {
     Ok(View::framing(&model.facts))
 }
 
-/// A model's file read before it's copied in, telling `meter` how far the read has got, and
-/// failing once `meter` is stopped.
+/// A model's file read before it's copied in, failing once `meter` is stopped, by its Cancel or
+/// the window closing. It fails as a broken read does, never as one interrupted: a read for an
+/// exact length tries an interrupted one again, for ever.
 struct Watched {
     inner: std::io::BufReader<std::fs::File>,
     meter: Arc<Meter>,
-    len: u64,
+    /// How many bytes it's read.
+    read: u64,
+}
+
+/// For tests: the bytes a model's framing read gets through before it's stopped as its Cancel
+/// stops it, or none.
+static STOP_FRAMING_AFTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// For tests: has a model's framing read stopped as its Cancel stops it once it has read `bytes`
+/// of the file, or never with `None`.
+#[doc(hidden)]
+pub fn stop_framing_after(bytes: Option<u64>) {
+    STOP_FRAMING_AFTER.store(bytes.unwrap_or(u64::MAX), std::sync::atomic::Ordering::SeqCst);
 }
 
 impl Watched {
     fn stopped(&self) -> std::io::Result<()> {
-        if self.meter.stop().load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "stopped"));
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.read >= STOP_FRAMING_AFTER.load(SeqCst) {
+            self.meter.stop().store(true, SeqCst);
+        }
+        if self.meter.stop().load(SeqCst) {
+            return Err(std::io::Error::other("stopped"));
         }
         Ok(())
     }
@@ -647,12 +663,9 @@ impl Watched {
 
 impl std::io::Read for Watched {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        use std::io::Seek as _;
         self.stopped()?;
         let read = self.inner.read(buf)?;
-        if let Ok(at) = self.inner.stream_position() {
-            self.meter.tell(at.min(self.len), self.len);
-        }
+        self.read += read as u64;
         Ok(read)
     }
 }

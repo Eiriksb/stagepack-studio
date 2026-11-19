@@ -1538,3 +1538,37 @@ fn a_cancelled_model_copy_inserts_nothing(cx: &mut TestAppContext) {
     let root = work.path().join("recovery");
     assert!(files_under(&root).iter().all(|name| !name.ends_with(".ply")), "{:?}", files_under(&root));
 }
+
+#[gpui_kit::test]
+fn a_model_copy_cancelled_part_way_through_framing_ends_and_lets_the_next_in(cx: &mut TestAppContext) {
+    let Some(_alone) = alone("a_model_copy_cancelled_part_way_through_framing_ends_and_lets_the_next_in") else { return };
+    let work = tempfile::tempdir().unwrap();
+    let typing = copying_editor(cx, PLAIN_TALK, work.path());
+    // A binary cloud of some 300 KB, read whole to frame it, stopped as its Cancel stops it a
+    // third of the way through its points, which are read a record at a time for exact lengths.
+    let cloud = slides_model::make_test_ply(20_000, true);
+    let from = outside(work.path(), "cloud.ply", &cloud);
+    workspace_view::stop_framing_after(Some(cloud.len() as u64 / 3));
+    let view = typing.view.clone();
+    cx.update(|cx| view.update(cx, |view, cx| view.chosen_models(vec![from], cx)));
+    // It ends, however long the test executor takes to run it.
+    let began = Instant::now();
+    loop {
+        cx.run_until_parked();
+        if typing.status(cx).as_deref() == Some("The copy was cancelled, so nothing was added.") {
+            break;
+        }
+        assert!(began.elapsed() < Duration::from_secs(30), "the copy never ended: {:?}", typing.status(cx));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    workspace_view::stop_framing_after(None);
+    typing.settle(cx);
+    assert_eq!(typing.source(cx), PLAIN_TALK);
+    assert!(!can_undo(&typing, cx));
+    let root = work.path().join("recovery");
+    assert!(files_under(&root).iter().all(|name| !name.ends_with(".ply")), "{:?}", files_under(&root));
+    // The next one goes in.
+    let from = outside(work.path(), "box.glb", &box_model());
+    choose_models(&typing, cx, vec![from]);
+    assert_eq!(typing.source(cx), with_inserted(INSERTED));
+}
