@@ -12,6 +12,8 @@ make = []
 # Each line of a recording is JSON; read into checked values once its length is known.
 serde = { workspace = true }
 serde_json = { workspace = true }
+# How many cells a character takes on the screen.
+unicode-width = "=0.2.3"
 
 [dev-dependencies]
 # The tests make their own recordings.

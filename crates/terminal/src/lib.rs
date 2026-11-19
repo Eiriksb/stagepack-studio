@@ -1,5 +1,6 @@
 //! Terminal recordings: reading an asciinema recording (`.cast`, its second format) into a
-//! checked, bounded list of timed events. This knows nothing of windows and draws nothing.
+//! checked, bounded list of timed events, the screen they're played on, and a player that
+//! steps the screen through time. This knows nothing of windows and draws nothing.
 //!
 //! A recording is data. Every limit is checked as the file is read, before anything is kept:
 //! the file's length, the screen's size, the number of events, each event's output, the
@@ -8,6 +9,9 @@
 //! than crashing or hanging.
 
 mod cast;
+mod parse;
+mod player;
+mod screen;
 
 use std::fmt;
 
@@ -17,6 +21,8 @@ pub use cast::{
 };
 #[cfg(feature = "make")]
 pub use cast::{make_demo_cast, make_test_cast};
+pub use player::{KEPT_EVERY, MOST_KEPT_CELLS, MOST_KEPT_SCREENS, Player};
+pub use screen::{Cell, Colour, Screen, Style, Wide, rgb};
 
 /// Why a recording can't be played.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
