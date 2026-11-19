@@ -1,0 +1,19 @@
+[package]
+name = "slides-terminal"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Makes small recordings, for tests here and in the other crates.
+make = []
+
+[dependencies]
+# Each line of a recording is JSON; read into checked values once its length is known.
+serde = { workspace = true }
+serde_json = "=1.0.154"
+
+[dev-dependencies]
+# The tests make their own recordings.
+slides-terminal = { path = ".", features = ["make"] }
+proptest = "1"

@@ -7173,6 +7173,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "slides-terminal"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "serde_json",
+ "slides-terminal",
+]
+
+[[package]]
 name = "slides-video"
 version = "0.1.0"
 dependencies = [
