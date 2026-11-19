@@ -176,14 +176,14 @@ impl WorkspaceView {
     /// Puts the 3D models in the files at `paths`, as the Model tool's dialog gives them, the
     /// first [`MOST_DROPPED`] of them, on the slide, each once it's copied into the talk, framed
     /// whole, the status line showing how far that's got. A file that isn't a model is said, and
-    /// left out.
+    /// left out, as is why a kind of model this app doesn't read can't be drawn.
     pub fn chosen_models(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         let more = paths.len() > MOST_DROPPED;
         for path in paths.into_iter().take(MOST_DROPPED) {
             if is_kind(&path, FileKind::Model) {
                 self.insert_large_file(FileKind::Model, path, cx);
             } else {
-                self.say(CantDraw::NotAModel.to_string(), cx);
+                self.say(other_model_kind(&path).unwrap_or(CantDraw::NotAModel).to_string(), cx);
             }
         }
         if more {
@@ -200,12 +200,14 @@ impl WorkspaceView {
 
     /// Puts the pictures, videos and 3D models in the first [`MOST_DROPPED`] of the files at
     /// `paths` on the slide, and says if there were more. A picture goes on at once; a video or a
-    /// model once it's copied in.
+    /// model once it's copied in. A kind of model this app doesn't read says why it can't be drawn.
     fn insert_files(&mut self, paths: Vec<PathBuf>, dropped: bool, cx: &mut Context<Self>) {
         let more = paths.len() > MOST_DROPPED;
         for path in paths.iter().take(MOST_DROPPED) {
             if let Some(kind) = [FileKind::Video, FileKind::Model].into_iter().find(|kind| is_kind(path, *kind)) {
                 self.insert_large_file(kind, path.clone(), cx);
+            } else if let Some(why) = other_model_kind(path) {
+                self.say(why.to_string(), cx);
             } else {
                 self.insert_file(path, dropped, cx);
             }
@@ -597,6 +599,17 @@ fn is_kind(path: &Path, kind: FileKind) -> bool {
     extension.is_some_and(|extension| kind.extensions().contains(&extension.as_str()))
 }
 
+/// Why the file at `path` can't be drawn, if it's named as a kind of 3D model this app doesn't
+/// read: a glTF kept as text needs the files beside it, and the others are kinds not drawn.
+fn other_model_kind(path: &Path) -> Option<CantDraw> {
+    let extension = path.extension()?.to_string_lossy().to_ascii_lowercase();
+    match extension.as_str() {
+        "gltf" => Some(CantDraw::NeedsOtherFiles),
+        "obj" | "stl" | "fbx" => Some(CantDraw::KindNotDrawn),
+        _ => None,
+    }
+}
+
 /// The view the 3D model in the file at `path`, outside the talk, is seen whole from, or why
 /// it's refused: for a background task. A mesh's is found from its headers alone; a point
 /// cloud's header doesn't say where its points lie, so a cloud is read whole, within the limits
@@ -642,10 +655,22 @@ struct Watched {
 static STOP_FRAMING_AFTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
 /// For tests: has a model's framing read stopped as its Cancel stops it once it has read `bytes`
-/// of the file, or never with `None`.
+/// of the file, until what's given is dropped, even by a test that fails.
 #[doc(hidden)]
-pub fn stop_framing_after(bytes: Option<u64>) {
-    STOP_FRAMING_AFTER.store(bytes.unwrap_or(u64::MAX), std::sync::atomic::Ordering::SeqCst);
+pub fn stop_framing_after(bytes: u64) -> StopsFraming {
+    STOP_FRAMING_AFTER.store(bytes, std::sync::atomic::Ordering::SeqCst);
+    StopsFraming(())
+}
+
+/// A model's framing read stopped part-way, while it's held: see [`stop_framing_after`].
+#[doc(hidden)]
+#[must_use]
+pub struct StopsFraming(());
+
+impl Drop for StopsFraming {
+    fn drop(&mut self) {
+        STOP_FRAMING_AFTER.store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl Watched {

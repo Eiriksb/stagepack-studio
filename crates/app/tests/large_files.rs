@@ -2026,7 +2026,7 @@ fn a_file_named_glb_that_is_text_is_refused_before_copying() {
         let refused = document.add_large_file(FileKind::Model, name, &from, &counted, &never());
         assert_eq!(refused, Err(NotAdded::NotAModel), "{name}");
         assert_eq!(copied.get(), 0, "{name}: nothing was copied");
-        assert!(NotAdded::NotAModel.to_string().contains("3D model"));
+        assert_eq!(NotAdded::NotAModel.to_string(), slides_model::CantDraw::NotAModel.to_string(), "one wording, whichever way it was added");
     }
     assert!(files_under(&root).iter().all(|name| !name.contains(".glb") && !name.contains(".ply")), "{:?}", files_under(&root));
     // What starts as a model does is taken in, whichever kind it is, whichever line end a point cloud has.

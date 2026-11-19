@@ -172,7 +172,8 @@ impl std::fmt::Display for NotAdded {
             NotAdded::NameTaken => "This talk already has a different file with that name.",
             NotAdded::VideoTooLarge => "That video is larger than 4 GB, so it wasn't added.",
             NotAdded::ModelTooLarge => "That model is larger than 256 MB, so it wasn't added.",
-            NotAdded::NotAModel => "That file isn't a 3D model this app can show, so it wasn't added.",
+            // As a model put on a slide that isn't one says: one refusal, one sentence.
+            NotAdded::NotAModel => "This file isn't a 3D model.",
             NotAdded::NoRoom => "There isn't room on the disk for that file, so it wasn't added.",
             NotAdded::RanOutOfRoom => "The disk filled up while that file was copied, so it wasn't added.",
             NotAdded::Changed => "That file changed or went while it was copied, so it wasn't added.",

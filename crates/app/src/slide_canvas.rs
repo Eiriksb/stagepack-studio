@@ -94,6 +94,12 @@ pub struct SlideCanvas {
     /// The models drawn live over their layers, each with a number of its own.
     turners: Vec<(u64, Turner)>,
     turners_made: u64,
+    /// The models waiting to be read, in turn, as one at a time is: a show arriving on a slide
+    /// of several reads them one after another, not all at once.
+    models_to_read: std::collections::VecDeque<(u64, LargeOpen)>,
+    /// How many models are being read now, and the most there have been at once.
+    models_reading: usize,
+    most_models_read_at_once: usize,
     /// Live pictures of models no longer shown, which the next paint releases.
     retired_models: Vec<Arc<RenderImage>>,
     /// How many live pictures of models have been made to show, and released, in all.
@@ -483,25 +489,43 @@ impl SlideCanvas {
     }
 
     /// Reads the model of turner `id` with `open` on a background task, and puts it on the
-    /// card. What comes of one stopped meanwhile, or of the canvas gone, is let go of.
+    /// card, once those asked for before it are read: one at a time. What comes of one stopped
+    /// meanwhile, or of the canvas gone, is let go of; one stopped before its turn isn't read.
     fn read_model(&mut self, id: u64, open: LargeOpen, cx: &mut Context<Self>) {
+        self.models_to_read.push_back((id, open));
+        self.read_next_model(cx);
+        cx.notify();
+    }
+
+    /// Reads the next model waiting, unless one is being read.
+    fn read_next_model(&mut self, cx: &mut Context<Self>) {
+        if self.models_reading > 0 {
+            return;
+        }
+        let Some((id, open)) = self.next_model_to_read() else { return };
+        self.models_reading += 1;
+        self.most_models_read_at_once = self.most_models_read_at_once.max(self.models_reading);
         cx.spawn(async move |canvas, cx| {
             let reading = cx.background_spawn(async move { model_view::read_model(open) }).await;
             let mut reading = Some(reading);
             canvas
                 .update(cx, |canvas, cx| {
-                    let Some((_, turner)) = canvas.turners.iter_mut().find(|(at, _)| *at == id) else { return };
-                    let Some(reading) = reading.take() else { return };
-                    let read = matches!(reading, model_view::Reading::Read(..));
-                    if let Some(why) = turner.read(reading) {
-                        cx.emit(ModelFailed(why));
+                    canvas.models_reading -= 1;
+                    if let Some((_, turner)) = canvas.turners.iter_mut().find(|(at, _)| *at == id)
+                        && let Some(reading) = reading.take()
+                    {
+                        let read = matches!(reading, model_view::Reading::Read(..));
+                        if let Some(why) = turner.read(reading) {
+                            cx.emit(ModelFailed(why));
+                        }
+                        if turner.was_let_go() {
+                            cx.emit(ModelLetGo);
+                        }
+                        if read {
+                            cx.emit(VideoOpened);
+                        }
                     }
-                    if turner.was_let_go() {
-                        cx.emit(ModelLetGo);
-                    }
-                    if read {
-                        cx.emit(VideoOpened);
-                    }
+                    canvas.read_next_model(cx);
                     cx.notify();
                 })
                 .ok();
@@ -509,7 +533,16 @@ impl SlideCanvas {
             drop(reading);
         })
         .detach();
-        cx.notify();
+    }
+
+    /// The next model waiting to be read whose turner is still here.
+    fn next_model_to_read(&mut self) -> Option<(u64, LargeOpen)> {
+        while let Some((id, open)) = self.models_to_read.pop_front() {
+            if self.turners.iter().any(|(at, _)| *at == id) {
+                return Some((id, open));
+            }
+        }
+        None
     }
 
     /// Stops drawing every model live: each shows its still again.
@@ -638,6 +671,12 @@ impl SlideCanvas {
     #[doc(hidden)]
     pub fn models_waiting(&self) -> bool {
         self.turners.iter().any(|(_, turner)| turner.waiting())
+    }
+
+    /// The most models that have been read at once here.
+    #[doc(hidden)]
+    pub fn most_models_read_at_once(&self) -> usize {
+        self.most_models_read_at_once
     }
 
     /// How many live pictures of models have been made to show, and how many released, in all.

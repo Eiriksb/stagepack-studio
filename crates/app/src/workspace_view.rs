@@ -64,7 +64,7 @@ mod inserting;
 mod saving;
 mod starting;
 
-pub use inserting::{DIALOG_FAILED, ONLY_PICTURES, ONLY_THE_FIRST, stop_framing_after};
+pub use inserting::{DIALOG_FAILED, ONLY_PICTURES, ONLY_THE_FIRST, StopsFraming, stop_framing_after};
 pub use starting::{open_start_window, open_untitled_ids, refresh_start_screens};
 
 pub const CANVAS_ID: &str = "canvas";

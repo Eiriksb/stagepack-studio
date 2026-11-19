@@ -1270,12 +1270,19 @@ fn a_chosen_model_is_copied_in_and_put_on_the_slide_framed(cx: &mut TestAppConte
     let needs_others = slides_model::glb_from(r#"{"asset":{"version":"2.0"},"buffers":[{"uri":"other.bin","byteLength":4}]}"#, &[]);
     let damaged = slides_model::CantDraw::Damaged.to_string();
     let needs = slides_model::CantDraw::NeedsOtherFiles.to_string();
+    let kind = slides_model::CantDraw::KindNotDrawn.to_string();
     let cases = [
         ("words.glb", b"these are words, not a model".to_vec(), NOT_A_MODEL),
         ("empty.ply", Vec::new(), NOT_A_MODEL),
         ("notes.txt", b"words".to_vec(), NOT_A_MODEL),
         ("cut.glb", cut, damaged.as_str()),
         ("others.glb", needs_others, needs.as_str()),
+        // Kinds of model this app doesn't read, by their names: why, rather than that they're none.
+        ("scene.gltf", b"{}".to_vec(), needs.as_str()),
+        ("Scene.GLTF", b"{}".to_vec(), needs.as_str()),
+        ("mesh.obj", b"v 0 0 0".to_vec(), kind.as_str()),
+        ("part.stl", b"solid part".to_vec(), kind.as_str()),
+        ("rig.fbx", b"Kaydara FBX Binary".to_vec(), kind.as_str()),
     ];
     for (name, bytes, why) in cases {
         let from = outside(work.path(), name, &bytes);
@@ -1301,6 +1308,25 @@ fn a_dropped_model_is_inserted_among_dropped_pictures(cx: &mut TestAppContext) {
     let words = outside(work.path(), "words.glb", b"these are words, not a model");
     drop_on_slide(&typing, cx, &[words]);
     assert_eq!(typing.status(cx).as_deref(), Some(NOT_A_MODEL));
+    assert_eq!(typing.source(cx), PLAIN_TALK);
+    // Kinds of model this app doesn't read say why, dropped or their paths pasted.
+    let needs = slides_model::CantDraw::NeedsOtherFiles.to_string();
+    let kind = slides_model::CantDraw::KindNotDrawn.to_string();
+    let others = [("scene.gltf", &needs), ("mesh.OBJ", &kind), ("plan.gltf", &needs), ("part.stl", &kind), ("parts.gltf", &needs), ("rig.fbx", &kind)];
+    let others: Vec<_> = others.into_iter().map(|(name, why)| (name, outside(work.path(), name, b"not one this app reads"), why)).collect();
+    for (name, from, why) in &others {
+        drop_on_slide(&typing, cx, std::slice::from_ref(from));
+        assert_eq!(typing.status(cx).as_deref(), Some(why.as_str()), "{name} dropped");
+    }
+    for (name, from, why) in &others {
+        cx.write_to_clipboard(gpui_kit::ClipboardItem {
+            entries: vec![gpui_kit::ClipboardEntry::ExternalPaths(gpui_kit::ExternalPaths([from.clone()].into_iter().collect()))],
+        });
+        click_on(&typing, cx, stagepack_studio::clipboard_tools::PASTE_ID);
+        cx.run_until_parked();
+        typing.settle(cx);
+        assert_eq!(typing.status(cx).as_deref(), Some(why.as_str()), "{name} pasted");
+    }
     assert_eq!(typing.source(cx), PLAIN_TALK);
 
     let red = outside(work.path(), "red.png", &png(100, 100, [255, 0, 0, 255]));
@@ -1528,6 +1554,44 @@ fn a_hand_written_model_reads_or_says_why(cx: &mut TestAppContext) {
     }
 }
 
+#[gpui_kit::test]
+fn a_model_that_cannot_be_drawn_offers_no_turn(cx: &mut TestAppContext) {
+    let Some(_alone) = alone("a_model_that_cannot_be_drawn_offers_no_turn") else { return };
+    let typing = open_folder(cx, talk_folder(&talk(), b"these are words, not a model"), None);
+    stills_made(&typing, cx);
+    select_model(&typing, cx);
+    assert!(bounds_of(&typing, cx, MODEL_TURN_ID).is_none(), "Turn isn't offered for a model its still says can't be drawn");
+    // Space says why, and reads nothing.
+    let put_on = model_view::models_put_on_card();
+    typing.press(cx, "space");
+    typing.settle(cx);
+    assert_eq!(typing.status(cx).as_deref(), Some(NOT_A_MODEL));
+    let canvas = editor_canvas(&typing, cx);
+    assert!(cx.read(|cx| canvas.read(cx).models_turned()).is_empty(), "nothing is turned");
+    assert_eq!(model_view::models_put_on_card(), put_on);
+    // One that can be drawn offers it.
+    let typing = editor(cx, &talk());
+    select_model(&typing, cx);
+    assert!(bounds_of(&typing, cx, MODEL_TURN_ID).is_some());
+}
+
+#[gpui_kit::test]
+fn the_show_reads_its_models_one_at_a_time(cx: &mut TestAppContext) {
+    let Some(_alone) = alone("the_show_reads_its_models_one_at_a_time") else { return };
+    let tags: Vec<String> = (0..3)
+        .map(|at| format!("<Model src=\"assets/box.glb\" x=\"{}\" y=\"100\" w=\"400\" h=\"300\" view=\"{FRONT}\" turn=\"auto\" />", 100 + at * 500))
+        .collect();
+    let source = format!("# One\n\n---\n\n# Models\n\n{}\n", tags.join("\n\n"));
+    let show = rehearse(cx, &source);
+    show.press(cx, "right");
+    let canvas = show.canvas(cx);
+    until(cx, show.audience, "every model's live picture", |cx| {
+        let shown = pictures(cx, &canvas);
+        shown.len() == 3 && shown.iter().all(Option::is_some)
+    });
+    assert_eq!(cx.read(|cx| canvas.read(cx).most_models_read_at_once()), 1, "read one at a time");
+}
+
 /// Every word the window shows that a person reads: what each thing is called, the status
 /// line, the notices, and what the form's fields show.
 fn words_shown(typing: &Typing, cx: &mut TestAppContext) -> Vec<String> {
@@ -1679,7 +1743,7 @@ fn a_model_copy_cancelled_part_way_through_framing_ends_and_lets_the_next_in(cx:
     // third of the way through its points, which are read a record at a time for exact lengths.
     let cloud = slides_model::make_test_ply(20_000, true);
     let from = outside(work.path(), "cloud.ply", &cloud);
-    workspace_view::stop_framing_after(Some(cloud.len() as u64 / 3));
+    let stopping = workspace_view::stop_framing_after(cloud.len() as u64 / 3);
     let view = typing.view.clone();
     cx.update(|cx| view.update(cx, |view, cx| view.chosen_models(vec![from], cx)));
     // It ends, however long the test executor takes to run it.
@@ -1692,7 +1756,7 @@ fn a_model_copy_cancelled_part_way_through_framing_ends_and_lets_the_next_in(cx:
         assert!(began.elapsed() < Duration::from_secs(30), "the copy never ended: {:?}", typing.status(cx));
         std::thread::sleep(Duration::from_millis(5));
     }
-    workspace_view::stop_framing_after(None);
+    drop(stopping);
     typing.settle(cx);
     assert_eq!(typing.source(cx), PLAIN_TALK);
     assert!(!can_undo(&typing, cx));

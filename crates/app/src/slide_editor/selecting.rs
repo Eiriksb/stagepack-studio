@@ -76,6 +76,7 @@ impl SlideEditor {
 
     /// Has the 3D model selected drawn live, to be turned by hand, or goes back to its still
     /// while it's turned, as its buttons and Space do. With no model selected, the key goes on.
+    /// One whose still already says it can't be drawn isn't read: why is said again.
     pub(super) fn turn_or_stop(&mut self, cx: &mut Context<Self>) {
         let Some(document) = self.document.clone() else {
             return;
@@ -90,6 +91,10 @@ impl SlideEditor {
         }
         self.stop_video(cx);
         let Some(source) = model.source.clone() else { return };
+        if let Some(said) = document.update(cx, |document, _| document.selected_model_said()) {
+            cx.emit(EditorEvent::Said(said.into()));
+            return;
+        }
         let opened = document.read(cx).open_large(&model.on.src);
         let Some(opened) = opened else {
             let said = document.update(cx, |document, _| document.selected_model_said());

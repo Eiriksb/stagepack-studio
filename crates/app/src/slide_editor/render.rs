@@ -49,10 +49,15 @@ impl Render for SlideEditor {
         };
         let video_playing = video.is_some() && self.video_playing(cx);
         // A model selected: a button in its middle that has it turned by hand, and while it is,
-        // buttons that write the view shown into the talk and go back to its still.
-        let model = match (selecting, self.document.clone()) {
-            (true, Some(document)) => document.update(cx, |document, _| document.selected_model()),
-            _ => None,
+        // buttons that write the view shown into the talk and go back to its still. One whose
+        // still says it can't be drawn has no Turn.
+        let (model, cant_draw) = match (selecting, self.document.clone()) {
+            (true, Some(document)) => document.update(cx, |document, _| {
+                let model = document.selected_model();
+                let cant_draw = model.is_some() && document.selected_model_said().is_some();
+                (model, cant_draw)
+            }),
+            _ => (None, false),
         };
         let model_turning = model.is_some() && self.model_turning();
         // The lines what's dragged snaps to, while the button is down.
@@ -292,7 +297,13 @@ impl Render for SlideEditor {
         // The buttons on a model: Turn, or Set view and Done while it's turned, each with where
         // its middle is from the model's.
         let model_buttons: Vec<(&'static str, &'static str, f32)> =
-            if model_turning { vec![(MODEL_SET_VIEW_ID, "Set view", -44.), (MODEL_DONE_ID, "Done", 44.)] } else { vec![(MODEL_TURN_ID, "Turn", 0.)] };
+            if model_turning {
+                vec![(MODEL_SET_VIEW_ID, "Set view", -44.), (MODEL_DONE_ID, "Done", 44.)]
+            } else if cant_draw {
+                Vec::new()
+            } else {
+                vec![(MODEL_TURN_ID, "Turn", 0.)]
+            };
         let (button_color, button_text) = (cx.theme().primary, cx.theme().primary_foreground);
         div()
             .id(SLIDE_EDITOR_ID)
