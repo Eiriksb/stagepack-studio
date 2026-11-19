@@ -52,19 +52,23 @@ struct TextureAt {
 
 impl TextureAt {
     /// The most memory decoding it may take at once: its bytes as stored, the picture as RGBA,
-    /// and for a JPEG, the decoder's own working, taken as two bytes for each number stored.
+    /// and the decoder's own working.
     fn decoding(&self) -> u64 {
-        let pixels = u64::from(self.size.width) * u64::from(self.size.height);
-        let working = match self.kind {
-            // Rows only.
-            Picture::Png => 0,
-            // Measured: a progressive JPEG keeps two bytes for each number of each pixel while
-            // it's decoded, and a little more, here allowed as 4 MB; one not progressive keeps
-            // less.
-            Picture::Jpeg => pixels * u64::from(self.size.channels) * 2 + 4 * 1024 * 1024,
-        };
-        self.len + pixels * 4 + working
+        match self.kind {
+            // A PNG is decoded a row at a time.
+            Picture::Png => self.len + u64::from(self.size.width) * u64::from(self.size.height) * 4,
+            Picture::Jpeg => jpeg_decoding(self.len, self.size.width, self.size.height, self.size.channels),
+        }
     }
+}
+
+/// The most memory decoding a JPEG may take, `stored` bytes of it held: the picture as RGBA, and
+/// the decoder's own working. Measured, a progressive JPEG keeps two bytes for each number of
+/// each pixel while it's decoded, and a little more, here allowed as 4 MB; one not progressive
+/// keeps less.
+fn jpeg_decoding(stored: u64, width: u32, height: u32, channels: u8) -> u64 {
+    let pixels = u64::from(width) * u64::from(height);
+    stored + pixels * 4 + pixels * u64::from(channels) * 2 + 4 * 1024 * 1024
 }
 
 /// What a description says is to be drawn, all of it checked.
@@ -766,8 +770,14 @@ fn decode_jpeg(bytes: &[u8], size: Size) -> Result<(Vec<u8>, usize), CantDraw> {
         .set_max_height(MOST_TEXTURE_SIDE as usize);
     let mut decoder = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(bytes), options);
     decoder.decode_headers().map_err(|_| CantDraw::Damaged)?;
-    if decoder.dimensions() != Some((size.width as usize, size.height as usize)) {
+    // What the decoder found is what's decoded, so it's checked again against what was allowed
+    // for, before anything is made for it.
+    let info = decoder.info().ok_or(CantDraw::Damaged)?;
+    if (u32::from(info.width), u32::from(info.height), info.components) != (size.width, size.height, size.channels) {
         return Err(CantDraw::Damaged);
+    }
+    if jpeg_decoding(bytes.len() as u64, size.width, size.height, info.components) > MOST_DECODING {
+        return Err(CantDraw::TooLarge);
     }
     let (out, channels) = match decoder.input_colorspace() {
         Some(ColorSpace::Luma) => (ColorSpace::Luma, 1),

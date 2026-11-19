@@ -183,6 +183,12 @@ fn with_texture(picture: &[u8]) -> Vec<u8> {
 /// The made grid with `picture` as its texture, followed by `pad` bytes of nothing kept in the
 /// same part of the file: the start of the file, as far as the picture's end, and its length.
 fn padded_texture(picture: &[u8], pad: u64) -> (Vec<u8>, u64) {
+    padded_texture_with(picture, pad, 0)
+}
+
+/// The same, the padding of `fill` bytes, as `Virtual::filled` gives them. The few bytes that
+/// pad the picture to four are made `fill` too.
+fn padded_texture_with(picture: &[u8], pad: u64, fill: u8) -> (Vec<u8>, u64) {
     assert_eq!(pad % 4, 0);
     let glb = with_texture(picture);
     let (text, bin) = glb_parts(&glb).unwrap();
@@ -202,6 +208,7 @@ fn padded_texture(picture: &[u8], pad: u64) -> (Vec<u8>, u64) {
     let bin_at = 20 + described;
     let bin_len = u32::from_le_bytes(start[bin_at..bin_at + 4].try_into().unwrap()) + pad as u32;
     start[bin_at..bin_at + 4].copy_from_slice(&bin_len.to_le_bytes());
+    start[bin_at + 8 + offset + picture.len()..].fill(fill);
     let len = u64::from(total);
     (start, len)
 }
@@ -528,18 +535,55 @@ fn any_bytes_read_or_say_why_named_cases() {
     image::GrayImage::from_pixel(3, 2, image::Luma([90])).write_to(&mut grey, image::ImageFormat::Png).unwrap();
     let grey = read(reader(with_texture(grey.get_ref()))).unwrap().texture.unwrap();
     assert_eq!(grey.rgba, [90, 90, 90, 255].repeat(6));
-    // A JPEG with markers that stand alone before its size: they have no length to read.
+    // A JPEG with markers that stand alone among its parts, where they don't belong: the
+    // decoder would read a length after them, so they're damage, as every walk here takes them.
     let jpeg = make_test_glb(MadeGlb::Grid { cells: 2, texture: 32, jpeg: true });
     let (text, bin) = glb_parts(&jpeg).unwrap();
     let json: Value = serde_json::from_str(&text).unwrap();
     let view = &json["bufferViews"][json["images"][0]["bufferView"].as_u64().unwrap() as usize];
     let at = view["byteOffset"].as_u64().unwrap() as usize;
-    let picture = &bin[at..at + view["byteLength"].as_u64().unwrap() as usize];
-    let marked = [&picture[..2], &[0xFF, 0x01, 0xFF, 0xD0, 0xFF, 0xFF, 0xD7], &picture[2..]].concat();
-    // Its size is found past them; whether the decoder then takes them is its own matter.
-    let marked = with_texture(&marked);
-    assert!(facts(reader(marked.clone())).is_ok());
-    assert!(matches!(facts_and_read(marked).map(|m| m.texture.map(|t| (t.width, t.height))), Ok(Some((32, 32))) | Err(CantDraw::Damaged)));
+    let picture = bin[at..at + view["byteLength"].as_u64().unwrap() as usize].to_vec();
+    for alone in [[0xFF, 0x01], [0xFF, 0xD0], [0xFF, 0xD7], [0xFF, 0xD8]] {
+        let marked = with_texture(&[&picture[..2], &alone, &picture[2..]].concat());
+        assert_eq!(facts(reader(marked.clone())).err(), Some(CantDraw::Damaged), "{alone:x?}");
+        assert_eq!(facts_and_read(marked).err(), Some(CantDraw::Damaged));
+    }
+    // Fill bytes before a marker are passed over.
+    let filled = with_texture(&[&picture[..2], &[0xFF; 5], &picture[2..]].concat());
+    assert_eq!(facts_and_read(filled).unwrap().texture.map(|t| (t.width, t.height)), Some((32, 32)));
+    // A JPEG cut short, in its last scan or just before its end, is damaged.
+    let whole = progressive_jpeg(64, 64, 3);
+    for cut in [whole.len() - 2, whole.len() - 3, whole.len() / 2] {
+        assert_eq!(facts_and_read(with_texture(&whole[..cut])).err(), Some(CantDraw::Damaged), "cut at {cut}");
+    }
+    assert!(facts_and_read(with_texture(&whole)).is_ok());
+    // A grey frame said first, a marker standing alone that the decoder would read a length
+    // after, landing it past the grey frame on a colour one twice the size: budgeted from one
+    // and decoded as the other, unless both agree.
+    let grey_frame = [0xFF, 0xC0, 0, 11, 8, 0x1B, 0x58, 0x1B, 0x58, 1, 1, 0x11, 0];
+    let mut desync = vec![0xFF, 0xD8, 0xFF, 0xD0];
+    desync.extend_from_slice(&grey_frame);
+    desync.extend_from_slice(&[0xFF, 0xE0]);
+    desync.extend_from_slice(&65_476u16.to_be_bytes());
+    desync.resize(desync.len() + 65_474, 0);
+    desync.extend_from_slice(&progressive_jpeg(7000, 7000, 3)[2..]);
+    let desync = with_texture(&desync);
+    assert!(facts_and_read(desync).is_err());
+    // The same without the marker: a grey frame first, then a whole colour JPEG's parts.
+    let mut two_frames = vec![0xFF, 0xD8];
+    two_frames.extend_from_slice(&grey_frame);
+    two_frames.extend_from_slice(&progressive_jpeg(7000, 7000, 3)[2..]);
+    assert!(facts_and_read(with_texture(&two_frames)).is_err());
+    // A JPEG of 100 MB of fill bytes after its frame is walked through in pieces, quickly.
+    let mut start = progressive_jpeg(16, 16, 3);
+    let scan = start.windows(2).position(|w| w == [0xFF, 0xDA]).unwrap();
+    start.truncate(scan);
+    let (start, len) = padded_texture_with(&start, 100_000_000, 0xFF);
+    let filled = || Box::new(Virtual::new(&start, len).filled(0xFF));
+    let started = Instant::now();
+    assert!(facts(filled()).is_ok());
+    assert_eq!(read(filled()).err(), Some(CantDraw::Damaged));
+    assert!(started.elapsed() < MOST_TIME, "{:?}", started.elapsed());
 
     // A progressive JPEG of 4:4:4 colour, the kind that takes the most to decode, just within
     // what may be taken, and one a little larger, refused before it's decoded. Each is a few
@@ -713,26 +757,34 @@ fn any_bytes_read_or_say_why_named_cases() {
 }
 
 /// A reader of a file of `len` bytes that starts with `start` and is nothing but zeros after it,
-/// without holding it.
+/// or another byte, without holding it.
 struct Virtual {
     start: Vec<u8>,
     len: u64,
     at: u64,
+    fill: u8,
 }
 
 impl Virtual {
     fn new(start: &[u8], len: u64) -> Virtual {
-        Virtual { start: start.to_vec(), len, at: 0 }
+        Virtual { start: start.to_vec(), len, at: 0, fill: 0 }
+    }
+
+    fn filled(self, fill: u8) -> Virtual {
+        Virtual { fill, ..self }
     }
 }
 
 impl Read for Virtual {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = (self.len.saturating_sub(self.at)).min(buf.len() as u64) as usize;
-        for byte in &mut buf[..n] {
-            *byte = self.start.get(self.at as usize).copied().unwrap_or(0);
-            self.at += 1;
+        let from_start = (self.start.len() as u64).saturating_sub(self.at).min(n as u64) as usize;
+        if from_start > 0 {
+            let at = self.at as usize;
+            buf[..from_start].copy_from_slice(&self.start[at..at + from_start]);
         }
+        buf[from_start..n].fill(self.fill);
+        self.at += n as u64;
         Ok(n)
     }
 }

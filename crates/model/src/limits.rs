@@ -30,5 +30,8 @@ pub(crate) const MOST_OBJECTS: usize = 100_000;
 pub(crate) const MOST_VALUES: usize = 1_000_000;
 /// The most parts of a JPEG looked through for its size.
 pub(crate) const MOST_JPEG_PARTS: u32 = 4096;
+/// The most steps taken walking a JPEG, each a part or a piece of 64 KB: enough for its parts and
+/// for a file of the most size read through in pieces twice over.
+pub(crate) const MOST_JPEG_PASSES: u32 = 4 * MOST_JPEG_PARTS + 2 * (MOST_BYTES / (64 * 1024)) as u32;
 /// The most memory decoding the texture may take at once.
 pub const MOST_DECODING: u64 = 300 * 1024 * 1024;
