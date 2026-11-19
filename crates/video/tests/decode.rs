@@ -64,6 +64,7 @@ fn frame_for_skips_what_is_late() {
     let frame = playing.frame_for(due(5, 30)).unwrap();
     assert!((frame.at - 5.0 / 30.0).abs() < 0.0005, "{}", frame.at);
     assert!(is_colour(&frame, colour_of(5), 8));
+    assert_eq!(playing.skipped(), 5, "the five before it were skipped");
     // Nothing newer is due yet.
     assert!(playing.frame_for(due(5, 30)).is_none());
     let frame = next_frame(&mut playing, due(6, 30)).unwrap();
@@ -72,6 +73,7 @@ fn frame_for_skips_what_is_late() {
     assert!(wait_for(Duration::from_secs(2), || playing.queued() == 12));
     let frame = playing.frame_for(due(12, 30)).unwrap();
     assert!(is_colour(&frame, colour_of(12), 8));
+    assert_eq!(playing.skipped(), 10, "and the five between six and twelve");
 }
 
 #[test]
@@ -134,8 +136,9 @@ fn dropping_it_ends_the_thread_quickly() {
     let video = open(reader(coloured_video(64, 48, 90, 30))).unwrap();
     let playing = video.play(0.0, true);
     let name = playing.thread_name().to_owned();
+    // The thread names itself as it starts, a moment after `play` returns.
     #[cfg(target_os = "linux")]
-    assert!(thread_is_running(&name), "no thread named {name}");
+    assert!(wait_for(Duration::from_millis(200), || thread_is_running(&name)), "no thread named {name}");
     let alive = playing.thread_alive();
     std::thread::sleep(Duration::from_millis(50));
     let dropped = Instant::now();

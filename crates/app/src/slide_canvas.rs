@@ -75,8 +75,22 @@ pub struct SlideCanvas {
     /// the window lets go of them, as it paints.
     frames_made: usize,
     frames_released: Rc<Cell<usize>>,
+    /// How many pictures of videos were passed over, late, in all.
+    frames_skipped: usize,
     /// How long taking the videos' pictures last took the window's thread.
     last_advance: std::time::Duration,
+    /// When the counts were last written out, and what they were then: see [`COUNTS_TO_STDERR`].
+    counted: Option<(std::time::Instant, usize, usize, usize)>,
+}
+
+/// Set, to anything, to have a window playing a video write how many of its pictures were
+/// shown, skipped and released each second to the standard error: for checking by hand how
+/// smoothly a video plays on a computer.
+pub const COUNTS_TO_STDERR: &str = "STUDIO_VIDEO_COUNTS";
+
+fn counts_wanted() -> bool {
+    static WANTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WANTED.get_or_init(|| std::env::var_os(COUNTS_TO_STDERR).is_some())
 }
 
 impl EventEmitter<ScaleChanged> for SlideCanvas {}
@@ -345,6 +359,12 @@ impl SlideCanvas {
         (self.frames_made, self.frames_released.get())
     }
 
+    /// How many pictures of videos have been passed over, late, for a newer one, in all.
+    #[doc(hidden)]
+    pub fn video_pictures_skipped(&self) -> usize {
+        self.frames_skipped
+    }
+
     /// How long taking the videos' pictures took the window's thread when it last drew.
     #[doc(hidden)]
     pub fn last_video_advance(&self) -> std::time::Duration {
@@ -355,6 +375,8 @@ impl SlideCanvas {
     /// while any plays. A turned video's picture is turned on a background task.
     fn advance_videos(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.players.is_empty() {
+            // The next to play is counted from its start.
+            self.counted = None;
             return;
         }
         let began = std::time::Instant::now();
@@ -366,6 +388,7 @@ impl SlideCanvas {
             let (waiting, failing) = (player.was_let_go(), player.failed().is_some());
             let advanced = player.advance(now, self.scale);
             self.frames_made += usize::from(advanced.made);
+            self.frames_skipped += advanced.skipped;
             self.retired_frames.extend(advanced.replaced);
             turnings.extend(advanced.turning.map(|turning| (*id, turning)));
             playing |= player.wants_frames();
@@ -398,7 +421,31 @@ impl SlideCanvas {
         if let_go {
             cx.emit(VideoLetGo);
         }
+        if counts_wanted() {
+            self.write_counts(began);
+        }
         self.last_advance = began.elapsed();
+    }
+
+    /// Writes how many pictures were shown, skipped and released since last written, once a
+    /// second at most, as [`COUNTS_TO_STDERR`] asks.
+    fn write_counts(&mut self, now: std::time::Instant) {
+        let (made, skipped, released) = (self.frames_made, self.frames_skipped, self.frames_released.get());
+        let Some((then, made_then, skipped_then, released_then)) = self.counted else {
+            self.counted = Some((now, made, skipped, released));
+            return;
+        };
+        let seconds = now.duration_since(then).as_secs_f64();
+        if seconds < 1.0 {
+            return;
+        }
+        eprintln!(
+            "video pictures in {seconds:.2} s: {} shown, {} skipped, {} released",
+            made - made_then,
+            skipped - skipped_then,
+            released - released_then
+        );
+        self.counted = Some((now, made, skipped, released));
     }
 
     /// The image of every layer, first to last, hidden ones included.

@@ -77,7 +77,7 @@ impl Video {
             state.done = true;
             state.failed = Some(CantPlay::CouldNotRead);
         }
-        Playing { shared, name, alive: token }
+        Playing { shared, name, alive: token, skipped: 0 }
     }
 
     /// How long each picture took to read, decode and turn into window colours, in order.
@@ -102,6 +102,8 @@ pub struct Playing {
     shared: Arc<Shared>,
     name: String,
     alive: Weak<()>,
+    /// How many pictures were passed over, late, for a newer one.
+    skipped: u64,
 }
 
 #[derive(Default)]
@@ -144,6 +146,9 @@ impl Playing {
         let mut state = self.shared.lock();
         let mut newest = None;
         while state.queue.front().is_some_and(|q| q.due <= seconds) {
+            if newest.is_some() {
+                self.skipped += 1;
+            }
             newest = state.queue.pop_front();
         }
         drop(state);
@@ -168,6 +173,12 @@ impl Playing {
     #[doc(hidden)]
     pub fn queued(&self) -> usize {
         self.shared.lock().queue.len()
+    }
+
+    /// How many pictures have been passed over, late, for a newer one due.
+    #[doc(hidden)]
+    pub fn skipped(&self) -> u64 {
+        self.skipped
     }
 
     /// The most pictures the queue has held at once.

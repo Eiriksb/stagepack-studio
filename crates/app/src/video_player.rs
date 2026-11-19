@@ -349,6 +349,7 @@ impl Player {
             None => self.from,
         };
         let mut advanced = Advanced::default();
+        let skipped_before = playing.skipped();
         let turned = self.on.rotate != 0.0;
         if !(turned && (self.turning || scale.is_none()))
             && let Some(frame) = playing.frame_for(seconds)
@@ -367,6 +368,7 @@ impl Player {
                 }
             }
         }
+        advanced.skipped = (playing.skipped() - skipped_before) as usize;
         let next = if playing.ended() {
             Some(State::Ended)
         } else {
@@ -416,6 +418,8 @@ impl Drop for Player {
 pub(crate) struct Advanced {
     /// Whether a new picture was made to show.
     pub made: bool,
+    /// How many pictures were passed over, late, for the one taken.
+    pub skipped: usize,
     /// The picture no longer shown.
     pub replaced: Option<Arc<RenderImage>>,
     /// A picture to turn off the window's thread, and then show.

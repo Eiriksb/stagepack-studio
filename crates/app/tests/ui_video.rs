@@ -390,11 +390,14 @@ fn a_late_frame_is_skipped(cx: &mut TestAppContext) {
     let canvas = play_selected(&typing, cx);
     decoded_ahead(cx, typing.handle, &canvas, 11);
     let (made, released) = images_made_and_released(cx, &canvas);
+    let skipped = cx.read(|cx| canvas.read(cx).video_pictures_skipped());
     next_frame(cx, typing.handle, 1000);
     assert_eq!(frame_times(cx, &canvas), vec![Some(1.0)], "the picture due, ten on");
     assert!(shows(frames(cx, &canvas)[0].as_ref().unwrap(), 10));
     // Only the one due was made to show, and the one it replaced was released.
     assert_eq!(images_made_and_released(cx, &canvas), (made + 1, released + 1));
+    // The nine between were skipped, and counted.
+    assert_eq!(cx.read(|cx| canvas.read(cx).video_pictures_skipped()), skipped + 9);
 }
 
 #[gpui_kit::test]
