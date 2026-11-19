@@ -3,7 +3,7 @@
 //!
 //! A recording is data. Every limit is checked as the file is read, before anything is kept:
 //! the file's length, the screen's size, the number of events, each event's output, the
-//! recording's length and all it keeps. Nothing in a recording is run, sent anywhere or read
+//! recording's length and all the text it keeps. Nothing in a recording is run, sent anywhere or read
 //! as a path. A file that isn't a recording that can be played says why in plain words rather
 //! than crashing or hanging.
 
@@ -12,7 +12,7 @@ mod cast;
 use std::fmt;
 
 pub use cast::{
-    Event, MOST_BYTES, MOST_EVENTS, MOST_GAP, MOST_HEIGHT, MOST_KEPT, MOST_LENGTH, MOST_OUTPUT, MOST_WIDTH, Mark, Recording,
+    Event, MOST_BYTES, MOST_EVENTS, MOST_GAP, MOST_HEIGHT, MOST_TEXT, MOST_LENGTH, MOST_OUTPUT, MOST_WIDTH, Mark, Recording,
     RecordingFacts, What, facts, played, read,
 };
 #[cfg(feature = "make")]

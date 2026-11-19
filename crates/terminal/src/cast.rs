@@ -25,10 +25,11 @@ pub const MOST_OUTPUT: usize = 1024 * 1024;
 pub const MOST_LENGTH: Duration = Duration::from_secs(24 * 60 * 60);
 /// The longest wait between two events as it's played.
 pub const MOST_GAP: Duration = Duration::from_secs(1);
-/// The most a read recording may keep: its text, once what isn't UTF-8 is made replacement
-/// characters, and its events and marks. Twice the most a file holds allows for the
-/// replacement characters.
-pub const MOST_KEPT: usize = 2 * MOST_BYTES;
+/// The most text a read recording may keep, once what isn't UTF-8 is made replacement
+/// characters: twice the most a file holds allows for them. Its events and marks are bounded
+/// by `MOST_EVENTS` instead: an event is held in 48 bytes and a mark in 24 more, so a million
+/// keep 72 MB at most besides their text.
+pub const MOST_TEXT: usize = 2 * MOST_BYTES;
 
 /// The longest line a recording's header may be.
 const MOST_HEADER: usize = 1024 * 1024;
@@ -115,7 +116,7 @@ pub fn read(bytes: &[u8]) -> Result<Recording, CantPlay> {
         };
         events.push(Event { at, what });
     })?;
-    // What's kept was counted by its length; it's held at that length too.
+    // The text was counted by its length; it's held at that length, and so are these.
     events.shrink_to_fit();
     marks.shrink_to_fit();
     Ok(Recording { width: read.width, height: read.height, events, length: read.length, marks })
@@ -199,7 +200,7 @@ fn walk<'a>(bytes: &'a [u8], mut each: impl FnMut(Duration, Duration, Seen<'a>))
     let height = side(header.height.as_ref(), MOST_HEIGHT)?;
 
     let mut events = 0;
-    let mut kept = 0;
+    let mut text_kept = 0;
     let mut last = 0.0;
     let mut timing = Timing::default();
     for line in bytes[header_end..].split(|b| *b == b'\n') {
@@ -235,13 +236,11 @@ fn walk<'a>(bytes: &'a [u8], mut each: impl FnMut(Duration, Duration, Seen<'a>))
             // Input, and codes not known here.
             _ => continue,
         };
-        kept += size_of::<Event>()
-            + match &seen {
-                Seen::Output(text) => text.len(),
-                Seen::Mark(text) => text.len() + size_of::<Mark>(),
-                Seen::Resize(..) => 0,
-            };
-        if kept > MOST_KEPT {
+        text_kept += match &seen {
+            Seen::Output(text) | Seen::Mark(text) => text.len(),
+            Seen::Resize(..) => 0,
+        };
+        if text_kept > MOST_TEXT {
             return Err(CantPlay::TooLarge);
         }
         let at = Duration::from_secs_f64(time);

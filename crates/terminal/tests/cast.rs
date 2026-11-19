@@ -63,6 +63,11 @@ fn measured<T>(work: impl FnOnce() -> T) -> (T, usize, isize) {
     (out, LARGEST.with(Cell::get), held() - before)
 }
 
+/// The most a read recording keeps: its text, and its events and marks.
+fn most_kept() -> isize {
+    (MOST_TEXT + MOST_EVENTS * (size_of::<Event>() + size_of::<Mark>())) as isize
+}
+
 /// The most allocated at once while reading.
 const MOST_ALLOCATED: usize = 64 * 1024 * 1024;
 const MOST_TIME: Duration = Duration::from_secs(2);
@@ -80,7 +85,7 @@ fn facts_and_read(bytes: &[u8]) -> Result<Recording, CantPlay> {
     let (recording, largest, kept) = measured(|| read(bytes));
     assert!(started.elapsed() < MOST_TIME, "reading took {:?}", started.elapsed());
     assert!(largest <= MOST_ALLOCATED, "reading allocated {largest} at once");
-    assert!(kept <= (MOST_KEPT + 1024) as isize, "reading kept {kept}");
+    assert!(kept <= most_kept() + 1024, "reading kept {kept}");
     match (&facts, &recording) {
         (Ok(facts), Ok(recording)) => {
             agree(facts, recording);
@@ -381,11 +386,13 @@ fn what_a_recording_keeps_is_bounded() {
     assert_eq!(facts_and_read(&twenty).unwrap(), recording);
     drop((twenty, recording));
 
-    // A million marks of labels that aren't UTF-8 would keep more than the most.
+    // A million marks of labels that aren't UTF-8 keep 60 MB of text, within the most, and
+    // their events and marks besides.
     let marks = not_utf8("m", MOST_EVENTS, 20);
     assert!(marks.len() <= MOST_BYTES);
-    assert_eq!(facts_and_read(&marks).err(), Some(CantPlay::TooLarge));
-    drop(marks);
+    let recording = facts_and_read(&marks).unwrap();
+    assert_eq!(recording.label(&recording.marks[MOST_EVENTS - 1]), "\u{fffd}".repeat(20));
+    drop((marks, recording));
     // A hundred thousand keep each label once, held at its length.
     let marks = not_utf8("m", 100_000, 20);
     let (recording, _, kept) = measured(|| read(&marks));
@@ -393,6 +400,27 @@ fn what_a_recording_keeps_is_bounded() {
     let each = size_of::<Event>() + size_of::<Mark>() + 60;
     assert!(kept <= (100_000 * each) as isize + 4096, "kept {kept}, {each} a mark");
     assert_eq!(recording.label(&recording.marks[99_999]), "\u{fffd}".repeat(20));
+}
+
+#[test]
+fn a_recording_within_the_limits_plays() {
+    // A million outputs of 22 letters, in a file just under the most.
+    let line = format!("[0,\"o\",\"{}\"]\n", "a".repeat(22));
+    let full = [make_test_cast(80, 24, &[]), line.repeat(MOST_EVENTS).into_bytes()].concat();
+    assert!(full.len() <= MOST_BYTES && full.len() > MOST_BYTES - MOST_BYTES / 16, "{}", full.len());
+    let (recording, _, kept) = measured(|| read(&full));
+    assert_eq!(recording.unwrap().events.len(), MOST_EVENTS);
+    assert!(kept <= most_kept(), "kept {kept}");
+    assert_eq!(facts_and_read(&full).unwrap().events.len(), MOST_EVENTS);
+    drop(full);
+    // A million marks labelled as steps.
+    let steps = [make_test_cast(80, 24, &[]), "[0,\"m\",\"step\"]\n".repeat(MOST_EVENTS).into_bytes()].concat();
+    let (recording, _, kept) = measured(|| read(&steps));
+    let recording = recording.unwrap();
+    assert_eq!(recording.marks.len(), MOST_EVENTS);
+    assert_eq!(recording.label(&recording.marks[MOST_EVENTS - 1]), "step");
+    assert!(kept <= most_kept(), "kept {kept}");
+    assert_eq!(facts(&steps).unwrap().marks, MOST_EVENTS);
 }
 
 #[test]
