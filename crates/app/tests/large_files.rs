@@ -24,7 +24,7 @@ use stagepack_studio::added_files::{FileKind, NotAdded};
 use stagepack_studio::clipboard::{self, AppData, LargeCopied, PastedLarge};
 use stagepack_studio::document::{Document, TalkPlace, UntitledId};
 use stagepack_studio::large_files::{
-    self, CACHE_LIMIT, LargeSource, VideoCache, ask_to_copy, progress_words, set_ask_before_copying_for_test, set_free_space_for_test,
+    self, CACHE_LIMIT, LargeSource, VideoCache, ask_to_copy, ask_to_copy_of, progress_words, set_ask_before_copying_for_test, set_free_space_for_test,
 };
 use stagepack_studio::recovery::Recovery;
 use stagepack_studio::saving::SaveTarget;
@@ -1745,4 +1745,203 @@ fn a_file_changed_while_it_is_saved_says_to_try_again() {
     };
     let failed = document.save_job().run_with(&progress, &never()).err().expect("the save fails").to_string();
     assert!(failed.ends_with("it changed while it was being copied. Try again."), "{failed}");
+}
+
+// Models: large files that aren't videos.
+
+/// A file of `len` bytes at `dir/name` that starts as a binary glTF does, then patterned bytes.
+/// It isn't a model that can be drawn, only one that is told apart from text by its start.
+fn a_model(dir: &Path, name: &str, len: u64, seed: u8) -> PathBuf {
+    let path = patterned(dir, name, len, seed);
+    let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    let mut head = b"glTF".to_vec();
+    head.extend_from_slice(&2u32.to_le_bytes());
+    head.extend_from_slice(&(len as u32).to_le_bytes());
+    file.write_all(&head).unwrap();
+    path
+}
+
+const MODEL: &str = "<Model src=\"assets/ship.glb\" x=\"100\" y=\"100\" w=\"640\" h=\"360\" />";
+
+/// Copies the model at `from` into the talk in `typing`'s window, as Insert does, and puts it on
+/// the slide once it's there.
+fn copy_in_model(typing: &Typing, cx: &mut TestAppContext, from: &Path) -> String {
+    let from = from.to_path_buf();
+    let added = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let given = added.clone();
+    cx.update(|cx| {
+        typing.view.update(cx, |view, cx| {
+            view.copy_in_large_file(
+                FileKind::Model,
+                from,
+                move |view, path, cx| {
+                    *given.borrow_mut() = Some(path.clone());
+                    let document = view.document().unwrap().clone();
+                    document.update(cx, |document, cx| {
+                        document.insert_tag("Insert model", "Model", &[("src", &path)], None).unwrap();
+                        cx.notify();
+                    });
+                },
+                cx,
+            );
+        })
+    });
+    cx.run_until_parked();
+    typing.settle(cx);
+    added.borrow().clone().expect("it was copied in")
+}
+
+/// What copying the model from the talk in `folder` puts on the clipboard.
+fn copied_model_from(folder: &Path) -> ClipboardItem {
+    let mut from = Document::open(folder, Fonts::bundled_only()).unwrap();
+    let at = from.source().find("<Model").unwrap();
+    assert!(from.select(0, at..at + MODEL.len()));
+    let (text, files) = from.copy_selected().unwrap();
+    let large = from.large_for_copy(&text);
+    assert_eq!(large.len(), 1, "carried by where it lies");
+    let entry = clipboard::element_entry_with_large(&text, &files, &large).unwrap();
+    let metadata = entry.metadata.unwrap();
+    assert!(metadata.len() < 4096, "not its bytes: {} bytes", metadata.len());
+    ClipboardItem::new_string_with_metadata(entry.text, metadata)
+}
+
+#[gpui_kit::test]
+fn a_model_is_kept_saved_and_brought_back_as_a_video_is(cx: &mut TestAppContext) {
+    set_up();
+    let work = tempfile::tempdir().unwrap();
+    let from = a_model(work.path(), "Ship.GLB", TWIN, 31);
+    let root = work.path().join("root");
+    let typing = open_untitled_talk(cx, untitled(), &root);
+    let path = copy_in_model(&typing, cx, &from);
+    assert_eq!(path, "assets/ship.glb", "named as a video is");
+
+    // Kept in the working copy, by where it lies, and found again after a crash.
+    wait(cx, KEEP_PAUSE);
+    let place = typing.document(cx).read_with(cx, |document, _| document.place().clone());
+    let TalkPlace::Untitled(id) = place else { panic!("untitled") };
+    let found = Recovery::new(root.join("recovery")).find(&place).expect("a working copy");
+    assert!(found.text.contains(&path));
+    assert_eq!(found.large.len(), 1, "the model, by where it lies");
+    assert_eq!(found.large[0].0, path);
+    assert!(same_pieces(std::fs::File::open(&found.large[0].1).unwrap(), std::fs::File::open(&from).unwrap()));
+    let back = open_brought_back(cx, id, found, 2, &root);
+    back.settle(cx);
+    let document = back.document(cx);
+    document.read_with(cx, |document, _| {
+        assert!(document.source().contains(&path));
+        assert!(reads_back(document, &path, &from));
+        assert!(lies_at(document, &path).unwrap().starts_with(root.join("recovery")), "in the new window's working copy");
+    });
+
+    // Saved as a folder and as a pack, each holding the same bytes and opening again.
+    wait(cx, KEEP_PAUSE);
+    for target in [root.join("Documents").join("saved"), root.join("Documents").join("saved.sptx")] {
+        let saved = document.update(cx, |document, _| {
+            let target = if target.extension().is_some() { SaveTarget::Packed(target.clone()) } else { SaveTarget::Folder(target.clone()) };
+            document.save_as_job(target).run()
+        });
+        assert!(saved.is_ok(), "{}", target.display());
+        assert!(same_pieces(saved_file(&target, &path).unwrap(), std::fs::File::open(&from).unwrap()), "{}", target.display());
+        assert!(reads_back(&reopen(&target), &path, &from), "{} opens again", target.display());
+    }
+
+    // Copied from a talk that holds it and pasted into another: the file comes too.
+    let source = tempfile::tempdir().unwrap();
+    std::fs::create_dir(source.path().join("assets")).unwrap();
+    std::fs::copy(&from, source.path().join("assets/ship.glb")).unwrap();
+    std::fs::write(source.path().join("slides.md"), format!("# From\n\n{MODEL}\n")).unwrap();
+    let other = open_untitled_talk(cx, untitled(), &root);
+    paste_in(&other, cx, copied_model_from(source.path()));
+    let asked = other.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        window.try_find(COPY_LARGE_ID).is_some()
+    });
+    assert!(asked, "it asks first");
+    click_on(&other, cx, COPY_LARGE_ID);
+    cx.run_until_parked();
+    other.settle(cx);
+    other.document(cx).read_with(cx, |document, _| {
+        assert!(document.source().contains("<Model src=\"assets/ship.glb\""), "{}", document.source());
+        assert!(reads_back(document, "assets/ship.glb", &from));
+        assert!(lies_at(document, "assets/ship.glb").unwrap().starts_with(root.join("recovery")));
+    });
+}
+
+#[test]
+fn a_model_over_the_limit_is_refused_in_words() {
+    set_up();
+    let work = tempfile::tempdir().unwrap();
+    let mut document = untitled();
+    keep_in(&mut document, &work.path().join("recovery"));
+    let huge = work.path().join("huge.glb");
+    std::fs::File::create(&huge).unwrap().set_len(stagepack_studio::added_files::MAX_MODEL_BYTES + 1).unwrap();
+    let copied = std::cell::Cell::new(0);
+    let counted = |done: u64, _: u64| copied.set(done);
+    let refused = document.add_large_file(FileKind::Model, "huge.glb", &huge, &counted, &never());
+    assert_eq!(refused, Err(NotAdded::ModelTooLarge));
+    assert_eq!(copied.get(), 0, "refused before anything is copied");
+    assert!(NotAdded::ModelTooLarge.to_string().contains("256 MB"), "{}", NotAdded::ModelTooLarge);
+    assert!(files_under(&work.path().join("recovery")).iter().all(|name| !name.ends_with(".glb")));
+    // A video of that size is no trouble: the limits are each kind's own.
+    let long_video = work.path().join("long.mp4");
+    std::fs::File::create(&long_video).unwrap().set_len(stagepack_studio::added_files::MAX_MODEL_BYTES + 1).unwrap();
+    assert_ne!(document.large_copy(FileKind::Video, "long.mp4", LargeSource::File(long_video), None).err(), Some(NotAdded::VideoTooLarge));
+    // A model's bytes aren't added as a small file's are.
+    assert_eq!(document.add_file(FileKind::Model, "ship.glb", vec![0; 100]), Err(NotAdded::NotThatKind));
+}
+
+#[gpui_kit::test]
+fn the_status_bar_says_model_while_a_model_is_copied(cx: &mut TestAppContext) {
+    set_up();
+    let work = tempfile::tempdir().unwrap();
+    let from = a_model(work.path(), "ship.glb", TWIN, 32);
+    let root = work.path().join("root");
+    let typing = open_untitled_talk(cx, untitled(), &root);
+    let called = std::rc::Rc::new(std::cell::Cell::new(false));
+    let given = called.clone();
+    cx.update(|cx| {
+        typing.view.update(cx, |view, cx| view.copy_in_large_file(FileKind::Model, from.clone(), move |_, _, _| given.set(true), cx))
+    });
+    let label = typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        let label = window.find(PROGRESS_ID).label().map(str::to_string);
+        window.click(CANCEL_PROGRESS_ID, cx);
+        label
+    });
+    assert_eq!(label.as_deref(), Some("Copying model… 0%"));
+    cx.run_until_parked();
+    typing.settle(cx);
+    assert!(!called.get(), "cancelled, nothing was added");
+    assert!(files_under(&root).iter().all(|name| !name.contains(".glb")), "{:?}", files_under(&root));
+    assert_eq!(ask_to_copy_of(1, 40_000_000, "model"), "Copy 1 model, 40 MB, into this presentation?");
+}
+
+#[test]
+fn a_file_named_glb_that_is_text_is_refused_before_copying() {
+    set_up();
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("recovery");
+    let mut document = untitled();
+    keep_in(&mut document, &root);
+    for (name, text) in [("notes.glb", "Dear all, this is only a letter.\n"), ("cloud.ply", "not a point cloud at all\n"), ("empty.glb", "")] {
+        let from = work.path().join(name);
+        std::fs::write(&from, text).unwrap();
+        let copied = std::cell::Cell::new(0);
+        let counted = |done: u64, _: u64| copied.set(done);
+        let refused = document.add_large_file(FileKind::Model, name, &from, &counted, &never());
+        assert_eq!(refused, Err(NotAdded::NotAModel), "{name}");
+        assert_eq!(copied.get(), 0, "{name}: nothing was copied");
+        assert!(NotAdded::NotAModel.to_string().contains("3D model"));
+    }
+    assert!(files_under(&root).iter().all(|name| !name.contains(".glb") && !name.contains(".ply")), "{:?}", files_under(&root));
+    // What starts as a model does is taken in, whichever kind it is.
+    let ply = work.path().join("cloud.ply");
+    std::fs::write(&ply, "ply\nformat ascii 1.0\nelement vertex 0\nend_header\n").unwrap();
+    assert_eq!(document.add_large_file(FileKind::Model, "cloud.ply", &ply, &no_progress, &never()).as_deref(), Ok("assets/cloud.ply"));
+    let glb = a_model(work.path(), "ship.glb", 1000, 33);
+    assert_eq!(document.add_large_file(FileKind::Model, "ship.glb", &glb, &no_progress, &never()).as_deref(), Ok("assets/ship.glb"));
+    // A model's name on a video, or the other way round, isn't one.
+    let video = patterned(work.path(), "clip.mp4", 1000, 34);
+    assert_eq!(document.add_large_file(FileKind::Model, "clip.mp4", &video, &no_progress, &never()), Err(NotAdded::NotThatKind));
+    assert_eq!(document.add_large_file(FileKind::Video, "ship.glb", &glb, &no_progress, &never()), Err(NotAdded::NotThatKind));
 }

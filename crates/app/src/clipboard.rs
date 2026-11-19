@@ -32,7 +32,7 @@ use slides_format::{
     text_flows,
 };
 
-use crate::added_files::{FileKind, MAX_ADDED_BYTES, MAX_VIDEO_BYTES, component_stem};
+use crate::added_files::{FileKind, MAX_ADDED_BYTES, component_stem};
 use crate::large_files::{LargeSource, Looked};
 use crate::text_editing::clean_typed;
 
@@ -97,6 +97,24 @@ pub fn large_left_out(count: usize) -> String {
     match count {
         1 => "The video wasn't copied, so it has nothing to play.".to_string(),
         count => format!("{count} videos weren't copied, so they have nothing to play."),
+    }
+}
+
+/// What the window says when `count` models a paste carried weren't copied, as whoever pasted
+/// said not to.
+pub fn models_left_out(count: usize) -> String {
+    match count {
+        1 => "The model wasn't copied, so there's nothing to show.".to_string(),
+        count => format!("{count} models weren't copied, so there's nothing to show."),
+    }
+}
+
+/// What the window says when the files of `count` models a paste carried are gone, or changed,
+/// since they were copied.
+pub fn models_gone(count: usize) -> String {
+    match count {
+        1 => "The model's file is gone, or has changed since it was copied, so it wasn't copied and there's nothing to show.".to_string(),
+        count => format!("The files of {count} models are gone, or have changed since they were copied, so they weren't copied and there's nothing to show."),
     }
 }
 
@@ -436,7 +454,7 @@ fn pasted_large(file: JsonFile) -> Option<PastedLarge> {
     let kind = pasted_kind(&file.path).filter(|kind| kind.is_large())?;
     let lies = file.lies?;
     let at = PathBuf::from(&lies.file);
-    if !at.is_absolute() || lies.len > MAX_VIDEO_BYTES || lies.file.chars().any(char::is_control) {
+    if !at.is_absolute() || lies.len > kind.max_bytes() || lies.file.chars().any(char::is_control) {
         return None;
     }
     let source = match lies.entry {
@@ -472,7 +490,7 @@ fn pasted_file(file: JsonFile) -> Option<PastedFile> {
         }
         FileKind::ComponentBuild => bytes.starts_with(WASM_MAGIC),
         // Carried by where it lies, never as bytes.
-        FileKind::Video => false,
+        FileKind::Video | FileKind::Model => false,
     };
     let built_from = file
         .built_from
@@ -495,7 +513,7 @@ pub fn pasted_kind(path: &str) -> Option<FileKind> {
         return None;
     }
     let kinds: &[FileKind] = match folder {
-        "assets" => &[FileKind::Picture, FileKind::Data, FileKind::Video],
+        "assets" => &[FileKind::Picture, FileKind::Data, FileKind::Video, FileKind::Model],
         "components" => &[FileKind::ComponentSource],
         "build" => &[FileKind::ComponentBuild],
         _ => return None,

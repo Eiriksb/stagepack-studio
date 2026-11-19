@@ -28,7 +28,7 @@ use sha2::{Digest as _, Sha256};
 use slides_components::BuildEntry;
 use slides_engine::{AddedFile, is_large_kind, open_packed, read_talk_text, write_atomically};
 
-use crate::added_files::{FileKind, MAX_ADDED_BYTES, MAX_VIDEO_BYTES, is_added_path};
+use crate::added_files::{FileKind, MAX_ADDED_BYTES, is_added_path, kind_of_path, large_folders};
 use crate::document::{SLIDES_FILE, TalkPlace, UNTITLED_NAME, UntitledId};
 use crate::permissions::BuildPermissions;
 
@@ -440,7 +440,7 @@ impl Recovery {
     pub fn large_folder(&self, place: &TalkPlace) -> io::Result<PathBuf> {
         let folder = self.slot_folder(&canonical(place))?;
         let files = folder.join(FILES_FOLDER);
-        for made in [files.clone(), files.join(FileKind::Video.folder())] {
+        for made in std::iter::once(files.clone()).chain(large_folders().into_iter().map(|folder| files.join(folder))) {
             refuse_link(&made)?;
             create_private(&made)?;
             refuse_link(&made)?;
@@ -996,26 +996,30 @@ fn kept_files(slot: &Path) -> Vec<(String, Arc<[u8]>)> {
 
 /// The large files added to the talk kept in the working copy's `slot`, by their path in the talk
 /// and where they lie, without reading them: plain files only, not links, with names a file
-/// added to a talk can have, each no bigger than a video can be, as the disk says. One that was
+/// added to a talk can have, each no bigger than its kind can be, as the disk says. One that was
 /// being copied in when the app stopped lies under a name of its own, and isn't one of these.
 fn kept_large(slot: &Path) -> Vec<(String, PathBuf)> {
     let files = slot.join(FILES_FOLDER);
-    let folder = files.join(FileKind::Video.folder());
-    if refuse_link(&files).is_err() || refuse_link(&folder).is_err() {
+    if refuse_link(&files).is_err() {
         return Vec::new();
     }
-    let Ok(entries) = std::fs::read_dir(&folder) else {
-        return Vec::new();
-    };
-    let mut kept: Vec<(String, PathBuf)> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let name = format!("{}/{}", FileKind::Video.folder(), entry.file_name().to_str()?);
+    let mut kept: Vec<(String, PathBuf)> = Vec::new();
+    for folder_name in large_folders() {
+        let folder = files.join(folder_name);
+        if refuse_link(&folder).is_err() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            continue;
+        };
+        kept.extend(entries.flatten().filter_map(|entry| {
+            let name = format!("{folder_name}/{}", entry.file_name().to_str()?);
             let meta = std::fs::symlink_metadata(entry.path()).ok()?;
-            let fits = is_added_path(&name) && is_large_kind(&name) && meta.is_file() && meta.len() <= MAX_VIDEO_BYTES;
+            let kind = kind_of_path(&name).filter(|kind| kind.is_large())?;
+            let fits = is_large_kind(&name) && meta.is_file() && meta.len() <= kind.max_bytes();
             fits.then(|| (name, entry.path()))
-        })
-        .collect();
+        }));
+    }
     kept.sort();
     kept
 }

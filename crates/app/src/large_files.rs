@@ -13,7 +13,7 @@ use std::time::SystemTime;
 use sha2::{Digest as _, Sha256};
 use slides_engine::{PackError, ReadSeek, TalkFiles, open_packed, write_new_atomically_with};
 
-use crate::added_files::{MAX_VIDEO_BYTES, NotAdded};
+use crate::added_files::{FileKind, MAX_VIDEO_BYTES, NotAdded};
 
 /// A paste that would copy more than this into the talk asks first.
 pub const ASK_BEFORE_COPYING: u64 = 256 * 1024 * 1024;
@@ -160,9 +160,14 @@ pub fn progress_words(doing: &str, done: u64, total: u64) -> String {
 
 /// What a paste asks before it copies `count` videos of `bytes` in all into the talk.
 pub fn ask_to_copy(count: usize, bytes: u64) -> String {
+    ask_to_copy_of(count, bytes, "video")
+}
+
+/// What a paste asks before it copies `count` files, called `noun`, `bytes` in all, into the talk.
+pub fn ask_to_copy_of(count: usize, bytes: u64, noun: &str) -> String {
     let megabytes = bytes.saturating_add(500_000) / 1_000_000;
-    let videos = if count == 1 { "1 video".to_string() } else { format!("{count} videos") };
-    format!("Copy {videos}, {} MB, into this presentation?", megabytes.max(1))
+    let files = if count == 1 { format!("1 {noun}") } else { format!("{count} {noun}s") };
+    format!("Copy {files}, {} MB, into this presentation?", megabytes.max(1))
 }
 
 /// Where the bytes of a large file to copy come from.
@@ -186,6 +191,11 @@ impl LargeSource {
     /// Looks at it, without reading it: a regular file, or a file a pack holds, of no more than
     /// [`MAX_VIDEO_BYTES`]. For a file in a pack, it's when the pack last changed.
     pub(crate) fn look(&self) -> Result<Looked, NotAdded> {
+        self.look_as(None)
+    }
+
+    /// [`Self::look`], where the file is to be a file of `kind`, which sets how large it can be.
+    pub(crate) fn look_as(&self, kind: Option<FileKind>) -> Result<Looked, NotAdded> {
         let looked = match self {
             LargeSource::File(path) => {
                 // Asked first, as opening a named pipe waits until something writes to it.
@@ -201,8 +211,9 @@ impl LargeSource {
                 Looked { len, modified: metadata.modified().ok() }
             }
         };
-        if looked.len > MAX_VIDEO_BYTES {
-            return Err(NotAdded::VideoTooLarge);
+        let kind = kind.unwrap_or(FileKind::Video);
+        if looked.len > kind.max_bytes().min(MAX_VIDEO_BYTES) {
+            return Err(NotAdded::too_large(kind));
         }
         Ok(looked)
     }
@@ -233,6 +244,32 @@ fn open_regular(path: &Path) -> Option<std::fs::File> {
     }
     let file = options.open(path).ok()?;
     file.metadata().ok()?.is_file().then_some(file)
+}
+
+/// Whether the file `source` names, to be the talk's file at `path`, starts as a 3D model of the
+/// kind its extension says. Only its first few bytes are read. A file that can't be opened, or a
+/// compressed one in a pack, isn't judged here: the copy finds it changed, or the model's reader
+/// refuses it.
+pub(crate) fn starts_as_model(source: &LargeSource, path: &str) -> bool {
+    let Some((_, ext)) = path.rsplit_once('.') else { return false };
+    let mut head = [0u8; crate::added_files::MODEL_HEAD_BYTES];
+    let read = match source {
+        LargeSource::File(from) => open_regular(from).map(|file| read_head(file, &mut head)),
+        LargeSource::InPack { pack, entry } => open_packed(pack).ok().and_then(|files| files.open(entry)).map(|from| read_head(from, &mut head)),
+    };
+    read.is_none_or(|got| crate::added_files::model_head_fits(ext, &head[..got]))
+}
+
+/// Reads up to the length of `head` from the start of `from`, and says how much there was.
+fn read_head(mut from: impl Read, head: &mut [u8]) -> usize {
+    let mut got = 0;
+    while got < head.len() {
+        match from.read(&mut head[got..]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got += n,
+        }
+    }
+    got
 }
 
 /// The plain file at `path`, opened to read, unless it's a link or anything but a file. Where the

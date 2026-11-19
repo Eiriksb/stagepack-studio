@@ -44,13 +44,15 @@ pub enum FileKind {
     ComponentBuild,
     /// A video, which can be large: it's copied in as a file, never read whole.
     Video,
+    /// A 3D model, which can be large: it's copied in as a file, as a video is.
+    Model,
 }
 
 impl FileKind {
     /// The talk's folder the file goes in.
     pub fn folder(self) -> &'static str {
         match self {
-            FileKind::Picture | FileKind::Data | FileKind::Video => "assets",
+            FileKind::Picture | FileKind::Data | FileKind::Video | FileKind::Model => "assets",
             FileKind::ComponentSource => "components",
             FileKind::ComponentBuild => "build",
         }
@@ -64,6 +66,7 @@ impl FileKind {
             FileKind::ComponentSource => &["rs"],
             FileKind::ComponentBuild => &["wasm"],
             FileKind::Video => &["mp4", "m4v", "mov"],
+            FileKind::Model => &["glb", "ply"],
         }
     }
 
@@ -73,16 +76,65 @@ impl FileKind {
 
     /// Whether a file of this kind can be large, and so is copied in as a file, never read whole.
     pub fn is_large(self) -> bool {
-        self == FileKind::Video
+        matches!(self, FileKind::Video | FileKind::Model)
+    }
+
+    /// The largest file of this kind that can be added to a talk: for a kind that can be large,
+    /// the most a large file can be; for any other, [`MAX_ADDED_BYTES`].
+    pub fn max_bytes(self) -> u64 {
+        match self {
+            FileKind::Video => MAX_VIDEO_BYTES,
+            FileKind::Model => MAX_MODEL_BYTES,
+            _ => MAX_ADDED_BYTES as u64,
+        }
+    }
+
+    /// What a file of this kind is called in the words a person is shown.
+    pub fn noun(self) -> &'static str {
+        match self {
+            FileKind::Picture => "picture",
+            FileKind::Data => "data file",
+            FileKind::ComponentSource | FileKind::ComponentBuild => "component",
+            FileKind::Video => "video",
+            FileKind::Model => "model",
+        }
     }
 
     /// Every kind, in the order a path's kind is looked for.
-    pub(crate) const ALL: [FileKind; 5] =
-        [FileKind::Picture, FileKind::Data, FileKind::ComponentSource, FileKind::ComponentBuild, FileKind::Video];
+    pub(crate) const ALL: [FileKind; 6] =
+        [FileKind::Picture, FileKind::Data, FileKind::ComponentSource, FileKind::ComponentBuild, FileKind::Video, FileKind::Model];
+}
+
+/// The talk's folders that large files, of any kind, go in, each once.
+pub(crate) fn large_folders() -> Vec<&'static str> {
+    let mut folders: Vec<&'static str> = Vec::new();
+    for kind in FileKind::ALL.into_iter().filter(|kind| kind.is_large()) {
+        if !folders.contains(&kind.folder()) {
+            folders.push(kind.folder());
+        }
+    }
+    folders
 }
 
 /// The largest video that can be added to a talk.
 pub const MAX_VIDEO_BYTES: u64 = slides_engine::MAX_LARGE_FILE;
+
+/// The largest 3D model that can be added to a talk.
+pub const MAX_MODEL_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Whether `head`, the first bytes of a file named with the extension `ext`, say it's a 3D model
+/// of that kind: a binary glTF starts with its magic and a version and length, a point cloud
+/// with `ply` and a line end. A name alone doesn't make a model.
+pub(crate) fn model_head_fits(ext: &str, head: &[u8]) -> bool {
+    match ext.to_ascii_lowercase().as_str() {
+        "glb" => head.len() >= 12 && head.starts_with(b"glTF"),
+        "ply" => head.starts_with(b"ply\n") || head.starts_with(b"ply\r"),
+        _ => false,
+    }
+}
+
+/// How many bytes of a model's start [`model_head_fits`] is given.
+pub(crate) const MODEL_HEAD_BYTES: usize = 12;
 
 /// Why a file wasn't added. Its words are the sentence the person adding it is shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +146,10 @@ pub enum NotAdded {
     NameTaken,
     /// A video over [`MAX_VIDEO_BYTES`].
     VideoTooLarge,
+    /// A model over [`MAX_MODEL_BYTES`].
+    ModelTooLarge,
+    /// A file named as a 3D model that doesn't start as one does.
+    NotAModel,
     /// The disk hasn't room for it, as was seen before anything was copied.
     NoRoom,
     /// The disk filled up while it was copied.
@@ -115,12 +171,21 @@ impl std::fmt::Display for NotAdded {
             NotAdded::Unreadable => "That file couldn't be read.",
             NotAdded::NameTaken => "This talk already has a different file with that name.",
             NotAdded::VideoTooLarge => "That video is larger than 4 GB, so it wasn't added.",
+            NotAdded::ModelTooLarge => "That model is larger than 256 MB, so it wasn't added.",
+            NotAdded::NotAModel => "That file isn't a 3D model this app can show, so it wasn't added.",
             NotAdded::NoRoom => "There isn't room on the disk for that file, so it wasn't added.",
             NotAdded::RanOutOfRoom => "The disk filled up while that file was copied, so it wasn't added.",
             NotAdded::Changed => "That file changed or went while it was copied, so it wasn't added.",
             NotAdded::Cancelled => "The copy was cancelled, so nothing was added.",
             NotAdded::NowhereToKeep => "There's nowhere to keep that file until the talk is saved, so it wasn't added.",
         })
+    }
+}
+
+impl NotAdded {
+    /// Why a file of `kind` over its most was refused.
+    pub fn too_large(kind: FileKind) -> NotAdded {
+        if kind == FileKind::Model { NotAdded::ModelTooLarge } else { NotAdded::VideoTooLarge }
     }
 }
 
@@ -225,7 +290,7 @@ fn checked(kind: FileKind, suggested: &str, bytes: Vec<u8>) -> Result<(Vec<u8>, 
         // The engine finds the component's tag in its source: one it can't is no component.
         FileKind::ComponentSource => std::str::from_utf8(&bytes).ok().and_then(slides_components::component_tag).is_some(),
         FileKind::ComponentBuild => bytes.starts_with(WASM_MAGIC),
-        FileKind::Picture | FileKind::Video => unreachable!("a picture and a video are checked above"),
+        FileKind::Picture | FileKind::Video | FileKind::Model => unreachable!("a picture and a large file are checked above"),
     };
     if !fits || (kind.is_component() && component_stem(suggested).is_none()) {
         return Err(NotAdded::NotThatKind);

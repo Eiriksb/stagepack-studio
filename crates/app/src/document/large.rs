@@ -262,6 +262,8 @@ pub struct LargeCopy {
     looked: Looked,
     /// Its path in the talk.
     path: String,
+    /// What kind of file it is.
+    kind: FileKind,
     /// The working copy's folder of files.
     folder: PathBuf,
     /// The files of the talk with as many bytes, and their hashes if they're known.
@@ -303,6 +305,11 @@ impl LargeCopy {
         self.looked.len
     }
 
+    /// What kind of file it copies.
+    pub fn kind(&self) -> FileKind {
+        self.kind
+    }
+
     /// Whether it copies nothing at all.
     pub fn is_empty(&self) -> bool {
         self.looked.len == 0
@@ -313,10 +320,14 @@ impl LargeCopy {
     /// is hashed first, and one with the same hash is the file: nothing is copied. Room on the
     /// disk is looked for before anything is copied. Stopped, or failing, nothing is left.
     pub fn run(self, progress: &dyn Fn(u64, u64), stop: &AtomicBool) -> CopiedIn {
-        let LargeCopy { source, looked, path, folder, candidates, files, mut claim, recovery, place } = self;
+        let LargeCopy { source, looked, path, kind, folder, candidates, files, mut claim, recovery, place } = self;
         let hashing = !candidates.is_empty();
         let total = if hashing { looked.len.saturating_mul(2) } else { looked.len };
         let outcome = (|| {
+            // A model that doesn't start as one does is refused before a byte of it is copied.
+            if kind == FileKind::Model && !large_files::starts_as_model(&source, &path) {
+                return Err(NotAdded::NotAModel);
+            }
             if hashing {
                 let hash = large_files::hash_source(&source, looked, &Told { progress, before: 0, total }, stop)?;
                 for (there, known) in &candidates {
@@ -662,7 +673,7 @@ impl Document {
         if !kind.is_large() {
             return Err(NotAdded::NotThatKind);
         }
-        let looked = from.look()?;
+        let looked = from.look_as(Some(kind))?;
         if expected.is_some_and(|expected| expected != looked) {
             return Err(NotAdded::Changed);
         }
@@ -687,7 +698,7 @@ impl Document {
         drop(spoken_for);
         let claim = Claim { to, spoken_for: self.large.spoken_for.clone(), made: false };
         let (recovery, place) = (recovery.clone(), self.place.clone());
-        Ok(LargeCopy { source: from, looked, path, folder, candidates, files: self.files.clone(), claim, recovery, place })
+        Ok(LargeCopy { source: from, looked, path, kind, folder, candidates, files: self.files.clone(), claim, recovery, place })
     }
 
     /// The last part of [`Self::add_large_file`], on the window's thread: the file copied becomes
@@ -744,7 +755,7 @@ impl Document {
     /// `slides.md`; in the working copies, in a slot's folder of files; or in a pack, under that
     /// path. A file on disk is copied from where the system resolves it to, links and all.
     fn may_bring(&self, large: &PastedLarge) -> Option<LargeSource> {
-        let named = large.kind.is_large() && added_files::is_added_path(&large.path) && is_large_kind(&large.path);
+        let named = large.kind.is_large() && added_files::kind_of_path(&large.path) == Some(large.kind) && is_large_kind(&large.path);
         if !named {
             return None;
         }
@@ -773,10 +784,10 @@ impl Document {
             return Vec::new();
         };
         let files = &*self.files;
-        files
-            .names_in(FileKind::Video.folder())
+        added_files::large_folders()
             .into_iter()
-            .filter(|path| is_large_kind(path) && crate::clipboard::pasted_kind(path) == Some(FileKind::Video))
+            .flat_map(|folder| files.names_in(folder))
+            .filter(|path| is_large_kind(path) && crate::clipboard::pasted_kind(path).is_some_and(FileKind::is_large))
             .filter(|path| guarded(|| talk_uses(&talk, files, path)).unwrap_or(false))
             .filter_map(|path| {
                 let source = match (files.lies_at(&path), &self.place) {
@@ -786,7 +797,7 @@ impl Document {
                     }
                     (None, _) => return None,
                 };
-                let looked = source.look().ok()?;
+                let looked = source.look_as(crate::clipboard::pasted_kind(&path)).ok()?;
                 Some(CopiedLarge { path, source, looked })
             })
             .collect()
@@ -875,10 +886,15 @@ impl Document {
         let mut any = false;
         let mut clashed = false;
         for (path, at) in large {
-            if !added_files::is_added_path(&path) || !is_large_kind(&path) {
+            let Some(kind) = added_files::kind_of_path(&path).filter(|kind| kind.is_large()) else {
+                continue;
+            };
+            if !is_large_kind(&path) {
                 continue;
             }
-            let Some(len) = std::fs::symlink_metadata(&at).ok().filter(std::fs::Metadata::is_file).map(|meta| meta.len()) else {
+            let Some(len) =
+                std::fs::symlink_metadata(&at).ok().filter(std::fs::Metadata::is_file).map(|meta| meta.len()).filter(|len| *len <= kind.max_bytes())
+            else {
                 continue;
             };
             if self.added.lies_at(&path).is_some_and(|lies| lies == at) {
@@ -927,6 +943,6 @@ impl Document {
 
     /// Whether the talk's own files, as last saved, hold a large file.
     pub(crate) fn holds_large(&self) -> bool {
-        self.own_files.names_in(FileKind::Video.folder()).iter().any(|path| is_large_kind(path))
+        added_files::large_folders().into_iter().any(|folder| self.own_files.names_in(folder).iter().any(|path| is_large_kind(path)))
     }
 }

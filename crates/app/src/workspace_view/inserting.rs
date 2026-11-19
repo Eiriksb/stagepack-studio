@@ -7,7 +7,7 @@ use crate::clipboard::{LargeCopied, PastedFiles};
 use crate::clipboard_tools::ClipboardThing;
 use crate::document::{InsertFailed, LargeCopy};
 use crate::insert::{ICON_SIZE, INSERT_ICON};
-use crate::large_files::{LargeSource, ask_before_copying, ask_to_copy};
+use crate::large_files::{LargeSource, ask_before_copying, ask_to_copy_of};
 use slides_video::CantPlay;
 
 /// What the window says when a file that isn't a picture or a video is dropped on the slide.
@@ -20,8 +20,21 @@ pub const MOST_DROPPED: usize = 20;
 pub const ONLY_THE_FIRST: &str = "Only the first 20 files were added.";
 /// What a picture pasted from the clipboard is named, as like as is safe.
 const PASTED_PICTURE: &str = "pasted-picture.png";
-/// What the status line says while a video is copied into the talk.
-const COPYING_VIDEO: &str = "Copying video";
+/// What the status line says while a large file called `noun`, as a video or a model, is copied
+/// into the talk.
+fn copying(noun: &str) -> String {
+    format!("Copying {noun}")
+}
+
+/// What the files being copied by `copies` are called, in one word: their kind's if they're all of
+/// one, otherwise a plain "file".
+fn noun_of(copies: &[(usize, LargeCopy)]) -> &'static str {
+    let first = copies.first().map(|(_, copy)| copy.kind());
+    match first {
+        Some(kind) if copies.iter().all(|(_, copy)| copy.kind() == kind) => kind.noun(),
+        _ => "file",
+    }
+}
 
 /// A video waiting to be copied in, from the file at `path`, and put on slide `slide`, the slide
 /// shown when it was asked for.
@@ -307,7 +320,7 @@ impl WorkspaceView {
             Ok(copy) => copy,
             Err(why) => return finished(self, Err(NotCopied { said: why.to_string(), cancelled: false }), cx),
         };
-        let meter = self.start_progress(COPYING_VIDEO, true, cx);
+        let meter = self.start_progress(copying(kind.noun()), true, cx);
         let running = meter.clone();
         let start = move |_: &mut Self, cx: &mut Context<Self>| cx.spawn(async move |this, cx| {
             let copied = cx
@@ -381,7 +394,8 @@ impl WorkspaceView {
             // Nothing is asked while another question is up, so nothing is pasted.
             return self.say(crate::clipboard::ANSWER_FIRST, cx);
         }
-        let asked = ask_to_copy(waiting.copies.len(), bytes);
+        let noun = noun_of(&waiting.copies);
+        let asked = ask_to_copy_of(waiting.copies.len(), bytes, noun);
         let waiting = std::rc::Rc::new(std::cell::RefCell::new(Some(waiting)));
         let view = cx.weak_entity();
         window.open_dialog(cx, move |dialog, _, _| {
@@ -405,7 +419,7 @@ impl WorkspaceView {
             };
             let cancelled = waiting.clone();
             dialog
-                .title("Copy the video?")
+                .title(format!("Copy the {noun}?"))
                 // Escape, a click beside it, or its close button: nothing is pasted.
                 .on_cancel(move |_, _, _| {
                     cancelled.borrow_mut().take();
@@ -429,7 +443,7 @@ impl WorkspaceView {
             return;
         };
         let WaitingPaste { copies, mut files, paste } = waiting;
-        let meter = self.start_progress(COPYING_VIDEO, true, cx);
+        let meter = self.start_progress(copying(noun_of(&copies)), true, cx);
         let running = meter.clone();
         let start = move |_: &mut Self, cx: &mut Context<Self>| cx.spawn(async move |this, cx| {
             let copied = cx
