@@ -1,6 +1,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell as Counter;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use slides_terminal::*;
@@ -86,12 +87,12 @@ fn a_recording_plays_at_its_own_times() {
     let screen = player.screen_at(secs(0.7));
     assert_eq!((screen.width(), screen.height(), line(screen, 0)), (10, 2, "a".to_owned()));
     // The screen as it ends, whatever's been played.
-    let last = player.last();
+    let last = player.last().unwrap();
     assert_eq!((last.width(), last.height(), line(&last, 0)), (4, 1, "xyz".to_owned()));
     assert_eq!(&last, player.screen_at(secs(2.6)));
     // A recording of nothing is a blank screen of its size.
     let mut empty = Player::new(recording(7, 3, &[]));
-    assert_eq!(empty.last(), Screen::new(7, 3));
+    assert_eq!(empty.last().unwrap(), Screen::new(7, 3));
     assert_eq!(empty.screen_at(secs(5.0)), &Screen::new(7, 3));
     assert_eq!(empty.stops(), &[] as &[Duration]);
 }
@@ -101,12 +102,22 @@ fn marks_are_stops() {
     let recording = recording(
         10,
         2,
-        &[(0.5, "o", "a"), (1.0, "m", "first"), (1.5, "o", "b"), (9.0, "m", "second"), (9.2, "o", "c"), (9.2, "m", "")],
+        &[
+            (0.5, "o", "a"),
+            (1.0, "m", "first"),
+            (1.5, "o", "b"),
+            (9.0, "m", "second"),
+            (9.2, "o", "c"),
+            (9.2, "m", ""),
+            (9.2, "o", "d"),
+            (9.2, "m", "again"),
+        ],
     );
     let mut player = Player::new(recording.clone());
-    let stops: Vec<Duration> = recording.marks.iter().map(|mark| mark.at).collect();
+    // Two marks at the same time are one stop.
+    assert_eq!(recording.marks.len(), 4);
+    let stops: Vec<Duration> = recording.marks[..3].iter().map(|mark| mark.at).collect();
     assert_eq!(player.stops(), stops.as_slice());
-    assert_eq!(player.stops().len(), 3);
     assert_eq!(player.next_stop(Duration::ZERO), Some(stops[0]));
     assert_eq!(player.next_stop(stops[0]), Some(stops[1]));
     assert_eq!(player.next_stop(stops[1] - secs(0.01)), Some(stops[1]));
@@ -115,8 +126,104 @@ fn marks_are_stops() {
     // At a stop the screen is as it was when the mark was made.
     assert_eq!(line(player.screen_at(stops[0]), 0), "a");
     assert_eq!(line(player.screen_at(stops[1]), 0), "ab");
+    // What came after a mark at its own time isn't shown at it, but is just after.
     assert_eq!(line(player.screen_at(stops[2]), 0), "abc");
+    assert_eq!(line(player.screen_at(stops[2] + Duration::from_nanos(1)), 0), "abcd");
     assert_eq!(line(player.screen_at(stops[0]), 0), "a");
+    assert_eq!(line(player.screen_at(stops[2]), 0), "abc");
+    assert_eq!(line(&player.last().unwrap(), 0), "abcd");
+}
+
+#[test]
+fn playing_can_be_stopped_part_way() {
+    let recording = busy();
+    let stop = AtomicBool::new(true);
+    let mut player = Player::new(recording.clone());
+    assert!(player.screen_at_within(recording.length, &stop).is_none());
+    assert!(player.last_within(&stop).is_none());
+    // Where it stopped, it goes on from.
+    stop.store(false, Ordering::Relaxed);
+    let want = Player::new(recording.clone()).screen_at(recording.length).clone();
+    assert_eq!(player.screen_at_within(recording.length, &stop), Some(&want));
+    assert_eq!(player.last_within(&stop), Some(Ok(want)));
+}
+
+/// A recording on the largest screen with every cell of both screens written, then `marks`
+/// marks, each after a character if `written`, a thousandth of a second apart.
+fn marked(marks: usize, written: bool) -> Arc<Recording> {
+    let mut lines: Vec<(f64, &str, String)> = vec![
+        (0.0, "o", "y".repeat(500 * 200)),
+        (0.0, "o", format!("\u{1b}[?1049h{}", "x".repeat(500 * 200))),
+    ];
+    for i in 0..marks {
+        let at = i as f64 * 0.001;
+        if written {
+            lines.push((at, "o", "z".to_owned()));
+        }
+        lines.push((at, "m", String::new()));
+    }
+    let lines: Vec<(f64, &str, &str)> = lines.iter().map(|(at, code, text)| (*at, *code, text.as_str())).collect();
+    Arc::new(read(&make_test_cast(500, 200, &lines)).unwrap())
+}
+
+#[test]
+fn many_marks_on_the_largest_screen_are_quick() {
+    let release = !cfg!(debug_assertions);
+    for (marks, written) in [(if release { 200_000 } else { 5_000 }, false), (if release { 50_000 } else { 3_000 }, true)] {
+        let recording = marked(marks, written);
+        let started = Instant::now();
+        let before = held();
+        let mut player = Player::new(recording.clone());
+        let end = player.screen_at(recording.length).clone();
+        let kept = held() - before;
+        if release {
+            assert!(started.elapsed() < Duration::from_secs(2), "{marks} marks took {:?}", started.elapsed());
+        }
+        assert!(kept <= (100_000_000 + recording.events.len() * 64) as isize, "{marks} marks kept {kept}");
+        assert_eq!(player.last().unwrap(), end);
+        // Back to marks here and there, and forward again.
+        for mark in [marks / 2, 1, marks - 1, marks / 3, 0] {
+            let at = recording.marks[mark].at;
+            let started = Instant::now();
+            let screen = player.screen_at(at).clone();
+            if release {
+                assert!(started.elapsed() < Duration::from_millis(50), "back to mark {mark} took {:?}", started.elapsed());
+            }
+            if mark % 3 == 0 {
+                assert_eq!(screen, *Player::new(recording.clone()).screen_at(at), "mark {mark}");
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg_attr(debug_assertions, ignore = "this plays as much as the most costly recording")]
+fn a_recording_too_costly_to_play_says_so() {
+    let fill = "\u{1b}[?1049h".to_owned() + &"x".repeat(500 * 200);
+    // Each event within the most output one may hold, and all of them as much work as about
+    // four seconds of it.
+    let costly = "\u{9b}41m\u{9b}2J\u{9b}42m\u{9b}2J".repeat(50_000);
+    let mut lines: Vec<(f64, &str, &str)> = vec![(0.0, "o", &fill)];
+    for i in 0..20 {
+        lines.push((f64::from(i), "o", &costly));
+    }
+    lines.push((31.0, "m", ""));
+    let recording = Arc::new(read(&make_test_cast(500, 200, &lines)).unwrap());
+    let started = Instant::now();
+    assert_eq!(Player::new(recording.clone()).last(), Err(CantPlay::TooLarge));
+    assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
+    let mut player = Player::new(recording.clone());
+    assert!(player.screen_at(recording.length).too_costly());
+    // A million resizes, the most events a recording may have.
+    let mut lines: Vec<(f64, &str, &str)> = vec![(0.0, "o", &fill)];
+    for i in 0..999_999 {
+        lines.push((0.0, "r", if i % 2 == 0 { "499x199" } else { "500x200" }));
+    }
+    let recording = Arc::new(read(&make_test_cast(500, 200, &lines)).unwrap());
+    let started = Instant::now();
+    let last = Player::new(recording).last();
+    assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
+    assert_eq!(last.err(), Some(CantPlay::TooLarge));
 }
 
 /// A recording of about a minute and a half with something of every kind in it: text, colours,
@@ -172,8 +279,8 @@ fn going_back_is_the_same_as_going_forward() {
         assert_eq!(wandering.screen_at(*at), &want, "going from {other:?} to {at:?}");
     }
     let mut player = Player::new(recording.clone());
-    assert_eq!(player.last(), *player.screen_at(recording.length));
-    assert_eq!(player.last(), Player::new(recording).last());
+    assert_eq!(player.last().unwrap(), *player.screen_at(recording.length));
+    assert_eq!(player.last().unwrap(), Player::new(recording).last().unwrap());
 }
 
 #[test]
@@ -190,7 +297,7 @@ fn what_a_player_keeps_is_bounded() {
     let lines: Vec<(f64, &str, &str)> = lines.iter().map(|(at, code, text)| (*at, *code, text.as_str())).collect();
     let recording = Arc::new(read(&make_test_cast(300, 100, &lines)).unwrap());
 
-    assert_eq!(size_of::<Cell>(), 20);
+    assert_eq!(size_of::<Cell>(), 28);
     let before = held();
     let mut player = Player::new(recording.clone());
     player.screen_at(recording.length);
@@ -244,7 +351,7 @@ fn a_long_recording_is_stepped_quickly() {
 
     let player = Player::new(recording.clone());
     let started = Instant::now();
-    let last = player.last();
+    let last = player.last().unwrap();
     assert!(started.elapsed() < Duration::from_secs(2), "the last screen took {:?}", started.elapsed());
 
     let mut player = Player::new(recording.clone());

@@ -146,7 +146,7 @@ fn the_cursor_moves_where_it_is_told() {
     assert_eq!(at(&format!("{}{}{}{}", csi("3;4H"), csi("s"), csi("9;9H"), csi("u"))), (3, 2));
     // The style is saved with the place.
     let screen = fed(20, 2, &format!("{}{ESC}7{}{ESC}8x", csi("31m"), csi("0m")));
-    assert_eq!(screen.cell(0, 0).style.fg, Colour::Indexed(1));
+    assert_eq!(screen.cell(0, 0).unwrap().style.fg, Colour::Indexed(1));
     // Brought back with nothing saved, it's the top left.
     assert_eq!(at(&format!("{}{ESC}8", csi("5;5H"))), (0, 0));
 
@@ -174,8 +174,8 @@ fn colours_and_styles_are_kept() {
             csi("38:2::10:20:30;48:5:100m"),
         ),
     );
-    let style = |col: u16| screen.cell(col, 0).style;
-    assert_eq!(screen.cell(0, 0).text, 'R');
+    let style = |col: u16| screen.cell(col, 0).unwrap().style;
+    assert_eq!(screen.cell(0, 0).unwrap().text, 'R');
     assert_eq!(style(0), Style { fg: Colour::Indexed(1), ..Style::default() });
     assert_eq!(style(1), Style { fg: Colour::Indexed(10), bold: true, ..Style::default() });
     assert_eq!(style(2), Style { fg: Colour::Indexed(200), bold: true, ..Style::default() });
@@ -191,20 +191,20 @@ fn colours_and_styles_are_kept() {
         1,
         &format!("{}a{}b{}c{}d{}e", csi("2;3;4m"), csi("22m"), csi("23m"), csi("24m"), csi("1;3;4;7;22;23;24;27m")),
     );
-    assert_eq!(screen.cell(0, 0).style, Style { faint: true, italic: true, underline: true, ..Style::default() });
-    assert_eq!(screen.cell(1, 0).style, Style { italic: true, underline: true, ..Style::default() });
-    assert_eq!(screen.cell(2, 0).style, Style { underline: true, ..Style::default() });
-    assert_eq!(screen.cell(3, 0).style, Style::default());
-    assert_eq!(screen.cell(4, 0).style, Style::default());
+    assert_eq!(screen.cell(0, 0).unwrap().style, Style { faint: true, italic: true, underline: true, ..Style::default() });
+    assert_eq!(screen.cell(1, 0).unwrap().style, Style { italic: true, underline: true, ..Style::default() });
+    assert_eq!(screen.cell(2, 0).unwrap().style, Style { underline: true, ..Style::default() });
+    assert_eq!(screen.cell(3, 0).unwrap().style, Style::default());
+    assert_eq!(screen.cell(4, 0).unwrap().style, Style::default());
     // Bright backgrounds, and back to the default colours; an empty one resets all.
     let screen = fed(30, 1, &format!("{}a{}b{}c{}d", csi("31;103m"), csi("39m"), csi("49m"), csi("1;31;m")));
-    assert_eq!(screen.cell(0, 0).style, Style { fg: Colour::Indexed(1), bg: Colour::Indexed(11), ..Style::default() });
-    assert_eq!(screen.cell(1, 0).style, Style { bg: Colour::Indexed(11), ..Style::default() });
-    assert_eq!(screen.cell(2, 0).style, Style::default());
-    assert_eq!(screen.cell(3, 0).style, Style::default());
+    assert_eq!(screen.cell(0, 0).unwrap().style, Style { fg: Colour::Indexed(1), bg: Colour::Indexed(11), ..Style::default() });
+    assert_eq!(screen.cell(1, 0).unwrap().style, Style { bg: Colour::Indexed(11), ..Style::default() });
+    assert_eq!(screen.cell(2, 0).unwrap().style, Style::default());
+    assert_eq!(screen.cell(3, 0).unwrap().style, Style::default());
     // A colour out of range is passed over without spoiling what follows it.
     let screen = fed(30, 1, &format!("{}a", csi("38;5;300;1m")));
-    assert_eq!(screen.cell(0, 0).style, Style { bold: true, ..Style::default() });
+    assert_eq!(screen.cell(0, 0).unwrap().style, Style { bold: true, ..Style::default() });
 
     // The colours as they're drawn.
     assert_eq!(rgb(Colour::Default, true), [0xcc, 0xcc, 0xcc]);
@@ -220,29 +220,46 @@ fn colours_and_styles_are_kept() {
 #[test]
 fn wide_and_combining_characters_take_their_cells() {
     let screen = fed(10, 2, "\u{4e2d}a");
-    assert_eq!((screen.cell(0, 0).text, screen.cell(0, 0).wide), ('\u{4e2d}', Wide::Left));
-    assert_eq!(screen.cell(1, 0).wide, Wide::Right);
-    assert_eq!((screen.cell(2, 0).text, screen.cell(2, 0).wide), ('a', Wide::Narrow));
+    assert_eq!((screen.cell(0, 0).unwrap().text, screen.cell(0, 0).unwrap().wide), ('\u{4e2d}', Wide::Left));
+    assert_eq!(screen.cell(1, 0).unwrap().wide, Wide::Right);
+    assert_eq!((screen.cell(2, 0).unwrap().text, screen.cell(2, 0).unwrap().wide), ('a', Wide::Narrow));
     assert_eq!(screen.cursor(), Some((3, 0)));
 
     // A combining mark joins the cell before and takes no cell of its own.
     let screen = fed(10, 2, "e\u{301}x");
-    assert_eq!(screen.cell(0, 0).text, 'e');
-    assert_eq!(screen.cell(1, 0).text, 'x');
+    assert_eq!(screen.cell(0, 0).unwrap().text, 'e');
+    assert_eq!(screen.cell(0, 0).unwrap().marks, [Some('\u{301}'), None]);
+    assert_eq!(screen.cell(1, 0).unwrap().text, 'x');
+    assert_eq!(screen.cell(1, 0).unwrap().marks, [None, None]);
     assert_eq!(screen.cursor(), Some((2, 0)));
+    // Two are kept, in the order written, and any more left out.
+    let screen = fed(10, 1, "a\u{301}\u{308}\u{30a}");
+    assert_eq!(screen.cell(0, 0).unwrap().marks, [Some('\u{301}'), Some('\u{308}')]);
+    // One after a wide character joins its first cell; one on the last cell, the cursor
+    // waiting there, joins that cell; one with nothing before it is left out.
+    let screen = fed(10, 1, "\u{4e2d}\u{301}");
+    assert_eq!(screen.cell(0, 0).unwrap().marks, [Some('\u{301}'), None]);
+    let screen = fed(3, 2, "abc\u{301}");
+    assert_eq!(screen.cell(2, 0).unwrap().marks, [Some('\u{301}'), None]);
+    assert_eq!(screen.cursor(), Some((2, 0)));
+    let screen = fed(3, 2, "\u{301}a");
+    assert_eq!(screen.cell(0, 0).unwrap().marks, [None, None]);
+    // Writing over a cell takes its marks too.
+    let screen = fed(3, 1, "e\u{301}\rx");
+    assert_eq!(screen.cell(0, 0).unwrap().marks, [None, None]);
 
     // A wide character that doesn't fit on the row starts the next.
     let screen = fed(5, 2, "abcd\u{4e2d}");
     assert_eq!(line(&screen, 0), "abcd");
-    assert_eq!(screen.cell(0, 1).wide, Wide::Left);
-    assert_eq!(screen.cell(1, 1).wide, Wide::Right);
+    assert_eq!(screen.cell(0, 1).unwrap().wide, Wide::Left);
+    assert_eq!(screen.cell(1, 1).unwrap().wide, Wide::Right);
 
     // Writing over either half of a wide character leaves no half behind.
     let screen = fed(10, 1, "\u{4e2d}\rx");
-    assert_eq!((screen.cell(0, 0).text, screen.cell(1, 0).text, screen.cell(1, 0).wide), ('x', ' ', Wide::Narrow));
+    assert_eq!((screen.cell(0, 0).unwrap().text, screen.cell(1, 0).unwrap().text, screen.cell(1, 0).unwrap().wide), ('x', ' ', Wide::Narrow));
     let screen = fed(10, 1, &format!("\u{4e2d}{}x", csi("2G")));
-    assert_eq!((screen.cell(0, 0).text, screen.cell(0, 0).wide), (' ', Wide::Narrow));
-    assert_eq!(screen.cell(1, 0).text, 'x');
+    assert_eq!((screen.cell(0, 0).unwrap().text, screen.cell(0, 0).unwrap().wide), (' ', Wide::Narrow));
+    assert_eq!(screen.cell(1, 0).unwrap().text, 'x');
     // On a screen one cell wide, a wide character has nowhere to go.
     let screen = fed(1, 2, "\u{4e2d}a");
     assert_eq!(lines(&screen), ["a", ""]);
@@ -276,8 +293,8 @@ fn erasing_and_inserting_move_the_right_cells() {
     let screen = fed(4, 2, &format!("ab{}{}", csi("44m"), csi("2J")));
     assert!(screen.rows().flatten().all(|cell| cell.text == ' ' && cell.style == Style { bg: Colour::Indexed(4), ..Style::default() }));
     let screen = fed(4, 1, &format!("abcd{}{}{}", csi("41m"), csi("2G"), csi("K")));
-    assert_eq!(screen.cell(0, 0).style.bg, Colour::Default);
-    assert_eq!(screen.cell(1, 0).style.bg, Colour::Indexed(1));
+    assert_eq!(screen.cell(0, 0).unwrap().style.bg, Colour::Default);
+    assert_eq!(screen.cell(1, 0).unwrap().style.bg, Colour::Indexed(1));
 
     // Erasing or shifting half of a wide character takes the whole of it.
     let screen = fed(6, 1, &format!("a\u{4e2d}b{}{}", csi("3G"), csi("K")));
@@ -352,6 +369,16 @@ fn the_alternate_screen_comes_and_goes() {
 }
 
 #[test]
+fn a_cell_off_the_screen_is_nothing() {
+    let screen = fed(4, 2, "ab");
+    assert_eq!(screen.cell(1, 0).map(|cell| cell.text), Some('b'));
+    assert!(screen.cell(3, 1).is_some());
+    assert!(screen.cell(4, 0).is_none());
+    assert!(screen.cell(0, 2).is_none());
+    assert!(screen.cell(u16::MAX, u16::MAX).is_none());
+}
+
+#[test]
 fn a_resize_keeps_what_fits() {
     let mut screen = fed(6, 3, "abcdef\r\nghi");
     screen.resize(4, 4);
@@ -367,7 +394,7 @@ fn a_resize_keeps_what_fits() {
     let mut screen = fed(4, 1, "a\u{4e2d}");
     screen.resize(2, 1);
     assert_eq!(line(&screen, 0), "a");
-    assert_eq!(screen.cell(1, 0).wide, Wide::Narrow);
+    assert_eq!(screen.cell(1, 0).unwrap().wide, Wide::Narrow);
     // Sizes are kept within what a screen can be.
     let mut screen = Screen::new(0, 60000);
     assert_eq!((screen.width(), screen.height()), (1, 200));
@@ -574,6 +601,120 @@ proptest! {
         }
         prop_assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
         prop_assert!(LARGEST.with(Counter::get) <= 64 * 1024 * 1024);
+    }
+}
+
+proptest! {
+    // The largest screen, with a few cases, as a screen of every size is tried above.
+    #![proptest_config(ProptestConfig { cases: 8, ..ProptestConfig::default() })]
+
+    #[test]
+    fn any_output_keeps_the_largest_screen_sound(steps in steps(), split in any::<prop::sample::Index>()) {
+        let started = Instant::now();
+        LARGEST.with(|largest| largest.set(0));
+        let mut screen = Screen::new(500, 200);
+        screen.feed(&"y".repeat(500 * 200));
+        for step in &steps {
+            match step {
+                Step::Feed(text) => {
+                    let at = split.index(text.chars().count() + 1);
+                    let at = text.char_indices().nth(at).map_or(text.len(), |(at, _)| at);
+                    screen.feed(&text[..at]);
+                    screen.feed(&text[at..]);
+                }
+                Step::Resize(width, height) => screen.resize(width.saturating_mul(13), height.saturating_mul(10)),
+            }
+            sound(&screen);
+        }
+        prop_assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
+        prop_assert!(LARGEST.with(Counter::get) <= 64 * 1024 * 1024);
+    }
+}
+
+/// The costliest kinds of output known, each a few bytes that move, clear or copy as many cells
+/// as they can on the largest screen.
+fn costly() -> Vec<(&'static str, String)> {
+    let csi = |rest: &str| format!("\u{9b}{rest}");
+    vec![
+        ("a line written and scrolled", "x\n".to_owned()),
+        ("the whole screen scrolled", csi("200S")),
+        ("a row written and the screen scrolled", format!("x{}", csi("S"))),
+        ("a row written and a line inserted", format!("x{}", csi("L"))),
+        ("characters inserted", csi("@")),
+        ("characters deleted", csi("P")),
+        ("a row written and the rest of the screen erased", format!("x{}", csi("J"))),
+        ("the screen erased in two colours", format!("{}{}{}{}", csi("41m"), csi("2J"), csi("42m"), csi("2J"))),
+        (
+            "the screen erased in nine colours",
+            ["41", "42", "43", "44", "45", "46", "47", "100", "101"].iter().map(|bg| format!("{}{}", csi(&format!("{bg}m")), csi("2J"))).collect(),
+        ),
+        ("starting again", "\u{1b}c".to_owned()),
+        ("the alternate screen and back", format!("{}{}", csi("?1049h"), csi("?1049l"))),
+        ("wide characters", "\u{4e2d}".to_owned()),
+        ("combining marks", "e\u{301}".to_owned()),
+    ]
+}
+
+/// The largest screen with every cell of both its screens written.
+fn full() -> Screen {
+    let mut screen = Screen::new(500, 200);
+    screen.feed(&"y".repeat(500 * 200));
+    screen.feed(&format!("\u{1b}[?1049h{}\u{1b}[?1049l", "x".repeat(500 * 200)));
+    screen
+}
+
+#[test]
+#[cfg_attr(debug_assertions, ignore = "this checks how quick a release build is")]
+fn costly_output_is_refused_or_quick() {
+    for (what, unit) in costly() {
+        let chunk = unit.repeat((1 << 20) / unit.len());
+        let mut screen = full();
+        let started = Instant::now();
+        // As much as a recording may hold.
+        for _ in 0..32 {
+            screen.feed(&chunk);
+        }
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(2), "{what} took {took:?}, too costly: {}", screen.too_costly());
+        sound(&screen);
+    }
+    // A million resizes, the most events a recording may have.
+    let mut screen = full();
+    let started = Instant::now();
+    for i in 0..1_000_000 {
+        let side = if i % 2 == 0 { (499, 199) } else { (500, 200) };
+        screen.resize(side.0, side.1);
+    }
+    assert!(started.elapsed() < Duration::from_secs(2), "resizing took {:?}", started.elapsed());
+    assert!(screen.too_costly());
+    // Once too costly, a screen does nothing more.
+    let before = screen.clone();
+    screen.feed("more");
+    screen.resize(10, 10);
+    assert_eq!(screen, before);
+}
+
+#[test]
+fn costly_output_keeps_the_largest_screen_sound() {
+    // A megabyte of each, four in a release build.
+    let megabytes = if cfg!(debug_assertions) { 1 } else { 4 };
+    for (_, unit) in costly() {
+        let mut screen = full();
+        screen.feed(&unit.repeat((megabytes << 20) / unit.len()));
+        sound(&screen);
+    }
+}
+
+#[test]
+#[cfg_attr(debug_assertions, ignore = "this feeds as much as the largest recording holds")]
+fn ordinary_output_is_not_too_costly() {
+    // Lines as programs write them, as much as the largest recording holds, on the smallest
+    // screen of an ordinary terminal and on the largest.
+    let lines = "ls: some output of a typical width for a line here\r\n".repeat(600_000);
+    for (width, height) in [(80, 24), (500, 200)] {
+        let mut screen = Screen::new(width, height);
+        screen.feed(&lines);
+        assert!(!screen.too_costly(), "{width} by {height}");
     }
 }
 

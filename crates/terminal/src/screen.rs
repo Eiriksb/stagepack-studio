@@ -6,7 +6,8 @@
 //! colour but its own cells'. What it does:
 //!
 //! - text, wrapped at the right edge (the cursor waits on the last cell until the next
-//!   character, as terminals do); wide characters take two cells; a combining mark takes none;
+//!   character, as terminals do); wide characters take two cells; a combining mark takes none,
+//!   joined to the cell before (two at most a cell);
 //! - carriage return, line feed (and vertical tab and form feed, as line feeds), backspace, tab
 //!   (stops every 8 cells);
 //! - the cursor moved up, down, forward, back, to a row and column, a column, a row, the next or
@@ -22,6 +23,11 @@
 //! Everything else is read and does nothing: every operating system command (titles, the
 //! clipboard, links, colour changes), every device control, application, privacy and other
 //! string, every query, the bell, and every other mode and sequence.
+//!
+//! What a screen is fed costs work, counted as it's done: a character, a row moved, a cell
+//! copied or cleared. Once a screen has done more than a recording may cost, about two seconds
+//! of it, it does nothing more, and says so: a recording made to keep a computer busy is too
+//! large to play rather than a wait.
 
 use std::fmt;
 use std::sync::Arc;
@@ -31,10 +37,13 @@ use unicode_width::UnicodeWidthChar;
 use crate::cast::{MOST_HEIGHT, MOST_WIDTH};
 use crate::parse::{Action, Csi, Parser};
 
-/// One cell of the screen.
+/// One cell of the screen, held in 28 bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Cell {
     pub text: char,
+    /// The combining marks joined to the character, in the order written; any past two are
+    /// left out.
+    pub marks: [Option<char>; 2],
     pub wide: Wide,
     pub style: Style,
 }
@@ -77,7 +86,7 @@ pub enum Colour {
 
 impl Default for Cell {
     fn default() -> Self {
-        Cell { text: ' ', wide: Wide::Narrow, style: Style::default() }
+        Cell { text: ' ', marks: [None; 2], wide: Wide::Narrow, style: Style::default() }
     }
 }
 
@@ -125,22 +134,24 @@ pub fn rgb(colour: Colour, foreground: bool) -> [u8; 3] {
     }
 }
 
-/// A row of the screen. A blank row shares its cells with others of its colour, so clearing
-/// and scrolling cost a row at a time rather than a cell at a time.
-#[derive(Clone)]
-enum Row {
-    Blank(Arc<[Cell]>),
-    Cells(Vec<Cell>),
-}
+/// The most work a screen does before it stops: up to about a second and a half of it in a
+/// release build, at the costliest kind of work. What programs ordinarily write costs 20 to 40 a
+/// byte, so the largest recording of it is well within this.
+pub const MOST_WORK: u64 = 2_000_000_000;
+/// What each kind of work costs, a cell copied costing one: a character read, a row moved, a row
+/// shared or let go, a row made, and a cell cleared or shifted. They were measured in a release
+/// build on the laptop this was written on, where each costs up to about 0.8 ns a unit.
+const CHAR_WORK: u64 = 24;
+const ROW_MOVED: u64 = 1;
+pub(crate) const ROW_SHARED: u64 = 16;
+const ROW_MADE: u64 = 64;
+const CELL_CLEARED: u64 = 2;
+/// How many blank rows, one for each background colour, are kept to share.
+const BLANKS_KEPT: usize = 8;
 
-impl Row {
-    fn cells(&self) -> &[Cell] {
-        match self {
-            Row::Blank(cells) => cells,
-            Row::Cells(cells) => cells,
-        }
-    }
-}
+/// A row's cells, shared with the screens kept as they were and with the other rows cleared to
+/// the same colour until one of them is changed.
+type Row = Arc<[Cell]>;
 
 /// Where the cursor is and what it writes with, as saved and brought back.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -163,7 +174,7 @@ impl PartialEq for Grid {
     fn eq(&self, other: &Self) -> bool {
         self.saved == other.saved
             && self.rows.len() == other.rows.len()
-            && self.rows.iter().zip(&other.rows).all(|(a, b)| a.cells() == b.cells())
+            && self.rows.iter().zip(&other.rows).all(|(a, b)| Arc::ptr_eq(a, b) || a == b)
     }
 }
 
@@ -185,10 +196,14 @@ pub struct Screen {
     top: u16,
     bottom: u16,
     parser: Parser,
-    /// The last blank row made, shared by the rows cleared to its colour.
-    blank: Arc<[Cell]>,
+    /// Blank rows, one for each background colour, latest first, shared by the rows cleared.
+    blanks: Vec<Row>,
+    /// The work done so far.
+    work: u64,
 }
 
+/// Two screens are the same if they show the same and go on the same; the work each took
+/// doesn't count, nor which blank rows each keeps to share.
 impl PartialEq for Screen {
     fn eq(&self, other: &Self) -> bool {
         self.width == other.width
@@ -203,6 +218,7 @@ impl PartialEq for Screen {
             && self.top == other.top
             && self.bottom == other.bottom
             && self.parser == other.parser
+            && self.too_costly() == other.too_costly()
     }
 }
 
@@ -222,16 +238,21 @@ fn side(side: u16, most: u16) -> u16 {
     side.clamp(1, most)
 }
 
+/// A cell left blank where half of a wide character was.
+fn halved(cell: Cell) -> Cell {
+    Cell { text: ' ', marks: [None; 2], wide: Wide::Narrow, style: cell.style }
+}
+
 impl Screen {
     /// A blank screen of this many columns and rows, each kept between one and the most a
     /// recording may have.
     pub fn new(width: u16, height: u16) -> Screen {
         let (width, height) = (side(width, MOST_WIDTH), side(height, MOST_HEIGHT));
-        let blank: Arc<[Cell]> = vec![Cell::default(); usize::from(width)].into();
+        let blank: Row = vec![Cell::default(); usize::from(width)].into();
         Screen {
             width,
             height,
-            main: Grid { rows: vec![Row::Blank(blank.clone()); usize::from(height)], saved: Pen::default() },
+            main: Grid { rows: vec![blank.clone(); usize::from(height)], saved: Pen::default() },
             alternate: None,
             on_alternate: false,
             pen: Pen::default(),
@@ -241,7 +262,8 @@ impl Screen {
             top: 0,
             bottom: height - 1,
             parser: Parser::default(),
-            blank,
+            blanks: vec![blank],
+            work: 0,
         }
     }
 
@@ -253,9 +275,9 @@ impl Screen {
         self.height
     }
 
-    /// The cell at this column and row, which must be on the screen.
-    pub fn cell(&self, col: u16, row: u16) -> &Cell {
-        &self.grid().rows[usize::from(row)].cells()[usize::from(col)]
+    /// The cell at this column and row, or nothing off the screen.
+    pub fn cell(&self, col: u16, row: u16) -> Option<&Cell> {
+        self.grid().rows.get(usize::from(row))?.get(usize::from(col))
     }
 
     /// Where the cursor is, as column and row, or nothing while it's hidden.
@@ -265,24 +287,45 @@ impl Screen {
 
     /// Each row's cells, top to bottom; each row is as wide as the screen.
     pub fn rows(&self) -> impl Iterator<Item = &[Cell]> {
-        self.grid().rows.iter().map(Row::cells)
+        self.grid().rows.iter().map(|row| &**row)
     }
 
-    /// How many cells the screen holds, both its screens counted.
-    pub(crate) fn cells_held(&self) -> usize {
-        let grids = if self.alternate.is_some() { 2 } else { 1 };
-        usize::from(self.width) * usize::from(self.height) * grids
+    /// Whether the screen has done more work than a recording may cost, and so stopped: what
+    /// it shows is as it was then, and the recording is too large to play.
+    pub fn too_costly(&self) -> bool {
+        self.work > MOST_WORK
+    }
+
+    /// The work done so far, in the units `MOST_WORK` counts.
+    pub(crate) fn work(&self) -> u64 {
+        self.work
+    }
+
+    /// Every row of both screens, as held.
+    pub(crate) fn held_rows(&self) -> impl Iterator<Item = &Row> {
+        self.main.rows.iter().chain(self.alternate.iter().flat_map(|grid| &grid.rows))
+    }
+
+    fn charge(&mut self, work: u64) {
+        self.work = self.work.saturating_add(work);
     }
 
     /// Reads what a program wrote. A sequence cut off at the end is finished by what's fed next.
     pub fn feed(&mut self, text: &str) {
+        if self.too_costly() {
+            return;
+        }
         for c in text.chars() {
+            self.work += CHAR_WORK;
             match self.parser.advance(c) {
                 Action::None => {}
                 Action::Print(c) => self.print(c),
                 Action::Control(c) => self.control(c),
                 Action::Escape { intermediate, last } => self.escape(intermediate, last),
                 Action::Csi(csi) => self.csi(&csi),
+            }
+            if self.too_costly() {
+                return;
             }
         }
     }
@@ -291,18 +334,21 @@ impl Screen {
     /// stays; if the cursor's row would be cut off, rows go from the top instead.
     pub fn resize(&mut self, width: u16, height: u16) {
         let (width, height) = (side(width, MOST_WIDTH), side(height, MOST_HEIGHT));
-        if (width, height) == (self.width, self.height) {
+        if (width, height) == (self.width, self.height) || self.too_costly() {
             return;
         }
         let dropped = (self.pen.row + 1).saturating_sub(height);
         let on_alternate = self.on_alternate;
+        let width_changed = width != self.width;
         self.width = width;
         self.height = height;
+        // The blank rows were made for the old width.
+        let old_blanks = if width_changed { std::mem::take(&mut self.blanks) } else { Vec::new() };
         let mut main = std::mem::take(&mut self.main.rows);
-        self.resize_rows(&mut main, if on_alternate { 0 } else { dropped });
+        self.resize_rows(&mut main, if on_alternate { 0 } else { dropped }, &old_blanks);
         self.main.rows = main;
         if let Some(mut alternate) = self.alternate.as_mut().map(|grid| std::mem::take(&mut grid.rows)) {
-            self.resize_rows(&mut alternate, if on_alternate { dropped } else { 0 });
+            self.resize_rows(&mut alternate, if on_alternate { dropped } else { 0 }, &old_blanks);
             if let Some(grid) = self.alternate.as_mut() {
                 grid.rows = alternate;
             }
@@ -318,30 +364,33 @@ impl Screen {
         self.bottom = height - 1;
     }
 
-    /// Fits rows to the screen's size, the first `dropped` going.
-    fn resize_rows(&mut self, rows: &mut Vec<Row>, dropped: u16) {
+    /// Fits rows to the screen's size, the first `dropped` going. Rows that were blank, one of
+    /// `old_blanks`, are blank again at the new width.
+    fn resize_rows(&mut self, rows: &mut Vec<Row>, dropped: u16, old_blanks: &[Row]) {
         let (width, height) = (usize::from(self.width), usize::from(self.height));
+        self.charge(ROW_SHARED * rows.len() as u64);
         rows.drain(..usize::from(dropped).min(rows.len()));
         rows.truncate(height);
-        for row in rows.iter_mut() {
-            match row {
-                Row::Blank(cells) => {
-                    let bg = cells[0].style.bg;
-                    *row = Row::Blank(self.blank_cells(bg));
+        if !old_blanks.is_empty() || rows.first().is_some_and(|row| row.len() != width) {
+            for row in rows.iter_mut() {
+                if let Some(blank) = old_blanks.iter().find(|blank| Arc::ptr_eq(blank, row)) {
+                    *row = self.blank_cells(blank[0].style.bg);
+                    continue;
                 }
-                Row::Cells(cells) => {
-                    cells.resize(width, Cell::default());
-                    // A wide character cut in half by the new edge goes.
-                    if let Some(last) = cells.last_mut()
-                        && last.wide == Wide::Left
-                    {
-                        *last = Cell { text: ' ', wide: Wide::Narrow, style: last.style };
-                    }
+                self.charge(ROW_MADE + 4 * width as u64);
+                let mut cells: Row = row.iter().copied().chain(std::iter::repeat(Cell::default())).take(width).collect();
+                // A wide character cut in half by the new edge goes.
+                if let Some(last) = Arc::get_mut(&mut cells).and_then(|cells| cells.last_mut())
+                    && last.wide == Wide::Left
+                {
+                    *last = halved(*last);
                 }
+                *row = cells;
             }
         }
         let blank = self.blank_cells(Colour::Default);
-        rows.resize(height, Row::Blank(blank));
+        self.charge(ROW_SHARED * height.saturating_sub(rows.len()) as u64);
+        rows.resize(height, blank);
     }
 
     fn grid(&self) -> &Grid {
@@ -358,12 +407,19 @@ impl Screen {
         }
     }
 
-    /// A blank row's cells of this background, shared with the last made if it's the same.
-    fn blank_cells(&mut self, bg: Colour) -> Arc<[Cell]> {
-        if self.blank.len() != usize::from(self.width) || self.blank[0].style.bg != bg {
-            self.blank = vec![self.erased_with(bg); usize::from(self.width)].into();
+    /// A blank row of this background, shared with the others of it.
+    fn blank_cells(&mut self, bg: Colour) -> Row {
+        match self.blanks.iter().position(|blank| blank[0].style.bg == bg) {
+            Some(0) => {}
+            Some(found) => self.blanks[..=found].rotate_right(1),
+            None => {
+                self.charge(ROW_MADE + CELL_CLEARED * u64::from(self.width));
+                let blank: Row = vec![self.erased_with(bg); usize::from(self.width)].into();
+                self.blanks.insert(0, blank);
+                self.blanks.truncate(BLANKS_KEPT);
+            }
         }
-        self.blank.clone()
+        self.blanks[0].clone()
     }
 
     /// A cell as erasing leaves it: blank, with the background colour in use.
@@ -372,24 +428,15 @@ impl Screen {
     }
 
     fn erased_with(&self, bg: Colour) -> Cell {
-        Cell { text: ' ', wide: Wide::Narrow, style: Style { bg, ..Style::default() } }
+        Cell { style: Style { bg, ..Style::default() }, ..Cell::default() }
     }
 
-    /// A blank row in the background colour in use.
-    fn blank_row(&mut self) -> Row {
-        Row::Blank(self.blank_cells(self.pen.style.bg))
-    }
-
-    /// A row's cells to change, made its own if it was blank.
+    /// A row's cells to change, copied first if they're shared.
     fn row_mut(&mut self, row: u16) -> &mut [Cell] {
-        let row = &mut self.grid_mut().rows[usize::from(row)];
-        if let Row::Blank(cells) = row {
-            *row = Row::Cells(cells.to_vec());
+        if Arc::strong_count(&self.grid().rows[usize::from(row)]) > 1 {
+            self.charge(ROW_MADE + u64::from(self.width));
         }
-        match row {
-            Row::Cells(cells) => cells,
-            Row::Blank(_) => unreachable!("the row was just made its own"),
-        }
+        Arc::make_mut(&mut self.grid_mut().rows[usize::from(row)])
     }
 
     fn print(&mut self, c: char) {
@@ -398,10 +445,8 @@ impl Screen {
             ' '..='~' => 1,
             _ => c.width().unwrap_or(0),
         };
-        // A combining mark has no cell of its own; one cell holds one character, so it's
-        // joined to the cell before by being left out.
         if wide == 0 {
-            return;
+            return self.join(c);
         }
         let width = self.width;
         if wide == 2 && width < 2 {
@@ -424,23 +469,43 @@ impl Screen {
         let cells = self.row_mut(self.pen.row);
         // Writing over half of a wide character leaves no half behind.
         if col > 0 && cells[col].wide == Wide::Right {
-            cells[col - 1] = Cell { text: ' ', wide: Wide::Narrow, style: cells[col - 1].style };
+            cells[col - 1] = halved(cells[col - 1]);
         }
         let end = col + wide;
         if cells[end - 1].wide == Wide::Left && end < cells.len() {
-            cells[end] = Cell { text: ' ', wide: Wide::Narrow, style: cells[end].style };
+            cells[end] = halved(cells[end]);
         }
         if wide == 2 {
-            cells[col] = Cell { text: c, wide: Wide::Left, style };
-            cells[col + 1] = Cell { text: ' ', wide: Wide::Right, style };
+            cells[col] = Cell { text: c, marks: [None; 2], wide: Wide::Left, style };
+            cells[col + 1] = Cell { text: ' ', marks: [None; 2], wide: Wide::Right, style };
         } else {
-            cells[col] = Cell { text: c, wide: Wide::Narrow, style };
+            cells[col] = Cell { text: c, marks: [None; 2], wide: Wide::Narrow, style };
         }
         if end >= usize::from(width) {
             self.pen.col = width - 1;
             self.wrap_next = self.wraps;
         } else {
             self.pen.col = end as u16;
+        }
+    }
+
+    /// Joins a combining mark to the character written last: the cell before the cursor, or
+    /// the cursor's own while it waits on the last cell.
+    fn join(&mut self, mark: char) {
+        let col = if self.wrap_next {
+            self.pen.col
+        } else if self.pen.col > 0 {
+            self.pen.col - 1
+        } else {
+            return;
+        };
+        let mut col = usize::from(col);
+        if self.grid().rows[usize::from(self.pen.row)][col].wide == Wide::Right && col > 0 {
+            col -= 1;
+        }
+        let cells = self.row_mut(self.pen.row);
+        if let Some(free) = cells[col].marks.iter_mut().find(|free| free.is_none()) {
+            *free = Some(mark);
         }
     }
 
@@ -493,25 +558,32 @@ impl Screen {
 
     /// Moves the rows from `top` to `bottom` up by `count`, blank rows coming in below.
     fn scroll_up(&mut self, top: u16, bottom: u16, count: u16) {
-        let (top, bottom) = (usize::from(top), usize::from(bottom));
-        let count = usize::from(count).min(bottom + 1 - top);
-        let blank = self.blank_row();
-        let rows = &mut self.grid_mut().rows[top..=bottom];
-        rows.rotate_left(count);
-        let len = rows.len();
-        for row in &mut rows[len - count..] {
-            *row = blank.clone();
-        }
+        self.scroll(top, bottom, count, true);
     }
 
     /// Moves the rows from `top` to `bottom` down by `count`, blank rows coming in above.
     fn scroll_down(&mut self, top: u16, bottom: u16, count: u16) {
-        let (top, bottom) = (usize::from(top), usize::from(bottom));
-        let count = usize::from(count).min(bottom + 1 - top);
-        let blank = self.blank_row();
-        let rows = &mut self.grid_mut().rows[top..=bottom];
-        rows.rotate_right(count);
-        for row in &mut rows[..count] {
+        self.scroll(top, bottom, count, false);
+    }
+
+    fn scroll(&mut self, top: u16, bottom: u16, count: u16, up: bool) {
+        let rows = bottom + 1 - top;
+        // Scrolling every row away clears them.
+        if count >= rows {
+            return self.erase_rows(top, bottom + 1);
+        }
+        self.charge(ROW_MOVED * u64::from(rows) + ROW_SHARED * u64::from(count));
+        let blank = self.blank_cells(self.pen.style.bg);
+        let (count, region) = (usize::from(count), &mut self.grid_mut().rows[usize::from(top)..=usize::from(bottom)]);
+        let len = region.len();
+        let coming = if up {
+            region.rotate_left(count);
+            len - count..len
+        } else {
+            region.rotate_right(count);
+            0..count
+        };
+        for row in &mut region[coming] {
             *row = blank.clone();
         }
     }
@@ -526,6 +598,7 @@ impl Screen {
         if from == 0 && to == usize::from(self.width) {
             return self.erase_rows(row, row + 1);
         }
+        self.charge(CELL_CLEARED * (to - from) as u64);
         let erased = self.erased();
         let cells = self.row_mut(row);
         cells[from..to].fill(erased);
@@ -537,26 +610,34 @@ impl Screen {
         }
     }
 
-    /// Erases whole rows from `from` up to `to`. A row already the same blank is left as it is,
-    /// so clearing a clear screen costs next to nothing.
+    /// Erases whole rows from `from` up to `to`. A row already the same blank is left as it is.
     fn erase_rows(&mut self, from: u16, to: u16) {
         let blank = self.blank_cells(self.pen.style.bg);
         let (from, to) = (usize::from(from), usize::from(to.min(self.height)));
-        for row in &mut self.grid_mut().rows[from.min(to)..to] {
-            if !matches!(row, Row::Blank(cells) if Arc::ptr_eq(cells, &blank)) {
-                *row = Row::Blank(blank.clone());
+        let from = from.min(to);
+        let mut shared = 0;
+        for row in &mut self.grid_mut().rows[from..to] {
+            if !Arc::ptr_eq(row, &blank) {
+                *row = blank.clone();
+                shared += 1;
             }
         }
+        self.charge(ROW_MOVED * (to - from) as u64 + ROW_SHARED * shared);
     }
 
-    /// Starts again, as a new screen of the same size.
+    /// Starts again, as a new screen of the same size. The work done so far still counts.
     fn reset(&mut self) {
-        let (width, height) = (self.width, self.height);
-        let blank = self.blank_cells(Colour::Default);
-        let main = std::mem::take(&mut self.main.rows);
-        *self = Screen { main: Grid { rows: main, saved: Pen::default() }, blank, ..Screen::new(1, 1) };
-        (self.width, self.height, self.bottom) = (width, height, height - 1);
-        self.erase_rows(0, height);
+        self.alternate = None;
+        self.on_alternate = false;
+        self.pen = Pen::default();
+        self.main.saved = Pen::default();
+        self.wrap_next = false;
+        self.shown = true;
+        self.wraps = true;
+        self.top = 0;
+        self.bottom = self.height - 1;
+        self.parser = Parser::default();
+        self.erase_rows(0, self.height);
     }
 
     fn escape(&mut self, intermediate: u8, last: u8) {
@@ -657,6 +738,7 @@ impl Screen {
             }
             b'@' | b'P' => {
                 self.wrap_next = false;
+                self.charge(2 * CELL_CLEARED * u64::from(width));
                 let erased = self.erased();
                 let (col, n) = (usize::from(col), usize::from(n).min(usize::from(width - col)));
                 let cells = self.row_mut(row);
@@ -731,7 +813,8 @@ impl Screen {
     fn switch(&mut self, alternate: bool) {
         if alternate && self.alternate.is_none() {
             let blank = self.blank_cells(Colour::Default);
-            self.alternate = Some(Grid { rows: vec![Row::Blank(blank); usize::from(self.height)], saved: Pen::default() });
+            self.charge(ROW_SHARED * u64::from(self.height));
+            self.alternate = Some(Grid { rows: vec![blank; usize::from(self.height)], saved: Pen::default() });
         }
         self.on_alternate = alternate;
         self.wrap_next = false;
@@ -826,7 +909,7 @@ fn mend(cells: &mut [Cell]) {
             Wide::Left if cells.get(col + 1).is_some_and(|next| next.wide == Wide::Right) => col += 2,
             Wide::Narrow => col += 1,
             _ => {
-                cells[col] = Cell { text: ' ', wide: Wide::Narrow, style: cells[col].style };
+                cells[col] = halved(cells[col]);
                 col += 1;
             }
         }

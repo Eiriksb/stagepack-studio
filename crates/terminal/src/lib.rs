@@ -21,8 +21,8 @@ pub use cast::{
 };
 #[cfg(feature = "make")]
 pub use cast::{make_demo_cast, make_test_cast};
-pub use player::{KEPT_EVERY, MOST_KEPT_CELLS, MOST_KEPT_SCREENS, Player};
-pub use screen::{Cell, Colour, Screen, Style, Wide, rgb};
+pub use player::{KEPT_EVERY, MOST_KEPT_BYTES, MOST_KEPT_SCREENS, Player};
+pub use screen::{Cell, Colour, MOST_WORK, Screen, Style, Wide, rgb};
 
 /// Why a recording can't be played.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
