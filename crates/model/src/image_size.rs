@@ -90,7 +90,8 @@ fn after_fill(len: u64, at: u64, read: &mut dyn FnMut(u64, u64) -> Result<Vec<u8
         }
         let piece = read(at, JPEG_PIECE.min(len - at))?;
         match piece.iter().position(|b| *b != 0xFF) {
-            Some(0) => return Ok(at),
+            // The run ended with the piece before: its last fill byte is the one just before.
+            Some(0) => return Ok(at - 1),
             Some(k) => return Ok(at + k as u64 - 1),
             None => at += piece.len() as u64,
         }

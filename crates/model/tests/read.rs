@@ -551,6 +551,11 @@ fn any_bytes_read_or_say_why_named_cases() {
     // Fill bytes before a marker are passed over.
     let filled = with_texture(&[&picture[..2], &[0xFF; 5], &picture[2..]].concat());
     assert_eq!(facts_and_read(filled).unwrap().texture.map(|t| (t.width, t.height)), Some((32, 32)));
+    // However long the fill runs, even to the end of a piece read, it is passed over.
+    for run in [65_533, 65_534, 65_535, 65_536, 131_071] {
+        let filled = with_texture(&[&picture[..2], &vec![0xFF; run], &picture[2..]].concat());
+        assert_eq!(facts_and_read(filled).unwrap().texture.map(|t| (t.width, t.height)), Some((32, 32)), "{run}");
+    }
     // A JPEG cut short, in its last scan or just before its end, is damaged.
     let whole = progressive_jpeg(64, 64, 3);
     for cut in [whole.len() - 2, whole.len() - 3, whole.len() / 2] {
