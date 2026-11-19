@@ -642,6 +642,8 @@ impl Drop for Drawing {
 static MODELS_INSERTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static MODELS_TURNED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static VIEWS_SET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// How many drags the show's windows took, whole.
+static SHOW_DRAGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The videos playing in the editor.
 fn videos_playing(typing: &typing::Typing, cx: &TestAppContext) -> usize {
@@ -669,8 +671,9 @@ fn a_moment(cx: &mut TestAppContext) {
     cx.run_until_parked();
 }
 
-/// A drag with the mouse in a show's window `show`, from `from` to `to`.
-fn show_drag(cx: &mut TestAppContext, show: gpui_kit::AnyWindowHandle, from: gpui_kit::Point<gpui_kit::Pixels>, to: gpui_kit::Point<gpui_kit::Pixels>) {
+/// A drag with the mouse in a show's window `show`, from `from` to `to`, and whether it was
+/// made whole: a window that closed part-way, as the show ending on its click closes it, stops it.
+fn show_drag(cx: &mut TestAppContext, show: gpui_kit::AnyWindowHandle, from: gpui_kit::Point<gpui_kit::Pixels>, to: gpui_kit::Point<gpui_kit::Pixels>) -> bool {
     use gpui_kit::test::TestWindowExt as _;
     use gpui_kit::{AppContext as _, InputEvent as _, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
     let held = Some(MouseButton::Left);
@@ -681,13 +684,18 @@ fn show_drag(cx: &mut TestAppContext, show: gpui_kit::AnyWindowHandle, from: gpu
         MouseUpEvent { button: MouseButton::Left, position: to, modifiers: Modifiers::default(), click_count: 1 }.to_platform_input(),
     ];
     for event in events {
-        cx.update_window(show, |_, window, cx| {
+        let sent = cx.update_window(show, |_, window, cx| {
             window.render_frame(cx);
             window.dispatch_event(event, cx);
-        })
-        .ok();
+        });
+        if sent.is_err() {
+            let open = cx.read(|cx| cx.windows()).iter().any(|window| window.window_id() == show.window_id());
+            assert!(!open, "the show's window is open, and took no drag: {:?}", sent.err());
+            return false;
+        }
         cx.run_until_parked();
     }
+    true
 }
 
 /// A turn of the wheel by `lines` at `at` on the slide.
@@ -853,6 +861,9 @@ fn window_run(cx: &mut TestAppContext, start: Start, seed: u64) {
             first_save(&typing, cx, &save, seed);
             saved = Some(save);
         }
+        // Choices 0 to 29 each do something, and the three past them type a letter: with choice
+        // 5, typing has 4 chances in 33, as it had 4 in 30 before the models' three arms came, so
+        // it stays among the most done.
         let choice = rng.below(33);
         let elements = typing.layout(cx).elements().to_vec();
         let element = (!elements.is_empty()).then(|| elements[rng.below(elements.len())].clone());
@@ -1017,7 +1028,9 @@ fn window_run(cx: &mut TestAppContext, start: Start, seed: u64) {
                     let show = shows[rng.below(shows.len())];
                     if rng.below(5) == 0 {
                         let from = gpui_kit::point(gpui_kit::px(rng.below(600) as f32 + 100.), gpui_kit::px(rng.below(400) as f32 + 100.));
-                        show_drag(cx, show, from, gpui_kit::point(from.x + gpui_kit::px(80.), from.y + gpui_kit::px(20.)));
+                        if show_drag(cx, show, from, gpui_kit::point(from.x + gpui_kit::px(80.), from.y + gpui_kit::px(20.))) {
+                            SHOW_DRAGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     } else {
                         cx.simulate_keystrokes(show, ["right", "right", "left", "space"][rng.below(4)]);
                     }
@@ -1175,9 +1188,10 @@ fn random_presses_keep_the_slide_free_while_the_list_or_notes_have_the_keyboard(
         }
     }
     let count = |counted: &std::sync::atomic::AtomicUsize| counted.load(std::sync::atomic::Ordering::Relaxed);
-    let (inserted, turned, set) = (count(&MODELS_INSERTED), count(&MODELS_TURNED), count(&VIEWS_SET));
-    println!("the window runs put {inserted} models on slides, turned one {turned} times and set {set} views");
+    let (inserted, turned, set, dragged) = (count(&MODELS_INSERTED), count(&MODELS_TURNED), count(&VIEWS_SET), count(&SHOW_DRAGS));
+    let said = format!("the window runs put {inserted} models on slides, turned one {turned} times, set {set} views and dragged in the show {dragged} times");
+    println!("{said}");
     if seeds().count() >= 5 {
-        assert!(inserted > 0 && turned > 0 && set > 0, "the window runs put {inserted} models on slides, turned one {turned} times and set {set} views");
+        assert!(inserted > 0 && turned > 0 && set > 0 && dragged > 0, "{said}");
     }
 }

@@ -705,16 +705,20 @@ impl Drop for ModelsAlone {
     }
 }
 
-/// Runs alone with the app's drawer on the adapter `ADAPTER` names, or the best there is, and
-/// says which; or `None`, after saying why `test` is skipped.
+/// Runs alone with the app's drawer on the adapter `ADAPTER` names, or the best there is with
+/// none, and says which; or `None`, after saying why `test` is skipped. An `ADAPTER` it doesn't
+/// know stops the test, saying so.
 fn models_alone(test: &str) -> Option<ModelsAlone> {
     use slides_model::{AdapterKind, Drawer, DrawerOptions};
     let alone = ModelsAlone(MODELS_ALONE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
-    let only = match std::env::var("ADAPTER").as_deref() {
-        Ok("discrete") => Some(AdapterKind::Discrete),
-        Ok("integrated") => Some(AdapterKind::Integrated),
-        Ok("software") => Some(AdapterKind::Software),
-        _ => None,
+    let only = match std::env::var("ADAPTER") {
+        Err(std::env::VarError::NotPresent) => None,
+        Ok(kind) if kind.is_empty() => None,
+        Ok(kind) if kind == "discrete" => Some(AdapterKind::Discrete),
+        Ok(kind) if kind == "integrated" => Some(AdapterKind::Integrated),
+        Ok(kind) if kind == "software" => Some(AdapterKind::Software),
+        // Not the best there is in its place, which would time another card under its name.
+        other => panic!("ADAPTER is {other:?}: it can be discrete, integrated or software, or left unset for the best there is"),
     };
     let drawer = Drawer::start_with(DrawerOptions { only, ..DrawerOptions::default() });
     let began = Instant::now();
