@@ -7,7 +7,10 @@
 //! slide is selected, typed in or waiting while the list of slides or the notes have the
 //! keyboard. Half of those runs start on the start screen with a template picked at random and
 //! save the new presentation for the first time at a random step; what's saved, opened again at
-//! the end, has the text the window has.
+//! the end, has the text the window has. Among the window's steps a made video is put on the
+//! slide, from the Video tool's dialog or dropped, played and stopped, and the show started,
+//! stepped through and ended: a video plays only while it alone is selected in the editor, and
+//! nothing plays once the show is over.
 //!
 //! Each talk runs with a few seeds; `SEEDS=n` runs seed `n` alone, and `SEEDS=a..b` a range.
 //! `PROPTEST_CASES=n` runs the arranging with `n` seeds in all, spread over its talks.
@@ -578,6 +581,56 @@ fn pick_from_menu(typing: &typing::Typing, cx: &mut TestAppContext, at: usize, c
     }
 }
 
+/// The thing selected, if it's a video and nothing else is.
+fn video_selected(typing: &typing::Typing, cx: &TestAppContext) -> bool {
+    let source = typing.source(cx);
+    let things = typing.document(cx).read_with(cx, |document, _| document.selection().map_or(0, |selection| selection.things.len()));
+    things == 1 && typing::selected(typing, cx).is_some_and(|(_, range)| source.get(range).is_some_and(|thing| thing.starts_with("<Video")))
+}
+
+/// The videos playing in the editor.
+fn videos_playing(typing: &typing::Typing, cx: &TestAppContext) -> usize {
+    cx.read(|cx| typing.view.read(cx).slide_canvas().read(cx).playing_videos().len())
+}
+
+/// The windows open now that weren't among `before`.
+fn windows_since(before: &[gpui_kit::AnyWindowHandle], cx: &TestAppContext) -> Vec<gpui_kit::AnyWindowHandle> {
+    cx.read(|cx| cx.windows()).into_iter().filter(|window| before.iter().all(|was| was.window_id() != window.window_id())).collect()
+}
+
+/// Lets a twentieth of a second pass and draws every window, as a video playing asks for.
+fn a_moment(cx: &mut TestAppContext) {
+    use gpui_kit::AppContext as _;
+    use gpui_kit::test::TestWindowExt as _;
+    cx.executor().advance_clock(std::time::Duration::from_millis(50));
+    cx.run_until_parked();
+    for window in cx.read(|cx| cx.windows()) {
+        cx.update_window(window, |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+        })
+        .ok();
+    }
+    cx.run_until_parked();
+}
+
+/// Drops `path` from outside the app on the slide at (`x`, `y`), and lets its copy run.
+fn drop_file(typing: &typing::Typing, cx: &mut TestAppContext, path: std::path::PathBuf, x: f32, y: f32) {
+    use gpui_kit::InputEvent as _;
+    use gpui_kit::test::TestWindowExt as _;
+    let at = typing.at(cx, x, y);
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        let paths = gpui_kit::ExternalPaths([path].into_iter().collect());
+        window.dispatch_event(gpui_kit::FileDropEvent::Entered { position: at, paths }.to_platform_input(), cx);
+        window.dispatch_event(gpui_kit::FileDropEvent::Pending { position: at }.to_platform_input(), cx);
+        window.dispatch_event(gpui_kit::FileDropEvent::Submit { position: at }.to_platform_input(), cx);
+        window.render_frame(cx);
+    });
+    cx.run_until_parked();
+    typing.settle(cx);
+}
+
 /// What a run in the window starts from.
 #[derive(Clone, Copy)]
 enum Start<'a> {
@@ -671,10 +724,14 @@ fn window_run(cx: &mut TestAppContext, start: Start, seed: u64) {
     use stagepack_studio::slide_editor::handle_id;
     use stagepack_studio::start_screen::template_tile_id;
     use stagepack_studio::templates::templates;
+    use stagepack_studio::slide_editor::{VIDEO_PLAY_ID, VIDEO_STOP_ID};
     // The scratch folder a new presentation keeps all it keeps in, and is saved to.
     let root = tempfile::tempdir().unwrap();
+    // A made video, outside the talk, to put on its slides: six pictures of a colour each.
+    let clip = root.path().join("Made clip.mp4");
+    std::fs::write(&clip, slides_video::make_test_video(64, 36, 6, 10, |at| [40 * at as u8, 255 - 40 * at as u8, 90, 255].repeat(64 * 36))).unwrap();
     let (typing, mut first_save_due) = match start {
-        Start::Talk(talk) => (typing::open(cx, talk), None),
+        Start::Talk(talk) => (typing::open_with(cx, talk, Some(stagepack_studio::recovery::Recovery::new(root.path().join("recovery")))), None),
         Start::StartScreen => {
             // Its own generator, so that the steps a seed makes are those a talk's run makes.
             let mut pick = Rng(seed.wrapping_mul(0xD6E8_FEB8_6659_FD93) | 1);
@@ -704,7 +761,7 @@ fn window_run(cx: &mut TestAppContext, start: Start, seed: u64) {
             first_save(&typing, cx, &save, seed);
             saved = Some(save);
         }
-        let choice = rng.below(27);
+        let choice = rng.below(30);
         let elements = typing.layout(cx).elements().to_vec();
         let element = (!elements.is_empty()).then(|| elements[rng.below(elements.len())].clone());
         let modifiers = [Modifiers::default(), Modifiers::shift(), Modifiers::control()][rng.below(3)];
@@ -823,8 +880,70 @@ fn window_run(cx: &mut TestAppContext, start: Start, seed: u64) {
                     typing.mouse_up(cx, to, 1, modifiers);
                 }
             }
+            // A made video put on the slide, from the Video tool's dialog or dropped.
+            (23, _) => {
+                if rng.below(2) == 0 {
+                    let view = typing.view.clone();
+                    let path = clip.clone();
+                    cx.update(|cx| view.update(cx, |view, cx| view.chosen_videos(vec![path], cx)));
+                    cx.run_until_parked();
+                    typing.settle(cx);
+                } else {
+                    drop_file(&typing, cx, clip.clone(), rng.below(1920) as f32, rng.below(1080) as f32);
+                }
+            }
+            // A video on the slide selected and played, or stopped, by its button or Space.
+            (24, _) | (25, _) => {
+                let source = typing.source(cx);
+                let videos: Vec<_> = elements.iter().filter(|element| source.get(element.source.clone()).is_some_and(|thing| thing.starts_with("<Video"))).cloned().collect();
+                if !videos.is_empty() && !video_selected(&typing, cx) {
+                    let video = &videos[rng.below(videos.len())];
+                    let at = typing.at(cx, video.rect.x + video.rect.w / 5., video.rect.y + video.rect.h / 5.);
+                    typing.click(cx, at);
+                }
+                match rng.below(3) {
+                    0 => typing.press(cx, "space"),
+                    _ => {
+                        if !click_if_shown(&typing, cx, VIDEO_PLAY_ID) {
+                            click_if_shown(&typing, cx, VIDEO_STOP_ID);
+                        }
+                    }
+                }
+                for _ in 0..rng.below(4) {
+                    a_moment(cx);
+                }
+            }
+            // The show, started, stepped through and ended.
+            (26, _) => {
+                typing.press(cx, "escape");
+                let before = cx.read(|cx| cx.windows());
+                typing.press(cx, ["f5", "shift-f5"][rng.below(2)]);
+                cx.run_until_parked();
+                let shows = windows_since(&before, cx);
+                assert!(!shows.is_empty(), "seed {seed} step {step}: the show didn't start");
+                for _ in 0..rng.below(6) {
+                    let show = shows[rng.below(shows.len())];
+                    cx.simulate_keystrokes(show, ["right", "right", "left", "space"][rng.below(4)]);
+                    a_moment(cx);
+                }
+                let which = rng.below(shows.len());
+                cx.simulate_keystrokes(shows[which], "escape");
+                cx.run_until_parked();
+                assert!(windows_since(&before, cx).is_empty(), "seed {seed} step {step}: Escape in show window {which} didn't end the show");
+                typing.with_window(cx, |window, _| window.activate_window());
+                typing.settle(cx);
+            }
             _ => typing.type_text(cx, "b"),
         }
+        let playing = videos_playing(&typing, cx);
+        assert!(
+            playing == 0 || (playing == 1 && video_selected(&typing, cx)),
+            "seed {seed} step {step}, choice {choice}: {playing} videos play in the editor, with the video selected {}, {:?} selected, typing {}\n{}",
+            video_selected(&typing, cx),
+            typing.document(cx).read_with(cx, |document, _| document.selection().cloned()),
+            typing.editing(cx).is_some(),
+            typing.source(cx)
+        );
         let held = list_or_notes_have_keyboard(&typing, cx);
         if held {
             let document = typing.document(cx);
@@ -844,6 +963,7 @@ fn window_run(cx: &mut TestAppContext, start: Start, seed: u64) {
         );
     }
     typing.press(cx, "escape");
+    assert_eq!(videos_playing(&typing, cx), 0, "seed {seed}: a video plays with nothing selected");
     if let Some(save) = &saved {
         saved_reads_as_the_window(&typing, cx, save, seed);
     }
