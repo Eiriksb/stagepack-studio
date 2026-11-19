@@ -1,5 +1,6 @@
 //! Reading a 3D model: a binary glTF (`.glb`) with everything inside it, or a point cloud
-//! (`.ply`). This knows nothing of windows or drawing: what it gives out is plain arrays.
+//! (`.ply`), and, with the `draw` feature, drawing one off-screen into a picture on a thread of
+//! its own. This knows nothing of windows: what it gives out is plain arrays.
 //!
 //! A model is data. Every size, count and place a file claims is checked against what holds it
 //! and the file's own length before anything is allocated or read, and against the limits
@@ -7,6 +8,10 @@
 //! file, a link or data written into its description is refused. A file that isn't a model that
 //! can be drawn says why in plain words rather than crashing or hanging.
 
+#[cfg(feature = "draw")]
+mod device;
+#[cfg(feature = "draw")]
+mod draw;
 mod glb;
 mod image_size;
 pub mod limits;
@@ -14,14 +19,21 @@ pub mod limits;
 mod make;
 mod maths;
 mod ply;
+mod view;
 
 use std::fmt;
+use std::time::Duration;
 use std::io::{Read, Seek, SeekFrom};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+#[cfg(feature = "draw")]
+pub use device::{AdapterKind, adapter_kinds};
+#[cfg(feature = "draw")]
+pub use draw::{Drawer, DrawerOptions, Scene};
 pub use limits::*;
 #[cfg(feature = "make")]
 pub use make::{BOX_COLOURS, GRID_COLOURS, MadeGlb, glb_from, glb_parts, make_test_glb, make_test_ply};
+pub use view::View;
 
 /// Something a model can be read from in pieces, from anywhere in it.
 pub trait ReadSeek: Read + Seek + Send {}
@@ -135,6 +147,25 @@ pub struct Texture {
 impl fmt::Debug for Texture {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Texture").field("width", &self.width).field("height", &self.height).finish()
+    }
+}
+
+/// A model drawn: straight-alpha BGRA, rows from the top, opaque where the model is and clear
+/// elsewhere.
+#[derive(Clone)]
+pub struct Picture {
+    pub width: u32,
+    pub height: u32,
+    pub bgra: Vec<u8>,
+    /// How long the graphics card took to draw it.
+    pub drawing: Duration,
+    /// How long it took to bring the picture back from the card.
+    pub reading_back: Duration,
+}
+
+impl fmt::Debug for Picture {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Picture").field("width", &self.width).field("height", &self.height).finish()
     }
 }
 

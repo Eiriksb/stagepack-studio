@@ -7136,9 +7136,11 @@ dependencies = [
  "gltf",
  "image",
  "png 0.18.1",
+ "pollster 0.4.0",
  "proptest",
  "serde_json",
  "slides-model",
+ "wgpu",
  "zune-jpeg 0.5.15",
 ]
 
