@@ -1,0 +1,23 @@
+[package]
+name = "slides-model"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Makes small models, for tests here and in the other crates.
+make = ["dep:serde_json"]
+
+[dependencies]
+# The glTF description only: its JSON read into types. Nothing that opens files, follows a
+# link or decodes a picture on its own.
+gltf = { workspace = true }
+# The one texture a model may hold, PNG or JPEG.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The tests make their own models.
+slides-model = { path = ".", features = ["make"] }
+serde_json = { workspace = true }
+proptest = "1"
