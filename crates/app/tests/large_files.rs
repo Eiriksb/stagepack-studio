@@ -966,6 +966,101 @@ fn compressed_pack(dir: &Path, file: &str, name: &str, len: u64, seed: u8) -> Pa
     at
 }
 
+/// Deflated data inflating to `len` zeros and a little more, a few bits each 258 bytes, made by
+/// hand with the fixed codes, so a test needn't compress hundreds of megabytes.
+fn deflated_zeros(len: u64) -> Vec<u8> {
+    struct Bits(Vec<u8>, u32, u32);
+    impl Bits {
+        fn put(&mut self, value: u32, n: u32) {
+            for i in 0..n {
+                self.1 |= ((value >> i) & 1) << self.2;
+                self.2 += 1;
+                if self.2 == 8 {
+                    self.0.push(self.1 as u8);
+                    (self.1, self.2) = (0, 0);
+                }
+            }
+        }
+        /// A Huffman code, its first bit first.
+        fn code(&mut self, code: u32, n: u32) {
+            for i in (0..n).rev() {
+                self.put((code >> i) & 1, 1);
+            }
+        }
+    }
+    let mut bits = Bits(Vec::new(), 0, 0);
+    // The last block, of fixed codes: a zero, then 258 more copied from one back, again and again.
+    bits.put(1, 1);
+    bits.put(1, 2);
+    bits.code(0x30, 8);
+    for _ in 0..len / 258 {
+        bits.code(0xC5, 8);
+        bits.code(0, 5);
+    }
+    bits.code(0, 7);
+    if bits.2 > 0 {
+        bits.0.push(bits.1 as u8);
+    }
+    bits.0
+}
+
+#[test]
+fn a_compressed_model_that_inflates_past_what_it_says_is_refused_and_leaves_nothing() {
+    set_up();
+    let work = tempfile::tempdir().unwrap();
+    let cache_folder = work.path().join("cache");
+    // A pack whose model says it holds 4 KB, compressed, and inflates to 300 MB: a model is never
+    // more than 256 MB.
+    let pack = work.path().join("bomb.sptx");
+    {
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&pack).unwrap());
+        let deflated = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("talk.json", deflated).unwrap();
+        zip.write_all(br#"{"format":1,"app":"another","entry":"slides.md"}"#).unwrap();
+        zip.start_file("slides.md", deflated).unwrap();
+        zip.write_all(b"# Bomb\n\n<Model src=\"assets/box.glb\" x=\"100\" y=\"100\" w=\"640\" h=\"360\" />\n").unwrap();
+        zip.start_file("assets/box.glb", deflated).unwrap();
+        zip.write_all(b"glTF").unwrap();
+        zip.finish().unwrap();
+    }
+    let mut bytes = std::fs::read(&pack).unwrap();
+    let find = |bytes: &[u8], sig: &[u8], name_at: usize| {
+        (0..bytes.len() - name_at).find(|&i| bytes[i..].starts_with(sig) && bytes[i + name_at..].starts_with(b"assets/box.glb")).unwrap()
+    };
+    let u16_at = |bytes: &[u8], at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]) as usize;
+    let u32_at = |bytes: &[u8], at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    let put = |bytes: &mut [u8], at: usize, value: usize| bytes[at..at + 4].copy_from_slice(&(value as u32).to_le_bytes());
+    let local = find(&bytes, b"PK\x03\x04", 30);
+    let start = local + 30 + u16_at(&bytes, local + 26) + u16_at(&bytes, local + 28);
+    let old = u32_at(&bytes, local + 18);
+    let bomb = deflated_zeros(300 << 20);
+    bytes.splice(start..start + old, bomb.iter().copied());
+    put(&mut bytes, local + 18, bomb.len());
+    put(&mut bytes, local + 22, 4096);
+    let central = find(&bytes, b"PK\x01\x02", 46);
+    put(&mut bytes, central + 20, bomb.len());
+    put(&mut bytes, central + 24, 4096);
+    let end = (0..bytes.len()).rev().find(|&i| bytes[i..].starts_with(b"PK\x05\x06")).unwrap();
+    let directory = u32_at(&bytes, end + 16);
+    put(&mut bytes, end + 16, directory + bomb.len() - old);
+    std::fs::write(&pack, bytes).unwrap();
+
+    let mut document = Document::open_packed(&pack, Fonts::bundled_only()).unwrap();
+    document.use_video_cache(VideoCache::new(cache_folder.clone(), CACHE_LIMIT));
+    let began = std::time::Instant::now();
+    // To turn it, or draw its still.
+    assert!(document.open_large("assets/box.glb").unwrap().open_unless_saving().is_err());
+    // Its facts.
+    let read = document.model_facts_to_read("assets/box.glb").unwrap().read();
+    document.take_model_facts(read);
+    assert_eq!(document.model_facts("assets/box.glb").map(|facts| facts.err()), Some(Some(slides_model::CantDraw::CouldNotRead)));
+    // An export's still.
+    assert!(document.export_input().files.open("assets/box.glb").is_none());
+    // Only what it said it held was inflated: nothing near 300 MB was written or held.
+    assert!(began.elapsed() < std::time::Duration::from_secs(10), "{:?}", began.elapsed());
+    assert!(files_under(&cache_folder).is_empty(), "nothing is left in the cache: {:?}", files_under(&cache_folder));
+}
+
 #[test]
 fn packs_old_and_odd_still_open() {
     set_up();

@@ -13,7 +13,7 @@ use std::time::SystemTime;
 use sha2::{Digest as _, Sha256};
 use slides_engine::{PackError, ReadSeek, TalkFiles, open_packed, write_new_atomically_with};
 
-use crate::added_files::{FileKind, MAX_VIDEO_BYTES, NotAdded};
+use crate::added_files::{FileKind, MAX_MODEL_BYTES, MAX_VIDEO_BYTES, NotAdded};
 
 /// A paste that would copy more than this into the talk asks first.
 pub const ASK_BEFORE_COPYING: u64 = 256 * 1024 * 1024;
@@ -845,6 +845,35 @@ impl Seek for HeldReader {
     }
 }
 
+/// The most the pack's `entry` is unpacked to: a 3D model's limit for a model, and for a video
+/// what the pack itself holds a large file to.
+fn most_unpacked(entry: &str) -> u64 {
+    let ext = entry.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()).unwrap_or_default();
+    if FileKind::Model.extensions().contains(&ext.as_str()) { MAX_MODEL_BYTES } else { u64::MAX }
+}
+
+/// What's written through it, `left` bytes at most: one more is refused, and what's being
+/// written is given up.
+struct Capped<'a> {
+    to: &'a mut dyn Write,
+    left: u64,
+}
+
+impl Write for Capped<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.len() as u64 > self.left {
+            return Err(io::Error::other("more than it can hold"));
+        }
+        let n = self.to.write(buf)?;
+        self.left -= n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.to.flush()
+    }
+}
+
 /// Where videos a pack holds compressed are unpacked to, to be read in pieces: such a pack is
 /// made by another program, as this app stores a video as it is. It holds [`CACHE_LIMIT`] at
 /// most, the files used longest ago going first.
@@ -867,9 +896,15 @@ impl VideoCache {
 
     /// The file the pack at `pack` holds as `entry`, unpacked here, a piece at a time, if it
     /// isn't already. The file is named for the pack, as it is now, and the entry, so a pack
-    /// that changes is unpacked again.
+    /// that changes is unpacked again. A 3D model is never unpacked past the most a model can
+    /// be, whatever its entry says it holds: one that says more is refused before anything is
+    /// written, and one that inflates past what it says stops there, leaving nothing.
     pub(crate) fn unpacked(&self, pack: &Path, entry: &str, stop: &AtomicBool) -> Option<PathBuf> {
         let (at, files, len) = self.place_for(pack, entry)?;
+        let most = most_unpacked(entry);
+        if len > most {
+            return None;
+        }
         if std::fs::symlink_metadata(&at).is_ok_and(|there| there.is_file() && there.len() == len) {
             // Used now: it goes after those used longer ago.
             let mut options = std::fs::OpenOptions::new();
@@ -888,7 +923,7 @@ impl VideoCache {
         if !has_room(&self.folder, len) {
             return None;
         }
-        let written = write_new_atomically_with(&at, |file| files.copy_entry(entry, file, &|_, _| {}, stop));
+        let written = write_new_atomically_with(&at, |file| files.copy_entry(entry, &mut Capped { to: file, left: most }, &|_, _| {}, stop));
         match written {
             Ok(()) => {}
             // Unpacked by another window meanwhile: taken only if it's a plain file, as long.
