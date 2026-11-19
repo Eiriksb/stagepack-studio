@@ -304,6 +304,15 @@ fn every_way_of_leaving_stops_the_decoding(cx: &mut TestAppContext) {
         typing.click(cx, at);
         Some(typing)
     });
+    // Its heading reaches past the video, to be clicked where the video isn't.
+    let long_heading = talk.replace("# Video", "# Video, with a heading long enough to reach past it");
+    left_by(cx, "a click in the slide's words, to type there", &long_heading, |typing, cx| {
+        typing.click_text(cx, 0, pos(0, 48));
+        assert!(typing.editing(cx).is_some(), "typing in the heading");
+        let canvas = editor_canvas(&typing, cx);
+        assert!(cx.read(|cx| canvas.read(cx).playing_videos()).is_empty(), "it stops at once");
+        Some(typing)
+    });
     left_by(cx, "another slide", &talk, |typing, cx| {
         typing.press(cx, "pagedown");
         assert_eq!(typing.current(cx), 1);
