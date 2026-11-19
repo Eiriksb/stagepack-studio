@@ -1,7 +1,12 @@
 //! A terminal recording on a slide, laid out as its screen: filled cells and real text in the
 //! bundled monospaced font, so the still, thumbnails, PDF and every editing tool see ordinary
-//! display items. Reading the recording and playing it to its end is a still made aside, as a
-//! video's is: until it's made the recording is a plain dark panel.
+//! display items. Reading the recording, playing it to its end and laying its screen out in
+//! cells is a still made aside, as a video's is: until it's made the recording is a plain dark
+//! panel. What's left for the thread laying the slide out is shaping the text, once for each
+//! height of a row, and placing what was laid out in the box.
+
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use slides_format::Tag;
 use slides_terminal::{Cell, Colour, Screen, Wide, rgb};
@@ -11,8 +16,8 @@ use toolkit::{Color, Theme};
 use crate::elements::box_size;
 use crate::pictures::TerminalStill;
 use crate::placeholder::placeholder_items;
-use crate::text::LINE_HEIGHT;
-use crate::{Align, DisplayItem, Fonts, LayoutEnv, Rect, TextRun, shape_text};
+use crate::text::{LINE_HEIGHT, MIN_TEXT_SIZE};
+use crate::{Align, DisplayItem, Fonts, LayoutEnv, Rect, ShapedText, TextRun, shape_text};
 
 /// The tag of a terminal recording on a slide.
 pub(crate) const TERMINAL_TAG: &str = "Terminal";
@@ -29,8 +34,15 @@ pub const TERMINAL_ROW: f32 = 18.0;
 const CELL_SHAPE: f32 = 0.6 / LINE_HEIGHT;
 /// The bundled monospaced font, in which every cell is as wide.
 const MONO: &str = "JetBrains Mono";
-/// The screen a recording is taken to have until it's been read.
+/// The screen a recording is taken to have until its header has been read.
 const SCREEN_UNTIL_READ: (u16, u16) = (80, 24);
+/// The most text items a row is laid out as. A row of more runs than this is one text item of
+/// them all, as shaping each alone would take too long on a screen made of them; a wide
+/// character in it still stands alone, unless that would make too many again.
+const MOST_RUNS_A_ROW: usize = 32;
+/// The most colours a screen's backgrounds or underlines are drawn in, each colour one item. A
+/// screen of more has each of its colours drawn as the nearest of the 216 of the colour cube.
+const MOST_COLOURS: usize = 256;
 
 /// The size of a screen of `columns` and `rows` at its own size: [`TERMINAL_ROW`] units a row.
 fn own_size((columns, rows): (u16, u16)) -> (f32, f32) {
@@ -49,6 +61,14 @@ fn rect_path(x: f32, y: f32, w: f32, h: f32) -> Option<tiny_skia::Path> {
 fn panel(rect: Rect) -> Option<DisplayItem> {
     let path = rect_path(rect.x, rect.y, rect.w, rect.h)?;
     Some(DisplayItem::Fill { path, color: color(rgb(Colour::Default, false)) })
+}
+
+/// A character as it's shown in a cell: anything the shaper would take as the end of a line, any
+/// other control, and anything that turns the direction text runs in, is a blank. The cells are
+/// shown left to right, as the terminal had them.
+fn shown(c: char) -> char {
+    let turns = matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') || turns { ' ' } else { c }
 }
 
 /// How a cell is drawn: its colours, as shown, and its font's weight and slant.
@@ -75,15 +95,43 @@ fn look(cell: &Cell, cursor: bool) -> Look {
     Look { fg, bg, bold: style.bold, italic: style.italic, underline: style.underline }
 }
 
-/// Whether `cell` shows nothing but its background.
-fn blank(cell: &Cell) -> bool {
-    cell.text == ' ' && cell.marks == [None; 2] && cell.wide != Wide::Left
+/// A piece of a text item in one look.
+struct Span {
+    text: String,
+    look: Look,
 }
 
-/// The most text items a row is laid out as. A row of more runs than this is one text item of
-/// them all, as shaping each alone would take too long on a screen made of them: its characters
-/// are on their cells as long as none is wide.
-const MOST_RUNS_A_ROW: usize = 32;
+/// A text item of the screen: the cell it starts at, and its pieces.
+struct CellText {
+    row: u16,
+    col: u16,
+    spans: Vec<Span>,
+}
+
+/// Cells in a row: the row, the first column and how many.
+type Cells = (u16, u16, u16);
+
+/// A screen laid out in cells, ready to be placed in a box of any size: made from the screen
+/// where the recording is played, so nothing of that is left for the thread laying out.
+pub(crate) struct LaidScreen {
+    pub(crate) columns: u16,
+    pub(crate) rows: u16,
+    /// Each background colour other than the screen's own, and the cells it fills.
+    fills: Vec<([u8; 3], Vec<Cells>)>,
+    texts: Vec<CellText>,
+    /// Each colour of underline, and the cells it's under.
+    lines: Vec<([u8; 3], Vec<Cells>)>,
+    /// About how many bytes it holds.
+    pub(crate) bytes: usize,
+}
+
+impl LaidScreen {
+    fn count(&self) -> usize {
+        let cells = |groups: &[([u8; 3], Vec<Cells>)]| groups.iter().map(|(_, cells)| cells.len() * size_of::<Cells>() + 32).sum::<usize>();
+        let texts: usize = self.texts.iter().map(|text| 32 + text.spans.iter().map(|span| span.text.len() + size_of::<Span>()).sum::<usize>()).sum();
+        size_of::<LaidScreen>() + cells(&self.fills) + cells(&self.lines) + texts
+    }
+}
 
 /// A run of a row's text in one look, from a column, until it's laid out, and how many cells it
 /// covers.
@@ -92,103 +140,140 @@ struct Run {
     look: Look,
     text: String,
     cells: u16,
+    wide: bool,
 }
 
-impl Run {
-    fn text_run(&self, text: String, size: f32) -> TextRun {
-        let Look { fg, bold, italic, .. } = self.look;
-        TextRun { text, size, bold, italic, underline: false, color: color(fg), family: MONO.to_string() }
-    }
+/// `runs`, the runs of one row, merged into one text item from the first's column, each but the
+/// last followed by blanks to where the next starts.
+fn merged(row: u16, runs: &[Run]) -> CellText {
+    let mut spans: Vec<Span> = runs
+        .windows(2)
+        .map(|pair| {
+            let blanks = usize::from((pair[1].from - pair[0].from).saturating_sub(pair[0].cells));
+            Span { text: format!("{}{}", pair[0].text, " ".repeat(blanks)), look: pair[0].look }
+        })
+        .collect();
+    spans.extend(runs.last().map(|last| Span { text: last.text.clone(), look: last.look }));
+    CellText { row, col: runs.first().map_or(0, |first| first.from), spans }
 }
 
-/// `screen` laid out over `rect`: a fill for the screen's background over the whole box, one for
-/// each run of cells of another background, the text of each run of cells in one look as a text
-/// item, underlines as strokes and the cursor, when it's shown, as a block. The cells are as large
-/// as fit the box keeping their shape, rows on whole units once a row is a unit high, and the
-/// screen sits in the middle of the box, on whole units.
-pub fn screen_items(screen: &Screen, rect: Rect, fonts: &mut Fonts) -> Vec<DisplayItem> {
-    let mut items: Vec<DisplayItem> = panel(rect).into_iter().collect();
-    let (columns, rows) = (f32::from(screen.width()), f32::from(screen.height()));
-    let fit = (rect.h / rows).min(rect.w / (columns * CELL_SHAPE));
-    if !fit.is_finite() || fit <= 0.0 {
-        return items;
+/// The runs of a row as its text items: each alone if there are few enough, or else those
+/// between wide characters merged, each wide character standing alone, as no font's is exactly
+/// two cells wide; and if that's still too many, all of them as one.
+fn row_texts(row: u16, runs: Vec<Run>) -> Vec<CellText> {
+    let alone = |run: &Run| CellText { row, col: run.from, spans: vec![Span { text: run.text.clone(), look: run.look }] };
+    if runs.len() <= MOST_RUNS_A_ROW {
+        return runs.iter().map(alone).collect();
     }
-    // Floored a little above, so a box made for whole rows isn't a unit short of them.
-    let (row_h, whole) = if fit >= 1.0 { ((fit + 1.0e-3).floor(), true) } else { (fit, false) };
-    let cell_w = row_h * CELL_SHAPE;
-    let on_unit = |at: f32| if whole { at.round() } else { at };
-    let left = rect.x + on_unit((rect.w - cell_w * columns) / 2.0);
-    let top = rect.y + on_unit((rect.h - row_h * rows) / 2.0);
-    let size = row_h / LINE_HEIGHT;
-    let cursor = screen.cursor().map(|(col, row)| (col.min(screen.width() - 1), row));
     let mut texts = Vec::new();
-    let mut lines = Vec::new();
-    for (row, cells) in screen.rows().enumerate() {
-        let y = top + row as f32 * row_h;
-        let x = |col: u16| left + f32::from(col) * cell_w;
-        let looks: Vec<Look> = (0..).zip(cells).map(|(col, cell)| look(cell, cursor == Some((col, row as u16)))).collect();
-        // The backgrounds, a fill for each run of one colour but the screen's own.
+    for piece in runs.split_inclusive(|run| run.wide) {
+        let (narrow, wide) = match piece.split_last() {
+            Some((last, narrow)) if last.wide => (narrow, Some(last)),
+            _ => (piece, None),
+        };
+        if !narrow.is_empty() {
+            texts.push(merged(row, narrow));
+        }
+        texts.extend(wide.map(alone));
+    }
+    if texts.len() > MOST_RUNS_A_ROW { vec![merged(row, &runs)] } else { texts }
+}
+
+/// The nearest of the colour cube's levels to a channel.
+fn cube_level(channel: u8) -> u8 {
+    const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    LEVELS.into_iter().min_by_key(|level| level.abs_diff(channel)).unwrap_or(0)
+}
+
+/// Cells by their colour, in the order each colour was first seen: as each is, if there are few
+/// enough colours, or else each the nearest of the colour cube.
+fn by_colour(cells: Vec<([u8; 3], Cells)>) -> Vec<([u8; 3], Vec<Cells>)> {
+    let mut colours: HashMap<[u8; 3], usize> = HashMap::new();
+    let distinct = {
+        for (colour, _) in &cells {
+            let next = colours.len();
+            colours.entry(*colour).or_insert(next);
+        }
+        colours.len()
+    };
+    let shown = |colour: [u8; 3]| if distinct > MOST_COLOURS { colour.map(cube_level) } else { colour };
+    let mut grouped: Vec<([u8; 3], Vec<Cells>)> = Vec::new();
+    let mut at: HashMap<[u8; 3], usize> = HashMap::new();
+    for (colour, cells) in cells {
+        let colour = shown(colour);
+        let index = *at.entry(colour).or_insert_with(|| {
+            grouped.push((colour, Vec::new()));
+            grouped.len() - 1
+        });
+        grouped[index].1.push(cells);
+    }
+    grouped
+}
+
+/// `screen` laid out in cells: a fill for each run of cells of a background other than the
+/// screen's own, the text of each run of cells in one look, underlines, and the cursor, when it's
+/// shown, as a block over both halves of a wide character.
+pub(crate) fn lay_out_screen(screen: &Screen) -> LaidScreen {
+    let cursor = screen.cursor().map(|(col, row)| (col.min(screen.width() - 1), row));
+    let (mut fills, mut lines, mut texts) = (Vec::new(), Vec::new(), Vec::new());
+    for (row, cells) in (0u16..).zip(screen.rows()) {
+        let under_cursor = |col: u16| {
+            let Some((at, _)) = cursor.filter(|(_, on)| *on == row) else { return false };
+            let wide = |col: u16| cells.get(usize::from(col)).map(|cell| cell.wide);
+            col == at || (col + 1 == at && wide(at) == Some(Wide::Right)) || (col == at + 1 && wide(at) == Some(Wide::Left))
+        };
+        let looks: Vec<Look> = (0u16..).zip(cells).map(|(col, cell)| look(cell, under_cursor(col))).collect();
+        // The backgrounds, a run for each colour but the screen's own.
         let mut from = 0;
         for col in 1..=looks.len() {
             if col < looks.len() && looks[col].bg == looks[from].bg {
                 continue;
             }
-            if looks[from].bg != rgb(Colour::Default, false)
-                && let Some(path) = rect_path(x(from as u16), y, (col - from) as f32 * cell_w, row_h)
-            {
-                items.push(DisplayItem::Fill { path, color: color(looks[from].bg) });
+            if looks[from].bg != rgb(Colour::Default, false) {
+                fills.push((looks[from].bg, (row, from as u16, (col - from) as u16)));
             }
             from = col;
         }
-        // The text, a run for each look, a blank going with the run it's in; a wide character
-        // stands alone, as no font's is exactly two cells wide.
+        // The text, a run for each look, a blank going with the run it's in.
         let mut run: Option<Run> = None;
         let mut runs = Vec::new();
         for ((col, cell), look) in (0u16..).zip(cells).zip(&looks) {
             if cell.wide == Wide::Right {
                 continue;
             }
-            if blank(cell) {
+            let text = shown(cell.text);
+            let marks: Vec<char> = cell.marks.iter().flatten().copied().filter(|mark| shown(*mark) != ' ').collect();
+            let width = if cell.wide == Wide::Left { 2 } else { 1 };
+            if text == ' ' && marks.is_empty() {
                 if let Some(run) = &mut run {
-                    run.text.push(' ');
-                    run.cells += 1;
+                    run.text.push_str(if width == 2 { "  " } else { " " });
+                    run.cells += width;
                 }
                 continue;
             }
-            let same = |run: &Run| (run.look.fg, run.look.bold, run.look.italic) == (look.fg, look.bold, look.italic);
-            if cell.wide == Wide::Left || !run.as_ref().is_some_and(same) {
+            let wide = cell.wide == Wide::Left;
+            let same = |run: &Run| !run.wide && (run.look.fg, run.look.bold, run.look.italic) == (look.fg, look.bold, look.italic);
+            if wide || !run.as_ref().is_some_and(same) {
                 runs.extend(run.take());
-                run = Some(Run { from: col, look: *look, text: String::new(), cells: 0 });
+                run = Some(Run { from: col, look: *look, text: String::new(), cells: 0, wide });
             }
             if let Some(run) = &mut run {
-                run.text.push(cell.text);
-                run.text.extend(cell.marks.iter().flatten());
-                run.cells += if cell.wide == Wide::Left { 2 } else { 1 };
+                run.text.push(text);
+                run.text.extend(marks);
+                run.cells += width;
             }
-            if cell.wide == Wide::Left {
+            if wide {
                 runs.extend(run.take());
             }
         }
         runs.extend(run);
+        // Blanks at a run's end are left out: each is a space of a cell.
         for run in &mut runs {
-            let blanks = run.text.len() - run.text.trim_end().len();
-            run.text.truncate(run.text.len() - blanks);
-            run.cells -= blanks as u16;
+            let kept = run.text.trim_end_matches(' ').len();
+            run.cells = run.cells.saturating_sub((run.text.len() - kept) as u16);
+            run.text.truncate(kept);
         }
-        if runs.len() <= MOST_RUNS_A_ROW {
-            texts.extend(runs.iter().map(|run| (x(run.from), y, vec![run.text_run(run.text.clone(), size)])));
-        } else if let Some(first) = runs.first() {
-            // Each run but the last is followed by blanks to where the next starts.
-            let mut spans: Vec<TextRun> = runs
-                .windows(2)
-                .map(|pair| {
-                    let blanks = usize::from((pair[1].from - pair[0].from).saturating_sub(pair[0].cells));
-                    pair[0].text_run(format!("{}{}", pair[0].text, " ".repeat(blanks)), size)
-                })
-                .collect();
-            spans.extend(runs.last().map(|last| last.text_run(last.text.clone(), size)));
-            texts.push((x(first.from), y, spans));
-        }
+        texts.extend(row_texts(row, runs));
         // Underlines, a line for each run of underlined cells of one colour.
         let mut from: Option<usize> = None;
         for col in 0..=looks.len() {
@@ -196,7 +281,7 @@ pub fn screen_items(screen: &Screen, rect: Rect, fonts: &mut Fonts) -> Vec<Displ
             match from {
                 Some(start) if goes_on(start) => continue,
                 Some(start) => {
-                    lines.push((x(start as u16), x(col as u16), y + row_h * 0.86, looks[start].fg));
+                    lines.push((looks[start].fg, (row, start as u16, (col - start) as u16)));
                     from = None;
                 }
                 None => {}
@@ -206,48 +291,143 @@ pub fn screen_items(screen: &Screen, rect: Rect, fonts: &mut Fonts) -> Vec<Displ
             }
         }
     }
-    for (x, y, runs) in texts {
-        let text = shape_text(fonts, &runs, None, Align::Left);
-        items.push(DisplayItem::Text { text, x, y });
+    let mut laid = LaidScreen { columns: screen.width(), rows: screen.height(), fills: by_colour(fills), texts, lines: by_colour(lines), bytes: 0 };
+    laid.bytes = laid.count();
+    laid
+}
+
+/// Where a screen's cells go in a box: as large as fit it keeping their shape, rows on whole
+/// units once a row is a unit high, and the screen in the middle of the box, on whole units.
+#[derive(Clone, Copy)]
+pub(crate) struct Grid {
+    pub(crate) row: f32,
+    cell: f32,
+    left: f32,
+    top: f32,
+    whole: bool,
+}
+
+impl Grid {
+    /// What tells one grid from another: where its cells are, and how large.
+    pub(crate) fn key(&self) -> (u32, u32, u32) {
+        (self.row.to_bits(), self.left.to_bits(), self.top.to_bits())
     }
-    let width = if whole { (row_h / 16.0).max(1.0) } else { row_h / 16.0 };
-    for (from, to, y, fg) in lines {
-        let mut line = PathBuilder::new();
-        line.move_to(from, y);
-        line.line_to(to, y);
-        if let Some(path) = line.finish() {
-            items.push(DisplayItem::Stroke { path, color: color(fg), width });
+}
+
+/// Where the cells of a screen of `columns` and `rows` go in `rect`, if they fit at all.
+pub(crate) fn grid(columns: u16, rows: u16, rect: Rect) -> Option<Grid> {
+    let (columns, rows) = (f32::from(columns), f32::from(rows));
+    let fit = (rect.h / rows).min(rect.w / (columns * CELL_SHAPE));
+    if !fit.is_finite() || fit <= 0.0 {
+        return None;
+    }
+    // Floored a little above, so a box made for whole rows isn't a unit short of them.
+    let (row, whole) = if fit >= 1.0 { ((fit + 1.0e-3).floor(), true) } else { (fit, false) };
+    let cell = row * CELL_SHAPE;
+    let on_unit = |at: f32| if whole { at.round() } else { at };
+    Some(Grid { row, cell, left: rect.x + on_unit((rect.w - cell * columns) / 2.0), top: rect.y + on_unit((rect.h - row * rows) / 2.0), whole })
+}
+
+/// The text items of `laid` shaped for rows `row` units high, in its order: the same wherever the
+/// box is, and however large, as long as its rows are as high. Rows too small for text have none.
+pub(crate) fn shape(laid: &LaidScreen, row: f32, fonts: &mut Fonts) -> Vec<ShapedText> {
+    let size = row / LINE_HEIGHT;
+    // Text is no smaller than this, and would be higher than such rows are.
+    if size < MIN_TEXT_SIZE {
+        return Vec::new();
+    }
+    laid.texts
+        .iter()
+        .map(|text| {
+            let runs: Vec<TextRun> = text
+                .spans
+                .iter()
+                .map(|span| TextRun { text: span.text.clone(), size, bold: span.look.bold, italic: span.look.italic, underline: false, color: color(span.look.fg), family: MONO.to_string() })
+                .collect();
+            shape_text(fonts, &runs, None, Align::Left)
+        })
+        .collect()
+}
+
+/// About how many bytes shaped text holds.
+pub(crate) fn shaped_bytes(shaped: &[ShapedText]) -> usize {
+    shaped.iter().map(|text| 256 + text.buffer.layout_runs().map(|run| run.text.len() + run.glyphs.len() * 96).sum::<usize>()).sum()
+}
+
+/// `laid` placed on `grid`, with its text `shaped` for the grid's rows: a fill for each background
+/// colour but the screen's own, the text, and a stroke for each colour of underline. The same for
+/// every box the grid is the same in, as a box resized a unit at a time often is.
+pub(crate) fn place(laid: &LaidScreen, grid: &Grid, shaped: &[ShapedText]) -> Vec<DisplayItem> {
+    let mut items = Vec::new();
+    let x = |col: u16| grid.left + f32::from(col) * grid.cell;
+    let y = |row: u16| grid.top + f32::from(row) * grid.row;
+    for (colour, cells) in &laid.fills {
+        let mut path = PathBuilder::with_capacity(cells.len() * 5, cells.len() * 4);
+        for &(row, col, count) in cells {
+            if let Some(rect) = tiny_skia::Rect::from_xywh(x(col), y(row), f32::from(count) * grid.cell, grid.row) {
+                path.push_rect(rect);
+            }
+        }
+        if let Some(path) = path.finish() {
+            items.push(DisplayItem::Fill { path, color: color(*colour) });
+        }
+    }
+    for (text, shaped) in laid.texts.iter().zip(shaped) {
+        items.push(DisplayItem::Text { text: shaped.clone(), x: x(text.col), y: y(text.row) });
+    }
+    let width = if grid.whole { (grid.row / 16.0).max(1.0) } else { grid.row / 16.0 };
+    for (colour, cells) in &laid.lines {
+        let mut path = PathBuilder::with_capacity(cells.len() * 2, cells.len() * 2);
+        for &(row, col, count) in cells {
+            let at = y(row) + grid.row * 0.86;
+            path.move_to(x(col), at);
+            path.line_to(x(col + count), at);
+        }
+        if let Some(path) = path.finish() {
+            items.push(DisplayItem::Stroke { path, color: color(*colour), width });
         }
     }
     items
 }
 
+/// `screen` laid out over `rect`, as a recording's last screen is: a fill of the screen's
+/// background over the whole box, and its cells as [`lay_out_screen`], [`grid`] and [`place`] lay
+/// them out.
+pub fn screen_items(screen: &Screen, rect: Rect, fonts: &mut Fonts) -> Vec<DisplayItem> {
+    let laid = lay_out_screen(screen);
+    let cells = match grid(laid.columns, laid.rows, rect) {
+        Some(grid) => place(&laid, &grid, &shape(&laid, grid.row, fonts)),
+        None => Vec::new(),
+    };
+    panel(rect).into_iter().chain(cells).collect()
+}
+
 /// A terminal recording placed on a slide, laid out: the size of its box, for the sides `wanted`
-/// gives and its screen's own shape for the rest, what it draws, how many times it stops, and
-/// why it can't be played if it can't. Until it's been read, it's a plain dark panel, of the
-/// shape of a screen of 80 by 24 where no size says otherwise.
+/// gives and the shape its header says its screen has for the rest, what it draws, how many
+/// times it stops, and why it can't be played if it can't. Until it's been read, it's a plain dark
+/// panel, and stops nowhere.
 pub(crate) fn lay_out_terminal(tag: &Tag, wanted: (Option<f32>, Option<f32>), theme: &Theme, env: &mut LayoutEnv) -> ((f32, f32), Vec<DisplayItem>, usize, Option<String>) {
     let src = tag.attr("src").unwrap_or_default().trim();
     // One with no file is never looked for.
-    let still = (!src.is_empty()).then(|| env.pictures.terminal_still(src, env.files));
-    let screen_size = match &still {
-        Some(TerminalStill::Screen(screen, _)) => (screen.width(), screen.height()),
-        _ => SCREEN_UNTIL_READ,
+    let (still, screen_size) = if src.is_empty() { (None, None) } else {
+        let (still, size) = env.pictures.terminal_still(src, env.files);
+        (Some(still), size)
     };
-    let (w, h) = box_size(wanted, Some(own_size(screen_size)));
+    let (w, h) = box_size(wanted, Some(own_size(screen_size.unwrap_or(SCREEN_UNTIL_READ))));
     let rect = Rect { x: 0.0, y: 0.0, w, h };
     let (items, stops, problem) = match still {
         None => (placeholder_items(TERMINAL_NO_FILE, rect, theme, env.fonts), 0, Some(TERMINAL_NO_FILE.to_string())),
         Some(TerminalStill::Cannot(why)) => (placeholder_items(&why.to_string(), rect, theme, env.fonts), 0, Some(why.to_string())),
         Some(TerminalStill::Coming) => (panel(rect).into_iter().collect(), 0, None),
-        Some(TerminalStill::Screen(screen, stops)) => {
-            let items = env.pictures.terminal_items(src, (w, h)).unwrap_or_else(|| {
-                let items = screen_items(&screen, rect, env.fonts);
-                env.pictures.keep_terminal_items(src, (w, h), &items);
-                items
-            });
+        Some(TerminalStill::Laid(_, stops)) => {
+            let cells = env.pictures.terminal_items(src, rect, env.fonts).unwrap_or_else(|| Arc::from(Vec::new()));
+            let items = panel(rect).into_iter().chain(cells.iter().cloned()).collect();
             (items, stops, None)
         }
     };
     ((w, h), items, stops, problem)
 }
+
+/// Shaped text and placed items, kept for a recording as it's laid out again and again.
+pub(crate) type Shaped = Arc<[ShapedText]>;
+pub(crate) type Placed = Arc<[DisplayItem]>;

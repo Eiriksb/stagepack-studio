@@ -32,7 +32,7 @@ pub const MOST_GAP: Duration = Duration::from_secs(1);
 pub const MOST_TEXT: usize = 2 * MOST_BYTES;
 
 /// The longest line a recording's header may be.
-const MOST_HEADER: usize = 1024 * 1024;
+pub const MOST_HEADER: usize = 1024 * 1024;
 /// The longest line an event may be: the most output written all as escapes of six bytes a
 /// byte, with room for its time and code.
 const MOST_LINE: usize = MOST_OUTPUT * 6 + 4096;
@@ -120,6 +120,24 @@ pub fn read(bytes: &[u8]) -> Result<Recording, CantPlay> {
     events.shrink_to_fit();
     marks.shrink_to_fit();
     Ok(Recording { width: read.width, height: read.height, events, length: read.length, marks })
+}
+
+/// The screen's size a recording starts with, in columns and rows, from its header alone: what
+/// the first line of `bytes`, which needn't be the whole file, says, or `None` if that isn't the
+/// header of a recording that can be played. Only the first [`MOST_HEADER`] bytes, and a mark
+/// of the order of its bytes, are looked at.
+pub fn screen_size(bytes: &[u8]) -> Option<(u16, u16)> {
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    let looked = &bytes[..bytes.len().min(MOST_HEADER + 1)];
+    let header_end = looked.iter().position(|b| *b == b'\n').unwrap_or(looked.len());
+    if header_end > MOST_HEADER {
+        return None;
+    }
+    let header = serde_json::from_slice::<Header>(bytes[..header_end].trim_ascii()).ok()?;
+    if header.version.as_ref().and_then(Value::as_u64) != Some(2) {
+        return None;
+    }
+    Some((side(header.width.as_ref(), MOST_WIDTH).ok()?, side(header.height.as_ref(), MOST_HEIGHT).ok()?))
 }
 
 /// Says what a recording is, from one pass over it that keeps no output.

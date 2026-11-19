@@ -463,3 +463,22 @@ fn each_refusal_reads_in_plain_words() {
     );
     assert_eq!(said[4], "This terminal recording couldn't be read.");
 }
+
+#[test]
+fn the_screens_size_is_read_from_the_header_alone() {
+    let cast = make_test_cast(132, 43, &[(0.1, "o", "hello"), (0.2, "r", "80x24")]);
+    assert_eq!(screen_size(&cast), Some((132, 43)), "as it starts");
+    let header_end = cast.iter().position(|b| *b == b'\n').unwrap();
+    assert_eq!(screen_size(&cast[..header_end]), Some((132, 43)), "the header is enough");
+    assert_eq!(screen_size(&[b"\xef\xbb\xbf".as_slice(), &cast].concat()), Some((132, 43)));
+    for not in [
+        b"just some words".to_vec(),
+        b"".to_vec(),
+        b"{\"version\": 1, \"width\": 80, \"height\": 24}\n".to_vec(),
+        b"{\"version\": 2, \"width\": 100000, \"height\": 24}\n".to_vec(),
+        b"{\"version\": 2, \"height\": 24}\n".to_vec(),
+        [b"{\"version\": 2, \"width\": 80, \"height\": 24, \"x\": \"".to_vec(), vec![b'a'; MOST_HEADER], b"\"}\n".to_vec()].concat(),
+    ] {
+        assert_eq!(screen_size(&not), None, "{:?}", String::from_utf8_lossy(&not[..not.len().min(60)]));
+    }
+}

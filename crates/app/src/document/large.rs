@@ -408,6 +408,17 @@ impl LargeOpen {
         self.open_as(false)
     }
 
+    /// The file read whole, as a terminal recording is: a small data file of the talk, read as any
+    /// is, from a pack compressed or not, and held among the talk's readers while it's read. Only a
+    /// byte more than a recording can be is read of one larger.
+    pub fn read_recording(self) -> Result<HeldReader, NotOpened> {
+        let LargeOpen { files, path, readers, .. } = self;
+        readers.open(|| {
+            let bytes = slides_engine::recording_bytes(&*files, &path).ok_or(NotOpened::Unreadable)?;
+            Ok(Box::new(std::io::Cursor::new(bytes)) as Box<dyn slides_engine::ReadSeek>)
+        })
+    }
+
     /// [`Self::open`] for reading a few headers on the window's thread: only a file read where it
     /// lies, never one from the cache, whose pack's list of files would have to be read first.
     pub(crate) fn open_in_place(self) -> Result<HeldReader, NotOpened> {
@@ -796,6 +807,17 @@ impl Document {
     /// still has been tried and it can't.
     pub fn model_problem_on(&mut self, index: usize, source: &std::ops::Range<usize>) -> Option<String> {
         guarded(|| self.deck.model_problem(index, source)).ok().flatten()
+    }
+
+    /// Why the terminal recording at `source` on slide `index` can't be played, in a plain
+    /// sentence, if it's been read and can't be, or has no file.
+    pub fn terminal_problem_on(&mut self, index: usize, source: &std::ops::Range<usize>) -> Option<String> {
+        guarded(|| self.deck.terminal_problem(index, source)).ok().flatten()
+    }
+
+    /// Whether a terminal recording on slide `index` is still being read aside.
+    pub fn terminal_pending(&mut self, index: usize) -> bool {
+        guarded(|| self.deck.terminal_pending(index)).unwrap_or(false)
     }
 
     /// Writes `view` as the starting view of the 3D model at `source` on the current slide, as

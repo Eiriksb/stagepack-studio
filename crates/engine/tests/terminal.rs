@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use slides_engine::*;
-use slides_terminal::{CantPlay, make_test_cast};
+use proptest::prelude::*;
+use slides_terminal::{CantPlay, Screen, make_test_cast};
 
 struct MapFiles(HashMap<String, Vec<u8>>);
 
@@ -250,7 +251,7 @@ fn marks_are_steps() {
 }
 
 #[test]
-fn ten_recordings_lay_out_off_the_window_thread() {
+fn ten_recordings_are_read_and_played_aside_not_where_slides_are_laid_out() {
     let paths: Vec<String> = (0..10).map(|at| format!("assets/run{at}.cast")).collect();
     let casts: HashMap<String, Vec<u8>> = paths
         .iter()
@@ -298,4 +299,180 @@ fn ten_recordings_lay_out_off_the_window_thread() {
     assert_eq!(deck.timeline(3).steps, 1, "its mark is a step once it's read");
     assert!(deck.still_jobs().is_empty(), "it's made once");
     assert_eq!(stills_decoded_on_this_thread(), made_here);
+}
+
+/// Every text item of `layer` on one line, and everything it draws within its box.
+fn all_on_one_line_and_within(items: &[DisplayItem], rect: Rect) -> Result<(), String> {
+    let within = |l: f32, t: f32, r: f32, b: f32| l >= rect.x - 0.01 && t >= rect.y - 0.01 && r <= rect.x + rect.w + 0.01 && b <= rect.y + rect.h + 0.01;
+    for item in items {
+        match item {
+            DisplayItem::Text { text, x, y } => {
+                let runs: Vec<_> = text.buffer.layout_runs().collect();
+                if runs.len() > 1 || runs.iter().any(|run| run.line_i != 0) {
+                    return Err(format!("a text item of {} lines: {:?}", runs.len(), runs.iter().map(|run| run.text).collect::<Vec<_>>()));
+                }
+                if !within(*x, *y, *x, *y + text.height) {
+                    return Err(format!("text at {x}, {y}, {} high, outside {rect:?}", text.height));
+                }
+            }
+            DisplayItem::Fill { path, .. } | DisplayItem::Stroke { path, .. } => {
+                let b = path.bounds();
+                if !within(b.left(), b.top(), b.right(), b.bottom()) {
+                    return Err(format!("{b:?} outside {rect:?}"));
+                }
+            }
+            DisplayItem::Picture { .. } => return Err("a picture".into()),
+        }
+    }
+    Ok(())
+}
+
+/// What a recording's output is made of: anything at all, and what's hard on a screen's text.
+fn piece() -> impl Strategy<Value = String> {
+    prop_oneof![
+        any::<char>().prop_map(String::from),
+        "[a-z ]{1,6}",
+        prop::sample::select(vec![
+            "\u{2029}", "\u{2028}", "\u{85}", "\u{a0}", "\u{3000}", "\u{202e}", "\u{200f}", "\u{1c}", "\u{301}", "\u{5d0}\u{5d1}",
+            "\u{4e2d}", "\u{1f600}", "\t", "\r\n", "\u{1b}[31m", "\u{1b}[7m", "\u{1b}[4m", "\u{1b}[44m", "\u{1b}[1;3m", "\u{1b}[2m",
+            "\u{1b}[0m", "\u{1b}[?25l", "\u{1b}[?25h", "\u{1b}[H", "\u{1b}[2J", "\u{1b}[38;2;1;2;3m", "\u{1b}[48;5;200m", "  ",
+        ])
+        .prop_map(String::from),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+    #[test]
+    fn any_screen_lays_out_on_its_cells(width in 1u16..48, height in 1u16..12, output in prop::collection::vec(piece(), 0..200), w in 1.0f32..900.0, h in 1.0f32..600.0) {
+        let mut screen = Screen::new(width, height);
+        screen.feed(&output.concat());
+        let mut fonts = Fonts::bundled_only();
+        let rect = Rect { x: 10.0, y: 20.0, w, h };
+        let items = screen_items(&screen, rect, &mut fonts);
+        prop_assert!(all_on_one_line_and_within(&items, rect).is_ok(), "{:?}", all_on_one_line_and_within(&items, rect));
+    }
+}
+
+#[test]
+fn what_would_end_a_line_is_a_blank() {
+    // A next line written as U+0085 is one to the screen, as to a terminal; these aren't.
+    for written in ["ab\u{2029}cd", "ab\u{2028}cd", "ab\u{a0}\u{a0}", "ab\u{3000}", "\u{202e}abc", "ab\u{1c}cd"] {
+        let cast = make_test_cast(20, 4, &[(0.1, "o", written)]);
+        let mut deck = deck_of("<Terminal src=\"assets/run.cast\" x=\"0\" />\n", &[("assets/run.cast", cast)]);
+        let layer = terminal_layer(&mut deck, 0);
+        let rect = Rect { x: 0.0, y: 0.0, w: layer.rect.w, h: layer.rect.h };
+        assert_eq!(all_on_one_line_and_within(&layer.items, rect), Ok(()), "{written:?}");
+        let cell = 18.0 * CELL_SHAPE;
+        let row = rows(&layer, deck.fonts_mut(), cell, 18.0, 4);
+        assert!(row[0].starts_with("ab") || row[0].contains("abc"), "{written:?}: {row:?}");
+        assert!(row[1..].iter().all(String::is_empty), "{written:?}: {row:?}");
+    }
+}
+
+#[test]
+fn a_wide_character_in_a_busy_row_keeps_the_rest_on_their_cells() {
+    let mut row = String::from("\u{1b}[31m\u{4e2d}");
+    row.extend((0..40).map(|at| format!("\u{1b}[38;5;{}m{}", 16 + at, (b'a' + at % 26) as char)));
+    let cast = make_test_cast(60, 2, &[(0.1, "o", &row)]);
+    let mut deck = deck_of("<Terminal src=\"assets/run.cast\" x=\"0\" />\n", &[("assets/run.cast", cast)]);
+    let layer = terminal_layer(&mut deck, 0);
+    let cell = 18.0 * CELL_SHAPE;
+    let mut placed = Vec::new();
+    for item in &layer.items {
+        let DisplayItem::Text { text, x, .. } = item else { continue };
+        let run = text.buffer.layout_runs().next().unwrap();
+        for glyph in run.glyphs {
+            placed.push((run.text[glyph.start..glyph.end].to_string(), x + glyph.x));
+        }
+    }
+    assert_eq!(placed[0], ("\u{4e2d}".to_string(), 0.0));
+    for (at, (text, x)) in placed[1..].iter().enumerate() {
+        assert!((x - (at as f32 + 2.0) * cell).abs() < 0.01, "{text} at {x}, not on cell {}", at + 2);
+    }
+    assert_eq!(placed.len(), 41);
+}
+
+#[test]
+fn the_cursor_on_a_wide_character_covers_both_its_cells() {
+    let cast = make_test_cast(10, 2, &[(0.1, "o", "a\u{4e2d}b\u{1b}[1;2H")]);
+    let mut deck = deck_of("<Terminal src=\"assets/run.cast\" x=\"0\" />\n", &[("assets/run.cast", cast)]);
+    let layer = terminal_layer(&mut deck, 0);
+    let cell = 18.0 * CELL_SHAPE;
+    assert!(fills(&layer).iter().any(|(at, colour)| near(*at, [cell, 0.0, 2.0 * cell, 18.0]) && *colour == FOREGROUND), "{:?}", fills(&layer));
+}
+
+#[test]
+fn a_recording_in_a_pack_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let pack = dir.path().join("talk.sptx");
+    let cast = make_test_cast(30, 4, &[(0.1, "o", "$ echo packed\r\npacked\r\n")]);
+    let source = "# One\n\n<Terminal src=\"assets/run.cast\" x=\"0\" w=\"640\" h=\"360\" />\n";
+    pack_new(&pack, source, "0.1.0", &[("assets/run.cast".to_string(), cast.clone())]).unwrap();
+    // Laid out where it's read.
+    let mut deck = Deck::open(Box::new(open_packed(&pack).unwrap()), Fonts::bundled_only(), source.to_string());
+    let layer = terminal_layer(&mut deck, 0);
+    assert!(text_of(&layer).contains("echo packed"), "{}", text_of(&layer));
+    assert_eq!(deck.terminal_problem(0, layer.source.as_ref().unwrap()), None);
+    // And aside, its file read as the talk's files are.
+    let packed = open_packed(&pack).unwrap();
+    assert_eq!(recording_bytes(&packed, "assets/run.cast").as_deref(), Some(cast.as_slice()));
+    let mut deck = Deck::open(Box::new(open_packed(&pack).unwrap()), Fonts::bundled_only(), source.to_string());
+    deck.make_stills_aside(Arc::new(|| {}), Arc::new(|_: &str| None));
+    assert!(deck.terminal_pending(0));
+    let job = deck.still_jobs().pop().unwrap();
+    let made = std::thread::spawn(move || {
+        let bytes = recording_bytes(&packed, job.path()).map(|bytes| Box::new(std::io::Cursor::new(bytes)) as Box<dyn ReadSeek>);
+        job.make(bytes)
+    })
+    .join()
+    .unwrap();
+    assert!(!made.failed());
+    deck.take_still(made);
+    assert!(!deck.terminal_pending(0));
+    assert!(text_of(&terminal_layer(&mut deck, 0)).contains("echo packed"));
+}
+
+#[test]
+fn the_box_has_its_shape_before_the_recording_is_read() {
+    let cast = make_test_cast(132, 43, &[(0.1, "o", "wide"), (0.2, "m", "here")]);
+    let mut deck = Deck::open(Box::new(MapFiles([("assets/run.cast".to_string(), cast.clone())].into())), Fonts::bundled_only(), "# One\n\n<Terminal src=\"assets/run.cast\" x=\"0\" />\n".to_string());
+    deck.make_stills_aside(Arc::new(|| {}), Arc::new(|_: &str| None));
+    let made_here = stills_decoded_on_this_thread();
+    let before = terminal_layer(&mut deck, 0);
+    let own = (132.0 * 18.0 * CELL_SHAPE, 43.0 * 18.0);
+    assert!(near([before.rect.w, before.rect.h, 0.0, 0.0], [own.0, own.1, 0.0, 0.0]), "its header's shape at once: {:?}", before.rect);
+    assert!(deck.terminal_pending(0), "it's being read");
+    assert_eq!(deck.timeline(0).steps, 0, "its stops come with it");
+    assert_eq!(stills_decoded_on_this_thread(), made_here, "only its header was read here");
+    let job = deck.still_jobs().pop().unwrap();
+    let made = std::thread::spawn(move || job.make(Some(Box::new(std::io::Cursor::new(cast))))).join().unwrap();
+    deck.take_still(made);
+    assert!(!deck.terminal_pending(0));
+    let after = terminal_layer(&mut deck, 0);
+    assert_eq!(after.rect, before.rect, "nothing moved when it came");
+    assert_eq!(deck.timeline(0).steps, 1);
+}
+
+#[test]
+fn recordings_are_let_go_of_past_the_budget() {
+    let files: HashMap<String, Vec<u8>> = (0..3).map(|at| (format!("assets/run{at}.cast"), make_test_cast(80, 24, &[(0.1, "o", &format!("number {at}"))]))).collect();
+    let talk = (0..3).map(|at| format!("# Slide {at}\n\n<Terminal src=\"assets/run{at}.cast\" x=\"0\" w=\"640\" h=\"360\" />\n")).collect::<Vec<_>>().join("\n---\n\n");
+    // Each read and laid out once, and kept, within a budget.
+    let read_again = |budget: usize| {
+        let mut deck = Deck::open(Box::new(MapFiles(files.clone())), Fonts::bundled_only(), talk.clone());
+        deck.set_picture_budget(budget);
+        let made = stills_decoded_on_this_thread();
+        for slide in 0..3 {
+            assert!(text_of(&terminal_layer(&mut deck, slide)).contains(&format!("number {slide}")));
+        }
+        assert_eq!(stills_decoded_on_this_thread() - made, 3);
+        // Slide 0 changed, it's laid out again: its recording is read again only if it was let go of.
+        deck.update(talk.replacen("# Slide 0", "# Slide zero", 1));
+        assert!(text_of(&terminal_layer(&mut deck, 0)).contains("number 0"));
+        stills_decoded_on_this_thread() - made - 3
+    };
+    assert_eq!(read_again(512 * 1024 * 1024), 0, "kept within the budget");
+    assert_eq!(read_again(1), 1, "let go of past it, and read again");
 }

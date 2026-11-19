@@ -710,6 +710,16 @@ impl Deck {
         self.pictures.terminal_problem(&src).map(|why| why.to_string())
     }
 
+    /// Whether a terminal recording on slide `index` is still being read aside: until it's read,
+    /// it's a plain panel, and its stops aren't among the slide's steps.
+    pub fn terminal_pending(&mut self, index: usize) -> bool {
+        if index >= self.slides.len() {
+            return false;
+        }
+        let sources: Vec<String> = self.specs(index).iter().filter_map(|spec| Some(spec.terminal.as_ref()?.src.clone())).collect();
+        sources.iter().any(|src| self.pictures.terminal_coming(src))
+    }
+
     /// The terminal recordings on slide `index` in its whole state, among its layers as `specs`
     /// and `layers` give them, with the deck's placing.
     pub fn terminals(&mut self, index: usize) -> Vec<TerminalLayer> {

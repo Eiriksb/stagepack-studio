@@ -16,8 +16,8 @@ mod screen;
 use std::fmt;
 
 pub use cast::{
-    Event, MOST_BYTES, MOST_EVENTS, MOST_GAP, MOST_HEIGHT, MOST_TEXT, MOST_LENGTH, MOST_OUTPUT, MOST_WIDTH, Mark, Recording,
-    RecordingFacts, What, facts, played, read,
+    Event, MOST_BYTES, MOST_EVENTS, MOST_GAP, MOST_HEADER, MOST_HEIGHT, MOST_TEXT, MOST_LENGTH, MOST_OUTPUT, MOST_WIDTH, Mark, Recording,
+    RecordingFacts, What, facts, played, read, screen_size,
 };
 #[cfg(feature = "make")]
 pub use cast::{make_demo_cast, make_test_cast};
