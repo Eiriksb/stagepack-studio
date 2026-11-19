@@ -1,33 +1,48 @@
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use proptest::prelude::*;
 use slides_terminal::*;
 
-/// Counts the largest single allocation any test here makes, so a test can tell whether a size
-/// claimed by a file was ever allocated.
+/// Counts, for each thread, the bytes it holds and the largest single allocation it made since
+/// asked last, so a test can tell what reading kept and whether a size claimed by a file was
+/// ever allocated, apart from what the test itself and the tests beside it hold.
 struct Counting;
 
-static LARGEST: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static HELD: Cell<isize> = const { Cell::new(0) };
+    static LARGEST: Cell<usize> = const { Cell::new(0) };
+}
+
+fn allocated(size: usize) {
+    let _ = HELD.try_with(|held| held.set(held.get() + size as isize));
+    let _ = LARGEST.try_with(|largest| largest.set(largest.get().max(size)));
+}
+
+fn released(size: usize) {
+    let _ = HELD.try_with(|held| held.set(held.get() - size as isize));
+}
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        LARGEST.fetch_max(layout.size(), Ordering::Relaxed);
+        allocated(layout.size());
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        LARGEST.fetch_max(layout.size(), Ordering::Relaxed);
+        allocated(layout.size());
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        LARGEST.fetch_max(new_size, Ordering::Relaxed);
+        released(layout.size());
+        allocated(new_size);
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        released(layout.size());
         unsafe { System.dealloc(ptr, layout) }
     }
 }
@@ -35,22 +50,44 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static COUNTING: Counting = Counting;
 
-/// The most allocated at once, by reading or by anything a test here makes to read.
+fn held() -> isize {
+    HELD.with(Cell::get)
+}
+
+/// Runs `work`, saying what it returned, the most it allocated at once, and how much more is
+/// held after it than before.
+fn measured<T>(work: impl FnOnce() -> T) -> (T, usize, isize) {
+    LARGEST.with(|largest| largest.set(0));
+    let before = held();
+    let out = work();
+    (out, LARGEST.with(Cell::get), held() - before)
+}
+
+/// The most allocated at once while reading.
 const MOST_ALLOCATED: usize = 64 * 1024 * 1024;
 const MOST_TIME: Duration = Duration::from_secs(2);
 
-/// Says what `bytes` is and reads it whole, each within two seconds and allocating no more than
-/// 64 MB at once. What `read` said, after checking `facts` agreed.
+/// Says what `bytes` is and reads it whole, each within two seconds, allocating no more than
+/// 64 MB at once and keeping no more than the most a recording keeps; finds its played times,
+/// keeping no more than a time an event. What `read` said, after checking `facts` agreed.
 fn facts_and_read(bytes: &[u8]) -> Result<Recording, CantPlay> {
     let started = Instant::now();
-    let facts = facts(bytes);
+    let (facts, largest, kept) = measured(|| facts(bytes));
     assert!(started.elapsed() < MOST_TIME, "facts took {:?}", started.elapsed());
+    assert!(largest <= MOST_ALLOCATED, "facts allocated {largest} at once");
+    assert_eq!(kept, 0, "facts kept something");
     let started = Instant::now();
-    let recording = read(bytes);
+    let (recording, largest, kept) = measured(|| read(bytes));
     assert!(started.elapsed() < MOST_TIME, "reading took {:?}", started.elapsed());
-    assert!(LARGEST.load(Ordering::Relaxed) <= MOST_ALLOCATED, "allocated {} at once", LARGEST.load(Ordering::Relaxed));
+    assert!(largest <= MOST_ALLOCATED, "reading allocated {largest} at once");
+    assert!(kept <= (MOST_KEPT + 1024) as isize, "reading kept {kept}");
     match (&facts, &recording) {
-        (Ok(facts), Ok(recording)) => agree(facts, recording),
+        (Ok(facts), Ok(recording)) => {
+            agree(facts, recording);
+            let (times, _, added) = measured(|| played(recording));
+            assert_eq!(times.len(), recording.events.len());
+            assert!(added <= (times.len() * size_of::<Duration>()) as isize + 64, "played kept {added}");
+        }
         (Err(why), _) => assert_eq!(recording.as_ref().err(), Some(why), "read and facts disagree"),
         (Ok(_), Err(why)) => panic!("facts read it and read said {why}"),
     }
@@ -112,21 +149,18 @@ fn a_made_recording_reads_back() {
     // The length and the marks are played times: the three seconds became one.
     assert!(close(recording.length, secs(2.6)), "{:?}", recording.length);
     assert_eq!(recording.marks.len(), 2);
-    assert_eq!(recording.marks[0].label, "listed");
+    assert_eq!((recording.marks[0].event, recording.label(&recording.marks[0])), (3, "listed"));
     assert!(close(recording.marks[0].at, secs(1.2)));
-    assert_eq!(recording.marks[1].label, "");
+    assert_eq!((recording.marks[1].event, recording.label(&recording.marks[1])), (6, ""));
     assert!(close(recording.marks[1].at, secs(2.6)));
 
-    let played = played(&recording);
-    assert_eq!(played.len(), recording.events.len());
-    let times: Vec<Duration> = played.iter().map(|event| event.at).collect();
+    let times = played(&recording);
+    assert_eq!(times.len(), recording.events.len());
     for (at, want) in times.iter().zip([0.5, 0.75, 0.9, 1.2, 2.2, 2.4, 2.6]) {
         assert!(close(*at, secs(want)), "{times:?}");
     }
-    assert_eq!(played.last().unwrap().at, recording.length);
-    for (event, want) in played.iter().zip(&recording.events) {
-        assert_eq!(event.what, want.what);
-    }
+    assert_eq!(*times.last().unwrap(), recording.length);
+    assert_eq!(times[3], recording.marks[0].at);
 
     // The first wait is shortened too, and a recording of nothing is no length.
     let late = facts_and_read(&make_test_cast(10, 5, &[(30.0, "o", "x")])).unwrap();
@@ -276,10 +310,21 @@ fn any_bytes_read_or_say_why_named_cases() {
     assert_eq!(facts_and_read(&events("[1e300, \"o\", \"x\"]\n")).err(), Some(CantPlay::TooLarge));
     assert!(facts_and_read(&events("[86400, \"o\", \"x\"]\n")).is_ok());
     assert!(facts_and_read(&events("[-0.0, \"o\", \"x\"]\n")).is_ok());
+    // A version that isn't a whole number isn't asciinema's.
+    for odd in ["2.0", "\"1.0.0\"", "\"2\"", "null"] {
+        let header = format!("{{\"version\": {odd}, \"width\": 80, \"height\": 24}}\n");
+        assert_eq!(facts_and_read(header.as_bytes()).err(), Some(CantPlay::NotARecording), "{odd}");
+        let pretty = format!("{{\n  \"version\": {odd},\n  \"width\": 80\n}}\n");
+        assert_eq!(facts_and_read(pretty.as_bytes()).err(), Some(CantPlay::Damaged), "{odd}");
+    }
     // A header longer than any header is, with or without a line's end.
     let long_header = header(&format!("\"width\": 80, \"height\": 24, \"title\": \"{}\"", "a".repeat(2 * 1024 * 1024)));
     assert_eq!(facts_and_read(&long_header).err(), Some(CantPlay::TooLarge));
     assert_eq!(facts_and_read(&long_header[..long_header.len() - 1]).err(), Some(CantPlay::TooLarge));
+    // A header padded past the longest, with an event on the same line.
+    let padded = [&header("\"width\": 80, \"height\": 24")[..], &vec![b' '; 2 * 1024 * 1024], b"[0.1, \"o\", \"x\"]\n"].concat();
+    let padded = [&padded[..padded.iter().position(|b| *b == b'\n').unwrap()], &padded[padded.iter().position(|b| *b == b'\n').unwrap() + 1..]].concat();
+    assert_eq!(facts_and_read(&padded).err(), Some(CantPlay::TooLarge));
 
     // A single line of 30 MB is too large, and is never parsed.
     let started = Instant::now();
@@ -313,6 +358,41 @@ fn any_bytes_read_or_say_why_named_cases() {
 
     // A header begun with a byte order mark reads.
     assert!(facts_and_read(&[b"\xef\xbb\xbf".as_slice(), &make_test_cast(80, 24, &[(0.1, "o", "x")])].concat()).is_ok());
+}
+
+#[test]
+fn what_a_recording_keeps_is_bounded() {
+    let not_utf8 = |code: &str, count: usize, each: usize| {
+        let line = [format!("[0,\"{code}\",\"").as_bytes(), &vec![0xff; each], b"\"]\n"].concat();
+        [make_test_cast(80, 24, &[]), line.repeat(count)].concat()
+    };
+    // Output of bytes that aren't UTF-8 becomes three times as much text. A file of 31 such
+    // outputs of 1 MB would keep 93 MB, so it's too large; one of 20 keeps three times the file.
+    let most = not_utf8("o", 31, MOST_OUTPUT);
+    assert!(most.len() <= MOST_BYTES);
+    assert_eq!(facts_and_read(&most).err(), Some(CantPlay::TooLarge));
+    drop(most);
+    let twenty = not_utf8("o", 20, MOST_OUTPUT);
+    let (recording, _, kept) = measured(|| read(&twenty));
+    let recording = recording.unwrap();
+    assert!(kept <= 3 * twenty.len() as isize + 4096, "kept {kept} of {}", twenty.len());
+    let (_, _, added) = measured(|| played(&recording));
+    assert!(added <= 20 * 16 + 64, "played kept {added}");
+    assert_eq!(facts_and_read(&twenty).unwrap(), recording);
+    drop((twenty, recording));
+
+    // A million marks of labels that aren't UTF-8 would keep more than the most.
+    let marks = not_utf8("m", MOST_EVENTS, 20);
+    assert!(marks.len() <= MOST_BYTES);
+    assert_eq!(facts_and_read(&marks).err(), Some(CantPlay::TooLarge));
+    drop(marks);
+    // A hundred thousand keep each label once, held at its length.
+    let marks = not_utf8("m", 100_000, 20);
+    let (recording, _, kept) = measured(|| read(&marks));
+    let recording = recording.unwrap();
+    let each = size_of::<Event>() + size_of::<Mark>() + 60;
+    assert!(kept <= (100_000 * each) as isize + 4096, "kept {kept}, {each} a mark");
+    assert_eq!(recording.label(&recording.marks[99_999]), "\u{fffd}".repeat(20));
 }
 
 #[test]

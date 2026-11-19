@@ -15,14 +15,20 @@ pub const MOST_BYTES: usize = 32 * 1024 * 1024;
 /// The widest and tallest screen a recording may have.
 pub const MOST_WIDTH: u16 = 500;
 pub const MOST_HEIGHT: u16 = 200;
-/// The most events a recording may hold, counting those that are left out.
+/// The most events a recording may hold. Every event line is counted, input and codes not known
+/// here among them though they're left out, as this bounds the work of reading one.
 pub const MOST_EVENTS: usize = 1_000_000;
 /// The most output, in bytes, one event may hold.
 pub const MOST_OUTPUT: usize = 1024 * 1024;
-/// The longest a recording may be, as it was recorded.
+/// The longest a recording may be, by the times it was recorded at, before its long waits are
+/// shortened.
 pub const MOST_LENGTH: Duration = Duration::from_secs(24 * 60 * 60);
 /// The longest wait between two events as it's played.
 pub const MOST_GAP: Duration = Duration::from_secs(1);
+/// The most a read recording may keep: its text, once what isn't UTF-8 is made replacement
+/// characters, and its events and marks. Twice the most a file holds allows for the
+/// replacement characters.
+pub const MOST_KEPT: usize = 2 * MOST_BYTES;
 
 /// The longest line a recording's header may be.
 const MOST_HEADER: usize = 1024 * 1024;
@@ -47,9 +53,20 @@ pub struct Recording {
     pub marks: Vec<Mark>,
 }
 
+impl Recording {
+    /// A mark's label, kept once, in its event.
+    pub fn label(&self, mark: &Mark) -> &str {
+        match self.events.get(mark.event).map(|event| &event.what) {
+            Some(What::Mark(label)) => label,
+            _ => "",
+        }
+    }
+}
+
 /// One thing that happened in a recording.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Event {
+    /// When it happened, as it was recorded; `played` gives the time it's played at.
     pub at: Duration,
     pub what: What,
 }
@@ -66,10 +83,12 @@ pub enum What {
 }
 
 /// A place a recording stops until the next click.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mark {
+    /// When it's played.
     pub at: Duration,
-    pub label: String,
+    /// Which of the recording's events it is; `Recording::label` gives its label.
+    pub event: usize,
 }
 
 /// What a recording is, without its output.
@@ -87,16 +106,18 @@ pub fn read(bytes: &[u8]) -> Result<Recording, CantPlay> {
     let mut marks = Vec::new();
     let read = walk(bytes, |at, played, seen| {
         let what = match seen {
-            Seen::Output(data) => What::Output(text(data)),
+            Seen::Output(text) => What::Output(kept(text)),
             Seen::Resize(width, height) => What::Resize(width, height),
-            Seen::Mark(data) => {
-                let label = text(data);
-                marks.push(Mark { at: played, label: label.clone() });
-                What::Mark(label)
+            Seen::Mark(text) => {
+                marks.push(Mark { at: played, event: events.len() });
+                What::Mark(kept(text))
             }
         };
         events.push(Event { at, what });
     })?;
+    // What's kept was counted by its length; it's held at that length too.
+    events.shrink_to_fit();
+    marks.shrink_to_fit();
     Ok(Recording { width: read.width, height: read.height, events, length: read.length, marks })
 }
 
@@ -111,14 +132,11 @@ pub fn facts(bytes: &[u8]) -> Result<RecordingFacts, CantPlay> {
     Ok(RecordingFacts { width: read.width, height: read.height, length: read.length, marks })
 }
 
-/// The events at the times they're played at: each wait longer than a second is a second.
-pub fn played(recording: &Recording) -> Vec<Event> {
+/// The times the events are played at, one for each of the recording's events: each wait
+/// longer than a second is a second.
+pub fn played(recording: &Recording) -> Vec<Duration> {
     let mut timing = Timing::default();
-    let mut events = Vec::with_capacity(recording.events.len());
-    for event in &recording.events {
-        events.push(Event { at: timing.step(event.at), what: event.what.clone() });
-    }
-    events
+    recording.events.iter().map(|event| timing.step(event.at)).collect()
 }
 
 /// Turns recorded times into played ones, one event after another.
@@ -136,11 +154,11 @@ impl Timing {
     }
 }
 
-/// An event that's kept, as it lies in the file.
+/// An event that's kept, its text borrowed from the file where it can be.
 enum Seen<'a> {
-    Output(Cow<'a, [u8]>),
+    Output(Cow<'a, str>),
     Resize(u16, u16),
-    Mark(Cow<'a, [u8]>),
+    Mark(Cow<'a, str>),
 }
 
 /// What reading the whole recording found besides its events.
@@ -164,21 +182,24 @@ fn walk<'a>(bytes: &'a [u8], mut each: impl FnMut(Duration, Duration, Seen<'a>))
     if bytes.len() > MOST_BYTES {
         return Err(CantPlay::TooLarge);
     }
-    if header.len() > MOST_HEADER {
+    // No line's end within the longest a header can be, with more of the file after it.
+    if header_end > MOST_HEADER {
         return Err(if older_version(bytes) { CantPlay::KindNotPlayed } else { CantPlay::TooLarge });
     }
     let Ok(header) = serde_json::from_slice::<Header>(header) else {
         return Err(if older_version(bytes) { CantPlay::KindNotPlayed } else { CantPlay::Damaged });
     };
-    match header.version {
+    // asciinema numbers its formats with whole numbers; anything else isn't one of them.
+    match header.version.as_ref().and_then(Value::as_u64) {
         None => return Err(CantPlay::NotARecording),
-        Some(version) if version.as_u64() != Some(2) => return Err(CantPlay::KindNotPlayed),
-        Some(_) => {}
+        Some(2) => {}
+        Some(_) => return Err(CantPlay::KindNotPlayed),
     }
     let width = side(header.width.as_ref(), MOST_WIDTH)?;
     let height = side(header.height.as_ref(), MOST_HEIGHT)?;
 
     let mut events = 0;
+    let mut kept = 0;
     let mut last = 0.0;
     let mut timing = Timing::default();
     for line in bytes[header_end..].split(|b| *b == b'\n') {
@@ -205,8 +226,8 @@ fn walk<'a>(bytes: &'a [u8], mut each: impl FnMut(Duration, Duration, Seen<'a>))
             return Err(CantPlay::TooLarge);
         }
         let seen = match &*code.0 {
-            b"o" => Seen::Output(data.0),
-            b"m" => Seen::Mark(data.0),
+            b"o" => Seen::Output(text(data.0)),
+            b"m" => Seen::Mark(text(data.0)),
             b"r" => {
                 let (width, height) = size(&data.0)?;
                 Seen::Resize(width, height)
@@ -214,6 +235,15 @@ fn walk<'a>(bytes: &'a [u8], mut each: impl FnMut(Duration, Duration, Seen<'a>))
             // Input, and codes not known here.
             _ => continue,
         };
+        kept += size_of::<Event>()
+            + match &seen {
+                Seen::Output(text) => text.len(),
+                Seen::Mark(text) => text.len() + size_of::<Mark>(),
+                Seen::Resize(..) => 0,
+            };
+        if kept > MOST_KEPT {
+            return Err(CantPlay::TooLarge);
+        }
         let at = Duration::from_secs_f64(time);
         each(at, timing.step(at), seen);
     }
@@ -272,8 +302,11 @@ fn older_version(bytes: &[u8]) -> bool {
         return false;
     };
     let rest = rest.trim_ascii_start();
-    let digits = &rest[..rest.iter().position(|b| !b.is_ascii_digit()).unwrap_or(rest.len())];
-    !digits.is_empty() && digits != b"2"
+    let end = rest.iter().position(|b| !b.is_ascii_digit()).unwrap_or(rest.len());
+    let (digits, after) = rest.split_at(end);
+    // Only a whole number is a version.
+    let whole = !matches!(after.first(), Some(b'.' | b'e' | b'E'));
+    !digits.is_empty() && whole && digits != b"2"
 }
 
 /// A string of an event, as the bytes it holds, borrowed from the line where it has no escapes.
@@ -309,37 +342,55 @@ impl<'de> Deserialize<'de> for Data<'de> {
 }
 
 /// An event's bytes as text. What isn't UTF-8, such as half of a character, becomes the
-/// replacement character, once for each half a character written as an escape.
-fn text(data: Cow<'_, [u8]>) -> String {
-    let mut bytes = match data {
-        Cow::Owned(bytes) => match String::from_utf8(bytes) {
-            Ok(text) => return text,
-            Err(not) => not.into_bytes(),
-        },
+/// replacement character.
+fn text(bytes: Cow<'_, [u8]>) -> Cow<'_, str> {
+    match bytes {
         Cow::Borrowed(bytes) => match std::str::from_utf8(bytes) {
-            Ok(text) => return text.to_owned(),
-            Err(_) => bytes.to_vec(),
+            Ok(text) => Cow::Borrowed(text),
+            Err(_) => Cow::Owned(replaced(bytes)),
         },
-    };
+        Cow::Owned(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => Cow::Owned(text),
+            Err(not) => Cow::Owned(replaced(not.as_bytes())),
+        },
+    }
+}
+
+/// Bytes that aren't all UTF-8 as text. Half of a character written as an escape is kept as
+/// three bytes, starting 0xED, that become one replacement character rather than three.
+fn replaced(bytes: &[u8]) -> String {
+    if !bytes.contains(&0xed) {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
     let mut out = String::with_capacity(bytes.len());
-    let mut rest = &mut bytes[..];
+    pieces(bytes, |piece| out.push_str(piece));
+    out
+}
+
+/// Text kept in a recording, held at its length.
+fn kept(text: Cow<'_, str>) -> String {
+    let mut text = text.into_owned();
+    text.shrink_to_fit();
+    text
+}
+
+/// Hands on bytes as pieces of text, what isn't UTF-8 as the replacement character, once for
+/// each half a character written as an escape.
+fn pieces(mut bytes: &[u8], mut piece: impl FnMut(&str)) {
     loop {
-        match std::str::from_utf8(rest) {
-            Ok(text) => {
-                out.push_str(text);
-                return out;
-            }
+        match std::str::from_utf8(bytes) {
+            Ok(text) => return piece(text),
             Err(not) => {
-                let (good, bad) = rest.split_at_mut(not.valid_up_to());
-                out.push_str(std::str::from_utf8(good).unwrap_or_default());
-                out.push(char::REPLACEMENT_CHARACTER);
+                let (good, bad) = bytes.split_at(not.valid_up_to());
+                piece(std::str::from_utf8(good).unwrap_or_default());
+                piece("\u{fffd}");
                 // Half of a character written as an escape is kept as three bytes, which
                 // aren't UTF-8 on their own.
                 let skip = match bad {
                     [0xed, 0xa0..=0xbf, 0x80..=0xbf, ..] => 3,
                     _ => not.error_len().unwrap_or(bad.len()),
                 };
-                rest = &mut bad[skip..];
+                bytes = &bad[skip..];
             }
         }
     }
