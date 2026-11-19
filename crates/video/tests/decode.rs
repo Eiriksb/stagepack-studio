@@ -481,3 +481,51 @@ fn a_video_failing_part_way_says_why_before_it_lets_go_of_the_file() {
         assert!(let_go, "the thread let go of the file");
     }
 }
+
+/// The made 12-picture clip with the last picture given no time of its own, as some programs
+/// write it.
+fn last_without_duration() -> Vec<u8> {
+    let made = coloured_video(64, 48, 12, 30);
+    edit(&made, |boxes| find(boxes, "moov/trak/mdia/minf/stbl/stts").data = table(0, &[2, 11, 1000, 1, 0]))
+}
+
+#[test]
+fn a_last_picture_with_no_duration_plays() {
+    let video = open(reader(last_without_duration())).unwrap();
+    assert_eq!(video.info().frames, 12);
+    assert!((video.info().seconds - 12.0 / 30.0).abs() < 0.001, "{}", video.info().seconds);
+    let mut playing = video.play(0.0, false);
+    let mut last = None;
+    for i in 0..12 {
+        last = next_frame(&mut playing, due(i, 30));
+        let frame = last.as_ref().unwrap_or_else(|| panic!("no frame {i}"));
+        assert!((frame.at - i as f64 / 30.0).abs() < 0.0005, "frame {i} at {}", frame.at);
+        assert!(is_colour(frame, colour_of(i), 8), "frame {i}");
+    }
+    assert!(is_colour(last.as_ref().unwrap(), colour_of(11), 8));
+    assert!(wait_for(Duration::from_secs(2), || playing.ended()));
+    assert_eq!(playing.failed(), None);
+
+    let mut playing = open(reader(last_without_duration())).unwrap().play(0.0, true);
+    for i in 0..40 {
+        let frame = next_frame(&mut playing, due(i, 30)).unwrap_or_else(|| panic!("no frame {i}"));
+        assert!((frame.at - (i % 12) as f64 / 30.0).abs() < 0.0005, "frame {i} at {}", frame.at);
+        assert!(is_colour(&frame, colour_of(i % 12), 8), "frame {i}");
+    }
+    assert!(!playing.ended());
+    assert_eq!(playing.failed(), None);
+}
+
+#[test]
+fn a_last_picture_more_than_a_frame_past_the_end_is_refused() {
+    // Shown two frames after the end, with no time of its own, or a frame and a half after it.
+    let made = coloured_video(64, 48, 12, 30);
+    let ctts = |last: u32| Mp4Box { kind: *b"ctts", head: Vec::new(), data: table(0, &[2, 11, 0, 1, last]), inside: Vec::new() };
+    let without = edit(&last_without_duration(), |boxes| find(boxes, "moov/trak/mdia/minf/stbl").inside.insert(2, ctts(2001)));
+    assert_eq!(open(reader(without)).err(), Some(CantPlay::Damaged));
+    let with = edit(&made, |boxes| find(boxes, "moov/trak/mdia/minf/stbl").inside.insert(2, ctts(2500)));
+    assert_eq!(open(reader(with)).err(), Some(CantPlay::Damaged));
+    // Half a frame past is taken as the last picture's own frame.
+    let near = edit(&made, |boxes| find(boxes, "moov/trak/mdia/minf/stbl").inside.insert(2, ctts(1500)));
+    assert_eq!(open(reader(near)).map(|v| v.info().frames).ok(), Some(12));
+}

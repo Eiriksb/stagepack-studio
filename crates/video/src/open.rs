@@ -376,7 +376,7 @@ fn describe(moov: &[u8], len: u64) -> Result<Index, CantPlay> {
     let mut samples = Vec::with_capacity(count);
     place_samples(track, count, len, &mut samples)?;
     check_apart(&samples)?;
-    let length = time_samples(track, &mut samples)?;
+    let (mut length, last_start) = time_samples(track, &mut samples)?;
     if let Some(stss) = &stbl.stss {
         for sample in &mut samples {
             sample.sync = false;
@@ -399,9 +399,21 @@ fn describe(moov: &[u8], len: u64) -> Result<Index, CantPlay> {
         sample.shown -= first;
     }
 
+    // Some programs give the last picture no time of its own, so it's shown at the very end: it's
+    // given an average frame's time, the header's length where that says no more than one more
+    // frame. A picture shown later than that is a damaged table: it would never be due, and a
+    // looped video would wait for it.
+    let last = times[count - 1];
+    if last >= length {
+        let frame = if count > 1 { last_start / (count as i64 - 1) } else { i64::try_from(mdia.mdhd.duration).unwrap_or(0) };
+        if frame <= 0 || last - length > frame {
+            return Err(CantPlay::Damaged);
+        }
+        let said = i64::try_from(mdia.mdhd.duration).unwrap_or(0);
+        length = if said > last && said <= last + frame { said } else { last + frame };
+    }
     let seconds = length as f64 / f64::from(ticks_a_second);
-    // A picture shown at or after the end is a damaged table: it would never be due.
-    if seconds <= 0.0 || times[count - 1] >= length {
+    if seconds <= 0.0 {
         return Err(CantPlay::Damaged);
     }
     let frames_a_second = count as f64 / seconds;
@@ -501,15 +513,17 @@ fn check_apart(samples: &[Sample]) -> Result<(), CantPlay> {
 }
 
 /// Works out when each picture is shown, from the tables of durations and offsets. Gives the
-/// whole video's length in ticks.
-fn time_samples(track: &Mp4Track, samples: &mut [Sample]) -> Result<i64, CantPlay> {
+/// whole video's length in ticks, and when the last picture starts before its offset.
+fn time_samples(track: &Mp4Track, samples: &mut [Sample]) -> Result<(i64, i64), CantPlay> {
     let stbl = &track.trak.mdia.minf.stbl;
     let mut decoded: i64 = 0;
+    let mut last_start = 0;
     let mut i = 0;
     'runs: for run in &stbl.stts.entries {
         for _ in 0..run.sample_count {
             let Some(sample) = samples.get_mut(i) else { break 'runs };
             sample.shown = decoded;
+            last_start = decoded;
             decoded = decoded.checked_add(i64::from(run.sample_delta)).ok_or(CantPlay::Damaged)?;
             i += 1;
         }
@@ -529,5 +543,5 @@ fn time_samples(track: &Mp4Track, samples: &mut [Sample]) -> Result<i64, CantPla
             }
         }
     }
-    Ok(decoded)
+    Ok((decoded, last_start))
 }
