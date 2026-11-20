@@ -103,7 +103,8 @@ fn agree(facts: &RecordingFacts, recording: &Recording) {
     assert_eq!(facts.width, recording.width);
     assert_eq!(facts.height, recording.height);
     assert_eq!(facts.length, recording.length);
-    assert_eq!(facts.marks, recording.marks.len());
+    // Its stops are its marks at their played times, those at one time one stop, as the show has them.
+    assert_eq!(facts.marks, Player::new(std::sync::Arc::new(recording.clone())).stops().len());
 }
 
 fn secs(seconds: f64) -> Duration {
@@ -420,7 +421,8 @@ fn a_recording_within_the_limits_plays() {
     assert_eq!(recording.marks.len(), MOST_EVENTS);
     assert_eq!(recording.label(&recording.marks[MOST_EVENTS - 1]), "step");
     assert!(kept <= most_kept(), "kept {kept}");
-    assert_eq!(facts(&steps).unwrap().marks, MOST_EVENTS);
+    // All at one time, they're one stop.
+    assert_eq!(facts(&steps).unwrap().marks, 1);
 }
 
 #[test]
@@ -434,6 +436,15 @@ fn facts_agree_with_read() {
     let facts = facts(&three).unwrap();
     assert_eq!((facts.width, facts.height, facts.marks), (500, 200, 2));
     assert!(close(facts.length, secs(2.1)));
+    // Two marks at one time are one stop.
+    let twice = make_test_cast(80, 24, &[(0.1, "o", "a"), (1.0, "m", "one"), (1.0, "m", "two"), (2.0, "m", "three")]);
+    let (facts, recording) = (facts_of(&twice), read(&twice).unwrap());
+    assert_eq!((facts.marks, recording.marks.len()), (2, 3));
+    agree(&facts, &recording);
+}
+
+fn facts_of(bytes: &[u8]) -> RecordingFacts {
+    facts(bytes).unwrap()
 }
 
 #[test]

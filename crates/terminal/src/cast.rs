@@ -98,6 +98,7 @@ pub struct RecordingFacts {
     pub width: u16,
     pub height: u16,
     pub length: Duration,
+    /// How many times it stops: its marks, those at one played time counted once.
     pub marks: usize,
 }
 
@@ -140,12 +141,16 @@ pub fn screen_size(bytes: &[u8]) -> Option<(u16, u16)> {
     Some((side(header.width.as_ref(), MOST_WIDTH).ok()?, side(header.height.as_ref(), MOST_HEIGHT).ok()?))
 }
 
-/// Says what a recording is, from one pass over it that keeps no output.
+/// Says what a recording is, from one pass over it that keeps no output. Its marks are counted
+/// as the stops they make: those at one played time, one stop, as a player has them.
 pub fn facts(bytes: &[u8]) -> Result<RecordingFacts, CantPlay> {
-    let mut marks = 0;
-    let read = walk(bytes, |_, _, seen| {
-        if let Seen::Mark(_) = seen {
+    let (mut marks, mut last) = (0, None);
+    let read = walk(bytes, |_, played, seen| {
+        if let Seen::Mark(_) = seen
+            && last != Some(played)
+        {
             marks += 1;
+            last = Some(played);
         }
     })?;
     Ok(RecordingFacts { width: read.width, height: read.height, length: read.length, marks })
