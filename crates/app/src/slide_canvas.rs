@@ -52,9 +52,22 @@ struct Sprite {
     image: Arc<RenderImage>,
 }
 
-/// A layer to paint, how far below its place it is, whether it's painted itself, and the
-/// pictures of videos and models over it, each with where its layer is now.
-type RunSprite = (Sprite, f32, bool, Vec<(Shown, Rect)>);
+/// A layer to paint, how far below its place it is, whether it's painted itself, the pictures of
+/// videos and models over it, each with where its layer is now, and the plain panel of a
+/// recording started over it that has no picture yet, with its box and how far it's turned.
+type RunSprite = (Sprite, f32, bool, Vec<(Shown, Rect)>, Option<(Rect, f32)>);
+
+/// What shows of a terminal recording's layer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[doc(hidden)]
+pub enum RecordingShows {
+    /// Its still: its last screen.
+    Still,
+    /// Its plain panel: it's been started, and has no picture yet.
+    Panel,
+    /// A picture of its screen, from this far into it, in seconds.
+    Picture(f64),
+}
 
 /// Showing layers next to each other that share an opacity. Each sprite comes with how far
 /// below its place it is, in slide units, and the pictures of the videos playing over it.
@@ -866,6 +879,31 @@ impl SlideCanvas {
         (self.replays_made, self.replays_released.get())
     }
 
+    /// The box and turn of the recording playing over layer `layer` whose first picture is still
+    /// to come, if one is.
+    fn recording_panel(&self, layer: usize) -> Option<(Rect, f32)> {
+        let replay = self.replays.iter().find(|replay| replay.layer == layer)?;
+        (replay.shown().is_none() && replay.is_playing()).then_some((replay.on.rect, replay.on.rotate))
+    }
+
+    /// What shows of layer `layer`, if it's a recording's: its still, its plain panel, or a
+    /// picture of its screen.
+    #[doc(hidden)]
+    pub fn recording_shows(&self, layer: usize) -> RecordingShows {
+        match self.replays.iter().find(|replay| replay.layer == layer).and_then(|replay| replay.shown()) {
+            Some(shown) => RecordingShows::Picture(shown.at),
+            None if self.recording_panel(layer).is_some() => RecordingShows::Panel,
+            None => RecordingShows::Still,
+        }
+    }
+
+    /// Takes in `replay`, readied for this slide before it was shown, to play over its layer.
+    pub(crate) fn adopt_recording(&mut self, replay: Replay, cx: &mut Context<Self>) {
+        self.stop_recording(replay.layer);
+        self.replays.push(replay);
+        cx.notify();
+    }
+
     /// Takes the newest pictures of the recordings playing, without waiting for any, and asks
     /// the window for another frame while any has a picture to come.
     fn advance_recordings(&mut self, window: &mut Window) {
@@ -877,6 +915,12 @@ impl SlideCanvas {
             let (made, replaced) = replay.advance(self.scale);
             self.replays_made += usize::from(made);
             self.retired_replays.extend(replaced);
+            // One done with, whose picture was drawn at another scale, shows its still again,
+            // drawn anew at this one.
+            let other_scale = replay.shown().is_some_and(|shown| matches!(shown.placed, Placed::Drawn { scale, .. } if Some(scale) != self.scale));
+            if other_scale && !replay.is_playing() && !replay.wants_frames() {
+                self.retired_replays.extend(replay.take_shown());
+            }
             wanted |= replay.wants_frames();
         }
         if wanted {
@@ -938,10 +982,13 @@ impl SlideCanvas {
                 .filter(|replay| replay.layer == index)
                 .filter_map(|replay| Some((replay.shown()?.clone(), replay.on.rect)))
                 .collect();
+            // A recording started shows its plain panel until its first picture, never its still,
+            // its last screen, which would give away what's to come.
+            let panel = self.recording_panel(index);
             // A model drawn live, or a recording played, shows in place of its still, which would
             // show through around it.
-            let still = model.is_empty() && replay.is_empty();
-            let sprite = (sprite.clone(), look.offset_y, still, over.into_iter().chain(model).chain(replay).collect());
+            let still = model.is_empty() && replay.is_empty() && panel.is_none();
+            let sprite = (sprite.clone(), look.offset_y, still, over.into_iter().chain(model).chain(replay).collect(), panel);
             match runs.last_mut() {
                 Some(run) if run.opacity == look.opacity => run.sprites.push(sprite),
                 _ => runs.push(Run {
@@ -994,7 +1041,7 @@ fn paint_sprites(
     let to_window = drawn_at.map_or(1.0, |drawn_at| scale / drawn_at) / scale_factor;
     let width = f32::from(slide.size.width);
     let unit = width / SLIDE_WIDTH;
-    for (Sprite { layer, image }, offset_y, painted, over) in sprites {
+    for (Sprite { layer, image }, offset_y, painted, over, panel) in sprites {
         let place = Bounds {
             origin: slide.origin
                 + point(
@@ -1012,6 +1059,22 @@ fn paint_sprites(
             window
                 .paint_image(slide, place, Corners::default(), image, 0, false)
                 .ok();
+        }
+        // A recording's plain panel, turned with its box.
+        if let Some((rect, rotate)) = panel {
+            let (middle_x, middle_y) = (rect.x + rect.w / 2., rect.y + rect.h / 2.);
+            let (sin, cos) = rotate.to_radians().sin_cos();
+            let corners = [(rect.x, rect.y), (rect.x + rect.w, rect.y), (rect.x + rect.w, rect.y + rect.h), (rect.x, rect.y + rect.h)].map(|(x, y)| {
+                let (dx, dy) = (x - middle_x, y - middle_y);
+                let (x, y) = (middle_x + dx * cos - dy * sin, middle_y + dx * sin + dy * cos);
+                slide.origin + point(px(x * unit + offset_x * width), px((y + offset_y) * unit))
+            });
+            let mut path = PathBuilder::fill();
+            path.add_polygon(&corners, true);
+            if let Ok(path) = path.build() {
+                let [r, g, b] = slides_terminal::rgb(slides_terminal::Colour::Default, false);
+                window.paint_path(path, gpui_kit::rgb(u32::from_be_bytes([0, r, g, b])));
+            }
         }
         // A video playing over the layer, where the layer is and moving as it does.
         for (shown, rect) in over {

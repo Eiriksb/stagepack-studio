@@ -124,6 +124,9 @@ pub const SELECTION_CONTEXT: &str = "SlideSelection";
 pub const VIDEO_CONTEXT: &str = "SlideVideo";
 /// The key context added to [`SELECTION_CONTEXT`] while the one thing selected is a 3D model.
 pub const MODEL_CONTEXT: &str = "SlideModel";
+/// The key context added to [`SELECTION_CONTEXT`] while the one thing selected is a terminal
+/// recording.
+pub const TERMINAL_CONTEXT: &str = "SlideTerminal";
 
 /// How long the caret shows, and then doesn't, as it blinks.
 const BLINK: Duration = Duration::from_millis(500);

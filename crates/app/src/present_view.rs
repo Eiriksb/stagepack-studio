@@ -14,7 +14,7 @@ use crate::present::{
     WindowPlan, choose_windows, clock_text, layer_look, moment_time, slide_looks,
 };
 use crate::model_view::{Aim, aim_at, inside_turned};
-use crate::replay::Aim as ReplayAim;
+use crate::replay::{Aim as ReplayAim, Replay, Source as ReplaySource};
 use crate::slide_canvas::{ModelLetGo, ScaleChanged, SlideCanvas, VideoLetGo, VideoOpened};
 use crate::workspace_view::APP_ID;
 
@@ -441,8 +441,13 @@ pub struct AudienceView {
     turn_drag: Option<(ModelLayer, Point<Pixels>, bool)>,
     /// Whether the press last let go of turned a model, so that it's no click of the show's.
     turned: bool,
-    /// The place whose terminal recordings were last played, which tells a click back from one on.
+    /// The place whose terminal recordings were last played, which tells a click back from one on,
+    /// and whether it was come to going back: so it stays until the place changes.
     replayed_at: Option<Place>,
+    replayed_back: bool,
+    /// The recordings of the slide the next click brings, readied at their start, each with the
+    /// slide: the slide shows with their first pictures already drawn.
+    ready: Vec<(usize, Replay)>,
     rehearsing: bool,
     focus_handle: FocusHandle,
     _watching: [Subscription; 9],
@@ -492,6 +497,8 @@ impl AudienceView {
             turn_drag: None,
             turned: false,
             replayed_at: None,
+            replayed_back: false,
+            ready: Vec::new(),
             rehearsing,
             focus_handle,
             _watching: watching,
@@ -598,8 +605,10 @@ impl AudienceView {
     /// Plays the terminal recordings of the show's place: each on its slide that's there at its
     /// step, from when the slide shows or its click comes, to the next of its stops after the
     /// clicks come since, where it waits for the next click. A click back sends it back to the
-    /// stop before, still. On a slide come to, each starts from its start, and none plays on the
-    /// slide left. One still being read, or that can't be played, isn't started.
+    /// stop before, still. On a slide come to going on, each starts from its start, readied before
+    /// if it could be; on one come back to from a later one, each shows where its clicks have
+    /// brought it, its end being its still. None plays on the slide left. One still being read, or
+    /// that can't be played, isn't started.
     fn play_recordings(&mut self, document: &Entity<Document>, place: Place, time: f32, cx: &mut Context<Self>) {
         let moment = Moment {
             step: place.step,
@@ -611,7 +620,21 @@ impl AudienceView {
         });
         let was = self.replayed_at.replace(place);
         let afresh = was.is_none_or(|was| was.slide != place.slide);
-        let back = !afresh && was.is_some_and(|was| place.step < was.step);
+        // Drawn again at the same place, it was come to as it was.
+        let back = match was {
+            Some(was) if was == place => self.replayed_back,
+            Some(was) => (was.slide, was.step) > (place.slide, place.step),
+            None => false,
+        };
+        self.replayed_back = back;
+        let mut ready: Vec<Replay> = Vec::new();
+        for (at, replay) in std::mem::take(&mut self.ready) {
+            if at == place.slide && afresh && !back {
+                ready.push(replay);
+            } else {
+                self.ready.push((at, replay));
+            }
+        }
         if afresh {
             // The slide left keeps its recordings' last pictures while it goes.
             self.leaving.update(cx, |canvas, cx| canvas.hold_recordings(cx));
@@ -635,13 +658,20 @@ impl AudienceView {
                 // At its end, still, it's its still.
                 None if aim == ReplayAim::At(passed) && passed >= terminal.on.stops => {}
                 None => {
+                    if let Some(at) = ready.iter().position(|replay| replay.layer == terminal.layer && replay.on.src == terminal.on.src) {
+                        let mut replay = ready.swap_remove(at);
+                        replay.place(terminal.on.clone());
+                        replay.aim(aim);
+                        self.current.update(cx, |canvas, cx| canvas.adopt_recording(replay, cx));
+                        continue;
+                    }
                     if pending || document.update(cx, |document, _| document.terminal_problem_on(slide, &source)).is_some() {
                         continue;
                     }
                     let Some(open) = document.read(cx).open_large(&terminal.on.src) else { continue };
                     let fonts = document.update(cx, |document, _| document.fonts_seed());
                     let (layer, on) = (terminal.layer, terminal.on.clone());
-                    self.current.update(cx, |canvas, cx| canvas.play_recording(layer, on, aim, crate::replay::Source { open, fonts }, true, cx));
+                    self.current.update(cx, |canvas, cx| canvas.play_recording(layer, on, aim, ReplaySource { open, fonts }, true, cx));
                 }
             }
         }
@@ -649,16 +679,37 @@ impl AudienceView {
 
     /// Lays out the slide the next click brings, if it's another, at the scale the audience sees
     /// it at, so that what it shows is ready by the time it's there: a busy recording's screen,
-    /// drawn aside, has been, rather than its plain panel showing first.
+    /// drawn aside, has been, rather than its plain panel showing first. Its recordings there from
+    /// its start are readied, each held at its start with its first picture drawn; those readied
+    /// for a slide the next click no longer brings end.
     fn ready_next(&mut self, document: &Entity<Document>, cx: &mut Context<Self>) {
-        let Some(scale) = self.current.read(cx).scale() else { return };
         let here = self.show.read(cx).session.place().slide;
-        let upcoming = self.show.update(cx, |show, cx| show.upcoming(cx));
-        let Some(upcoming) = upcoming.filter(|upcoming| upcoming.slide != here) else { return };
-        document.update(cx, |document, _| {
+        let upcoming = self.show.update(cx, |show, cx| show.upcoming(cx)).filter(|upcoming| upcoming.slide != here);
+        self.ready.retain(|(at, _)| upcoming.is_some_and(|upcoming| upcoming.slide == *at));
+        let (Some(scale), Some(upcoming)) = (self.current.read(cx).scale(), upcoming) else { return };
+        let moment = Moment { step: upcoming.step, time: 0.0 };
+        let (terminals, pending, slide) = document.update(cx, |document, _| {
             let slide = document.shown_slide(upcoming.slide);
-            document.layers_at(slide, Moment { step: upcoming.step, time: 0.0 }, scale);
+            document.layers_at(slide, moment, scale);
+            (document.terminals_at(slide, moment), document.terminal_pending(slide), slide)
         });
+        if pending {
+            return;
+        }
+        for terminal in terminals {
+            let Some(source) = terminal.source.clone() else { continue };
+            let readied = self.ready.iter().any(|(_, replay)| replay.layer == terminal.layer && replay.on.src == terminal.on.src);
+            if readied || terminal.click.unwrap_or(0) > upcoming.step {
+                continue;
+            }
+            if document.update(cx, |document, _| document.terminal_problem_on(slide, &source)).is_some() {
+                continue;
+            }
+            let Some(open) = document.read(cx).open_large(&terminal.on.src) else { continue };
+            let fonts = document.update(cx, |document, _| document.fonts_seed());
+            let replay = Replay::start(terminal.layer, terminal.on, ReplayAim::Start, ReplaySource { open, fonts }, true, Some(scale));
+            self.ready.push((upcoming.slide, replay));
+        }
     }
 
     /// Has `model` drawn live on the slide shown, from `aim`, turning on its own if it does. One

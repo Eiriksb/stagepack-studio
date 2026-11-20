@@ -14,12 +14,12 @@ use std::time::{Duration, Instant};
 use typing::*;
 
 use gpui_kit::test::TestWindowExt as _;
-use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, RenderImage, TestAppContext, VisualTestContext};
+use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, RenderImage, TestAppContext, VisualTestContext, px, size};
 use slides_engine::{Fonts, Moment};
 use stagepack_studio::document::Document;
 use stagepack_studio::present_view::{AudienceView, Presentation, PresenterView, start_show};
 use stagepack_studio::replay;
-use stagepack_studio::slide_canvas::SlideCanvas;
+use stagepack_studio::slide_canvas::{RecordingShows, SlideCanvas};
 use stagepack_studio::slide_editor::{TERMINAL_PLAY_ID, TERMINAL_STOP_ID};
 use stagepack_studio::video_player::{Making, make_one};
 use stagepack_studio::workspace_view;
@@ -293,7 +293,17 @@ fn image_of(cx: &TestAppContext, canvas: &Entity<SlideCanvas>, layer: usize) -> 
 
 /// The place among the show's layers of the first slide's recording.
 fn shown_layer(document: &Entity<Document>, cx: &mut TestAppContext) -> usize {
-    document.update(cx, |document, _| document.terminals_at(0, Moment { step: 0, time: 0.0 })[0].layer)
+    layer_on(document, 0, 0, cx)
+}
+
+/// The place among the layers of slide `slide` at step `step` of its recording.
+fn layer_on(document: &Entity<Document>, slide: usize, step: u32, cx: &mut TestAppContext) -> usize {
+    document.update(cx, |document, _| document.terminals_at(slide, Moment { step, time: 0.0 })[0].layer)
+}
+
+/// What shows of layer `layer` on `canvas`.
+fn shows(cx: &TestAppContext, canvas: &Entity<SlideCanvas>, layer: usize) -> RecordingShows {
+    cx.read(|cx| canvas.read(cx).recording_shows(layer))
 }
 
 fn same_picture(a: &RenderImage, b: &RenderImage) -> bool {
@@ -422,13 +432,15 @@ fn the_presenter_shows_the_last_screen(cx: &mut TestAppContext) {
     let presenter = show.presenters(cx);
     assert!(times(cx, &presenter).is_empty(), "no second copy plays");
     assert_eq!(replay::threads_running(), 1);
-    // Its slide shows the still, the last screen, as the audience's does under its replay.
-    assert!(cx.read(|cx| presenter.read(cx).images().len()) >= 2);
-    let (audience_scale, presenter_scale) = cx.read(|cx| (canvas.read(cx).scale(), presenter.read(cx).scale()));
-    if audience_scale == presenter_scale {
-        let layer = shown_layer(&show.document, cx);
-        assert!(same_picture(&image_of(cx, &presenter, layer), &image_of(cx, &canvas, layer)));
-    }
+    // Its slide shows the still, the last screen, drawn at its own scale.
+    let layer = shown_layer(&show.document, cx);
+    let scale = cx.read(|cx| presenter.read(cx).scale()).expect("drawn");
+    let still = show.document.update(cx, |document, _| document.layers_at(0, Moment { step: 0, time: 0.0 }, scale))[layer].clone();
+    let shown = image_of(cx, &presenter, layer);
+    let wanted = slides_engine::to_bgra_frame(&still.pixmap);
+    assert_eq!((shown.size(0).width.0 as u32, shown.size(0).height.0 as u32), (wanted.buffer().width(), wanted.buffer().height()));
+    assert!(shown.as_bytes(0) == Some(wanted.buffer().as_raw().as_slice()), "the presenter's slide shows the last screen");
+    assert_eq!(shows(cx, &presenter, layer), RecordingShows::Still);
 }
 
 #[gpui_kit::test]
@@ -617,29 +629,182 @@ fn every_way_of_leaving_stops_the_replay(cx: &mut TestAppContext) {
     assert!(took <= Duration::from_millis(300), "undo: its thread took {took:?} to end");
     assert!(times(cx, &canvas).is_empty());
 
+    // A jump to a slide further on.
+    left_by(cx, "a jump to another slide", &format!("{talk}\n---\n\n# Three\n"), |typing, cx| {
+        typing.document(cx).update(cx, |document, cx| {
+            document.go_to(2);
+            cx.notify();
+        });
+        typing.settle(cx);
+        assert_eq!(typing.current(cx), 2);
+        Some(typing)
+    });
+
     // In the show: the slide left, the slide come back to, and the show ended.
-    let show = rehearse(cx, &talk, &running(30));
+    let three = format!("# Zero\n\n---\n\n{talk}");
+    let show = rehearse(cx, &three, &running(30));
+    // Readied for the next slide, at its start.
+    until(cx, show.audience, "the next slide's recording readied", |_| replay::threads_running() == 1);
+    show.press(cx, "right");
+    assert_eq!(show.step(cx), (1, 0));
     let canvas = show.first_picture(cx);
     until(cx, show.audience, "it plays on", |cx| times(cx, &canvas)[0].is_some_and(|at| at >= 0.3));
     show.press(cx, "right");
-    assert_eq!(show.step(cx), (1, 0));
+    assert_eq!(show.step(cx), (2, 0));
     assert!(times(cx, &show.canvas(cx)).is_empty(), "nothing plays on the next slide");
     let took = threads_end(cx, Some(show.audience), "the slide left");
     assert!(took <= Duration::from_millis(300), "the slide left: its thread took {took:?} to end");
     nothing_drawn(cx, show.audience, "the slide left");
     let (made, released) = made_and_released(cx, &canvas);
     assert_eq!(made, released, "the slide left: every picture is released");
-    // Held here, the canvas would outlive its window as the show ends.
-    drop(canvas);
+    // Come back to from the slide after, it shows its end, its still, and nothing plays.
     show.press(cx, "left");
+    assert_eq!(show.step(cx), (1, 0));
+    for_a_while(cx, show.audience, 100);
+    assert!(times(cx, &canvas).is_empty(), "come back to, it's its still");
+    assert_eq!(replay::threads_running(), 0, "come back to: no thread");
+    drop(canvas);
+    // Come to again going on, it starts from its beginning.
+    show.press(cx, "left");
+    show.press(cx, "right");
+    assert_eq!(show.step(cx), (1, 0));
     let canvas = show.first_picture(cx);
     assert!(times(cx, &canvas)[0].is_some_and(|at| at < 0.3), "from the beginning again: {:?}", times(cx, &canvas));
+    // Held here, the canvas would outlive its window as the show ends.
     drop(canvas);
     cx.simulate_keystrokes(show.audience, "escape");
     cx.run_until_parked();
     assert!(show.show.read_with(cx, |show, _| show.has_ended()));
     let took = threads_end(cx, None, "the show ended");
     assert!(took <= Duration::from_millis(300), "the show ended: its thread took {took:?} to end");
+
+    // Left through a transition: its last picture stays as the next slide comes in, and then goes.
+    let faded = format!("# Run\n\n{TERMINAL}\n\n---\ntransition: fade\n---\n\n# Two\n");
+    let show = rehearse(cx, &faded, &running(30));
+    let canvas = show.first_picture(cx);
+    show.press(cx, "right");
+    let view: Entity<AudienceView> = cx.read(|cx| show.show.read(cx).audience()).unwrap().1;
+    let leaving = cx.read(|cx| view.read(cx).outgoing(cx).cloned()).expect("the slide left is still seen");
+    assert!(pictures(cx, &leaving)[0].is_some(), "its last picture stays");
+    let took = threads_end(cx, Some(show.audience), "the transition");
+    assert!(took <= Duration::from_millis(300), "the transition: its thread took {took:?} to end");
+    // The transition's time is the show's clock.
+    for _ in 0..30 {
+        cx.executor().advance_clock(Duration::from_millis(50));
+        cx.run_until_parked();
+        cx.update_window(show.audience, |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+    }
+    show.settle(cx);
+    assert!(times(cx, &leaving).is_empty(), "once the transition's done, it goes");
+    let (made, released) = made_and_released(cx, &leaving);
+    assert_eq!(made, released, "the transition: every picture is released");
+    nothing_drawn(cx, show.audience, "the transition");
+    drop((canvas, leaving, view));
+    cx.update_window(show.audience, |_, window, _| window.remove_window()).ok();
+    cx.run_until_parked();
+    threads_end(cx, None, "the transition's show closed");
+}
+
+#[gpui_kit::test]
+fn come_back_to_from_a_later_slide_it_shows_its_end(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let show = rehearse(cx, &talk(), &marked());
+    let canvas = show.first_picture(cx);
+    holds_at(cx, show.audience, &canvas, STOPS[0]);
+    show.press(cx, "right");
+    show.press(cx, "right");
+    show.press(cx, "right");
+    assert_eq!(show.step(cx), (1, 0));
+    threads_end(cx, Some(show.audience), "the slide left");
+    show.press(cx, "left");
+    assert_eq!(show.step(cx), (0, 2));
+    let canvas = show.canvas(cx);
+    let layer = shown_layer(&show.document, cx);
+    for_a_while(cx, show.audience, 100);
+    assert_eq!(shows(cx, &canvas, layer), RecordingShows::Still, "its last screen, its still");
+    assert_eq!(replay::threads_running(), 0, "and no thread");
+    // A step back from there goes to the mark before, soon.
+    let began = Instant::now();
+    show.press(cx, "left");
+    holds_at(cx, show.audience, &canvas, STOPS[1]);
+    assert!(began.elapsed() < Duration::from_secs(1), "the mark's screen took {:?}", began.elapsed());
+    // Drawn again at the same place, it stays there.
+    show.document.update(cx, |_, cx| cx.notify());
+    show.settle(cx);
+    for_a_while(cx, show.audience, 200);
+    assert!(is_at(times(cx, &canvas)[0], STOPS[1]), "it stays at the mark: {:?}", times(cx, &canvas));
+}
+
+#[gpui_kit::test]
+fn the_first_frame_never_shows_the_last_screen(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let clicked = TERMINAL.replace(" />", " click=\"1\" />");
+    let source = format!("# Zero\n\n---\n\n# Run\n\n{TERMINAL}\n\n---\n\n# Clicked\n\n{clicked}\n");
+    let show = rehearse(cx, &source, &marked());
+    let document = show.document.clone();
+    until(cx, show.audience, "the stills", |cx| document.read_with(cx, |document, _| !document.stills_coming()));
+    show.settle(cx);
+    // The next slide's recording is readied, its first picture drawn, before it's come to.
+    until(cx, show.audience, "the next slide's recording readied", |_| replay::threads_running() == 1);
+    for_a_while(cx, show.audience, 300);
+    let first_frame = |cx: &mut TestAppContext| {
+        cx.simulate_keystrokes(show.audience, "right");
+        cx.run_until_parked();
+        cx.update_window(show.audience, |_, window, cx| window.render_frame(cx)).unwrap();
+    };
+    first_frame(cx);
+    assert_eq!(show.step(cx), (1, 0));
+    let layer = layer_on(&document, 1, 0, cx);
+    let canvas = show.canvas(cx);
+    let seen = shows(cx, &canvas, layer);
+    assert!(matches!(seen, RecordingShows::Picture(at) if at < STOPS[0]), "arrived at, it shows its start at once: {seen:?}");
+    holds_at(cx, show.audience, &canvas, STOPS[0]);
+    show.press(cx, "right");
+    show.press(cx, "right");
+    show.press(cx, "right");
+    assert_eq!(show.step(cx), (2, 0));
+    // Its click comes: its panel, or its start, never its last screen.
+    first_frame(cx);
+    assert_eq!(show.step(cx), (2, 1));
+    let layer = layer_on(&document, 2, 1, cx);
+    let canvas = show.canvas(cx);
+    let seen = shows(cx, &canvas, layer);
+    assert!(seen == RecordingShows::Panel || matches!(seen, RecordingShows::Picture(at) if at < STOPS[0]), "on its click: {seen:?}");
+}
+
+#[gpui_kit::test]
+fn space_plays_and_stops_a_selected_recording(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let typing = editor(cx, &talk(), &running(30));
+    select_terminal(&typing, cx);
+    typing.press(cx, "space");
+    let canvas = editor_canvas(&typing, cx);
+    until(cx, typing.handle, "the first picture", |cx| pictures(cx, &canvas).first().is_some_and(Option::is_some));
+    assert!(typing.editing(cx).is_none(), "nothing is typed");
+    typing.press(cx, "space");
+    assert!(times(cx, &canvas).is_empty(), "stopped");
+    threads_end(cx, Some(typing.handle), "space");
+}
+
+#[gpui_kit::test]
+fn a_finished_replay_gives_way_to_its_still_at_a_new_size(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let typing = editor(cx, &talk(), &marked());
+    let canvas = play_selected(&typing, cx);
+    holds_at(cx, typing.handle, &canvas, END);
+    threads_end(cx, Some(typing.handle), "the end");
+    let layer = typing.document(cx).update(cx, |document, _| document.terminals_here()[0].layer);
+    assert!(matches!(shows(cx, &canvas, layer), RecordingShows::Picture(_)));
+    VisualTestContext::from_window(typing.handle, cx).simulate_resize(size(px(1000.), px(700.)));
+    typing.settle(cx);
+    until(cx, typing.handle, "the still at the new size", |cx| shows(cx, &canvas, layer) == RecordingShows::Still);
+    typing.settle(cx);
+    let (made, released) = made_and_released(cx, &canvas);
+    assert_eq!(made, released, "its picture is released");
 }
 
 #[gpui_kit::test]

@@ -62,9 +62,13 @@ impl Render for SlideEditor {
         let model_turning = model.is_some() && self.model_turning();
         // A terminal recording selected that can be played: a button in its middle that plays it,
         // or stops it while it plays.
-        let terminal = match (selecting, self.document.clone()) {
-            (true, Some(document)) => document.update(cx, |document, _| document.selected_terminal().filter(|_| document.selected_terminal_plays())),
-            _ => None,
+        let (terminal, terminal_selected) = match (selecting, self.document.clone()) {
+            (true, Some(document)) => document.update(cx, |document, _| {
+                let terminal = document.selected_terminal();
+                let selected = terminal.is_some();
+                (terminal.filter(|_| document.selected_terminal_plays()), selected)
+            }),
+            _ => (None, false),
         };
         let terminal_playing = terminal.is_some() && self.recording_playing(cx);
         // The lines what's dragged snaps to, while the button is down.
@@ -304,6 +308,7 @@ impl Render for SlideEditor {
         let key_context = match (selecting, video.is_some(), model.is_some()) {
             (true, true, _) => format!("{SELECTION_CONTEXT} {VIDEO_CONTEXT}"),
             (true, _, true) => format!("{SELECTION_CONTEXT} {MODEL_CONTEXT}"),
+            (true, false, false) if terminal_selected => format!("{SELECTION_CONTEXT} {TERMINAL_CONTEXT}"),
             (true, false, false) => SELECTION_CONTEXT.to_string(),
             (false, _, _) => EDITOR_CONTEXT.to_string(),
         };
@@ -421,6 +426,7 @@ impl Render for SlideEditor {
             .on_action(cx.listener(|this, _: &SelectAllThings, window, cx| this.select_all_things(window, cx)))
             .on_action(cx.listener(|this, _: &PlayOrStopVideo, _, cx| this.play_or_stop(cx)))
             .on_action(cx.listener(|this, _: &TurnOrStopModel, _, cx| this.turn_or_stop(cx)))
+            .on_action(cx.listener(|this, _: &PlayOrStopRecording, _, cx| this.play_or_stop_recording(cx)))
             // The wheel over a model being turned brings it nearer, or takes it further away.
             .on_scroll(cx.listener(|this, event: &ScrollEvent, window, cx| {
                 let steps = f32::from(event.delta.pixel_delta(window.line_height()).y) / f32::from(window.line_height());

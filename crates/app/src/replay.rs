@@ -39,6 +39,8 @@ pub enum Aim {
     PlayTo(Option<usize>),
     /// The screen at stop `n`, held there, or its end past its last.
     At(usize),
+    /// The screen as it starts, held there: a replay readied for a slide not shown yet.
+    Start,
 }
 
 /// What the window wants of a replay's thread.
@@ -367,6 +369,7 @@ fn play(shared: &Shared, open: LargeOpen, fonts: FontsSeed, stays: bool) -> Resu
                     }
                 }
                 Aim::At(stop) => Going::Held(time_of_stop(&player, Some(stop))),
+                Aim::Start => Going::Held(Duration::ZERO),
             };
         }
         let at = going.at(now);
