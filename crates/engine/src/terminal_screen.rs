@@ -136,12 +136,24 @@ pub(crate) struct LaidScreen {
     pub(crate) glyphs: usize,
     /// How many runs of cells it fills or underlines.
     pub(crate) runs: usize,
+    /// How many of its characters may each be shaped alone, as one a font draws off its cell is:
+    /// those not plain ASCII, each once for each look it's in, as one shaped alone is shaped once.
+    /// Counted no further than enough to send the screen aside.
+    pub(crate) alone: usize,
 }
 
+/// What shaping a character alone costs, against a character shaped with the rest of its row:
+/// more than a twentieth of what's shaped where it's asked for in all is too much there.
+const ALONE_WEIGHT: usize = 20;
+
+/// The most characters counted as shaped alone: a screen of more is shaped aside whatever else.
+const MOST_ALONE_COUNTED: usize = 1_000;
+
 impl LaidScreen {
-    /// How much there is to shape, place and draw of it: its characters and its runs of cells.
+    /// How much there is to shape, place and draw of it: its characters, its runs of cells, and
+    /// what may each be shaped alone, weighed as many characters.
     pub(crate) fn pieces(&self) -> usize {
-        self.glyphs + self.runs
+        self.glyphs + self.runs + self.alone * ALONE_WEIGHT
     }
 
     fn count(&self) -> usize {
@@ -310,9 +322,42 @@ pub(crate) fn lay_out_screen(screen: &Screen) -> LaidScreen {
     }
     let glyphs = texts.iter().flat_map(|text| &text.spans).map(|span| span.text.chars().count()).sum();
     let runs = fills.len() + lines.len();
-    let mut laid = LaidScreen { columns: screen.width(), rows: screen.height(), fills: by_colour(fills), texts, lines: by_colour(lines), bytes: 0, glyphs, runs };
+    let alone = may_be_shaped_alone(&texts);
+    let mut laid = LaidScreen { columns: screen.width(), rows: screen.height(), fills: by_colour(fills), texts, lines: by_colour(lines), bytes: 0, glyphs, runs, alone };
     laid.bytes = laid.count();
     laid
+}
+
+/// How many of the characters of `texts`, with their marks, may each be shaped alone: those not
+/// plain ASCII, once for each look, as [`shape`] shapes each such once. Up to
+/// [`MOST_ALONE_COUNTED`].
+fn may_be_shaped_alone(texts: &[CellText]) -> usize {
+    let mut seen: std::collections::HashSet<(String, [u8; 3], bool, bool)> = std::collections::HashSet::new();
+    for text in texts {
+        for cluster in clusters(text) {
+            if seen.len() > MOST_ALONE_COUNTED {
+                return seen.len();
+            }
+            let Some((written, look)) = cluster_text(text, &cluster) else { continue };
+            if !written.is_ascii() {
+                seen.insert((written, look.fg, look.bold, look.italic));
+            }
+        }
+    }
+    seen.len()
+}
+
+/// The text of `cluster` of `text`, and its look.
+fn cluster_text(text: &CellText, cluster: &Cluster) -> Option<(String, Look)> {
+    let mut at = 0;
+    for span in &text.spans {
+        if cluster.start < at + span.text.len() {
+            let end = cluster.end.min(at + span.text.len());
+            return Some((span.text.get(cluster.start - at..end - at)?.to_string(), span.look));
+        }
+        at += span.text.len();
+    }
+    None
 }
 
 /// Where a screen's cells go in a box: as large as fit it keeping their shape, rows on whole

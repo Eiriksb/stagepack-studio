@@ -1098,3 +1098,49 @@ fn a_long_header_is_read_to_its_end_for_the_screens_size() {
     let (w, h) = terminal_size(160, 48);
     assert!((layer.rect.w - w).abs() < 0.01 && (layer.rect.h - h).abs() < 0.01, "{:?}", layer.rect);
 }
+
+/// A screen of 80 by 50 with 3,990 cells of `letter`, each in a colour of its own: just under the
+/// most pieces placed where they're asked for, every letter needing shaping alone if a font has
+/// it wider than its cell.
+fn distinct_letters(letter: char) -> Vec<u8> {
+    let mut out = String::new();
+    for at in 0..3_990u32 {
+        if at > 0 && at % 80 == 0 {
+            out.push_str("\r\n");
+        }
+        out.push_str(&format!("\u{1b}[38;2;{};{};{}m{letter}", at % 256, at / 256, 7));
+    }
+    make_test_cast(80, 50, &[(0.1, "o", &out)])
+}
+
+#[test]
+#[cfg_attr(debug_assertions, ignore = "this checks how quick a release build is")]
+fn a_screen_of_letters_shaped_one_at_a_time_is_laid_out_aside() {
+    let mut fonts = Fonts::with_system_fallback();
+    let probe = shape_text(&mut fonts, &[TextRun { text: "\u{b94}".into(), size: 20.0, bold: false, italic: false, underline: false, color: toolkit::Color::rgb(0, 0, 0), family: "JetBrains Mono".into() }], None, Align::Left);
+    if probe.buffer.layout_runs().flat_map(|run| run.glyphs.iter()).any(|glyph| glyph.glyph_id == 0) {
+        eprintln!("skipped: no font on this machine has Tamil letters");
+        return;
+    }
+    let cast = distinct_letters('\u{b94}');
+    let source = "# One\n\n<Terminal src=\"assets/run.cast\" x=\"0\" y=\"0\" w=\"1920\" h=\"1080\" />\n";
+    let mut deck = Deck::open(Box::new(MapFiles([("assets/run.cast".to_string(), cast.clone())].into())), fonts, source.to_string());
+    deck.make_stills_aside(Arc::new(|| {}), Arc::new(|_: &str| None));
+    deck.specs(0);
+    let job = deck.still_jobs().pop().unwrap();
+    let made = std::thread::spawn(move || job.make_recording(Ok(cast))).join().unwrap();
+    deck.take_still(made);
+    // Its first layout, and one in a box of another size, as when a resize ends.
+    let mut slowest = std::time::Duration::ZERO;
+    for (at, source) in [source.to_string(), source.replace("w=\"1920\" h=\"1080\"", "w=\"1500\" h=\"900\"")].into_iter().enumerate() {
+        if at > 0 {
+            deck.update(source);
+        }
+        let started = std::time::Instant::now();
+        deck.specs(0);
+        slowest = slowest.max(started.elapsed());
+    }
+    println!("a screen of 3,990 Tamil letters each its own colour laid out where it's asked for in at most {slowest:?}");
+    assert!(slowest < std::time::Duration::from_millis(8), "{slowest:?}");
+    assert!(!deck.still_jobs().is_empty(), "shaped aside");
+}
