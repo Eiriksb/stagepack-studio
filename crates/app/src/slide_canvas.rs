@@ -128,12 +128,14 @@ pub struct SlideCanvas {
     /// How many pictures of recordings have been taken to show, and released, in all.
     replays_made: usize,
     replays_released: Rc<Cell<usize>>,
+    /// When the recordings' counts were last written out, and what they were then.
+    replays_counted: Option<(std::time::Instant, usize, usize)>,
 }
 
 /// Set, to anything, to have a window playing a video write how many of its pictures were
-/// shown, skipped and released each second to the standard error, and one turning a 3D model how
-/// many of its pictures were drawn and shown, and released: for checking by hand how smoothly a
-/// video plays or a model turns on a computer.
+/// shown, skipped and released each second to the standard error, and one turning a 3D model or
+/// playing a terminal recording how many of its pictures were drawn and shown, and released: for
+/// checking by hand how smoothly a video plays, a model turns or a recording plays on a computer.
 pub const COUNTS_TO_STDERR: &str = "STUDIO_VIDEO_COUNTS";
 
 fn counts_wanted() -> bool {
@@ -908,7 +910,14 @@ impl SlideCanvas {
     /// the window for another frame while any has a picture to come.
     fn advance_recordings(&mut self, window: &mut Window) {
         if self.replays.is_empty() {
+            // The next to play is counted from its start.
+            self.replays_counted = None;
             return;
+        }
+        if counts_wanted()
+            && let Some(line) = picture_counts("recording", &mut self.replays_counted, std::time::Instant::now(), self.replays_made, self.replays_released.get())
+        {
+            eprintln!("{line}");
         }
         let mut wanted = false;
         for replay in &mut self.replays {
@@ -1180,6 +1189,12 @@ impl Render for SlideCanvas {
 /// `made` and `released` in all now: nothing the first time, which `counted` begins counting
 /// from, and then once a second at most, counting afresh from each time it's written.
 fn model_counts(counted: &mut Option<(std::time::Instant, usize, usize)>, now: std::time::Instant, made: usize, released: usize) -> Option<String> {
+    picture_counts("model", counted, now, made, released)
+}
+
+/// What a window writes of the pictures of `what`, a model turning or a recording playing, as
+/// [`model_counts`] says.
+fn picture_counts(what: &str, counted: &mut Option<(std::time::Instant, usize, usize)>, now: std::time::Instant, made: usize, released: usize) -> Option<String> {
     let Some((then, made_then, released_then)) = *counted else {
         *counted = Some((now, made, released));
         return None;
@@ -1189,13 +1204,24 @@ fn model_counts(counted: &mut Option<(std::time::Instant, usize, usize)>, now: s
         return None;
     }
     *counted = Some((now, made, released));
-    Some(format!("model pictures in {seconds:.2} s: {} drawn and shown, {} released", made - made_then, released - released_then))
+    Some(format!("{what} pictures in {seconds:.2} s: {} drawn and shown, {} released", made - made_then, released - released_then))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::model_counts;
+    use super::{model_counts, picture_counts};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn recording_counts_are_written_once_a_second_at_most() {
+        let mut counted = None;
+        let start = Instant::now();
+        assert_eq!(picture_counts("recording", &mut counted, start, 3, 1), None);
+        assert_eq!(
+            picture_counts("recording", &mut counted, start + Duration::from_millis(1250), 63, 60).as_deref(),
+            Some("recording pictures in 1.25 s: 60 drawn and shown, 59 released")
+        );
+    }
 
     #[test]
     fn model_counts_are_written_once_a_second_at_most() {
