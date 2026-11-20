@@ -816,3 +816,54 @@ fn a_layer_wanted_drawn_aside_is_drawn_once_at_the_scale_asked_for_last() {
     deck.layers(0, 1.0);
     assert_eq!(deck.draw_jobs().len(), 1);
 }
+
+#[test]
+fn what_stands_in_at_a_scale_is_made_once() {
+    let cast = full_screen();
+    let mut deck = deck_aside(&full_screen_at(960.0, "One"), cast.clone());
+    settle(&mut deck, &cast, 0.5);
+    let first = deck.layers(0, 0.75).last().unwrap().clone();
+    // Laid out again, as after a keystroke beside it, before it's drawn.
+    deck.update(full_screen_at(960.0, "One more"));
+    let again = deck.layers(0, 0.75).last().unwrap().clone();
+    assert!(Arc::ptr_eq(&first.pixmap, &again.pixmap), "the same stand-in, not stretched again");
+}
+
+#[test]
+fn a_layer_drawn_aside_for_a_scale_let_go_of_is_dropped() {
+    let cast = full_screen();
+    let mut deck = deck_aside(&full_screen_at(960.0, "One"), cast.clone());
+    settle(&mut deck, &cast, 0.5);
+    deck.layers(0, 0.6);
+    let job = deck.draw_jobs().pop().unwrap();
+    // Four other scales asked for since, as in a zoom: the one it was drawn for is let go of.
+    for scale in [0.7, 0.8, 0.9, 1.0] {
+        deck.layers(0, scale);
+    }
+    assert!(deck.take_drawn(job.draw()).is_empty(), "nothing to draw again");
+}
+
+#[test]
+fn a_busy_screen_dragged_at_a_new_scale_is_drawn_aside() {
+    let cast = full_screen();
+    let mut deck = deck_aside(&full_screen_at(960.0, "One"), cast.clone());
+    settle(&mut deck, &cast, 0.5);
+    let range = deck.terminals(0)[0].source.clone().unwrap();
+    let rect = Rect { x: 200.0, y: 100.0, w: 960.0, h: 540.0 };
+    deck.set_placing(0, vec![Placing { target: slides_format::Target::Tag(range), rect, rotate: 0.0 }]);
+    let shown = deck.layers(0, 0.75).last().unwrap().clone();
+    assert!(lit(&shown) > 0, "its picture at the other scale, stretched");
+    let draws = deck.draw_jobs();
+    assert_eq!(draws.len(), 1, "drawn aside, not here");
+    for job in draws {
+        assert_eq!(deck.take_drawn(job.draw()), vec![0]);
+    }
+    deck.layers(0, 0.75);
+    assert!(deck.draw_jobs().is_empty(), "kept");
+}
+
+#[test]
+fn a_recording_still_being_shaped_is_the_same_recording() {
+    let on = TerminalOn { src: "assets/run.cast".to_string(), rect: Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }, rotate: 0.0, stops: 2, pending: true };
+    assert_eq!(on, TerminalOn { pending: false, ..on.clone() });
+}

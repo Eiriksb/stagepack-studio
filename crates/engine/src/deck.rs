@@ -148,10 +148,17 @@ impl Laid {
     }
 }
 
-/// A number that differs when a layer's items sit or measure differently.
-fn drawing_fingerprint(items: &[DisplayItem]) -> u64 {
+/// A number that differs when a layer's items sit or measure differently. A terminal recording's
+/// screen of many items is told by the items it shares with what's kept of the recording, which
+/// are the same as long as its box is: a screen has too many to go through each time it's laid
+/// out, and with its box, which the key holds, and its file, they're all there is to it.
+fn drawing_fingerprint(spec: &LayerSpec) -> u64 {
     let mut hasher = DefaultHasher::new();
-    for item in items {
+    if spec.terminal.is_some() && spec.items.len() > 64 {
+        (3u8, spec.items.as_ptr() as usize, spec.items.len()).hash(&mut hasher);
+        return hasher.finish();
+    }
+    for item in spec.items.iter() {
         match item {
             DisplayItem::Fill { path, .. } | DisplayItem::Stroke { path, .. } => {
                 let b = path.bounds();
@@ -186,6 +193,9 @@ struct Drawn {
     placed_empty_regions: Option<Vec<Arc<Layer>>>,
     /// The value of `Deck::layers_asked_for` when these were last asked for.
     asked: u64,
+    /// What stands in for terminal recordings' layers being drawn aside, or whose screens are
+    /// being shaped aside, by their keys: each made once at this scale.
+    standing: HashMap<LayerKey, Arc<Layer>>,
 }
 
 impl Drawn {
@@ -211,7 +221,7 @@ impl Drawn {
     /// Every layer it holds, some of them perhaps more than once.
     fn layers(&self) -> impl Iterator<Item = &Arc<Layer>> {
         let empty = self.empty_regions.iter().chain(&self.placed_empty_regions).flatten();
-        self.by_key.values().chain(self.placed_by_key.values().map(|(layer, _)| layer)).chain(empty)
+        self.by_key.values().chain(self.placed_by_key.values().map(|(layer, _)| layer)).chain(empty).chain(self.standing.values())
     }
 }
 
@@ -329,19 +339,38 @@ fn pieces_drawn(spec: &LayerSpec, scale: f32) -> usize {
 type Picture = (LayerKey, Arc<Layer>);
 
 /// What's shown of a terminal recording's layer while it's drawn aside, or while its screen is
-/// shaped and placed aside: the newest picture of the recording there is, `own`, drawn at this
-/// scale, or else `others`, at others, stretched to where it is now, or else its plain panel. Gives
-/// as well the picture at this scale it was made from, to keep until the layer is drawn.
+/// shaped and placed aside: what stood in for it at this scale already, or a picture of the
+/// recording, `own`, drawn at this scale, moved or stretched to where it is now, or else one of
+/// `others`, at the nearest scale below this one, or the nearest above, stretched, or else what
+/// stood in for it at any scale, stretched, or else its plain panel. Gives as well the picture at
+/// this scale it was made from, to keep until the layer is drawn.
 fn standing_in(own: &Drawn, others: &HashMap<u32, Drawn>, key: &LayerKey, spec: &LayerSpec, scale: f32, fonts: &mut Fonts) -> (Arc<Layer>, Option<Picture>) {
+    let from = || drawn_of(own, key).map(|(key, layer)| (key.clone(), layer.clone()));
+    if let Some(layer) = own.standing.get(key) {
+        return (layer.clone(), from());
+    }
     if let Some((from, layer, _)) = resized_layer(own, key, spec, scale) {
         return (layer, Some(from));
     }
-    let newest = others.values().filter_map(|drawn| Some((drawn.asked, drawn_of(drawn, key)?))).max_by_key(|(asked, _)| *asked);
-    if let Some((_, (_, drawn))) = newest {
-        return (Arc::new(crate::render::stretched_layer(drawn, spec, scale)), None);
+    // Positive floats order as their bits do.
+    let nearest = |(at, _): &(u32, &Arc<Layer>)| {
+        let at = f32::from_bits(*at);
+        if at <= scale { (false, (scale - at).to_bits()) } else { (true, (at - scale).to_bits()) }
+    };
+    let pictures = others.iter().filter_map(|(at, drawn)| Some((*at, drawn_of(drawn, key)?.1)));
+    let this = scale.to_bits();
+    let stood_in = std::iter::once((&this, own)).chain(others).filter_map(|(at, drawn)| Some((*at, standing_of(drawn, key)?)));
+    if let Some((_, picture)) = pictures.min_by_key(nearest).or_else(|| stood_in.min_by_key(nearest)) {
+        return (Arc::new(crate::render::stretched_layer(picture, spec, scale)), None);
     }
     let panel = LayerSpec { items: spec.items.iter().take(1).cloned().collect(), ..spec.clone() };
     (Arc::new(render_layer(&panel, scale, fonts)), None)
+}
+
+/// What stood in for a layer of the terminal recording whose layer `key` is, in `drawn`.
+fn standing_of<'a>(drawn: &'a Drawn, key: &LayerKey) -> Option<&'a Arc<Layer>> {
+    key.terminal.as_ref()?;
+    drawn.standing.iter().find(|(other, _)| other.terminal == key.terminal && other.files_generation == key.files_generation).map(|(_, layer)| layer)
 }
 
 /// Wants slide `index`'s layer of `key`, `spec`, drawn aside at `scale`, among `jobs`, unless it's
@@ -350,7 +379,7 @@ fn standing_in(own: &Drawn, others: &HashMap<u32, Drawn>, key: &LayerKey, spec: 
 fn want_drawn(
     jobs: &mut Vec<DrawJob>,
     drawing: &mut HashMap<(usize, u32, LayerKey), Weak<()>>,
-    fonts: &Fonts,
+    fonts: &mut Fonts,
     (index, scale, key, spec): (usize, f32, &LayerKey, &LayerSpec),
 ) -> bool {
     let at = (index, scale.to_bits(), key.clone());
@@ -1323,7 +1352,7 @@ impl Deck {
         }
         // Apart from the others while it's drawn, as a picture at another scale can stand in.
         let mut drawn = scales.remove(&scale.to_bits()).unwrap_or_default();
-        let mut by_key = HashMap::new();
+        let (mut by_key, mut standing) = (HashMap::new(), HashMap::new());
         let mut ordered = Vec::with_capacity(laid.specs.len());
         let aside = self.pictures.makes_aside();
         let mut wanted = false;
@@ -1339,10 +1368,11 @@ impl Deck {
                     // picture it's made from is kept until it's drawn.
                     None if spec.terminal.as_ref().is_some_and(|on| on.pending) || (aside && spec.terminal.is_some() && pieces_drawn(spec, scale) > MOST_PIECES_DRAWN_HERE) => {
                         if !spec.terminal.as_ref().is_some_and(|on| on.pending) {
-                            wanted |= want_drawn(&mut self.draw_jobs, &mut self.drawing, &self.fonts, (index, scale, key, spec));
+                            wanted |= want_drawn(&mut self.draw_jobs, &mut self.drawing, &mut self.fonts, (index, scale, key, spec));
                         }
                         let (layer, from) = standing_in(&drawn, scales, key, spec, scale, &mut self.fonts);
                         by_key.extend(from);
+                        standing.insert(key.clone(), layer.clone());
                         layer
                     }
                     None => {
@@ -1360,6 +1390,7 @@ impl Deck {
             ordered.push(layer);
         }
         drawn.by_key = by_key;
+        drawn.standing = standing;
         drawn.ordered = Some((moment, ordered.clone()));
         scales.insert(scale.to_bits(), drawn);
         if wanted {
@@ -1383,10 +1414,11 @@ impl Deck {
         self.drawing.remove(&(slide, scale, key.clone()));
         let Some(state) = self.slides.get_mut(slide) else { return Vec::new() };
         let at_moment = state.at_moment.as_ref().map(|(_, laid)| laid);
-        if !state.laid.iter().chain(at_moment).any(|laid| laid.keys.contains(&key)) {
+        if !state.laid.iter().chain(at_moment).chain(&state.placed).any(|laid| laid.keys.contains(&key)) {
             return Vec::new();
         }
-        let drawn = state.drawn.entry(scale).or_default();
+        // A scale let go of since isn't brought back.
+        let Some(drawn) = state.drawn.get_mut(&scale) else { return Vec::new() };
         drawn.by_key.insert(key, layer);
         drawn.ordered = None;
         drawn.placing_changed();
@@ -1477,7 +1509,7 @@ impl Deck {
         LayerKey {
             text: format!("{}\n{layout}\n{}\n{text}", self.theme, spec.source.is_some()),
             place: place_bits(spec),
-            drawing: drawing_fingerprint(&spec.items),
+            drawing: drawing_fingerprint(spec),
             files_generation: self.files_generation,
             moment: spec.varies.then_some((moment.step, moment.time.to_bits())),
             terminal: spec.terminal.as_ref().map(|on| on.src.clone()),
@@ -1632,6 +1664,7 @@ impl Deck {
         let mut drawn = scales.remove(&scale.to_bits()).unwrap_or_default();
         let mut by_key = HashMap::new();
         let mut ordered = Vec::with_capacity(placed.specs.len());
+        let (aside, mut wanted) = (self.pictures.makes_aside(), false);
         for (spec, key) in placed.specs.iter().zip(&placed.keys) {
             let layer = if spec.source.is_none() {
                 self.backgrounds
@@ -1648,9 +1681,15 @@ impl Deck {
                     .or_else(|| moved_layer(&drawn, key, scale))
                     .or_else(|| spec.terminal.as_ref().and_then(|_| resized_layer(&drawn, key, spec, scale).map(|(_, layer, at)| (layer, at))))
                     .or_else(|| {
-                        // A screen still shaped aside is shown as a picture of it at another scale,
-                        // if there's one.
-                        spec.terminal.as_ref().filter(|on| on.pending)?;
+                        // A screen still shaped aside, or too long to draw here and drawn aside, is
+                        // shown as a picture of it at another scale meanwhile, if there's one.
+                        let pending = spec.terminal.as_ref()?.pending;
+                        if !pending {
+                            if !(aside && pieces_drawn(spec, scale) > MOST_PIECES_DRAWN_HERE) {
+                                return None;
+                            }
+                            wanted |= want_drawn(&mut self.draw_jobs, &mut self.drawing, &mut self.fonts, (index, scale, key, spec));
+                        }
                         let (layer, _) = standing_in(&drawn, scales, key, spec, scale, &mut self.fonts);
                         let at = DrawnAt::of(&layer, spec.rect.x, spec.rect.y);
                         Some((layer, at))
@@ -1668,6 +1707,9 @@ impl Deck {
         drawn.placed_by_key = by_key;
         drawn.placed_ordered = Some(ordered.clone());
         scales.insert(scale.to_bits(), drawn);
+        if wanted {
+            self.pictures.tell_wanted();
+        }
         self.keep_within_budget(index);
         ordered
     }

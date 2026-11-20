@@ -115,8 +115,9 @@ pub struct TerminalLayer {
 
 /// A terminal recording on a slide: the file it plays, where it plays, as its layer is placed,
 /// and how many times it stops until the next click, once its file has been read: none until
-/// then, or if it can't be played.
-#[derive(Clone, Debug, PartialEq)]
+/// then, or if it can't be played. Two are the same recording, playing the same, whether or not
+/// either's screen is still being shaped.
+#[derive(Clone, Debug)]
 pub struct TerminalOn {
     pub src: String,
     pub rect: Rect,
@@ -125,4 +126,10 @@ pub struct TerminalOn {
     /// Whether its screen is still being shaped and placed aside: until it is, its layer is its
     /// panel alone, and what was drawn of it before is shown in its place.
     pub pending: bool,
+}
+
+impl PartialEq for TerminalOn {
+    fn eq(&self, other: &TerminalOn) -> bool {
+        (&self.src, self.rect, self.rotate, self.stops) == (&other.src, other.rect, other.rotate, other.stops)
+    }
 }

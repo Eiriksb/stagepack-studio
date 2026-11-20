@@ -95,6 +95,8 @@ pub struct Fonts {
     pub cache: SwashCache,
     /// Fonts that ship with the app or the talk. Any other font came from this computer.
     known: HashSet<fontdb::ID>,
+    /// These fonts for another thread, as they were when there were as many faces as it says.
+    seed: Option<(usize, FontsSeed)>,
 }
 
 impl Fonts {
@@ -113,6 +115,7 @@ impl Fonts {
             system: FontSystem::new_with_locale_and_db_and_fallback("en-US".to_string(), db, EmojiFirst::new()),
             cache: SwashCache::new(),
             known,
+            seed: None,
         }
     }
 
@@ -162,31 +165,41 @@ impl Fonts {
             .db_mut()
             .load_font_source(fontdb::Source::Binary(data));
         self.known.extend(ids);
+        self.seed = None;
     }
 }
 
 /// The fonts as they are now, to draw with on another thread: the same faces, by the same ids, so
-/// text shaped with the fonts it came from draws the same with these.
+/// text shaped with the fonts it came from draws the same with these. Shared, as it holds every
+/// font of the computer as well.
 #[derive(Clone)]
-pub struct FontsSeed {
-    db: fontdb::Database,
-    known: HashSet<fontdb::ID>,
-}
+pub struct FontsSeed(Arc<(fontdb::Database, HashSet<fontdb::ID>)>);
 
 impl Fonts {
-    /// These fonts as they are now, for another thread.
-    pub fn seed(&self) -> FontsSeed {
-        FontsSeed { db: self.system.db().clone(), known: self.known.clone() }
+    /// These fonts as they are now, for another thread: made once until a font is added.
+    pub fn seed(&mut self) -> FontsSeed {
+        let faces = self.system.db().len();
+        if let Some((seeded, seed)) = &self.seed
+            && *seeded == faces
+        {
+            return seed.clone();
+        }
+        let seed = FontsSeed(Arc::new((self.system.db().clone(), self.known.clone())));
+        self.seed = Some((faces, seed.clone()));
+        seed
     }
 }
 
 impl FontsSeed {
-    /// Fonts of the faces these were taken from.
+    /// Fonts of the faces these were taken from: for the thread they're for, as the faces are
+    /// copied.
     pub fn fonts(self) -> Fonts {
+        let (db, known) = Arc::unwrap_or_clone(self.0);
         Fonts {
-            system: FontSystem::new_with_locale_and_db_and_fallback("en-US".to_string(), self.db, EmojiFirst::new()),
+            system: FontSystem::new_with_locale_and_db_and_fallback("en-US".to_string(), db, EmojiFirst::new()),
             cache: SwashCache::new(),
-            known: self.known,
+            known,
+            seed: None,
         }
     }
 }
@@ -367,5 +380,19 @@ pub fn draw_text(target: &mut PixmapMut, text: &ShapedText, fonts: &mut Fonts, t
         if let Some(rect) = Rect::from_xywh(x, y, width, thickness) {
             target.fill_rect(rect, &solid(color.r, color.g, color.b, color.a), transform, None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_fonts_are_seeded_once_until_they_change() {
+        let mut fonts = Fonts::bundled_only();
+        let seed = fonts.seed();
+        assert!(Arc::ptr_eq(&seed.0, &fonts.seed().0), "shared");
+        fonts.load_talk_font(BUNDLED[0].to_vec());
+        assert!(!Arc::ptr_eq(&seed.0, &fonts.seed().0), "seeded again once a font is added");
     }
 }

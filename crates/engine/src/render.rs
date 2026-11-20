@@ -97,6 +97,9 @@ pub fn render_layer(spec: &LayerSpec, scale: f32, fonts: &mut Fonts) -> Layer {
     })
 }
 
+/// The most pixels of a stretched picture copied on one thread.
+const STRETCHED_ALONE: usize = 250_000;
+
 /// `drawn`, `spec`'s layer as it was drawn at `scale` before it was resized, stretched over where
 /// `spec` is drawn now: what's shown of a layer while it's being resized, when drawing it again
 /// each time would take too long.
@@ -107,10 +110,41 @@ pub(crate) fn stretched_layer(drawn: &Layer, spec: &LayerSpec, scale: f32) -> La
     let Some(mut pixmap) = Pixmap::new(width, height) else {
         return blank_layer();
     };
-    let stretch = Transform::from_scale(width as f32 / drawn.pixmap.width() as f32, height as f32 / drawn.pixmap.height() as f32);
-    // Only while it's being resized: the nearest pixel is quick, and soon drawn properly.
-    let paint = PixmapPaint { quality: FilterQuality::Nearest, ..PixmapPaint::default() };
-    pixmap.draw_pixmap(0, 0, drawn.pixmap.as_ref().as_ref(), &paint, stretch, None);
+    // Only while it's resized, or drawn at another scale: the nearest pixel is quick, and it's soon
+    // drawn properly. Each pixel is copied, a row the same as the one before copied whole, and a
+    // large picture's rows are shared among threads, as this is on the thread asking for it.
+    let (from_w, from_h) = (drawn.pixmap.width() as usize, drawn.pixmap.height() as usize);
+    let (to_w, to_h) = (width as usize, height as usize);
+    let nearest = |at: usize, to: usize, from: usize| ((2 * at + 1) * from / (2 * to)).min(from - 1);
+    let columns: Vec<usize> = (0..to_w).map(|x| nearest(x, to_w, from_w)).collect();
+    let from = drawn.pixmap.pixels();
+    let copy_rows = |first: usize, rows: &mut [tiny_skia::PremultipliedColorU8]| {
+        let mut row_before = None;
+        for (at, row) in rows.chunks_exact_mut(to_w).enumerate() {
+            let source_row = nearest(first + at, to_h, from_h);
+            match row_before {
+                Some((before, kept)) if before == source_row => row.copy_from_slice(kept),
+                _ => {
+                    let source = &from[source_row * from_w..(source_row + 1) * from_w];
+                    for (pixel, &x) in row.iter_mut().zip(&columns) {
+                        *pixel = source[x];
+                    }
+                }
+            }
+            row_before = Some((source_row, &*row));
+        }
+    };
+    let threads = if to_w * to_h < STRETCHED_ALONE { 1 } else { std::thread::available_parallelism().map_or(1, |n| n.get().min(8)) };
+    let rows_each = to_h.div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        for (part, rows) in pixmap.pixels_mut().chunks_mut(rows_each * to_w).enumerate() {
+            if threads == 1 {
+                copy_rows(0, rows);
+            } else {
+                scope.spawn(move || copy_rows(part * rows_each, rows));
+            }
+        }
+    });
     Layer { pixmap: Arc::new(pixmap), x: device_offset(min_x), y: device_offset(min_y) }
 }
 
