@@ -150,12 +150,14 @@ impl Laid {
 
 /// A number that differs when a layer's items sit or measure differently. A terminal recording's
 /// screen of many items is told by the items it shares with what's kept of the recording, which
-/// are the same as long as its box is: a screen has too many to go through each time it's laid
-/// out, and with its box, which the key holds, and its file, they're all there is to it.
-fn drawing_fingerprint(spec: &LayerSpec) -> u64 {
+/// are the same as long as its box is, and by the version of the file it was made from, `version`,
+/// as the items of a version since may lie where those of the one before did: a screen has too
+/// many to go through each time it's laid out, and with its box, which the key holds, and its
+/// file, they're all there is to it.
+fn drawing_fingerprint(spec: &LayerSpec, version: Option<&crate::pictures::FileVersion>) -> u64 {
     let mut hasher = DefaultHasher::new();
     if spec.terminal.is_some() && spec.items.len() > 64 {
-        (3u8, spec.items.as_ptr() as usize, spec.items.len()).hash(&mut hasher);
+        (3u8, spec.items.as_ptr() as usize, spec.items.len(), version).hash(&mut hasher);
         return hasher.finish();
     }
     for item in spec.items.iter() {
@@ -1519,7 +1521,7 @@ impl Deck {
         LayerKey {
             text: format!("{}\n{layout}\n{}\n{text}", self.theme, spec.source.is_some()),
             place: place_bits(spec),
-            drawing: drawing_fingerprint(spec),
+            drawing: drawing_fingerprint(spec, spec.terminal.as_ref().and_then(|on| self.pictures.terminal_version(&on.src))),
             files_generation: self.files_generation,
             moment: spec.varies.then_some((moment.step, moment.time.to_bits())),
             terminal: spec.terminal.as_ref().map(|on| on.src.clone()),
@@ -1827,5 +1829,36 @@ impl SlideState {
             Some((at, laid)) if *at == moment => laid,
             _ => self.laid.as_mut().expect("the slide was just laid out"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pictures::FileVersion;
+    use crate::{Enter, Rect, TerminalOn};
+
+    #[test]
+    fn a_busy_screen_of_another_version_of_its_file_is_told_from_the_one_before() {
+        let rect = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        let fill = || DisplayItem::Fill { path: tiny_skia::PathBuilder::from_rect(tiny_skia::Rect::from_xywh(0.0, 0.0, 1.0, 1.0).unwrap()), color: toolkit::Color::rgb(1, 2, 3) };
+        let terminal = TerminalOn { src: "assets/run.cast".to_string(), rect, rotate: 0.0, stops: 0, pending: false };
+        let spec = LayerSpec {
+            source: None,
+            rect,
+            rotate: 0.0,
+            items: (0..65).map(|_| fill()).collect::<Vec<_>>().into(),
+            click: None,
+            enter: Enter::Appear,
+            native: Vec::new(),
+            is_title: false,
+            varies: false,
+            video: None,
+            model: None,
+            terminal: Some(terminal),
+        };
+        let (one, two) = (FileVersion::Hash(1), FileVersion::Hash(2));
+        assert_eq!(drawing_fingerprint(&spec, Some(&one)), drawing_fingerprint(&spec, Some(&one)));
+        assert_ne!(drawing_fingerprint(&spec, Some(&one)), drawing_fingerprint(&spec, Some(&two)));
     }
 }

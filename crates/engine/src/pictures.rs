@@ -47,7 +47,7 @@ const SVG_NAMESPACE: &str = "http://www.w3.org/2000/svg";
 
 /// What tells a file from a later version of itself: its stamp, or a hash of its bytes
 /// where there's no stamp to go by.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Hash)]
 pub(crate) enum FileVersion {
     Stamp(u64, SystemTime),
     Hash(u64),
@@ -788,6 +788,12 @@ impl PictureCache {
         self.terminal_stills.insert(path.to_string(), cached);
         self.let_go_of_unused();
         (still, size)
+    }
+
+    /// The version of the file of the terminal recording at `path` its still was made from, if
+    /// it's been asked for.
+    pub(crate) fn terminal_version(&self, path: &str) -> Option<&FileVersion> {
+        self.terminal_stills.get(path)?.version.as_ref()
     }
 
     /// Why the terminal recording at `path` can't be played, if it's been tried and it can't.
