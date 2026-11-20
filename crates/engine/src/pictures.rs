@@ -334,12 +334,26 @@ impl CachedTerminal {
 pub fn recording_bytes(files: &dyn TalkFiles, path: &str) -> Result<Vec<u8>, CantReplay> {
     let most = slides_terminal::MOST_BYTES + 1;
     if files.len(path).is_some_and(|len| len > most as u64) {
+        // One that doesn't start as a recording does isn't one, however large.
         let reader = files.open(path).ok_or(CantReplay::TooLarge)?;
+        if let Some(why) = not_a_recording(&header_of(path, files).ok_or(CantReplay::CouldNotRead)?) {
+            return Err(why);
+        }
         return read_recording(Some(reader));
     }
     let mut bytes = files.read(path).ok_or(CantReplay::CouldNotRead)?;
     bytes.truncate(most);
     Ok(bytes)
+}
+
+/// Why the file starting with `prefix` isn't a recording that can be played, if its header says
+/// it isn't: what its first line says, read alone.
+fn not_a_recording(prefix: &[u8]) -> Option<CantReplay> {
+    if slides_terminal::screen_size(prefix).is_some() {
+        return None;
+    }
+    let header = prefix.split(|b| *b == b'\n').next().unwrap_or_default();
+    Some(slides_terminal::read(header).err().unwrap_or(CantReplay::NotARecording))
 }
 
 /// What `reader` reads of a recording, as far as a byte more than one can be.
@@ -350,18 +364,26 @@ fn read_recording(reader: Option<Box<dyn ReadSeek>>) -> Result<Vec<u8>, CantRepl
     Ok(bytes)
 }
 
-/// The screen's size the header of the recording at `path` gives, reading no more than a header
-/// can be where the file can be read in pieces.
+/// The screen's size the header of the recording at `path` gives, reading no more than its header,
+/// even of a file a pack holds compressed.
 fn header_size(path: &str, files: &dyn TalkFiles) -> Option<(u16, u16)> {
-    let bytes = match files.open(path) {
-        Some(reader) => {
-            let mut bytes = Vec::new();
-            std::io::Read::read_to_end(&mut std::io::Read::take(reader, slides_terminal::MOST_HEADER as u64 + 4), &mut bytes).ok()?;
-            bytes
-        }
-        None => files.read(path)?,
-    };
-    slides_terminal::screen_size(&bytes)
+    slides_terminal::screen_size(&header_of(path, files)?)
+}
+
+/// As much of a recording as its header is looked for in at most: the most a header can be, a
+/// mark of the order of its bytes, and the end of its line.
+const HEADER_READ: usize = slides_terminal::MOST_HEADER + 4;
+/// As much as is read first, which holds any header but a crafted one.
+const HEADER_FIRST: usize = 4096;
+
+/// The start of the file at `path`, as far as its first line's end: what's read of it first, or,
+/// if that hasn't the end of a line, as much as a header can be.
+fn header_of(path: &str, files: &dyn TalkFiles) -> Option<Vec<u8>> {
+    let first = files.read_prefix(path, HEADER_FIRST)?;
+    if first.len() < HEADER_FIRST || first.contains(&b'\n') {
+        return Some(first);
+    }
+    files.read_prefix(path, HEADER_READ)
 }
 
 /// The last screen of the recording read as `bytes` laid out in cells, and its stops, or why it

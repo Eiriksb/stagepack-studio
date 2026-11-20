@@ -515,7 +515,9 @@ fn a_file_too_large_to_be_a_recording_is_read_no_further_than_it_need_be() {
             panic!("read whole")
         }
         fn open(&self, _: &str) -> Option<Box<dyn ReadSeek>> {
-            Some(Box::new(std::io::Cursor::new(vec![b'{'; 33 * 1024 * 1024])))
+            let mut bytes = make_test_cast(80, 24, &[]);
+            bytes.resize(33 * 1024 * 1024, b'{');
+            Some(Box::new(std::io::Cursor::new(bytes)))
         }
         fn len(&self, _: &str) -> Option<u64> {
             Some(33 * 1024 * 1024)
@@ -990,4 +992,109 @@ fn a_recording_is_drawn_within_its_box_whatever_its_items_reach() {
     assert_eq!(turned.pixmap.pixel(1, 1).unwrap().alpha(), 0, "a corner outside the turned box is clear");
     let middle = turned.pixmap.pixel(turned.pixmap.width() / 2, turned.pixmap.height() / 2).unwrap();
     assert_eq!((middle.red(), middle.alpha()), (255, 255), "inside it, what's drawn");
+}
+
+/// A talk's files that count how many times each is read whole.
+struct Counted<F: TalkFiles>(F, std::sync::Mutex<HashMap<String, usize>>);
+
+impl<F: TalkFiles> TalkFiles for Counted<F> {
+    fn read(&self, path: &str) -> Option<Vec<u8>> {
+        *self.1.lock().unwrap().entry(path.to_string()).or_default() += 1;
+        self.0.read(path)
+    }
+    fn open(&self, path: &str) -> Option<Box<dyn ReadSeek>> {
+        self.0.open(path)
+    }
+    fn read_prefix(&self, path: &str, most: usize) -> Option<Vec<u8>> {
+        self.0.read_prefix(path, most)
+    }
+    fn len(&self, path: &str) -> Option<u64> {
+        self.0.len(path)
+    }
+    fn never_changes(&self) -> bool {
+        self.0.never_changes()
+    }
+}
+
+/// A recording of about 30 MB that packs small: 160 by 48, and thirty outputs of a megabyte less a little.
+fn large_packable_cast() -> Vec<u8> {
+    let output = "x".repeat(1_000_000 - 64);
+    let lines: Vec<(f64, &str, &str)> = (0..30).map(|at| (f64::from(at) * 0.1, "o", output.as_str())).collect();
+    make_test_cast(160, 48, &lines)
+}
+
+#[test]
+fn a_packed_recordings_header_is_read_without_unpacking_it_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let pack = dir.path().join("talk.sptx");
+    let cast = large_packable_cast();
+    assert!(cast.len() > 29_000_000);
+    let source = "# One\n\n<Terminal src=\"assets/run.cast\" x=\"0\" />\n";
+    pack_new(&pack, source, "0.1.0", &[("assets/run.cast".to_string(), cast.clone())]).unwrap();
+    assert!(std::fs::metadata(&pack).unwrap().len() < 1_000_000, "packed compressed");
+    let packed = open_packed(&pack).unwrap();
+    assert!(packed.open("assets/run.cast").is_none(), "compressed, it can't be read where it lies");
+    assert_eq!(packed.read_prefix("assets/run.cast", 4096).as_deref(), Some(&cast[..4096]));
+    assert_eq!(packed.read_prefix("assets/missing.cast", 4096), None);
+    // Laid out with its still made aside, as the app's window does, its box has its header's
+    // shape, and it isn't read whole.
+    let files = Arc::new(Counted(packed, Default::default()));
+    struct Shared(Arc<Counted<PackedFiles>>);
+    impl TalkFiles for Shared {
+        fn read(&self, path: &str) -> Option<Vec<u8>> {
+            self.0.read(path)
+        }
+        fn open(&self, path: &str) -> Option<Box<dyn ReadSeek>> {
+            self.0.open(path)
+        }
+        fn read_prefix(&self, path: &str, most: usize) -> Option<Vec<u8>> {
+            self.0.read_prefix(path, most)
+        }
+        fn len(&self, path: &str) -> Option<u64> {
+            self.0.len(path)
+        }
+        // As the app's files over a pack stamp its files: a pack never changes.
+        fn stamp(&self, path: &str) -> Option<(u64, std::time::SystemTime)> {
+            Some((self.0.len(path)?, std::time::SystemTime::UNIX_EPOCH))
+        }
+        fn never_changes(&self) -> bool {
+            true
+        }
+    }
+    let mut deck = Deck::open(Box::new(Shared(files.clone())), Fonts::bundled_only(), source.to_string());
+    deck.make_stills_aside(Arc::new(|| {}), Arc::new(|_: &str| None));
+    let layer = terminal_layer(&mut deck, 0);
+    let (w, h) = terminal_size(160, 48);
+    assert!((layer.rect.w - w).abs() < 0.01 && (layer.rect.h - h).abs() < 0.01, "{:?}", layer.rect);
+    assert_eq!(files.1.lock().unwrap().get("assets/run.cast"), None, "never read whole here");
+}
+
+#[test]
+fn a_file_too_large_to_be_a_recording_that_is_not_one_says_so() {
+    // Far larger than a recording can be, and a picture: it isn't a recording, which is what's said.
+    let mut picture = b"\x89PNG\r\n\x1a\n".to_vec();
+    picture.resize(40 * 1024 * 1024, 0);
+    let files = MemoryFiles::new(vec![("assets/run.cast".to_string(), Arc::from(picture))]);
+    assert_eq!(recording_bytes(&files, "assets/run.cast"), Err(CantPlay::NotARecording));
+    // One that starts as a recording does is too large.
+    let mut large = make_test_cast(80, 24, &[]);
+    large.resize(40 * 1024 * 1024, b' ');
+    let files = MemoryFiles::new(vec![("assets/run.cast".to_string(), Arc::from(large))]);
+    assert_eq!(recording_bytes(&files, "assets/run.cast").and_then(|bytes| slides_terminal::read(&bytes).map(|_| ())), Err(CantPlay::TooLarge));
+}
+
+#[test]
+fn a_long_header_is_read_to_its_end_for_the_screens_size() {
+    let mut cast = format!("{{\"version\": 2, \"width\": 160, \"height\": 48, \"title\": \"{}\"}}\n", "t".repeat(6000)).into_bytes();
+    cast.extend_from_slice(b"[0.1, \"o\", \"hello\"]\n");
+    let source = "# One\n\n<Terminal src=\"assets/run.cast\" x=\"0\" />\n";
+    // In a folder, whose files are stamped, so its header alone is read for its size.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("assets")).unwrap();
+    std::fs::write(dir.path().join("assets/run.cast"), cast).unwrap();
+    let mut deck = Deck::open(Box::new(FolderFiles::new(dir.path().to_path_buf())), Fonts::bundled_only(), source.to_string());
+    deck.make_stills_aside(Arc::new(|| {}), Arc::new(|_: &str| None));
+    let layer = terminal_layer(&mut deck, 0);
+    let (w, h) = terminal_size(160, 48);
+    assert!((layer.rect.w - w).abs() < 0.01 && (layer.rect.h - h).abs() < 0.01, "{:?}", layer.rect);
 }

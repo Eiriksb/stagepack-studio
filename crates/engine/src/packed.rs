@@ -666,6 +666,17 @@ impl TalkFiles for PackedFiles {
         (end <= self.pack_len).then(|| Box::new(PackReader::new(self.pack.clone(), start, len)) as Box<dyn ReadSeek>)
     }
 
+    /// As far as `most` bytes of the entry, unpacked as far as that if it's compressed, the rest
+    /// of it never read.
+    fn read_prefix(&self, path: &str, most: usize) -> Option<Vec<u8>> {
+        let &i = self.index.get(&normalise(path)?)?;
+        let mut zip = self.zip();
+        let entry = zip.by_index(i).ok()?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::Read::take(entry, most as u64), &mut bytes).ok()?;
+        Some(bytes)
+    }
+
     /// The size the entry states, which was held to the pack's limits when it opened.
     fn len(&self, path: &str) -> Option<u64> {
         let &i = self.index.get(&normalise(path)?)?;

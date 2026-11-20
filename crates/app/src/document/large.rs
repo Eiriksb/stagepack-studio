@@ -526,6 +526,10 @@ impl TalkFiles for ModelsUnpacked {
         self.files.open(path).or_else(|| self.unpacked(path))
     }
 
+    fn read_prefix(&self, path: &str, most: usize) -> Option<Vec<u8>> {
+        self.files.read_prefix(path, most)
+    }
+
     fn lies_at(&self, path: &str) -> Option<PathBuf> {
         self.files.lies_at(path)
     }
