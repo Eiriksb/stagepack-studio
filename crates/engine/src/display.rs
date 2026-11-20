@@ -31,7 +31,9 @@ pub struct LayerSpec {
     pub source: Option<Range<usize>>,
     pub rect: Rect,
     pub rotate: f32,
-    pub items: Vec<DisplayItem>,
+    /// Shared, so a layer laid out again from what's kept, as a terminal recording's screen is,
+    /// holds the same items rather than a copy of them.
+    pub items: Arc<[DisplayItem]>,
     /// The click this layer appears on, or `None` if it's there from the start.
     pub click: Option<u32>,
     pub enter: Enter,
@@ -120,4 +122,7 @@ pub struct TerminalOn {
     pub rect: Rect,
     pub rotate: f32,
     pub stops: usize,
+    /// Whether its screen is still being shaped and placed aside: until it is, its layer is its
+    /// panel alone, and what was drawn of it before is shown in its place.
+    pub pending: bool,
 }

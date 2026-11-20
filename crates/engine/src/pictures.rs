@@ -16,7 +16,7 @@ use toolkit::Color;
 use slides_model::{CantDraw, View};
 use slides_terminal::{CantPlay as CantReplay, Player};
 
-use crate::terminal_screen::{LaidScreen, Placed, Shaped, grid, lay_out_screen, place, placed_bytes, shape, shaped_bytes};
+use crate::terminal_screen::{GridKey, LaidScreen, Placed, Shaped, grid, lay_out_screen, panel_alone, place, placed_bytes, shape, shaped_bytes};
 
 use crate::{ReadSeek, Rect, TalkFiles};
 
@@ -186,19 +186,21 @@ pub struct StillJob {
 }
 
 /// A recording's last screen, laid out in cells, to have its text shaped for rows of a height, with
-/// fonts of its own, and placed in the box it was asked for in: a screen with too much text to
-/// shape on the thread laying it out.
+/// fonts of its own, unless it's `shaped` for them already, and placed in the box it was asked for
+/// in: a screen with too much to shape or place on the thread laying it out.
 #[derive(Clone)]
 struct ShapeWanted {
     laid: Arc<LaidScreen>,
     row: f32,
     rect: Rect,
+    shaped: Option<Shaped>,
     fonts: crate::FontsSeed,
 }
 
-/// The most characters a recording's last screen has that are shaped on the thread laying it
-/// out, when stills are made aside: one with more is shaped aside, about two milliseconds of it.
-const MOST_GLYPHS_SHAPED_HERE: usize = 4_000;
+/// The most characters and runs of cells a recording's last screen has that are shaped and placed
+/// on the thread laying it out, when stills are made aside: one with more is shaped and placed
+/// aside, about two milliseconds of it.
+const MOST_PIECES_LAID_HERE: usize = 4_000;
 
 /// The still of a model wanted: where it's seen from, how large it's drawn, and what draws it.
 #[derive(Clone)]
@@ -243,7 +245,7 @@ impl StillJob {
     pub fn make(self, reader: Option<Box<dyn ReadSeek>>) -> MadeStill {
         let still = match &self.model {
             _ if let Some(wanted) = &self.shape => {
-                let shaped: Shaped = Arc::from(shape(&wanted.laid, wanted.row, &mut wanted.fonts.clone().fonts()));
+                let shaped: Shaped = wanted.shaped.clone().unwrap_or_else(|| Arc::from(shape(&wanted.laid, wanted.row, &mut wanted.fonts.clone().fonts())));
                 let placed = grid(wanted.laid.columns, wanted.laid.rows, wanted.rect).map(|grid| (grid.key(), Placed::from(place(&wanted.laid, &grid, &shaped))));
                 Made::Shaped(shaped, placed)
             }
@@ -261,7 +263,7 @@ enum Made {
     Model(ModelStill),
     Terminal(TerminalStill),
     /// A recording's screen's text, shaped, and placed in a box.
-    Shaped(Shaped, Option<((u32, u32, u32), Placed)>),
+    Shaped(Shaped, Option<(GridKey, Placed)>),
 }
 
 /// A still made aside, for [`crate::Deck::take_still`] to take in.
@@ -303,11 +305,11 @@ struct CachedTerminal {
     version: Option<FileVersion>,
     /// The screen's size its header gives, read as the recording was first asked for.
     size: Option<(u16, u16)>,
-    /// Its text shaped for rows of a height, and what it was last placed as, for a box of a size.
+    /// Its text shaped for rows of a height, and what it was last placed as, for a box.
     shaped: Option<(u32, Shaped, usize)>,
-    placed: Option<((u32, u32, u32), Placed)>,
-    /// The height of rows its text is being shaped for aside, if it is.
-    shaping: Option<u32>,
+    placed: Option<(GridKey, Placed)>,
+    /// The box it's being shaped and placed for aside, if it is.
+    shaping: Option<GridKey>,
     /// The bytes of all of that, as counted among the pictures'.
     bytes: usize,
     last_used: u64,
@@ -616,7 +618,7 @@ impl PictureCache {
                     return None;
                 }
                 let row = wanted.row.to_bits();
-                if cached.shaping == Some(row) {
+                if cached.shaping.is_some() && cached.shaping == placed.as_ref().map(|(on, _)| *on) {
                     cached.shaping = None;
                 }
                 let bytes = shaped_bytes(&shaped);
@@ -779,42 +781,41 @@ impl PictureCache {
         self.terminal_stills.get(path).is_some_and(|cached| matches!(cached.still, TerminalStill::Coming))
     }
 
-    /// The cells of the last screen of the recording at `path` placed in `rect`, if it's been laid
-    /// out: what they were placed as last, if they're where they were, or placed again, the text
-    /// shaped again only if its rows are of another height.
+    /// The last screen of the recording at `path` laid out in `rect`, its panel and its cells, if
+    /// it's been read and they're not being shaped and placed aside: what they were placed as
+    /// last, if the box is the same, or placed again, the text shaped again only if its rows are
+    /// of another height.
     pub(crate) fn terminal_items(&mut self, path: &str, rect: Rect, fonts: &mut crate::Fonts) -> Option<Placed> {
         self.asked_for += 1;
         let asked_for = self.asked_for;
         let cached = self.terminal_stills.get_mut(path)?;
         cached.last_used = asked_for;
         let TerminalStill::Laid(laid, _) = &cached.still else { return None };
-        let grid = grid(laid.columns, laid.rows, rect)?;
+        let Some(grid) = grid(laid.columns, laid.rows, rect) else { return Some(panel_alone(rect)) };
         if let Some((placed_on, items)) = &cached.placed
             && *placed_on == grid.key()
         {
             return Some(items.clone());
         }
         let row = grid.row.to_bits();
-        let (shaped, shaped_size) = match &cached.shaped {
-            Some((shaped_for, shaped, bytes)) if *shaped_for == row => (shaped.clone(), *bytes),
-            // Too much to shape here: it's shaped aside, and has no text until then.
-            _ if laid.glyphs > MOST_GLYPHS_SHAPED_HERE && self.aside.is_some() => {
-                if cached.shaping != Some(row)
-                    && let Some(aside) = &mut self.aside
-                {
-                    cached.shaping = Some(row);
-                    let shape = ShapeWanted { laid: laid.clone(), row: grid.row, rect, fonts: fonts.seed() };
-                    aside.jobs.push(StillJob { path: path.to_string(), version: cached.version.clone(), model: None, terminal: true, shape: Some(shape) });
-                    (aside.wanted)();
-                }
-                return None;
+        let shaped = cached.shaped.as_ref().filter(|(shaped_for, ..)| *shaped_for == row).map(|(_, shaped, bytes)| (shaped.clone(), *bytes));
+        // Too much to shape or place here: it's done aside, and there's nothing until then.
+        if laid.pieces() > MOST_PIECES_LAID_HERE
+            && let Some(aside) = &mut self.aside
+        {
+            if cached.shaping != Some(grid.key()) {
+                cached.shaping = Some(grid.key());
+                let shape = ShapeWanted { laid: laid.clone(), row: grid.row, rect, shaped: shaped.map(|(shaped, _)| shaped), fonts: fonts.seed() };
+                aside.jobs.push(StillJob { path: path.to_string(), version: cached.version.clone(), model: None, terminal: true, shape: Some(shape) });
+                (aside.wanted)();
             }
-            _ => {
-                let shaped: Shaped = Arc::from(shape(laid, grid.row, fonts));
-                let bytes = shaped_bytes(&shaped);
-                (shaped, bytes)
-            }
-        };
+            return None;
+        }
+        let (shaped, shaped_size) = shaped.unwrap_or_else(|| {
+            let shaped: Shaped = Arc::from(shape(laid, grid.row, fonts));
+            let bytes = shaped_bytes(&shaped);
+            (shaped, bytes)
+        });
         let items: Placed = place(laid, &grid, &shaped).into();
         cached.shaped = Some((row, shaped, shaped_size));
         cached.placed = Some((grid.key(), items.clone()));

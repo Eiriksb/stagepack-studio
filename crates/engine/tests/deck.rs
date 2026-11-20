@@ -319,7 +319,7 @@ fn deck_of_pictures(count: usize) -> (tempfile::TempDir, Deck) {
 
 /// Slide `index`'s picture, seen in a way that doesn't keep it in memory.
 fn picture_on(deck: &mut Deck, index: usize) -> Weak<tiny_skia::Pixmap> {
-    let drawn = deck.specs(index).iter().flat_map(|spec| &spec.items).find_map(|item| match item {
+    let drawn = deck.specs(index).iter().flat_map(|spec| spec.items.iter()).find_map(|item| match item {
         DisplayItem::Picture { pixmap, .. } => Some(Arc::downgrade(pixmap)),
         _ => None,
     });

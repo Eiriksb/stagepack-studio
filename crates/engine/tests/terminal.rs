@@ -38,7 +38,7 @@ type Written = (f32, f32, String, (u8, u8, u8), u16);
 /// Each text item of `layer`.
 fn texts(layer: &LayerSpec, fonts: &mut Fonts) -> Vec<Written> {
     let mut found = Vec::new();
-    for item in &layer.items {
+    for item in layer.items.iter() {
         let DisplayItem::Text { text, x, y } = item else { continue };
         let Some(run) = text.buffer.layout_runs().next() else { continue };
         let glyph = run.glyphs.first().expect("a text item has a glyph");
@@ -137,7 +137,7 @@ fn a_recording_lays_out_as_its_last_screen() {
     assert!(fills.iter().any(|(at, colour)| near(*at, [5.0 * cell, row, 2.0 * cell, row]) && *colour == (0x24, 0x72, 0xc8)), "cells of a colour of their own: {fills:?}");
     assert!(fills.iter().any(|(at, colour)| near(*at, [2.0 * cell, 2.0 * row, cell, row]) && *colour == FOREGROUND), "the cursor, a block: {fills:?}");
     // Each character on its cell.
-    for item in &layer.items {
+    for item in layer.items.iter() {
         let DisplayItem::Text { text, .. } = item else { continue };
         for (at, glyph) in text.buffer.layout_runs().next().unwrap().glyphs.iter().enumerate() {
             assert!((glyph.x - at as f32 * cell).abs() < 0.01 && (glyph.w - cell).abs() < 0.01, "{at}: {} {}", glyph.x, glyph.w);
@@ -380,7 +380,7 @@ fn a_wide_character_in_a_busy_row_keeps_the_rest_on_their_cells() {
     let layer = terminal_layer(&mut deck, 0);
     let cell = 18.0 * CELL_SHAPE;
     let mut placed = Vec::new();
-    for item in &layer.items {
+    for item in layer.items.iter() {
         let DisplayItem::Text { text, x, .. } = item else { continue };
         let run = text.buffer.layout_runs().next().unwrap();
         for glyph in run.glyphs {
@@ -547,7 +547,7 @@ fn a_row_of_many_wide_characters_keeps_each_on_its_cells() {
     let layer = terminal_layer(&mut deck, 0);
     let cell = 18.0 * CELL_SHAPE;
     let mut placed = Vec::new();
-    for item in &layer.items {
+    for item in layer.items.iter() {
         let DisplayItem::Text { text, x, .. } = item else { continue };
         let run = text.buffer.layout_runs().next().unwrap();
         placed.extend(run.glyphs.iter().map(|glyph| x + glyph.x));
@@ -666,4 +666,153 @@ fn cells_are_drawn_in_their_own_colours_and_text_only_where_it_can_be_read() {
     // Small, as in a thumbnail, there's no text, only cells.
     let small = render_layer(&spec, 0.01, deck.fonts_mut());
     assert_eq!(text_pixels(&small), 0);
+}
+
+/// A screen of 500 by 200 blank cells, each with a background and an underline of its own: 65,536
+/// colours of each, and no text at all.
+fn colourful_screen() -> Vec<u8> {
+    let mut rows: Vec<String> = (0..200u32)
+        .map(|row| {
+            let mut out = String::new();
+            for col in 0..500u32 {
+                let colour = (row * 500 + col) % 65_536;
+                let (high, low) = (colour >> 8, colour & 255);
+                out.push_str(&format!("\u{1b}[4;38;2;{low};{high};160;48;2;{high};{low};64m "));
+            }
+            if row < 199 {
+                out.push_str("\u{1b}[0m\r\n");
+            }
+            out
+        })
+        .collect();
+    rows.push("\u{1b}[?25l".to_string());
+    let output: Vec<(f64, &str, &str)> = rows.iter().enumerate().map(|(at, row)| (0.01 * at as f64, "o", row.as_str())).collect();
+    make_test_cast(500, 200, &output)
+}
+
+/// A deck of one slide of `source`, its recording `cast`, making its stills aside.
+fn deck_aside(source: &str, cast: Vec<u8>) -> Deck {
+    let mut deck = Deck::open(Box::new(MapFiles([("assets/run.cast".to_string(), cast)].into())), Fonts::bundled_only(), source.to_string());
+    deck.make_stills_aside(Arc::new(|| {}), Arc::new(|_: &str| None));
+    deck
+}
+
+/// Makes each still and draws each layer wanted aside, as the window's background tasks do, until
+/// none is wanted, the slide drawn at `scale` between.
+fn settle(deck: &mut Deck, cast: &[u8], scale: f32) {
+    loop {
+        deck.layers(0, scale);
+        let (stills, draws) = (deck.still_jobs(), deck.draw_jobs());
+        if stills.is_empty() && draws.is_empty() {
+            return;
+        }
+        for job in stills {
+            let made = if job.reads_a_file() { job.make_recording(Ok(cast.to_vec())) } else { job.make(None) };
+            deck.take_still(made);
+        }
+        for job in draws {
+            deck.take_drawn(job.draw());
+        }
+    }
+}
+
+/// How many pixels of `layer` are about as light as the screen's text.
+fn lit(layer: &Layer) -> usize {
+    layer.pixmap.pixels().iter().filter(|pixel| pixel.red() > 0x60).count()
+}
+
+/// The slide of one recording of a full screen, `w` wide.
+fn full_screen_at(w: f32, heading: &str) -> String {
+    format!("# {heading}\n\n<Terminal src=\"assets/run.cast\" x=\"0\" y=\"0\" w=\"{w}\" h=\"{}\" />\n", w * 9.0 / 16.0)
+}
+
+#[test]
+fn a_screen_of_many_colours_and_no_text_is_placed_and_drawn_aside() {
+    let source = "# One\n\n<Terminal src=\"assets/run.cast\" x=\"0\" y=\"0\" w=\"1920\" h=\"1080\" />\n";
+    let mut deck = deck_aside(source, colourful_screen());
+    deck.specs(0);
+    let job = deck.still_jobs().pop().unwrap();
+    deck.take_still(job.make_recording(Ok(colourful_screen())));
+    // No text, but too many cells to place here: placed aside, its panel meanwhile.
+    deck.layers(0, 1.0);
+    let mut jobs = deck.still_jobs();
+    assert_eq!(jobs.len(), 1, "placed aside");
+    assert!(!jobs[0].reads_a_file());
+    assert_eq!(terminal_layer(&mut deck, 0).items.len(), 1, "its panel");
+    deck.take_still(jobs.pop().unwrap().make(None));
+    // And too many to draw here: drawn aside.
+    deck.layers(0, 1.0);
+    let layer = terminal_layer(&mut deck, 0);
+    assert_eq!(layer.items.len(), 1 + 65_536 + 65_536, "the panel, a fill of each colour and an underline of each");
+    assert_eq!(deck.draw_jobs().len(), 1, "drawn aside");
+    // Laid out again, as after a keystroke beside it, its items are shared, not made again.
+    deck.update(source.replace("# One", "# One more"));
+    assert!(Arc::ptr_eq(&terminal_layer(&mut deck, 0).items, &layer.items));
+}
+
+#[test]
+fn a_busy_screen_resized_shows_its_picture_stretched_until_it_is_drawn_again() {
+    let cast = full_screen();
+    let mut deck = deck_aside(&full_screen_at(960.0, "One"), cast.clone());
+    settle(&mut deck, &cast, 0.5);
+    assert!(lit(deck.layers(0, 0.5).last().unwrap()) > 0, "drawn");
+    // The resize written once it ends: its rows are of another height, and shaped aside.
+    deck.update(full_screen_at(1440.0, "One"));
+    let shown = deck.layers(0, 0.5).last().unwrap().clone();
+    assert!(shown.pixmap.width().abs_diff(720) <= 1, "{} wide", shown.pixmap.width());
+    assert!(lit(&shown) > 0, "its picture stretched, not its panel");
+    let mut stills = deck.still_jobs();
+    assert_eq!(stills.len(), 1, "shaped aside");
+    // Laid out again meanwhile, as after a keystroke beside it, it's still its picture.
+    deck.update(full_screen_at(1440.0, "One more"));
+    assert!(lit(deck.layers(0, 0.5).last().unwrap()) > 0, "still its picture");
+    // Shaped, it's drawn aside, and its picture stands in until then.
+    deck.take_still(stills.pop().unwrap().make(None));
+    assert!(lit(deck.layers(0, 0.5).last().unwrap()) > 0, "still its picture while it's drawn");
+    let draws = deck.draw_jobs();
+    assert_eq!(draws.len(), 1);
+    for job in draws {
+        deck.take_drawn(job.draw());
+    }
+    let mut here = Deck::open(Box::new(MapFiles([("assets/run.cast".to_string(), cast)].into())), Fonts::bundled_only(), full_screen_at(1440.0, "One more"));
+    let whole = here.layers(0, 0.5);
+    assert_eq!(deck.layers(0, 0.5).last().unwrap().pixmap.data(), whole.last().unwrap().pixmap.data(), "drawn as it is");
+}
+
+#[test]
+fn a_busy_screen_at_a_new_scale_shows_its_picture_at_another_stretched() {
+    let cast = full_screen();
+    let mut deck = deck_aside(&full_screen_at(960.0, "One"), cast.clone());
+    settle(&mut deck, &cast, 0.5);
+    // As when the editor zooms, or the audience's window first shows it.
+    let shown = deck.layers(0, 0.75).last().unwrap().clone();
+    assert!(shown.pixmap.width().abs_diff(720) <= 1, "{} wide", shown.pixmap.width());
+    assert!(lit(&shown) > 0, "its picture at the other scale stretched, not its panel");
+    assert_eq!(deck.draw_jobs().len(), 1, "drawn aside at this scale");
+}
+
+#[test]
+fn a_layer_wanted_drawn_aside_is_drawn_once_at_the_scale_asked_for_last() {
+    let cast = full_screen();
+    let mut deck = deck_aside(&full_screen_at(960.0, "One"), cast.clone());
+    settle(&mut deck, &cast, 0.5);
+    deck.layers(0, 1.0);
+    deck.layers(0, 0.75);
+    let draws = deck.draw_jobs();
+    assert_eq!(draws.len(), 1, "the newest scale's alone");
+    // One dropped undrawn, as when the window closes it, is wanted again when next asked for.
+    drop(draws);
+    deck.update(full_screen_at(960.0, "One more"));
+    deck.layers(0, 0.75);
+    let draws = deck.draw_jobs();
+    assert_eq!(draws.len(), 1, "wanted again");
+    for job in draws {
+        assert_eq!(deck.take_drawn(job.draw()), vec![0]);
+    }
+    deck.layers(0, 0.75);
+    assert!(deck.draw_jobs().is_empty(), "kept");
+    // The scale dropped is drawn when it's asked for again.
+    deck.update(full_screen_at(960.0, "One"));
+    deck.layers(0, 1.0);
+    assert_eq!(deck.draw_jobs().len(), 1);
 }

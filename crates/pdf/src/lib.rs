@@ -71,7 +71,7 @@ fn draw_layer(surface: &mut Surface, spec: &LayerSpec, drawing: &mut Drawing) {
     }
     surface.push_transform(&Transform::from_translate(x, y));
     surface.push_transform(&Transform::from_rotate_at(spec.rotate, w / 2.0, h / 2.0));
-    for item in &spec.items {
+    for item in spec.items.iter() {
         match item {
             DisplayItem::Fill { path, color } => {
                 if let Some(path) = convert_path(path) {

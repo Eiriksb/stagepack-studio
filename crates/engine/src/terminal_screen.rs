@@ -126,9 +126,16 @@ pub(crate) struct LaidScreen {
     pub(crate) bytes: usize,
     /// How many characters its text has.
     pub(crate) glyphs: usize,
+    /// How many runs of cells it fills or underlines.
+    pub(crate) runs: usize,
 }
 
 impl LaidScreen {
+    /// How much there is to shape, place and draw of it: its characters and its runs of cells.
+    pub(crate) fn pieces(&self) -> usize {
+        self.glyphs + self.runs
+    }
+
     fn count(&self) -> usize {
         let cells = |groups: &[([u8; 3], Vec<Cells>)]| groups.iter().map(|(_, cells)| cells.len() * size_of::<Cells>() + 32).sum::<usize>();
         let texts: usize = self.texts.iter().map(|text| 32 + text.spans.iter().map(|span| span.text.len() + size_of::<Span>()).sum::<usize>()).sum();
@@ -294,7 +301,8 @@ pub(crate) fn lay_out_screen(screen: &Screen) -> LaidScreen {
         }
     }
     let glyphs = texts.iter().flat_map(|text| &text.spans).map(|span| span.text.chars().count()).sum();
-    let mut laid = LaidScreen { columns: screen.width(), rows: screen.height(), fills: by_colour(fills), texts, lines: by_colour(lines), bytes: 0, glyphs };
+    let runs = fills.len() + lines.len();
+    let mut laid = LaidScreen { columns: screen.width(), rows: screen.height(), fills: by_colour(fills), texts, lines: by_colour(lines), bytes: 0, glyphs, runs };
     laid.bytes = laid.count();
     laid
 }
@@ -308,12 +316,16 @@ pub(crate) struct Grid {
     left: f32,
     top: f32,
     whole: bool,
+    /// The box.
+    rect: Rect,
 }
 
+/// What tells one grid from another of the same screen: the box it's in.
+pub(crate) type GridKey = [u32; 4];
+
 impl Grid {
-    /// What tells one grid from another: where its cells are, and how large.
-    pub(crate) fn key(&self) -> (u32, u32, u32) {
-        (self.row.to_bits(), self.left.to_bits(), self.top.to_bits())
+    pub(crate) fn key(&self) -> GridKey {
+        [self.rect.x, self.rect.y, self.rect.w, self.rect.h].map(f32::to_bits)
     }
 }
 
@@ -328,7 +340,7 @@ pub(crate) fn grid(columns: u16, rows: u16, rect: Rect) -> Option<Grid> {
     let (row, whole) = if fit >= 1.0 { ((fit + 1.0e-3).floor(), true) } else { (fit, false) };
     let cell = row * CELL_SHAPE;
     let on_unit = |at: f32| if whole { at.round() } else { at };
-    Some(Grid { row, cell, left: rect.x + on_unit((rect.w - cell * columns) / 2.0), top: rect.y + on_unit((rect.h - row * rows) / 2.0), whole })
+    Some(Grid { row, cell, left: rect.x + on_unit((rect.w - cell * columns) / 2.0), top: rect.y + on_unit((rect.h - row * rows) / 2.0), whole, rect })
 }
 
 /// The text items of `laid` shaped for rows `row` units high, in its order: the same wherever the
@@ -374,11 +386,11 @@ pub(crate) fn placed_bytes(items: &[DisplayItem]) -> usize {
         .sum()
 }
 
-/// `laid` placed on `grid`, with its text `shaped` for the grid's rows: a fill for each background
-/// colour but the screen's own, the text, and a stroke for each colour of underline. The same for
-/// every box the grid is the same in, as a box resized a unit at a time often is.
+/// `laid` placed on `grid`, with its text `shaped` for the grid's rows: a fill of the screen's
+/// background over the whole box, a fill for each background colour but the screen's own, the
+/// text, and a stroke for each colour of underline.
 pub(crate) fn place(laid: &LaidScreen, grid: &Grid, shaped: &[ShapedText]) -> Vec<DisplayItem> {
-    let mut items = Vec::new();
+    let mut items: Vec<DisplayItem> = panel(grid.rect).into_iter().collect();
     let x = |col: u16| grid.left + f32::from(col) * grid.cell;
     let y = |row: u16| grid.top + f32::from(row) * grid.row;
     for (colour, cells) in &laid.fills {
@@ -415,25 +427,38 @@ pub(crate) fn place(laid: &LaidScreen, grid: &Grid, shaped: &[ShapedText]) -> Ve
 /// them out.
 pub fn screen_items(screen: &Screen, rect: Rect, fonts: &mut Fonts) -> Vec<DisplayItem> {
     let laid = lay_out_screen(screen);
-    let cells = match grid(laid.columns, laid.rows, rect) {
+    match grid(laid.columns, laid.rows, rect) {
         Some(grid) => place(&laid, &grid, &shape(&laid, grid.row, fonts)),
-        None => Vec::new(),
-    };
-    panel(rect).into_iter().chain(cells).collect()
+        None => panel(rect).into_iter().collect(),
+    }
+}
+
+/// A plain panel over `rect`, alone, as a recording is laid out until its screen is.
+pub(crate) fn panel_alone(rect: Rect) -> Placed {
+    panel(rect).into_iter().collect()
+}
+
+/// A terminal recording placed on a slide, laid out.
+pub(crate) struct LaidTerminal {
+    /// The size of its box.
+    pub(crate) size: (f32, f32),
+    /// What it draws, shared with what's kept of the recording.
+    pub(crate) items: Placed,
+    /// How many times it stops.
+    pub(crate) stops: usize,
+    /// Why it can't be played, if it can't.
+    pub(crate) problem: Option<String>,
+    /// Whether its screen is being shaped and placed aside, its panel alone until then.
+    pub(crate) pending: bool,
 }
 
 /// A terminal recording placed on a slide, laid out: the size of its box, for the sides `wanted`
 /// gives and the shape its header says its screen has for the rest, what it draws, how many
 /// times it stops, and why it can't be played if it can't. Until it's been read, it's a plain dark
 /// panel, and stops nowhere. One being resized, `placing`, is its panel alone: what's shown of it
-/// meanwhile is its picture as it was drawn, stretched, and it's laid out once it's let go.
-pub(crate) fn lay_out_terminal(
-    tag: &Tag,
-    wanted: (Option<f32>, Option<f32>),
-    placing: bool,
-    theme: &Theme,
-    env: &mut LayoutEnv,
-) -> ((f32, f32), Vec<DisplayItem>, usize, Option<String>) {
+/// meanwhile is its picture as it was drawn, stretched, and it's laid out once it's let go. One
+/// whose screen is being shaped and placed aside is its panel alone too, until it's taken in.
+pub(crate) fn lay_out_terminal(tag: &Tag, wanted: (Option<f32>, Option<f32>), placing: bool, theme: &Theme, env: &mut LayoutEnv) -> LaidTerminal {
     let src = tag.attr("src").unwrap_or_default().trim();
     // One with no file is never looked for.
     let (still, screen_size) = if src.is_empty() { (None, None) } else {
@@ -442,18 +467,17 @@ pub(crate) fn lay_out_terminal(
     };
     let (w, h) = box_size(wanted, Some(own_size(screen_size.unwrap_or(SCREEN_UNTIL_READ))));
     let rect = Rect { x: 0.0, y: 0.0, w, h };
-    let (items, stops, problem) = match still {
-        None => (placeholder_items(TERMINAL_NO_FILE, rect, theme, env.fonts), 0, Some(TERMINAL_NO_FILE.to_string())),
-        Some(TerminalStill::Cannot(why)) => (placeholder_items(&why.to_string(), rect, theme, env.fonts), 0, Some(why.to_string())),
-        Some(TerminalStill::Coming) => (panel(rect).into_iter().collect(), 0, None),
-        Some(TerminalStill::Laid(_, stops)) if placing => (panel(rect).into_iter().collect(), stops, None),
-        Some(TerminalStill::Laid(_, stops)) => {
-            let cells = env.pictures.terminal_items(src, rect, env.fonts).unwrap_or_else(|| Arc::from(Vec::new()));
-            let items = panel(rect).into_iter().chain(cells.iter().cloned()).collect();
-            (items, stops, None)
-        }
-    };
-    ((w, h), items, stops, problem)
+    let laid = |items: Placed, stops: usize, problem: Option<String>, pending: bool| LaidTerminal { size: (w, h), items, stops, problem, pending };
+    match still {
+        None => laid(placeholder_items(TERMINAL_NO_FILE, rect, theme, env.fonts).into(), 0, Some(TERMINAL_NO_FILE.to_string()), false),
+        Some(TerminalStill::Cannot(why)) => laid(placeholder_items(&why.to_string(), rect, theme, env.fonts).into(), 0, Some(why.to_string()), false),
+        Some(TerminalStill::Coming) => laid(panel_alone(rect), 0, None, false),
+        Some(TerminalStill::Laid(_, stops)) if placing => laid(panel_alone(rect), stops, None, false),
+        Some(TerminalStill::Laid(_, stops)) => match env.pictures.terminal_items(src, rect, env.fonts) {
+            Some(items) => laid(items, stops, None, false),
+            None => laid(panel_alone(rect), stops, None, true),
+        },
+    }
 }
 
 /// Shaped text and placed items, kept for a recording as it's laid out again and again.

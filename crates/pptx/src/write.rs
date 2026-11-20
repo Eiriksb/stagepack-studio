@@ -464,7 +464,7 @@ mod tests {
             source: None,
             rect: Rect { x: 100.0, y: 100.0, w: 50.0, h: 50.0 },
             rotate: 0.0,
-            items: Vec::new(),
+            items: Vec::new().into(),
             click: None,
             enter: Enter::default(),
             native: vec![element.clone()],

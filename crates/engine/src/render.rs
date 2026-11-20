@@ -37,7 +37,7 @@ pub(crate) fn device_offset(at: f32) -> i32 {
 /// rotation, with the rect's top-left corner as the origin.
 fn extent(spec: &LayerSpec) -> (f32, f32, f32, f32) {
     let (mut left, mut top, mut right, mut bottom) = (0.0_f32, 0.0_f32, spec.rect.w, spec.rect.h);
-    for item in &spec.items {
+    for item in spec.items.iter() {
         let (l, t, r, b) = match item {
             DisplayItem::Fill { path, .. } => {
                 let b = path.bounds();
@@ -173,7 +173,7 @@ fn turned_picture_layer(width: u32, height: u32, bgra: &[u8], opaque: bool, rect
         source: None,
         rect,
         rotate,
-        items: vec![item],
+        items: vec![item].into(),
         click: None,
         enter: Enter::Appear,
         native: Vec::new(),
@@ -203,7 +203,7 @@ fn draw_layer(spec: &LayerSpec, scale: f32, mut text: impl FnMut(&mut PixmapMut,
     // Items are in slide units, so the item transform scales as well as places.
     let at = Transform::from_translate(-min_x, -min_y).pre_concat(place).pre_scale(scale, scale);
     let mut target = pixmap.as_mut();
-    for item in &spec.items {
+    for item in spec.items.iter() {
         match item {
             DisplayItem::Fill { path, color } => {
                 if !(cells && fill_cells(&mut target, path, *color, at)) {
