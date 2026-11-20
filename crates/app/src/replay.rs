@@ -12,7 +12,7 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use gpui_kit::RenderImage;
@@ -30,6 +30,9 @@ const BETWEEN_PICTURES: Duration = Duration::from_nanos(1_000_000_000 / MOST_PIC
 const SAVING_WAIT: Duration = Duration::from_millis(20);
 /// What a replay's thread is called.
 pub const THREAD_NAME: &str = "playing a recording";
+/// The most recordings a window plays, or has readied, at once: each holds its own screens, and
+/// more would show no more of a slide than their last screens do.
+pub const MOST_PLAYING: usize = 4;
 
 /// Where a replay goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +106,23 @@ static RUNNING: AtomicUsize = AtomicUsize::new(0);
 static DRAWN: AtomicUsize = AtomicUsize::new(0);
 static FASTER: AtomicU32 = AtomicU32::new(1);
 static SLOWED_NANOS: AtomicU64 = AtomicU64::new(0);
+static READ: AtomicUsize = AtomicUsize::new(0);
+
+/// A file read for replays, by what tells it from others.
+type FileIdentity = (usize, String, Option<(u64, std::time::SystemTime)>);
+
+/// A recording read for replays, kept only as long as a replay holds it; replays wanting it while
+/// it's read wait for it.
+type Kept = Arc<Mutex<Weak<Recording>>>;
+
+/// The recordings being played, by their file, so that replays of one file share what's read of it.
+static BEING_PLAYED: Mutex<Vec<(FileIdentity, Kept)>> = Mutex::new(Vec::new());
+
+/// How many times replays have read a recording's file: for tests that replays of one share it.
+#[doc(hidden)]
+pub fn recordings_read() -> usize {
+    READ.load(Ordering::SeqCst)
+}
 
 /// How many replays' threads are running now: for tests that every one ends.
 #[doc(hidden)]
@@ -326,18 +346,49 @@ fn read(shared: &Shared, open: LargeOpen) -> Result<Option<Recording>, CantPlay>
             return Ok(None);
         }
         match open.clone().read_recording() {
-            Ok(bytes) => return slides_terminal::read(&bytes?).map(Some),
+            Ok(bytes) => {
+                READ.fetch_add(1, Ordering::SeqCst);
+                return slides_terminal::read(&bytes?).map(Some);
+            }
             Err(NotOpened::Saving) => std::thread::sleep(SAVING_WAIT),
             Err(NotOpened::Unreadable | NotOpened::NotUnpacked) => return Err(CantPlay::CouldNotRead),
         }
     }
 }
 
+/// The recording `open` reads, shared with every other replay of the same file playing now, read
+/// here if none is: or nothing if the replay is stopped first.
+fn shared_recording(shared: &Shared, open: &LargeOpen) -> Result<Option<Arc<Recording>>, CantPlay> {
+    let identity = open.identity();
+    let kept = {
+        let mut playing = lock(&BEING_PLAYED);
+        // What no replay holds, or waits for, any more goes.
+        playing.retain(|(_, kept)| Arc::strong_count(kept) > 1 || kept.try_lock().map_or(true, |recording| recording.strong_count() > 0));
+        match playing.iter().find(|(of, _)| *of == identity) {
+            Some((_, kept)) => kept.clone(),
+            None => {
+                let kept = Arc::new(Mutex::new(Weak::new()));
+                playing.push((identity, kept.clone()));
+                kept
+            }
+        }
+    };
+    let mut recording = lock(&kept);
+    if let Some(read) = recording.upgrade() {
+        return Ok(Some(read));
+    }
+    let Some(read) = read(shared, open.clone())? else { return Ok(None) };
+    let read = Arc::new(read);
+    *recording = Arc::downgrade(&read);
+    Ok(Some(read))
+}
+
 /// Plays the recording `open` reads as `shared` asks, until it's stopped, or, unless it `stays`,
-/// until it's at its end.
+/// until it's at its end. The talk's files `open` reads are held while it plays, so that what
+/// tells its file from others stays its own.
 fn play(shared: &Shared, open: LargeOpen, fonts: FontsSeed, stays: bool) -> Result<(), CantPlay> {
-    let Some(recording) = read(shared, open)? else { return Ok(()) };
-    let mut player = Player::new(Arc::new(recording));
+    let Some(recording) = shared_recording(shared, &open)? else { return Ok(()) };
+    let mut player = Player::new(recording);
     let mut fonts = fonts.fonts();
     let time_of_stop = |player: &Player, stop: Option<usize>| stop.and_then(|stop| player.stops().get(stop).copied()).unwrap_or_else(|| player.end());
     let mut going = Going::Held(Duration::ZERO);

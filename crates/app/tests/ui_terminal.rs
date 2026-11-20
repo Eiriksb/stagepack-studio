@@ -33,6 +33,7 @@ impl Drop for Alone {
     fn drop(&mut self) {
         replay::play_faster_for_tests(1);
         replay::slow_for_tests(Duration::ZERO);
+        workspace_view::hold_recording_checks_for_tests(false);
     }
 }
 
@@ -1137,7 +1138,7 @@ fn the_form_says_what_the_recording_is(cx: &mut TestAppContext) {
     let form = cx.read(|cx| typing.view.read(cx).inspector().clone());
     let labels = cx.read(|cx| form.read(cx).labels());
     assert_eq!(labels, ["Left", "Top", "Width", "Height", "Turn"], "its place, and nothing else");
-    // Moved through the form, only its place changes, and the facts were read once.
+    // Moved, only its place changes, and its facts are as they were.
     let tag = the_tag(&typing, cx);
     typing.press(cx, "right");
     assert_ne!(the_tag(&typing, cx), tag);
@@ -1314,10 +1315,14 @@ fn a_hand_written_terminal_reads_or_says_why(cx: &mut TestAppContext) {
     ];
     let slides: Vec<String> = written.iter().enumerate().map(|(at, tag)| format!("# Slide {at}\n\n{tag}\n\n{BOX}\n")).collect();
     let source = slides.join("\n---\n\n");
-    let folder = talk_folder(&source, &eighty());
+    // The talk in a folder of its own, with a recording beside it, outside it, which is never read.
+    let beside = tempfile::tempdir().unwrap();
+    let folder = tempfile::tempdir_in(beside.path()).unwrap();
+    std::fs::write(folder.path().join("slides.md"), &source).unwrap();
+    std::fs::create_dir(folder.path().join("assets")).unwrap();
+    std::fs::write(folder.path().join("assets/run.cast"), eighty()).unwrap();
     std::fs::write(folder.path().join("assets/clip.mp4"), b"\0\0\0\x18ftypmp42 not really a video").unwrap();
-    // A recording beside the talk, outside it, is never read.
-    std::fs::write(folder.path().parent().unwrap().join("outside.cast"), eighty()).ok();
+    std::fs::write(beside.path().join("outside.cast"), eighty()).unwrap();
     let typing = open_folder(cx, folder, None);
     let why = [
         slides_engine::TERMINAL_NO_FILE.to_string(),
@@ -1351,4 +1356,170 @@ fn a_hand_written_terminal_reads_or_says_why(cx: &mut TestAppContext) {
         typing.press(cx, "ctrl-z");
         assert_eq!(typing.source(cx), before, "{tag}");
     }
+}
+
+/// A talk whose first slide has `first` boxes of the recording and whose second has `second`.
+fn many_talk(first: usize, second: usize) -> String {
+    let boxes = |count: usize| {
+        (0..count)
+            .map(|at| format!("<Terminal src=\"assets/run.cast\" x=\"{}\" y=\"{}\" w=\"300\" h=\"150\" />", 10 + (at % 5) * 380, 10 + (at / 5) * 200))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    format!("# Many\n\n{}\n\n---\n\n# More\n\n{}\n", boxes(first), boxes(second))
+}
+
+/// The layers of the recordings on slide `slide` at its start, in their order.
+fn recording_layers(document: &Entity<Document>, slide: usize, cx: &mut TestAppContext) -> Vec<usize> {
+    let mut layers: Vec<usize> = document.update(cx, |document, _| document.terminals_at(slide, Moment { step: 0, time: 0.0 })).iter().map(|terminal| terminal.layer).collect();
+    layers.sort();
+    layers
+}
+
+#[gpui_kit::test]
+fn no_more_than_four_recordings_play_at_once_and_their_file_is_read_once(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let read = replay::recordings_read();
+    let show = rehearse(cx, &many_talk(25, 3), &marked());
+    let canvas = show.canvas(cx);
+    until(cx, show.audience, "four pictures", |cx| pictures(cx, &canvas).iter().flatten().count() == replay::MOST_PLAYING);
+    for_a_while(cx, show.audience, 200);
+    assert_eq!(replay::threads_running(), replay::MOST_PLAYING, "four play, and the next slide's wait");
+    // The first four by their order on the slide; the rest show their last screens.
+    let mut playing = cx.read(|cx| canvas.read(cx).playing_recordings());
+    playing.sort();
+    let layers = recording_layers(&show.document, 0, cx);
+    assert_eq!(layers.len(), 25);
+    assert_eq!(playing, layers[..replay::MOST_PLAYING]);
+    assert_eq!(replay::recordings_read() - read, 1, "the four share what's read of their file");
+}
+
+#[gpui_kit::test]
+fn the_next_slides_recordings_are_readied_within_the_same_four(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let show = rehearse(cx, &many_talk(2, 5), &running(1));
+    let canvas = show.canvas(cx);
+    until(cx, show.audience, "two pictures", |cx| pictures(cx, &canvas).iter().flatten().count() == 2);
+    for_a_while(cx, show.audience, 200);
+    assert_eq!(replay::threads_running(), replay::MOST_PLAYING, "two play, and two of the next slide's are readied");
+    // On the next slide, its first four play.
+    show.press(cx, "right");
+    assert_eq!(show.step(cx).0, 1);
+    let canvas = show.canvas(cx);
+    until(cx, show.audience, "four pictures", |cx| pictures(cx, &canvas).iter().flatten().count() == replay::MOST_PLAYING);
+    assert!(replay::threads_running() <= replay::MOST_PLAYING, "{}", replay::threads_running());
+    let mut playing = cx.read(|cx| canvas.read(cx).playing_recordings());
+    playing.sort();
+    assert_eq!(playing, recording_layers(&show.document, 1, cx)[..replay::MOST_PLAYING]);
+}
+
+fn window_open(cx: &TestAppContext, handle: AnyWindowHandle) -> bool {
+    cx.read(|cx| cx.windows().iter().any(|window| window.window_id() == handle.window_id()))
+}
+
+fn progress_said(typing: &Typing, cx: &mut TestAppContext) -> Option<String> {
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        window.try_find(workspace_view::PROGRESS_ID).and_then(|found| found.label().map(str::to_string))
+    })
+}
+
+#[gpui_kit::test]
+fn recordings_are_checked_one_at_a_time_saying_so(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let work = tempfile::tempdir().unwrap();
+    let typing = keeping_editor(cx, PLAIN_TALK, work.path());
+    workspace_view::hold_recording_checks_for_tests(true);
+    let paths = vec![outside(work.path(), "one.cast", &eighty()), outside(work.path(), "two.cast", &three_minutes())];
+    choose_recordings(&typing, cx, paths);
+    assert_eq!(workspace_view::recording_checks_running(), 1);
+    assert_eq!(progress_said(&typing, cx).as_deref(), Some("Reading the terminal recording… 50%"));
+    wait(cx, 50);
+    assert_eq!(workspace_view::recording_checks_running(), 1, "one at a time");
+    assert_eq!(typing.source(cx), PLAIN_TALK);
+    workspace_view::hold_recording_checks_for_tests(false);
+    wait(cx, 10);
+    typing.settle(cx);
+    assert_eq!(typing.source(cx).matches("<Terminal").count(), 2, "both added");
+    assert_eq!(workspace_view::recording_checks_running(), 0);
+    assert_eq!(progress_said(&typing, cx), None);
+    let source = typing.source(cx);
+    assert!(source.find("assets/one.cast") < source.find("assets/two.cast"), "in the order chosen: {source}");
+}
+
+#[gpui_kit::test]
+fn cancel_stops_the_recording_being_checked_and_those_waiting(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let work = tempfile::tempdir().unwrap();
+    let typing = keeping_editor(cx, PLAIN_TALK, work.path());
+    workspace_view::hold_recording_checks_for_tests(true);
+    choose_recordings(&typing, cx, vec![outside(work.path(), "one.cast", &eighty()), outside(work.path(), "two.cast", &three_minutes())]);
+    assert_eq!(workspace_view::recording_checks_running(), 1);
+    click_on(&typing, cx, workspace_view::CANCEL_PROGRESS_ID);
+    wait(cx, 10);
+    workspace_view::hold_recording_checks_for_tests(false);
+    wait(cx, 10);
+    typing.settle(cx);
+    assert_eq!(workspace_view::recording_checks_running(), 0);
+    assert_eq!(progress_said(&typing, cx), None);
+    assert_eq!(typing.source(cx), PLAIN_TALK, "neither was added");
+}
+
+#[gpui_kit::test]
+fn closing_the_window_stops_a_recording_being_checked(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let work = tempfile::tempdir().unwrap();
+    let typing = keeping_editor(cx, PLAIN_TALK, work.path());
+    workspace_view::hold_recording_checks_for_tests(true);
+    choose_recordings(&typing, cx, vec![outside(work.path(), "one.cast", &eighty()), outside(work.path(), "two.cast", &eighty())]);
+    assert_eq!(workspace_view::recording_checks_running(), 1);
+    let document = typing.document(cx);
+    let handle = typing.handle;
+    assert!(!VisualTestContext::from_window(handle, cx).simulate_close(), "it waits for the check it stops");
+    cx.run_until_parked();
+    assert!(window_open(cx, handle), "until the check has stopped");
+    // The check sees it's to stop, though it's still held, and the window closes once it has,
+    // the other never checked.
+    wait(cx, 10);
+    assert_eq!(workspace_view::recording_checks_running(), 0);
+    assert!(!window_open(cx, handle), "closed once the check stopped");
+    assert_eq!(document.read_with(cx, |document, _| document.source().to_string()), PLAIN_TALK, "nothing was added");
+}
+
+/// A recording of the largest screen erased again and again in nine colours: more work to play
+/// than any recording is played with.
+fn too_costly() -> Vec<u8> {
+    let erases: String = ["41", "42", "43", "44", "45", "46", "47", "100", "101"].iter().map(|bg| format!("\u{1b}[{bg}m\u{1b}[2J")).collect();
+    let output = erases.repeat(1_000_000 / erases.len());
+    let lines: Vec<(f64, &str, &str)> = (0..3).map(|at| (f64::from(at) * 0.1, "o", output.as_str())).collect();
+    slides_terminal::make_test_cast(500, 200, &lines)
+}
+
+#[gpui_kit::test]
+fn a_recording_too_costly_to_play_is_refused_saying_why(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let work = tempfile::tempdir().unwrap();
+    let typing = keeping_editor(cx, PLAIN_TALK, work.path());
+    let cast = too_costly();
+    let recording = slides_terminal::read(&cast).unwrap();
+    assert!(slides_terminal::Player::new(std::sync::Arc::new(recording)).last().is_err(), "too costly to play");
+    choose_recordings(&typing, cx, vec![outside(work.path(), "costly.cast", &cast)]);
+    assert_eq!(workspace_view::recording_checks_running(), 0);
+    assert_eq!(typing.status(cx), Some(slides_terminal::CantPlay::TooLarge.to_string()));
+    assert_eq!(typing.source(cx), PLAIN_TALK);
+    assert!(!has_file(&typing, cx, "assets/costly.cast"));
+}
+
+#[gpui_kit::test]
+fn a_recording_that_cant_be_read_says_so_in_its_own_words(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let work = tempfile::tempdir().unwrap();
+    let typing = keeping_editor(cx, PLAIN_TALK, work.path());
+    // A folder named as a recording can't be read as one.
+    let folder = work.path().join("folder.cast");
+    std::fs::create_dir(&folder).unwrap();
+    choose_recordings(&typing, cx, vec![folder]);
+    assert_eq!(workspace_view::recording_checks_running(), 0);
+    assert_eq!(typing.status(cx), Some(slides_terminal::CantPlay::CouldNotRead.to_string()));
+    assert_eq!(typing.source(cx), PLAIN_TALK);
 }

@@ -451,6 +451,12 @@ impl LargeOpen {
         self.open_as(false)
     }
 
+    /// What tells this file from another and one version of it from another, while it's open: the
+    /// talk's files it's read from, its path in them, and its stamp, if they give one.
+    pub(crate) fn identity(&self) -> (usize, String, Option<(u64, std::time::SystemTime)>) {
+        (Arc::as_ptr(&self.files) as *const () as usize, self.path.clone(), self.files.stamp(&self.path))
+    }
+
     /// The file read whole, as a terminal recording is: a small data file of the talk, read as any
     /// is, from a pack compressed or not, while held among the talk's readers. Only a byte more than
     /// a recording can be is read of one larger. What can't be read says why, as a recording's

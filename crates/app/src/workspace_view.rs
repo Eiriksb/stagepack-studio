@@ -64,7 +64,7 @@ mod inserting;
 mod saving;
 mod starting;
 
-pub use inserting::{DIALOG_FAILED, ONLY_PICTURES, ONLY_THE_FIRST, StopsFraming, stop_framing_after};
+pub use inserting::{DIALOG_FAILED, ONLY_PICTURES, ONLY_THE_FIRST, READING_RECORDING, StopsFraming, hold_recording_checks_for_tests, recording_checks_running, stop_framing_after};
 pub use starting::{open_start_window, open_untitled_ids, refresh_start_screens};
 
 pub const CANVAS_ID: &str = "canvas";
@@ -369,6 +369,10 @@ pub struct WorkspaceView {
     /// turn, and whether one is being copied now.
     large_waiting: std::collections::VecDeque<inserting::WaitingLarge>,
     large_copying: bool,
+    /// Terminal recordings dropped, pasted or chosen, waiting to be checked before they're added,
+    /// one at a time in turn, and whether one is being checked now.
+    recordings_waiting: std::collections::VecDeque<inserting::WaitingRecording>,
+    recording_checking: bool,
     /// What to say once the files waiting are all in, as that more files were dropped than go on.
     said_after_large: Option<&'static str>,
     /// Whether the window is to close once the copies it stopped as it was closed have ended.
@@ -686,6 +690,8 @@ impl WorkspaceView {
             progressing: Vec::new(),
             large_waiting: std::collections::VecDeque::new(),
             large_copying: false,
+            recordings_waiting: std::collections::VecDeque::new(),
+            recording_checking: false,
             said_after_large: None,
             close_when_idle: false,
             saves_running: 0,

@@ -14,7 +14,7 @@ use crate::present::{
     WindowPlan, choose_windows, clock_text, layer_look, moment_time, slide_looks,
 };
 use crate::model_view::{Aim, aim_at, inside_turned};
-use crate::replay::{Aim as ReplayAim, Replay, Source as ReplaySource};
+use crate::replay::{Aim as ReplayAim, MOST_PLAYING, Replay, Source as ReplaySource};
 use crate::slide_canvas::{ModelLetGo, ScaleChanged, SlideCanvas, VideoLetGo, VideoOpened};
 use crate::workspace_view::APP_ID;
 
@@ -608,7 +608,9 @@ impl AudienceView {
     /// stop before, still. On a slide come to going on, each starts from its start, readied before
     /// if it could be; on one come back to from a later one, each shows where its clicks have
     /// brought it, its end being its still. None plays on the slide left. One still being read, or
-    /// that can't be played, isn't started.
+    /// that can't be played, isn't started. No more than [`MOST_PLAYING`] play or are readied at
+    /// once: the first of the slide shown, by their order on it, and then those readied for the
+    /// next; the rest show their stills.
     fn play_recordings(&mut self, document: &Entity<Document>, place: Place, time: f32, cx: &mut Context<Self>) {
         let moment = Moment {
             step: place.step,
@@ -668,6 +670,12 @@ impl AudienceView {
                     if pending || document.update(cx, |document, _| document.terminal_problem_on(slide, &source)).is_some() {
                         continue;
                     }
+                    // No more than the most play or are readied at once: this slide's first, by
+                    // their order on it, before the next slide's. Past them, one shows its still.
+                    let readied = ready.len() + self.ready.len();
+                    if self.current.read(cx).playing_recordings().len() + readied >= MOST_PLAYING && self.ready.pop().is_none() {
+                        continue;
+                    }
                     let Some(open) = document.read(cx).open_large(&terminal.on.src) else { continue };
                     let fonts = document.update(cx, |document, _| document.fonts_seed());
                     let (layer, on) = (terminal.layer, terminal.on.clone());
@@ -681,7 +689,8 @@ impl AudienceView {
     /// it at, so that what it shows is ready by the time it's there: a busy recording's screen,
     /// drawn aside, has been, rather than its plain panel showing first. Its recordings there from
     /// its start are readied, each held at its start with its first picture drawn; those readied
-    /// for a slide the next click no longer brings end.
+    /// for a slide the next click no longer brings end. They're readied only while fewer than
+    /// [`MOST_PLAYING`] play or are readied.
     fn ready_next(&mut self, document: &Entity<Document>, cx: &mut Context<Self>) {
         let here = self.show.read(cx).session.place().slide;
         let upcoming = self.show.update(cx, |show, cx| show.upcoming(cx)).filter(|upcoming| upcoming.slide != here);
@@ -697,6 +706,10 @@ impl AudienceView {
             return;
         }
         for terminal in terminals {
+            // Within the most that play or are readied at once, the slide shown's first.
+            if self.current.read(cx).playing_recordings().len() + self.ready.len() >= MOST_PLAYING {
+                break;
+            }
             let Some(source) = terminal.source.clone() else { continue };
             let readied = self.ready.iter().any(|(_, replay)| replay.layer == terminal.layer && replay.on.src == terminal.on.src);
             if readied || terminal.click.unwrap_or(0) > upcoming.step {
