@@ -10,9 +10,11 @@
 //! the end, has the text the window has. Among the window's steps a made video is put on the
 //! slide, from the Video tool's dialog or dropped, played and stopped; a made 3D model is put on
 //! the slide the same ways, turned by its button or Space, dragged round and zoomed, its view
-//! set, and turning done; and the show started, stepped through, dragged on and ended: a video
-//! plays and a model turns only while it alone is selected in the editor, nothing plays once the
-//! show is over, and at the end no model is turned or held on the graphics card.
+//! set, and turning done; a made terminal recording is put on the slide the same ways, played and
+//! stopped by its button or Space; and the show started, stepped through, dragged on, clicked
+//! through a recording's marks and back, and ended: a video plays, a model turns and a recording
+//! plays only while it alone is selected in the editor, nothing plays once the show is over and
+//! every replay's thread ends, and at the end no model is turned or held on the graphics card.
 //!
 //! Each talk runs with a few seeds; `SEEDS=n` runs seed `n` alone, and `SEEDS=a..b` a range.
 //! `PROPTEST_CASES=n` runs the arranging with `n` seeds in all, spread over its talks.
@@ -597,6 +599,41 @@ fn model_selected(typing: &typing::Typing, cx: &TestAppContext) -> bool {
     things == 1 && typing::selected(typing, cx).is_some_and(|(_, range)| source.get(range).is_some_and(|thing| thing.starts_with("<Model")))
 }
 
+/// The thing selected, if it's a terminal recording and nothing else is.
+fn recording_selected(typing: &typing::Typing, cx: &TestAppContext) -> bool {
+    let source = typing.source(cx);
+    let things = typing.document(cx).read_with(cx, |document, _| document.selection().map_or(0, |selection| selection.things.len()));
+    things == 1 && typing::selected(typing, cx).is_some_and(|(_, range)| source.get(range).is_some_and(|thing| thing.starts_with("<Terminal")))
+}
+
+/// The recordings playing in the editor.
+fn recordings_playing(typing: &typing::Typing, cx: &TestAppContext) -> usize {
+    cx.read(|cx| typing.view.read(cx).slide_canvas().read(cx).playing_recordings().len())
+}
+
+/// The canvas of the slide the audience sees, among the show's windows `shows`: it's looked for
+/// afresh each time, as the audience's two canvases swap as a slide comes in.
+fn audience_canvas(cx: &mut TestAppContext, shows: &[gpui_kit::AnyWindowHandle]) -> Option<gpui_kit::Entity<stagepack_studio::slide_canvas::SlideCanvas>> {
+    use stagepack_studio::present_view::AudienceView;
+    cx.read(|cx| {
+        shows.iter().find_map(|window| {
+            let root = window.downcast::<gpui_kit::base::Root>()?.read(cx).ok()?;
+            let view = root.view().clone().downcast::<AudienceView>().ok()?;
+            Some(view.read(cx).current().clone())
+        })
+    })
+}
+
+/// Waits, in real time, for every replay's thread to end, drawing the windows meanwhile.
+fn replays_end(cx: &mut TestAppContext, what: &str) {
+    let began = std::time::Instant::now();
+    while stagepack_studio::replay::threads_running() > 0 {
+        assert!(began.elapsed() < std::time::Duration::from_secs(10), "{what}: a replay's thread didn't end");
+        a_moment(cx);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
 /// The models turned in the editor.
 fn models_turned(typing: &typing::Typing, cx: &TestAppContext) -> usize {
     cx.read(|cx| typing.view.read(cx).slide_canvas().read(cx).models_turned().len())
@@ -642,6 +679,11 @@ impl Drop for Drawing {
 static MODELS_INSERTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static MODELS_TURNED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static VIEWS_SET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// How many times the window runs put a terminal recording on a slide, played one in the editor,
+/// and clicked in the show while a recording's slide showed.
+static RECORDINGS_INSERTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static RECORDINGS_PLAYED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static RECORDING_CLICKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// How many drags the show's windows took, whole.
 static SHOW_DRAGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -821,7 +863,7 @@ fn window_run(cx: &mut TestAppContext, start: Start, seed: u64) {
     use stagepack_studio::slide_editor::handle_id;
     use stagepack_studio::start_screen::template_tile_id;
     use stagepack_studio::templates::templates;
-    use stagepack_studio::slide_editor::{MODEL_DONE_ID, MODEL_SET_VIEW_ID, MODEL_TURN_ID, VIDEO_PLAY_ID, VIDEO_STOP_ID};
+    use stagepack_studio::slide_editor::{MODEL_DONE_ID, MODEL_SET_VIEW_ID, MODEL_TURN_ID, TERMINAL_PLAY_ID, TERMINAL_STOP_ID, VIDEO_PLAY_ID, VIDEO_STOP_ID};
     // The scratch folder a new presentation keeps all it keeps in, and is saved to.
     let root = tempfile::tempdir().unwrap();
     // A made video, outside the talk, to put on its slides: six pictures of a colour each.
@@ -830,6 +872,10 @@ fn window_run(cx: &mut TestAppContext, start: Start, seed: u64) {
     // And a made 3D model: a box of three materials.
     let model = root.path().join("Made box.glb");
     std::fs::write(&model, slides_model::make_test_glb(slides_model::MadeGlb::Boxes)).unwrap();
+    // And a made terminal recording: a short session with a mark, and a program in the alternate
+    // screen.
+    let recording = root.path().join("Made run.cast");
+    std::fs::write(&recording, slides_terminal::make_demo_cast()).unwrap();
     let (typing, mut first_save_due) = match start {
         Start::Talk(talk) => (typing::open_with(cx, talk, Some(stagepack_studio::recovery::Recovery::new(root.path().join("recovery")))), None),
         Start::StartScreen => {
@@ -861,10 +907,10 @@ fn window_run(cx: &mut TestAppContext, start: Start, seed: u64) {
             first_save(&typing, cx, &save, seed);
             saved = Some(save);
         }
-        // Choices 0 to 29 each do something, and the three past them type a letter: with choice
-        // 5, typing has 4 chances in 33, as it had 4 in 30 before the models' three arms came, so
-        // it stays among the most done.
-        let choice = rng.below(33);
+        // Choices 0 to 32 each do something, and the three past them type a letter: with choice
+        // 5, typing has 4 chances in 36, as it had 4 in 30 before the models' and the recordings'
+        // three arms each came, so it stays among the most done.
+        let choice = rng.below(36);
         let elements = typing.layout(cx).elements().to_vec();
         let element = (!elements.is_empty()).then(|| elements[rng.below(elements.len())].clone());
         let modifiers = [Modifiers::default(), Modifiers::shift(), Modifiers::control()][rng.below(3)];
@@ -1114,8 +1160,88 @@ fn window_run(cx: &mut TestAppContext, start: Start, seed: u64) {
                     click_if_shown(&typing, cx, MODEL_DONE_ID);
                 }
             }
+            // A made recording put on the slide, from the Terminal recording tool's dialog or dropped.
+            (30, _) => {
+                let before = typing.source(cx).matches("<Terminal").count();
+                if rng.below(2) == 0 {
+                    let view = typing.view.clone();
+                    let path = recording.clone();
+                    cx.update(|cx| view.update(cx, |view, cx| view.chosen_recordings(vec![path], cx)));
+                    cx.run_until_parked();
+                    typing.settle(cx);
+                } else {
+                    drop_file(&typing, cx, recording.clone(), rng.below(1920) as f32, rng.below(1080) as f32);
+                }
+                if typing.source(cx).matches("<Terminal").count() > before {
+                    RECORDINGS_INSERTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            // A recording on the slide selected and played, or stopped, by its button or Space.
+            (31, _) => {
+                let source = typing.source(cx);
+                let recordings: Vec<_> = elements.iter().filter(|element| source.get(element.source.clone()).is_some_and(|thing| thing.starts_with("<Terminal"))).cloned().collect();
+                if !recordings.is_empty() && !recording_selected(&typing, cx) {
+                    let recording = &recordings[rng.below(recordings.len())];
+                    let at = typing.at(cx, recording.rect.x + recording.rect.w / 5., recording.rect.y + recording.rect.h / 5.);
+                    typing.click(cx, at);
+                }
+                match rng.below(3) {
+                    0 => typing.press(cx, "space"),
+                    _ => {
+                        if !click_if_shown(&typing, cx, TERMINAL_PLAY_ID) {
+                            click_if_shown(&typing, cx, TERMINAL_STOP_ID);
+                        }
+                    }
+                }
+                if recordings_playing(&typing, cx) > 0 {
+                    RECORDINGS_PLAYED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                // A little real time for its thread to play in, and the frames it asks for.
+                for _ in 0..rng.below(4) {
+                    std::thread::sleep(std::time::Duration::from_millis(rng.below(40) as u64));
+                    a_moment(cx);
+                }
+            }
+            // The show, with a recording in the talk, clicked through, now and then back a step,
+            // as its marks stop it, and ended: every replay's thread ends after.
+            (32, _) => {
+                if slices(&typing.source(cx)).iter().any(|slide| slide.contains("<Terminal")) {
+                    typing.press(cx, "escape");
+                    let before = cx.read(|cx| cx.windows());
+                    typing.press(cx, ["f5", "shift-f5"][rng.below(2)]);
+                    cx.run_until_parked();
+                    let shows = windows_since(&before, cx);
+                    assert!(!shows.is_empty(), "seed {seed} step {step}: the show didn't start");
+                    for _ in 0..4 + rng.below(12) {
+                        let canvas = audience_canvas(cx, &shows).expect("the audience's window");
+                        if cx.read(|cx| !canvas.read(cx).replay_times().is_empty()) {
+                            RECORDING_CLICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        let show = shows[rng.below(shows.len())];
+                        cx.simulate_keystrokes(show, ["right", "right", "space", "left"][rng.below(4)]);
+                        std::thread::sleep(std::time::Duration::from_millis(rng.below(30) as u64));
+                        a_moment(cx);
+                    }
+                    let which = rng.below(shows.len());
+                    cx.simulate_keystrokes(shows[which], "escape");
+                    cx.run_until_parked();
+                    assert!(windows_since(&before, cx).is_empty(), "seed {seed} step {step}: Escape in show window {which} didn't end the show");
+                    replays_end(cx, &format!("seed {seed} step {step}: the show over"));
+                    typing.with_window(cx, |window, _| window.activate_window());
+                    typing.settle(cx);
+                }
+            }
             _ => typing.type_text(cx, "b"),
         }
+        let replaying = recordings_playing(&typing, cx);
+        assert!(
+            replaying == 0 || (replaying == 1 && recording_selected(&typing, cx)),
+            "seed {seed} step {step}, choice {choice}: {replaying} recordings play in the editor, with the recording selected {}, {:?} selected, typing {}\n{}",
+            recording_selected(&typing, cx),
+            typing.document(cx).read_with(cx, |document, _| document.selection().cloned()),
+            typing.editing(cx).is_some(),
+            typing.source(cx)
+        );
         let turned = models_turned(&typing, cx);
         assert!(
             turned == 0 || (turned == 1 && model_selected(&typing, cx)),
@@ -1155,6 +1281,8 @@ fn window_run(cx: &mut TestAppContext, start: Start, seed: u64) {
     typing.press(cx, "escape");
     assert_eq!(videos_playing(&typing, cx), 0, "seed {seed}: a video plays with nothing selected");
     assert_eq!(models_turned(&typing, cx), 0, "seed {seed}: a model turns with nothing selected");
+    assert_eq!(recordings_playing(&typing, cx), 0, "seed {seed}: a recording plays with nothing selected");
+    replays_end(cx, &format!("seed {seed}: at the end"));
     cx.run_until_parked();
     assert_eq!(stagepack_studio::model_view::scenes_held(), 0, "seed {seed}: a model is held on the graphics card with none turned");
     if let Some(save) = &saved {
@@ -1189,9 +1317,14 @@ fn random_presses_keep_the_slide_free_while_the_list_or_notes_have_the_keyboard(
     }
     let count = |counted: &std::sync::atomic::AtomicUsize| counted.load(std::sync::atomic::Ordering::Relaxed);
     let (inserted, turned, set, dragged) = (count(&MODELS_INSERTED), count(&MODELS_TURNED), count(&VIEWS_SET), count(&SHOW_DRAGS));
-    let said = format!("the window runs put {inserted} models on slides, turned one {turned} times, set {set} views and dragged in the show {dragged} times");
+    let (recorded, played, clicked) = (count(&RECORDINGS_INSERTED), count(&RECORDINGS_PLAYED), count(&RECORDING_CLICKS));
+    let said = format!(
+        "the window runs put {inserted} models on slides, turned one {turned} times, set {set} views and dragged in the show {dragged} times; \
+         put {recorded} recordings on slides, played one {played} times and clicked in the show on a recording's slide {clicked} times"
+    );
     println!("{said}");
     if seeds().count() >= 5 {
         assert!(inserted > 0 && turned > 0 && set > 0 && dragged > 0, "{said}");
+        assert!(recorded > 0 && played > 0 && clicked > 0, "{said}");
     }
 }
