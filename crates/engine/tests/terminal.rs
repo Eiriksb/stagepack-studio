@@ -917,3 +917,77 @@ fn a_recording_still_being_shaped_is_the_same_recording() {
     let on = TerminalOn { src: "assets/run.cast".to_string(), rect: Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }, rotate: 0.0, stops: 2, pending: true };
     assert_eq!(on, TerminalOn { pending: false, ..on.clone() });
 }
+
+/// Each glyph `items` draws: the text of its cluster, where it starts and how far it goes, the
+/// cell its cluster is on for cells `cell` wide from `left`, and whether a font had it.
+fn glyphs_on_cells(items: &[DisplayItem], left: f32, cell: f32) -> Vec<(String, f32, f32, usize, bool)> {
+    let mut found = Vec::new();
+    for item in items {
+        let DisplayItem::Text { text, x, .. } = item else { continue };
+        let first = ((x - left) / cell).round() as usize;
+        for run in text.buffer.layout_runs() {
+            for glyph in run.glyphs {
+                // Every letter in these rows is one character of one cell.
+                let on = first + run.text[..glyph.start].chars().count();
+                found.push((run.text[glyph.start..glyph.end].to_string(), x + glyph.x, glyph.w, on, glyph.glyph_id != 0));
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn letters_another_font_draws_wider_stay_on_their_cells_and_in_the_box() {
+    // The app's fonts: letters the bundled one hasn't come from the system's, at their own widths.
+    let mut fonts = Fonts::with_system_fallback();
+    let rect = Rect { x: 0.0, y: 0.0, w: 720.0, h: 72.0 };
+    let (row, columns) = (36.0, 40u16);
+    let cell = row * CELL_SHAPE;
+    let left = ((rect.w - f32::from(columns) * cell) / 2.0).round();
+    for (script, letter) in [("Tamil", '\u{b94}'), ("Devanagari", '\u{915}'), ("Hebrew", '\u{5d0}'), ("Arabic", '\u{628}')] {
+        for written in [letter.to_string().repeat(40), format!("ab{}cd", letter.to_string().repeat(36))] {
+            let mut screen = Screen::new(columns, 2);
+            screen.feed(&written);
+            let items = screen_items(&screen, rect, &mut fonts);
+            let glyphs = glyphs_on_cells(&items, left, cell);
+            if glyphs.iter().any(|(text, .., had)| text.contains(letter) && !had) {
+                eprintln!("skipped {script}: no font on this machine has its letters");
+                continue;
+            }
+            assert!(!glyphs.is_empty(), "{script}");
+            for (text, x, w, _, _) in &glyphs {
+                assert!(*x >= rect.x - 0.01 && x + w <= rect.x + rect.w + 0.01, "{script}: {text} from {x} to {} outside the box", x + w);
+            }
+            let mut starts: HashMap<usize, f32> = HashMap::new();
+            for (_, x, _, on, _) in &glyphs {
+                let start = starts.entry(*on).or_insert(*x);
+                *start = start.min(*x);
+            }
+            assert_eq!(starts.len(), written.chars().count(), "{script}: a cluster for each cell");
+            for (on, x) in starts {
+                assert!((x - (left + on as f32 * cell)).abs() < 0.01, "{script}: the letter on cell {on} starts at {x}, not {}", left + on as f32 * cell);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_recording_is_drawn_within_its_box_whatever_its_items_reach() {
+    let cast = make_test_cast(10, 2, &[(0.1, "o", "word")]);
+    let mut deck = deck_of("<Terminal src=\"assets/run.cast\" x=\"0\" y=\"0\" w=\"200\" h=\"80\" />\n", &[("assets/run.cast", cast)]);
+    let spec = terminal_layer(&mut deck, 0);
+    let plain = render_layer(&spec, 1.0, deck.fonts_mut());
+    // A fill reaching far past the box, as text a font draws too wide would.
+    let mut items: Vec<DisplayItem> = spec.items.to_vec();
+    let path = tiny_skia::PathBuilder::from_rect(tiny_skia::Rect::from_xywh(-300.0, -300.0, 900.0, 900.0).unwrap());
+    items.push(DisplayItem::Fill { path, color: toolkit::Color::rgb(255, 0, 0) });
+    let reaching = LayerSpec { items: items.into(), ..spec.clone() };
+    let drawn = render_layer(&reaching, 1.0, deck.fonts_mut());
+    assert_eq!((drawn.pixmap.width(), drawn.pixmap.height(), drawn.x, drawn.y), (plain.pixmap.width(), plain.pixmap.height(), plain.x, plain.y), "the box's pixels alone");
+    // Turned, the corners of the pixmap around it are outside the box, and left clear.
+    let turned = render_layer(&LayerSpec { rotate: 30.0, ..reaching }, 1.0, deck.fonts_mut());
+    assert!(turned.pixmap.width() < 400, "the turned box's pixels alone: {}", turned.pixmap.width());
+    assert_eq!(turned.pixmap.pixel(1, 1).unwrap().alpha(), 0, "a corner outside the turned box is clear");
+    let middle = turned.pixmap.pixel(turned.pixmap.width() / 2, turned.pixmap.height() / 2).unwrap();
+    assert_eq!((middle.red(), middle.alpha()), (255, 255), "inside it, what's drawn");
+}

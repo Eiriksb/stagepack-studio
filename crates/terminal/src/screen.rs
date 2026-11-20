@@ -496,10 +496,7 @@ impl Screen {
 
     fn print(&mut self, c: char) {
         let c = if self.pen.lines { line_drawing(c) } else { c };
-        let wide = match c {
-            ' '..='~' => 1,
-            _ => c.width().unwrap_or(0),
-        };
+        let wide = cells_of(c);
         if wide == 0 {
             return self.join(c);
         }
@@ -983,4 +980,19 @@ fn line_drawing(c: char) -> char {
         '_'..='~' => LINES[c as usize - '_' as usize],
         c => c,
     }
+}
+
+/// How many cells a character written to a screen takes: none for a mark joined to the character
+/// before it, two for a wide one.
+fn cells_of(c: char) -> usize {
+    match c {
+        ' '..='~' => 1,
+        _ => c.width().unwrap_or(0),
+    }
+}
+
+/// Whether `c`, written to a screen, is a mark joined to the character before it rather than a
+/// character of its own cells.
+pub fn joins(c: char) -> bool {
+    cells_of(c) == 0
 }

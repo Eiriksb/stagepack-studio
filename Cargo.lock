@@ -7153,6 +7153,7 @@ dependencies = [
  "cosmic-text",
  "image",
  "krilla",
+ "miniz_oxide 0.8.9",
  "slides-engine",
  "slides-terminal",
  "tempfile",

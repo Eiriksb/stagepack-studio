@@ -4,7 +4,7 @@ use std::cell::Cell;
 use std::sync::Arc;
 
 use tiny_skia::{
-    ColorU8, FillRule, FilterQuality, Paint, Pixmap, PixmapMut, PixmapPaint, Point, Shader, Stroke, Transform,
+    ColorU8, FillRule, FilterQuality, Mask, Paint, Pixmap, PixmapMut, PixmapPaint, Point, Shader, Stroke, Transform,
 };
 use toolkit::Color;
 
@@ -35,9 +35,13 @@ pub(crate) fn device_offset(at: f32) -> i32 {
 }
 
 /// `(left, top, right, bottom)` of the box around the rect and everything drawn, before
-/// rotation, with the rect's top-left corner as the origin.
+/// rotation, with the rect's top-left corner as the origin. A terminal recording is its box
+/// alone: what its items reach past it, as a letter a font draws wider than its cell, isn't drawn.
 fn extent(spec: &LayerSpec) -> (f32, f32, f32, f32) {
     let (mut left, mut top, mut right, mut bottom) = (0.0_f32, 0.0_f32, spec.rect.w, spec.rect.h);
+    if spec.terminal.is_some() {
+        return (left, top, right, bottom);
+    }
     for item in spec.items.iter() {
         let (l, t, r, b) = match item {
             DisplayItem::Fill { path, .. } => {
@@ -275,6 +279,15 @@ fn draw_layer(spec: &LayerSpec, scale: f32, mut text: impl FnMut(&mut PixmapMut,
                 let picture_paint = PixmapPaint { quality: FilterQuality::Bilinear, ..PixmapPaint::default() };
                 target.draw_pixmap(0, 0, (**picture).as_ref(), &picture_paint, fit, None);
             }
+        }
+    }
+    // A turned recording's pixmap holds more than its box, at the corners: what's drawn there is
+    // cleared, so nothing of it shows past its box.
+    if cells && (at.kx != 0.0 || at.ky != 0.0) {
+        let mask = tiny_skia::Rect::from_xywh(0.0, 0.0, spec.rect.w, spec.rect.h).zip(Mask::new(width, height));
+        if let Some((rect, mut mask)) = mask {
+            mask.fill_path(&tiny_skia::PathBuilder::from_rect(rect), FillRule::Winding, true, at);
+            pixmap.apply_mask(&mask);
         }
     }
     Layer {

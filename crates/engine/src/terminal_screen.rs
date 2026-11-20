@@ -108,11 +108,13 @@ struct Span {
     look: Look,
 }
 
-/// A text item of the screen: the cell it starts at, and its pieces.
+/// A text item of the screen: the cell it starts at, its pieces, and whether it's one wide
+/// character, of two cells, rather than characters of a cell each.
 struct CellText {
     row: u16,
     col: u16,
     spans: Vec<Span>,
+    wide: bool,
 }
 
 /// Cells in a row: the row, the first column and how many.
@@ -170,14 +172,14 @@ fn merged(row: u16, runs: &[Run]) -> CellText {
         })
         .collect();
     spans.extend(runs.last().map(|last| Span { text: last.text.clone(), look: last.look }));
-    CellText { row, col: runs.first().map_or(0, |first| first.from), spans }
+    CellText { row, col: runs.first().map_or(0, |first| first.from), spans, wide: false }
 }
 
 /// The runs of a row as its text items: each alone if there are few enough, or else those
 /// between wide characters merged, each wide character standing alone, as no font's is exactly
 /// two cells wide.
 fn row_texts(row: u16, runs: Vec<Run>) -> Vec<CellText> {
-    let alone = |run: &Run| CellText { row, col: run.from, spans: vec![Span { text: run.text.clone(), look: run.look }] };
+    let alone = |run: &Run| CellText { row, col: run.from, spans: vec![Span { text: run.text.clone(), look: run.look }], wide: run.wide };
     if runs.len() <= MOST_RUNS_A_ROW {
         return runs.iter().map(alone).collect();
     }
@@ -349,32 +351,181 @@ pub(crate) fn grid(columns: u16, rows: u16, rect: Rect) -> Option<Grid> {
     Some(Grid { row, cell, left: rect.x + on_unit((rect.w - cell * columns) / 2.0), top: rect.y + on_unit((rect.h - row * rows) / 2.0), whole, rect })
 }
 
-/// The text items of `laid` shaped for rows `row` units high, in its order: the same wherever the
-/// box is, and however large, as long as its rows are as high. Rows too small for text have none.
-pub(crate) fn shape(laid: &LaidScreen, row: f32, fonts: &mut Fonts) -> Vec<ShapedText> {
+/// A piece of a screen's text, shaped: the cell it starts at, how far below the top of its row
+/// it's drawn, and its text.
+#[derive(Clone)]
+pub(crate) struct ShapedCells {
+    row: u16,
+    col: u16,
+    down: f32,
+    text: ShapedText,
+}
+
+/// A character of a text item and the marks joined to it: where it is in the item's text, in
+/// bytes, the cell it starts at, counted from the item's first, and how many cells it has.
+struct Cluster {
+    start: usize,
+    end: usize,
+    cell: u16,
+    cells: u16,
+}
+
+/// The characters of `text`, with the marks joined to each.
+fn clusters(text: &CellText) -> Vec<Cluster> {
+    let cells = if text.wide { 2 } else { 1 };
+    let mut clusters: Vec<Cluster> = Vec::new();
+    let mut at = 0;
+    for span in &text.spans {
+        for (from, c) in span.text.char_indices() {
+            let (start, end) = (at + from, at + from + c.len_utf8());
+            match clusters.last_mut() {
+                Some(last) if slides_terminal::joins(c) => last.end = end,
+                _ => {
+                    let cell = clusters.last().map_or(0, |last| last.cell + last.cells);
+                    clusters.push(Cluster { start, end, cell, cells });
+                }
+            }
+        }
+        at += span.text.len();
+    }
+    clusters
+}
+
+/// How near its cell a letter has to be to be on it, in cells.
+const ON_CELL: f32 = 1.0 / 256.0;
+
+/// For each of `clusters`, where `shaped` starts it and how far it reaches, if it's shaped at
+/// all, and whether all of it runs left to right.
+fn extents(shaped: &ShapedText, clusters: &[Cluster]) -> Vec<Option<(f32, f32, bool)>> {
+    let mut found: Vec<Option<(f32, f32, bool)>> = clusters.iter().map(|_| None).collect();
+    for run in shaped.buffer.layout_runs() {
+        for glyph in run.glyphs {
+            let at = clusters.partition_point(|cluster| cluster.start <= glyph.start).saturating_sub(1);
+            let Some(extent) = found.get_mut(at) else { continue };
+            let (left, right, ltr) = extent.get_or_insert((f32::MAX, f32::MIN, true));
+            (*left, *right, *ltr) = (left.min(glyph.x), right.max(glyph.x + glyph.w), *ltr && glyph.level.is_ltr());
+        }
+    }
+    found
+}
+
+/// Whether each of `clusters` that `shaped` has starts on its cell and stays within its cells,
+/// for cells `cell` wide, and runs left to right, all on one line.
+fn on_cells(shaped: &ShapedText, clusters: &[Cluster], cell: f32) -> bool {
+    shaped.buffer.layout_runs().all(|run| run.line_i == 0)
+        && clusters.iter().zip(extents(shaped, clusters)).all(|(cluster, extent)| {
+            extent.is_none_or(|(left, right, ltr)| {
+                ltr && (left - f32::from(cluster.cell) * cell).abs() <= ON_CELL * cell && right <= f32::from(cluster.cell + cluster.cells) * cell + ON_CELL * cell
+            })
+        })
+}
+
+/// The runs to shape of the part of `text` from byte `start` to `end`, at `size`.
+fn runs_of(text: &CellText, start: usize, end: usize, size: f32) -> Vec<TextRun> {
+    let mut runs = Vec::new();
+    let mut at = 0;
+    for span in &text.spans {
+        let (from, to) = (start.max(at), end.min(at + span.text.len()));
+        if from < to {
+            let look = span.look;
+            runs.push(TextRun { text: span.text[from - at..to - at].to_string(), size, bold: look.bold, italic: look.italic, underline: false, color: color(look.fg), family: MONO.to_string() });
+        }
+        at += span.text.len();
+    }
+    runs
+}
+
+/// What a character shaped alone is, by its text and look, so that one written again and again is
+/// shaped once: its text, shaped narrower if it would be wider than its cells, and how far below
+/// its row's top it goes, or nothing if it can't be made narrow enough to read.
+type Alone = HashMap<(String, [u8; 3], bool, bool), Option<(ShapedText, f32)>>;
+
+/// A character of `text` and its marks shaped alone for rows `row` units high, and drawn narrower
+/// if its font has it wider than its cells, in the middle of its row.
+fn shape_alone(text: &CellText, cluster: &Cluster, row: f32, fonts: &mut Fonts, alone: &mut Alone) -> Option<(ShapedText, f32)> {
+    let runs = runs_of(text, cluster.start, cluster.end, row / LINE_HEIGHT);
+    let first = runs.first()?;
+    let key = (runs.iter().map(|run| run.text.as_str()).collect::<String>(), [first.color.r, first.color.g, first.color.b], first.bold, first.italic);
+    if let Some(shaped) = alone.get(&key) {
+        return shaped.clone();
+    }
+    let room = f32::from(cluster.cells) * row * CELL_SHAPE;
+    let (mut size, mut shaped) = (row / LINE_HEIGHT, shape_text(fonts, &runs, None, Align::Left));
+    // Shaped again smaller until it fits, as its width goes with its size.
+    for _ in 0..3 {
+        let reach = shaped.buffer.layout_runs().flat_map(|run| run.glyphs.iter()).map(|glyph| glyph.x + glyph.w).fold(0.0, f32::max);
+        if reach <= room * (1.0 + ON_CELL / 2.0) {
+            break;
+        }
+        size *= room / reach * (1.0 - ON_CELL / 4.0);
+        if size < MIN_TEXT_SIZE {
+            alone.insert(key, None);
+            return None;
+        }
+        let runs: Vec<TextRun> = runs.iter().map(|run| TextRun { size, ..run.clone() }).collect();
+        shaped = shape_text(fonts, &runs, None, Align::Left);
+    }
+    let made = Some((shaped, (row - size * LINE_HEIGHT) / 2.0));
+    alone.insert(key, made.clone());
+    made
+}
+
+/// The text items of `laid` shaped for rows `row` units high: the same wherever the box is, and
+/// however large, as long as its rows are as high. Rows too small for text have none. Each
+/// character is on its cell, as the terminal had it: an item a font shapes off its cells, as one
+/// that draws a letter wider than the bundled font's or runs it right to left does, is shaped in
+/// pieces, each of its characters that's off on its own, at its cell and narrowed to fit them.
+pub(crate) fn shape(laid: &LaidScreen, row: f32, fonts: &mut Fonts) -> Vec<ShapedCells> {
     let size = row / LINE_HEIGHT;
     // Text is no smaller than this, and would be higher than such rows are.
     if size < MIN_TEXT_SIZE {
         return Vec::new();
     }
-    laid.texts
-        .iter()
-        .map(|text| {
-            let runs: Vec<TextRun> = text
-                .spans
-                .iter()
-                .map(|span| TextRun { text: span.text.clone(), size, bold: span.look.bold, italic: span.look.italic, underline: false, color: color(span.look.fg), family: MONO.to_string() })
-                .collect();
-            shape_text(fonts, &runs, None, Align::Left)
-        })
-        .collect()
+    let cell = row * CELL_SHAPE;
+    let mut alone = Alone::new();
+    let mut pieces = Vec::with_capacity(laid.texts.len());
+    for text in &laid.texts {
+        let whole = shape_text(fonts, &runs_of(text, 0, usize::MAX, size), None, Align::Left);
+        let clusters = clusters(text);
+        if on_cells(&whole, &clusters, cell) {
+            pieces.push(ShapedCells { row: text.row, col: text.col, down: 0.0, text: whole });
+            continue;
+        }
+        // Those that fit their cells where they are go together, from the first of them.
+        let fits: Vec<bool> = clusters
+            .iter()
+            .zip(extents(&whole, &clusters))
+            .map(|(cluster, extent)| extent.is_none_or(|(left, right, ltr)| ltr && right - left <= f32::from(cluster.cells) * cell * (1.0 + ON_CELL)))
+            .collect();
+        let mut at = 0;
+        while at < clusters.len() {
+            let together = fits[at..].iter().take_while(|fits| **fits).count();
+            let group = &clusters[at..at + together.max(1)];
+            at += group.len();
+            if together > 1 {
+                let (start, end) = (group[0].start, group[group.len() - 1].end);
+                let shaped = shape_text(fonts, &runs_of(text, start, end, size), None, Align::Left);
+                let moved: Vec<Cluster> = group.iter().map(|cluster| Cluster { start: cluster.start - start, end: cluster.end - start, cell: cluster.cell - group[0].cell, cells: cluster.cells }).collect();
+                if on_cells(&shaped, &moved, cell) {
+                    pieces.push(ShapedCells { row: text.row, col: text.col + group[0].cell, down: 0.0, text: shaped });
+                    continue;
+                }
+            }
+            for cluster in group {
+                if let Some((shaped, down)) = shape_alone(text, cluster, row, fonts, &mut alone) {
+                    pieces.push(ShapedCells { row: text.row, col: text.col + cluster.cell, down, text: shaped });
+                }
+            }
+        }
+    }
+    pieces
 }
 
 /// About how many bytes shaped text holds.
-pub(crate) fn shaped_bytes(shaped: &[ShapedText]) -> usize {
+pub(crate) fn shaped_bytes(shaped: &[ShapedCells]) -> usize {
     // Each glyph is held as it's shaped and as it's laid out, and the line's text with it.
     let glyph = 2 * size_of::<cosmic_text::LayoutGlyph>() + 32;
-    shaped.iter().map(|text| 512 + text.buffer.layout_runs().map(|run| 2 * run.text.len() + run.glyphs.len() * glyph).sum::<usize>()).sum()
+    shaped.iter().map(|piece| 512 + piece.text.buffer.layout_runs().map(|run| 2 * run.text.len() + run.glyphs.len() * glyph).sum::<usize>()).sum()
 }
 
 /// About how many bytes placed items hold: each item, and each path's points and verbs.
@@ -395,7 +546,7 @@ pub(crate) fn placed_bytes(items: &[DisplayItem]) -> usize {
 /// `laid` placed on `grid`, with its text `shaped` for the grid's rows: a fill of the screen's
 /// background over the whole box, a fill for each background colour but the screen's own, the
 /// text, and a stroke for each colour of underline.
-pub(crate) fn place(laid: &LaidScreen, grid: &Grid, shaped: &[ShapedText]) -> Vec<DisplayItem> {
+pub(crate) fn place(laid: &LaidScreen, grid: &Grid, shaped: &[ShapedCells]) -> Vec<DisplayItem> {
     let mut items: Vec<DisplayItem> = panel(grid.rect).into_iter().collect();
     let x = |col: u16| grid.left + f32::from(col) * grid.cell;
     let y = |row: u16| grid.top + f32::from(row) * grid.row;
@@ -412,8 +563,8 @@ pub(crate) fn place(laid: &LaidScreen, grid: &Grid, shaped: &[ShapedText]) -> Ve
             items.push(DisplayItem::Fill { path, color: color(*colour) });
         }
     }
-    for (text, shaped) in laid.texts.iter().zip(shaped) {
-        items.push(DisplayItem::Text { text: shaped.clone(), x: x(text.col), y: y(text.row) });
+    for piece in shaped {
+        items.push(DisplayItem::Text { text: piece.text.clone(), x: x(piece.col), y: y(piece.row) + piece.down });
     }
     let width = if grid.whole { (grid.row / 16.0).max(1.0) } else { grid.row / 16.0 };
     for (colour, cells) in &laid.lines {
@@ -489,5 +640,5 @@ pub(crate) fn lay_out_terminal(tag: &Tag, wanted: (Option<f32>, Option<f32>), pl
 }
 
 /// Shaped text and placed items, kept for a recording as it's laid out again and again.
-pub(crate) type Shaped = Arc<[ShapedText]>;
+pub(crate) type Shaped = Arc<[ShapedCells]>;
 pub(crate) type Placed = Arc<[DisplayItem]>;
