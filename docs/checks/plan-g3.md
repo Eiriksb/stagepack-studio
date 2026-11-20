@@ -119,4 +119,15 @@ The branch hasn't been pushed or merged yet. Once it's in `main`, this check sta
 
 ## The final review
 
-Left for the plan's final review, as G2's record had its own.
+A reviewer read the whole branch at 8c4ec90, area by area: the terminal crate's reader, screen and player, the engine's tag, screen layout, busy screens aside and stand-ins, and the app's replay, show, editor, inserting, form and exports. It built two scratch programs to test what it suspected and ran no whole suite. It found the steps a recording adds agree between the engine, the show and the editor, every replay's thread ends when it's let go, and each refusal reads the same wherever it's shown. It asked for one fix that matters most, two that matter and four small ones, and the one fix wave made them, with the small ones Tasks 5 and 6 had left:
+
+- **A recording's letters ran past its box** where the system's fonts draw them wider than a cell (above, under *Known after the run*). Each letter is kept on its cell and a recording is drawn within its box everywhere, the PDF's page included. (ccaa0a7)
+- **Opening a packed talk unpacked each recording whole** for its header, on the window's thread. Only its first part is read now. (f3acc51)
+- **Nothing bounded the memory of many recordings** across the slide shown, the next one readied and those checked before they're added. At most four play or are readied at once, replays of one file share what's read of it, and recordings dropped together are checked one at a time, with a line saying so and a Cancel. (795dd6b)
+- **Smaller:** the form's stops count as the show's do; a busy screen's drawn layer is told by its file's version; a file over 32 MB that isn't a recording says so; and the timing tests ask a typical and a near-slowest frame rather than the slowest alone. (ff43e06, c6f69d1, 8974d33, 4be87f9)
+
+The reviewer checked the wave and found one thing its first fix brought: a crafted screen of many different letters each shaped alone was shaped on the window's thread, 84 ms for Tamil letters each in its own colour. Such letters now weigh more toward sending a screen aside, and the same screen is laid out in 0.31 ms. (39d7a0d)
+
+At 39d7a0d, `scripts/cargo-safe.sh test --workspace --no-fail-fast` passed: 2,595 tests, 0 failed, 56 ignored, and clippy gave no warnings. The fourteen release timing tests of recordings passed on the charger. The window wasn't run again after the wave, so its fixes have been seen in tests only.
+
+The smaller findings and the questions for the owner are in `docs/superpowers/plans/2026-11-19-live-content-plan-g3-decisions.md`.
