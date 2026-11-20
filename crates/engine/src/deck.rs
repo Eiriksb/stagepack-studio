@@ -870,6 +870,16 @@ impl Deck {
         terminals_of(self.specs(index))
     }
 
+    /// The terminal recordings on slide `index` at `moment`, among its layers as `layers_at`
+    /// gives them then.
+    pub fn terminals_at(&mut self, index: usize, moment: Moment) -> Vec<TerminalLayer> {
+        if index >= self.slides.len() {
+            return Vec::new();
+        }
+        let moment = self.ensure_laid_at(index, moment);
+        terminals_of(&self.slides[index].laid_at(moment).specs)
+    }
+
     /// The 3D models on slide `index` in its whole state, among its layers as `specs` and
     /// `layers` give them, with the deck's placing.
     pub fn models(&mut self, index: usize) -> Vec<ModelLayer> {

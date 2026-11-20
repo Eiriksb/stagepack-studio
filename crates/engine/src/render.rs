@@ -1,5 +1,6 @@
 //! Draws a `LayerSpec` into its own pixmap, and puts layers together.
 
+use std::cell::Cell;
 use std::sync::Arc;
 
 use tiny_skia::{
@@ -100,6 +101,12 @@ pub fn render_layer(spec: &LayerSpec, scale: f32, fonts: &mut Fonts) -> Layer {
 /// The most pixels of a stretched picture copied on one thread.
 const STRETCHED_ALONE: usize = 250_000;
 
+thread_local! {
+    /// For tests: whether no thread can be made to share a stretch with, as when the system
+    /// has none to give.
+    static THREADS_REFUSED: Cell<bool> = const { Cell::new(false) };
+}
+
 /// `drawn`, `spec`'s layer as it was drawn at `scale` before it was resized, stretched over where
 /// `spec` is drawn now: what's shown of a layer while it's being resized, when drawing it again
 /// each time would take too long.
@@ -136,15 +143,23 @@ pub(crate) fn stretched_layer(drawn: &Layer, spec: &LayerSpec, scale: f32) -> La
     };
     let threads = if to_w * to_h < STRETCHED_ALONE { 1 } else { std::thread::available_parallelism().map_or(1, |n| n.get().min(8)) };
     let rows_each = to_h.div_ceil(threads).max(1);
+    // Each part's rows wait to be copied by its thread, or here if no thread could be made.
+    let parts: Vec<std::sync::Mutex<Option<&mut [tiny_skia::PremultipliedColorU8]>>> =
+        pixmap.pixels_mut().chunks_mut(rows_each * to_w).map(|rows| std::sync::Mutex::new(Some(rows))).collect();
+    let copy_rows = &copy_rows;
     std::thread::scope(|scope| {
-        for (part, rows) in pixmap.pixels_mut().chunks_mut(rows_each * to_w).enumerate() {
-            if threads == 1 {
-                copy_rows(0, rows);
-            } else {
-                scope.spawn(move || copy_rows(part * rows_each, rows));
+        for (part, rows) in parts.iter().enumerate() {
+            let copy = move || {
+                if let Some(rows) = rows.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
+                    copy_rows(part * rows_each, rows);
+                }
+            };
+            if threads == 1 || THREADS_REFUSED.with(Cell::get) || std::thread::Builder::new().spawn_scoped(scope, copy).is_err() {
+                copy();
             }
         }
     });
+    drop(parts);
     Layer { pixmap: Arc::new(pixmap), x: device_offset(min_x), y: device_offset(min_y) }
 }
 
@@ -335,4 +350,32 @@ pub fn to_bgra_frame(pixmap: &Pixmap) -> image::Frame {
         bytes.extend_from_slice(&[c.blue(), c.green(), c.red(), c.alpha()]);
     }
     image::Frame::new(image::RgbaImage::from_raw(pixmap.width(), pixmap.height(), bytes).expect("buffer matches size"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A spec over `rect` with nothing in it.
+    fn spec(rect: Rect) -> LayerSpec {
+        LayerSpec { source: None, rect, rotate: 0.0, items: Vec::new().into(), click: None, enter: Enter::Appear, native: Vec::new(), is_title: false, varies: false, video: None, model: None, terminal: None }
+    }
+
+    #[test]
+    fn a_picture_is_stretched_alike_whether_or_not_a_thread_can_be_made() {
+        let mut pixmap = Pixmap::new(300, 200).unwrap();
+        for (at, pixel) in pixmap.pixels_mut().iter_mut().enumerate() {
+            *pixel = ColorU8::from_rgba((at % 251) as u8, (at / 300 % 251) as u8, 7, 255).premultiply();
+        }
+        let drawn = Layer { pixmap: Arc::new(pixmap), x: 0, y: 0 };
+        // Large enough to be shared among threads.
+        let wanted = spec(Rect { x: 0.0, y: 0.0, w: 1200.0, h: 800.0 });
+        let shared = stretched_layer(&drawn, &wanted, 1.0);
+        THREADS_REFUSED.with(|refused| refused.set(true));
+        let alone = stretched_layer(&drawn, &wanted, 1.0);
+        THREADS_REFUSED.with(|refused| refused.set(false));
+        assert_eq!(alone.pixmap.width(), 1201);
+        assert!(alone.pixmap.data() == shared.pixmap.data(), "copied here, it's the same");
+        assert!(alone.pixmap.pixels().iter().all(|pixel| pixel.alpha() == 255), "every row is copied");
+    }
 }

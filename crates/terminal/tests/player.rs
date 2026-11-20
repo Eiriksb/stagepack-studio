@@ -420,3 +420,19 @@ fn a_long_recording_is_stepped_quickly() {
     }
     assert!(slowest < Duration::from_millis(50), "going back to a mark took {slowest:?}");
 }
+
+#[test]
+fn a_player_says_when_its_screen_changes_and_ends() {
+    let cast = make_test_cast(20, 4, &[(0.5, "o", "a"), (1.0, "o", "b"), (1.0, "m", ""), (1.0, "o", "c"), (1.5, "o", "d")]);
+    let player = Player::new(Arc::new(read(&cast).unwrap()));
+    assert_eq!(player.events_at(Duration::ZERO), 0);
+    assert_eq!(player.events_at(Duration::from_millis(500)), 1);
+    // At the stop, up to its mark: what's at the same time after it comes once it's played on.
+    assert_eq!(player.events_at(Duration::from_secs(1)), 3);
+    assert_eq!(player.events_at(Duration::from_millis(1001)), 4);
+    assert_eq!(player.time_of(0), Some(Duration::from_millis(500)));
+    assert_eq!(player.time_of(4), Some(Duration::from_millis(1500)));
+    assert_eq!(player.time_of(5), None);
+    assert_eq!(player.end(), Duration::from_millis(1500));
+    assert_eq!(player.events_at(player.end()), 5);
+}

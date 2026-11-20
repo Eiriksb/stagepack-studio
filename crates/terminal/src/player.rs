@@ -109,10 +109,7 @@ impl Player {
     /// As `screen_at`, but looking at `stop` between events, and giving nothing if it was set
     /// before the screen was reached. The screen is left where it got to.
     pub fn screen_at_within(&mut self, at: Duration, stop: &AtomicBool) -> Option<&Screen> {
-        let mut target = self.times.partition_point(|time| *time <= at);
-        if let Ok(stop) = self.stops.binary_search(&at) {
-            target = target.min(self.stop_events[stop] + 1);
-        }
+        let target = self.events_at(at);
         // The kept screens start with the first, of no events, so one is always found.
         let nearest = &self.kept[self.kept.partition_point(|kept| kept.events <= target) - 1];
         if target < self.played || nearest.events > self.played {
@@ -126,6 +123,27 @@ impl Player {
             self.step();
         }
         Some(&self.screen)
+    }
+
+    /// How many events the screen at a played time has been fed, as [`Self::screen_at`] plays
+    /// them: every event before it, and those at it up to the stop there if there is one.
+    pub fn events_at(&self, at: Duration) -> usize {
+        let target = self.times.partition_point(|time| *time <= at);
+        match self.stops.binary_search(&at) {
+            Ok(stop) => target.min(self.stop_events[stop] + 1),
+            Err(_) => target,
+        }
+    }
+
+    /// When event `event` is played, counting from none, if the recording has it: after
+    /// [`Self::events_at`] has given `event`, the time the screen next changes.
+    pub fn time_of(&self, event: usize) -> Option<Duration> {
+        self.times.get(event).copied()
+    }
+
+    /// When the recording ends: the played time of its last event.
+    pub fn end(&self) -> Duration {
+        self.times.last().copied().unwrap_or_default()
     }
 
     /// The next stop after a played time.

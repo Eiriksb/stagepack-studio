@@ -883,11 +883,12 @@ impl WorkspaceView {
         }
         self.notices = notices;
         if let Some(layers) = layers {
-            let (videos, models) = document.update(cx, |document, _| (document.videos_here(), document.models_here()));
+            let (videos, models, terminals) = document.update(cx, |document, _| (document.videos_here(), document.models_here(), document.terminals_here()));
             self.slide_canvas.update(cx, |canvas, cx| {
                 canvas.set_layers(layers, cx);
                 canvas.place_videos(&videos, cx);
                 canvas.place_models(&models, cx);
+                canvas.place_recordings(&terminals, cx);
             });
         }
         cx.notify();
@@ -1117,6 +1118,7 @@ impl WorkspaceView {
         // The show plays the talk's videos and turns its models: none does here meanwhile.
         self.slide_editor.update(cx, |editor, cx| {
             editor.stop_video(cx);
+            editor.stop_recording(cx);
             editor.stop_turning(cx);
         });
         let this = cx.entity().downgrade();

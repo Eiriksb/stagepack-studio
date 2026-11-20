@@ -60,6 +60,13 @@ impl Render for SlideEditor {
             _ => (None, false),
         };
         let model_turning = model.is_some() && self.model_turning();
+        // A terminal recording selected that can be played: a button in its middle that plays it,
+        // or stops it while it plays.
+        let terminal = match (selecting, self.document.clone()) {
+            (true, Some(document)) => document.update(cx, |document, _| document.selected_terminal().filter(|_| document.selected_terminal_plays())),
+            _ => None,
+        };
+        let terminal_playing = terminal.is_some() && self.recording_playing(cx);
         // The lines what's dragged snaps to, while the button is down.
         let guides = self.guides().to_vec();
         // A thing being dragged out of the slide's text: a dashed line where it'll go.
@@ -158,6 +165,12 @@ impl Render for SlideEditor {
         let video_button = video.as_ref().zip(placed).map(|(video, (slide, area))| {
             let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
             let rect = video.on.rect;
+            let middle = slide.origin + point(px((rect.x + rect.w / 2.) * unit), px((rect.y + rect.h / 2.) * unit));
+            in_editor(Bounds { origin: middle, size: size(px(0.), px(0.)) }, area).origin
+        });
+        let terminal_button = terminal.as_ref().zip(placed).map(|(terminal, (slide, area))| {
+            let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
+            let rect = terminal.on.rect;
             let middle = slide.origin + point(px((rect.x + rect.w / 2.) * unit), px((rect.y + rect.h / 2.) * unit));
             in_editor(Bounds { origin: middle, size: size(px(0.), px(0.)) }, area).origin
         });
@@ -483,6 +496,41 @@ impl Render for SlideEditor {
                                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                                     cx.stop_propagation();
                                     this.play_or_stop(cx);
+                                }))
+                                .child(label),
+                        ),
+                )
+            })
+            .when_some(terminal_button, |this, middle| {
+                let (id, label) = if terminal_playing { (TERMINAL_STOP_ID, "Stop") } else { (TERMINAL_PLAY_ID, "Play") };
+                this.child(
+                    div()
+                        .absolute()
+                        .left(middle.x)
+                        .top(middle.y)
+                        .child(
+                            div()
+                                .id(id)
+                                .test_support()
+                                .aria_label(label)
+                                .absolute()
+                                // Its middle at the recording's.
+                                .left(px(-32.))
+                                .top(px(-16.))
+                                .w(px(64.))
+                                .h(px(32.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_md()
+                                .bg(button_color)
+                                .text_color(button_text)
+                                .text_sm()
+                                .cursor_pointer()
+                                // The press is the button's, not the slide's beneath it.
+                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.play_or_stop_recording(cx);
                                 }))
                                 .child(label),
                         ),

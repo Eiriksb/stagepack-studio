@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use slides_engine::{AddedFile, MadeStill, MeasureVideo, ModelLayer, StillJob, StillWanted, VideoLayer, is_large_kind};
+use slides_engine::{AddedFile, MadeStill, MeasureVideo, ModelLayer, StillJob, StillWanted, TerminalLayer, VideoLayer, is_large_kind};
 
 use super::*;
 use crate::clipboard::{CopiedLarge, PastedLarge};
@@ -834,6 +834,40 @@ impl Document {
     /// Whether a terminal recording on slide `index` is still being read aside.
     pub fn terminal_pending(&mut self, index: usize) -> bool {
         guarded(|| self.deck.terminal_pending(index)).unwrap_or(false)
+    }
+
+    /// The terminal recordings on the current slide, among the layers [`Self::editor_layers`]
+    /// gives.
+    pub fn terminals_here(&mut self) -> Vec<TerminalLayer> {
+        let current = self.current();
+        guarded(|| self.deck.terminals(current)).unwrap_or_default()
+    }
+
+    /// The terminal recordings on slide `index`, of those a show goes through, at `moment`, among
+    /// the layers [`Self::layers_at`] gives then.
+    pub fn terminals_at(&mut self, index: usize, moment: slides_engine::Moment) -> Vec<TerminalLayer> {
+        guarded(|| self.deck.terminals_at(index, moment)).unwrap_or_default()
+    }
+
+    /// The one thing selected on the slide shown, if it's a terminal recording placed on it.
+    pub fn selected_terminal(&mut self) -> Option<TerminalLayer> {
+        let selected = self.selected()?.clone();
+        if selected.slide != self.current() || self.selection().is_none_or(|selection| selection.things.len() != 1) {
+            return None;
+        }
+        self.terminals_here().into_iter().find(|terminal| terminal.source.as_ref() == Some(&selected.source))
+    }
+
+    /// Whether the terminal recording selected can be played: it's been read, and can be.
+    pub fn selected_terminal_plays(&mut self) -> bool {
+        let Some(source) = self.selected_terminal().and_then(|terminal| terminal.source) else { return false };
+        let current = self.current();
+        !self.terminal_pending(current) && self.terminal_problem_on(current, &source).is_none()
+    }
+
+    /// The talk's fonts, to draw with on another thread, as a recording played is.
+    pub fn fonts_seed(&mut self) -> slides_engine::FontsSeed {
+        self.deck.fonts_mut().seed()
     }
 
     /// Writes `view` as the starting view of the 3D model at `source` on the current slide, as

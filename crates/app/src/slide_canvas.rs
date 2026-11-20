@@ -7,12 +7,13 @@ use std::sync::Arc;
 
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::*;
-use slides_engine::{Layer, ModelLayer, ModelOn, Rect, VideoLayer, VideoOn, to_bgra_frame};
+use slides_engine::{Layer, ModelLayer, ModelOn, Rect, TerminalLayer, TerminalOn, VideoLayer, VideoOn, to_bgra_frame};
 use slides_model::{CantDraw, View};
 
 use crate::document::LargeOpen;
 use crate::model_view::{self, Aim, Turner};
 use crate::present::{LayerLook, SlideLook};
+use crate::replay::{Aim as ReplayAim, Replay, Source as ReplaySource};
 use crate::video_player::{Placed, Player, Shown, Turning, discard, open_and_play};
 
 /// The width of a 16:9 slide, in slide units.
@@ -107,6 +108,13 @@ pub struct SlideCanvas {
     models_released: Rc<Cell<usize>>,
     /// When the models' counts were last written out, and what they were then.
     models_counted: Option<(std::time::Instant, usize, usize)>,
+    /// The terminal recordings playing over their layers.
+    replays: Vec<Replay>,
+    /// Pictures of recordings no longer shown, which the next paint releases.
+    retired_replays: Vec<Arc<RenderImage>>,
+    /// How many pictures of recordings have been taken to show, and released, in all.
+    replays_made: usize,
+    replays_released: Rc<Cell<usize>>,
 }
 
 /// Set, to anything, to have a window playing a video write how many of its pictures were
@@ -738,6 +746,144 @@ impl SlideCanvas {
         }
     }
 
+    /// Plays the terminal recording `on`, over layer `layer`, from its start to `aim`, reading it
+    /// and drawing it as `source` says, on a thread of its own. One that `stays` waits at
+    /// its end to be sent back to a mark, as in the show; one that doesn't ends there, as in the
+    /// editor. Either way its last picture stays until it's stopped.
+    pub fn play_recording(&mut self, layer: usize, on: TerminalOn, aim: ReplayAim, source: ReplaySource, stays: bool, cx: &mut Context<Self>) {
+        self.stop_recording(layer);
+        self.replays.push(Replay::start(layer, on, aim, source, stays, self.scale));
+        cx.notify();
+    }
+
+    /// Sends the recording playing over layer `layer`, if one is, on to `aim`.
+    pub fn aim_recording(&mut self, layer: usize, aim: ReplayAim, cx: &mut Context<Self>) {
+        if let Some(replay) = self.replays.iter_mut().find(|replay| replay.layer == layer) {
+            replay.aim(aim);
+            cx.notify();
+        }
+    }
+
+    /// Where the recording playing over layer `layer` has been sent, if one plays there.
+    pub fn recording_aim(&self, layer: usize) -> Option<ReplayAim> {
+        self.replays.iter().find(|replay| replay.layer == layer).map(Replay::aimed)
+    }
+
+    /// Stops the recording playing over layer `layer`, if one is: its still shows again.
+    fn stop_recording(&mut self, layer: usize) {
+        self.replays.retain_mut(|replay| {
+            let keep = replay.layer != layer;
+            if !keep {
+                self.retired_replays.extend(replay.take_shown());
+            }
+            keep
+        });
+    }
+
+    /// Stops every recording playing: each shows its still again.
+    pub fn stop_recordings(&mut self, cx: &mut Context<Self>) {
+        if self.replays.is_empty() {
+            return;
+        }
+        for mut replay in std::mem::take(&mut self.replays) {
+            self.retired_replays.extend(replay.take_shown());
+        }
+        cx.notify();
+    }
+
+    /// Stops the recording playing over layer `layer`, if one is.
+    pub fn stop_recording_on(&mut self, layer: usize, cx: &mut Context<Self>) {
+        let before = self.replays.len();
+        self.stop_recording(layer);
+        if self.replays.len() != before {
+            cx.notify();
+        }
+    }
+
+    /// Ends every recording's thread, each keeping the picture it shows, as on a slide left
+    /// that's still seen as the next comes in.
+    pub fn hold_recordings(&mut self, cx: &mut Context<Self>) {
+        for replay in &mut self.replays {
+            replay.hold();
+        }
+        cx.notify();
+    }
+
+    /// Follows the recordings among the layers as they're placed now: one still over its layer
+    /// plays where the layer is, and one whose layer plays something else, or nothing, stops.
+    pub fn place_recordings(&mut self, terminals: &[TerminalLayer], cx: &mut Context<Self>) {
+        let before = self.replays.len();
+        self.replays.retain_mut(|replay| {
+            match terminals.iter().find(|terminal| terminal.layer == replay.layer && terminal.on.src == replay.on.src) {
+                Some(terminal) => {
+                    if terminal.on != replay.on {
+                        replay.place(terminal.on.clone());
+                    }
+                    true
+                }
+                None => {
+                    self.retired_replays.extend(replay.take_shown());
+                    false
+                }
+            }
+        });
+        if self.replays.len() != before {
+            cx.notify();
+        }
+    }
+
+    /// The layers a recording's thread is playing over.
+    pub fn playing_recordings(&self) -> Vec<usize> {
+        self.replays.iter().filter(|replay| replay.is_playing()).map(|replay| replay.layer).collect()
+    }
+
+    /// Why each recording held here couldn't be played, if it couldn't, in order.
+    pub fn recording_failures(&self) -> Vec<Option<slides_terminal::CantPlay>> {
+        self.replays.iter().map(Replay::failed).collect()
+    }
+
+    /// The picture each recording held here shows now, in the order they were started.
+    #[doc(hidden)]
+    pub fn replay_pictures(&self) -> Vec<Option<Arc<RenderImage>>> {
+        self.replays.iter().map(|replay| replay.shown().map(|shown| shown.image.clone())).collect()
+    }
+
+    /// When in its recording each picture shown is from, in seconds, in the same order.
+    #[doc(hidden)]
+    pub fn replay_times(&self) -> Vec<Option<f64>> {
+        self.replays.iter().map(|replay| replay.shown().map(|shown| shown.at)).collect()
+    }
+
+    /// Whether any recording held here has pictures still to come.
+    #[doc(hidden)]
+    pub fn replays_moving(&self) -> bool {
+        self.replays.iter().any(Replay::wants_frames)
+    }
+
+    /// How many pictures of recordings have been taken to show, and how many released, in all.
+    #[doc(hidden)]
+    pub fn replay_images(&self) -> (usize, usize) {
+        (self.replays_made, self.replays_released.get())
+    }
+
+    /// Takes the newest pictures of the recordings playing, without waiting for any, and asks
+    /// the window for another frame while any has a picture to come.
+    fn advance_recordings(&mut self, window: &mut Window) {
+        if self.replays.is_empty() {
+            return;
+        }
+        let mut wanted = false;
+        for replay in &mut self.replays {
+            let (made, replaced) = replay.advance(self.scale);
+            self.replays_made += usize::from(made);
+            self.retired_replays.extend(replaced);
+            wanted |= replay.wants_frames();
+        }
+        if wanted {
+            window.request_animation_frame();
+        }
+    }
+
     /// The image of every layer, first to last, hidden ones included.
     pub fn images(&self) -> Vec<Arc<RenderImage>> {
         self.sprites
@@ -786,9 +932,16 @@ impl SlideCanvas {
                 .filter(|(_, turner)| turner.layer == index)
                 .filter_map(|(_, turner)| Some((turner.shown()?.clone(), turner.on.rect)))
                 .collect();
-            // A model drawn live shows in place of its still, which would show through around it.
-            let still = model.is_empty();
-            let sprite = (sprite.clone(), look.offset_y, still, over.into_iter().chain(model).collect());
+            let replay: Vec<(Shown, Rect)> = self
+                .replays
+                .iter()
+                .filter(|replay| replay.layer == index)
+                .filter_map(|replay| Some((replay.shown()?.clone(), replay.on.rect)))
+                .collect();
+            // A model drawn live, or a recording played, shows in place of its still, which would
+            // show through around it.
+            let still = model.is_empty() && replay.is_empty();
+            let sprite = (sprite.clone(), look.offset_y, still, over.into_iter().chain(model).chain(replay).collect());
             match runs.last_mut() {
                 Some(run) if run.opacity == look.opacity => run.sprites.push(sprite),
                 _ => runs.push(Run {
@@ -896,11 +1049,14 @@ impl Render for SlideCanvas {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.advance_videos(window, cx);
         self.advance_models(window, cx);
+        self.advance_recordings(window);
         let retired = std::mem::take(&mut self.retired);
         let frames = std::mem::take(&mut self.retired_frames);
         let released = self.frames_released.clone();
         let model_pictures = std::mem::take(&mut self.retired_models);
         let models_released = self.models_released.clone();
+        let replay_pictures = std::mem::take(&mut self.retired_replays);
+        let replays_released = self.replays_released.clone();
         let edge_color = self.framed.then(|| cx.theme().border);
         let this = cx.entity().downgrade();
         // A child of its own, as it has to happen even with no layer showing.
@@ -917,6 +1073,10 @@ impl Render for SlideCanvas {
                 for image in model_pictures {
                     window.drop_image(image).ok();
                     models_released.set(models_released.get() + 1);
+                }
+                for image in replay_pictures {
+                    window.drop_image(image).ok();
+                    replays_released.set(replays_released.get() + 1);
                 }
                 if let Some((slide, scale)) = fit(area, window.scale_factor()) {
                     if let Some(color) = edge_color {

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use gpui_kit::component::{ActiveTheme as _, TitleBar, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use slides_engine::{Enter, LayerTiming, ModelLayer, Moment, Transition, VideoLayer};
+use slides_engine::{Enter, LayerTiming, ModelLayer, Moment, TerminalLayer, Transition, VideoLayer};
 
 use crate::document::{Document, LargeOpen};
 use crate::present::{
@@ -14,6 +14,7 @@ use crate::present::{
     WindowPlan, choose_windows, clock_text, layer_look, moment_time, slide_looks,
 };
 use crate::model_view::{Aim, aim_at, inside_turned};
+use crate::replay::Aim as ReplayAim;
 use crate::slide_canvas::{ModelLetGo, ScaleChanged, SlideCanvas, VideoLetGo, VideoOpened};
 use crate::workspace_view::APP_ID;
 
@@ -156,13 +157,19 @@ impl Presentation {
         })
     }
 
-    /// Goes forward by a click, or to the next slide once this one's clicks have all come.
+    /// Goes forward by a click, or to the next slide once this one's clicks have all come. On a
+    /// slide whose terminal recording is still being read, whose marks aren't known yet, it waits
+    /// there rather than going on past them.
     pub fn next(&mut self, cx: &mut Context<Self>) {
         let left = self.session.place();
         let left_time = self.time_at(cx.background_executor().now());
-        let moved = self
-            .document
-            .update(cx, |document, _| self.session.next(document));
+        let moved = self.document.update(cx, |document, _| {
+            let leaving = self.session.upcoming(document).is_some_and(|upcoming| upcoming.slide != left.slide);
+            if leaving && document.terminal_pending(document.shown_slide(left.slide)) {
+                return Moved::Stayed;
+            }
+            self.session.next(document)
+        });
         let began = cx.background_executor().now();
         match moved {
             Moved::Revealed { step } => self.reveal = Some(Reveal { step, began }),
@@ -434,6 +441,8 @@ pub struct AudienceView {
     turn_drag: Option<(ModelLayer, Point<Pixels>, bool)>,
     /// Whether the press last let go of turned a model, so that it's no click of the show's.
     turned: bool,
+    /// The place whose terminal recordings were last played, which tells a click back from one on.
+    replayed_at: Option<Place>,
     rehearsing: bool,
     focus_handle: FocusHandle,
     _watching: [Subscription; 9],
@@ -482,6 +491,7 @@ impl AudienceView {
             models_of: None,
             turn_drag: None,
             turned: false,
+            replayed_at: None,
             rehearsing,
             focus_handle,
             _watching: watching,
@@ -583,6 +593,72 @@ impl AudienceView {
             });
         }
         self.models = models;
+    }
+
+    /// Plays the terminal recordings of the show's place: each on its slide that's there at its
+    /// step, from when the slide shows or its click comes, to the next of its stops after the
+    /// clicks come since, where it waits for the next click. A click back sends it back to the
+    /// stop before, still. On a slide come to, each starts from its start, and none plays on the
+    /// slide left. One still being read, or that can't be played, isn't started.
+    fn play_recordings(&mut self, document: &Entity<Document>, place: Place, time: f32, cx: &mut Context<Self>) {
+        let moment = Moment {
+            step: place.step,
+            time,
+        };
+        let (terminals, pending, slide): (Vec<TerminalLayer>, bool, usize) = document.update(cx, |document, _| {
+            let slide = document.shown_slide(place.slide);
+            (document.terminals_at(slide, moment), document.terminal_pending(slide), slide)
+        });
+        let was = self.replayed_at.replace(place);
+        let afresh = was.is_none_or(|was| was.slide != place.slide);
+        let back = !afresh && was.is_some_and(|was| place.step < was.step);
+        if afresh {
+            // The slide left keeps its recordings' last pictures while it goes.
+            self.leaving.update(cx, |canvas, cx| canvas.hold_recordings(cx));
+            self.current.update(cx, |canvas, cx| canvas.stop_recordings(cx));
+        }
+        self.current.update(cx, |canvas, cx| canvas.place_recordings(&terminals, cx));
+        for terminal in &terminals {
+            let Some(source) = terminal.source.clone() else { continue };
+            let click = terminal.click.unwrap_or(0);
+            if place.step < click {
+                // Back before its click, it stops.
+                self.current.update(cx, |canvas, cx| canvas.stop_recording_on(terminal.layer, cx));
+                continue;
+            }
+            // How many of its stops the clicks since it appeared have passed.
+            let passed = (place.step - click) as usize;
+            let aim = if back { ReplayAim::At(passed) } else { ReplayAim::PlayTo(Some(passed)) };
+            match self.current.read(cx).recording_aim(terminal.layer) {
+                Some(aimed) if aimed == aim => {}
+                Some(_) => self.current.update(cx, |canvas, cx| canvas.aim_recording(terminal.layer, aim, cx)),
+                // At its end, still, it's its still.
+                None if aim == ReplayAim::At(passed) && passed >= terminal.on.stops => {}
+                None => {
+                    if pending || document.update(cx, |document, _| document.terminal_problem_on(slide, &source)).is_some() {
+                        continue;
+                    }
+                    let Some(open) = document.read(cx).open_large(&terminal.on.src) else { continue };
+                    let fonts = document.update(cx, |document, _| document.fonts_seed());
+                    let (layer, on) = (terminal.layer, terminal.on.clone());
+                    self.current.update(cx, |canvas, cx| canvas.play_recording(layer, on, aim, crate::replay::Source { open, fonts }, true, cx));
+                }
+            }
+        }
+    }
+
+    /// Lays out the slide the next click brings, if it's another, at the scale the audience sees
+    /// it at, so that what it shows is ready by the time it's there: a busy recording's screen,
+    /// drawn aside, has been, rather than its plain panel showing first.
+    fn ready_next(&mut self, document: &Entity<Document>, cx: &mut Context<Self>) {
+        let Some(scale) = self.current.read(cx).scale() else { return };
+        let here = self.show.read(cx).session.place().slide;
+        let upcoming = self.show.update(cx, |show, cx| show.upcoming(cx));
+        let Some(upcoming) = upcoming.filter(|upcoming| upcoming.slide != here) else { return };
+        document.update(cx, |document, _| {
+            let slide = document.shown_slide(upcoming.slide);
+            document.layers_at(slide, Moment { step: upcoming.step, time: 0.0 }, scale);
+        });
     }
 
     /// Has `model` drawn live on the slide shown, from `aim`, turning on its own if it does. One
@@ -709,6 +785,8 @@ impl AudienceView {
         self.drawn_time = time;
         self.play_videos(&document, place, time, cx);
         self.show_models(&document, place, time, cx);
+        self.play_recordings(&document, place, time, cx);
+        self.ready_next(&document, cx);
         if let Some((arrival, _)) = arrival {
             // It has this already, unless the window has just changed size.
             show_on(
@@ -760,6 +838,7 @@ impl AudienceView {
                 canvas.set_layers(Vec::new(), cx);
                 canvas.stop_videos(cx);
                 canvas.stop_models(cx);
+                canvas.stop_recordings(cx);
             }
         });
         if arrival.is_some() || revealing.is_some() {
