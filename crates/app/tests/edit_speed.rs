@@ -1232,3 +1232,32 @@ fn a_recording_of_many_colours_coming_in_is_quick() {
     println!("a recording of many colours taken in and drawn: {slowest:?}");
     assert!(slowest < MOST, "{slowest:?}");
 }
+
+/// The editor zoomed on the slide of the busiest recording, a new scale each of twenty frames, from
+/// a little smaller to the window's: what's shown of it meanwhile is a picture of it stretched, and
+/// no frame waits on drawing it. Given beside the same zoom on a slide of an ordinary recording, as
+/// the slide's background and words are drawn again at each scale too.
+#[test]
+#[ignore = "timing; run in release"]
+fn a_frame_of_a_zoom_on_the_busiest_recording_is_quick() {
+    let dir = recording_talk_folder();
+    let zoom = |doc: &mut Document, slide: usize| {
+        doc.go_to(slide);
+        let mut times = Vec::new();
+        for frame in 1..=20 {
+            let scale = 1280. / 1920. * (0.6 + frame as f32 * 0.02);
+            let start = Instant::now();
+            doc.editor_layers(scale);
+            times.push(start.elapsed());
+        }
+        times.sort();
+        (times[times.len() / 2], *times.last().unwrap())
+    };
+    let (mut doc, _) = open_recording_talk(dir.path(), 0);
+    let (ordinary, ordinary_slowest) = zoom(&mut doc, 0);
+    let (mut doc, _) = open_recording_talk(dir.path(), RECORDING_SLIDES / 2);
+    let (median, slowest) = zoom(&mut doc, RECORDING_SLIDES / 2);
+    assert!(!doc.draw_jobs().is_empty(), "drawn aside");
+    println!("zoom frame on the busiest recording: median {median:?}, slowest {slowest:?}; on an ordinary one: median {ordinary:?}, slowest {ordinary_slowest:?}");
+    assert!(slowest < MOST_FOR_A_DRAG_FRAME, "a zoom frame took {slowest:?}");
+}
