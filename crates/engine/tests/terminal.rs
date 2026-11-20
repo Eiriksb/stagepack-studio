@@ -552,6 +552,42 @@ fn a_truecolour_gradient_keeps_its_colours() {
     assert_eq!(lines.len(), 4000, "an underline for each colour");
 }
 
+/// Cells of two colours, side by side and one above the other, drawn at any scale: no gap between
+/// two of them shows the screen's own background, as one did between some columns at some scales.
+#[test]
+fn cells_of_other_colours_side_by_side_leave_no_gap_between() {
+    let mut out = String::new();
+    for row in 0..24u32 {
+        for col in 0..80u32 {
+            out.push_str(if (row + col) % 2 == 0 { "\u{1b}[48;2;200;60;60m " } else { "\u{1b}[48;2;60;200;60m " });
+        }
+        if row < 23 {
+            out.push_str("\u{1b}[0m\r\n");
+        }
+    }
+    let cast = make_test_cast(80, 24, &[(0.1, "o", &out), (0.2, "o", "\u{1b}[?25l")]);
+    // A box of the screen's own shape, so that its cells fill it but for less than a cell.
+    let mut deck = deck_of("<Terminal src=\"assets/run.cast\" x=\"614\" y=\"324\" w=\"691\" h=\"432\" />\n", &[("assets/run.cast", cast)]);
+    let layer = terminal_layer(&mut deck, 0);
+    let mut fonts = Fonts::bundled_only();
+    let mut gaps = Vec::new();
+    for hundredths in 30..=150 {
+        let scale = hundredths as f32 / 100.0;
+        let drawn = render_layer(&layer, scale, &mut fonts);
+        let (w, h) = (drawn.pixmap.width(), drawn.pixmap.height());
+        let is_background = |x: u32, y: u32| {
+            let pixel = drawn.pixmap.pixel(x, y).unwrap();
+            (pixel.red(), pixel.green(), pixel.blue()) == BACKGROUND
+        };
+        let across = (w / 20..w - w / 20).filter(|&x| is_background(x, h / 2)).count();
+        let down = (h / 20..h - h / 20).filter(|&y| is_background(w / 2, y)).count();
+        if across + down > 0 {
+            gaps.push((scale, across, down));
+        }
+    }
+    assert!(gaps.is_empty(), "the background shows between cells at (scale, across, down) {gaps:?}");
+}
+
 #[test]
 fn a_row_of_many_wide_characters_keeps_each_on_its_cells() {
     // Thirty wide characters, each with a letter after, every one its own colour.

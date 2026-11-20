@@ -402,7 +402,9 @@ pub(crate) fn place(laid: &LaidScreen, grid: &Grid, shaped: &[ShapedText]) -> Ve
     for (colour, cells) in &laid.fills {
         let mut path = PathBuilder::with_capacity(cells.len() * 5, cells.len() * 4);
         for &(row, col, count) in cells {
-            if let Some(rect) = tiny_skia::Rect::from_xywh(x(col), y(row), f32::from(count) * grid.cell, grid.row) {
+            // Each edge where the cells beside it have theirs, to the bit, so that no pixel between
+            // two colours is left out of both at any scale.
+            if let Some(rect) = tiny_skia::Rect::from_ltrb(x(col), y(row), x(col + count), y(row + 1)) {
                 path.push_rect(rect);
             }
         }
