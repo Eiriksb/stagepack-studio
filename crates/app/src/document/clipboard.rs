@@ -81,6 +81,10 @@ impl TalkFiles for CarriedFiles<'_> {
         self.find(path).map(|file| file.bytes.clone())
     }
 
+    fn read_prefix(&self, path: &str, most: usize) -> Option<Vec<u8>> {
+        self.find(path).map(|file| file.bytes[..file.bytes.len().min(most)].to_vec())
+    }
+
     fn len(&self, path: &str) -> Option<u64> {
         self.find(path).map(|file| file.bytes.len() as u64)
     }

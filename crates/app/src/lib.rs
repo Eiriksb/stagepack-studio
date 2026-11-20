@@ -27,6 +27,7 @@ pub mod permissions;
 pub mod present;
 pub mod present_view;
 pub mod recovery;
+pub mod replay;
 pub mod ribbon;
 pub mod save_flow;
 pub mod saving;

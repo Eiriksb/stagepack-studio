@@ -14,8 +14,11 @@ use tiny_skia::{ColorU8, Pixmap, Transform};
 use toolkit::Color;
 
 use slides_model::{CantDraw, View};
+use slides_terminal::{CantPlay as CantReplay, Player};
 
-use crate::{ReadSeek, TalkFiles};
+use crate::terminal_screen::{GridKey, LaidScreen, Placed, Shaped, grid, lay_out_screen, panel_alone, place, placed_bytes, shape, shaped_bytes};
+
+use crate::{ReadSeek, Rect, TalkFiles};
 
 /// The longest edge a picture is kept at.
 const MAX_EDGE: u32 = 4096;
@@ -44,7 +47,7 @@ const SVG_NAMESPACE: &str = "http://www.w3.org/2000/svg";
 
 /// What tells a file from a later version of itself: its stamp, or a hash of its bytes
 /// where there's no stamp to go by.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Hash)]
 pub(crate) enum FileVersion {
     Stamp(u64, SystemTime),
     Hash(u64),
@@ -103,6 +106,11 @@ pub struct PictureCache {
     model_stills: HashMap<ModelKey, CachedModelStill>,
     /// What draws a model's still, if anything can: the engine itself can't.
     draw_model: Option<DrawModel>,
+    /// The last screens of the talk's terminal recordings, by the recording's path in the talk,
+    /// counted among the pictures' bytes.
+    terminal_stills: HashMap<String, CachedTerminal>,
+    /// `asked_for` as the slide being laid out now started: what was asked for since is in use.
+    layout_began: u64,
 }
 
 impl Default for PictureCache {
@@ -117,6 +125,8 @@ impl Default for PictureCache {
             aside: None,
             model_stills: HashMap::new(),
             draw_model: None,
+            terminal_stills: HashMap::new(),
+            layout_began: 0,
         }
     }
 }
@@ -169,7 +179,28 @@ pub struct StillJob {
     version: Option<FileVersion>,
     /// What's drawn of a model, if it's a model's still.
     model: Option<ModelWanted>,
+    /// Whether it's a terminal recording's last screen.
+    terminal: bool,
+    /// The text of a terminal recording's last screen to be shaped, rather than its file read.
+    shape: Option<ShapeWanted>,
 }
+
+/// A recording's last screen, laid out in cells, to have its text shaped for rows of a height, with
+/// fonts of its own, unless it's `shaped` for them already, and placed in the box it was asked for
+/// in: a screen with too much to shape or place on the thread laying it out.
+#[derive(Clone)]
+struct ShapeWanted {
+    laid: Arc<LaidScreen>,
+    row: f32,
+    rect: Rect,
+    shaped: Option<Shaped>,
+    fonts: crate::FontsSeed,
+}
+
+/// The most characters and runs of cells a recording's last screen has that are shaped and placed
+/// on the thread laying it out, when stills are made aside: one with more is shaped and placed
+/// aside, about two milliseconds of it.
+const MOST_PIECES_LAID_HERE: usize = 4_000;
 
 /// The still of a model wanted: where it's seen from, how large it's drawn, and what draws it.
 #[derive(Clone)]
@@ -190,15 +221,39 @@ impl StillJob {
         self.model.is_some()
     }
 
-    /// Makes the still from what `reader` reads, the video's or model's file, or, with none,
-    /// says it couldn't be read. It decodes, or draws, so it's for a thread other than the
-    /// window's.
+    /// Whether it's a terminal recording's last screen, played to its end rather than decoded, or
+    /// its text shaped.
+    pub fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+
+    /// Whether it's made from its file: all are but a recording's screen to have its text shaped.
+    pub fn reads_a_file(&self) -> bool {
+        self.shape.is_none()
+    }
+
+    /// Makes a terminal recording's still from its file, read with [`recording_bytes`], or why
+    /// that couldn't be read. As [`Self::make`], it's for a thread other than the window's.
+    pub fn make_recording(self, bytes: Result<Vec<u8>, CantReplay>) -> MadeStill {
+        let still = Made::Terminal(make_terminal_still(bytes));
+        MadeStill { path: self.path, version: self.version, model: self.model, terminal: self.terminal, shape: self.shape, still }
+    }
+
+    /// Makes the still from what `reader` reads, the video's, model's or recording's file, or,
+    /// with none, says it couldn't be read. It decodes, draws, or plays a recording through, so
+    /// it's for a thread other than the window's.
     pub fn make(self, reader: Option<Box<dyn ReadSeek>>) -> MadeStill {
         let still = match &self.model {
+            _ if let Some(wanted) = &self.shape => {
+                let shaped: Shaped = wanted.shaped.clone().unwrap_or_else(|| Arc::from(shape(&wanted.laid, wanted.row, &mut wanted.fonts.clone().fonts())));
+                let placed = grid(wanted.laid.columns, wanted.laid.rows, wanted.rect).map(|grid| (grid.key(), Placed::from(place(&wanted.laid, &grid, &shaped))));
+                Made::Shaped(shaped, placed)
+            }
+            _ if self.terminal => Made::Terminal(make_terminal_still(read_recording(reader))),
             Some(wanted) => Made::Model(make_model_still(reader, wanted)),
             None => Made::Video(make_still(reader)),
         };
-        MadeStill { path: self.path, version: self.version, model: self.model, still }
+        MadeStill { path: self.path, version: self.version, model: self.model, terminal: self.terminal, shape: self.shape, still }
     }
 }
 
@@ -206,6 +261,9 @@ impl StillJob {
 enum Made {
     Video(Still),
     Model(ModelStill),
+    Terminal(TerminalStill),
+    /// A recording's screen's text, shaped, and placed in a box.
+    Shaped(Shaped, Option<(GridKey, Placed)>),
 }
 
 /// A still made aside, for [`crate::Deck::take_still`] to take in.
@@ -213,18 +271,138 @@ pub struct MadeStill {
     path: String,
     version: Option<FileVersion>,
     model: Option<ModelWanted>,
+    terminal: bool,
+    shape: Option<ShapeWanted>,
     still: Made,
 }
 
 impl MadeStill {
     /// Whether no still could be made: why is said once it's taken in.
     pub fn failed(&self) -> bool {
-        matches!(self.still, Made::Video(Still::Cannot(_)) | Made::Model(ModelStill::Cannot(_)))
+        matches!(self.still, Made::Video(Still::Cannot(_)) | Made::Model(ModelStill::Cannot(_)) | Made::Terminal(TerminalStill::Cannot(_)))
     }
 
     /// The still to be made again, as when its file was taken away while it was read.
     pub fn again(self) -> StillJob {
-        StillJob { path: self.path, version: self.version, model: self.model }
+        StillJob { path: self.path, version: self.version, model: self.model, terminal: self.terminal, shape: self.shape }
+    }
+}
+
+/// What a terminal recording shows while it isn't playing.
+#[derive(Clone)]
+pub(crate) enum TerminalStill {
+    /// Its screen as it ends, laid out in cells, and how many times it stops until the next click.
+    Laid(Arc<LaidScreen>, usize),
+    /// Why it can't be played.
+    Cannot(CantReplay),
+    /// Being read and played through on another thread.
+    Coming,
+}
+
+struct CachedTerminal {
+    still: TerminalStill,
+    /// What its file was when it was asked for, if it could be read.
+    version: Option<FileVersion>,
+    /// The screen's size its header gives, read as the recording was first asked for.
+    size: Option<(u16, u16)>,
+    /// Its text shaped for rows of a height, and what it was last placed as, for a box.
+    shaped: Option<(u32, Shaped, usize)>,
+    placed: Option<(GridKey, Placed)>,
+    /// The box it's being shaped and placed for aside, if it is.
+    shaping: Option<GridKey>,
+    /// The bytes of all of that, as counted among the pictures'.
+    bytes: usize,
+    last_used: u64,
+}
+
+impl CachedTerminal {
+    fn count(&self) -> usize {
+        let laid = match &self.still {
+            TerminalStill::Laid(laid, _) => laid.bytes,
+            _ => 0,
+        };
+        let shaped = self.shaped.as_ref().map_or(0, |(_, _, bytes)| *bytes);
+        let placed = self.placed.as_ref().map_or(0, |(_, items)| placed_bytes(items));
+        laid + shaped + placed
+    }
+}
+
+/// The bytes of the terminal recording at `path` to play, read as any of the talk's data files is,
+/// or why they can't be. One larger than a recording can be is read only as far as a byte more,
+/// which is enough to tell what it is, where it can be read in pieces, and is too large where it
+/// can't.
+pub fn recording_bytes(files: &dyn TalkFiles, path: &str) -> Result<Vec<u8>, CantReplay> {
+    let most = slides_terminal::MOST_BYTES + 1;
+    if files.len(path).is_some_and(|len| len > most as u64) {
+        // One that doesn't start as a recording does isn't one, however large.
+        let reader = files.open(path).ok_or(CantReplay::TooLarge)?;
+        if let Some(why) = not_a_recording(&header_of(path, files).ok_or(CantReplay::CouldNotRead)?) {
+            return Err(why);
+        }
+        return read_recording(Some(reader));
+    }
+    let mut bytes = files.read(path).ok_or(CantReplay::CouldNotRead)?;
+    bytes.truncate(most);
+    Ok(bytes)
+}
+
+/// Why the file starting with `prefix` isn't a recording that can be played, if its header says
+/// it isn't: what its first line says, read alone.
+fn not_a_recording(prefix: &[u8]) -> Option<CantReplay> {
+    if slides_terminal::screen_size(prefix).is_some() {
+        return None;
+    }
+    let header = prefix.split(|b| *b == b'\n').next().unwrap_or_default();
+    Some(slides_terminal::read(header).err().unwrap_or(CantReplay::NotARecording))
+}
+
+/// What `reader` reads of a recording, as far as a byte more than one can be.
+fn read_recording(reader: Option<Box<dyn ReadSeek>>) -> Result<Vec<u8>, CantReplay> {
+    let reader = reader.ok_or(CantReplay::CouldNotRead)?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::Read::take(reader, slides_terminal::MOST_BYTES as u64 + 1), &mut bytes).map_err(|_| CantReplay::CouldNotRead)?;
+    Ok(bytes)
+}
+
+/// The screen's size the header of the recording at `path` gives, reading no more than its header,
+/// even of a file a pack holds compressed.
+fn header_size(path: &str, files: &dyn TalkFiles) -> Option<(u16, u16)> {
+    slides_terminal::screen_size(&header_of(path, files)?)
+}
+
+/// As much of a recording as its header is looked for in at most: the most a header can be, a
+/// mark of the order of its bytes, and the end of its line.
+const HEADER_READ: usize = slides_terminal::MOST_HEADER + 4;
+/// As much as is read first, which holds any header but a crafted one.
+const HEADER_FIRST: usize = 4096;
+
+/// The start of the file at `path`, as far as its first line's end: what's read of it first, or,
+/// if that hasn't the end of a line, as much as a header can be.
+fn header_of(path: &str, files: &dyn TalkFiles) -> Option<Vec<u8>> {
+    let first = files.read_prefix(path, HEADER_FIRST)?;
+    if first.len() < HEADER_FIRST || first.contains(&b'\n') {
+        return Some(first);
+    }
+    files.read_prefix(path, HEADER_READ)
+}
+
+/// The last screen of the recording read as `bytes` laid out in cells, and its stops, or why it
+/// can't be played. The recording read, and the screen it was played on, are let go of before this
+/// returns: a recording can hold far more than the screen it ends on.
+fn make_terminal_still(bytes: Result<Vec<u8>, CantReplay>) -> TerminalStill {
+    STILLS_MADE_HERE.with(|made| made.set(made.get() + 1));
+    let played = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let bytes = bytes?;
+        let recording = slides_terminal::read(&bytes)?;
+        drop(bytes);
+        let player = Player::new(Arc::new(recording));
+        let stops = player.stops().len();
+        player.last().map(|screen| (lay_out_screen(&screen), stops))
+    }));
+    match played {
+        Ok(Ok((laid, stops))) => TerminalStill::Laid(Arc::new(laid), stops),
+        Ok(Err(why)) => TerminalStill::Cannot(why),
+        Err(_) => TerminalStill::Cannot(CantReplay::Damaged),
     }
 }
 
@@ -326,8 +504,8 @@ thread_local! {
     static STILLS_MADE_HERE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// How many videos' stills have been decoded on this thread, for tests that none is on the
-/// window's.
+/// How many videos' stills have been decoded, and terminal recordings read and played through,
+/// on this thread, for tests that none is on the window's.
 #[doc(hidden)]
 pub fn stills_decoded_on_this_thread() -> usize {
     STILLS_MADE_HERE.with(std::cell::Cell::get)
@@ -378,7 +556,10 @@ impl PictureCache {
         self.pictures.clear();
         self.stills.retain(|path, cached| large_file_version(path, files) == cached.version);
         self.model_stills.retain(|key, cached| large_file_version(&key.path, files) == cached.version);
-        self.bytes = self.stills.values().map(|cached| cached.still.bytes()).sum::<usize>() + self.model_stills.values().map(|cached| cached.still.bytes()).sum::<usize>();
+        self.terminal_stills.retain(|path, cached| FileVersion::of_file(path, files) == cached.version);
+        self.bytes = self.stills.values().map(|cached| cached.still.bytes()).sum::<usize>()
+            + self.model_stills.values().map(|cached| cached.still.bytes()).sum::<usize>()
+            + self.terminal_stills.values().map(|cached| cached.bytes).sum::<usize>();
     }
 
     /// Leaves videos' stills to be made aside from now on, telling `wanted` each time one is
@@ -388,6 +569,23 @@ impl PictureCache {
     pub(crate) fn make_stills_aside(&mut self, wanted: StillWanted, measure: MeasureVideo) {
         let jobs = self.aside.take().map(|aside| aside.jobs).unwrap_or_default();
         self.aside = Some(Aside { wanted, measure, jobs });
+    }
+
+    /// Whether stills are made aside: what's told when one is wanted is told too when anything
+    /// else is wanted made aside.
+    pub(crate) fn tell_wanted(&self) -> bool {
+        match &self.aside {
+            Some(aside) => {
+                (aside.wanted)();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether stills are made aside.
+    pub(crate) fn makes_aside(&self) -> bool {
+        self.aside.is_some()
     }
 
     /// The stills wanted to be made aside since last asked.
@@ -409,7 +607,7 @@ impl PictureCache {
             // A file that isn't there is known not to be read without decoding anything.
             Some(_) if version.is_none() && files.len(path).is_none() => Still::Cannot(slides_video::CantPlay::CouldNotRead),
             Some(aside) => {
-                aside.jobs.push(StillJob { path: path.to_string(), version: version.clone(), model: None });
+                aside.jobs.push(StillJob { path: path.to_string(), version: version.clone(), model: None, terminal: false, shape: None });
                 (aside.wanted)();
                 Still::Coming((aside.measure)(path))
             }
@@ -432,8 +630,36 @@ impl PictureCache {
     /// Takes in a still made aside, and gives the path of its video if it was still wanted:
     /// one whose file has changed since it was asked for isn't, and is asked for again.
     pub(crate) fn take_still(&mut self, made: MadeStill) -> Option<String> {
-        let MadeStill { path, version, model, still } = made;
+        let MadeStill { path, version, model, shape: shaped_for, still, .. } = made;
         match (still, model) {
+            (Made::Shaped(shaped, placed), _) => {
+                let wanted = shaped_for?;
+                let cached = self.terminal_stills.get_mut(&path)?;
+                let same = matches!(&cached.still, TerminalStill::Laid(laid, _) if Arc::ptr_eq(laid, &wanted.laid));
+                if !same || cached.version != version {
+                    return None;
+                }
+                let row = wanted.row.to_bits();
+                if cached.shaping.is_some() && cached.shaping == placed.as_ref().map(|(on, _)| *on) {
+                    cached.shaping = None;
+                }
+                let bytes = shaped_bytes(&shaped);
+                (cached.shaped, cached.placed) = (Some((row, shaped, bytes)), placed);
+                let bytes = cached.count();
+                self.bytes = self.bytes - cached.bytes + bytes;
+                cached.bytes = bytes;
+            }
+            (Made::Terminal(still), _) => {
+                let cached = self.terminal_stills.get_mut(&path)?;
+                if !matches!(cached.still, TerminalStill::Coming) || cached.version != version {
+                    return None;
+                }
+                cached.still = still;
+                (cached.shaped, cached.placed) = (None, None);
+                let bytes = cached.count();
+                self.bytes = self.bytes - cached.bytes + bytes;
+                cached.bytes = bytes;
+            }
             (Made::Video(still), _) => {
                 let cached = self.stills.get_mut(&path)?;
                 if !matches!(cached.still, Still::Coming(_)) || cached.version != version {
@@ -494,7 +720,7 @@ impl PictureCache {
                     self.model_stills.remove(other);
                 }
                 aside.jobs.retain(|job| job.model.as_ref().is_none_or(|model| !older.contains(&model.key)));
-                aside.jobs.push(StillJob { path: path.to_string(), version: version.clone(), model: Some(wanted) });
+                aside.jobs.push(StillJob { path: path.to_string(), version: version.clone(), model: Some(wanted), terminal: false, shape: None });
                 (aside.wanted)();
                 let before = self
                     .model_stills
@@ -526,10 +752,119 @@ impl PictureCache {
         }
     }
 
+    /// The last screen of the terminal recording at `path`, laid out in cells, and its stops, made
+    /// once for each version of its file: aside, if stills are made aside. And the screen's size
+    /// its header gives, read now, as the talk's data files are read.
+    pub(crate) fn terminal_still(&mut self, path: &str, files: &dyn TalkFiles) -> (TerminalStill, Option<(u16, u16)>) {
+        self.stills_asked.push(path.to_string());
+        self.asked_for += 1;
+        let asked_for = self.asked_for;
+        if let Some(cached) = self.terminal_stills.get_mut(path) {
+            cached.last_used = asked_for;
+            return (cached.still.clone(), cached.size);
+        }
+        // A file without a stamp is read once, for its version and its header both.
+        let (version, size) = match files.stamp(path) {
+            Some((length, modified)) => (Some(FileVersion::Stamp(length, modified)), header_size(path, files)),
+            None => match files.read(path) {
+                Some(bytes) => (Some(FileVersion::of_bytes(&bytes)), slides_terminal::screen_size(&bytes)),
+                None => (None, None),
+            },
+        };
+        let still = match &mut self.aside {
+            // One that can't be read is kept as it is until its file is there, or changes, as
+            // every edit and file added checks.
+            _ if version.is_none() => TerminalStill::Cannot(CantReplay::CouldNotRead),
+            None => make_terminal_still(recording_bytes(files, path)),
+            Some(aside) => {
+                aside.jobs.push(StillJob { path: path.to_string(), version: version.clone(), model: None, terminal: true, shape: None });
+                (aside.wanted)();
+                TerminalStill::Coming
+            }
+        };
+        let mut cached = CachedTerminal { still: still.clone(), version, size, shaped: None, placed: None, shaping: None, bytes: 0, last_used: asked_for };
+        cached.bytes = cached.count();
+        self.bytes += cached.bytes;
+        self.terminal_stills.insert(path.to_string(), cached);
+        self.let_go_of_unused();
+        (still, size)
+    }
+
+    /// The version of the file of the terminal recording at `path` its still was made from, if
+    /// it's been asked for.
+    pub(crate) fn terminal_version(&self, path: &str) -> Option<&FileVersion> {
+        self.terminal_stills.get(path)?.version.as_ref()
+    }
+
+    /// Why the terminal recording at `path` can't be played, if it's been tried and it can't.
+    pub(crate) fn terminal_problem(&self, path: &str) -> Option<CantReplay> {
+        match self.terminal_stills.get(path)?.still {
+            TerminalStill::Cannot(why) => Some(why),
+            _ => None,
+        }
+    }
+
+    /// Whether the terminal recording at `path` is being read aside.
+    pub(crate) fn terminal_coming(&self, path: &str) -> bool {
+        self.terminal_stills.get(path).is_some_and(|cached| matches!(cached.still, TerminalStill::Coming))
+    }
+
+    /// The last screen of the recording at `path` laid out in `rect`, its panel and its cells, if
+    /// it's been read and they're not being shaped and placed aside: what they were placed as
+    /// last, if the box is the same, or placed again, the text shaped again only if its rows are
+    /// of another height.
+    pub(crate) fn terminal_items(&mut self, path: &str, rect: Rect, fonts: &mut crate::Fonts) -> Option<Placed> {
+        self.asked_for += 1;
+        let asked_for = self.asked_for;
+        let cached = self.terminal_stills.get_mut(path)?;
+        cached.last_used = asked_for;
+        let TerminalStill::Laid(laid, _) = &cached.still else { return None };
+        let Some(grid) = grid(laid.columns, laid.rows, rect) else { return Some(panel_alone(rect)) };
+        if let Some((placed_on, items)) = &cached.placed
+            && *placed_on == grid.key()
+        {
+            return Some(items.clone());
+        }
+        let row = grid.row.to_bits();
+        let shaped = cached.shaped.as_ref().filter(|(shaped_for, ..)| *shaped_for == row).map(|(_, shaped, bytes)| (shaped.clone(), *bytes));
+        // Too much to shape or place here: it's done aside, and there's nothing until then.
+        if laid.pieces() > MOST_PIECES_LAID_HERE
+            && let Some(aside) = &mut self.aside
+        {
+            if cached.shaping != Some(grid.key()) {
+                cached.shaping = Some(grid.key());
+                let shape = ShapeWanted { laid: laid.clone(), row: grid.row, rect, shaped: shaped.map(|(shaped, _)| shaped), fonts: fonts.seed() };
+                aside.jobs.push(StillJob { path: path.to_string(), version: cached.version.clone(), model: None, terminal: true, shape: Some(shape) });
+                (aside.wanted)();
+            }
+            return None;
+        }
+        let (shaped, shaped_size) = shaped.unwrap_or_else(|| {
+            let shaped: Shaped = Arc::from(shape(laid, grid.row, fonts));
+            let bytes = shaped_bytes(&shaped);
+            (shaped, bytes)
+        });
+        let items: Placed = place(laid, &grid, &shaped).into();
+        cached.shaped = Some((row, shaped, shaped_size));
+        cached.placed = Some((grid.key(), items.clone()));
+        let bytes = cached.count();
+        self.bytes = self.bytes - cached.bytes + bytes;
+        cached.bytes = bytes;
+        self.let_go_of_unused();
+        Some(items)
+    }
+
     /// Forgets every still whose video's file is no longer what it was, as when files are added:
     /// one that couldn't be read may be there now.
     pub(crate) fn drop_replaced_stills(&mut self, files: &dyn TalkFiles) {
         let held = &mut self.bytes;
+        self.terminal_stills.retain(|path, cached| {
+            let same = FileVersion::of_file(path, files) == cached.version;
+            if !same {
+                *held -= cached.bytes;
+            }
+            same
+        });
         self.stills.retain(|path, cached| {
             let same = large_file_version(path, files) == cached.version;
             if !same {
@@ -550,10 +885,12 @@ impl PictureCache {
     pub(crate) fn stills_coming(&self) -> bool {
         self.stills.values().any(|cached| matches!(cached.still, Still::Coming(_)))
             || self.model_stills.values().any(|cached| matches!(cached.still, ModelStill::Coming(_)))
+            || self.terminal_stills.values().any(|cached| matches!(cached.still, TerminalStill::Coming))
     }
 
     /// The videos whose stills were asked for since this was last asked.
     pub(crate) fn take_stills_asked(&mut self) -> Vec<String> {
+        self.layout_began = self.asked_for;
         let mut asked = std::mem::take(&mut self.stills_asked);
         asked.sort();
         asked.dedup();
@@ -608,6 +945,10 @@ impl PictureCache {
         if !self.is_over_budget() {
             return;
         }
+        self.let_go_of_terminals();
+        if !self.is_over_budget() {
+            return;
+        }
         let pictures = self
             .pictures
             .iter()
@@ -651,11 +992,50 @@ impl PictureCache {
         }
     }
 
+    /// While over budget, lets go of what's kept of the terminal recordings not asked for by the
+    /// slide being laid out, those asked for longest ago first: their placed and shaped text, and
+    /// then their screens, which are read again when next asked for.
+    fn let_go_of_terminals(&mut self) {
+        let mut unused: Vec<(u64, String)> = self
+            .terminal_stills
+            .iter()
+            .filter(|(_, cached)| cached.last_used <= self.layout_began && cached.bytes > 0)
+            .map(|(path, cached)| (cached.last_used, path.clone()))
+            .collect();
+        unused.sort_unstable();
+        for whole in [false, true] {
+            for (_, path) in &unused {
+                if self.bytes <= self.memory_budget {
+                    return;
+                }
+                let Some(cached) = self.terminal_stills.get_mut(path) else { continue };
+                self.bytes -= cached.bytes;
+                if whole {
+                    if matches!(cached.still, TerminalStill::Laid(..)) {
+                        self.terminal_stills.remove(path);
+                        continue;
+                    }
+                } else {
+                    (cached.shaped, cached.placed) = (None, None);
+                }
+                cached.bytes = cached.count();
+                self.bytes += cached.bytes;
+            }
+        }
+    }
+
     /// Forgets every picture whose file is no longer the one that was read, and says
     /// whether there were any.
     pub(crate) fn drop_replaced(&mut self, files: &dyn TalkFiles) -> bool {
-        let before = (self.pictures.len(), self.stills.len() + self.model_stills.len());
+        let before = (self.pictures.len(), self.stills.len() + self.model_stills.len() + self.terminal_stills.len());
         let held = &mut self.bytes;
+        self.terminal_stills.retain(|path, cached| {
+            let same = FileVersion::of_file(path, files) == cached.version;
+            if !same {
+                *held -= cached.bytes;
+            }
+            same
+        });
         self.pictures.retain(|path, cached| {
             let same = FileVersion::of_file(path, files).as_ref() == Some(&cached.version);
             if !same {
@@ -677,7 +1057,7 @@ impl PictureCache {
             }
             same
         });
-        (self.pictures.len(), self.stills.len() + self.model_stills.len()) != before
+        (self.pictures.len(), self.stills.len() + self.model_stills.len() + self.terminal_stills.len()) != before
     }
 }
 

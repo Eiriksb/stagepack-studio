@@ -7,7 +7,7 @@ use krilla::color::rgb;
 use krilla::geom::{Path, PathBuilder, Point, Size, Transform};
 use krilla::num::NormalizedF32;
 use krilla::page::PageSettings;
-use krilla::paint::{Fill, Stroke};
+use krilla::paint::{Fill, FillRule, Stroke};
 use krilla::surface::Surface;
 use krilla::text::{Font, GlyphId, KrillaGlyph};
 use krilla::image::Image;
@@ -71,7 +71,17 @@ fn draw_layer(surface: &mut Surface, spec: &LayerSpec, drawing: &mut Drawing) {
     }
     surface.push_transform(&Transform::from_translate(x, y));
     surface.push_transform(&Transform::from_rotate_at(spec.rotate, w / 2.0, h / 2.0));
-    for item in &spec.items {
+    // A terminal recording is drawn within its box, as on the slide: a letter a font draws wider
+    // than its cell doesn't reach past it.
+    let clip = spec.terminal.as_ref().and_then(|_| krilla::geom::Rect::from_xywh(0.0, 0.0, w, h)).and_then(|rect| {
+        let mut path = PathBuilder::new();
+        path.push_rect(rect);
+        path.finish()
+    });
+    if let Some(clip) = &clip {
+        surface.push_clip_path(clip, &FillRule::NonZero);
+    }
+    for item in spec.items.iter() {
         match item {
             DisplayItem::Fill { path, color } => {
                 if let Some(path) = convert_path(path) {
@@ -90,6 +100,9 @@ fn draw_layer(surface: &mut Surface, spec: &LayerSpec, drawing: &mut Drawing) {
             DisplayItem::Text { text, x, y } => draw_text(surface, text, *x, *y, drawing.fonts, drawing.font_cache),
             DisplayItem::Picture { pixmap, src, rect } => draw_picture(surface, pixmap, src.as_deref(), rect, drawing),
         }
+    }
+    if clip.is_some() {
+        surface.pop();
     }
     surface.pop();
     surface.pop();

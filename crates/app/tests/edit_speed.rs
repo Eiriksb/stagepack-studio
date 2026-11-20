@@ -1,6 +1,6 @@
-//! How long a keystroke takes on a long talk, before anything is drawn, and on a talk of videos
-//! and one of 3D models; how long opening those talks takes; and what a video playing and a model
-//! turning cost the window's thread. Only meaningful in a release build:
+//! How long a keystroke takes on a long talk, before anything is drawn, and on a talk of videos,
+//! one of 3D models and one of terminal recordings; how long opening those talks takes; and what a
+//! video playing, a model turning and a recording playing cost the window's thread. Only meaningful in a release build:
 //! `scripts/cargo-safe.sh test --release -p stagepack-studio --test edit_speed -- --ignored`.
 //!
 //! The models are drawn on the best graphics adapter there is, or with `ADAPTER=discrete`,
@@ -979,6 +979,566 @@ fn a_model_turning_for_300_pictures_leaves_the_window_free(cx: &mut gpui_kit::Te
         frames.last().unwrap()
     );
     assert!(at(&showing, 0.5) < MOST_FOR_A_DRAG_FRAME, "a frame took {:?}", at(&showing, 0.5));
+    cx.update_window(audience, |_, window, _| window.remove_window()).ok();
+    cx.run_until_parked();
+}
+
+// Terminal recordings.
+
+const RECORDING_SLIDES: usize = 10;
+
+/// The costliest screen there is to lay out: 500 columns by 200 rows, every cell a colour of its
+/// own, its text and its background, each far from the cell's beside it, and underlined.
+fn busiest_recording() -> Vec<u8> {
+    let rows: Vec<String> = (0..200u32)
+        .map(|row| {
+            let mut out = String::new();
+            for col in 0..500u32 {
+                let n = row * 500 + col;
+                let (r, g, b) = ((n % 64) as u8, (n / 64 % 64) as u8, (n / 4096 % 64) as u8);
+                let (r, g, b) = if n % 2 == 0 { (r, g, b) } else { (255 - r, 255 - g, 255 - b) };
+                out.push_str(&format!("\u{1b}[4;38;2;{r};{g};{b};48;2;{b};{r};{g}m{}", (b'a' + (n % 26) as u8) as char));
+            }
+            if row < 199 {
+                out.push_str("\r\n");
+            }
+            out
+        })
+        .collect();
+    let lines: Vec<(f64, &str, &str)> = rows.iter().enumerate().map(|(at, row)| (0.01 * at as f64, "o", row.as_str())).collect();
+    slides_terminal::make_test_cast(500, 200, &lines)
+}
+
+/// A screen with no text that's as costly: 500 columns by 200 rows of blank cells, each with a
+/// background and an underline of its own, 65,536 colours of each.
+fn colourful_recording() -> Vec<u8> {
+    let rows: Vec<String> = (0..200u32)
+        .map(|row| {
+            let mut out = String::new();
+            for col in 0..500u32 {
+                let colour = (row * 500 + col) % 65_536;
+                let (high, low) = (colour >> 8, colour & 255);
+                out.push_str(&format!("\u{1b}[4;38;2;{low};{high};160;48;2;{high};{low};64m "));
+            }
+            if row < 199 {
+                out.push_str("\u{1b}[0m\r\n");
+            }
+            out
+        })
+        .collect();
+    let lines: Vec<(f64, &str, &str)> = rows.iter().enumerate().map(|(at, row)| (0.01 * at as f64, "o", row.as_str())).collect();
+    slides_terminal::make_test_cast(500, 200, &lines)
+}
+
+/// A talk of ten slides each with words and a recording, the middle one the busiest there is,
+/// and the others an ordinary session's.
+fn recording_talk_folder() -> tempfile::TempDir {
+    recording_talk_folder_with(busiest_recording())
+}
+
+/// [`recording_talk_folder`] with `busiest` the middle one.
+fn recording_talk_folder_with(busiest: Vec<u8>) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let mut talk = String::new();
+    for n in 0..RECORDING_SLIDES {
+        if n > 0 {
+            talk.push_str("---\n\n");
+        }
+        // The busiest fills the slide, so that its text is drawn even at the window's scale.
+        let place = if n == RECORDING_SLIDES / 2 { "x=\"0\" y=\"0\" w=\"1920\" h=\"1080\"" } else { "x=\"900\" y=\"300\" w=\"960\" h=\"540\"" };
+        talk.push_str(&format!("# Slide {n}\n\nSome **bold** words about run {n}.\n\n<Terminal src=\"assets/run{n}.cast\" {place} />\n\n"));
+    }
+    std::fs::write(dir.path().join("slides.md"), talk).unwrap();
+    std::fs::create_dir(dir.path().join("assets")).unwrap();
+    for n in 0..RECORDING_SLIDES {
+        let cast = if n == RECORDING_SLIDES / 2 { busiest.clone() } else { slides_terminal::make_demo_cast() };
+        std::fs::write(dir.path().join(format!("assets/run{n}.cast")), cast).unwrap();
+    }
+    dir
+}
+
+/// Takes in each still wanted, made as the window's background tasks make them, and each layer
+/// wanted drawn aside, drawn as they draw them, timing how long taking it in and drawing the slide
+/// again takes on the window's thread: the slowest is given.
+fn take_recordings_in(doc: &mut Document) -> Duration {
+    let mut slowest = Duration::ZERO;
+    loop {
+        let jobs = doc.still_jobs();
+        let draws = doc.draw_jobs();
+        if jobs.is_empty() && draws.is_empty() {
+            return slowest;
+        }
+        for job in draws {
+            let drawn = job.draw();
+            let start = Instant::now();
+            doc.take_drawn(drawn);
+            doc.editor_layers(1280. / 1920.);
+            slowest = slowest.max(start.elapsed());
+        }
+        for (job, open) in jobs {
+            let stagepack_studio::video_player::Making::Made(still) = stagepack_studio::video_player::make_one(job, open) else { panic!("a still waits") };
+            assert!(!still.failed());
+            let start = Instant::now();
+            doc.take_still(still);
+            doc.editor_layers(1280. / 1920.);
+            slowest = slowest.max(start.elapsed());
+        }
+    }
+}
+
+/// The talk of recordings opened as the window opens it, at slide `slide`, its recordings read.
+fn open_recording_talk(dir: &std::path::Path, slide: usize) -> (Document, Duration) {
+    let mut doc = Document::open(dir, Fonts::bundled_only()).unwrap();
+    doc.make_stills_aside(std::sync::Arc::new(|| {}));
+    doc.go_to(slide);
+    doc.editor_layers(1280. / 1920.);
+    let slowest = take_recordings_in(&mut doc);
+    (doc, slowest)
+}
+
+/// An ordinary recording's last screen taken in, and its slide drawn again, is as quick as a
+/// keystroke.
+#[test]
+#[ignore = "timing; run in release"]
+fn a_recordings_screen_coming_in_is_quick() {
+    let dir = recording_talk_folder();
+    let (_doc, slowest) = open_recording_talk(dir.path(), 0);
+    println!("slowest recording's screen taken in and drawn: {slowest:?}");
+    assert!(slowest < MOST, "{slowest:?}");
+}
+
+/// A letter typed on the slide of the busiest recording there is, beside it.
+#[test]
+#[ignore = "timing; run in release"]
+fn a_keystroke_beside_the_busiest_recording_is_quick() {
+    keystrokes_beside(recording_talk_folder(), "the busiest recording");
+}
+
+/// A letter typed beside a recording of many colours and no text.
+#[test]
+#[ignore = "timing; run in release"]
+fn a_keystroke_beside_a_recording_of_many_colours_is_quick() {
+    keystrokes_beside(recording_talk_folder_with(colourful_recording()), "a recording of many colours");
+}
+
+/// Letters typed on the slide of the middle recording of `dir`, `what`, beside it.
+fn keystrokes_beside(dir: tempfile::TempDir, what: &str) {
+    let slide = RECORDING_SLIDES / 2;
+    let (mut doc, _) = open_recording_talk(dir.path(), slide);
+    let flows = text_flows(doc.talk(), slide);
+    let body = flows.iter().position(|flow| flow.place == FlowPlace::Region("body".into())).expect("the slide has words");
+    let words: usize = flows[body].paras[0].spans.iter().map(|span| span.text.len()).sum();
+    assert!(doc.begin_text(slide, body, Pos { para: 0, offset: words }));
+    doc.text_layout(slide);
+    let mut times = Vec::with_capacity(KEYSTROKES);
+    for key in 0..KEYSTROKES {
+        let letter = if key % 6 == 5 { " " } else { "a" };
+        let start = Instant::now();
+        doc.apply_text(|edit| edit.insert(letter)).unwrap();
+        let head = doc.text().unwrap().edit.selection.head;
+        assert!(doc.text_layout(slide).caret(body, head).is_some());
+        doc.editor_layers(1280. / 1920.);
+        times.push(start.elapsed());
+    }
+    assert!(doc.still_jobs().is_empty(), "typing beside a recording doesn't read it again");
+    times.sort();
+    let median = times[times.len() / 2];
+    println!("median keystroke beside {what}: {median:?} (slowest {:?})", times.last().unwrap());
+    assert!(median < MOST, "a keystroke took {median:?}");
+}
+
+/// The busiest recording there is dragged about its slide.
+#[test]
+#[ignore = "timing; run in release"]
+fn a_frame_of_a_drag_of_the_busiest_recording_is_quick() {
+    drag_frames_of_recording(recording_talk_folder(), "the busiest recording");
+}
+
+/// A recording of many colours and no text dragged about its slide.
+#[test]
+#[ignore = "timing; run in release"]
+fn a_frame_of_a_drag_of_a_recording_of_many_colours_is_quick() {
+    drag_frames_of_recording(recording_talk_folder_with(colourful_recording()), "a recording of many colours");
+}
+
+/// The middle recording of `dir`, `what`, dragged about its slide.
+fn drag_frames_of_recording(dir: tempfile::TempDir, what: &str) {
+    let slide = RECORDING_SLIDES / 2;
+    let (mut doc, _) = open_recording_talk(dir.path(), slide);
+    let talk = doc.source().to_string();
+    let away = |starts: &[(Thing, Placed)]| starts.iter().map(|(_, placed)| Rect { x: placed.rect.x + 5000., y: placed.rect.y + 5000., ..bounds(placed) }).collect();
+    let (median, slowest, _, _) = drag_frames_of(&mut doc, &talk, slide, 1, away, here_and_there, |doc| {
+        assert!(doc.still_jobs().is_empty(), "a recording moved keeps its screen");
+    });
+    println!("median drag frame of {what}: {median:?} (slowest {slowest:?})");
+    assert!(median < MOST_FOR_A_DRAG_FRAME, "a drag frame took {median:?}");
+}
+
+/// The busiest recording there is made larger a unit a frame: its text is shaped again only when
+/// its rows are another whole unit high, and laid out in the box at the rest, and what's shown is
+/// its picture as it was drawn, stretched, until the drag ends. Both are timed.
+#[test]
+#[ignore = "timing; run in release"]
+fn a_frame_of_a_resize_of_the_busiest_recording_is_quick() {
+    let dir = recording_talk_folder();
+    let slide = RECORDING_SLIDES / 2;
+    let (mut doc, _) = open_recording_talk(dir.path(), slide);
+    assert!(doc.select_all_things());
+    let (thing, rect, rotate) = doc.selected_boxes().into_iter().next().unwrap();
+    let (mut laying, mut drawing) = (Vec::new(), Vec::new());
+    for frame in 1..=100 {
+        let grown = Rect { w: rect.w + frame as f32, h: rect.h + frame as f32 * 0.5625, ..rect };
+        let start = Instant::now();
+        doc.preview_places(&[(thing.clone(), Placed { rect: grown, rotate })]);
+        doc.text_layout(slide);
+        laying.push(start.elapsed());
+        let start = Instant::now();
+        doc.editor_layers(1280. / 1920.);
+        drawing.push(start.elapsed());
+    }
+    doc.drop_preview();
+    laying.sort();
+    drawing.sort();
+    let median = laying[laying.len() / 2];
+    let drawn = drawing[drawing.len() / 2];
+    println!("median resize frame of the busiest recording: laid out in {median:?} (slowest {:?}), drawn in {drawn:?} (slowest {:?})", laying.last().unwrap(), drawing.last().unwrap());
+    assert!(median + drawn < MOST_FOR_A_DRAG_FRAME, "a frame took {median:?} to lay out and {drawn:?} to draw");
+}
+
+/// The busiest recording's screen taken in, and its slide drawn again, as the window does once it's
+/// been read aside: the window waits on that no longer than on a keystroke.
+#[test]
+#[ignore = "timing; run in release"]
+fn the_busiest_recordings_screen_coming_in_is_quick() {
+    let dir = recording_talk_folder();
+    let (mut doc, slowest) = open_recording_talk(dir.path(), RECORDING_SLIDES / 2);
+    println!("the busiest recording's screen taken in and drawn: {slowest:?}");
+    assert!(slowest < MOST, "{slowest:?}");
+    // Drawn small, for the list of slides, its text isn't drawn.
+    let start = Instant::now();
+    doc.thumbnail(RECORDING_SLIDES / 2, 192);
+    let small = start.elapsed();
+    println!("the busiest recording's slide drawn small: {small:?}");
+    assert!(small < MOST, "{small:?}");
+}
+
+/// A recording of many colours and no text taken in, as the busiest is: shaped, placed and drawn
+/// aside, the window waiting on none of it.
+#[test]
+#[ignore = "timing; run in release"]
+fn a_recording_of_many_colours_coming_in_is_quick() {
+    let dir = recording_talk_folder_with(colourful_recording());
+    let (_doc, slowest) = open_recording_talk(dir.path(), RECORDING_SLIDES / 2);
+    println!("a recording of many colours taken in and drawn: {slowest:?}");
+    assert!(slowest < MOST, "{slowest:?}");
+}
+
+/// The editor zoomed on the slide of the busiest recording, a new scale each of twenty frames, from
+/// a little smaller to the window's: what's shown of it meanwhile is a picture of it stretched, and
+/// no frame waits on drawing it. Given beside the same zoom on a slide of an ordinary recording, as
+/// the slide's background and words are drawn again at each scale too.
+#[test]
+#[ignore = "timing; run in release"]
+fn a_frame_of_a_zoom_on_the_busiest_recording_is_quick() {
+    let dir = recording_talk_folder();
+    let zoom = |doc: &mut Document, slide: usize| {
+        doc.go_to(slide);
+        let mut times = Vec::new();
+        for frame in 1..=20 {
+            let scale = 1280. / 1920. * (0.6 + frame as f32 * 0.02);
+            let start = Instant::now();
+            doc.editor_layers(scale);
+            times.push(start.elapsed());
+        }
+        times.sort();
+        // The median, the second slowest of twenty, and the slowest.
+        (times[times.len() / 2], times[times.len() - 2], *times.last().unwrap())
+    };
+    let (mut doc, _) = open_recording_talk(dir.path(), 0);
+    let (ordinary, _, ordinary_slowest) = zoom(&mut doc, 0);
+    let (mut doc, _) = open_recording_talk(dir.path(), RECORDING_SLIDES / 2);
+    let (median, nearly_slowest, slowest) = zoom(&mut doc, RECORDING_SLIDES / 2);
+    assert!(!doc.draw_jobs().is_empty(), "drawn aside");
+    println!(
+        "zoom frame on the busiest recording: median {median:?}, 90th percentile {nearly_slowest:?}, slowest {slowest:?}; \
+         on an ordinary one: median {ordinary:?}, slowest {ordinary_slowest:?}"
+    );
+    // A frame the machine was busy for isn't the zoom's: nine in ten are within the budget.
+    assert!(median < MOST_FOR_A_DRAG_FRAME, "a zoom frame took {median:?} at the median");
+    assert!(nearly_slowest < MOST_FOR_A_DRAG_FRAME, "a zoom frame took {nearly_slowest:?} at the 90th percentile");
+}
+
+/// A recording that uses the alternate screen and full colour: a program draws a picture of
+/// colours there, changes it, and leaves it, as a full-screen program does.
+fn alternate_recording() -> Vec<u8> {
+    let picture = |shift: u32| {
+        let mut out = String::from("\u{1b}[H");
+        for row in 0..24u32 {
+            for col in 0..80u32 {
+                let (r, g, b) = ((col * 3 + shift) % 256, (row * 10 + shift) % 256, (col + row + shift) % 256);
+                out.push_str(&format!("\u{1b}[48;2;{r};{g};{b}m "));
+            }
+            out.push_str("\u{1b}[0m");
+            if row < 23 {
+                out.push_str("\r\n");
+            }
+        }
+        out
+    };
+    let (first, second) = (format!("\u{1b}[?1049h{}", picture(0)), picture(90));
+    slides_terminal::make_test_cast(
+        80,
+        24,
+        &[(0.0, "o", "$ colours\r\n"), (0.3, "o", &first), (0.8, "m", "drawn"), (1.3, "o", &second), (1.8, "o", "\u{1b}[?1049l$ ")],
+    )
+}
+
+/// A folder holding a talk of [`RECORDING_SLIDES`] slides, each a heading, words and a list,
+/// with a recording beside them when `with_recordings`: the demo on even slides and one using the
+/// alternate screen and full colour on odd ones.
+fn ten_recordings_folder(with_recordings: bool) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let mut talk = String::from("---\ntitle: A talk of recordings\n---\n\n");
+    for n in 0..RECORDING_SLIDES {
+        if n > 0 {
+            talk.push_str("---\n\n");
+        }
+        talk.push_str(&format!("# Slide {n}\n\nSome **bold** words about run {n}.\n\n- the first thing\n- the second thing\n\n"));
+        if with_recordings {
+            talk.push_str(&format!("<Terminal src=\"assets/run{n}.cast\" x=\"1000\" y=\"300\" w=\"800\" h=\"500\" />\n\n"));
+        }
+    }
+    std::fs::write(dir.path().join("slides.md"), talk).unwrap();
+    if with_recordings {
+        std::fs::create_dir(dir.path().join("assets")).unwrap();
+        for n in 0..RECORDING_SLIDES {
+            let cast = if n.is_multiple_of(2) { slides_terminal::make_demo_cast() } else { alternate_recording() };
+            std::fs::write(dir.path().join(format!("assets/run{n}.cast")), cast).unwrap();
+        }
+    }
+    dir
+}
+
+/// A letter typed on a slide of a talk of ten recordings, beside its recording, none playing.
+#[test]
+#[ignore = "timing; run in release"]
+fn a_keystroke_on_a_talk_of_ten_recordings_is_quick() {
+    keystrokes_beside(ten_recordings_folder(true), "a recording, on a talk of ten");
+}
+
+/// A recording dragged about its slide, on a talk of ten recordings.
+#[test]
+#[ignore = "timing; run in release"]
+fn a_frame_of_a_drag_of_a_recording_on_a_talk_of_ten_is_quick() {
+    drag_frames_of_recording(ten_recordings_folder(true), "a recording, on a talk of ten");
+}
+
+/// Opening a talk of ten recordings, as the window does: the talk read, every slide drawn small
+/// for the list of slides and the first drawn for the editor, a recording shown as a plain panel
+/// until its last screen is read aside. That takes under half a second more than the same talk
+/// without its recordings. Taking the ten screens in after, as the window's background tasks make
+/// them, is timed too.
+#[test]
+#[ignore = "timing; run in release"]
+fn opening_a_talk_of_ten_recordings_is_quick() {
+    let (plain, recordings) = (ten_recordings_folder(false), ten_recordings_folder(true));
+    let open = |dir: &std::path::Path| {
+        let start = Instant::now();
+        let mut doc = Document::open(dir, Fonts::bundled_only()).unwrap();
+        doc.make_stills_aside(std::sync::Arc::new(|| {}));
+        for index in 0..doc.slide_count() {
+            assert!(doc.thumbnail(index, 192).is_some());
+        }
+        doc.editor_layers(1280. / 1920.);
+        (start.elapsed(), doc)
+    };
+    let (mut without, mut with, mut screens) = (Vec::new(), Vec::new(), Vec::new());
+    for _ in 0..5 {
+        without.push(open(plain.path()).0);
+        let (took, mut doc) = open(recordings.path());
+        with.push(took);
+        let start = Instant::now();
+        take_recordings_in(&mut doc);
+        for index in 0..doc.slide_count() {
+            assert!(doc.thumbnail(index, 192).is_some());
+        }
+        screens.push(start.elapsed());
+    }
+    for times in [&mut without, &mut with, &mut screens] {
+        times.sort();
+    }
+    let (without, with, screens) = (without[2], with[2], screens[2]);
+    println!(
+        "opening a talk of {RECORDING_SLIDES} slides: {without:?} without recordings, {with:?} with one on each; \
+         their {RECORDING_SLIDES} last screens read and taken in after in {screens:?}"
+    );
+    assert!(with < without + Duration::from_millis(500), "opening took {with:?}, against {without:?} without recordings");
+}
+
+/// A recording of about 30 MB that a pack holds in about half that: 80 by 24, and thirty outputs
+/// of a megabyte less a little, of numbers.
+fn large_recording() -> Vec<u8> {
+    let mut next = 0x2545_f491_u32;
+    let output: String = (0..110_000)
+        .map(|_| {
+            next = next.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            format!("{:08x} ", next >> 8)
+        })
+        .collect();
+    let lines: Vec<(f64, &str, &str)> = (0..30).map(|at| (f64::from(at) * 0.1, "o", output.as_str())).collect();
+    slides_terminal::make_test_cast(80, 24, &lines)
+}
+
+/// Opening a packed talk of ten slides each with a recording of about 30 MB, as the window does,
+/// a recording shown as a plain panel until its last screen is read aside: each slide's first
+/// layout, every slide drawn small and each in the editor, reads no more of a recording than its
+/// header, so none takes longer than a keystroke on the window's thread.
+#[test]
+#[ignore = "timing; run in release"]
+fn opening_a_packed_talk_of_ten_large_recordings_is_quick() {
+    let folder = tempfile::tempdir().unwrap();
+    let mut talk = String::new();
+    for n in 0..RECORDING_SLIDES {
+        if n > 0 {
+            talk.push_str("---\n\n");
+        }
+        talk.push_str(&format!("# Slide {n}\n\nWords about run {n}.\n\n<Terminal src=\"assets/run{n}.cast\" x=\"1000\" y=\"300\" w=\"800\" h=\"500\" />\n\n"));
+    }
+    std::fs::write(folder.path().join("slides.md"), talk).unwrap();
+    std::fs::create_dir(folder.path().join("assets")).unwrap();
+    let cast = large_recording();
+    assert!(cast.len() > 29_000_000 && cast.len() <= 32 * 1024 * 1024, "{}", cast.len());
+    for n in 0..RECORDING_SLIDES {
+        std::fs::write(folder.path().join(format!("assets/run{n}.cast")), &cast).unwrap();
+    }
+    drop(cast);
+    let packed = tempfile::tempdir().unwrap();
+    let pack = packed.path().join("talk.sptx");
+    slides_engine::pack_folder(folder.path(), &pack, "0.1.0").unwrap();
+    drop(folder);
+    let mut steps = Vec::new();
+    let start = Instant::now();
+    let mut doc = Document::open_packed(&pack, Fonts::bundled_only()).unwrap();
+    doc.make_stills_aside(std::sync::Arc::new(|| {}));
+    let opened = start.elapsed();
+    for index in 0..doc.slide_count() {
+        let start = Instant::now();
+        assert!(doc.thumbnail(index, 192).is_some());
+        steps.push(start.elapsed());
+    }
+    for slide in 0..doc.slide_count() {
+        let start = Instant::now();
+        doc.go_to(slide);
+        doc.editor_layers(1280. / 1920.);
+        steps.push(start.elapsed());
+    }
+    assert_eq!(doc.still_jobs().len(), RECORDING_SLIDES, "each recording's still is made aside");
+    steps.sort();
+    println!("a packed talk of {RECORDING_SLIDES} recordings of 30 MB opened in {opened:?}; its slides laid out: median {:?}, slowest {:?}", steps[steps.len() / 2], steps.last().unwrap());
+    assert!(*steps.last().unwrap() < MOST, "a slide took {:?} to lay out", steps.last().unwrap());
+}
+
+/// A recording of two hours and 500,000 events, with a mark every 4,000.
+fn long_recording() -> Vec<u8> {
+    let mut lines: Vec<(f64, &str, String)> = Vec::with_capacity(500_200);
+    let step = 7200.0 / 500_000.0;
+    for i in 0..500_000u32 {
+        let at = f64::from(i) * step;
+        let text = match i % 5 {
+            0 => format!("\u{1b}[32mok\u{1b}[0m test {i}\r\n"),
+            1 => "$ ".to_owned(),
+            2 => "l".to_owned(),
+            3 => "s".to_owned(),
+            _ => "\r\n".to_owned(),
+        };
+        lines.push((at, "o", text));
+        if i % 4000 == 3999 {
+            lines.push((at, "m", "next".to_owned()));
+        }
+    }
+    let lines: Vec<(f64, &str, &str)> = lines.iter().map(|(at, code, text)| (*at, *code, text.as_str())).collect();
+    slides_terminal::make_test_cast(160, 48, &lines)
+}
+
+/// The long recording playing in the show, filling the slide, for 300 of the frames the window
+/// draws, a sixtieth of a second apart: how long each takes the window's thread, the newest
+/// picture taken in. Stepping the screen and drawing its picture are on the replay's own thread.
+/// The window here draws nothing to a screen, so painting the picture isn't in it.
+#[gpui_kit::test]
+#[ignore = "timing; run in release"]
+fn a_long_recording_playing_for_300_frames_leaves_the_window_free(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::AppContext as _;
+    use gpui_kit::test::TestWindowExt as _;
+    use stagepack_studio::present_view::start_show;
+    const FRAMES: usize = 300;
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        stagepack_studio::workspace_view::bind_keys(cx);
+    });
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::write(folder.path().join("slides.md"), "# Played\n\n<Terminal src=\"assets/long.cast\" x=\"0\" y=\"0\" w=\"1920\" h=\"1080\" />\n").unwrap();
+    std::fs::create_dir(folder.path().join("assets")).unwrap();
+    std::fs::write(folder.path().join("assets/long.cast"), long_recording()).unwrap();
+    let document = cx.new(|_| Document::open(folder.path(), Fonts::bundled_only()).unwrap());
+    let show = cx.update(|cx| start_show(document.clone(), false, cx));
+    let (audience, view) = cx.read(|cx| show.read(cx).audience()).expect("the audience's window");
+    let draw = |cx: &mut gpui_kit::TestAppContext| {
+        cx.run_until_parked();
+        let start = Instant::now();
+        cx.update_window(audience, |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let took = start.elapsed();
+        cx.run_until_parked();
+        took
+    };
+    let canvas = cx.read(|cx| view.read(cx).current().clone());
+    let made = |cx: &gpui_kit::TestAppContext| canvas.read_with(cx, |canvas, _| canvas.replay_images().0);
+    let began = Instant::now();
+    while made(cx) == 0 {
+        draw(cx);
+        assert!(began.elapsed() < Duration::from_secs(60), "the first picture never came");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // Every frame drawn, and those that took in a new picture.
+    let (mut frames, mut showing) = (Vec::with_capacity(FRAMES), Vec::new());
+    let first = made(cx);
+    let began = Instant::now();
+    for frame in 0..FRAMES {
+        let due = began + Duration::from_micros(16_667 * frame as u64);
+        if let Some(wait) = due.checked_duration_since(Instant::now()) {
+            std::thread::sleep(wait);
+        }
+        let before = made(cx);
+        let took = draw(cx);
+        frames.push(took);
+        if made(cx) > before {
+            showing.push(took);
+        }
+    }
+    let took = began.elapsed();
+    let pictures = made(cx) - first;
+    assert!(pictures >= FRAMES / 4, "only {pictures} pictures came in {took:?}");
+    let (made, released) = canvas.read_with(cx, |canvas, _| canvas.replay_images());
+    assert!(released + 1 >= made, "{made} made and {released} released");
+    frames.sort();
+    showing.sort();
+    let at = |times: &[Duration], part: f64| times[((times.len() - 1) as f64 * part).round() as usize];
+    println!(
+        "the long recording playing for {FRAMES} frames in {took:?}, {pictures} new pictures: of the frames the window drew, \
+         those taking in a new picture took its thread a median {:?}, 99th percentile {:?}; every frame, median {:?}, \
+         99th percentile {:?}, slowest {:?}",
+        at(&showing, 0.5),
+        at(&showing, 0.99),
+        at(&frames, 0.5),
+        at(&frames, 0.99),
+        frames.last().unwrap()
+    );
+    assert!(at(&frames, 0.5) < MOST_FOR_A_DRAG_FRAME, "a frame took {:?}", at(&frames, 0.5));
+    assert!(at(&showing, 0.5) < MOST_FOR_A_DRAG_FRAME, "a frame taking in a picture took {:?}", at(&showing, 0.5));
+    assert!(at(&frames, 0.99) < Duration::from_millis(16), "a frame took {:?} at the 99th percentile", at(&frames, 0.99));
     cx.update_window(audience, |_, window, _| window.remove_window()).ok();
     cx.run_until_parked();
 }

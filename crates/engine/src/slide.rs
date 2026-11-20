@@ -13,8 +13,9 @@ use crate::placeholder::placeholder_items;
 use crate::text_geometry::{LayerText, RegionBox};
 use crate::{
     Align, ComponentAsks, DisplayItem, Enter, Fonts, LayerSpec, LayoutDef, Moment, Notice, PictureCache, Rect, RegionDef, TalkComponents, TalkFiles, TextRun,
-    Transition, VideoOn, ModelOn, layout_by_name, shape_text,
+    Transition, VideoOn, ModelOn, TerminalOn, layout_by_name, shape_text,
 };
+use crate::terminal_screen::{LaidTerminal, TERMINAL_TAG, lay_out_terminal};
 
 /// How wide and high a slide is, in slide units.
 pub const SLIDE_WIDTH: f32 = 1920.0;
@@ -230,7 +231,7 @@ pub(crate) fn layout_slide_placed(talk: &Talk, index: usize, env: &mut LayoutEnv
                             source: Some(piece.source),
                             rect,
                             rotate: 0.0,
-                            items: piece.items,
+                            items: piece.items.into(),
                             click: Some((step as u32 + 1).min(MAX_CLICK)),
                             enter: timing.enter,
                             native: piece.native,
@@ -239,6 +240,7 @@ pub(crate) fn layout_slide_placed(talk: &Talk, index: usize, env: &mut LayoutEnv
                             varies,
                             video: None,
                             model: None,
+                            terminal: None,
                         });
                         texts.push(LayerText { region: Some((region.name, rect)), ..piece.text });
                     }
@@ -249,7 +251,7 @@ pub(crate) fn layout_slide_placed(talk: &Talk, index: usize, env: &mut LayoutEnv
         }
         let (drawing, varies) = noting_asks(env, |env| flow_region(blocks, region, rect.w, &theme, env, &mut notices));
         let (items, native) = (drawing.items, drawing.native);
-        layers.push(LayerSpec { source: Some(source), rect, rotate, items, click, enter: timing.enter, native, is_title, varies, video: None, model: None });
+        layers.push(LayerSpec { source: Some(source), rect, rotate, items: items.into(), click, enter: timing.enter, native, is_title, varies, video: None, model: None, terminal: None });
         texts.push(LayerText { region: Some((region.name, rect)), ..drawing.text });
     }
     for block in &slide.blocks {
@@ -350,10 +352,13 @@ fn positioned_layer(tag: &Tag, placing: Option<&Placing>, theme: &Theme, env: &m
         place.h = held(rect.h, place.h, 0.0, MAX_SIZE);
         place.rotate = held(*rotate, place.rotate, -MAX_ROTATION, MAX_ROTATION);
     }
-    for notice in place.notices {
+    for notice in std::mem::take(&mut place.notices) {
         if !notices.contains(&notice) {
             notices.push(notice);
         }
+    }
+    if tag.name == TERMINAL_TAG {
+        return (terminal_layer(tag, &place, placing.is_some(), theme, env, notices), LayerText::default());
     }
     let ((w, h), drawing) = lay_out_positioned_tag(tag, (place.w, place.h), place.align, theme, env, notices);
     let rect = Rect { x: place.x.unwrap_or(0.0), y: place.y.unwrap_or(0.0), w, h };
@@ -382,7 +387,7 @@ fn positioned_layer(tag: &Tag, placing: Option<&Placing>, theme: &Theme, env: &m
         source: Some(tag.range.clone()),
         rect,
         rotate,
-        items: drawing.items,
+        items: drawing.items.into(),
         click: place.click,
         enter: place.enter,
         native: drawing.native,
@@ -390,8 +395,36 @@ fn positioned_layer(tag: &Tag, placing: Option<&Placing>, theme: &Theme, env: &m
         varies: false,
         video,
         model,
+        terminal: None,
     };
     (layer, drawing.text)
+}
+
+/// The layer of a terminal recording placed at `place`: its last screen, which it plays over
+/// when asked. It's drawn by the engine alone, so it has nothing of its own for export, which
+/// takes it as a picture of its screen.
+fn terminal_layer(tag: &Tag, place: &TagPlace, placing: bool, theme: &Theme, env: &mut LayoutEnv, notices: &mut Vec<Notice>) -> LayerSpec {
+    let LaidTerminal { size: (w, h), items, stops, problem, pending } = lay_out_terminal(tag, (place.w, place.h), placing, theme, env);
+    if let Some(problem) = problem {
+        add_notice(notices, problem);
+    }
+    let rect = Rect { x: place.x.unwrap_or(0.0), y: place.y.unwrap_or(0.0), w, h };
+    let rotate = place.rotate.unwrap_or(0.0);
+    let src = tag.attr("src").unwrap_or_default().trim().to_string();
+    LayerSpec {
+        source: Some(tag.range.clone()),
+        rect,
+        rotate,
+        items,
+        click: place.click,
+        enter: place.enter,
+        native: Vec::new(),
+        is_title: false,
+        varies: false,
+        video: None,
+        model: None,
+        terminal: Some(TerminalOn { src, rect, rotate, stops, pending }),
+    }
 }
 
 /// Adds `text` to `notices`, shortened, unless it's there already.
@@ -588,7 +621,7 @@ pub(crate) fn empty_region_layer(region: &EmptyRegion, theme: &Theme, fonts: &mu
         source: None,
         rect: region.rect,
         rotate: region.rotate,
-        items,
+        items: items.into(),
         click: None,
         enter: Enter::Appear,
         native: Vec::new(),
@@ -596,6 +629,7 @@ pub(crate) fn empty_region_layer(region: &EmptyRegion, theme: &Theme, fonts: &mu
         varies: false,
         video: None,
         model: None,
+        terminal: None,
     }
 }
 
@@ -606,7 +640,7 @@ fn error_layer(slide: &Slide, message: &str, theme: &Theme, fonts: &mut Fonts) -
         source: Some(slide.range.clone()),
         rect,
         rotate: 0.0,
-        items: placeholder_items(message, rect, theme, fonts),
+        items: placeholder_items(message, rect, theme, fonts).into(),
         click: None,
         enter: Enter::Appear,
         native: vec![placeholder_element(message, rect, theme)],
@@ -614,6 +648,7 @@ fn error_layer(slide: &Slide, message: &str, theme: &Theme, fonts: &mut Fonts) -
         varies: false,
         video: None,
         model: None,
+        terminal: None,
     }
 }
 
@@ -699,7 +734,7 @@ fn background(theme: &Theme) -> LayerSpec {
         source: None,
         rect: Rect { x: 0.0, y: 0.0, w: SLIDE_WIDTH, h: SLIDE_HEIGHT },
         rotate: 0.0,
-        items: vec![DisplayItem::Fill { path: PathBuilder::from_rect(area), color: theme.background }],
+        items: vec![DisplayItem::Fill { path: PathBuilder::from_rect(area), color: theme.background }].into(),
         click: None,
         enter: Enter::Appear,
         native: Vec::new(),
@@ -707,6 +742,7 @@ fn background(theme: &Theme) -> LayerSpec {
         varies: false,
         video: None,
         model: None,
+        terminal: None,
     }
 }
 

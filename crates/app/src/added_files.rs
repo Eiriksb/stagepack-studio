@@ -1,6 +1,6 @@
-//! Files added to a talk: pictures, data, components and videos brought in from outside it. What
-//! may be added, under what name, and which of them the talk's text uses, so that a save writes
-//! those. The bytes are kept in memory, in the talk's [`AddedSet`], until a save writes them; a
+//! Files added to a talk: pictures, data, terminal recordings, components and videos brought in
+//! from outside it. What may be added, under what name, and which of them the talk's text uses,
+//! so that a save writes those. The bytes are kept in memory, in the talk's [`AddedSet`], until a save writes them; a
 //! video's never are: it's copied into the window's working copy, and held there by its path.
 //!
 //! [`AddedSet`]: slides_engine::AddedSet
@@ -46,13 +46,15 @@ pub enum FileKind {
     Video,
     /// A 3D model, which can be large: it's copied in as a file, as a video is.
     Model,
+    /// A terminal recording, which is a small text file of the talk's, held as a chart's data is.
+    Recording,
 }
 
 impl FileKind {
     /// The talk's folder the file goes in.
     pub fn folder(self) -> &'static str {
         match self {
-            FileKind::Picture | FileKind::Data | FileKind::Video | FileKind::Model => "assets",
+            FileKind::Picture | FileKind::Data | FileKind::Video | FileKind::Model | FileKind::Recording => "assets",
             FileKind::ComponentSource => "components",
             FileKind::ComponentBuild => "build",
         }
@@ -67,6 +69,7 @@ impl FileKind {
             FileKind::ComponentBuild => &["wasm"],
             FileKind::Video => &["mp4", "m4v", "mov"],
             FileKind::Model => &["glb", "ply"],
+            FileKind::Recording => &["cast"],
         }
     }
 
@@ -97,12 +100,20 @@ impl FileKind {
             FileKind::ComponentSource | FileKind::ComponentBuild => "component",
             FileKind::Video => "video",
             FileKind::Model => "model",
+            FileKind::Recording => "terminal recording",
         }
     }
 
     /// Every kind, in the order a path's kind is looked for.
-    pub(crate) const ALL: [FileKind; 6] =
-        [FileKind::Picture, FileKind::Data, FileKind::ComponentSource, FileKind::ComponentBuild, FileKind::Video, FileKind::Model];
+    pub(crate) const ALL: [FileKind; 7] = [
+        FileKind::Picture,
+        FileKind::Data,
+        FileKind::ComponentSource,
+        FileKind::ComponentBuild,
+        FileKind::Video,
+        FileKind::Model,
+        FileKind::Recording,
+    ];
 }
 
 /// The talk's folders that large files, of any kind, go in, each once.
@@ -150,6 +161,8 @@ pub enum NotAdded {
     ModelTooLarge,
     /// A file named as a 3D model that doesn't start as one does.
     NotAModel,
+    /// A file named as a terminal recording that doesn't start as one does.
+    NotARecording,
     /// The disk hasn't room for it, as was seen before anything was copied.
     NoRoom,
     /// The disk filled up while it was copied.
@@ -174,6 +187,8 @@ impl std::fmt::Display for NotAdded {
             NotAdded::ModelTooLarge => "That model is larger than 256 MB, so it wasn't added.",
             // As a model put on a slide that isn't one says: one refusal, one sentence.
             NotAdded::NotAModel => "This file isn't a 3D model.",
+            // As a recording on a slide that isn't one says.
+            NotAdded::NotARecording => "This file isn't a terminal recording.",
             NotAdded::NoRoom => "There isn't room on the disk for that file, so it wasn't added.",
             NotAdded::RanOutOfRoom => "The disk filled up while that file was copied, so it wasn't added.",
             NotAdded::Changed => "That file changed or went while it was copied, so it wasn't added.",
@@ -190,7 +205,9 @@ impl NotAdded {
             FileKind::Model => NotAdded::ModelTooLarge,
             FileKind::Video => NotAdded::VideoTooLarge,
             // Not kinds that can be large: only asked of those that can.
-            FileKind::Picture | FileKind::Data | FileKind::ComponentSource | FileKind::ComponentBuild => NotAdded::TooLarge,
+            FileKind::Picture | FileKind::Data | FileKind::ComponentSource | FileKind::ComponentBuild | FileKind::Recording => {
+                NotAdded::TooLarge
+            }
         }
     }
 }
@@ -291,8 +308,14 @@ fn checked(kind: FileKind, suggested: &str, bytes: Vec<u8>) -> Result<(Vec<u8>, 
         None => allowed[0],
         Some(given) => *allowed.iter().find(|ext| ext.eq_ignore_ascii_case(given)).ok_or(NotAdded::NotThatKind)?,
     };
+    // Whether one can be played is found off the window's thread before it's added; here, only
+    // that it starts as a recording does.
+    if kind == FileKind::Recording && !is_recording(&bytes) {
+        return Err(NotAdded::NotARecording);
+    }
     let fits = match kind {
         FileKind::Data => std::str::from_utf8(&bytes).is_ok(),
+        FileKind::Recording => true,
         // The engine finds the component's tag in its source: one it can't is no component.
         FileKind::ComponentSource => std::str::from_utf8(&bytes).ok().and_then(slides_components::component_tag).is_some(),
         FileKind::ComponentBuild => bytes.starts_with(WASM_MAGIC),
@@ -302,6 +325,12 @@ fn checked(kind: FileKind, suggested: &str, bytes: Vec<u8>) -> Result<(Vec<u8>, 
         return Err(NotAdded::NotThatKind);
     }
     Ok((bytes, ext))
+}
+
+/// Whether `bytes` start as a terminal recording that can be played does: with the header of
+/// asciinema's second format, of a screen that can be played. Only its first line is read.
+pub(crate) fn is_recording(bytes: &[u8]) -> bool {
+    slides_terminal::screen_size(bytes).is_some()
 }
 
 /// Where a file being added goes.

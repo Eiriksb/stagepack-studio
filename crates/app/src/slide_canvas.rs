@@ -7,12 +7,13 @@ use std::sync::Arc;
 
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::*;
-use slides_engine::{Layer, ModelLayer, ModelOn, Rect, VideoLayer, VideoOn, to_bgra_frame};
+use slides_engine::{Layer, ModelLayer, ModelOn, Rect, TerminalLayer, TerminalOn, VideoLayer, VideoOn, to_bgra_frame};
 use slides_model::{CantDraw, View};
 
 use crate::document::LargeOpen;
 use crate::model_view::{self, Aim, Turner};
 use crate::present::{LayerLook, SlideLook};
+use crate::replay::{Aim as ReplayAim, Replay, Source as ReplaySource};
 use crate::video_player::{Placed, Player, Shown, Turning, discard, open_and_play};
 
 /// The width of a 16:9 slide, in slide units.
@@ -51,9 +52,22 @@ struct Sprite {
     image: Arc<RenderImage>,
 }
 
-/// A layer to paint, how far below its place it is, whether it's painted itself, and the
-/// pictures of videos and models over it, each with where its layer is now.
-type RunSprite = (Sprite, f32, bool, Vec<(Shown, Rect)>);
+/// A layer to paint, how far below its place it is, whether it's painted itself, the pictures of
+/// videos and models over it, each with where its layer is now, and the plain panel of a
+/// recording started over it that has no picture yet, with its box and how far it's turned.
+type RunSprite = (Sprite, f32, bool, Vec<(Shown, Rect)>, Option<(Rect, f32)>);
+
+/// What shows of a terminal recording's layer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[doc(hidden)]
+pub enum RecordingShows {
+    /// Its still: its last screen.
+    Still,
+    /// Its plain panel: it's been started, and has no picture yet.
+    Panel,
+    /// A picture of its screen, from this far into it, in seconds.
+    Picture(f64),
+}
 
 /// Showing layers next to each other that share an opacity. Each sprite comes with how far
 /// below its place it is, in slide units, and the pictures of the videos playing over it.
@@ -107,12 +121,21 @@ pub struct SlideCanvas {
     models_released: Rc<Cell<usize>>,
     /// When the models' counts were last written out, and what they were then.
     models_counted: Option<(std::time::Instant, usize, usize)>,
+    /// The terminal recordings playing over their layers.
+    replays: Vec<Replay>,
+    /// Pictures of recordings no longer shown, which the next paint releases.
+    retired_replays: Vec<Arc<RenderImage>>,
+    /// How many pictures of recordings have been taken to show, and released, in all.
+    replays_made: usize,
+    replays_released: Rc<Cell<usize>>,
+    /// When the recordings' counts were last written out, and what they were then.
+    replays_counted: Option<(std::time::Instant, usize, usize)>,
 }
 
 /// Set, to anything, to have a window playing a video write how many of its pictures were
-/// shown, skipped and released each second to the standard error, and one turning a 3D model how
-/// many of its pictures were drawn and shown, and released: for checking by hand how smoothly a
-/// video plays or a model turns on a computer.
+/// shown, skipped and released each second to the standard error, and one turning a 3D model or
+/// playing a terminal recording how many of its pictures were drawn and shown, and released: for
+/// checking by hand how smoothly a video plays, a model turns or a recording plays on a computer.
 pub const COUNTS_TO_STDERR: &str = "STUDIO_VIDEO_COUNTS";
 
 fn counts_wanted() -> bool {
@@ -738,6 +761,182 @@ impl SlideCanvas {
         }
     }
 
+    /// Plays the terminal recording `on`, over layer `layer`, from its start to `aim`, reading it
+    /// and drawing it as `source` says, on a thread of its own. One that `stays` waits at
+    /// its end to be sent back to a mark, as in the show; one that doesn't ends there, as in the
+    /// editor. Either way its last picture stays until it's stopped.
+    pub fn play_recording(&mut self, layer: usize, on: TerminalOn, aim: ReplayAim, source: ReplaySource, stays: bool, cx: &mut Context<Self>) {
+        self.stop_recording(layer);
+        self.replays.push(Replay::start(layer, on, aim, source, stays, self.scale));
+        cx.notify();
+    }
+
+    /// Sends the recording playing over layer `layer`, if one is, on to `aim`.
+    pub fn aim_recording(&mut self, layer: usize, aim: ReplayAim, cx: &mut Context<Self>) {
+        if let Some(replay) = self.replays.iter_mut().find(|replay| replay.layer == layer) {
+            replay.aim(aim);
+            cx.notify();
+        }
+    }
+
+    /// Where the recording playing over layer `layer` has been sent, if one plays there.
+    pub fn recording_aim(&self, layer: usize) -> Option<ReplayAim> {
+        self.replays.iter().find(|replay| replay.layer == layer).map(Replay::aimed)
+    }
+
+    /// Stops the recording playing over layer `layer`, if one is: its still shows again.
+    fn stop_recording(&mut self, layer: usize) {
+        self.replays.retain_mut(|replay| {
+            let keep = replay.layer != layer;
+            if !keep {
+                self.retired_replays.extend(replay.take_shown());
+            }
+            keep
+        });
+    }
+
+    /// Stops every recording playing: each shows its still again.
+    pub fn stop_recordings(&mut self, cx: &mut Context<Self>) {
+        if self.replays.is_empty() {
+            return;
+        }
+        for mut replay in std::mem::take(&mut self.replays) {
+            self.retired_replays.extend(replay.take_shown());
+        }
+        cx.notify();
+    }
+
+    /// Stops the recording playing over layer `layer`, if one is.
+    pub fn stop_recording_on(&mut self, layer: usize, cx: &mut Context<Self>) {
+        let before = self.replays.len();
+        self.stop_recording(layer);
+        if self.replays.len() != before {
+            cx.notify();
+        }
+    }
+
+    /// Ends every recording's thread, each keeping the picture it shows, as on a slide left
+    /// that's still seen as the next comes in.
+    pub fn hold_recordings(&mut self, cx: &mut Context<Self>) {
+        for replay in &mut self.replays {
+            replay.hold();
+        }
+        cx.notify();
+    }
+
+    /// Follows the recordings among the layers as they're placed now: one still over its layer
+    /// plays where the layer is, and one whose layer plays something else, or nothing, stops.
+    pub fn place_recordings(&mut self, terminals: &[TerminalLayer], cx: &mut Context<Self>) {
+        let before = self.replays.len();
+        self.replays.retain_mut(|replay| {
+            match terminals.iter().find(|terminal| terminal.layer == replay.layer && terminal.on.src == replay.on.src) {
+                Some(terminal) => {
+                    if terminal.on != replay.on {
+                        replay.place(terminal.on.clone());
+                    }
+                    true
+                }
+                None => {
+                    self.retired_replays.extend(replay.take_shown());
+                    false
+                }
+            }
+        });
+        if self.replays.len() != before {
+            cx.notify();
+        }
+    }
+
+    /// The layers a recording's thread is playing over.
+    pub fn playing_recordings(&self) -> Vec<usize> {
+        self.replays.iter().filter(|replay| replay.is_playing()).map(|replay| replay.layer).collect()
+    }
+
+    /// Why each recording held here couldn't be played, if it couldn't, in order.
+    pub fn recording_failures(&self) -> Vec<Option<slides_terminal::CantPlay>> {
+        self.replays.iter().map(Replay::failed).collect()
+    }
+
+    /// The picture each recording held here shows now, in the order they were started.
+    #[doc(hidden)]
+    pub fn replay_pictures(&self) -> Vec<Option<Arc<RenderImage>>> {
+        self.replays.iter().map(|replay| replay.shown().map(|shown| shown.image.clone())).collect()
+    }
+
+    /// When in its recording each picture shown is from, in seconds, in the same order.
+    #[doc(hidden)]
+    pub fn replay_times(&self) -> Vec<Option<f64>> {
+        self.replays.iter().map(|replay| replay.shown().map(|shown| shown.at)).collect()
+    }
+
+    /// Whether any recording held here has pictures still to come.
+    #[doc(hidden)]
+    pub fn replays_moving(&self) -> bool {
+        self.replays.iter().any(Replay::wants_frames)
+    }
+
+    /// How many pictures of recordings have been taken to show, and how many released, in all.
+    #[doc(hidden)]
+    pub fn replay_images(&self) -> (usize, usize) {
+        (self.replays_made, self.replays_released.get())
+    }
+
+    /// The box and turn of the recording playing over layer `layer` whose first picture is still
+    /// to come, if one is.
+    fn recording_panel(&self, layer: usize) -> Option<(Rect, f32)> {
+        let replay = self.replays.iter().find(|replay| replay.layer == layer)?;
+        (replay.shown().is_none() && replay.is_playing()).then_some((replay.on.rect, replay.on.rotate))
+    }
+
+    /// What shows of layer `layer`, if it's a recording's: its still, its plain panel, or a
+    /// picture of its screen.
+    #[doc(hidden)]
+    pub fn recording_shows(&self, layer: usize) -> RecordingShows {
+        match self.replays.iter().find(|replay| replay.layer == layer).and_then(|replay| replay.shown()) {
+            Some(shown) => RecordingShows::Picture(shown.at),
+            None if self.recording_panel(layer).is_some() => RecordingShows::Panel,
+            None => RecordingShows::Still,
+        }
+    }
+
+    /// Takes in `replay`, readied for this slide before it was shown, to play over its layer.
+    pub(crate) fn adopt_recording(&mut self, replay: Replay, cx: &mut Context<Self>) {
+        self.stop_recording(replay.layer);
+        self.replays.push(replay);
+        cx.notify();
+    }
+
+    /// Takes the newest pictures of the recordings playing, without waiting for any, and asks
+    /// the window for another frame while any has a picture to come.
+    fn advance_recordings(&mut self, window: &mut Window) {
+        if self.replays.is_empty() {
+            // The next to play is counted from its start.
+            self.replays_counted = None;
+            return;
+        }
+        if counts_wanted()
+            && let Some(line) = picture_counts("recording", &mut self.replays_counted, std::time::Instant::now(), self.replays_made, self.replays_released.get())
+        {
+            eprintln!("{line}");
+        }
+        let mut wanted = false;
+        for replay in &mut self.replays {
+            let (made, replaced) = replay.advance(self.scale);
+            self.replays_made += usize::from(made);
+            self.retired_replays.extend(replaced);
+            // One done with, whose picture was drawn at another scale, shows its still again,
+            // drawn anew at this one.
+            let other_scale = replay.shown().is_some_and(|shown| matches!(shown.placed, Placed::Drawn { scale, .. } if Some(scale) != self.scale));
+            if other_scale && !replay.is_playing() && !replay.wants_frames() {
+                self.retired_replays.extend(replay.take_shown());
+            }
+            wanted |= replay.wants_frames();
+        }
+        if wanted {
+            window.request_animation_frame();
+        }
+    }
+
     /// The image of every layer, first to last, hidden ones included.
     pub fn images(&self) -> Vec<Arc<RenderImage>> {
         self.sprites
@@ -786,9 +985,19 @@ impl SlideCanvas {
                 .filter(|(_, turner)| turner.layer == index)
                 .filter_map(|(_, turner)| Some((turner.shown()?.clone(), turner.on.rect)))
                 .collect();
-            // A model drawn live shows in place of its still, which would show through around it.
-            let still = model.is_empty();
-            let sprite = (sprite.clone(), look.offset_y, still, over.into_iter().chain(model).collect());
+            let replay: Vec<(Shown, Rect)> = self
+                .replays
+                .iter()
+                .filter(|replay| replay.layer == index)
+                .filter_map(|replay| Some((replay.shown()?.clone(), replay.on.rect)))
+                .collect();
+            // A recording started shows its plain panel until its first picture, never its still,
+            // its last screen, which would give away what's to come.
+            let panel = self.recording_panel(index);
+            // A model drawn live, or a recording played, shows in place of its still, which would
+            // show through around it.
+            let still = model.is_empty() && replay.is_empty() && panel.is_none();
+            let sprite = (sprite.clone(), look.offset_y, still, over.into_iter().chain(model).chain(replay).collect(), panel);
             match runs.last_mut() {
                 Some(run) if run.opacity == look.opacity => run.sprites.push(sprite),
                 _ => runs.push(Run {
@@ -841,7 +1050,7 @@ fn paint_sprites(
     let to_window = drawn_at.map_or(1.0, |drawn_at| scale / drawn_at) / scale_factor;
     let width = f32::from(slide.size.width);
     let unit = width / SLIDE_WIDTH;
-    for (Sprite { layer, image }, offset_y, painted, over) in sprites {
+    for (Sprite { layer, image }, offset_y, painted, over, panel) in sprites {
         let place = Bounds {
             origin: slide.origin
                 + point(
@@ -859,6 +1068,22 @@ fn paint_sprites(
             window
                 .paint_image(slide, place, Corners::default(), image, 0, false)
                 .ok();
+        }
+        // A recording's plain panel, turned with its box.
+        if let Some((rect, rotate)) = panel {
+            let (middle_x, middle_y) = (rect.x + rect.w / 2., rect.y + rect.h / 2.);
+            let (sin, cos) = rotate.to_radians().sin_cos();
+            let corners = [(rect.x, rect.y), (rect.x + rect.w, rect.y), (rect.x + rect.w, rect.y + rect.h), (rect.x, rect.y + rect.h)].map(|(x, y)| {
+                let (dx, dy) = (x - middle_x, y - middle_y);
+                let (x, y) = (middle_x + dx * cos - dy * sin, middle_y + dx * sin + dy * cos);
+                slide.origin + point(px(x * unit + offset_x * width), px((y + offset_y) * unit))
+            });
+            let mut path = PathBuilder::fill();
+            path.add_polygon(&corners, true);
+            if let Ok(path) = path.build() {
+                let [r, g, b] = slides_terminal::rgb(slides_terminal::Colour::Default, false);
+                window.paint_path(path, gpui_kit::rgb(u32::from_be_bytes([0, r, g, b])));
+            }
         }
         // A video playing over the layer, where the layer is and moving as it does.
         for (shown, rect) in over {
@@ -896,11 +1121,14 @@ impl Render for SlideCanvas {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.advance_videos(window, cx);
         self.advance_models(window, cx);
+        self.advance_recordings(window);
         let retired = std::mem::take(&mut self.retired);
         let frames = std::mem::take(&mut self.retired_frames);
         let released = self.frames_released.clone();
         let model_pictures = std::mem::take(&mut self.retired_models);
         let models_released = self.models_released.clone();
+        let replay_pictures = std::mem::take(&mut self.retired_replays);
+        let replays_released = self.replays_released.clone();
         let edge_color = self.framed.then(|| cx.theme().border);
         let this = cx.entity().downgrade();
         // A child of its own, as it has to happen even with no layer showing.
@@ -917,6 +1145,10 @@ impl Render for SlideCanvas {
                 for image in model_pictures {
                     window.drop_image(image).ok();
                     models_released.set(models_released.get() + 1);
+                }
+                for image in replay_pictures {
+                    window.drop_image(image).ok();
+                    replays_released.set(replays_released.get() + 1);
                 }
                 if let Some((slide, scale)) = fit(area, window.scale_factor()) {
                     if let Some(color) = edge_color {
@@ -957,6 +1189,12 @@ impl Render for SlideCanvas {
 /// `made` and `released` in all now: nothing the first time, which `counted` begins counting
 /// from, and then once a second at most, counting afresh from each time it's written.
 fn model_counts(counted: &mut Option<(std::time::Instant, usize, usize)>, now: std::time::Instant, made: usize, released: usize) -> Option<String> {
+    picture_counts("model", counted, now, made, released)
+}
+
+/// What a window writes of the pictures of `what`, a model turning or a recording playing, as
+/// [`model_counts`] says.
+fn picture_counts(what: &str, counted: &mut Option<(std::time::Instant, usize, usize)>, now: std::time::Instant, made: usize, released: usize) -> Option<String> {
     let Some((then, made_then, released_then)) = *counted else {
         *counted = Some((now, made, released));
         return None;
@@ -966,13 +1204,24 @@ fn model_counts(counted: &mut Option<(std::time::Instant, usize, usize)>, now: s
         return None;
     }
     *counted = Some((now, made, released));
-    Some(format!("model pictures in {seconds:.2} s: {} drawn and shown, {} released", made - made_then, released - released_then))
+    Some(format!("{what} pictures in {seconds:.2} s: {} drawn and shown, {} released", made - made_then, released - released_then))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::model_counts;
+    use super::{model_counts, picture_counts};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn recording_counts_are_written_once_a_second_at_most() {
+        let mut counted = None;
+        let start = Instant::now();
+        assert_eq!(picture_counts("recording", &mut counted, start, 3, 1), None);
+        assert_eq!(
+            picture_counts("recording", &mut counted, start + Duration::from_millis(1250), 63, 60).as_deref(),
+            Some("recording pictures in 1.25 s: 60 drawn and shown, 59 released")
+        );
+    }
 
     #[test]
     fn model_counts_are_written_once_a_second_at_most() {

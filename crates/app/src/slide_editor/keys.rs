@@ -42,6 +42,7 @@ actions!(
         SelectAllThings,
         PlayOrStopVideo,
         TurnOrStopModel,
+        PlayOrStopRecording,
     ]
 );
 
@@ -114,6 +115,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("space", PlayOrStopVideo, Some(VIDEO_CONTEXT)),
         // Nor does a 3D model: Space turns it by hand, or goes back to its still.
         KeyBinding::new("space", TurnOrStopModel, Some(MODEL_CONTEXT)),
+        // Nor does a terminal recording: Space plays it, or stops it.
+        KeyBinding::new("space", PlayOrStopRecording, Some(TERMINAL_CONTEXT)),
     ]);
     crate::text_tools::bind_keys(cx);
 }

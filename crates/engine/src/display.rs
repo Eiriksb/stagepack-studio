@@ -31,7 +31,9 @@ pub struct LayerSpec {
     pub source: Option<Range<usize>>,
     pub rect: Rect,
     pub rotate: f32,
-    pub items: Vec<DisplayItem>,
+    /// Shared, so a layer laid out again from what's kept, as a terminal recording's screen is,
+    /// holds the same items rather than a copy of them.
+    pub items: Arc<[DisplayItem]>,
     /// The click this layer appears on, or `None` if it's there from the start.
     pub click: Option<u32>,
     pub enter: Enter,
@@ -45,6 +47,8 @@ pub struct LayerSpec {
     pub video: Option<VideoOn>,
     /// The 3D model this layer is the still of, which is drawn live over it when it's turned.
     pub model: Option<ModelOn>,
+    /// The terminal recording this layer is the last screen of, which plays over it when asked.
+    pub terminal: Option<TerminalOn>,
 }
 
 /// A video among a slide's layers: the place of its layer among them, where its tag is written,
@@ -97,4 +101,35 @@ pub struct ModelOn {
     pub views: Vec<slides_model::View>,
     pub rect: Rect,
     pub rotate: f32,
+}
+
+/// A terminal recording among a slide's layers: the place of its layer among them, where its tag
+/// is written, the click it appears on, and what it plays.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TerminalLayer {
+    pub layer: usize,
+    pub source: Option<Range<usize>>,
+    pub click: Option<u32>,
+    pub on: TerminalOn,
+}
+
+/// A terminal recording on a slide: the file it plays, where it plays, as its layer is placed,
+/// and how many times it stops until the next click, once its file has been read: none until
+/// then, or if it can't be played. Two are the same recording, playing the same, whether or not
+/// either's screen is still being shaped.
+#[derive(Clone, Debug)]
+pub struct TerminalOn {
+    pub src: String,
+    pub rect: Rect,
+    pub rotate: f32,
+    pub stops: usize,
+    /// Whether its screen is still being shaped and placed aside: until it is, its layer is its
+    /// panel alone, and what was drawn of it before is shown in its place.
+    pub pending: bool,
+}
+
+impl PartialEq for TerminalOn {
+    fn eq(&self, other: &TerminalOn) -> bool {
+        (&self.src, self.rect, self.rotate, self.stops) == (&other.src, other.rect, other.rotate, other.stops)
+    }
 }

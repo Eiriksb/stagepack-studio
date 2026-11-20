@@ -471,7 +471,8 @@ fn pasted_large(file: JsonFile) -> Option<PastedLarge> {
 
 /// `file` as a paste takes it, if its path is one [`pasted_kind`] gives a kind and its bytes are
 /// base64 of no more than [`MAX_ADDED_BYTES`] that hold that kind of file: a picture the engine
-/// reads, UTF-8 data, a component's source the check lets be built, or a WebAssembly module.
+/// reads, UTF-8 data, a terminal recording, a component's source the check lets be built, or a
+/// WebAssembly module.
 fn pasted_file(file: JsonFile) -> Option<PastedFile> {
     let kind = pasted_kind(&file.path)?;
     if stated_len(&file.bytes) > MAX_ADDED_BYTES.saturating_add(3) {
@@ -484,6 +485,7 @@ fn pasted_file(file: JsonFile) -> Option<PastedFile> {
     let fits = match kind {
         FileKind::Picture => slides_engine::picture_format(&bytes).is_some(),
         FileKind::Data => std::str::from_utf8(&bytes).is_ok(),
+        FileKind::Recording => crate::added_files::is_recording(&bytes),
         FileKind::ComponentSource => {
             bytes.len() as u64 <= slides_engine::MAX_SOURCE_BYTES
                 && std::str::from_utf8(&bytes).is_ok_and(|source| slides_components::check_source(&file.path, source).is_ok())
@@ -513,7 +515,7 @@ pub fn pasted_kind(path: &str) -> Option<FileKind> {
         return None;
     }
     let kinds: &[FileKind] = match folder {
-        "assets" => &[FileKind::Picture, FileKind::Data, FileKind::Video, FileKind::Model],
+        "assets" => &[FileKind::Picture, FileKind::Data, FileKind::Video, FileKind::Model, FileKind::Recording],
         "components" => &[FileKind::ComponentSource],
         "build" => &[FileKind::ComponentBuild],
         _ => return None,

@@ -7108,6 +7108,7 @@ dependencies = [
  "slides-components",
  "slides-format",
  "slides-model",
+ "slides-terminal",
  "slides-video",
  "svgtypes 0.16.2",
  "syntect",
@@ -7152,7 +7153,9 @@ dependencies = [
  "cosmic-text",
  "image",
  "krilla",
+ "miniz_oxide 0.8.9",
  "slides-engine",
+ "slides-terminal",
  "tempfile",
  "tiny-skia",
  "toolkit",
@@ -7165,11 +7168,23 @@ dependencies = [
  "quick-xml 0.41.0",
  "sha2 0.10.9",
  "slides-engine",
+ "slides-terminal",
  "tempfile",
  "tiny-skia",
  "toolkit",
  "url",
  "zip",
+]
+
+[[package]]
+name = "slides-terminal"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "serde_json",
+ "slides-terminal",
+ "unicode-width",
 ]
 
 [[package]]
@@ -7294,6 +7309,7 @@ dependencies = [
  "slides-model",
  "slides-pdf",
  "slides-pptx",
+ "slides-terminal",
  "slides-video",
  "tempfile",
  "toml 0.8.23",

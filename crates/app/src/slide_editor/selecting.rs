@@ -74,6 +74,61 @@ impl SlideEditor {
         }
     }
 
+    /// Plays the terminal recording selected, from its start through its marks to its end, where
+    /// it holds; or stops it while it plays, as its button does. One still being read, or that
+    /// can't be played, has no button.
+    pub(super) fn play_or_stop_recording(&mut self, cx: &mut Context<Self>) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        if self.recording_playing(cx) {
+            self.stop_recording(cx);
+            return;
+        }
+        let (terminal, plays) = document.update(cx, |document, _| (document.selected_terminal(), document.selected_terminal_plays()));
+        let Some(terminal) = terminal.filter(|_| plays) else { return };
+        self.stop_recording(cx);
+        self.stop_video(cx);
+        self.stop_turning(cx);
+        let Some(source) = terminal.source.clone() else { return };
+        let Some(open) = document.read(cx).open_large(&terminal.on.src) else { return };
+        let (slide, talk, fonts) = document.update(cx, |document, _| (document.current(), talk_hash(document.source()), document.fonts_seed()));
+        self.canvas.update(cx, |canvas, cx| {
+            canvas.play_recording(terminal.layer, terminal.on, crate::replay::Aim::PlayTo(None), crate::replay::Source { open, fonts }, false, cx)
+        });
+        self.replaying = Some(PlayingHere { slide, source, talk });
+        cx.notify();
+    }
+
+    /// Whether the recording selected is playing.
+    pub(super) fn recording_playing(&self, cx: &App) -> bool {
+        self.replaying.is_some() && !self.canvas.read(cx).playing_recordings().is_empty()
+    }
+
+    /// Stops the recording played, if one was, showing its still again.
+    pub fn stop_recording(&mut self, cx: &mut Context<Self>) {
+        if self.replaying.take().is_some() {
+            self.canvas.update(cx, |canvas, cx| canvas.stop_recordings(cx));
+            cx.notify();
+        }
+    }
+
+    /// Stops the recording played unless it's still the one thing selected, on the slide it was
+    /// played on, with the talk's text as it was.
+    fn keep_replaying_only_what_holds(&mut self, cx: &mut Context<Self>) {
+        let (Some(replaying), Some(document)) = (self.replaying.clone(), self.document.clone()) else {
+            return;
+        };
+        let holds = document.update(cx, |document, _| {
+            document.current() == replaying.slide
+                && talk_hash(document.source()) == replaying.talk
+                && document.selected_terminal().is_some_and(|terminal| terminal.source.as_ref() == Some(&replaying.source))
+        });
+        if !holds {
+            self.stop_recording(cx);
+        }
+    }
+
     /// Has the 3D model selected drawn live, to be turned by hand, or goes back to its still
     /// while it's turned, as its buttons and Space do. With no model selected, the key goes on.
     /// One whose still already says it can't be drawn isn't read: why is said again.
@@ -268,6 +323,7 @@ impl SlideEditor {
     /// its file is done. So for a model turned.
     pub(super) fn keep_playing_only_what_holds(&mut self, cx: &mut Context<Self>) {
         self.keep_turning_only_what_holds(cx);
+        self.keep_replaying_only_what_holds(cx);
         let (Some(playing), Some(document)) = (self.playing.clone(), self.document.clone()) else {
             return;
         };

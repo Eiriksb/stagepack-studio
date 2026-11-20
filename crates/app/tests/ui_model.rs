@@ -1304,7 +1304,7 @@ fn a_dropped_model_is_inserted_among_dropped_pictures(cx: &mut TestAppContext) {
     // test window, a drop after a key press doesn't reach the slide.)
     let notes = outside(work.path(), "notes.txt", b"words");
     drop_on_slide(&typing, cx, &[notes]);
-    assert_eq!(typing.status(cx).as_deref(), Some("Only pictures, videos and 3D models can be dropped on a slide."));
+    assert_eq!(typing.status(cx).as_deref(), Some("Only pictures, videos, 3D models and terminal recordings can be dropped on a slide."));
     let words = outside(work.path(), "words.glb", b"these are words, not a model");
     drop_on_slide(&typing, cx, &[words]);
     assert_eq!(typing.status(cx).as_deref(), Some(NOT_A_MODEL));

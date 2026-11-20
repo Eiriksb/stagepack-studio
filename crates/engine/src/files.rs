@@ -50,6 +50,15 @@ pub trait TalkFiles {
         self.read(path).map(|bytes| Box::new(Cursor::new(bytes)) as Box<dyn ReadSeek>)
     }
 
+    /// The first `most` bytes of `path`, or all of it if it's shorter, or `None` if it can't be
+    /// read: what a header is read from. Unless the files say otherwise, it's opened and read as
+    /// far as that.
+    fn read_prefix(&self, path: &str, most: usize) -> Option<Vec<u8>> {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::Read::take(self.open(path)?, most as u64), &mut bytes).ok()?;
+        Some(bytes)
+    }
+
     /// The file on disk `path` can be read from directly, when there is one.
     fn lies_at(&self, _path: &str) -> Option<PathBuf> {
         None
@@ -213,6 +222,10 @@ impl TalkFiles for std::sync::Arc<dyn TalkFiles + Send + Sync> {
         (**self).open(path)
     }
 
+    fn read_prefix(&self, path: &str, most: usize) -> Option<Vec<u8>> {
+        (**self).read_prefix(path, most)
+    }
+
     fn lies_at(&self, path: &str) -> Option<PathBuf> {
         (**self).lies_at(path)
     }
@@ -260,6 +273,10 @@ impl MemoryFiles {
 impl TalkFiles for MemoryFiles {
     fn read(&self, path: &str) -> Option<Vec<u8>> {
         self.get(path).map(|bytes| bytes.to_vec())
+    }
+
+    fn read_prefix(&self, path: &str, most: usize) -> Option<Vec<u8>> {
+        self.get(path).map(|bytes| bytes[..bytes.len().min(most)].to_vec())
     }
 
     fn len(&self, path: &str) -> Option<u64> {
@@ -527,6 +544,18 @@ impl TalkFiles for WithAdded {
             Some(AddedFile::Bytes(bytes)) => Some(bytes.to_vec()),
             Some(AddedFile::At(..)) => None,
             None => self.under.read(path),
+        }
+    }
+
+    fn read_prefix(&self, path: &str, most: usize) -> Option<Vec<u8>> {
+        if self.entered_index(path).is_some() || matches!(self.added.file(path), Some(AddedFile::At(..))) {
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::Read::take(self.open(path)?, most as u64), &mut bytes).ok()?;
+            return Some(bytes);
+        }
+        match self.added.file(path) {
+            Some(AddedFile::Bytes(bytes)) => Some(bytes[..bytes.len().min(most)].to_vec()),
+            _ => self.under.read_prefix(path, most),
         }
     }
 

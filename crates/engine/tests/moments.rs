@@ -100,7 +100,7 @@ fn lay_out_at(source: &str, moment: Moment) -> LaidOutSlide {
 fn texts_of(specs: &[LayerSpec]) -> Vec<String> {
     let mut lines = Vec::new();
     for spec in specs {
-        for item in &spec.items {
+        for item in spec.items.iter() {
             if let DisplayItem::Text { text, .. } = item {
                 lines.extend(text.buffer.lines.iter().map(|line| line.text().trim_end().to_string()));
             }
@@ -233,7 +233,7 @@ fn png(tint: u8) -> Vec<u8> {
 
 /// Slide `index`'s picture in its whole state, seen in a way that doesn't keep it in memory.
 fn picture_on(deck: &mut Deck, index: usize) -> Weak<tiny_skia::Pixmap> {
-    let drawn = deck.specs(index).iter().flat_map(|spec| &spec.items).find_map(|item| match item {
+    let drawn = deck.specs(index).iter().flat_map(|spec| spec.items.iter()).find_map(|item| match item {
         DisplayItem::Picture { pixmap, .. } => Some(Arc::downgrade(pixmap)),
         _ => None,
     });

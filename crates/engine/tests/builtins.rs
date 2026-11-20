@@ -704,7 +704,7 @@ fn an_svg_cannot_draw_files_from_the_computer_or_embedded_pictures() {
     for href in [outside.display().to_string(), format!("data:image/png;base64,{RED_PIXEL}")] {
         let svg = format!("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"8\" height=\"8\"><image href=\"{href}\" width=\"8\" height=\"8\"/></svg>");
         let (slide, _) = lay_out("<Picture src=\"a.svg\" x=\"0\" />\n", &[("a.svg", svg.into_bytes())]);
-        for item in &slide.layers[1].items {
+        for item in slide.layers[1].items.iter() {
             if let DisplayItem::Picture { pixmap, .. } = item {
                 assert!(!painted(pixmap), "{href} was drawn");
             }
@@ -1047,7 +1047,7 @@ fn a_shapes_kind_is_a_choice() {
 /// Everything a layer draws and is, written out, to compare with what it was.
 fn described(layer: &LayerSpec) -> String {
     let mut out = format!("{:?} turned {}\n", layer.rect, layer.rotate);
-    for item in &layer.items {
+    for item in layer.items.iter() {
         out += &match item {
             DisplayItem::Fill { path, color } => format!("fill {color:?} {:?}\n", path.segments().collect::<Vec<_>>()),
             DisplayItem::Stroke { path, color, width } => format!("stroke {color:?} {width} {:?}\n", path.segments().collect::<Vec<_>>()),

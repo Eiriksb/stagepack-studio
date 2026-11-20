@@ -65,6 +65,7 @@ impl Render for Inspector {
         self.follow_talk(&values, window, cx);
         let (facts, video_problem) = self.video_said(cx);
         let model = self.model_said(cx);
+        let (terminal_facts, terminal_problem) = self.terminal_said(cx);
         for image in self.retired.drain(..) {
             window.drop_image(image).ok();
         }
@@ -189,6 +190,28 @@ impl Render for Inspector {
                 this.child(
                     div()
                         .id(INSPECTOR_MODEL_PROBLEM_ID)
+                        .test_support()
+                        .aria_label(problem.clone())
+                        .text_sm()
+                        .text_color(cx.theme().danger)
+                        .child(problem),
+                )
+            })
+            .when_some(terminal_facts.map(SharedString::from), |this, facts| {
+                this.child(
+                    div()
+                        .id(INSPECTOR_TERMINAL_FACTS_ID)
+                        .test_support()
+                        .aria_label(facts.clone())
+                        .text_sm()
+                        .text_color(muted)
+                        .child(facts),
+                )
+            })
+            .when_some(terminal_problem.map(SharedString::from), |this, problem| {
+                this.child(
+                    div()
+                        .id(INSPECTOR_TERMINAL_PROBLEM_ID)
                         .test_support()
                         .aria_label(problem.clone())
                         .text_sm()

@@ -232,6 +232,27 @@ impl Document {
         self.insert_sized_on(slide, INSERT_MODEL, "Model", (&[("src", &name)], &after), insert::MODEL_SIZE, None)
     }
 
+    /// Adds `bytes`, a terminal recording whose screen is `screen`, its columns and rows, to the
+    /// talk as a file named as like `suggested` as is safe, and puts it on the current slide as
+    /// [`Self::insert_sized`] does, as one step named "Insert terminal recording": its screen at
+    /// its own size, made smaller to fit the slide. A recording the talk has already is that one.
+    /// Whether it can be played is for the caller to have found, off the window's thread: here
+    /// it's only refused if it doesn't start as a recording does.
+    pub fn insert_terminal(&mut self, suggested: &str, bytes: Vec<u8>, screen: (u16, u16)) -> Result<(), InsertFailed> {
+        self.insert_terminal_on(self.current, suggested, bytes, screen)
+    }
+
+    /// [`Self::insert_terminal`] on slide `slide`, as when it was asked for there and was looked
+    /// at after another was shown: that slide is shown again, with the recording selected. A
+    /// slide that's gone since is the one shown.
+    pub fn insert_terminal_on(&mut self, slide: usize, suggested: &str, bytes: Vec<u8>, screen: (u16, u16)) -> Result<(), InsertFailed> {
+        let slide = if slide < self.talk().slides.len() { slide } else { self.current };
+        let path = self.add_file(FileKind::Recording, suggested, bytes).map_err(InsertFailed::File)?;
+        self.insert_sized_on(slide, INSERT_TERMINAL, "Terminal", (&[("src", &path)], &[]), insert::terminal_size(screen), None)
+            .map_err(InsertFailed::Edit)?;
+        Ok(())
+    }
+
     /// Puts a table of `columns` columns and `rows` rows under its heading row, every cell empty,
     /// at the end of the current slide's content, as one step named "Insert table", and starts
     /// typing in its first heading cell. Typing on the slide ends first, and nothing stays

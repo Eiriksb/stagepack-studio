@@ -27,6 +27,8 @@ slides-model = { path = "../model", features = ["draw"] }
 slides-pdf = { path = "../pdf" }
 slides-pptx = { path = "../pptx" }
 slides-video = { path = "../video" }
+# Why a terminal recording can't be read, said as its still says it.
+slides-terminal = { path = "../terminal" }
 toolkit = { path = "../toolkit" }
 unicode-segmentation = "=1.13.3"
 
@@ -39,6 +41,8 @@ gpui-kit = { version = "=0.9.0", features = ["test-support"] }
 slides-video = { path = "../video", features = ["make"] }
 # And their own models, drawn on drawers they can slow down.
 slides-model = { path = "../model", features = ["make", "draw", "test-hooks"] }
+# And their own terminal recordings.
+slides-terminal = { path = "../terminal", features = ["make"] }
 image = "0.25"
 miniz_oxide = "=0.8.9"
 proptest = "=1.12.0"

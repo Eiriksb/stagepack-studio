@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use slides_engine::{AddedFile, MadeStill, MeasureVideo, ModelLayer, StillJob, StillWanted, VideoLayer, is_large_kind};
+use slides_engine::{AddedFile, MadeStill, MeasureVideo, ModelLayer, StillJob, StillWanted, TerminalLayer, VideoLayer, is_large_kind};
 
 use super::*;
 use crate::clipboard::{CopiedLarge, PastedLarge};
@@ -51,13 +51,15 @@ pub(crate) struct LargeHome {
     stills_waiting: Vec<StillJob>,
     /// What a talk's file is read from, as things are now, for what reads off the window's thread.
     opening: Arc<Mutex<Opening>>,
-    /// What's known of each video and 3D model, by its path, and the version of its file it was
-    /// read from, at most [`MOST_FACTS`] of them, each numbered as it was asked for.
+    /// What's known of each video, 3D model and terminal recording, by its path, and the version
+    /// of its file it was read from, at most [`MOST_FACTS`] of them, each numbered as it was asked
+    /// for.
     facts: BTreeMap<String, (Option<FileStamp>, Facts, u64)>,
     facts_asked: u64,
 }
 
-/// The most videos and models whose facts are kept: the one asked for longest ago goes first.
+/// The most videos, models and recordings whose facts are kept: the one asked for longest ago
+/// goes first.
 const MOST_FACTS: usize = 256;
 
 /// A file's length and when it was last changed, which tell a new version of it. A file the
@@ -65,7 +67,7 @@ const MOST_FACTS: usize = 256;
 /// or one added and kept in the working copy, and is told by its length alone.
 type FileStamp = (u64, std::time::SystemTime);
 
-/// What's known of a video's or a model's facts.
+/// What's known of a video's, a model's or a recording's facts.
 enum Facts {
     /// They're being read.
     Reading,
@@ -75,11 +77,30 @@ enum Facts {
     Known(Known),
 }
 
-/// A video's facts or a model's, or why there are none.
+/// A video's facts, a model's or a recording's, or why there are none.
 #[derive(Clone, Copy)]
 enum Known {
     Video(Result<VideoFacts, slides_video::CantPlay>),
     Model(Result<slides_model::ModelFacts, slides_model::CantDraw>),
+    Recording(Result<slides_terminal::RecordingFacts, slides_terminal::CantPlay>),
+}
+
+/// The kind of file whose facts are read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FactsOf {
+    Video,
+    Model,
+    Recording,
+}
+
+impl Known {
+    fn of(&self) -> FactsOf {
+        match self {
+            Known::Video(_) => FactsOf::Video,
+            Known::Model(_) => FactsOf::Model,
+            Known::Recording(_) => FactsOf::Recording,
+        }
+    }
 }
 
 /// What the form says of a video: how long it is, in seconds, and its size, in pixels, as it's shown.
@@ -89,14 +110,22 @@ pub struct VideoFacts {
     pub size: (u32, u32),
 }
 
-/// A video's facts, or a model's, to be read off the window's thread, as the whole of a video's
-/// index is read and a model's description: see [`Document::video_facts_to_read`] and
-/// [`Document::model_facts_to_read`].
+/// A video's facts, a model's or a recording's, to be read off the window's thread, as the whole
+/// of a video's index is read, a model's description and a recording from end to end: see
+/// [`Document::video_facts_to_read`], [`Document::model_facts_to_read`] and
+/// [`Document::recording_facts_to_read`].
 pub struct FactsToRead {
     path: String,
     version: Option<FileStamp>,
-    open: Option<LargeOpen>,
-    model: bool,
+    from: ReadFrom,
+}
+
+/// Where facts to be read are read from, and what kind of file they're of.
+enum ReadFrom {
+    Video(Option<LargeOpen>),
+    Model(Option<LargeOpen>),
+    /// Read whole, as a small data file of the talk's is.
+    Recording(Option<LargeOpen>),
 }
 
 /// What came of reading a video's or a model's facts, for [`Document::take_video_facts`] or
@@ -111,16 +140,30 @@ pub struct FactsRead {
 impl FactsToRead {
     /// Reads them, held among the talk's readers, within the limits a model is read with. A video
     /// a pack holds compressed is read only once it's been unpacked, never unpacked just for this;
-    /// a model, never more than 256 MB, is unpacked to read them, as it is to draw its still.
+    /// a model, never more than 256 MB, is unpacked to read them, as it is to draw its still. A
+    /// recording is read as its still reads it, unpacked if a pack holds it compressed.
     pub fn read(self) -> FactsRead {
-        let cant_read = if self.model { Known::Model(Err(slides_model::CantDraw::CouldNotRead)) } else { Known::Video(Err(slides_video::CantPlay::CouldNotRead)) };
-        let open = if self.model { LargeOpen::open_unless_saving } else { LargeOpen::open_for_still };
-        let read = match self.open.map(open) {
+        let (open, model) = match self.from {
+            ReadFrom::Recording(open) => {
+                let read = match open.map(LargeOpen::read_recording) {
+                    None => Some(Err(slides_terminal::CantPlay::CouldNotRead)),
+                    Some(Ok(bytes)) => Some(bytes.and_then(|bytes| slides_terminal::facts(&bytes))),
+                    // While a save replaces the pack: read again after it.
+                    Some(Err(_)) => None,
+                };
+                return FactsRead { path: self.path, version: self.version, read: read.map(Known::Recording) };
+            }
+            ReadFrom::Video(open) => (open, false),
+            ReadFrom::Model(open) => (open, true),
+        };
+        let cant_read = if model { Known::Model(Err(slides_model::CantDraw::CouldNotRead)) } else { Known::Video(Err(slides_video::CantPlay::CouldNotRead)) };
+        let opened = if model { LargeOpen::open_unless_saving } else { LargeOpen::open_for_still };
+        let read = match open.map(opened) {
             None | Some(Err(NotOpened::Unreadable)) => Some(cant_read),
             Some(Err(NotOpened::Saving | NotOpened::NotUnpacked)) => None,
             Some(Ok(reader)) => {
                 let watch = reader.watch();
-                let read = if self.model { Known::Model(slides_model::facts(Box::new(reader))) } else { Known::Video(facts_of(reader)) };
+                let read = if model { Known::Model(slides_model::facts(Box::new(reader))) } else { Known::Video(facts_of(reader)) };
                 match read {
                     // A save let go of its file: they're read again after it.
                     Known::Video(Err(_)) | Known::Model(Err(_)) if watch.is_let_go() => None,
@@ -408,6 +451,28 @@ impl LargeOpen {
         self.open_as(false)
     }
 
+    /// What tells this file from another and one version of it from another, while it's open: the
+    /// talk's files it's read from, its path in them, and its stamp, if they give one.
+    pub(crate) fn identity(&self) -> (usize, String, Option<(u64, std::time::SystemTime)>) {
+        (Arc::as_ptr(&self.files) as *const () as usize, self.path.clone(), self.files.stamp(&self.path))
+    }
+
+    /// The file read whole, as a terminal recording is: a small data file of the talk, read as any
+    /// is, from a pack compressed or not, while held among the talk's readers. Only a byte more than
+    /// a recording can be is read of one larger. What can't be read says why, as a recording's
+    /// still says it; while a save replaces the pack, it isn't read.
+    pub fn read_recording(self) -> Result<Result<Vec<u8>, slides_terminal::CantPlay>, NotOpened> {
+        let LargeOpen { files, path, readers, .. } = self;
+        let mut read = Err(slides_terminal::CantPlay::CouldNotRead);
+        // Held while it's read, and let go of at once: what's read is all that's wanted of it.
+        let held = readers.open(|| {
+            read = slides_engine::recording_bytes(&*files, &path);
+            Ok(Box::new(std::io::Cursor::new(Vec::new())) as Box<dyn slides_engine::ReadSeek>)
+        })?;
+        drop(held);
+        Ok(read)
+    }
+
     /// [`Self::open`] for reading a few headers on the window's thread: only a file read where it
     /// lies, never one from the cache, whose pack's list of files would have to be read first.
     pub(crate) fn open_in_place(self) -> Result<HeldReader, NotOpened> {
@@ -465,6 +530,10 @@ impl TalkFiles for ModelsUnpacked {
 
     fn open(&self, path: &str) -> Option<Box<dyn slides_engine::ReadSeek>> {
         self.files.open(path).or_else(|| self.unpacked(path))
+    }
+
+    fn read_prefix(&self, path: &str, most: usize) -> Option<Vec<u8>> {
+        self.files.read_prefix(path, most)
     }
 
     fn lies_at(&self, path: &str) -> Option<PathBuf> {
@@ -599,7 +668,7 @@ impl Document {
     pub fn video_facts(&self, path: &str) -> Option<Result<VideoFacts, slides_video::CantPlay>> {
         match self.known_facts(path)? {
             Known::Video(known) => Some(known),
-            Known::Model(_) => None,
+            Known::Model(_) | Known::Recording(_) => None,
         }
     }
 
@@ -609,7 +678,17 @@ impl Document {
     pub fn model_facts(&self, path: &str) -> Option<Result<slides_model::ModelFacts, slides_model::CantDraw>> {
         match self.known_facts(path)? {
             Known::Model(known) => Some(known),
-            Known::Video(_) => None,
+            Known::Video(_) | Known::Recording(_) => None,
+        }
+    }
+
+    /// What's known of the terminal recording at `path`, a file of the talk's, as its file is
+    /// now: its screen's size, how long it plays and how many times it stops, or why it can't be
+    /// played. `None` until they've been read, with [`Self::recording_facts_to_read`].
+    pub fn recording_facts(&self, path: &str) -> Option<Result<slides_terminal::RecordingFacts, slides_terminal::CantPlay>> {
+        match self.known_facts(path)? {
+            Known::Recording(known) => Some(known),
+            Known::Video(_) | Known::Model(_) => None,
         }
     }
 
@@ -625,30 +704,48 @@ impl Document {
     /// The facts of the video at `path` to be read, on another thread, if they're neither known
     /// for its file as it is now nor being read or waiting to be: they're read once a version.
     pub fn video_facts_to_read(&mut self, path: &str) -> Option<FactsToRead> {
-        self.facts_to_read(path, false)
+        self.facts_to_read(path, FactsOf::Video)
     }
 
     /// The facts of the 3D model at `path` to be read, on another thread, from its headers alone,
     /// as [`Self::video_facts_to_read`] gives a video's.
     pub fn model_facts_to_read(&mut self, path: &str) -> Option<FactsToRead> {
-        self.facts_to_read(path, true)
+        self.facts_to_read(path, FactsOf::Model)
     }
 
-    /// The facts of the video, or the model if `model`, at `path` to be read. Those known of the
-    /// other kind, as of a file named by a video and a model both, are read again as this kind.
-    fn facts_to_read(&mut self, path: &str, model: bool) -> Option<FactsToRead> {
+    /// The facts of the terminal recording at `path` to be read, on another thread, from end to
+    /// end, keeping none of its output, as [`Self::video_facts_to_read`] gives a video's. It's
+    /// read from the talk's files as any of its data files is, unpacked if a pack holds it
+    /// compressed.
+    pub fn recording_facts_to_read(&mut self, path: &str) -> Option<FactsToRead> {
+        self.facts_to_read(path, FactsOf::Recording)
+    }
+
+    /// Takes in a recording's facts, read off the window's thread, as [`Self::take_video_facts`]
+    /// takes in a video's.
+    pub fn take_recording_facts(&mut self, read: FactsRead) -> bool {
+        self.take_video_facts(read)
+    }
+
+    /// The facts of the file of kind `of` at `path` to be read. Those known of another kind, as
+    /// of a file named by a video and a model both, are read again as this kind.
+    fn facts_to_read(&mut self, path: &str, of: FactsOf) -> Option<FactsToRead> {
         let key = slides_engine::normalise(path).unwrap_or_else(|| path.to_string());
         let version = self.file_stamp(&key);
         let asked = self.large.facts.get(&key).is_some_and(|(held, facts, _)| match facts {
             Facts::Reading | Facts::Waiting => true,
-            Facts::Known(known) => *held == version && matches!(known, Known::Model(_)) == model,
+            Facts::Known(known) => *held == version && known.of() == of,
         });
         if asked {
             return None;
         }
         self.keep_facts(key.clone(), version, Facts::Reading);
-        let open = self.open_large(&key);
-        Some(FactsToRead { path: key, version, open, model })
+        let from = match of {
+            FactsOf::Video => ReadFrom::Video(self.open_large(&key)),
+            FactsOf::Model => ReadFrom::Model(self.open_large(&key)),
+            FactsOf::Recording => ReadFrom::Recording(self.open_large(&key)),
+        };
+        Some(FactsToRead { path: key, version, from })
     }
 
     /// Takes in a model's facts, read off the window's thread, as [`Self::take_video_facts`]
@@ -701,6 +798,17 @@ impl Document {
         if let Some(wanted) = wanted {
             wanted();
         }
+    }
+
+    /// The layers wanted drawn aside since last asked: terminal recordings' screens too long to
+    /// draw on the window's thread. Each is drawn with [`slides_engine::DrawJob::draw`] on another.
+    pub fn draw_jobs(&mut self) -> Vec<slides_engine::DrawJob> {
+        self.deck.draw_jobs()
+    }
+
+    /// Takes in a layer drawn aside, and says whether a slide shows it, to be drawn again.
+    pub fn take_drawn(&mut self, drawn: slides_engine::DrawnLayer) -> bool {
+        !self.deck.take_drawn(drawn).is_empty()
     }
 
     /// Takes in a still made aside, and says whether a slide shows it: it's drawn again when
@@ -796,6 +904,51 @@ impl Document {
     /// still has been tried and it can't.
     pub fn model_problem_on(&mut self, index: usize, source: &std::ops::Range<usize>) -> Option<String> {
         guarded(|| self.deck.model_problem(index, source)).ok().flatten()
+    }
+
+    /// Why the terminal recording at `source` on slide `index` can't be played, in a plain
+    /// sentence, if it's been read and can't be, or has no file.
+    pub fn terminal_problem_on(&mut self, index: usize, source: &std::ops::Range<usize>) -> Option<String> {
+        guarded(|| self.deck.terminal_problem(index, source)).ok().flatten()
+    }
+
+    /// Whether a terminal recording on slide `index` is still being read aside.
+    pub fn terminal_pending(&mut self, index: usize) -> bool {
+        guarded(|| self.deck.terminal_pending(index)).unwrap_or(false)
+    }
+
+    /// The terminal recordings on the current slide, among the layers [`Self::editor_layers`]
+    /// gives.
+    pub fn terminals_here(&mut self) -> Vec<TerminalLayer> {
+        let current = self.current();
+        guarded(|| self.deck.terminals(current)).unwrap_or_default()
+    }
+
+    /// The terminal recordings on slide `index`, of those a show goes through, at `moment`, among
+    /// the layers [`Self::layers_at`] gives then.
+    pub fn terminals_at(&mut self, index: usize, moment: slides_engine::Moment) -> Vec<TerminalLayer> {
+        guarded(|| self.deck.terminals_at(index, moment)).unwrap_or_default()
+    }
+
+    /// The one thing selected on the slide shown, if it's a terminal recording placed on it.
+    pub fn selected_terminal(&mut self) -> Option<TerminalLayer> {
+        let selected = self.selected()?.clone();
+        if selected.slide != self.current() || self.selection().is_none_or(|selection| selection.things.len() != 1) {
+            return None;
+        }
+        self.terminals_here().into_iter().find(|terminal| terminal.source.as_ref() == Some(&selected.source))
+    }
+
+    /// Whether the terminal recording selected can be played: it's been read, and can be.
+    pub fn selected_terminal_plays(&mut self) -> bool {
+        let Some(source) = self.selected_terminal().and_then(|terminal| terminal.source) else { return false };
+        let current = self.current();
+        !self.terminal_pending(current) && self.terminal_problem_on(current, &source).is_none()
+    }
+
+    /// The talk's fonts, to draw with on another thread, as a recording played is.
+    pub fn fonts_seed(&mut self) -> slides_engine::FontsSeed {
+        self.deck.fonts_mut().seed()
     }
 
     /// Writes `view` as the starting view of the 3D model at `source` on the current slide, as

@@ -45,7 +45,7 @@ use colors::color_of;
 use fields::{Choice, FIRST_FRAME, Kind, Spec, Typed, file_name, number_typed, stepped, text_typed};
 
 pub use fields::{BOTH_QUOTES, NOT_A_NUMBER, NOT_WHOLE};
-pub use labels::{model_facts, video_facts};
+pub use labels::{model_facts, terminal_facts, video_facts};
 
 pub const INSPECTOR_ID: &str = "inspector";
 /// What names the thing selected, at the top of the panel.
@@ -63,6 +63,11 @@ pub const INSPECTOR_VIDEO_PROBLEM_ID: &str = "inspector-video-problem";
 pub const INSPECTOR_MODEL_FACTS_ID: &str = "inspector-model-facts";
 /// The sentence saying why a 3D model selected can't be drawn, if it can't.
 pub const INSPECTOR_MODEL_PROBLEM_ID: &str = "inspector-model-problem";
+/// The line saying how big a terminal recording selected's screen is, how long it plays and how
+/// many times it stops, read off the window's thread.
+pub const INSPECTOR_TERMINAL_FACTS_ID: &str = "inspector-terminal-facts";
+/// The sentence saying why a terminal recording selected can't be played, if it can't.
+pub const INSPECTOR_TERMINAL_PROBLEM_ID: &str = "inspector-terminal-problem";
 /// The line saying how many views a 3D model selected has, one a click in the show.
 pub const INSPECTOR_MODEL_VIEWS_ID: &str = "inspector-model-views";
 /// The button that adds the view a 3D model being turned is shown from to its views.
@@ -435,6 +440,47 @@ impl Inspector {
         let unread = view.is_some_and(|view| slides_model::View::parse(&view).is_none()).then(|| slides_engine::MODEL_VIEW_UNREAD.to_string());
         let problem = problem.or_else(|| known.and_then(Result::err).map(|why| why.to_string())).or(unread);
         ModelSaid { facts, problem, views }
+    }
+
+    /// What the form says of the terminal recording it's for, if it's for one: how big its screen
+    /// is, how long it plays and how many times it stops, once that's been read off the window's
+    /// thread, once for each version of its file, and why it can't be played, if it can't.
+    fn terminal_said(&mut self, cx: &mut Context<Self>) -> (Option<String>, Option<String>) {
+        let (Some(form), Some(document)) = (&self.form, self.document.clone()) else {
+            return (None, None);
+        };
+        let Subject::Thing(target) = &form.target else {
+            return (None, None);
+        };
+        let target = target.clone();
+        if form.shape.tag.as_deref() != Some("Terminal") {
+            return (None, None);
+        }
+        let src = self.talk_attr("src", cx).map(|src| src.trim().to_string()).filter(|src| !src.is_empty());
+        let Some(src) = src else {
+            return (None, Some(slides_engine::TERMINAL_NO_FILE.to_string()));
+        };
+        let (known, to_read, problem) = document.update(cx, |document, _| {
+            let known = document.recording_facts(&src);
+            let to_read = if known.is_none() { document.recording_facts_to_read(&src) } else { None };
+            let problem = if target.slide == document.current() { document.terminal_problem_on(target.slide, &target.source) } else { None };
+            (known, to_read, problem)
+        });
+        if let Some(to_read) = to_read {
+            let document = document.downgrade();
+            cx.spawn(async move |this, cx| {
+                let read = cx.background_spawn(async move { to_read.read() }).await;
+                let known = document.update(cx, |document, _| document.take_recording_facts(read)).unwrap_or(false);
+                if known {
+                    this.update(cx, |_, cx| cx.notify()).ok();
+                }
+            })
+            .detach();
+        }
+        // What can't be played has no facts to say, but why.
+        let problem = problem.or_else(|| known.and_then(Result::err).map(|why| why.to_string()));
+        let facts = known.and_then(Result::ok).filter(|_| problem.is_none()).map(labels::terminal_facts);
+        (facts, problem)
     }
 
     /// Adds the view the 3D model the form is for is shown from, while it's turned, to its views.

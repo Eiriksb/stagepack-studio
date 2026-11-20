@@ -76,7 +76,7 @@ Design: `docs/superpowers/specs/2026-11-18-live-content-design.md`. The owner as
 
 - **G1. Large files and video:** a clip in the talk plays on its slide. File: `2026-11-18-live-content-plan-g1-video.md`. What ran is in `docs/checks/plan-g1.md`.
 - **G2. 3D models:** a model file drawn on its slide, turned by hand or between saved views on clicks. File: `2026-11-19-live-content-plan-g2-models.md`. What ran is in `docs/checks/plan-g2.md`.
-- **G3. Terminal replay:** a recorded session played back on its slide.
+- **G3. Terminal replay:** a recorded session played back on its slide. File: `2026-11-19-live-content-plan-g3-replay.md`. What ran is in `docs/checks/plan-g3.md`.
 - **G4. The AI tool:** commands, and a server an AI assistant can use, to read what a talk may hold, check a talk and see a picture of a slide.
 - **G5. The live terminal add-on:** a real shell or container behind a slide, off unless connected and said yes to.
 

@@ -15,7 +15,7 @@ You don't need to know Rust well. If you have written a function in any language
 
 ## Where a component goes
 
-A talk is a folder with `slides.md` in it. To start one, choose a template on the app's start screen, or *New presentation…* in the File menu, and save it with *Save As* as a talk folder; or make the folder and `slides.md` yourself. Put each component in its own file in a folder called `components`, next to `slides.md`. Pictures, videos, 3D models and data files go in a folder called `assets`. The example talk has:
+A talk is a folder with `slides.md` in it. To start one, choose a template on the app's start screen, or *New presentation…* in the File menu, and save it with *Save As* as a talk folder; or make the folder and `slides.md` yourself. Put each component in its own file in a folder called `components`, next to `slides.md`. Pictures, videos, 3D models, terminal recordings and data files go in a folder called `assets`. The example talk has:
 
 - `slides.md`, the slides.
 - `components/score.rs`, `components/callout.rs` and the other examples.
@@ -375,6 +375,7 @@ A talk is shared like any other file, so a component is held to some limits. The
 - **One drawing can read at most 64 MiB of files between them.** A read past that gives nothing.
 - **A component can't play a video.** A video goes on a slide by itself, from the Insert tab or as `<Video src="assets/clip.mp4" />`, and plays there.
 - **A component can't draw a 3D model.** A model goes on a slide by itself, from the Insert tab or as `<Model src="assets/model.glb" />`, and is drawn and turned there.
+- **A component can't play a terminal recording.** A recording goes on a slide by itself, from the Insert tab or as `<Terminal src="assets/run.cast" />`, and plays there.
 - **A component's elements can be nested at most 40 levels deep, and it can give back at most 20,000 elements and 256 KiB of text**, counting its text, problems, icon names, picture paths and path data together. It can place the content between its tags once. Past that, what it drew can't be read back safely or laid out in time.
 - **Each drawing has 250 ms and 64 MiB.** A component that never finishes or keeps taking memory is stopped, so it can't freeze the app.
 - **A source file is at most 1 MiB, a build at most 4 MiB, and a talk has at most 256 components.** These keep a talk from taking a long time to open. A talk loads at most 16 MiB of builds between them, and loading that much takes several seconds the first time.

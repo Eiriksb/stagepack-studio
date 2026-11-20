@@ -103,6 +103,11 @@ pub fn step_badge_id(n: usize) -> String {
 pub const VIDEO_PLAY_ID: &str = "video-play";
 pub const VIDEO_STOP_ID: &str = "video-stop";
 
+/// The button in the middle of a terminal recording selected that plays it, through its marks to
+/// its end, and that stops it while it plays.
+pub const TERMINAL_PLAY_ID: &str = "terminal-play";
+pub const TERMINAL_STOP_ID: &str = "terminal-stop";
+
 /// The button in the middle of a 3D model selected that has it drawn live, to turn it by hand.
 pub const MODEL_TURN_ID: &str = "model-turn";
 /// While a model is turned: the button that writes the view shown into the talk, and the one
@@ -119,6 +124,9 @@ pub const SELECTION_CONTEXT: &str = "SlideSelection";
 pub const VIDEO_CONTEXT: &str = "SlideVideo";
 /// The key context added to [`SELECTION_CONTEXT`] while the one thing selected is a 3D model.
 pub const MODEL_CONTEXT: &str = "SlideModel";
+/// The key context added to [`SELECTION_CONTEXT`] while the one thing selected is a terminal
+/// recording.
+pub const TERMINAL_CONTEXT: &str = "SlideTerminal";
 
 /// How long the caret shows, and then doesn't, as it blinks.
 const BLINK: Duration = Duration::from_millis(500);
@@ -222,6 +230,8 @@ pub struct SlideEditor {
     painted: MarkColors,
     /// The video selected that was played, while it's let play.
     playing: Option<selecting::PlayingHere>,
+    /// The terminal recording selected that was played, while it's let play.
+    replaying: Option<selecting::PlayingHere>,
     /// The 3D model selected that's being turned, and its layer, while it's let turn.
     turning: Option<(selecting::PlayingHere, usize)>,
     /// Where the pointer was as a drag turning the model last moved it.
@@ -274,11 +284,13 @@ impl SlideEditor {
                     this.end_editing(false, window, cx)
                 }
             }),
-            // The window losing the keyboard ends a drag, writing nothing, and stops a video.
+            // The window losing the keyboard ends a drag, writing nothing, and stops a video or a
+            // recording playing.
             cx.observe_window_activation(window, |this, window, cx| {
                 if !window.is_window_active() {
                     this.end_drag(cx);
                     this.stop_video(cx);
+                    this.stop_recording(cx);
                     this.stop_turning(cx);
                 }
             }),
@@ -358,6 +370,7 @@ impl SlideEditor {
             show_steps: false,
             painted: MarkColors::default(),
             playing: None,
+            replaying: None,
             turning: None,
             turn_drag: None,
             ime_place: None,
