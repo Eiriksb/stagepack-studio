@@ -1,0 +1,121 @@
+# Plan G3: what ran, and what to check by hand
+
+The run was on the `plan-g3` branch, starting from commit d00cb1b, on a 16-core Linux laptop with an Intel Core Ultra 7 255H, its integrated Intel graphics and a discrete NVIDIA card, on its charger, with Rust 1.98.0, in a release build, on 2026-11-20. It found one thing to fix, with a test that failed before its fix: between two cells of other background colours a line of the screen's own background showed, a pixel wide, at some scales. A second change lets a window write how many pictures of a playing recording it draws and releases each second, as it does for videos and models, which is how the playing below was measured, and which the hand checks use. Both are under *What it found*. The branch hasn't been pushed or merged yet. Nothing here has run on Windows.
+
+Every recording in this run and in the tests was made by the terminal crate's own test makers, `slides_terminal::make_test_cast` and `make_demo_cast`, from a scratch program and the tests themselves: in the window, *the demo* (80 by 24, 5 seconds: a prompt, a command typed a character at a time, coloured output, a mark, a second command, and a full-screen program in the alternate screen that exits; 1.4 KB); *the long one* (160 by 48, two hours and 500,000 events, a mark every 4,000, so 125 stops; 14.6 MB); *the colours* (80 by 24, 4 seconds: a picture of 1,920 cells, each a background of its own in full colour, drawn in the alternate screen, a mark, drawn twice more, and left; 138 KB); and a text file of one line named `notes.cast`. None was made by `asciinema rec`, and none of the owner's own recordings was used. **Made recordings are simpler than real ones**: they use fewer kinds of sequence than a real shell, editor or full-screen program writes, so a real one may show something the screen draws wrongly, or not at all; that is the first hand check.
+
+## Tests on Linux
+
+At the run's last commit, `scripts/cargo-safe.sh test --workspace --no-fail-fast` passed: 2,581 tests, 0 failed, 54 ignored, no warnings. The four new ignored ones are the release timing tests below. `scripts/cargo-safe.sh clippy --workspace --all-targets` gave no warnings.
+
+The random editing session, `crates/app/tests/typing_random.rs`, has its three parts as before: typing, arranging, and the window. The window's part now has three more kinds of step among its 70: the demo put on the slide, from the Terminal recording tool's dialog or dropped at a random place; a recording on the slide selected and played, or stopped, by its button or Space, with a little real time for it to play in; and, with a recording in the talk, the show started, clicked through with Right and Space and now and then Left, so through a recording's marks and back, and ended. After every step, besides the checks it had, a recording plays in the editor only while it alone is selected; after the show is over, and at the end, every replay's thread ends. A count across the runs makes sure they did it: in the default run of 20, the steps put 23 recordings on slides, played one in the editor 5 times and clicked 78 times in the show while a recording's slide showed (and, as before, put 29 models on slides, turned one 5 times, set 11 views and dragged in the show 20 times). The session passed, its three parts together in 7 minutes 16 seconds. It found nothing to fix.
+
+The release timing tests, `scripts/cargo-safe.sh test --release -p stagepack-studio --test edit_speed -- --ignored`, have four new ones, on a talk of ten slides each a heading, words, a list and a recording of 800 by 500 beside them, the demo on even slides and one using the alternate screen and full colour on odd ones; and on the long one playing in the show, filling the slide:
+
+| What | Measured |
+| --- | --- |
+| A keystroke beside a recording, on that talk, the slide laid out and drawn again: median (slowest) | 2.8 to 2.9 ms (7.6 to 9.2 ms) |
+| A frame of a drag of a recording on that talk: median (slowest) | 0.018 to 0.025 ms (0.08 ms) |
+| Opening that talk as the window does, every slide drawn small and the first drawn, against the same talk without its recordings | 10.3 to 10.9 ms against 9.6 to 11.3 ms |
+| Its ten last screens read, played to their ends and taken in after, off the window's thread but for taking them in | 10.3 to 10.4 ms |
+| The long one playing in the show for 300 of the window's frames, a sixtieth of a second apart: how many new pictures came | 135 and 136 in 5.0 s |
+| The same: each frame that took in a new picture, on the window's thread: median (99th percentile) | 0.45 to 0.56 ms (0.60 to 1.0 ms) |
+| The same: every frame: median (99th percentile) | 0.45 to 0.51 ms (0.61 to 1.0 ms) |
+
+The budgets are 8 ms for a keystroke and 6 ms for a frame of a drag or of the window's, at the median, and opening may take half a second more than without recordings: all hold. The window draws nothing to a screen in these tests, so painting the picture isn't in their numbers; the window's thread only takes in a picture the replay's thread has drawn. **The long one shows about 27 new pictures a second there, not 60**: its screen changes every 14 ms, but its replay's thread draws a picture of the whole slide's 160 by 48 cells, its text shaped, about every 37 ms here, which the window never waits for; that, not the window, is how often a playing recording this busy changes on the screen. Why each picture takes that long hasn't been looked into. The ten-recording talk's slides are ordinary; the costliest screen there is, 500 by 200 cells each of its own colours, has the timing tests Task 3 added, which ran too. The whole timing suite, 31 tests, ran once one test at a time: 30 passed, and one of Task 3's failed, `a_frame_of_a_zoom_on_the_busiest_recording_is_quick`, whose slowest of twenty frames took 8.5 ms against its 6 ms; run alone five times after, it passed each time, its slowest 3.8 to 5.8 ms, its median 2.6 to 2.9 ms. It asks the slowest frame, not the median, to be within the budget, so a frame the machine was busy for fails it; nothing of this task's changes what it draws but the fills' edges, which cost no more. Every other test from before ran within its budget, the table-cell keystroke at 5.7 ms at the median.
+
+## The scratch display, and the owner's data
+
+As in plans G1 and G2: a nested X display, `Xephyr :88` at 1,600 by 900 with no window manager; every launch through one script that refuses to start without that display and a scratch message bus, with `DISPLAY=:88`, `WAYLAND_DISPLAY`, `XAUTHORITY` and `STUDIO_BUNDLE` taken away, `HOME` set to a scratch home in the session's scratch folder, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` and `XDG_DOCUMENTS_DIR` set to folders in it, a `Documents` folder there, and `STUDIO_VIDEO_COUNTS=1`. The message bus's socket was in a short scratch folder of its own. The running app's environment was read back from `/proc` to be sure. The system's file dialogs were answered by D5's stand-in for the desktop portal on that bus, which writes down what each Open and Save asked and answers with a path. Keys and clicks went in through the X test extension, and files were dropped on the window with D3's small program speaking the drag-and-drop protocol, built afresh from its source for the run. Screenshots were kept in the scratch folder, not committed; every one was looked at.
+
+The real data folders, `~/.local/share/stagepack-studio` and `~/.cache/stagepack-studio`, were listed with every file's time and size before the first launch and after the last: the two lists, of 25,134 entries each, are the same. The modification times of the two folders and of the real `~/Documents` are the same before and after, and so is the list of what's in `~/Documents`; only the home folder's own time, which other programs on the desktop change, moved. The made recordings, the saved pack, the exports and the scratch home, about 71 MB, were deleted after it.
+
+The nested display draws in software and shows only so many pictures a second, whatever the app asks, as before: here about 7 a second in the show's window of 1,600 by 900, and 8 to 16 in the editor's smaller box. So how smoothly a recording plays can't be judged here: that is a hand check. What was measured instead, with the counts the app now writes when asked (below): pictures of recordings drawn and shown, and released, each second; processor use and memory, read from `/proc` each second.
+
+## Real-window check on Linux
+
+### What it did
+
+In four sessions of the app, with a crash before the third, started with `STUDIO_VIDEO_COUNTS=1`:
+
+- **A presentation, and the demo:** *Light* on the start screen gave *Untitled presentation*; a title, *Recordings*, was typed. *Terminal recording* on the Insert tab, in its group *Recordings*, asked the dialog for a file (*Insert*, several allowed), and the stand-in answered the demo. It was on the slide at once, in the middle at 614, 324, 691 by 432, its last screen showing, selected, with *Play* at its middle and *Terminal recording selected* on the status line. Its form says *Terminal recording*, its name *demo.cast*, *80 by 24, 5 s, 1 stop*, and its place. The list of slides shows its still.
+- **Played in the editor:** *Play* became *Stop*, and the recording played from its start: the command typed, its coloured listing, the full-screen program's table, and back to the prompt, through its mark without stopping; at its end it held its last screen and *Play* came back. While it played, 5 to 8 pictures were drawn and shown a second, every one released.
+- **The long one, dropped:** a new slide with Ctrl+M, and the long one dropped on it: on the slide within a second, at 269, 108, 1,382 by 864 (as large as the slide allows, keeping its shape), its plain panel for a moment and then its last screen, *long.cast*, *160 by 48, 2 h, 125 stops*. Space played it and Space stopped it; 8 to 21 pictures a second while it played.
+- **The colours:** a third slide, and the colours from the tool: *80 by 24, 4 s, 1 stop*. Played, it drew its picture of colours in the alternate screen, changed it twice and left it for the prompt and a line in orange.
+- **A text file named `.cast`:** from the tool, the status line said *This file isn't a terminal recording.* and nothing was put on the slide.
+- **The show:** F5 presented from the first slide. The demo started at once, typed its command and held at its mark. Right played it on through the full-screen program to its end; Left showed the screen at its mark again. Right twice more went to the long one's slide, which started at once: it played for 54 seconds to its first mark and held there. Meanwhile **7 pictures were drawn and shown a second, every one released, 1.2 to 1.5 of a core, 521 MB, flat**; held at the mark, 0.01 to 0.02 of a core. Right played on, and Left 0.3 seconds after showed the mark's screen again, from *test 3995*, without playing two hours. Right 130 times went through its 125 marks to the colours' slide, which played; Left showed its mark, and Left again went back to the long one's slide, showing its end, *test 499995*, at once, nothing replaying. Escape ended the show: no recording's thread was left, and the window, idle, used 0.01 of a core, 485 MB, 66 threads.
+- **Saved as a pack, closed, opened, played:** Ctrl+S asked *Keep the talk as a folder of files, or pack it into one file to send.*; *Packed talk (.sptx)* asked the dialog for *Untitled presentation.sptx*, the stand-in answered `Recordings.sptx` in Documents, and the status line said *Saved Recordings.sptx.*, the title *Recordings · 1 / 3*. The pack holds the three recordings compressed, as a chart's data is, the long one in 2.1 MB. The window closed without asking, the app ended, and its working copy was gone. Started again, *Open a talk file…* opened `Recordings.sptx` with its three stills; the long one played from the pack, 16 to 17 pictures a second.
+- **A crash, and the talk brought back:** Ctrl+N, *Dark*, a title, and the demo dropped on it; five seconds later the app was ended with `kill -9`. Its working copy held the demo. Started again, the start screen listed it under *Not saved last time*, *Untitled presentation*, *Crash*, *1 slide*; *Open* showed it with its recording, which played.
+- **A slide copied to another talk:** with `Recordings.sptx` open in a second window, its colours' slide was copied from the list of slides and pasted into the brought-back talk. The slide came with its recording, the file in that talk's working copy, and it played there.
+- **Exported:** *PDF…* and *PowerPoint…* from the Export menu of `Recordings.sptx`, answered with files in a scratch folder: each said *Exported Recordings.pdf. 3 terminal recordings were exported as their last screen.* (and *.pptx*). The PDF has 3 pages of 960 by 540 points, each recording its last screen, and its text can be selected: `pdftotext` gives each screen's lines, *demo:~/talk$ ls --color*, *ok test 499995*, *full colour done*. The PowerPoint file, turned into a PDF by LibreOffice with a scratch profile, shows the same three screens as pictures.
+- **Idle, and closing:** with two windows open and nothing playing, the app used 0.01 to 0.04 of a core and 414 MB. The pack's window closed without asking; the brought-back one asked *Save before closing?*, *Don't save* closed it, the app ended, and its working copy was gone.
+- **After the fix below:** a talk folder of the colours alone, opened from the command line and presented: at its mark, its picture of colours had no line between its cells.
+
+### What it found
+
+- **Between two cells of other background colours, a line of the screen's own background showed**, a pixel wide and dark, at some scales: in the show's window of 1,600 by 900, two such lines ran down the colours' picture. A row's run of a colour was filled from its left edge across its width, and the cell after it from its own left edge, and the two sums can differ in their last bit, so that at some scales a pixel between them was in neither. Each run is now filled from edge to edge as the grid has them, so neighbours share their edges exactly. Test: `cells_of_other_colours_side_by_side_leave_no_gap_between` in `crates/engine/tests/terminal.rs`, which drew a checkerboard of two colours at every scale from 0.30 to 1.50 and found the line at 0.5 and 1.5 before the fix.
+- **Nothing counted the pictures of a playing recording outside a test**, so how a recording plays couldn't be measured in the window. With `STUDIO_VIDEO_COUNTS` set, the window now writes, each second a recording plays, a line such as *recording pictures in 1.04 s: 7 drawn and shown, 7 released* to the standard error. Test: `recording_counts_are_written_once_a_second_at_most` in `crates/app/src/slide_canvas.rs`.
+
+### What looks wrong and wasn't changed
+
+- **A recording put on a slide covers what's there**: on a slide of the *title* layout, the demo went over the title, and the long one, as large as the slide allows, over the title and the body; and *Click to add text*, the empty body's hint, is drawn over the recording in the editor. A recording dropped goes in the middle of the slide, not where it was dropped, as a model does.
+- **The check before a recording is added has no status line or Cancel**: the long one took under a second here; a crafted one may take two seconds, and nothing shows meanwhile. Several added at once are checked at once.
+- **The status line kept *This file isn't a terminal recording.*** after the show until something else was said, as it keeps a model's.
+- **Going through a recording of many marks in the show takes a click for each**: the long one's 125 stops took 130 presses of Right to get past. The show has no way to jump to another slide.
+- **The Terminal recording tool's Open dialog offers no list of kinds of file**, as the other tools don't, so a person isn't steered to `.cast`. The real dialog's look is a hand check.
+- **The Save dialog for a new talk suggested the scratch home, not its Documents folder**, as in G2: the scratch home had no `user-dirs.dirs` naming one.
+
+## Not exercised
+
+- **A recording made by `asciinema rec`**, of a real shell, editor or full-screen program, and the owner's own recordings: nothing here was recorded on this machine.
+- **How smoothly any recording plays**, on any real display. The nested display shows about 7 to 16 pictures a second.
+- **Anything at all on Windows.**
+- **Right-to-left letters**, such as Hebrew or Arabic, in a recording: within a run they can swap cells, a known gap from Task 3, not tried in the window.
+- **Zooming the editor in past 100 %** on a crafted busy screen, which Task 3 measured at 7 to 13 ms a frame on the window's thread, over the budget; ordinary recordings, as here, are well within it.
+- **The system's real file dialogs**, for *Terminal recording*, Save As, Open and Export.
+- **A second screen**, and the show's presenter window with a recording (covered by a headless test: it shows the last screen).
+- **A recording's path pasted on the slide**: headless tests only.
+- **Desktop PowerPoint**: the PowerPoint file was drawn by LibreOffice.
+
+## Hand check on a real Linux display
+
+Under an X11 session and a Wayland session, from a release build started with `STUDIO_VIDEO_COUNTS=1` in a terminal, so that it writes its counts.
+
+1. Record three sessions of your own with `asciinema rec`, in its second format: asciinema 2 writes it; asciinema 3 writes its third unless told to write the second (see `asciinema rec --help`). A shell session of a few commands with coloured output, `ls --color` and `git log --oneline --graph` say; a full-screen program, such as `htop`, `vim` with a colour scheme or `less`, opened and quit; and one with a mark or two, added while recording with asciinema's key for a marker (set in asciinema's settings first), or by adding a line such as `[12.5, "m", ""]` to the file by hand, in time order. Put each on a slide with *Terminal recording*, and say whether its last screen looks as your terminal did: letters, colours, bold, the cursor, lines drawn with box characters, and nothing left over from the full-screen program.
+2. Play each in the editor with *Play* and in the show with F5: say whether it plays at the pace it was recorded, whether it looks smooth, and what the counts say. About as many pictures a second as the recording changes, up to the screen's, is smooth.
+3. In the show, click through the marks and back with Right and Left: say whether each stop is where you marked it, and whether Left shows the screen at the mark before at once.
+4. A recording with letters other than English, an emoji or two and a line of Chinese or Japanese: say whether each sits in its cells, wide ones in two. If you can, one with Hebrew or Arabic: Task 3 knows letters in a run can swap cells; say how it looks.
+5. A recording whose terminal was resized while recording, and one of a terminal much wider than 80 columns: say whether each fits its box and reads.
+6. Zoom the editor in and out with a recording on the slide and say whether it stays sharp once the zoom stops, and whether anything shows a gap or a line between coloured cells.
+7. Leave a long recording playing in the show for ten minutes, and say what the system monitor shows of the app's memory: it should stay flat.
+8. *Terminal recording* on the Insert tab: say whether the system's Open dialog shows, and whether you can find `.cast` files in it easily.
+9. Present a talk with a recording on a second screen, with Shift+F5's presenter window on the first: the recording should play on the audience's screen and show its last screen on the presenter's.
+10. Export a talk with your recordings to PDF, open it in a PDF reader, and select and copy a line of a recording's text: say whether what's pasted reads as the screen did.
+
+## Windows check, by hand
+
+The branch hasn't been pushed or merged yet. Once it's in `main`, this check starts from a clone of `main`, on a Windows PC as in `docs/checks/plan-d5.md`.
+
+1. `cargo test --workspace`: send back the summary lines, and any that failed.
+2. `cargo test --release -p stagepack-studio --test edit_speed -- --ignored`: send back the lines it prints.
+3. `cargo build --release -p stagepack-studio`, and start it from a terminal after `set STUDIO_VIDEO_COUNTS=1`.
+4. Record a session with asciinema under WSL or on a Linux or Mac computer, as asciinema isn't made for Windows, and copy the `.cast` file over; steps 1 to 3, 6, 9 and 10 of the Linux check with it.
+5. *Terminal recording* on the Insert tab: say whether the Open dialog shows `.cast` files, and put a recording on a slide by dragging it from Explorer.
+6. A recording saved with Windows line endings (open it in Notepad and save it): say whether it's read, or what's said.
+7. Save the talk packed, close it, and open it again: say whether the recordings play from the pack.
+8. Export it to PowerPoint and open it in desktop PowerPoint: each recording should be a picture of its last screen.
+9. Quit the app while a recording plays in the show: it should end within a second or two.
+10. D5's, G1's and G2's Windows checks, where they're still open.
+
+## Known after the run
+
+- **Right-to-left letters within a run can swap cells**, from Task 3: a recording in Hebrew or Arabic may show its letters out of order.
+- **Zooming in past 100 % on a crafted busy screen** can take 7 to 13 ms a frame on the window's thread while it's drawn again at the new scale.
+- **The check before a recording is added has no status line or Cancel.**
+- **The show has no jump to a slide**, so a recording of many marks takes a click for each.
+- **Nothing has been checked on Windows**, and how smooth a recording plays is a hand check on a real screen.
+- **Not in this plan:** recording inside the app; typing into a recording; scrollback; speed settings; sound; a recording in PowerPoint as anything but its last screen; asciinema's version 1 or 3 formats.
+
+## The final review
+
+Left for the plan's final review, as G2's record had its own.
