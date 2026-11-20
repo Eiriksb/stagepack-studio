@@ -50,6 +50,12 @@ fn own_size((columns, rows): (u16, u16)) -> (f32, f32) {
     (f32::from(columns) * TERMINAL_ROW * CELL_SHAPE, f32::from(rows) * TERMINAL_ROW)
 }
 
+/// The size, in slide units, a recording whose screen is `columns` by `rows` has on a slide at
+/// its own size, as one placed with no size is laid out.
+pub fn terminal_size(columns: u16, rows: u16) -> (f32, f32) {
+    own_size((columns, rows))
+}
+
 fn color([r, g, b]: [u8; 3]) -> Color {
     Color::rgb(r, g, b)
 }

@@ -4,7 +4,7 @@
 use toolkit::{PropField, PropKind};
 
 /// A built-in component's settings, by argument, in the order they're shown, with their labels.
-const BUILT_INS: [(&str, &[(&str, &str)]); 7] = [
+const BUILT_INS: [(&str, &[(&str, &str)]); 8] = [
     ("Shape", &[("kind", "Shape"), ("fill", "Fill"), ("outline", "Outline"), ("outline-width", "Outline width")]),
     (
         "Box",
@@ -20,6 +20,8 @@ const BUILT_INS: [(&str, &[(&str, &str)]); 7] = [
     ("Picture", &[("src", "Picture")]),
     ("Video", &[("loop", "Loop"), ("poster", "Still picture")]),
     ("Model", &[("turn", "Turns on its own")]),
+    // Its place alone: its file is named above, and put on the slide from the Insert tab.
+    ("Terminal", &[]),
     (
         "Chart",
         &[
@@ -33,10 +35,10 @@ const BUILT_INS: [(&str, &[(&str, &str)]); 7] = [
     ),
 ];
 
-/// The built-ins' arguments the form leaves out: `(tag, argument)`. A video's or a model's file
-/// is named above its fields, and a new one is put on the slide from the Insert tab; a model's
-/// views are set by turning it, and counted under its fields.
-const LEFT_OUT: [(&str, &str); 4] = [("Video", "src"), ("Model", "src"), ("Model", "view"), ("Model", "views")];
+/// The built-ins' arguments the form leaves out: `(tag, argument)`. A video's, a model's or a
+/// terminal recording's file is named above its fields, and a new one is put on the slide from
+/// the Insert tab; a model's views are set by turning it, and counted under its fields.
+const LEFT_OUT: [(&str, &str); 5] = [("Video", "src"), ("Model", "src"), ("Model", "view"), ("Model", "views"), ("Terminal", "src")];
 
 /// The built-ins' arguments that are ticked or not, though they take a word: `(tag, argument)`.
 /// A model's `turn` is `auto`, ticked, or left out.
@@ -153,6 +155,25 @@ pub fn views_counted(views: usize) -> String {
         1 => "1 view".to_string(),
         views => format!("{views} views"),
     }
+}
+
+/// What the form says of a terminal recording as `facts` give it: its screen's size, how long it
+/// plays and how many times it stops, "80 by 24, 3 min 20 s, 2 stops".
+pub fn terminal_facts(facts: slides_terminal::RecordingFacts) -> String {
+    let whole = facts.length.as_secs_f64().round() as u64;
+    let length = if whole == 0 {
+        "under a second".to_string()
+    } else {
+        let parts = [(whole / 3600, "h"), (whole / 60 % 60, "min"), (whole % 60, "s")];
+        let said: Vec<String> = parts.iter().filter(|(count, _)| *count > 0).map(|(count, unit)| format!("{count} {unit}")).collect();
+        said.join(" ")
+    };
+    let stops = match facts.marks {
+        0 => "no stops".to_string(),
+        1 => "1 stop".to_string(),
+        marks => format!("{marks} stops"),
+    };
+    format!("{} by {}, {length}, {stops}", facts.width, facts.height)
 }
 
 /// What the form says of a video `seconds` long and `size` pixels big, as its pictures are

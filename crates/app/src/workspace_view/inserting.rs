@@ -1,5 +1,6 @@
-//! Putting things on the slide from the window: pictures, videos and 3D models chosen in the
-//! system's dialog, dropped on the slide or pasted, shapes and text boxes from the Insert tab.
+//! Putting things on the slide from the window: pictures, videos, 3D models and terminal
+//! recordings chosen in the system's dialog, dropped on the slide or pasted, shapes and text
+//! boxes from the Insert tab.
 
 use super::*;
 use crate::added_files::{FileKind, MAX_ADDED_BYTES, NotAdded};
@@ -12,9 +13,9 @@ use std::sync::Arc;
 use slides_model::{CantDraw, ModelKind, View};
 use slides_video::CantPlay;
 
-/// What the window says when a file that isn't a picture, a video or a 3D model is dropped on the
-/// slide.
-pub const ONLY_PICTURES: &str = "Only pictures, videos and 3D models can be dropped on a slide.";
+/// What the window says when a file that isn't a picture, a video, a 3D model or a terminal
+/// recording is dropped on the slide.
+pub const ONLY_PICTURES: &str = "Only pictures, videos, 3D models and terminal recordings can be dropped on a slide.";
 /// What the window says when the dialog to choose pictures couldn't be shown.
 pub const DIALOG_FAILED: &str = "The file chooser couldn't be opened.";
 /// The most files a drop, a paste of files, or the dialog puts on the slide.
@@ -148,6 +149,33 @@ impl WorkspaceView {
         .detach();
     }
 
+    /// Asks for terminal recordings in the system's dialog, and puts each on the slide.
+    pub(super) fn ask_for_recordings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.document.is_none() {
+            return;
+        }
+        // The system's dialog can't be told which kinds to show: a file that isn't a recording
+        // is said once it's chosen.
+        let chosen = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Insert".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            match chosen.await {
+                Ok(Ok(Some(paths))) => {
+                    this.update(cx, |this, cx| this.chosen_recordings(paths, cx)).ok();
+                }
+                Ok(Err(_)) => {
+                    this.update(cx, |this, cx| this.say(DIALOG_FAILED, cx)).ok();
+                }
+                _ => {}
+            }
+        })
+        .detach();
+    }
+
     /// Puts the pictures in the files at `paths` on the slide, each in turn, one step each, as
     /// the dialog to choose them gives them, the first [`MOST_DROPPED`] of them. What isn't a
     /// picture is said, and left out. A video among them is copied in, and put on the slide
@@ -191,9 +219,27 @@ impl WorkspaceView {
         }
     }
 
-    /// Puts the pictures, videos and 3D models in the files at `paths`, dropped on the slide from
-    /// outside the app, on it, each in turn, one step each, the first [`MOST_DROPPED`] of them. A
-    /// file that's none of them is said, and left out.
+    /// Puts the terminal recordings in the files at `paths`, as the Terminal recording tool's
+    /// dialog gives them, the first [`MOST_DROPPED`] of them, on the slide, each once it's been
+    /// read and found to play, off the window's thread. A file that isn't a recording, or can't
+    /// be played, is said, and left out.
+    pub fn chosen_recordings(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let more = paths.len() > MOST_DROPPED;
+        for path in paths.into_iter().take(MOST_DROPPED) {
+            if is_kind(&path, FileKind::Recording) {
+                self.insert_recording(path, cx);
+            } else {
+                self.say(slides_terminal::CantPlay::NotARecording.to_string(), cx);
+            }
+        }
+        if more {
+            self.say_later(ONLY_THE_FIRST, cx);
+        }
+    }
+
+    /// Puts the pictures, videos, 3D models and terminal recordings in the files at `paths`,
+    /// dropped on the slide from outside the app, on it, each in turn, one step each, the first
+    /// [`MOST_DROPPED`] of them. A file that's none of them is said, and left out.
     pub(super) fn dropped(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         self.insert_files(paths, true, cx);
     }
@@ -206,6 +252,8 @@ impl WorkspaceView {
         for path in paths.iter().take(MOST_DROPPED) {
             if let Some(kind) = [FileKind::Video, FileKind::Model].into_iter().find(|kind| is_kind(path, *kind)) {
                 self.insert_large_file(kind, path.clone(), cx);
+            } else if is_kind(path, FileKind::Recording) {
+                self.insert_recording(path.clone(), cx);
             } else if let Some(why) = other_model_kind(path) {
                 self.say(why.to_string(), cx);
             } else {
@@ -297,6 +345,57 @@ impl WorkspaceView {
             FileKind::Model => self.copy_in_looked_at(kind, path, |path, meter| model_framing(path, meter).map(Found::Model), finished, cx),
             _ => self.copy_in_looked_at(kind, path, |path, _| video_shape(path).map(Found::Video), finished, cx),
         }
+    }
+
+    /// Reads the terminal recording in the file at `path`, from outside the talk, off the
+    /// window's thread, and plays it there to its end, and then adds it to the talk and puts it on
+    /// the slide shown now, selected, at its screen's own size: that slide is shown again then,
+    /// as any edit shows its slide. One that isn't a recording, or can't be played, is said, with
+    /// why, and nothing is added. The window going meanwhile, nothing is.
+    fn insert_recording(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(document) = &self.document else {
+            return;
+        };
+        let slide = document.read(cx).current();
+        let asked_of = document.entity_id();
+        let suggested = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+        cx.spawn(async move |this, cx| {
+            let read = cx.background_spawn(async move { playable_recording(&path) }).await;
+            this.update(cx, |this, cx| {
+                // Nor into another talk shown in the window since.
+                let same_talk = this.document.as_ref().is_some_and(|document| document.entity_id() == asked_of);
+                if this.is_closing_window() || !same_talk {
+                    return;
+                }
+                let (bytes, screen) = match read {
+                    Ok(read) => read,
+                    Err(why) => return this.say(why, cx),
+                };
+                let mut not_added = None;
+                // The edit's notice is what has the working copy keep the file added.
+                this.edit(
+                    |document| match document.insert_terminal_on(slide, &suggested, bytes, screen) {
+                        Ok(()) => Ok(Vec::new()),
+                        Err(InsertFailed::Edit(refused)) => Err(refused),
+                        Err(InsertFailed::File(why)) => {
+                            not_added = Some(why);
+                            Ok(Vec::new())
+                        }
+                    },
+                    cx,
+                );
+                if let Some(why) = not_added {
+                    return this.say(why.to_string(), cx);
+                }
+                // Its Delete and its arrow keys are the slide's, as a picture's are once it's put on.
+                let (window, view) = (this.window_handle, cx.weak_entity());
+                cx.defer(move |cx| {
+                    window.update(cx, |_, window, cx| view.update(cx, |view, cx| view.keyboard_to_the_slide(window, cx)).ok()).ok();
+                });
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Puts the picture in the file at `path`, from outside the talk, on the slide.
@@ -714,6 +813,29 @@ fn video_shape(path: &Path) -> Result<(u32, u32), String> {
         Err(CantPlay::NotAVideo | CantPlay::NoPicture) => Err(CantPlay::NotAVideo.to_string()),
         Err(CantPlay::CouldNotRead) => Err(NotAdded::Unreadable.to_string()),
         Err(_) => Ok((crate::insert::VIDEO_ROOM.0 as u32, crate::insert::VIDEO_ROOM.1 as u32)),
+    }
+}
+
+/// The bytes of the terminal recording in the file at `path`, outside the talk, and its screen's
+/// columns and rows as it starts, once it's been read and played to its end, within the limits a
+/// recording is played with: for a background task. Why it can't be put on a slide is said
+/// instead, in the words a recording that can't be played is shown with.
+fn playable_recording(path: &Path) -> Result<(Vec<u8>, (u16, u16)), String> {
+    let bytes = Document::read_outside_file(path).map_err(|why| match why {
+        NotAdded::TooLarge => slides_terminal::CantPlay::TooLarge.to_string(),
+        why => why.to_string(),
+    })?;
+    // Played as its still is, in case it holds what the screen refuses as too much work.
+    let played = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let recording = slides_terminal::read(&bytes)?;
+        let screen = (recording.width, recording.height);
+        slides_terminal::Player::new(Arc::new(recording)).last()?;
+        Ok::<_, slides_terminal::CantPlay>(screen)
+    }));
+    match played {
+        Ok(Ok(screen)) => Ok((bytes, screen)),
+        Ok(Err(why)) => Err(why.to_string()),
+        Err(_) => Err(slides_terminal::CantPlay::Damaged.to_string()),
     }
 }
 

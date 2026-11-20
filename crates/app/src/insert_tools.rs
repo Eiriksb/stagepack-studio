@@ -1,4 +1,4 @@
-//! The Insert tab's tools: Picture, Video, Model, the Shapes list, Text box, Icon, Table and Component. What
+//! The Insert tab's tools: Picture, Video, Model, Terminal recording, the Shapes list, Text box, Icon, Table and Component. What
 //! they put on the slide is [`crate::insert`]'s and [`crate::document::Document`]'s; the window
 //! does what they ask. Icon opens the [`IconPicker`], whose pick the window hears of, Table the
 //! [`TableGrid`], whose square clicked asks for a table that size, and Component the
@@ -21,6 +21,8 @@ pub const INSERT_PICTURE_ID: &str = "insert-picture";
 pub const INSERT_VIDEO_ID: &str = "insert-video";
 /// The Model tool, which asks for a 3D model's file to put on the slide.
 pub const INSERT_MODEL_ID: &str = "insert-model";
+/// The Terminal recording tool, which asks for a terminal recording's file to put on the slide.
+pub const INSERT_TERMINAL_ID: &str = "insert-terminal";
 /// The Shapes button, which lists the shapes.
 pub const INSERT_SHAPES_ID: &str = "insert-shapes";
 pub const INSERT_TEXT_BOX_ID: &str = "insert-text-box";
@@ -31,7 +33,7 @@ pub const INSERT_TABLE_ID: &str = "insert-table";
 /// The Component tool, which opens the list of components.
 pub const INSERT_COMPONENT_ID: &str = "insert-component";
 
-actions!(insert_tools, [InsertPicture, InsertVideo, InsertModel, InsertTextBox]);
+actions!(insert_tools, [InsertPicture, InsertVideo, InsertModel, InsertTerminal, InsertTextBox]);
 
 /// Puts a shape of kind `kind`, the talk's name for it, on the slide.
 #[derive(Clone, PartialEq, Debug, Action)]
@@ -111,6 +113,17 @@ pub fn insert_tab(
                     .tooltip("Put a 3D model from a file on the slide")
                     .disabled(!has_talk)
                     .on_click(|_, window, cx| window.dispatch_action(InsertModel.boxed_clone(), cx))
+                    .into_any_element(),
+            ],
+            cx,
+        ),
+        group(
+            "Recordings",
+            vec![
+                tool(INSERT_TERMINAL_ID, Icons::SquareTerminal, "Terminal recording")
+                    .tooltip("Put a recording of a terminal, made by asciinema, on the slide")
+                    .disabled(!has_talk)
+                    .on_click(|_, window, cx| window.dispatch_action(InsertTerminal.boxed_clone(), cx))
                     .into_any_element(),
             ],
             cx,

@@ -212,6 +212,8 @@ pub fn name_of(talk: &Talk, slide: usize, range: &Range<usize>) -> Option<String
             "Picture" | "Shape" | "Icon" | "Table" | "Chart" => tag.name.clone(),
             // Text boxes, as the Insert tab and the format name them.
             "Text" | "Box" => "Text box".to_string(),
+            // As the Insert tab names it.
+            "Terminal" => "Terminal recording".to_string(),
             name => spaced(name),
         },
         _ => return None,

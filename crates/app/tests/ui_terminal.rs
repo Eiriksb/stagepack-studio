@@ -835,3 +835,520 @@ fn an_idle_talk_of_recordings_does_no_work(cx: &mut TestAppContext) {
     threads_end(cx, Some(typing.handle), "the editor");
     idle(&typing, cx, "one played and stopped");
 }
+
+// Putting a recording on a slide.
+
+const PLAIN_TALK: &str = "# One\n\nSome words\n\n---\n\n# Two\n";
+const NOT_A_RECORDING: &str = "This file isn't a terminal recording.";
+
+/// An 80 by 24 recording, and what it's put on the slide as: its own size, in the middle.
+const INSERTED: &str = "<Terminal src=\"assets/demo-run.cast\" x=\"614\" y=\"324\" w=\"691\" h=\"432\" />";
+
+/// What [`PLAIN_TALK`] says once `inserted` is put after its first slide's content.
+fn with_inserted(inserted: &str) -> String {
+    PLAIN_TALK.replacen("Some words", &format!("Some words\n\n{inserted}"), 1)
+}
+
+/// A short recording of 80 by 24 that prints a word.
+fn eighty() -> Vec<u8> {
+    slides_terminal::make_test_cast(80, 24, &[(0.0, "o", "$ make\r\n"), (0.1, "o", "built\r\n")])
+}
+
+/// A recording 80 by 24, 3 minutes 20 seconds long as it's played, that stops twice.
+fn three_minutes() -> Vec<u8> {
+    let mut lines: Vec<(f64, &str, String)> = (0..=200).map(|at| (f64::from(at), "o", format!("line {at}\r\n"))).collect();
+    lines.insert(51, (50.0, "m", String::new()));
+    lines.insert(102, (100.0, "m", String::new()));
+    let lines: Vec<(f64, &str, &str)> = lines.iter().map(|(at, code, text)| (*at, *code, text.as_str())).collect();
+    slides_terminal::make_test_cast(80, 24, &lines)
+}
+
+/// A folder talk of `source` in a window that keeps its working copies under `root`.
+fn keeping_editor(cx: &mut TestAppContext, source: &str, root: &std::path::Path) -> Typing {
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::write(folder.path().join("slides.md"), source).unwrap();
+    open_folder(cx, folder, Some(stagepack_studio::recovery::Recovery::new(root.join("recovery"))))
+}
+
+/// A file named `name` holding `bytes` in `dir`, outside any talk.
+fn outside(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+/// Hands `paths` to the window as the Terminal recording tool's dialog would, and lets them be
+/// looked at and put on the slide.
+fn choose_recordings(typing: &Typing, cx: &mut TestAppContext, paths: Vec<std::path::PathBuf>) {
+    let view = typing.view.clone();
+    cx.update(|cx| view.update(cx, |view, cx| view.chosen_recordings(paths, cx)));
+    cx.run_until_parked();
+    typing.settle(cx);
+}
+
+/// Drops `paths` from outside the app on the middle of the slide.
+fn drop_on_slide(typing: &Typing, cx: &mut TestAppContext, paths: &[std::path::PathBuf]) {
+    use gpui_kit::InputEvent as _;
+    let at = typing.at(cx, 960., 540.);
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        let paths = gpui_kit::ExternalPaths(paths.iter().cloned().collect());
+        window.dispatch_event(gpui_kit::FileDropEvent::Entered { position: at, paths }.to_platform_input(), cx);
+        window.dispatch_event(gpui_kit::FileDropEvent::Pending { position: at }.to_platform_input(), cx);
+        window.dispatch_event(gpui_kit::FileDropEvent::Submit { position: at }.to_platform_input(), cx);
+        window.render_frame(cx);
+    });
+    cx.run_until_parked();
+    typing.settle(cx);
+}
+
+/// Pastes `paths`, as files copied from outside the app are.
+fn paste_paths(typing: &Typing, cx: &mut TestAppContext, paths: &[std::path::PathBuf]) {
+    cx.write_to_clipboard(gpui_kit::ClipboardItem {
+        entries: vec![gpui_kit::ClipboardEntry::ExternalPaths(gpui_kit::ExternalPaths(paths.iter().cloned().collect()))],
+    });
+    click_on(typing, cx, stagepack_studio::clipboard_tools::PASTE_ID);
+    cx.run_until_parked();
+    typing.settle(cx);
+}
+
+fn selected_text(typing: &Typing, cx: &TestAppContext) -> Option<String> {
+    let source = typing.source(cx);
+    selected(typing, cx).map(|(_, range)| source[range].to_string())
+}
+
+fn can_undo(typing: &Typing, cx: &TestAppContext) -> bool {
+    typing.document(cx).read_with(cx, |document, _| document.can_undo())
+}
+
+fn png(width: u32, height: u32, rgba: [u8; 4]) -> Vec<u8> {
+    let picture = image::RgbaImage::from_pixel(width, height, image::Rgba(rgba));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(picture).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+    bytes.into_inner()
+}
+
+/// The recording's tag, as the talk has it now.
+fn the_tag(typing: &Typing, cx: &mut TestAppContext) -> String {
+    let source = typing.source(cx);
+    let at = source.find("<Terminal").unwrap();
+    let end = at + source[at..].find("/>").unwrap() + 2;
+    source[at..end].to_string()
+}
+
+fn has_file(typing: &Typing, cx: &TestAppContext, path: &str) -> bool {
+    typing.document(cx).read_with(cx, |document, _| document.has_file(path))
+}
+
+/// Every file under `root`, by its path.
+fn files_under(root: &std::path::Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut folders = vec![root.to_path_buf()];
+    while let Some(folder) = folders.pop() {
+        for entry in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                folders.push(path);
+            } else {
+                found.push(path.display().to_string());
+            }
+        }
+    }
+    found
+}
+
+/// The words of the element `id`, if it's there.
+fn label_of(typing: &Typing, cx: &mut TestAppContext, id: &str) -> Option<String> {
+    let id = gpui_kit::SharedString::from(id.to_string());
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        window.try_find(id).and_then(|found| found.label().map(str::to_string))
+    })
+}
+
+/// Waits for the form's line `id`, read off the window's thread, to say something.
+fn said_by_form(typing: &Typing, cx: &mut TestAppContext, id: &'static str) -> String {
+    let mut said = None;
+    until(cx, typing.handle, id, |cx| {
+        said = typing.with_window(cx, |window, cx| {
+            window.render_frame(cx);
+            window.try_find(id).and_then(|found| found.label().map(str::to_string))
+        });
+        said.is_some()
+    });
+    said.unwrap()
+}
+
+/// Why the recording on slide `slide` can't be played, once its still has been tried.
+fn problem_of(typing: &Typing, cx: &mut TestAppContext, slide: usize) -> Option<String> {
+    stills_made(typing, cx);
+    let source = typing.document(cx).update(cx, |document, _| {
+        document.terminals_at(slide, Moment { step: 0, time: 0.0 }).first().and_then(|terminal| terminal.source.clone())
+    });
+    let source = source.expect("a recording on the slide");
+    typing.document(cx).update(cx, |document, _| document.terminal_problem_on(slide, &source))
+}
+
+#[gpui_kit::test]
+fn a_chosen_recording_is_put_on_the_slide(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let work = tempfile::tempdir().unwrap();
+    let typing = keeping_editor(cx, PLAIN_TALK, work.path());
+    // The Insert tab has it.
+    click_on(&typing, cx, stagepack_studio::ribbon::TAB_INSERT_ID);
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        let tool = window.find(stagepack_studio::insert_tools::INSERT_TERMINAL_ID);
+        assert_eq!(tool.label(), Some("Terminal recording"));
+        assert!(tool.visible());
+    });
+
+    let from = outside(work.path(), "Demo Run.CAST", &eighty());
+    choose_recordings(&typing, cx, vec![from.clone()]);
+    assert_eq!(typing.source(cx), with_inserted(INSERTED));
+    assert_eq!(selected_text(&typing, cx).as_deref(), Some(INSERTED));
+    assert_eq!(typing.status(cx).as_deref(), Some("Terminal recording selected"));
+    assert!(has_file(&typing, cx, "assets/demo-run.cast"));
+    assert_eq!(problem_of(&typing, cx, 0), None, "it plays");
+    // One step, which Undo takes away.
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), PLAIN_TALK);
+    assert!(!can_undo(&typing, cx), "it was one step");
+    // Made again, it's there and selected again.
+    typing.press(cx, "ctrl-shift-z");
+    assert_eq!(typing.source(cx), with_inserted(INSERTED));
+    assert_eq!(selected_text(&typing, cx).as_deref(), Some(INSERTED));
+    typing.press(cx, "ctrl-z");
+
+    // On the slide shown when it was asked for, though another is shown before it's looked at.
+    let view = typing.view.clone();
+    cx.update(|cx| view.update(cx, |view, cx| view.chosen_recordings(vec![from], cx)));
+    let document = typing.document(cx);
+    cx.update(|cx| {
+        document.update(cx, |document, cx| {
+            document.go_to(1);
+            cx.notify();
+        })
+    });
+    assert_eq!(typing.current(cx), 1);
+    cx.run_until_parked();
+    typing.settle(cx);
+    assert_eq!(typing.source(cx), with_inserted(INSERTED), "on the first slide");
+    assert_eq!(typing.current(cx), 0, "shown again, as any edit shows its slide");
+    assert_eq!(selected_text(&typing, cx).as_deref(), Some(INSERTED));
+    typing.press(cx, "ctrl-z");
+
+    // A screen larger than the slide is made smaller to fit it, keeping its shape.
+    let wide = outside(work.path(), "wide.cast", &slides_terminal::make_test_cast(500, 200, &[(0.0, "o", "wide")]));
+    choose_recordings(&typing, cx, vec![wide]);
+    assert_eq!(the_tag(&typing, cx), "<Terminal src=\"assets/wide.cast\" x=\"312\" y=\"0\" w=\"1296\" h=\"1080\" />");
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), PLAIN_TALK);
+}
+
+#[gpui_kit::test]
+fn a_dropped_or_pasted_recording_is_too(cx: &mut TestAppContext) {
+    let _alone = alone();
+    let work = tempfile::tempdir().unwrap();
+    let typing = keeping_editor(cx, PLAIN_TALK, work.path());
+    // A file that's none of what can be dropped is said, in words that name a recording too.
+    // (Dropped first: in a test window, a drop after a key press doesn't reach the slide.)
+    let notes = outside(work.path(), "notes.txt", b"words");
+    drop_on_slide(&typing, cx, &[notes]);
+    assert_eq!(typing.status(cx).as_deref(), Some("Only pictures, videos, 3D models and terminal recordings can be dropped on a slide."));
+
+    let red = outside(work.path(), "red.png", &png(100, 100, [255, 0, 0, 255]));
+    let run = outside(work.path(), "demo run.cast", &eighty());
+    drop_on_slide(&typing, cx, &[red, run.clone()]);
+    let source = typing.source(cx);
+    assert_eq!(source.matches("<Picture").count(), 1, "{source}");
+    assert_eq!(source.matches(INSERTED).count(), 1, "{source}");
+    assert!(has_file(&typing, cx, "assets/demo-run.cast"));
+    // Each its own step.
+    typing.press(cx, "ctrl-z");
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), PLAIN_TALK);
+    assert!(!can_undo(&typing, cx));
+
+    // Its path pasted is a drop.
+    paste_paths(&typing, cx, &[run]);
+    assert_eq!(typing.source(cx), with_inserted(INSERTED));
+    assert_eq!(selected_text(&typing, cx).as_deref(), Some(INSERTED));
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), PLAIN_TALK);
+    // One that isn't a recording, pasted or dropped, says why.
+    let words = outside(work.path(), "words.cast", b"these are words, not a recording");
+    paste_paths(&typing, cx, std::slice::from_ref(&words));
+    assert_eq!(typing.status(cx).as_deref(), Some(NOT_A_RECORDING));
+    assert_eq!(typing.source(cx), PLAIN_TALK);
+}
+
+#[gpui_kit::test]
+fn a_file_that_isnt_a_recording_is_refused_saying_why(cx: &mut TestAppContext) {
+    use slides_terminal::CantPlay;
+    let _alone = alone();
+    let work = tempfile::tempdir().unwrap();
+    let typing = keeping_editor(cx, PLAIN_TALK, work.path());
+    let mut cut = eighty();
+    cut.extend_from_slice(b"[0.2, \"o\", \"cut");
+    let too_long = slides_terminal::make_test_cast(80, 24, &[(0.0, "o", "start"), (25.0 * 3600.0, "o", "end")]);
+    let mut over = b"{\"version\": 2, \"width\": 80, \"height\": 24}\n".to_vec();
+    over.resize(33 * 1024 * 1024, b' ');
+    let said = |why: CantPlay| why.to_string();
+    let cases = [
+        ("words.cast", b"these are words, not a recording".to_vec(), said(CantPlay::NotARecording)),
+        ("empty.cast", Vec::new(), said(CantPlay::NotARecording)),
+        ("picture.cast", png(10, 10, [0, 0, 255, 255]), said(CantPlay::NotARecording)),
+        ("notes.txt", eighty(), said(CantPlay::NotARecording)),
+        ("old.cast", b"{\"version\": 1, \"width\": 80, \"height\": 24, \"stdout\": []}".to_vec(), said(CantPlay::KindNotPlayed)),
+        ("cut.cast", cut, said(CantPlay::Damaged)),
+        ("huge.cast", slides_terminal::make_test_cast(1000, 24, &[]), said(CantPlay::TooLarge)),
+        ("long.cast", too_long, said(CantPlay::TooLarge)),
+        ("over.cast", over, said(CantPlay::TooLarge)),
+    ];
+    for (name, bytes, why) in &cases {
+        let from = outside(work.path(), name, bytes);
+        choose_recordings(&typing, cx, vec![from]);
+        assert_eq!(typing.source(cx), PLAIN_TALK, "{name}");
+        assert_eq!(typing.status(cx).as_deref(), Some(why.as_str()), "{name}");
+        let stem = name.split('.').next().unwrap();
+        assert!(!has_file(&typing, cx, &format!("assets/{stem}.cast")), "{name} wasn't added");
+    }
+    assert!(!can_undo(&typing, cx));
+    // Dropped, the same.
+    let words = outside(work.path(), "words.cast", b"these are words, not a recording");
+    drop_on_slide(&typing, cx, &[words]);
+    assert_eq!(typing.status(cx).as_deref(), Some(NOT_A_RECORDING));
+    assert_eq!(typing.source(cx), PLAIN_TALK);
+    wait(cx, 1_000);
+    let kept: Vec<String> = files_under(&work.path().join("recovery")).into_iter().filter(|name| name.ends_with(".cast")).collect();
+    assert!(kept.is_empty(), "nothing refused was kept: {kept:?}");
+}
+
+#[gpui_kit::test]
+fn the_form_says_what_the_recording_is(cx: &mut TestAppContext) {
+    use stagepack_studio::inspector::{INSPECTOR_MESSAGE_ID, INSPECTOR_TERMINAL_FACTS_ID, INSPECTOR_TERMINAL_PROBLEM_ID};
+    let _alone = alone();
+    let typing = editor(cx, &talk(), &three_minutes());
+    select_terminal(&typing, cx);
+    assert_eq!(said_by_form(&typing, cx, INSPECTOR_TERMINAL_FACTS_ID), "80 by 24, 3 min 20 s, 2 stops");
+    assert_eq!(label_of(&typing, cx, INSPECTOR_MESSAGE_ID).as_deref(), Some("run.cast"), "its file, by its name");
+    assert_eq!(label_of(&typing, cx, INSPECTOR_TERMINAL_PROBLEM_ID), None, "it plays");
+    let form = cx.read(|cx| typing.view.read(cx).inspector().clone());
+    let labels = cx.read(|cx| form.read(cx).labels());
+    assert_eq!(labels, ["Left", "Top", "Width", "Height", "Turn"], "its place, and nothing else");
+    // Moved through the form, only its place changes, and the facts were read once.
+    let tag = the_tag(&typing, cx);
+    typing.press(cx, "right");
+    assert_ne!(the_tag(&typing, cx), tag);
+    assert_eq!(said_by_form(&typing, cx, INSPECTOR_TERMINAL_FACTS_ID), "80 by 24, 3 min 20 s, 2 stops");
+
+    // Short ones, and those that stop once or never.
+    use stagepack_studio::inspector::terminal_facts;
+    let facts = |length: f64, marks: usize| slides_terminal::RecordingFacts { width: 120, height: 40, length: Duration::from_secs_f64(length), marks };
+    assert_eq!(terminal_facts(facts(12.4, 1)), "120 by 40, 12 s, 1 stop");
+    assert_eq!(terminal_facts(facts(0.2, 0)), "120 by 40, under a second, no stops");
+    assert_eq!(terminal_facts(facts(180.0, 3)), "120 by 40, 3 min, 3 stops");
+    assert_eq!(terminal_facts(facts(3_725.0, 0)), "120 by 40, 1 h 2 min 5 s, no stops");
+
+    // One that can't be played says why, and has no facts.
+    let typing = editor(cx, &talk(), b"these are words, not a recording");
+    select_terminal(&typing, cx);
+    assert_eq!(said_by_form(&typing, cx, INSPECTOR_TERMINAL_PROBLEM_ID), NOT_A_RECORDING);
+    assert_eq!(label_of(&typing, cx, INSPECTOR_TERMINAL_FACTS_ID), None);
+
+    // Read from a pack that holds it compressed, as it's read to be played.
+    let work = tempfile::tempdir().unwrap();
+    let pack = compressed_pack(work.path(), &talk(), &three_minutes());
+    let document = Document::open_packed(&pack, Fonts::bundled_only()).unwrap();
+    let typing = open_untitled_talk(cx, document, work.path());
+    stills_made(&typing, cx);
+    select_terminal(&typing, cx);
+    assert_eq!(said_by_form(&typing, cx, INSPECTOR_TERMINAL_FACTS_ID), "80 by 24, 3 min 20 s, 2 stops");
+}
+
+/// A pack made by another program, its talk of `source` and its `assets/run.cast`, `cast`, both
+/// compressed, in `work`.
+fn compressed_pack(work: &std::path::Path, source: &str, cast: &[u8]) -> std::path::PathBuf {
+    use std::io::Write as _;
+    let at = work.join("compressed.sptx");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&at).unwrap());
+    let deflated = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    zip.start_file("talk.json", deflated).unwrap();
+    zip.write_all(br#"{"format":1,"app":"another","entry":"slides.md"}"#).unwrap();
+    zip.start_file("slides.md", deflated).unwrap();
+    zip.write_all(source.as_bytes()).unwrap();
+    zip.start_file("assets/run.cast", deflated).unwrap();
+    zip.write_all(cast).unwrap();
+    zip.finish().unwrap();
+    at
+}
+
+/// The file `path` in the pack `pack`, and whether it's compressed there.
+fn in_pack(pack: &std::path::Path, path: &str) -> Option<(Vec<u8>, bool)> {
+    use std::io::Read as _;
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(pack).unwrap()).unwrap();
+    let mut entry = zip.by_name(path).ok()?;
+    let compressed = entry.compression() != zip::CompressionMethod::Stored;
+    let mut bytes = Vec::new();
+    entry.read_to_end(&mut bytes).unwrap();
+    Some((bytes, compressed))
+}
+
+/// Whether `document`'s first slide's recording plays, once its still has been made.
+fn plays(document: &mut Document) -> bool {
+    let Some(source) = document.terminals_at(0, Moment { step: 0, time: 0.0 }).first().and_then(|terminal| terminal.source.clone()) else {
+        return false;
+    };
+    // Its still is made here, as the window makes it aside.
+    document.notices();
+    for (job, open) in document.still_jobs() {
+        match make_one(job, open) {
+            Making::Made(made) => {
+                document.take_still(made);
+            }
+            Making::Waits(_) => return false,
+        }
+    }
+    document.terminal_problem_on(0, &source).is_none() && !document.terminal_pending(0)
+}
+
+#[gpui_kit::test]
+fn a_recording_is_kept_saved_and_brought_back(cx: &mut TestAppContext) {
+    use stagepack_studio::saving::SaveTarget;
+    let _alone = alone();
+    let work = tempfile::tempdir().unwrap();
+    let recovery = stagepack_studio::recovery::Recovery::new(work.path().join("recovery"));
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::write(folder.path().join("slides.md"), PLAIN_TALK).unwrap();
+    let typing = open_folder(cx, folder, Some(recovery.clone()));
+    let from = outside(work.path(), "demo-run.cast", &eighty());
+    choose_recordings(&typing, cx, vec![from]);
+    let inserted = typing.source(cx);
+    assert_eq!(inserted, with_inserted(INSERTED));
+
+    // A crash: the working copy keeps it, and it's brought back.
+    wait(cx, 1_000);
+    let Typing { _folder: folder, handle, view, .. } = typing;
+    drop(view);
+    cx.update_window(handle, |_, window, _| window.remove_window()).unwrap();
+    cx.run_until_parked();
+    assert!(!folder.path().join("assets").exists(), "nothing written until a save");
+    let typing = open_folder(cx, folder, Some(recovery));
+    click_on(&typing, cx, workspace_view::RECOVER_ID);
+    assert_eq!(typing.source(cx), inserted);
+    assert!(has_file(&typing, cx, "assets/demo-run.cast"));
+    assert_eq!(problem_of(&typing, cx, 0), None, "brought back, it plays");
+
+    // Saved in place, in a folder.
+    typing.press(cx, "ctrl-s");
+    wait(cx, 500);
+    typing.settle(cx);
+    let saved = typing._folder.path().join("assets/demo-run.cast");
+    assert_eq!(std::fs::read(&saved).unwrap(), eighty());
+
+    // Copied with its slide into another talk, it comes too, and plays there.
+    typing.press(cx, "pageup");
+    click_on(&typing, cx, stagepack_studio::slide_strip::strip_row_id(0));
+    typing.press(cx, "ctrl-c");
+    let into = open(cx, "# A\n");
+    click_on(&into, cx, stagepack_studio::slide_strip::strip_row_id(0));
+    into.press(cx, "ctrl-v");
+    cx.run_until_parked();
+    into.settle(cx);
+    assert!(into.source(cx).contains("<Terminal src=\"assets/demo-run.cast\""), "{}", into.source(cx));
+    assert!(has_file(&into, cx, "assets/demo-run.cast"), "its file came with it");
+    assert_eq!(problem_of(&into, cx, 1), None, "it plays there");
+
+    // Save As a pack: it's in the pack, compressed, and read from there.
+    let mut document = Document::open(typing._folder.path(), Fonts::bundled_only()).unwrap();
+    let pack = work.path().join("talk.sptx");
+    let saved = document.save_as_job(SaveTarget::Packed(pack.clone())).run().unwrap();
+    document.saved(saved);
+    assert_eq!(in_pack(&pack, "assets/demo-run.cast"), Some((eighty(), true)));
+    assert!(plays(&mut document), "read from the pack now");
+    let mut fresh = Document::open_packed(&pack, Fonts::bundled_only()).unwrap();
+    assert!(plays(&mut fresh), "the pack opened again");
+
+    // Added to a pack and saved in place, it's in the pack.
+    let longer = slides_terminal::make_test_cast(80, 24, &[(0.0, "o", "$ again\r\n")]);
+    fresh.insert_terminal("again.cast", longer.clone(), (80, 24)).unwrap();
+    let saved = fresh.save_job().run().unwrap();
+    fresh.saved(saved);
+    assert_eq!(in_pack(&pack, "assets/again.cast").map(|(bytes, _)| bytes), Some(longer.clone()));
+    assert!(fresh.source().contains("<Terminal src=\"assets/again.cast\""));
+
+    // Save As a folder from the pack: both are there, and read from there.
+    let unpacked = work.path().join("unpacked");
+    let saved = fresh.save_as_job(SaveTarget::Folder(unpacked.clone())).run().unwrap();
+    fresh.saved(saved);
+    assert_eq!(std::fs::read(unpacked.join("assets/demo-run.cast")).unwrap(), eighty());
+    assert_eq!(std::fs::read(unpacked.join("assets/again.cast")).unwrap(), longer);
+    assert!(plays(&mut fresh));
+    assert!(plays(&mut Document::open(&unpacked, Fonts::bundled_only()).unwrap()));
+
+    // A slide copied from a talk in a pack brings its recording, unpacked.
+    let packed = Document::open_packed(&pack, Fonts::bundled_only()).unwrap();
+    let from_pack = open_untitled_talk(cx, packed, work.path());
+    click_on(&from_pack, cx, stagepack_studio::slide_strip::strip_row_id(0));
+    from_pack.press(cx, "ctrl-c");
+    let into = open(cx, "# B\n");
+    click_on(&into, cx, stagepack_studio::slide_strip::strip_row_id(0));
+    into.press(cx, "ctrl-v");
+    cx.run_until_parked();
+    into.settle(cx);
+    assert!(has_file(&into, cx, "assets/demo-run.cast"), "{}", into.source(cx));
+    assert_eq!(problem_of(&into, cx, 1), None, "it plays there");
+}
+
+#[gpui_kit::test]
+fn a_hand_written_terminal_reads_or_says_why(cx: &mut TestAppContext) {
+    use stagepack_studio::inspector::INSPECTOR_TERMINAL_PROBLEM_ID;
+    let _alone = alone();
+    let place = "x=\"100\" y=\"100\" w=\"640\" h=\"360\"";
+    let written = [
+        format!("<Terminal {place} />"),
+        format!("<Terminal src=\"../outside.cast\" {place} />"),
+        format!("<Terminal src=\"assets/clip.mp4\" {place} />"),
+        format!("<Terminal src=\"assets/gone.cast\" {place} />"),
+    ];
+    let slides: Vec<String> = written.iter().enumerate().map(|(at, tag)| format!("# Slide {at}\n\n{tag}\n\n{BOX}\n")).collect();
+    let source = slides.join("\n---\n\n");
+    let folder = talk_folder(&source, &eighty());
+    std::fs::write(folder.path().join("assets/clip.mp4"), b"\0\0\0\x18ftypmp42 not really a video").unwrap();
+    // A recording beside the talk, outside it, is never read.
+    std::fs::write(folder.path().parent().unwrap().join("outside.cast"), eighty()).ok();
+    let typing = open_folder(cx, folder, None);
+    let why = [
+        slides_engine::TERMINAL_NO_FILE.to_string(),
+        slides_terminal::CantPlay::CouldNotRead.to_string(),
+        NOT_A_RECORDING.to_string(),
+        slides_terminal::CantPlay::CouldNotRead.to_string(),
+    ];
+    for (at, (tag, why)) in written.iter().zip(&why).enumerate() {
+        if at > 0 {
+            typing.press(cx, "pagedown");
+        }
+        assert_eq!(typing.current(cx), at);
+        assert_eq!(problem_of(&typing, cx, at).as_deref(), Some(why.as_str()), "{tag}");
+        let notices = typing.document(cx).update(cx, |document, _| document.notices());
+        assert!(notices.iter().any(|notice| notice.contains(why.as_str())), "{tag}: {notices:?}");
+        select_terminal(&typing, cx);
+        assert_eq!(said_by_form(&typing, cx, INSPECTOR_TERMINAL_PROBLEM_ID), *why, "{tag}");
+        // Moved, only its place changes; deleted, only its bytes go; Undo puts each back exactly.
+        let before = typing.source(cx);
+        typing.press(cx, "right");
+        let moved = typing.source(cx);
+        let start = before.find(tag.as_str()).unwrap();
+        assert_eq!(moved[..start], before[..start], "{tag}");
+        let end = before.len() - start - tag.len();
+        assert_eq!(moved[moved.len() - end..], before[before.len() - end..], "{tag}");
+        assert_ne!(moved, before, "{tag}");
+        typing.press(cx, "delete");
+        assert_eq!(typing.source(cx), before.replacen(&format!("{tag}\n\n"), "", 1), "{tag}");
+        typing.press(cx, "ctrl-z");
+        assert_eq!(typing.source(cx), moved, "{tag}");
+        typing.press(cx, "ctrl-z");
+        assert_eq!(typing.source(cx), before, "{tag}");
+    }
+}

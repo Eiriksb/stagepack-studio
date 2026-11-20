@@ -31,6 +31,7 @@ pub const INSERT_TABLE: &str = "Insert table";
 pub const INSERT_COMPONENT: &str = "Insert component";
 pub const INSERT_VIDEO: &str = "Insert video";
 pub const INSERT_MODEL: &str = "Insert 3D model";
+pub const INSERT_TERMINAL: &str = "Insert terminal recording";
 
 /// How big a new icon is, as its `size` is written: its width and its height.
 pub const ICON_SIZE: &str = "128";
@@ -46,6 +47,18 @@ pub fn video_size(size: (u32, u32)) -> (f32, f32) {
         return VIDEO_ROOM;
     }
     let scale = (VIDEO_ROOM.0 / w).min(VIDEO_ROOM.1 / h).min(1.0);
+    (w * scale, h * scale)
+}
+
+/// How big a new terminal recording whose screen is `screen`, its columns and rows, is put on a
+/// slide, in slide units: the screen at its own size, its shape kept, made smaller to fit the
+/// slide.
+pub fn terminal_size(screen: (u16, u16)) -> (f32, f32) {
+    let (w, h) = slides_engine::terminal_size(screen.0, screen.1);
+    if w <= 0.0 || h <= 0.0 {
+        return VIDEO_ROOM;
+    }
+    let scale = (SLIDE.0 / w).min(SLIDE.1 / h).min(1.0);
     (w * scale, h * scale)
 }
 

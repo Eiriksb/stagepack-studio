@@ -521,7 +521,7 @@ fn the_export_says_how_many_models() {
 }
 
 #[test]
-fn the_export_says_how_many_terminal_recordings() {
+fn exports_say_how_many_recordings_became_their_last_screen() {
     let folder = tempfile::tempdir().unwrap();
     std::fs::create_dir(folder.path().join("assets")).unwrap();
     std::fs::write(folder.path().join("assets/run.cast"), slides_terminal::make_test_cast(40, 6, &[(0.1, "o", "$ make\r\ndone\r\n")])).unwrap();
@@ -542,5 +542,20 @@ fn the_export_says_how_many_terminal_recordings() {
         assert_eq!(counted(&notices), ["1 terminal recording was exported as its last screen."], "{kind:?}: {notices:?}");
         let notices = said(format!("# One\n\n{broken}"));
         assert!(counted(&notices).is_empty(), "{kind:?}: {notices:?}");
+    }
+    // From a pack, which holds a recording compressed, as one put on a slide and saved is.
+    let talk = folder.path().join("talk");
+    std::fs::create_dir_all(talk.join("assets")).unwrap();
+    std::fs::write(talk.join("slides.md"), format!("# One\n\n{one}\n---\n\n# Two\n\n{one}")).unwrap();
+    std::fs::copy(folder.path().join("assets/run.cast"), talk.join("assets/run.cast")).unwrap();
+    let pack = folder.path().join("talk.sptx");
+    slides_engine::pack_folder(&talk, &pack, "test").unwrap();
+    for kind in [ExportKind::PowerPoint, ExportKind::Pdf] {
+        let input = stagepack_studio::document::Document::open_packed(&pack, slides_engine::Fonts::bundled_only()).unwrap().export_input();
+        let (_dir, out) = target(&format!("talk.{}", kind.extension()));
+        let notices = run_export(input, kind, &out).unwrap();
+        let counted: Vec<&String> = notices.iter().filter(|notice| notice.contains("exported as")).collect();
+        assert_eq!(counted, ["2 terminal recordings were exported as their last screen."], "{kind:?}: {notices:?}");
+        assert!(notices.iter().all(|notice| !notice.contains("couldn't be read")), "{kind:?}: {notices:?}");
     }
 }

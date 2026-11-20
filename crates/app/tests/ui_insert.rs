@@ -34,7 +34,7 @@ const TALK: &str = "---\ntitle: T\n---\n\n# One\n\nSome words\n\n---\n\n# Two\n"
 /// Where the first slide's content ends, and where what's inserted on it goes.
 const END_OF_ONE: &str = "Some words";
 const NOT_A_PICTURE: &str = "That file isn't a picture this app can show.";
-const ONLY_PICTURES: &str = "Only pictures, videos and 3D models can be dropped on a slide.";
+const ONLY_PICTURES: &str = "Only pictures, videos, 3D models and terminal recordings can be dropped on a slide.";
 
 /// A picture `width` by `height`, all `rgba`, in `format`.
 fn encoded(width: u32, height: u32, rgba: [u8; 4], format: image::ImageFormat) -> Vec<u8> {
