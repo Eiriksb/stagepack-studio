@@ -1009,9 +1009,35 @@ fn busiest_recording() -> Vec<u8> {
     slides_terminal::make_test_cast(500, 200, &lines)
 }
 
+/// A screen with no text that's as costly: 500 columns by 200 rows of blank cells, each with a
+/// background and an underline of its own, 65,536 colours of each.
+fn colourful_recording() -> Vec<u8> {
+    let rows: Vec<String> = (0..200u32)
+        .map(|row| {
+            let mut out = String::new();
+            for col in 0..500u32 {
+                let colour = (row * 500 + col) % 65_536;
+                let (high, low) = (colour >> 8, colour & 255);
+                out.push_str(&format!("\u{1b}[4;38;2;{low};{high};160;48;2;{high};{low};64m "));
+            }
+            if row < 199 {
+                out.push_str("\u{1b}[0m\r\n");
+            }
+            out
+        })
+        .collect();
+    let lines: Vec<(f64, &str, &str)> = rows.iter().enumerate().map(|(at, row)| (0.01 * at as f64, "o", row.as_str())).collect();
+    slides_terminal::make_test_cast(500, 200, &lines)
+}
+
 /// A talk of ten slides each with words and a recording, the middle one the busiest there is,
 /// and the others an ordinary session's.
 fn recording_talk_folder() -> tempfile::TempDir {
+    recording_talk_folder_with(busiest_recording())
+}
+
+/// [`recording_talk_folder`] with `busiest` the middle one.
+fn recording_talk_folder_with(busiest: Vec<u8>) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let mut talk = String::new();
     for n in 0..RECORDING_SLIDES {
@@ -1025,7 +1051,7 @@ fn recording_talk_folder() -> tempfile::TempDir {
     std::fs::write(dir.path().join("slides.md"), talk).unwrap();
     std::fs::create_dir(dir.path().join("assets")).unwrap();
     for n in 0..RECORDING_SLIDES {
-        let cast = if n == RECORDING_SLIDES / 2 { busiest_recording() } else { slides_terminal::make_demo_cast() };
+        let cast = if n == RECORDING_SLIDES / 2 { busiest.clone() } else { slides_terminal::make_demo_cast() };
         std::fs::write(dir.path().join(format!("assets/run{n}.cast")), cast).unwrap();
     }
     dir
@@ -1085,7 +1111,18 @@ fn a_recordings_screen_coming_in_is_quick() {
 #[test]
 #[ignore = "timing; run in release"]
 fn a_keystroke_beside_the_busiest_recording_is_quick() {
-    let dir = recording_talk_folder();
+    keystrokes_beside(recording_talk_folder(), "the busiest recording");
+}
+
+/// A letter typed beside a recording of many colours and no text.
+#[test]
+#[ignore = "timing; run in release"]
+fn a_keystroke_beside_a_recording_of_many_colours_is_quick() {
+    keystrokes_beside(recording_talk_folder_with(colourful_recording()), "a recording of many colours");
+}
+
+/// Letters typed on the slide of the middle recording of `dir`, `what`, beside it.
+fn keystrokes_beside(dir: tempfile::TempDir, what: &str) {
     let slide = RECORDING_SLIDES / 2;
     let (mut doc, _) = open_recording_talk(dir.path(), slide);
     let flows = text_flows(doc.talk(), slide);
@@ -1106,7 +1143,7 @@ fn a_keystroke_beside_the_busiest_recording_is_quick() {
     assert!(doc.still_jobs().is_empty(), "typing beside a recording doesn't read it again");
     times.sort();
     let median = times[times.len() / 2];
-    println!("median keystroke beside the busiest recording: {median:?} (slowest {:?})", times.last().unwrap());
+    println!("median keystroke beside {what}: {median:?} (slowest {:?})", times.last().unwrap());
     assert!(median < MOST, "a keystroke took {median:?}");
 }
 
@@ -1114,7 +1151,18 @@ fn a_keystroke_beside_the_busiest_recording_is_quick() {
 #[test]
 #[ignore = "timing; run in release"]
 fn a_frame_of_a_drag_of_the_busiest_recording_is_quick() {
-    let dir = recording_talk_folder();
+    drag_frames_of_recording(recording_talk_folder(), "the busiest recording");
+}
+
+/// A recording of many colours and no text dragged about its slide.
+#[test]
+#[ignore = "timing; run in release"]
+fn a_frame_of_a_drag_of_a_recording_of_many_colours_is_quick() {
+    drag_frames_of_recording(recording_talk_folder_with(colourful_recording()), "a recording of many colours");
+}
+
+/// The middle recording of `dir`, `what`, dragged about its slide.
+fn drag_frames_of_recording(dir: tempfile::TempDir, what: &str) {
     let slide = RECORDING_SLIDES / 2;
     let (mut doc, _) = open_recording_talk(dir.path(), slide);
     let talk = doc.source().to_string();
@@ -1122,7 +1170,7 @@ fn a_frame_of_a_drag_of_the_busiest_recording_is_quick() {
     let (median, slowest, _, _) = drag_frames_of(&mut doc, &talk, slide, 1, away, here_and_there, |doc| {
         assert!(doc.still_jobs().is_empty(), "a recording moved keeps its screen");
     });
-    println!("median drag frame of the busiest recording: {median:?} (slowest {slowest:?})");
+    println!("median drag frame of {what}: {median:?} (slowest {slowest:?})");
     assert!(median < MOST_FOR_A_DRAG_FRAME, "a drag frame took {median:?}");
 }
 
@@ -1172,4 +1220,15 @@ fn the_busiest_recordings_screen_coming_in_is_quick() {
     let small = start.elapsed();
     println!("the busiest recording's slide drawn small: {small:?}");
     assert!(small < MOST, "{small:?}");
+}
+
+/// A recording of many colours and no text taken in, as the busiest is: shaped, placed and drawn
+/// aside, the window waiting on none of it.
+#[test]
+#[ignore = "timing; run in release"]
+fn a_recording_of_many_colours_coming_in_is_quick() {
+    let dir = recording_talk_folder_with(colourful_recording());
+    let (_doc, slowest) = open_recording_talk(dir.path(), RECORDING_SLIDES / 2);
+    println!("a recording of many colours taken in and drawn: {slowest:?}");
+    assert!(slowest < MOST, "{slowest:?}");
 }
