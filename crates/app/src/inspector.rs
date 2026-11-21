@@ -42,9 +42,10 @@ use crate::table_tools;
 use crate::text_tools::written_color;
 use crate::workspace_view::WorkspaceView;
 use colors::color_of;
-use fields::{Choice, Kind, Spec, Typed, file_name, number_typed, stepped, text_typed};
+use fields::{Choice, FIRST_FRAME, Kind, Spec, Typed, file_name, number_typed, stepped, text_typed};
 
 pub use fields::{BOTH_QUOTES, NOT_A_NUMBER, NOT_WHOLE};
+pub use labels::{model_facts, terminal_facts, video_facts};
 
 pub const INSPECTOR_ID: &str = "inspector";
 /// What names the thing selected, at the top of the panel.
@@ -53,6 +54,26 @@ pub const INSPECTOR_HEADING_ID: &str = "inspector-heading";
 pub const INSPECTOR_MESSAGE_ID: &str = "inspector-message";
 /// The button of a file field, inside the field.
 pub const INSPECTOR_CHOOSE_FILE_ID: &str = "inspector-choose-file";
+/// The line saying how long a video selected is and how big, read off the window's thread.
+pub const INSPECTOR_VIDEO_FACTS_ID: &str = "inspector-video-facts";
+/// The sentence saying why a video selected can't be played, if it can't.
+pub const INSPECTOR_VIDEO_PROBLEM_ID: &str = "inspector-video-problem";
+/// The line saying how many triangles or points a 3D model selected has, read off the window's
+/// thread.
+pub const INSPECTOR_MODEL_FACTS_ID: &str = "inspector-model-facts";
+/// The sentence saying why a 3D model selected can't be drawn, if it can't.
+pub const INSPECTOR_MODEL_PROBLEM_ID: &str = "inspector-model-problem";
+/// The line saying how big a terminal recording selected's screen is, how long it plays and how
+/// many times it stops, read off the window's thread.
+pub const INSPECTOR_TERMINAL_FACTS_ID: &str = "inspector-terminal-facts";
+/// The sentence saying why a terminal recording selected can't be played, if it can't.
+pub const INSPECTOR_TERMINAL_PROBLEM_ID: &str = "inspector-terminal-problem";
+/// The line saying how many views a 3D model selected has, one a click in the show.
+pub const INSPECTOR_MODEL_VIEWS_ID: &str = "inspector-model-views";
+/// The button that adds the view a 3D model being turned is shown from to its views.
+pub const INSPECTOR_ADD_VIEW_ID: &str = "inspector-add-view";
+/// The button that takes away a 3D model's views.
+pub const INSPECTOR_CLEAR_VIEWS_ID: &str = "inspector-clear-views";
 /// The button that puts an area selected back where its layout has it.
 pub const INSPECTOR_PUT_BACK_ID: &str = "inspector-put-back";
 
@@ -178,12 +199,22 @@ struct LookedUp {
     schema: Option<ComponentSchema>,
 }
 
+/// The talk's pictures, for a video's still, as last read off the window's thread, and for which
+/// thing picked and which files added they were read, or are being read.
+#[derive(Default)]
+struct Pictures {
+    read_for: Option<(u64, u64)>,
+    reading: Option<(u64, u64)>,
+    found: Vec<String>,
+}
+
 pub struct Inspector {
     document: Option<Entity<Document>>,
     /// What every change is made through.
     workspace: WeakEntity<WorkspaceView>,
     form: Option<Form>,
     looked_up: Option<LookedUp>,
+    pictures: Pictures,
     /// Pictures of a form let go of, which the window lets go of as the panel is drawn.
     retired: Vec<Arc<RenderImage>>,
     _subscriptions: Vec<Subscription>,
@@ -196,7 +227,7 @@ impl Inspector {
             .iter()
             .map(|document| cx.observe(document, |_, _, cx| cx.notify()))
             .collect();
-        Inspector { document, workspace, form: None, looked_up: None, retired: Vec::new(), _subscriptions: subscriptions }
+        Inspector { document, workspace, form: None, looked_up: None, pictures: Pictures::default(), retired: Vec::new(), _subscriptions: subscriptions }
     }
 
     /// The labels of the fields shown, in order.
@@ -213,7 +244,7 @@ impl Inspector {
         let field = self.field(name)?;
         Some(match &field.widget {
             Widget::Input(input) => input.read(cx).value().to_string(),
-            Widget::Flag => (self.talk_attr(name, cx).as_deref() == Some("true")).to_string(),
+            Widget::Flag => labels::says_yes(self.form_tag(), self.talk_attr(name, cx).as_deref()).to_string(),
             Widget::Color { picker, .. } => picker.read(cx).value().map(written_color).unwrap_or_default(),
             Widget::Choice { select, choices } => {
                 let value = select.read(cx).selected_value().cloned();
@@ -270,13 +301,18 @@ impl Inspector {
     }
 
     /// Writes `value`, one of the choices of the choice field for attribute `name`, as picking it
-    /// from the field's list does.
+    /// from the field's list does. For a video's still, `value` is one of the talk's pictures, or
+    /// empty for its first frame, which takes the still away.
     pub fn choose(&mut self, name: &str, value: &str, _window: &mut Window, cx: &mut Context<Self>) {
-        let known = self
-            .field(name)
-            .is_some_and(|field| matches!(&field.spec.kind, Kind::Choice(options) if options.iter().any(|option| option == value)));
-        if known {
-            self.write(name, Some(value), cx).ok();
+        let written = self.field(name).and_then(|field| match &field.spec.kind {
+            Kind::Choice(options) => options.iter().any(|option| option == value).then_some(Some(value)),
+            // Its first frame is no still of its own.
+            Kind::Still(_) if value.is_empty() => Some(None),
+            Kind::Still(pictures) => pictures.iter().any(|picture| picture == value).then_some(Some(value)),
+            _ => None,
+        });
+        if let Some(written) = written {
+            self.write(name, written, cx).ok();
             cx.notify();
         }
     }
@@ -315,6 +351,158 @@ impl Inspector {
         cx.notify();
     }
 
+    /// What the form says of the video it's for, if it's for one: how long it is and how big,
+    /// once that's been read, and why it can't be played, if it can't. What's known is read off
+    /// the window's thread, once for each version of its file, and the panel is drawn again once
+    /// it's there.
+    fn video_said(&mut self, cx: &mut Context<Self>) -> (Option<String>, Option<String>) {
+        let (Some(form), Some(document)) = (&self.form, self.document.clone()) else {
+            return (None, None);
+        };
+        let Subject::Thing(target) = &form.target else {
+            return (None, None);
+        };
+        let target = target.clone();
+        if form.shape.tag.as_deref() != Some("Video") {
+            return (None, None);
+        }
+        let src = self.talk_attr("src", cx).map(|src| src.trim().to_string()).filter(|src| !src.is_empty());
+        let Some(src) = src else {
+            return (None, Some(slides_engine::VIDEO_NO_FILE.to_string()));
+        };
+        let (known, to_read, problem) = document.update(cx, |document, _| {
+            let known = document.video_facts(&src);
+            let to_read = if known.is_none() { document.video_facts_to_read(&src) } else { None };
+            let problem = if target.slide == document.current() { document.video_problem(&target.source) } else { None };
+            (known, to_read, problem)
+        });
+        if let Some(to_read) = to_read {
+            let document = document.downgrade();
+            cx.spawn(async move |this, cx| {
+                let read = cx.background_spawn(async move { to_read.read() }).await;
+                let known = document.update(cx, |document, _| document.take_video_facts(read)).unwrap_or(false);
+                if known {
+                    this.update(cx, |_, cx| cx.notify()).ok();
+                }
+            })
+            .detach();
+        }
+        let facts = known.and_then(Result::ok).map(|facts| labels::video_facts(facts.seconds, facts.size));
+        let problem = problem.or_else(|| known.and_then(Result::err).map(|why| why.to_string()));
+        (facts, problem)
+    }
+
+    /// What the form says of the 3D model it's for, if it's for one: how many triangles or
+    /// points it has, once that's been read off the window's thread from its headers, once for
+    /// each version of its file; why it can't be drawn, if it can't; and its views.
+    fn model_said(&mut self, cx: &mut Context<Self>) -> ModelSaid {
+        let (Some(form), Some(document)) = (&self.form, self.document.clone()) else {
+            return ModelSaid::default();
+        };
+        let Subject::Thing(target) = &form.target else {
+            return ModelSaid::default();
+        };
+        let target = target.clone();
+        if form.shape.tag.as_deref() != Some("Model") {
+            return ModelSaid::default();
+        }
+        let turned = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).slide_editor().read(cx).model_turned())
+            .is_some_and(|turned| turned == target.source);
+        let written = self.talk_attr("views", cx);
+        let views = Some(ModelViews { count: views_of(written.as_deref()), written: written.is_some(), turned });
+        let src = self.talk_attr("src", cx).map(|src| src.trim().to_string()).filter(|src| !src.is_empty());
+        let Some(src) = src else {
+            return ModelSaid { facts: None, problem: Some(slides_engine::MODEL_NO_FILE.to_string()), views };
+        };
+        let (known, to_read, problem) = document.update(cx, |document, _| {
+            let known = document.model_facts(&src);
+            let to_read = if known.is_none() { document.model_facts_to_read(&src) } else { None };
+            let problem = if target.slide == document.current() { document.selected_model_said() } else { None };
+            (known, to_read, problem)
+        });
+        if let Some(to_read) = to_read {
+            let document = document.downgrade();
+            cx.spawn(async move |this, cx| {
+                let read = cx.background_spawn(async move { to_read.read() }).await;
+                let known = document.update(cx, |document, _| document.take_model_facts(read)).unwrap_or(false);
+                if known {
+                    this.update(cx, |_, cx| cx.notify()).ok();
+                }
+            })
+            .detach();
+        }
+        let facts = known.and_then(Result::ok).map(|facts| labels::model_facts(facts.kind, facts.triangles, facts.points));
+        // One drawn, but not from the view written, says that too.
+        let view = self.talk_attr("view", cx).filter(|view| !view.trim().is_empty());
+        let unread = view.is_some_and(|view| slides_model::View::parse(&view).is_none()).then(|| slides_engine::MODEL_VIEW_UNREAD.to_string());
+        let problem = problem.or_else(|| known.and_then(Result::err).map(|why| why.to_string())).or(unread);
+        ModelSaid { facts, problem, views }
+    }
+
+    /// What the form says of the terminal recording it's for, if it's for one: how big its screen
+    /// is, how long it plays and how many times it stops, once that's been read off the window's
+    /// thread, once for each version of its file, and why it can't be played, if it can't.
+    fn terminal_said(&mut self, cx: &mut Context<Self>) -> (Option<String>, Option<String>) {
+        let (Some(form), Some(document)) = (&self.form, self.document.clone()) else {
+            return (None, None);
+        };
+        let Subject::Thing(target) = &form.target else {
+            return (None, None);
+        };
+        let target = target.clone();
+        if form.shape.tag.as_deref() != Some("Terminal") {
+            return (None, None);
+        }
+        let src = self.talk_attr("src", cx).map(|src| src.trim().to_string()).filter(|src| !src.is_empty());
+        let Some(src) = src else {
+            return (None, Some(slides_engine::TERMINAL_NO_FILE.to_string()));
+        };
+        let (known, to_read, problem) = document.update(cx, |document, _| {
+            let known = document.recording_facts(&src);
+            let to_read = if known.is_none() { document.recording_facts_to_read(&src) } else { None };
+            let problem = if target.slide == document.current() { document.terminal_problem_on(target.slide, &target.source) } else { None };
+            (known, to_read, problem)
+        });
+        if let Some(to_read) = to_read {
+            let document = document.downgrade();
+            cx.spawn(async move |this, cx| {
+                let read = cx.background_spawn(async move { to_read.read() }).await;
+                let known = document.update(cx, |document, _| document.take_recording_facts(read)).unwrap_or(false);
+                if known {
+                    this.update(cx, |_, cx| cx.notify()).ok();
+                }
+            })
+            .detach();
+        }
+        // What can't be played has no facts to say, but why.
+        let problem = problem.or_else(|| known.and_then(Result::err).map(|why| why.to_string()));
+        let facts = known.and_then(Result::ok).filter(|_| problem.is_none()).map(labels::terminal_facts);
+        (facts, problem)
+    }
+
+    /// Adds the view the 3D model the form is for is shown from, while it's turned, to its views.
+    fn add_view(&mut self, cx: &mut Context<Self>) {
+        if let Some(workspace) = self.workspace.upgrade() {
+            let editor = workspace.read(cx).slide_editor().clone();
+            editor.update(cx, |editor, cx| editor.add_view(cx));
+        }
+    }
+
+    /// Takes away the views of the 3D model the form is for, as any setting is written: one
+    /// being turned goes back to its still.
+    fn clear_views(&mut self, cx: &mut Context<Self>) {
+        self.write("views", None, cx).ok();
+        cx.notify();
+    }
+
+    /// The tag of the thing the form is for, if it's one.
+    fn form_tag(&self) -> &str {
+        self.form.as_ref().and_then(|form| form.shape.tag.as_deref()).unwrap_or_default()
+    }
+
     fn field(&self, name: &str) -> Option<&Field> {
         self.form.as_ref()?.fields.iter().find(|field| field.spec.attr == name)
     }
@@ -332,6 +520,27 @@ impl Inspector {
             Subject::Several => None,
         }
     }
+}
+
+/// What the form says of a 3D model.
+#[derive(Default)]
+struct ModelSaid {
+    facts: Option<String>,
+    problem: Option<String>,
+    views: Option<ModelViews>,
+}
+
+/// How many views a 3D model has, whether it has any written, read or not, and whether it's
+/// being turned, so that the view it's shown from can be added.
+struct ModelViews {
+    count: usize,
+    written: bool,
+    turned: bool,
+}
+
+/// How many views a model whose `views` is `written` flies through, as the engine reads them.
+fn views_of(written: Option<&str>) -> usize {
+    slides_engine::read_model_views(written).0.len()
 }
 
 /// The kind of file `path` is, for a field that takes `extensions`, if it's one it takes and one

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use slides_components::{BuildEntry, BuildIndex, Diagnostic, INDEX_FILE, source_hash};
 use slides_engine::{
-    AddedSet, Align, ComponentInfo, ComponentState, Deck, SchemaLoad, ElementBox, Rect, FolderFiles, Fonts, Layer, LayerTiming, MemoryFiles, Moment, PackError, Pixmap,
+    AddedFile, AddedSet, Align, ComponentInfo, ComponentState, Deck, SchemaLoad, ElementBox, Rect, FolderFiles, Fonts, Layer, LayerTiming, MemoryFiles, Moment, PackError, Pixmap,
     SlideTimeline, TalkFiles, TextLayout, Transition, WithAdded, layout_by_name, open_packed, text_align,
     read_talk_text,
 };
@@ -26,7 +26,7 @@ use crate::added_files::{self, FileKind, MAX_ADDED_BYTES, NotAdded, Placed, talk
 use crate::clipboard::{CopiedFile, MAX_CLIPBOARD_FILES, MAX_CLIPBOARD_FILES_BYTES, PastedFile, PastedFiles};
 use crate::export::ExportInput;
 use crate::history::{History, RunId, one_edit};
-use crate::insert::{self, INSERT_COMPONENT, INSERT_PICTURE, INSERT_SHAPE, INSERT_TABLE, INSERT_TEXT_BOX, TEXT_BOX_SIZE};
+use crate::insert::{self, INSERT_COMPONENT, INSERT_MODEL, INSERT_PICTURE, INSERT_SHAPE, INSERT_TABLE, INSERT_TERMINAL, INSERT_TEXT_BOX, INSERT_VIDEO, TEXT_BOX_SIZE};
 use crate::palette::{self, COMPONENT_SIZE, LISTED_BUILT_INS};
 pub use crate::palette::PaletteEntry;
 use crate::present::TalkShape;
@@ -49,6 +49,7 @@ mod ending_text;
 mod errors;
 mod files;
 mod inserting;
+mod large;
 mod open;
 mod reading;
 mod saving;
@@ -62,6 +63,7 @@ pub use arranging::{ALIGN, ArrangeHere, DISTRIBUTE, MOVE, MOVE_OUT, NUDGE, ORDER
 pub use clipboard::Brought;
 pub use self::core::EditRun;
 use self::core::{Holds, Join, others_alike};
+pub use large::{CopiedIn, FactsRead, FactsToRead, LargeCopy, LargeKeep, LargeOpen, VideoFacts};
 pub use errors::{AREA_STAYS, DRAG_OUT_FIRST, EditRefused, InsertFailed, LAYOUT_FAILED, OpenProblem, panic_in_next_change, panic_in_next_layout};
 use errors::{built, guarded, laid_out, read_after, worked_out};
 pub use open::{TalkPlace, UNTITLED_NAME, UntitledId};
@@ -168,4 +170,6 @@ pub struct Document {
     palette_given_up: BTreeSet<String>,
     /// The longest a step of loading the palette has taken.
     palette_longest_step: Duration,
+    /// Where the talk's large files are copied to, and what it knows of them.
+    large: large::LargeHome,
 }

@@ -7,7 +7,14 @@
 //! slide is selected, typed in or waiting while the list of slides or the notes have the
 //! keyboard. Half of those runs start on the start screen with a template picked at random and
 //! save the new presentation for the first time at a random step; what's saved, opened again at
-//! the end, has the text the window has.
+//! the end, has the text the window has. Among the window's steps a made video is put on the
+//! slide, from the Video tool's dialog or dropped, played and stopped; a made 3D model is put on
+//! the slide the same ways, turned by its button or Space, dragged round and zoomed, its view
+//! set, and turning done; a made terminal recording is put on the slide the same ways, played and
+//! stopped by its button or Space; and the show started, stepped through, dragged on, clicked
+//! through a recording's marks and back, and ended: a video plays, a model turns and a recording
+//! plays only while it alone is selected in the editor, nothing plays once the show is over and
+//! every replay's thread ends, and at the end no model is turned or held on the graphics card.
 //!
 //! Each talk runs with a few seeds; `SEEDS=n` runs seed `n` alone, and `SEEDS=a..b` a range.
 //! `PROPTEST_CASES=n` runs the arranging with `n` seeds in all, spread over its talks.
@@ -578,6 +585,191 @@ fn pick_from_menu(typing: &typing::Typing, cx: &mut TestAppContext, at: usize, c
     }
 }
 
+/// The thing selected, if it's a video and nothing else is.
+fn video_selected(typing: &typing::Typing, cx: &TestAppContext) -> bool {
+    let source = typing.source(cx);
+    let things = typing.document(cx).read_with(cx, |document, _| document.selection().map_or(0, |selection| selection.things.len()));
+    things == 1 && typing::selected(typing, cx).is_some_and(|(_, range)| source.get(range).is_some_and(|thing| thing.starts_with("<Video")))
+}
+
+/// The thing selected, if it's a 3D model and nothing else is.
+fn model_selected(typing: &typing::Typing, cx: &TestAppContext) -> bool {
+    let source = typing.source(cx);
+    let things = typing.document(cx).read_with(cx, |document, _| document.selection().map_or(0, |selection| selection.things.len()));
+    things == 1 && typing::selected(typing, cx).is_some_and(|(_, range)| source.get(range).is_some_and(|thing| thing.starts_with("<Model")))
+}
+
+/// The thing selected, if it's a terminal recording and nothing else is.
+fn recording_selected(typing: &typing::Typing, cx: &TestAppContext) -> bool {
+    let source = typing.source(cx);
+    let things = typing.document(cx).read_with(cx, |document, _| document.selection().map_or(0, |selection| selection.things.len()));
+    things == 1 && typing::selected(typing, cx).is_some_and(|(_, range)| source.get(range).is_some_and(|thing| thing.starts_with("<Terminal")))
+}
+
+/// The recordings playing in the editor.
+fn recordings_playing(typing: &typing::Typing, cx: &TestAppContext) -> usize {
+    cx.read(|cx| typing.view.read(cx).slide_canvas().read(cx).playing_recordings().len())
+}
+
+/// The canvas of the slide the audience sees, among the show's windows `shows`: it's looked for
+/// afresh each time, as the audience's two canvases swap as a slide comes in.
+fn audience_canvas(cx: &mut TestAppContext, shows: &[gpui_kit::AnyWindowHandle]) -> Option<gpui_kit::Entity<stagepack_studio::slide_canvas::SlideCanvas>> {
+    use stagepack_studio::present_view::AudienceView;
+    cx.read(|cx| {
+        shows.iter().find_map(|window| {
+            let root = window.downcast::<gpui_kit::base::Root>()?.read(cx).ok()?;
+            let view = root.view().clone().downcast::<AudienceView>().ok()?;
+            Some(view.read(cx).current().clone())
+        })
+    })
+}
+
+/// Waits, in real time, for every replay's thread to end, drawing the windows meanwhile.
+fn replays_end(cx: &mut TestAppContext, what: &str) {
+    let began = std::time::Instant::now();
+    while stagepack_studio::replay::threads_running() > 0 {
+        assert!(began.elapsed() < std::time::Duration::from_secs(10), "{what}: a replay's thread didn't end");
+        a_moment(cx);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// The models turned in the editor.
+fn models_turned(typing: &typing::Typing, cx: &TestAppContext) -> usize {
+    cx.read(|cx| typing.view.read(cx).slide_canvas().read(cx).models_turned().len())
+}
+
+/// The app's drawer, on the software adapter where there is one and on the best there is
+/// otherwise, closed as the run ends, as a program that ends while a driver lets go of a device can
+/// crash in the driver. Where there's none at all, a model shows a plain panel, which the run
+/// takes as it comes.
+struct Drawing;
+
+impl Drawing {
+    fn start() -> Drawing {
+        use slides_model::{AdapterKind, Drawer, DrawerOptions};
+        let drawer = Drawer::start_with(DrawerOptions { only: Some(AdapterKind::Software), ..DrawerOptions::default() });
+        let began = std::time::Instant::now();
+        let software = loop {
+            if let Some(ready) = drawer.ready() {
+                break ready.is_ok();
+            }
+            assert!(began.elapsed() < std::time::Duration::from_secs(60), "the drawer never said whether it can draw");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        let drawer = if software { drawer } else { Drawer::start() };
+        if let Some(old) = stagepack_studio::model_view::use_drawer(drawer) {
+            assert!(old.join().unwrap(), "the drawer before let go of its device");
+        }
+        Drawing
+    }
+}
+
+impl Drop for Drawing {
+    fn drop(&mut self) {
+        let closed = stagepack_studio::model_view::close_drawer(std::time::Duration::from_secs(30));
+        if !std::thread::panicking() {
+            assert!(closed, "the drawer's thread never ended");
+        }
+    }
+}
+
+/// How many times the window runs put a model on a slide, turned one, and wrote a view: so
+/// that a run of them can't pass without doing any of it.
+static MODELS_INSERTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static MODELS_TURNED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static VIEWS_SET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// How many times the window runs put a terminal recording on a slide, played one in the editor,
+/// and clicked in the show while a recording's slide showed.
+static RECORDINGS_INSERTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static RECORDINGS_PLAYED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static RECORDING_CLICKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// How many drags the show's windows took, whole.
+static SHOW_DRAGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The videos playing in the editor.
+fn videos_playing(typing: &typing::Typing, cx: &TestAppContext) -> usize {
+    cx.read(|cx| typing.view.read(cx).slide_canvas().read(cx).playing_videos().len())
+}
+
+/// The windows open now that weren't among `before`.
+fn windows_since(before: &[gpui_kit::AnyWindowHandle], cx: &TestAppContext) -> Vec<gpui_kit::AnyWindowHandle> {
+    cx.read(|cx| cx.windows()).into_iter().filter(|window| before.iter().all(|was| was.window_id() != window.window_id())).collect()
+}
+
+/// Lets a twentieth of a second pass and draws every window, as a video playing asks for.
+fn a_moment(cx: &mut TestAppContext) {
+    use gpui_kit::AppContext as _;
+    use gpui_kit::test::TestWindowExt as _;
+    cx.executor().advance_clock(std::time::Duration::from_millis(50));
+    cx.run_until_parked();
+    for window in cx.read(|cx| cx.windows()) {
+        cx.update_window(window, |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+        })
+        .ok();
+    }
+    cx.run_until_parked();
+}
+
+/// A drag with the mouse in a show's window `show`, from `from` to `to`, and whether it was
+/// made whole: a window that closed part-way, as the show ending on its click closes it, stops it.
+fn show_drag(cx: &mut TestAppContext, show: gpui_kit::AnyWindowHandle, from: gpui_kit::Point<gpui_kit::Pixels>, to: gpui_kit::Point<gpui_kit::Pixels>) -> bool {
+    use gpui_kit::test::TestWindowExt as _;
+    use gpui_kit::{AppContext as _, InputEvent as _, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
+    let held = Some(MouseButton::Left);
+    let events = [
+        MouseDownEvent { button: MouseButton::Left, position: from, modifiers: Modifiers::default(), click_count: 1, first_mouse: false }.to_platform_input(),
+        MouseMoveEvent { position: gpui_kit::point((from.x + to.x) / 2., (from.y + to.y) / 2.), pressed_button: held, modifiers: Modifiers::default() }.to_platform_input(),
+        MouseMoveEvent { position: to, pressed_button: held, modifiers: Modifiers::default() }.to_platform_input(),
+        MouseUpEvent { button: MouseButton::Left, position: to, modifiers: Modifiers::default(), click_count: 1 }.to_platform_input(),
+    ];
+    for event in events {
+        let sent = cx.update_window(show, |_, window, cx| {
+            window.render_frame(cx);
+            window.dispatch_event(event, cx);
+        });
+        if sent.is_err() {
+            let open = cx.read(|cx| cx.windows()).iter().any(|window| window.window_id() == show.window_id());
+            assert!(!open, "the show's window is open, and took no drag: {:?}", sent.err());
+            return false;
+        }
+        cx.run_until_parked();
+    }
+    true
+}
+
+/// A turn of the wheel by `lines` at `at` on the slide.
+fn model_wheel(typing: &typing::Typing, cx: &mut TestAppContext, at: gpui_kit::Point<gpui_kit::Pixels>, lines: f32) {
+    use gpui_kit::test::TestWindowExt as _;
+    use gpui_kit::{InputEvent as _, ScrollDelta, ScrollEvent};
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        let event = ScrollEvent { position: at, delta: ScrollDelta::Lines(gpui_kit::point(0., lines)), ..ScrollEvent::default() };
+        window.dispatch_event(event.to_platform_input(), cx);
+    });
+    cx.run_until_parked();
+    typing.settle(cx);
+}
+
+/// Drops `path` from outside the app on the slide at (`x`, `y`), and lets its copy run.
+fn drop_file(typing: &typing::Typing, cx: &mut TestAppContext, path: std::path::PathBuf, x: f32, y: f32) {
+    use gpui_kit::InputEvent as _;
+    use gpui_kit::test::TestWindowExt as _;
+    let at = typing.at(cx, x, y);
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        let paths = gpui_kit::ExternalPaths([path].into_iter().collect());
+        window.dispatch_event(gpui_kit::FileDropEvent::Entered { position: at, paths }.to_platform_input(), cx);
+        window.dispatch_event(gpui_kit::FileDropEvent::Pending { position: at }.to_platform_input(), cx);
+        window.dispatch_event(gpui_kit::FileDropEvent::Submit { position: at }.to_platform_input(), cx);
+        window.render_frame(cx);
+    });
+    cx.run_until_parked();
+    typing.settle(cx);
+}
+
 /// What a run in the window starts from.
 #[derive(Clone, Copy)]
 enum Start<'a> {
@@ -671,10 +863,21 @@ fn window_run(cx: &mut TestAppContext, start: Start, seed: u64) {
     use stagepack_studio::slide_editor::handle_id;
     use stagepack_studio::start_screen::template_tile_id;
     use stagepack_studio::templates::templates;
+    use stagepack_studio::slide_editor::{MODEL_DONE_ID, MODEL_SET_VIEW_ID, MODEL_TURN_ID, TERMINAL_PLAY_ID, TERMINAL_STOP_ID, VIDEO_PLAY_ID, VIDEO_STOP_ID};
     // The scratch folder a new presentation keeps all it keeps in, and is saved to.
     let root = tempfile::tempdir().unwrap();
+    // A made video, outside the talk, to put on its slides: six pictures of a colour each.
+    let clip = root.path().join("Made clip.mp4");
+    std::fs::write(&clip, slides_video::make_test_video(64, 36, 6, 10, |at| [40 * at as u8, 255 - 40 * at as u8, 90, 255].repeat(64 * 36))).unwrap();
+    // And a made 3D model: a box of three materials.
+    let model = root.path().join("Made box.glb");
+    std::fs::write(&model, slides_model::make_test_glb(slides_model::MadeGlb::Boxes)).unwrap();
+    // And a made terminal recording: a short session with a mark, and a program in the alternate
+    // screen.
+    let recording = root.path().join("Made run.cast");
+    std::fs::write(&recording, slides_terminal::make_demo_cast()).unwrap();
     let (typing, mut first_save_due) = match start {
-        Start::Talk(talk) => (typing::open(cx, talk), None),
+        Start::Talk(talk) => (typing::open_with(cx, talk, Some(stagepack_studio::recovery::Recovery::new(root.path().join("recovery")))), None),
         Start::StartScreen => {
             // Its own generator, so that the steps a seed makes are those a talk's run makes.
             let mut pick = Rng(seed.wrapping_mul(0xD6E8_FEB8_6659_FD93) | 1);
@@ -704,7 +907,10 @@ fn window_run(cx: &mut TestAppContext, start: Start, seed: u64) {
             first_save(&typing, cx, &save, seed);
             saved = Some(save);
         }
-        let choice = rng.below(27);
+        // Choices 0 to 32 each do something, and the three past them type a letter: with choice
+        // 5, typing has 4 chances in 36, as it had 4 in 30 before the models' and the recordings'
+        // three arms each came, so it stays among the most done.
+        let choice = rng.below(36);
         let elements = typing.layout(cx).elements().to_vec();
         let element = (!elements.is_empty()).then(|| elements[rng.below(elements.len())].clone());
         let modifiers = [Modifiers::default(), Modifiers::shift(), Modifiers::control()][rng.below(3)];
@@ -823,8 +1029,237 @@ fn window_run(cx: &mut TestAppContext, start: Start, seed: u64) {
                     typing.mouse_up(cx, to, 1, modifiers);
                 }
             }
+            // A made video put on the slide, from the Video tool's dialog or dropped.
+            (23, _) => {
+                if rng.below(2) == 0 {
+                    let view = typing.view.clone();
+                    let path = clip.clone();
+                    cx.update(|cx| view.update(cx, |view, cx| view.chosen_videos(vec![path], cx)));
+                    cx.run_until_parked();
+                    typing.settle(cx);
+                } else {
+                    drop_file(&typing, cx, clip.clone(), rng.below(1920) as f32, rng.below(1080) as f32);
+                }
+            }
+            // A video on the slide selected and played, or stopped, by its button or Space.
+            (24, _) | (25, _) => {
+                let source = typing.source(cx);
+                let videos: Vec<_> = elements.iter().filter(|element| source.get(element.source.clone()).is_some_and(|thing| thing.starts_with("<Video"))).cloned().collect();
+                if !videos.is_empty() && !video_selected(&typing, cx) {
+                    let video = &videos[rng.below(videos.len())];
+                    let at = typing.at(cx, video.rect.x + video.rect.w / 5., video.rect.y + video.rect.h / 5.);
+                    typing.click(cx, at);
+                }
+                match rng.below(3) {
+                    0 => typing.press(cx, "space"),
+                    _ => {
+                        if !click_if_shown(&typing, cx, VIDEO_PLAY_ID) {
+                            click_if_shown(&typing, cx, VIDEO_STOP_ID);
+                        }
+                    }
+                }
+                for _ in 0..rng.below(4) {
+                    a_moment(cx);
+                }
+            }
+            // The show, started, stepped through, dragged on, as a model is turned, and ended.
+            (26, _) => {
+                typing.press(cx, "escape");
+                let before = cx.read(|cx| cx.windows());
+                typing.press(cx, ["f5", "shift-f5"][rng.below(2)]);
+                cx.run_until_parked();
+                let shows = windows_since(&before, cx);
+                assert!(!shows.is_empty(), "seed {seed} step {step}: the show didn't start");
+                for _ in 0..rng.below(6) {
+                    let show = shows[rng.below(shows.len())];
+                    if rng.below(5) == 0 {
+                        let from = gpui_kit::point(gpui_kit::px(rng.below(600) as f32 + 100.), gpui_kit::px(rng.below(400) as f32 + 100.));
+                        if show_drag(cx, show, from, gpui_kit::point(from.x + gpui_kit::px(80.), from.y + gpui_kit::px(20.))) {
+                            SHOW_DRAGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    } else {
+                        cx.simulate_keystrokes(show, ["right", "right", "left", "space"][rng.below(4)]);
+                    }
+                    a_moment(cx);
+                }
+                let which = rng.below(shows.len());
+                cx.simulate_keystrokes(shows[which], "escape");
+                cx.run_until_parked();
+                assert!(windows_since(&before, cx).is_empty(), "seed {seed} step {step}: Escape in show window {which} didn't end the show");
+                typing.with_window(cx, |window, _| window.activate_window());
+                typing.settle(cx);
+            }
+            // A made model put on the slide, from the Model tool's dialog or dropped.
+            (27, _) => {
+                let before = typing.source(cx).matches("<Model").count();
+                if rng.below(2) == 0 {
+                    let view = typing.view.clone();
+                    let path = model.clone();
+                    cx.update(|cx| view.update(cx, |view, cx| view.chosen_models(vec![path], cx)));
+                    cx.run_until_parked();
+                    typing.settle(cx);
+                } else {
+                    drop_file(&typing, cx, model.clone(), rng.below(1920) as f32, rng.below(1080) as f32);
+                }
+                if typing.source(cx).matches("<Model").count() > before {
+                    MODELS_INSERTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            // A model on the slide selected and turned, or done, by its button or Space, and
+            // dragged round or zoomed by the wheel while it's turned.
+            (28, _) => {
+                let source = typing.source(cx);
+                let models: Vec<_> = elements.iter().filter(|element| source.get(element.source.clone()).is_some_and(|thing| thing.starts_with("<Model"))).cloned().collect();
+                if !models.is_empty() && !model_selected(&typing, cx) {
+                    let model = &models[rng.below(models.len())];
+                    let at = typing.at(cx, model.rect.x + model.rect.w / 5., model.rect.y + model.rect.h / 5.);
+                    typing.click(cx, at);
+                }
+                match rng.below(3) {
+                    0 => typing.press(cx, "space"),
+                    _ => {
+                        if !click_if_shown(&typing, cx, MODEL_TURN_ID) {
+                            click_if_shown(&typing, cx, MODEL_DONE_ID);
+                        }
+                    }
+                }
+                if models_turned(&typing, cx) > 0 {
+                    MODELS_TURNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let model = typing::thing(&typing, cx, "<Model");
+                    let from = typing.at(cx, model.rect.x + model.rect.w / 3., model.rect.y + model.rect.h / 2.);
+                    if rng.below(2) == 0 {
+                        typing.drag(cx, from, gpui_kit::point(from.x + gpui_kit::px(rng.below(121) as f32 - 60.), from.y + gpui_kit::px(rng.below(61) as f32 - 30.)));
+                    } else {
+                        model_wheel(&typing, cx, from, [1., -1., 2.][rng.below(3)]);
+                    }
+                }
+                for _ in 0..rng.below(4) {
+                    a_moment(cx);
+                }
+            }
+            // A model turned, if none is, dragged round, and the view it shows written, as one
+            // step; and turning done, or not.
+            (29, _) => {
+                let source = typing.source(cx);
+                let models: Vec<_> = elements.iter().filter(|element| source.get(element.source.clone()).is_some_and(|thing| thing.starts_with("<Model"))).cloned().collect();
+                if models_turned(&typing, cx) == 0 && !models.is_empty() {
+                    let model = &models[rng.below(models.len())];
+                    let at = typing.at(cx, model.rect.x + model.rect.w / 5., model.rect.y + model.rect.h / 5.);
+                    typing.click(cx, at);
+                    click_if_shown(&typing, cx, MODEL_TURN_ID);
+                    if models_turned(&typing, cx) > 0 {
+                        let from = typing.at(cx, model.rect.x + model.rect.w / 3., model.rect.y + model.rect.h / 2.);
+                        typing.drag(cx, from, gpui_kit::point(from.x + gpui_kit::px(rng.below(121) as f32 - 60.), from.y));
+                        a_moment(cx);
+                    }
+                }
+                if click_if_shown(&typing, cx, MODEL_SET_VIEW_ID) {
+                    VIEWS_SET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                if rng.below(2) == 0 {
+                    click_if_shown(&typing, cx, MODEL_DONE_ID);
+                }
+            }
+            // A made recording put on the slide, from the Terminal recording tool's dialog or dropped.
+            (30, _) => {
+                let before = typing.source(cx).matches("<Terminal").count();
+                if rng.below(2) == 0 {
+                    let view = typing.view.clone();
+                    let path = recording.clone();
+                    cx.update(|cx| view.update(cx, |view, cx| view.chosen_recordings(vec![path], cx)));
+                    cx.run_until_parked();
+                    typing.settle(cx);
+                } else {
+                    drop_file(&typing, cx, recording.clone(), rng.below(1920) as f32, rng.below(1080) as f32);
+                }
+                if typing.source(cx).matches("<Terminal").count() > before {
+                    RECORDINGS_INSERTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            // A recording on the slide selected and played, or stopped, by its button or Space.
+            (31, _) => {
+                let source = typing.source(cx);
+                let recordings: Vec<_> = elements.iter().filter(|element| source.get(element.source.clone()).is_some_and(|thing| thing.starts_with("<Terminal"))).cloned().collect();
+                if !recordings.is_empty() && !recording_selected(&typing, cx) {
+                    let recording = &recordings[rng.below(recordings.len())];
+                    let at = typing.at(cx, recording.rect.x + recording.rect.w / 5., recording.rect.y + recording.rect.h / 5.);
+                    typing.click(cx, at);
+                }
+                match rng.below(3) {
+                    0 => typing.press(cx, "space"),
+                    _ => {
+                        if !click_if_shown(&typing, cx, TERMINAL_PLAY_ID) {
+                            click_if_shown(&typing, cx, TERMINAL_STOP_ID);
+                        }
+                    }
+                }
+                if recordings_playing(&typing, cx) > 0 {
+                    RECORDINGS_PLAYED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                // A little real time for its thread to play in, and the frames it asks for.
+                for _ in 0..rng.below(4) {
+                    std::thread::sleep(std::time::Duration::from_millis(rng.below(40) as u64));
+                    a_moment(cx);
+                }
+            }
+            // The show, with a recording in the talk, clicked through, now and then back a step,
+            // as its marks stop it, and ended: every replay's thread ends after.
+            (32, _) => {
+                if slices(&typing.source(cx)).iter().any(|slide| slide.contains("<Terminal")) {
+                    typing.press(cx, "escape");
+                    let before = cx.read(|cx| cx.windows());
+                    typing.press(cx, ["f5", "shift-f5"][rng.below(2)]);
+                    cx.run_until_parked();
+                    let shows = windows_since(&before, cx);
+                    assert!(!shows.is_empty(), "seed {seed} step {step}: the show didn't start");
+                    for _ in 0..4 + rng.below(12) {
+                        let canvas = audience_canvas(cx, &shows).expect("the audience's window");
+                        if cx.read(|cx| !canvas.read(cx).replay_times().is_empty()) {
+                            RECORDING_CLICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        let show = shows[rng.below(shows.len())];
+                        cx.simulate_keystrokes(show, ["right", "right", "space", "left"][rng.below(4)]);
+                        std::thread::sleep(std::time::Duration::from_millis(rng.below(30) as u64));
+                        a_moment(cx);
+                    }
+                    let which = rng.below(shows.len());
+                    cx.simulate_keystrokes(shows[which], "escape");
+                    cx.run_until_parked();
+                    assert!(windows_since(&before, cx).is_empty(), "seed {seed} step {step}: Escape in show window {which} didn't end the show");
+                    replays_end(cx, &format!("seed {seed} step {step}: the show over"));
+                    typing.with_window(cx, |window, _| window.activate_window());
+                    typing.settle(cx);
+                }
+            }
             _ => typing.type_text(cx, "b"),
         }
+        let replaying = recordings_playing(&typing, cx);
+        assert!(
+            replaying == 0 || (replaying == 1 && recording_selected(&typing, cx)),
+            "seed {seed} step {step}, choice {choice}: {replaying} recordings play in the editor, with the recording selected {}, {:?} selected, typing {}\n{}",
+            recording_selected(&typing, cx),
+            typing.document(cx).read_with(cx, |document, _| document.selection().cloned()),
+            typing.editing(cx).is_some(),
+            typing.source(cx)
+        );
+        let turned = models_turned(&typing, cx);
+        assert!(
+            turned == 0 || (turned == 1 && model_selected(&typing, cx)),
+            "seed {seed} step {step}, choice {choice}: {turned} models turn in the editor, with the model selected {}, {:?} selected, typing {}\n{}",
+            model_selected(&typing, cx),
+            typing.document(cx).read_with(cx, |document, _| document.selection().cloned()),
+            typing.editing(cx).is_some(),
+            typing.source(cx)
+        );
+        let playing = videos_playing(&typing, cx);
+        assert!(
+            playing == 0 || (playing == 1 && video_selected(&typing, cx)),
+            "seed {seed} step {step}, choice {choice}: {playing} videos play in the editor, with the video selected {}, {:?} selected, typing {}\n{}",
+            video_selected(&typing, cx),
+            typing.document(cx).read_with(cx, |document, _| document.selection().cloned()),
+            typing.editing(cx).is_some(),
+            typing.source(cx)
+        );
         let held = list_or_notes_have_keyboard(&typing, cx);
         if held {
             let document = typing.document(cx);
@@ -844,6 +1279,12 @@ fn window_run(cx: &mut TestAppContext, start: Start, seed: u64) {
         );
     }
     typing.press(cx, "escape");
+    assert_eq!(videos_playing(&typing, cx), 0, "seed {seed}: a video plays with nothing selected");
+    assert_eq!(models_turned(&typing, cx), 0, "seed {seed}: a model turns with nothing selected");
+    assert_eq!(recordings_playing(&typing, cx), 0, "seed {seed}: a recording plays with nothing selected");
+    replays_end(cx, &format!("seed {seed}: at the end"));
+    cx.run_until_parked();
+    assert_eq!(stagepack_studio::model_view::scenes_held(), 0, "seed {seed}: a model is held on the graphics card with none turned");
     if let Some(save) = &saved {
         saved_reads_as_the_window(&typing, cx, save, seed);
     }
@@ -868,9 +1309,22 @@ const IN_THE_WINDOW: &[&str] = &[
 fn random_presses_keep_the_slide_free_while_the_list_or_notes_have_the_keyboard(cx: &mut TestAppContext) {
     // Half the runs open a talk, and half start on the start screen with a template.
     let starts: Vec<Start> = IN_THE_WINDOW.iter().map(|talk| Start::Talk(talk)).chain([Start::StartScreen, Start::StartScreen]).collect();
+    let _drawing = Drawing::start();
     for (t, start) in starts.into_iter().enumerate() {
         for seed in seeds() {
             window_run(cx, start, seed * 31 + t as u64 + 1);
         }
+    }
+    let count = |counted: &std::sync::atomic::AtomicUsize| counted.load(std::sync::atomic::Ordering::Relaxed);
+    let (inserted, turned, set, dragged) = (count(&MODELS_INSERTED), count(&MODELS_TURNED), count(&VIEWS_SET), count(&SHOW_DRAGS));
+    let (recorded, played, clicked) = (count(&RECORDINGS_INSERTED), count(&RECORDINGS_PLAYED), count(&RECORDING_CLICKS));
+    let said = format!(
+        "the window runs put {inserted} models on slides, turned one {turned} times, set {set} views and dragged in the show {dragged} times; \
+         put {recorded} recordings on slides, played one {played} times and clicked in the show on a recording's slide {clicked} times"
+    );
+    println!("{said}");
+    if seeds().count() >= 5 {
+        assert!(inserted > 0 && turned > 0 && set > 0 && dragged > 0, "{said}");
+        assert!(recorded > 0 && played > 0 && clicked > 0, "{said}");
     }
 }

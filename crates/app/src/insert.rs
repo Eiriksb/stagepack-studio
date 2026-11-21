@@ -15,6 +15,10 @@ pub const SHAPE_SIZE: (f32, f32) = (480.0, 320.0);
 pub const LINE_SIZE: (f32, f32) = (480.0, 120.0);
 /// The size of a new text box.
 pub const TEXT_BOX_SIZE: (f32, f32) = (640.0, 200.0);
+/// The most room a new video takes: it's its own size, made smaller to fit in this.
+pub const VIDEO_ROOM: (f32, f32) = (960.0, 540.0);
+/// The size of a new 3D model, which has no shape of its own on the slide.
+pub const MODEL_SIZE: (f32, f32) = (960.0, 540.0);
 /// How thick a new line or arrow is drawn.
 const LINE_WIDTH: &str = "6";
 
@@ -25,12 +29,52 @@ pub const INSERT_TEXT_BOX: &str = "Insert text box";
 pub const INSERT_ICON: &str = "Insert icon";
 pub const INSERT_TABLE: &str = "Insert table";
 pub const INSERT_COMPONENT: &str = "Insert component";
+pub const INSERT_VIDEO: &str = "Insert video";
+pub const INSERT_MODEL: &str = "Insert 3D model";
+pub const INSERT_TERMINAL: &str = "Insert terminal recording";
 
 /// How big a new icon is, as its `size` is written: its width and its height.
 pub const ICON_SIZE: &str = "128";
 
 /// The kinds of shape the Shapes list offers, by the talk's names for them.
 pub const SHAPE_KINDS: [&str; 6] = ["rect", "rounded", "ellipse", "line", "arrow", "callout"];
+
+/// How big a new video `size` pixels big is put on a slide, in slide units: its own size, its
+/// shape kept, made smaller to fit in [`VIDEO_ROOM`]. One with no size is the room itself.
+pub fn video_size(size: (u32, u32)) -> (f32, f32) {
+    let (w, h) = (size.0 as f32, size.1 as f32);
+    if w <= 0.0 || h <= 0.0 {
+        return VIDEO_ROOM;
+    }
+    let scale = (VIDEO_ROOM.0 / w).min(VIDEO_ROOM.1 / h).min(1.0);
+    (w * scale, h * scale)
+}
+
+/// How big a new terminal recording whose screen is `screen`, its columns and rows, is put on a
+/// slide, in slide units: the screen at its own size, its shape kept, made smaller to fit the
+/// slide.
+pub fn terminal_size(screen: (u16, u16)) -> (f32, f32) {
+    let (w, h) = slides_engine::terminal_size(screen.0, screen.1);
+    if w <= 0.0 || h <= 0.0 {
+        return VIDEO_ROOM;
+    }
+    let scale = (SLIDE.0 / w).min(SLIDE.1 / h).min(1.0);
+    (w * scale, h * scale)
+}
+
+/// `view` as a new model's starting view is written, so that a person can read it: its angles
+/// to a thousandth of a degree, and its distance and the point it looks at to four figures of
+/// the distance, however large or small the model is.
+pub fn written_view(view: slides_model::View) -> slides_model::View {
+    let view = view.cleaned();
+    let places = |scale: f32| (3 - scale.log10().floor() as i32).clamp(0, 12) as usize;
+    // Written as decimals and read back, each prints as it was written.
+    let rounded = |v: f32, places: usize| format!("{v:.places$}").parse::<f32>().ok().filter(|r| r.is_finite()).unwrap_or(v);
+    let near = places(view.distance);
+    // A distance rounded to nothing would be no view.
+    let distance = Some(rounded(view.distance, near)).filter(|d| *d > 0.0).unwrap_or(view.distance);
+    slides_model::View { yaw: rounded(view.yaw, 3), pitch: rounded(view.pitch, 3), distance, target: view.target.map(|v| rounded(v, near)) }
+}
 
 /// The top-left corner, in slide units, of a new thing of `size`: centred on the slide, moved
 /// 40 down and right for each time that exact place is in `taken`, the top-left corners of the
@@ -95,4 +139,18 @@ pub fn hex(color: Color) -> String {
 /// A whole number of slide units, as a place or a size is written.
 pub fn whole(value: f32) -> String {
     format!("{}", value.round().max(0.0) as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slides_model::View;
+
+    #[test]
+    fn a_written_view_keeps_four_figures_of_its_distance() {
+        let view = |distance: f32, target: f32| View { yaw: 12.34567, pitch: 20.0, distance, target: [target, -target, 0.0] };
+        assert_eq!(written_view(view(3.680_629, 0.5)).to_string(), "12.346 20 3.681 0.5 -0.5 0");
+        assert_eq!(written_view(view(0.002_345_67, 0.000_123_456)).to_string(), "12.346 20 0.002346 0.000123 -0.000123 0");
+        assert_eq!(written_view(view(12_345.678, 1_234.567)).to_string(), "12.346 20 12346 1235 -1235 0");
+    }
 }

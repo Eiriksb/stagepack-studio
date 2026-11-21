@@ -28,10 +28,10 @@ use crate::cargo_file::{self, write_cargo_file};
 use crate::clipboard::ClipboardOp;
 use crate::clipboard_tools::ClipboardTools;
 use crate::document::{Document, EditRefused, OpenProblem, Reload, SLIDES_FILE, TalkPlace, UNREADABLE_FILE, UntitledId};
-use crate::export::{self, ExportKind, run_export, stagepack_executable};
+use crate::export::{self, ExportKind, stagepack_executable};
 use crate::icon_picker::{self, IconPicked, IconPicker};
 use crate::palette::InsertComponent;
-use crate::insert_tools::{InsertPicture, InsertShape, InsertTextBox};
+use crate::insert_tools::{InsertModel, InsertPicture, InsertShape, InsertTerminal, InsertTextBox, InsertVideo};
 use crate::layout_picker::SetLayout;
 use crate::inspector::{self, Inspector};
 use crate::markdown_panel::MarkdownPanel;
@@ -45,6 +45,7 @@ use crate::ribbon::{Panels, Ribbon, RibbonTab};
 use crate::save_flow::{CloseAnswer, Effect, SaveFlow, SaveOutcome};
 use crate::saving::{SaveError, SaveJob, SaveTarget, Saved};
 use crate::slide_canvas::{ScaleChanged, SlideCanvas};
+use crate::video_player::StillsTaken;
 use crate::slide_editor::{self, EditorEvent, SlideEditor};
 use crate::table_tools::{
     InsertTable, TableColumnLeft, TableColumnRight, TableDeleteColumn, TableDeleteRow, TableRowAbove, TableRowBelow,
@@ -63,7 +64,7 @@ mod inserting;
 mod saving;
 mod starting;
 
-pub use inserting::{DIALOG_FAILED, ONLY_PICTURES, ONLY_THE_FIRST};
+pub use inserting::{DIALOG_FAILED, ONLY_PICTURES, ONLY_THE_FIRST, READING_RECORDING, StopsFraming, hold_recording_checks_for_tests, recording_checks_running, stop_framing_after};
 pub use starting::{open_start_window, open_untitled_ids, refresh_start_screens};
 
 pub const CANVAS_ID: &str = "canvas";
@@ -99,6 +100,13 @@ pub const CLOSE_CANCEL_ID: &str = "close-cancel";
 pub const RECOVERY_ID: &str = "recovery";
 pub const RECOVER_ID: &str = "recover";
 pub const DISCARD_RECOVERY_ID: &str = "discard-recovery";
+/// The status line while a large file is copied in, saved or pasted: a bar, and how far it's got.
+pub const PROGRESS_ID: &str = "progress";
+/// The status line's Cancel, which stops what it shows the progress of.
+pub const CANCEL_PROGRESS_ID: &str = "cancel-progress";
+/// The answers to a paste that asks before copying large files into the talk.
+pub const COPY_LARGE_ID: &str = "copy-large";
+pub const DONT_COPY_LARGE_ID: &str = "dont-copy-large";
 
 /// The key context of the window's content, where its shortcuts apply.
 pub const KEY_CONTEXT: &str = "Workspace";
@@ -206,6 +214,8 @@ pub fn init(cx: &mut App) {
         theme.cursor_blink = theme.cursor_blink.with_idle_timeout(CARET_BLINKS_FOR);
     });
     bind_keys(cx);
+    // The drawer of 3D models lets go of its graphics device before the program ends.
+    crate::model_view::close_on_quit(cx);
 }
 
 /// The window's shortcuts, and a show's. [`init`] binds them.
@@ -278,6 +288,59 @@ const EXPORTING: Wording = Wording {
     doing: "Exporting",
     done: "Exported",
 };
+/// How far work that moves a large file has got, shared with the background task doing it.
+#[derive(Default)]
+pub(crate) struct Meter {
+    done: std::sync::atomic::AtomicU64,
+    total: std::sync::atomic::AtomicU64,
+    stop: std::sync::atomic::AtomicBool,
+}
+
+impl Meter {
+    /// Takes in how far it's got: `done` bytes of `total`.
+    pub(crate) fn tell(&self, done: u64, total: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.total.store(total, Relaxed);
+        self.done.store(done, Relaxed);
+    }
+
+    /// What's set to stop it.
+    pub(crate) fn stop(&self) -> &std::sync::atomic::AtomicBool {
+        &self.stop
+    }
+}
+
+/// Work that moves a large file, while the status line shows how far it's got.
+struct Progressing {
+    /// What it's doing, such as *Copying video*.
+    doing: SharedString,
+    /// Whether it's stopped when the window closes, as a copy into the talk is, which the talk
+    /// closing has no use for. A save goes on.
+    stops_on_close: bool,
+    meter: std::sync::Arc<Meter>,
+    /// Draws the line again while it goes on.
+    _ticker: Task<()>,
+}
+
+/// What the status line says while the window waits for a save to end before it closes.
+pub const CLOSING_AFTER_SAVE: &str = "Closing once the save is done; changes made now won't be kept.";
+
+/// What the status line says of work asked to stop, until it has.
+pub const STOPPING: &str = "Stopping…";
+
+/// Background work, started on the window's thread.
+type Start = Box<dyn FnOnce(&mut WorkspaceView, &mut Context<WorkspaceView>)>;
+
+/// Background work a test holds back, to do things while it would be running.
+struct HeldWork {
+    saves: bool,
+    copies: bool,
+    held: Vec<Start>,
+}
+
+/// How often the status line is drawn again while it shows how far work has got.
+const PROGRESS_TICK: Duration = Duration::from_millis(100);
+
 /// A file this app can't show but an installed Stagepack can.
 struct StagepackOffer {
     file: PathBuf,
@@ -300,6 +363,35 @@ pub struct WorkspaceView {
     notices: Vec<String>,
     /// What came of the last thing asked of the File or Export menu.
     status: Option<SharedString>,
+    /// Work that moves a large file, while it goes on, the newest last.
+    progressing: Vec<Progressing>,
+    /// Videos and 3D models dropped, pasted or chosen, waiting to be copied in, one at a time in
+    /// turn, and whether one is being copied now.
+    large_waiting: std::collections::VecDeque<inserting::WaitingLarge>,
+    large_copying: bool,
+    /// Terminal recordings dropped, pasted or chosen, waiting to be checked before they're added,
+    /// one at a time in turn, and whether one is being checked now.
+    recordings_waiting: std::collections::VecDeque<inserting::WaitingRecording>,
+    recording_checking: bool,
+    /// What to say once the files waiting are all in, as that more files were dropped than go on.
+    said_after_large: Option<&'static str>,
+    /// Whether the window is to close once the copies it stopped as it was closed have ended.
+    close_when_idle: bool,
+    /// How many saves are running, which a window closing waits for before it lets anything of
+    /// the working copy go: a save may be reading a video from it.
+    saves_running: usize,
+    /// Whether the window is to finish closing once nothing it waits for runs.
+    finish_closing: bool,
+    /// Whether the window has begun to close for good: its working copy is let go of, and it
+    /// goes once that's done. It does so once.
+    closing_for_good: bool,
+    /// Where a test hears, in order, what a save and a close did.
+    order_log: Option<crate::working_copies::OrderLog>,
+    /// Whether it was asked to close again while copies it stopped hadn't ended, and closes
+    /// without waiting for them.
+    close_anyway: bool,
+    /// For tests: which kinds of background work are held back, and those held.
+    held_work: Option<HeldWork>,
     /// The wait before a status that only stays a while goes, while it's showing.
     status_fading: Option<Task<()>>,
     markdown_panel: Entity<MarkdownPanel>,
@@ -595,6 +687,19 @@ impl WorkspaceView {
             slide_editor,
             notices,
             status: None,
+            progressing: Vec::new(),
+            large_waiting: std::collections::VecDeque::new(),
+            large_copying: false,
+            recordings_waiting: std::collections::VecDeque::new(),
+            recording_checking: false,
+            said_after_large: None,
+            close_when_idle: false,
+            saves_running: 0,
+            finish_closing: false,
+            closing_for_good: false,
+            order_log: None,
+            close_anyway: false,
+            held_work: None,
             status_fading: None,
             markdown_panel,
             show_markdown: panels.markdown,
@@ -644,7 +749,17 @@ impl WorkspaceView {
             _start_asked: None,
         };
         view.always_build = view.is_always_built();
+        view.make_stills_aside(cx);
         view
+    }
+
+    /// Has the talk's videos' stills made, and its slide drawn again as each comes.
+    fn make_stills_aside(&mut self, cx: &mut Context<Self>) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        crate::video_player::make_stills(&document, cx);
+        cx.subscribe(&document, |this, _, _: &StillsTaken, cx| this.show_slide(cx)).detach();
     }
 
     pub fn document(&self) -> Option<&Entity<Document>> {
@@ -774,8 +889,13 @@ impl WorkspaceView {
         }
         self.notices = notices;
         if let Some(layers) = layers {
-            self.slide_canvas
-                .update(cx, |canvas, cx| canvas.set_layers(layers, cx));
+            let (videos, models, terminals) = document.update(cx, |document, _| (document.videos_here(), document.models_here(), document.terminals_here()));
+            self.slide_canvas.update(cx, |canvas, cx| {
+                canvas.set_layers(layers, cx);
+                canvas.place_videos(&videos, cx);
+                canvas.place_models(&models, cx);
+                canvas.place_recordings(&terminals, cx);
+            });
         }
         cx.notify();
     }
@@ -1001,6 +1121,12 @@ impl WorkspaceView {
         if running {
             return;
         }
+        // The show plays the talk's videos and turns its models: none does here meanwhile.
+        self.slide_editor.update(cx, |editor, cx| {
+            editor.stop_video(cx);
+            editor.stop_recording(cx);
+            editor.stop_turning(cx);
+        });
         let this = cx.entity().downgrade();
         // Once this window is free again, as the show asks it which screen it's on.
         cx.defer(move |cx| {
@@ -1029,6 +1155,196 @@ impl WorkspaceView {
             self.status_fading = None;
             cx.notify();
         }
+    }
+
+    /// Shows how far work that moves a large file has got on the status line, `doing` it, with a
+    /// Cancel, until [`Self::end_progress`]. What it gives is told how far it's got, and says when
+    /// to stop. Work that `stops_on_close` is stopped when the window closes, which waits for it
+    /// to end. While more than one runs, the newest is shown, saying how many there are.
+    pub(crate) fn start_progress(&mut self, doing: impl Into<SharedString>, stops_on_close: bool, cx: &mut Context<Self>) -> std::sync::Arc<Meter> {
+        let meter = std::sync::Arc::new(Meter::default());
+        let ticking = meter.clone();
+        let ticker = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(PROGRESS_TICK).await;
+                let going = this.update(cx, |this, cx| {
+                    cx.notify();
+                    this.progressing.iter().any(|progressing| std::sync::Arc::ptr_eq(&progressing.meter, &ticking))
+                });
+                if !matches!(going, Ok(true)) {
+                    break;
+                }
+            }
+        });
+        self.progressing.push(Progressing { doing: doing.into(), stops_on_close, meter: meter.clone(), _ticker: ticker });
+        cx.notify();
+        meter
+    }
+
+    /// The work `meter` is told of is done: the status line no longer shows it. If the window was
+    /// closed while it ran, and nothing it stopped runs any more, it closes now.
+    pub(crate) fn end_progress(&mut self, meter: &std::sync::Arc<Meter>, cx: &mut Context<Self>) {
+        self.progressing.retain(|progressing| !std::sync::Arc::ptr_eq(&progressing.meter, meter));
+        cx.notify();
+        self.closing_may_go_on(cx);
+        if self.close_when_idle && !self.stops_running() {
+            self.close_when_idle = false;
+            let (window, view) = (self.window_handle, cx.weak_entity());
+            cx.defer(move |cx| {
+                window
+                    .update(cx, |_, window, cx| {
+                        let closes = view.update(cx, |view, cx| view.should_close(window, cx)).unwrap_or(true);
+                        if closes {
+                            window.remove_window();
+                        }
+                    })
+                    .ok();
+            });
+        }
+    }
+
+    /// The work the status line shows: the newest not yet stopped, whose Cancel stops it, or else
+    /// the newest, while it stops.
+    fn progress_shown(&self) -> Option<&Progressing> {
+        let stopped = |progressing: &&Progressing| progressing.meter.stop.load(std::sync::atomic::Ordering::SeqCst);
+        self.progressing.iter().rev().find(|progressing| !stopped(progressing)).or(self.progressing.last())
+    }
+
+    /// Holds back saves, if `saves`, and copies into the talk, if `copies`, as they're started,
+    /// until [`Self::release_held_work_for_test`]: they count as running meanwhile. For tests,
+    /// whose background work otherwise runs to its end at once.
+    #[doc(hidden)]
+    pub fn hold_work_for_test(&mut self, saves: bool, copies: bool) {
+        self.held_work = Some(HeldWork { saves, copies, held: Vec::new() });
+    }
+
+    /// Starts the work held back, and holds back no more.
+    #[doc(hidden)]
+    pub fn release_held_work_for_test(&mut self, cx: &mut Context<Self>) {
+        for start in self.held_work.take().map(|held| held.held).unwrap_or_default() {
+            start(self, cx);
+        }
+    }
+
+    /// Starts `start`, background work that's a save if `save` and else a copy into the talk,
+    /// unless a test holds that kind back.
+    pub(crate) fn start_work(&mut self, save: bool, start: impl FnOnce(&mut Self, &mut Context<Self>) + 'static, cx: &mut Context<Self>) {
+        match &mut self.held_work {
+            Some(held) if (save && held.saves) || (!save && held.copies) => held.held.push(Box::new(start)),
+            _ => start(self, cx),
+        }
+    }
+
+    /// Whether the window closing has to wait: for a save running, which may be reading what the
+    /// working copy holds, and for copies it stopped, unless it was asked to close anyway.
+    pub(super) fn close_waits(&self) -> bool {
+        self.save_waits() || (self.stops_running() && !self.close_anyway)
+    }
+
+    /// Whether a save is running, or not yet taken in: the window closing waits for the talk to
+    /// be marked saved, as the order of a save is the write, then the talk marked saved, then the
+    /// working copy let go.
+    pub(super) fn save_waits(&self) -> bool {
+        self.saves_running > 0 || self.save_flow.is_saving()
+    }
+
+    /// Whether the window is closing: waiting to, or going. No save starts then.
+    pub(super) fn is_closing_window(&self) -> bool {
+        self.finish_closing || self.closing_for_good
+    }
+
+    /// Tells `log`, in order, when a save's write is done, the talk is marked saved, the working
+    /// copy is cleared as the window closes, and the window has closed. For tests.
+    #[doc(hidden)]
+    pub fn log_order_for_test(&mut self, log: crate::working_copies::OrderLog, cx: &mut Context<Self>) {
+        self.order_log = Some(log.clone());
+        self.working_copies.update(cx, |copies, _| copies.log_order_for_test(log));
+    }
+
+    /// Tells the test listening, if one is, that `what` has happened.
+    pub(super) fn log_order(&self, what: &'static str) {
+        if let Some(log) = &self.order_log {
+            log.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(what);
+        }
+    }
+
+    /// Finishes closing the window, if it's waiting to and nothing it waits for runs any more.
+    pub(super) fn closing_may_go_on(&mut self, cx: &mut Context<Self>) {
+        if self.finish_closing && !self.close_waits() {
+            self.finish_closing = false;
+            self.close_after_working_copies(cx);
+        }
+    }
+
+    /// Whether any work runs that the window closing stops.
+    fn stops_running(&self) -> bool {
+        self.progressing.iter().any(|progressing| progressing.stops_on_close)
+    }
+
+    /// Stops every copy running, as the window is closing, and closes it once they've ended: they
+    /// copy into a working copy the close may be about to clear. Whether any was running.
+    pub(super) fn stop_before_closing(&mut self) -> bool {
+        if !self.stops_running() {
+            return false;
+        }
+        if self.close_when_idle || self.finish_closing {
+            // Asked again while they stop: a copy blocked on a disk that went away may never get
+            // to its next stop. The window closes without them; what they've written is in files
+            // under names of their own beside where they'd go, which a copy that ends takes away,
+            // and the next start's sweep takes away with the slot otherwise.
+            self.close_anyway = true;
+            self.close_when_idle = false;
+            return false;
+        }
+        for progressing in self.progressing.iter().filter(|progressing| progressing.stops_on_close) {
+            progressing.meter.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.close_when_idle = true;
+        true
+    }
+
+    /// The status line while work that moves a large file goes on: what it's doing, how far it's
+    /// got as a bar and in words, and a Cancel.
+    fn progress_line(&self, progressing: &Progressing, cx: &Context<Self>) -> impl IntoElement + use<> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (done, total) = (progressing.meter.done.load(Relaxed), progressing.meter.total.load(Relaxed));
+        let stopping = progressing.meter.stop.load(std::sync::atomic::Ordering::SeqCst);
+        let mut words = if stopping { STOPPING.to_string() } else { crate::large_files::progress_words(&progressing.doing, done, total) };
+        if self.finish_closing && self.save_waits() {
+            words = format!("{CLOSING_AFTER_SAVE} {words}");
+        }
+        if self.progressing.len() > 1 {
+            words = format!("{words} · {} running", self.progressing.len());
+        }
+        let words: SharedString = words.into();
+        let fraction = if total == 0 { 0.0 } else { (done as f64 / total as f64).clamp(0.0, 1.0) as f32 };
+        let meter = progressing.meter.clone();
+        h_flex()
+            .id(PROGRESS_ID)
+            .test_support()
+            .aria_label(words.clone())
+            .w_full()
+            .gap_2()
+            .px_2()
+            .items_center()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(
+                div()
+                    .w(px(160.))
+                    .h(px(6.))
+                    .rounded_full()
+                    .bg(cx.theme().secondary)
+                    .child(div().h_full().rounded_full().bg(cx.theme().primary).w(relative(fraction))),
+            )
+            .child(div().truncate().child(words))
+            .child(
+                Button::new(CANCEL_PROGRESS_ID)
+                    .xsmall()
+                    .ghost()
+                    .label("Cancel")
+                    .on_click(move |_, _, _| meter.stop.store(true, std::sync::atomic::Ordering::SeqCst)),
+            )
     }
 
     /// Puts `status` on the status line until [`STATUS_FADE`] has passed, or the next edit.
@@ -1141,8 +1457,10 @@ impl WorkspaceView {
             Some(kind.extension()),
             EXPORTING,
             move |document| {
-                let input = document.export_input();
-                move |out: &Path| run_export(input, kind, out)
+                let (input, readers) = (document.export_input(), document.readers());
+                // After a save replacing the pack that's running, and keeping one from replacing
+                // it until it's done.
+                move |out: &Path| export::run_export_reading_with(input, kind, out, |make| readers.while_reading(make))
             },
             cx,
         );
@@ -1506,6 +1824,9 @@ impl Render for WorkspaceView {
                 this.clipboard(ClipboardOp::Paste, window, cx)
             }))
             .on_action(cx.listener(|this, _: &InsertPicture, window, cx| this.ask_for_pictures(window, cx)))
+            .on_action(cx.listener(|this, _: &InsertVideo, window, cx| this.ask_for_videos(window, cx)))
+            .on_action(cx.listener(|this, _: &InsertModel, window, cx| this.ask_for_models(window, cx)))
+            .on_action(cx.listener(|this, _: &InsertTerminal, window, cx| this.ask_for_recordings(window, cx)))
             .on_action(cx.listener(|this, action: &InsertShape, window, cx| {
                 this.insert_shape(action.kind, cx);
                 this.keyboard_to_the_slide(window, cx);
@@ -1565,12 +1886,13 @@ impl Render for WorkspaceView {
                     muted_text,
                 ))
             })
-            .map(|this| match self.status.clone() {
-                Some(status) => this.child(footer_line(STATUS_ID, status, muted_text)),
+            .map(|this| match (self.progress_shown(), self.status.clone()) {
+                (Some(progressing), _) => this.child(self.progress_line(progressing, cx)),
+                (None, Some(status)) => this.child(footer_line(STATUS_ID, status, muted_text)),
                 // The line keeps its room with nothing on it, so the slide stays put as what's
                 // said comes and goes, as it does with each click that selects a thing.
-                None if self.document.is_some() => this.child(blank_footer_line()),
-                None => this,
+                (None, None) if self.document.is_some() => this.child(blank_footer_line()),
+                (None, None) => this,
             })
             .into_any_element()
     }

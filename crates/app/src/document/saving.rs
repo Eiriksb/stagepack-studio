@@ -74,6 +74,10 @@ impl Document {
             self.files_to_write(),
             self.index_for_save(),
         )
+        .moving_large(self.moves_large())
+        // A pack holding a large file is opened again whatever the save wrote, so nothing goes on
+        // holding the one it replaced: that would keep its disk space, videos and all.
+        .reading_back(self.readers_were_let_go() || self.holds_large())
     }
 
     /// A save of the talk as it is now, somewhere new. For an untitled talk that's its first
@@ -87,6 +91,7 @@ impl Document {
             self.files_to_write(),
             self.index_for_save(),
         )
+        .moving_large(self.moves_large())
     }
 
     /// The builds entered in the talk's index with the files added to it, of builds its text
@@ -136,6 +141,8 @@ impl Document {
     /// Takes in a save that worked. The talk is saved if its text is still what was written,
     /// and after a Save As it's kept in the new place from now on.
     pub fn saved(&mut self, saved: Saved) {
+        self.readers_saved();
+        self.large_saved();
         // Part of the talk now, wherever it's kept.
         for path in &saved.files_written {
             self.pending.remove(path);
@@ -154,6 +161,7 @@ impl Document {
             self.own_files = files.clone();
             self.files = Arc::new(WithAdded::new(files, self.added.clone()));
             self.deck.set_files(Box::new(self.files.clone()));
+            self.follow_files();
             self.components_looked_at();
         }
         if let Some((place, files)) = saved.moved_to {
@@ -170,6 +178,7 @@ impl Document {
             self.own_files = files.clone();
             self.files = Arc::new(WithAdded::new(files, self.added.clone()));
             self.deck.set_files(Box::new(self.files.clone()));
+            self.follow_files();
             self.components_looked_at();
         }
         // Read from where the talk is kept from here on, as its own files are, so that a change
@@ -229,7 +238,7 @@ impl Document {
     pub fn export_input(&self) -> ExportInput {
         ExportInput {
             source: self.source().to_string(),
-            files: self.files.clone(),
+            files: self.files_for_export(),
             talk_fonts: self.talk_fonts.clone(),
         }
     }

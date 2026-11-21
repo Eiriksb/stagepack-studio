@@ -407,7 +407,7 @@ fn a_caret_past_what_the_talk_holds_goes_on_a_new_line() {
 
 /// The text each of `specs` draws, line by line.
 fn texts_in(specs: &[LayerSpec]) -> Vec<String> {
-    specs.iter().flat_map(|spec| &spec.items).filter_map(|item| match item {
+    specs.iter().flat_map(|spec| spec.items.iter()).filter_map(|item| match item {
         DisplayItem::Text { text, .. } => Some(text.buffer.layout_runs().map(|run| run.text.to_string()).collect::<Vec<_>>().join("\n")),
         _ => None,
     }).collect()

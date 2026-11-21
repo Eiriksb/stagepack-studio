@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// A tag's attributes, each its name and its value.
+type Attrs<'a> = &'a [(&'a str, &'a str)];
+
 impl Document {
     /// Puts a `name` tag with `attrs`, and `body` inside it if it's given, on the current slide,
     /// after its content and before its notes, as one step named `label`, and selects it. It's
@@ -31,29 +34,36 @@ impl Document {
         size: (f32, f32),
         body: Option<&str>,
     ) -> Result<Vec<usize>, EditRefused> {
+        self.insert_sized_on(self.current, label, name, (attrs, &[]), size, body)
+    }
+
+    /// [`Self::insert_sized`] on slide `slide`, which is shown then, as any edit shows its slide,
+    /// with `attrs` before the place and `after` behind it.
+    fn insert_sized_on(
+        &mut self,
+        slide: usize,
+        label: &'static str,
+        name: &str,
+        (attrs, after): (Attrs<'_>, Attrs<'_>),
+        size: (f32, f32),
+        body: Option<&str>,
+    ) -> Result<Vec<usize>, EditRefused> {
         // Where things are is worked out from the talk as tidied.
         let tidied = self.finish_before_edit()?;
-        let slide = self.current;
         let layout = self.text_layout(slide);
         let taken: Vec<(f32, f32)> = layout.elements().iter().map(|element| (element.rect.x, element.rect.y)).collect();
         let (x, y) = insert::place_for(size, &taken);
         let place = [insert::whole(x), insert::whole(y), insert::whole(size.0.max(1.0)), insert::whole(size.1.max(1.0))];
         let mut all: Vec<(&str, &str)> = attrs.to_vec();
         all.extend(["x", "y", "w", "h"].into_iter().zip(place.iter().map(String::as_str)));
+        all.extend_from_slice(after);
         let text = tag_text(&NewTag { name, attrs: &all, body }).ok_or(EditRefused::CouldNotBeMade)?;
-        self.insert_text(label, &text, tidied)
-    }
-
-    /// Writes `text`, one block, at the end of the current slide's content, as one step named
-    /// `label`, and selects it. `tidied` says whether finishing the typing first changed the
-    /// talk. Undone, it goes and nothing is selected; made again, it's selected again.
-    pub(super) fn insert_text(&mut self, label: &'static str, text: &str, tidied: bool) -> Result<Vec<usize>, EditRefused> {
-        self.insert_texts(label, &[text.to_string()], tidied, None)
+        self.insert_texts_on(slide, label, &[text], tidied, None)
     }
 
     /// Writes `texts`, each one block, at the end of the current slide's content, in order, as
-    /// one step named `label`, and selects them, as [`Self::insert_text`] does one. Undone,
-    /// `before` is selected again.
+    /// one step named `label`, and selects them. Undone, they go and `before` is selected again;
+    /// made again, they're selected again.
     pub(super) fn insert_texts(
         &mut self,
         label: &'static str,
@@ -61,7 +71,18 @@ impl Document {
         tidied: bool,
         before: Option<selection::Selection>,
     ) -> Result<Vec<usize>, EditRefused> {
-        let slide = self.current;
+        self.insert_texts_on(self.current, label, texts, tidied, before)
+    }
+
+    /// [`Self::insert_texts`] on slide `slide`, which is shown then, as any edit shows its slide.
+    fn insert_texts_on(
+        &mut self,
+        slide: usize,
+        label: &'static str,
+        texts: &[String],
+        tidied: bool,
+        before: Option<selection::Selection>,
+    ) -> Result<Vec<usize>, EditRefused> {
         let (change, sources) = built(self.talk(), |talk| inserted(talk, slide, texts))?.ok_or(EditRefused::CouldNotBeMade)?;
         let depth = self.history.depth();
         let mut changed = self.make(label, change, Holds::Slide(slide), slide, slide, None)?;
@@ -176,6 +197,59 @@ impl Document {
     pub fn insert_picture(&mut self, suggested: &str, bytes: Vec<u8>) -> Result<(), InsertFailed> {
         let path = self.add_file(FileKind::Picture, suggested, bytes).map_err(InsertFailed::File)?;
         self.insert_tag(INSERT_PICTURE, "Picture", &[("src", &path)], None).map_err(InsertFailed::Edit)?;
+        Ok(())
+    }
+
+    /// Puts the video `name`, a file of the talk's, `size` pixels big, on the current slide as
+    /// [`Self::insert_sized`] does, as one step named "Insert video": its own shape, made smaller
+    /// to fit in 960 by 540.
+    pub fn insert_video(&mut self, name: String, size: (u32, u32)) -> Result<Vec<usize>, EditRefused> {
+        self.insert_video_on(self.current, name, size)
+    }
+
+    /// [`Self::insert_video`] on slide `slide`, as when it was asked for there and the copy ended
+    /// after another was shown: that slide is shown again, as any edit shows its slide, with the
+    /// video selected. A slide that's gone since is the one shown.
+    pub fn insert_video_on(&mut self, slide: usize, name: String, size: (u32, u32)) -> Result<Vec<usize>, EditRefused> {
+        let slide = if slide < self.talk().slides.len() { slide } else { self.current };
+        self.insert_sized_on(slide, INSERT_VIDEO, "Video", (&[("src", &name)], &[]), insert::video_size(size), None)
+    }
+
+    /// Puts the 3D model `name`, a file of the talk's, on the current slide as
+    /// [`Self::insert_sized`] does, as one step named "Insert 3D model": [`insert::MODEL_SIZE`]
+    /// big, seen from `view`, written after its place, if it's given.
+    pub fn insert_model(&mut self, name: String, view: Option<slides_model::View>) -> Result<Vec<usize>, EditRefused> {
+        self.insert_model_on(self.current, name, view)
+    }
+
+    /// [`Self::insert_model`] on slide `slide`, as when it was asked for there and the copy ended
+    /// after another was shown: that slide is shown again, with the model selected. A slide
+    /// that's gone since is the one shown.
+    pub fn insert_model_on(&mut self, slide: usize, name: String, view: Option<slides_model::View>) -> Result<Vec<usize>, EditRefused> {
+        let slide = if slide < self.talk().slides.len() { slide } else { self.current };
+        let view = view.map(|view| insert::written_view(view).to_string());
+        let after: Vec<(&str, &str)> = view.iter().map(|view| ("view", view.as_str())).collect();
+        self.insert_sized_on(slide, INSERT_MODEL, "Model", (&[("src", &name)], &after), insert::MODEL_SIZE, None)
+    }
+
+    /// Adds `bytes`, a terminal recording whose screen is `screen`, its columns and rows, to the
+    /// talk as a file named as like `suggested` as is safe, and puts it on the current slide as
+    /// [`Self::insert_sized`] does, as one step named "Insert terminal recording": its screen at
+    /// its own size, made smaller to fit the slide. A recording the talk has already is that one.
+    /// Whether it can be played is for the caller to have found, off the window's thread: here
+    /// it's only refused if it doesn't start as a recording does.
+    pub fn insert_terminal(&mut self, suggested: &str, bytes: Vec<u8>, screen: (u16, u16)) -> Result<(), InsertFailed> {
+        self.insert_terminal_on(self.current, suggested, bytes, screen)
+    }
+
+    /// [`Self::insert_terminal`] on slide `slide`, as when it was asked for there and was looked
+    /// at after another was shown: that slide is shown again, with the recording selected. A
+    /// slide that's gone since is the one shown.
+    pub fn insert_terminal_on(&mut self, slide: usize, suggested: &str, bytes: Vec<u8>, screen: (u16, u16)) -> Result<(), InsertFailed> {
+        let slide = if slide < self.talk().slides.len() { slide } else { self.current };
+        let path = self.add_file(FileKind::Recording, suggested, bytes).map_err(InsertFailed::File)?;
+        self.insert_sized_on(slide, INSERT_TERMINAL, "Terminal", (&[("src", &path)], &[]), insert::terminal_size(screen), None)
+            .map_err(InsertFailed::Edit)?;
         Ok(())
     }
 

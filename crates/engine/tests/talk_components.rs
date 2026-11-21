@@ -192,7 +192,7 @@ fn open_with(files: &Files, registry: Registry) -> Deck {
 fn texts(deck: &mut Deck, index: usize) -> Vec<String> {
     let mut lines = Vec::new();
     for spec in deck.specs(index) {
-        for item in &spec.items {
+        for item in spec.items.iter() {
             if let DisplayItem::Text { text, .. } = item {
                 lines.extend(text.buffer.lines.iter().map(|line| line.text().trim_end().to_string()));
             }
@@ -206,7 +206,7 @@ fn shows(deck: &mut Deck, index: usize, wanted: &str) -> bool {
 }
 
 fn dashed_outlines(deck: &mut Deck, index: usize) -> usize {
-    deck.specs(index).iter().flat_map(|spec| &spec.items).filter(|item| matches!(item, DisplayItem::Stroke { .. })).count()
+    deck.specs(index).iter().flat_map(|spec| spec.items.iter()).filter(|item| matches!(item, DisplayItem::Stroke { .. })).count()
 }
 
 fn info(deck: &Deck, tag: &str) -> ComponentInfo {
@@ -970,7 +970,7 @@ fn the_components_available_are_the_built_ins_and_the_talks_own() {
     let files = talk_with_hello("<Hello />\n", answering("Hello", &text_answer("Hi")));
     files.put("components/apple.rs", source("Apple"));
     let deck = open(&files);
-    assert_eq!(deck.available_components(), ["Apple", "Box", "Chart", "Hello", "Icon", "Picture", "Shape"]);
+    assert_eq!(deck.available_components(), ["Apple", "Box", "Chart", "Hello", "Icon", "Model", "Picture", "Shape", "Terminal", "Video"]);
 }
 
 // What a click on a placed component lands on.

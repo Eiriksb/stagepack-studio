@@ -4,7 +4,7 @@ use slides_format::{Block, DEFAULT_LAYOUT, FlowPlace, Slide, Tag, Talk, Target};
 use tiny_skia::PathBuilder;
 use toolkit::{Color, Registry, Theme};
 
-use crate::elements::lay_out_positioned_tag;
+use crate::elements::{MODEL_TAG, MOST_VIEWS, VIDEO_TAG, lay_out_positioned_tag, model_view, model_views};
 use crate::flow::{MAX_NOTICE_CHARS, flow_region, flow_region_each};
 use slides_components::shortened;
 use crate::timeline::{MAX_CLICK, RegionClick, read_region_timing, read_tag_timing, read_transition};
@@ -13,8 +13,9 @@ use crate::placeholder::placeholder_items;
 use crate::text_geometry::{LayerText, RegionBox};
 use crate::{
     Align, ComponentAsks, DisplayItem, Enter, Fonts, LayerSpec, LayoutDef, Moment, Notice, PictureCache, Rect, RegionDef, TalkComponents, TalkFiles, TextRun,
-    Transition, layout_by_name, shape_text,
+    Transition, VideoOn, ModelOn, TerminalOn, layout_by_name, shape_text,
 };
+use crate::terminal_screen::{LaidTerminal, TERMINAL_TAG, lay_out_terminal};
 
 /// How wide and high a slide is, in slide units.
 pub const SLIDE_WIDTH: f32 = 1920.0;
@@ -230,13 +231,16 @@ pub(crate) fn layout_slide_placed(talk: &Talk, index: usize, env: &mut LayoutEnv
                             source: Some(piece.source),
                             rect,
                             rotate: 0.0,
-                            items: piece.items,
+                            items: piece.items.into(),
                             click: Some((step as u32 + 1).min(MAX_CLICK)),
                             enter: timing.enter,
                             native: piece.native,
                             // A slide has one title, so only the first piece is it.
                             is_title: is_title && step == 0,
                             varies,
+                            video: None,
+                            model: None,
+                            terminal: None,
                         });
                         texts.push(LayerText { region: Some((region.name, rect)), ..piece.text });
                     }
@@ -247,7 +251,7 @@ pub(crate) fn layout_slide_placed(talk: &Talk, index: usize, env: &mut LayoutEnv
         }
         let (drawing, varies) = noting_asks(env, |env| flow_region(blocks, region, rect.w, &theme, env, &mut notices));
         let (items, native) = (drawing.items, drawing.native);
-        layers.push(LayerSpec { source: Some(source), rect, rotate, items, click, enter: timing.enter, native, is_title, varies });
+        layers.push(LayerSpec { source: Some(source), rect, rotate, items: items.into(), click, enter: timing.enter, native, is_title, varies, video: None, model: None, terminal: None });
         texts.push(LayerText { region: Some((region.name, rect)), ..drawing.text });
     }
     for block in &slide.blocks {
@@ -348,24 +352,118 @@ fn positioned_layer(tag: &Tag, placing: Option<&Placing>, theme: &Theme, env: &m
         place.h = held(rect.h, place.h, 0.0, MAX_SIZE);
         place.rotate = held(*rotate, place.rotate, -MAX_ROTATION, MAX_ROTATION);
     }
-    for notice in place.notices {
+    for notice in std::mem::take(&mut place.notices) {
         if !notices.contains(&notice) {
             notices.push(notice);
         }
     }
+    if tag.name == TERMINAL_TAG {
+        return (terminal_layer(tag, &place, placing.is_some(), theme, env, notices), LayerText::default());
+    }
     let ((w, h), drawing) = lay_out_positioned_tag(tag, (place.w, place.h), place.align, theme, env, notices);
+    let rect = Rect { x: place.x.unwrap_or(0.0), y: place.y.unwrap_or(0.0), w, h };
+    let rotate = place.rotate.unwrap_or(0.0);
+    let video = (tag.name == VIDEO_TAG).then(|| VideoOn {
+        src: tag.attr("src").unwrap_or_default().trim().to_string(),
+        looped: read_loop(tag.attr("loop"), notices),
+        rect,
+        rotate,
+    });
+    let model = (tag.name == MODEL_TAG).then(|| {
+        let (views, left_out) = model_views(tag.attr("views"));
+        if left_out {
+            add_notice(notices, format!("Some of this 3D model's views can't be read, or there are more than {MOST_VIEWS}, so they're left out"));
+        }
+        ModelOn {
+            src: tag.attr("src").unwrap_or_default().trim().to_string(),
+            turn: read_turn(tag.attr("turn"), notices),
+            view: model_view(tag.attr("view")).ok().flatten(),
+            views,
+            rect,
+            rotate,
+        }
+    });
     let layer = LayerSpec {
         source: Some(tag.range.clone()),
-        rect: Rect { x: place.x.unwrap_or(0.0), y: place.y.unwrap_or(0.0), w, h },
-        rotate: place.rotate.unwrap_or(0.0),
-        items: drawing.items,
+        rect,
+        rotate,
+        items: drawing.items.into(),
         click: place.click,
         enter: place.enter,
         native: drawing.native,
         is_title: false,
         varies: false,
+        video,
+        model,
+        terminal: None,
     };
     (layer, drawing.text)
+}
+
+/// The layer of a terminal recording placed at `place`: its last screen, which it plays over
+/// when asked. It's drawn by the engine alone, so it has nothing of its own for export, which
+/// takes it as a picture of its screen.
+fn terminal_layer(tag: &Tag, place: &TagPlace, placing: bool, theme: &Theme, env: &mut LayoutEnv, notices: &mut Vec<Notice>) -> LayerSpec {
+    let LaidTerminal { size: (w, h), items, stops, problem, pending } = lay_out_terminal(tag, (place.w, place.h), placing, theme, env);
+    if let Some(problem) = problem {
+        add_notice(notices, problem);
+    }
+    let rect = Rect { x: place.x.unwrap_or(0.0), y: place.y.unwrap_or(0.0), w, h };
+    let rotate = place.rotate.unwrap_or(0.0);
+    let src = tag.attr("src").unwrap_or_default().trim().to_string();
+    LayerSpec {
+        source: Some(tag.range.clone()),
+        rect,
+        rotate,
+        items,
+        click: place.click,
+        enter: place.enter,
+        native: Vec::new(),
+        is_title: false,
+        varies: false,
+        video: None,
+        model: None,
+        terminal: Some(TerminalOn { src, rect, rotate, stops, pending }),
+    }
+}
+
+/// Adds `text` to `notices`, shortened, unless it's there already.
+fn add_notice(notices: &mut Vec<Notice>, text: String) {
+    let notice = Notice(shortened(&text, MAX_NOTICE_CHARS));
+    if !notices.contains(&notice) {
+        notices.push(notice);
+    }
+}
+
+/// Whether a model's `turn` says to turn slowly on its own: `auto`. Left out, it stays still,
+/// and anything else says it stays still and is a notice.
+fn read_turn(value: Option<&str>, notices: &mut Vec<Notice>) -> bool {
+    let Some(value) = value else { return false };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => true,
+        "" | "none" | "no" => false,
+        _ => {
+            add_notice(notices, format!("A 3D model's turn can be auto, or left out to stay still, not {value}, so it stays still"));
+            false
+        }
+    }
+}
+
+/// Whether a video's `loop` says to go round again: written bare, or as `true`, `yes` or `1`.
+/// `false`, `no` and `0` say not to, and anything else says not to and is a notice.
+fn read_loop(value: Option<&str>, notices: &mut Vec<Notice>) -> bool {
+    let Some(value) = value else { return false };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "true" | "yes" | "1" => true,
+        "false" | "no" | "0" => false,
+        _ => {
+            let notice = Notice(shortened(&format!("A video's loop can be yes or no, not {value}, so it plays once"), MAX_NOTICE_CHARS));
+            if !notices.contains(&notice) {
+                notices.push(notice);
+            }
+            false
+        }
+    }
 }
 
 /// Whether the text of any of `blocks`, at any depth, has an inline `<Text>` tag that asks for
@@ -523,12 +621,15 @@ pub(crate) fn empty_region_layer(region: &EmptyRegion, theme: &Theme, fonts: &mu
         source: None,
         rect: region.rect,
         rotate: region.rotate,
-        items,
+        items: items.into(),
         click: None,
         enter: Enter::Appear,
         native: Vec::new(),
         is_title: false,
         varies: false,
+        video: None,
+        model: None,
+        terminal: None,
     }
 }
 
@@ -539,12 +640,15 @@ fn error_layer(slide: &Slide, message: &str, theme: &Theme, fonts: &mut Fonts) -
         source: Some(slide.range.clone()),
         rect,
         rotate: 0.0,
-        items: placeholder_items(message, rect, theme, fonts),
+        items: placeholder_items(message, rect, theme, fonts).into(),
         click: None,
         enter: Enter::Appear,
         native: vec![placeholder_element(message, rect, theme)],
         is_title: false,
         varies: false,
+        video: None,
+        model: None,
+        terminal: None,
     }
 }
 
@@ -630,12 +734,15 @@ fn background(theme: &Theme) -> LayerSpec {
         source: None,
         rect: Rect { x: 0.0, y: 0.0, w: SLIDE_WIDTH, h: SLIDE_HEIGHT },
         rotate: 0.0,
-        items: vec![DisplayItem::Fill { path: PathBuilder::from_rect(area), color: theme.background }],
+        items: vec![DisplayItem::Fill { path: PathBuilder::from_rect(area), color: theme.background }].into(),
         click: None,
         enter: Enter::Appear,
         native: Vec::new(),
         is_title: false,
         varies: false,
+        video: None,
+        model: None,
+        terminal: None,
     }
 }
 

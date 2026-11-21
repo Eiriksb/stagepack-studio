@@ -21,7 +21,7 @@ use stagepack_studio::permissions::BuildPermissions;
 use stagepack_studio::recovery::{NotTaken, Recovery};
 use stagepack_studio::ribbon::SAVE_ID;
 use stagepack_studio::workspace_view::{
-    BUILD_ALWAYS_ID, CLOSE_DONT_SAVE_ID, CLOSE_SAVE_ID, ExportPdf, ExportPowerPoint, SAVE_AS_CANCEL_ID, SAVE_AS_FOLDER_ID,
+    BUILD_ALWAYS_ID, CLOSE_CANCEL_ID, CLOSE_DONT_SAVE_ID, CLOSE_SAVE_ID, ExportPdf, ExportPowerPoint, SAVE_AS_CANCEL_ID, SAVE_AS_FOLDER_ID,
     SAVE_AS_PACKED_ID, Save, TITLE_ID,
 };
 
@@ -711,4 +711,49 @@ fn an_older_copy_left_by_a_crash_goes_with_the_one_brought_back(cx: &mut TestApp
         assert_eq!(recovery.untitled(), (Vec::new(), 0), "saves {saves}: nothing is listed again");
         assert_eq!(recovery.take_untitled(id).unwrap_err(), NotTaken::Gone, "saves {saves}");
     }
+}
+
+#[gpui_kit::test]
+fn a_place_chosen_after_dont_save_saves_nothing(cx: &mut TestAppContext) {
+    let (typing, places) = open_untitled(cx, "light");
+    add_slide(&typing, cx);
+    // Save As's place is being chosen as the window is closed without saving.
+    typing.press(cx, "ctrl-s");
+    click_in(cx, typing.handle, SAVE_AS_PACKED_ID);
+    assert!(cx.did_prompt_for_new_path());
+    let handle = typing.handle;
+    let out = places.documents.join("Declined.sptx");
+    assert!(!VisualTestContext::from_window(handle, cx).simulate_close());
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(CLOSE_DONT_SAVE_ID, cx);
+    })
+    .unwrap();
+    // And then a place is picked.
+    let chosen = out.clone();
+    cx.simulate_new_path_selection(move |_| Some(chosen));
+    cx.run_until_parked();
+    assert!(!out.exists(), "the edits not kept weren't saved");
+    assert!(!is_open(cx, handle));
+}
+
+#[gpui_kit::test]
+fn cancelling_a_close_while_a_save_runs_keeps_the_window_open(cx: &mut TestAppContext) {
+    let typing = open(cx, "# One\n");
+    let handle = typing.handle;
+    // Saved with nothing unsaved, and closed as it writes: the window waits for it.
+    cx.update_window(handle, |_, window, cx| window.dispatch_action(Box::new(Save), cx)).unwrap();
+    assert!(!VisualTestContext::from_window(handle, cx).simulate_close(), "not while it writes");
+    // Then edited, and closed again, and that close cancelled.
+    typing.with_window(cx, |window, cx| window.press("ctrl-m", cx));
+    assert!(!VisualTestContext::from_window(handle, cx).simulate_close());
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(CLOSE_CANCEL_ID, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(is_open(cx, handle), "the window stays open");
+    assert_eq!(std::fs::read_to_string(&typing.file).unwrap(), "# One\n", "and the edit unsaved");
+    assert!(typing.document(cx).read_with(cx, |document, _| document.has_unsaved_changes()));
 }

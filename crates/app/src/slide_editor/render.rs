@@ -42,6 +42,35 @@ impl Render for SlideEditor {
             Some((name, outline_corners(area.rect, area.rotate)))
         });
         let selecting = !outlines.is_empty() && !self.is_editing(cx);
+        // A video selected: a button in its middle that plays it, or stops it while it plays.
+        let video = match (selecting, self.document.clone()) {
+            (true, Some(document)) => document.update(cx, |document, _| document.selected_video()),
+            _ => None,
+        };
+        let video_playing = video.is_some() && self.video_playing(cx);
+        // A model selected: a button in its middle that has it turned by hand, and while it is,
+        // buttons that write the view shown into the talk and go back to its still. One whose
+        // still says it can't be drawn has no Turn.
+        let (model, cant_draw) = match (selecting, self.document.clone()) {
+            (true, Some(document)) => document.update(cx, |document, _| {
+                let model = document.selected_model();
+                let cant_draw = model.is_some() && document.selected_model_said().is_some();
+                (model, cant_draw)
+            }),
+            _ => (None, false),
+        };
+        let model_turning = model.is_some() && self.model_turning();
+        // A terminal recording selected that can be played: a button in its middle that plays it,
+        // or stops it while it plays.
+        let (terminal, terminal_selected) = match (selecting, self.document.clone()) {
+            (true, Some(document)) => document.update(cx, |document, _| {
+                let terminal = document.selected_terminal();
+                let selected = terminal.is_some();
+                (terminal.filter(|_| document.selected_terminal_plays()), selected)
+            }),
+            _ => (None, false),
+        };
+        let terminal_playing = terminal.is_some() && self.recording_playing(cx);
         // The lines what's dragged snaps to, while the button is down.
         let guides = self.guides().to_vec();
         // A thing being dragged out of the slide's text: a dashed line where it'll go.
@@ -137,6 +166,24 @@ impl Render for SlideEditor {
         painted.guides = shown(!guides.is_empty(), outline_color).or(painted.guides);
         painted.badge = shown(!badges.is_empty(), badge_color).or(painted.badge);
         painted.badge_words = shown(!badges.is_empty(), badge_text).or(painted.badge_words);
+        let video_button = video.as_ref().zip(placed).map(|(video, (slide, area))| {
+            let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
+            let rect = video.on.rect;
+            let middle = slide.origin + point(px((rect.x + rect.w / 2.) * unit), px((rect.y + rect.h / 2.) * unit));
+            in_editor(Bounds { origin: middle, size: size(px(0.), px(0.)) }, area).origin
+        });
+        let terminal_button = terminal.as_ref().zip(placed).map(|(terminal, (slide, area))| {
+            let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
+            let rect = terminal.on.rect;
+            let middle = slide.origin + point(px((rect.x + rect.w / 2.) * unit), px((rect.y + rect.h / 2.) * unit));
+            in_editor(Bounds { origin: middle, size: size(px(0.), px(0.)) }, area).origin
+        });
+        let model_button = model.as_ref().zip(placed).map(|(model, (slide, area))| {
+            let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
+            let rect = model.on.rect;
+            let middle = slide.origin + point(px((rect.x + rect.w / 2.) * unit), px((rect.y + rect.h / 2.) * unit));
+            in_editor(Bounds { origin: middle, size: size(px(0.), px(0.)) }, area).origin
+        });
         let lift_box = lift_outline.as_ref().and_then(|corners| Some((SharedString::from(LIFT_OUTLINE_ID), boxed(corners)?)));
         let frame_box = frame.as_ref().and_then(|(name, corners)| Some((SharedString::from(region_frame_id(name)), boxed(corners)?)));
         // Where the new box is in the editor, for whoever looks for it.
@@ -258,10 +305,28 @@ impl Render for SlideEditor {
         )
         .absolute()
         .size_full();
+        let key_context = match (selecting, video.is_some(), model.is_some()) {
+            (true, true, _) => format!("{SELECTION_CONTEXT} {VIDEO_CONTEXT}"),
+            (true, _, true) => format!("{SELECTION_CONTEXT} {MODEL_CONTEXT}"),
+            (true, false, false) if terminal_selected => format!("{SELECTION_CONTEXT} {TERMINAL_CONTEXT}"),
+            (true, false, false) => SELECTION_CONTEXT.to_string(),
+            (false, _, _) => EDITOR_CONTEXT.to_string(),
+        };
+        // The buttons on a model: Turn, or Set view and Done while it's turned, each with where
+        // its middle is from the model's.
+        let model_buttons: Vec<(&'static str, &'static str, f32)> =
+            if model_turning {
+                vec![(MODEL_SET_VIEW_ID, "Set view", -44.), (MODEL_DONE_ID, "Done", 44.)]
+            } else if cant_draw {
+                Vec::new()
+            } else {
+                vec![(MODEL_TURN_ID, "Turn", 0.)]
+            };
+        let (button_color, button_text) = (cx.theme().primary, cx.theme().primary_foreground);
         div()
             .id(SLIDE_EDITOR_ID)
             .test_support()
-            .key_context(if selecting { SELECTION_CONTEXT } else { EDITOR_CONTEXT })
+            .key_context(key_context.as_str())
             .track_focus(&self.focus_handle)
             .absolute()
             .size_full()
@@ -359,6 +424,16 @@ impl Render for SlideEditor {
             }))
             .on_action(cx.listener(|this, _: &DuplicateSelected, _, cx| this.duplicate(cx)))
             .on_action(cx.listener(|this, _: &SelectAllThings, window, cx| this.select_all_things(window, cx)))
+            .on_action(cx.listener(|this, _: &PlayOrStopVideo, _, cx| this.play_or_stop(cx)))
+            .on_action(cx.listener(|this, _: &TurnOrStopModel, _, cx| this.turn_or_stop(cx)))
+            .on_action(cx.listener(|this, _: &PlayOrStopRecording, _, cx| this.play_or_stop_recording(cx)))
+            // The wheel over a model being turned brings it nearer, or takes it further away.
+            .on_scroll(cx.listener(|this, event: &ScrollEvent, window, cx| {
+                let steps = f32::from(event.delta.pixel_delta(window.line_height()).y) / f32::from(window.line_height());
+                if steps != 0.0 && this.wheel_turning(event.position, steps, cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .on_action(cx.listener(|this, _: &ToggleBold, _, cx| {
                 this.format(|edit| edit.toggle(StyleBit::Bold), cx)
             }))
@@ -397,6 +472,110 @@ impl Render for SlideEditor {
                     .w(bounds.size.width)
                     .h(bounds.size.height)
             }))
+            .when_some(video_button, |this, middle| {
+                let (id, label) = if video_playing { (VIDEO_STOP_ID, "Stop") } else { (VIDEO_PLAY_ID, "Play") };
+                this.child(
+                    div()
+                        .absolute()
+                        .left(middle.x)
+                        .top(middle.y)
+                        .child(
+                            div()
+                                .id(id)
+                                .test_support()
+                                .aria_label(label)
+                                .absolute()
+                                // Its middle at the video's.
+                                .left(px(-32.))
+                                .top(px(-16.))
+                                .w(px(64.))
+                                .h(px(32.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_md()
+                                .bg(button_color)
+                                .text_color(button_text)
+                                .text_sm()
+                                .cursor_pointer()
+                                // The press is the button's, not the slide's beneath it.
+                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.play_or_stop(cx);
+                                }))
+                                .child(label),
+                        ),
+                )
+            })
+            .when_some(terminal_button, |this, middle| {
+                let (id, label) = if terminal_playing { (TERMINAL_STOP_ID, "Stop") } else { (TERMINAL_PLAY_ID, "Play") };
+                this.child(
+                    div()
+                        .absolute()
+                        .left(middle.x)
+                        .top(middle.y)
+                        .child(
+                            div()
+                                .id(id)
+                                .test_support()
+                                .aria_label(label)
+                                .absolute()
+                                // Its middle at the recording's.
+                                .left(px(-32.))
+                                .top(px(-16.))
+                                .w(px(64.))
+                                .h(px(32.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_md()
+                                .bg(button_color)
+                                .text_color(button_text)
+                                .text_sm()
+                                .cursor_pointer()
+                                // The press is the button's, not the slide's beneath it.
+                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.play_or_stop_recording(cx);
+                                }))
+                                .child(label),
+                        ),
+                )
+            })
+            .when_some(model_button, |this, middle| {
+                this.children(model_buttons.into_iter().map(|(id, label, across)| {
+                    div().absolute().left(middle.x).top(middle.y).child(
+                        div()
+                            .id(id)
+                            .test_support()
+                            .aria_label(label)
+                            .absolute()
+                            // Its middle `across` from the model's.
+                            .left(px(across - 40.))
+                            .top(px(-16.))
+                            .w(px(80.))
+                            .h(px(32.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .bg(button_color)
+                            .text_color(button_text)
+                            .text_sm()
+                            .cursor_pointer()
+                            // The press is the button's, not the slide's beneath it.
+                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                if id == MODEL_SET_VIEW_ID {
+                                    this.set_view(cx);
+                                } else {
+                                    this.turn_or_stop(cx);
+                                }
+                            }))
+                            .child(label),
+                    )
+                }))
+            })
             .children(badges.into_iter().map(|(id, corner, words)| {
                 div()
                     .id(id)

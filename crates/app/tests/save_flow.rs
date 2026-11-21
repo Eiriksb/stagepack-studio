@@ -429,3 +429,58 @@ fn a_first_save_that_fails_starts_nothing_after_it() {
         ],
     );
 }
+
+#[test]
+fn dont_save_while_a_place_is_chosen_lets_the_choosing_go() {
+    let mut flow = SaveFlow::default();
+    assert_eq!(flow.ask_save_untitled(), vec![AskWhereToSave]);
+    assert_eq!(flow.ask_close(true), vec![AskBeforeClosing]);
+    assert_eq!(flow.answer_close_untitled(CloseAnswer::DontSave), vec![LetGo, Close]);
+    assert_eq!(flow, SaveFlow::Idle, "nothing waits on the place");
+    check(
+        "a place chosen after",
+        &[
+            (SaveUntitled, vec![AskWhereToSave]),
+            (CloseAsked { unsaved: true }, vec![AskBeforeClosing]),
+            (AnswerUntitled(CloseAnswer::DontSave), vec![LetGo, Close]),
+            // Not said to be left open: it closed.
+            (NotChosen, vec![]),
+        ],
+    );
+}
+
+#[test]
+fn cancelling_a_close_while_a_save_runs_keeps_the_window_open() {
+    check(
+        "closed with nothing unsaved, edited, and closed again",
+        &[
+            (Save, vec![StartSave]),
+            (CloseAsked { unsaved: false }, vec![]),
+            (CloseAsked { unsaved: true }, vec![AskBeforeClosing]),
+            (Answer(CloseAnswer::Cancel), vec![]),
+            // The edits stay unsaved, and the window open.
+            (saved(true), vec![]),
+        ],
+    );
+    check(
+        "close and save, then cancelled",
+        &[
+            (CloseAsked { unsaved: true }, vec![AskBeforeClosing]),
+            (Answer(CloseAnswer::Save), vec![StartSave]),
+            (CloseAsked { unsaved: true }, vec![AskBeforeClosing]),
+            (Answer(CloseAnswer::Cancel), vec![]),
+            (saved(false), vec![]),
+        ],
+    );
+    check(
+        "close and save on an untitled talk, then cancelled as the place is chosen",
+        &[
+            (CloseAsked { unsaved: true }, vec![AskBeforeClosing]),
+            (AnswerUntitled(CloseAnswer::Save), vec![AskWhereToSave]),
+            (CloseAsked { unsaved: true }, vec![AskBeforeClosing]),
+            (AnswerUntitled(CloseAnswer::Cancel), vec![]),
+            (Chosen { first: true }, vec![StartSave]),
+            (saved(false), vec![]),
+        ],
+    );
+}

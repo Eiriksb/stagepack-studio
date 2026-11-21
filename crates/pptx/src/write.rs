@@ -13,7 +13,7 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use tiny_skia::Pixmap;
-use slides_engine::{Deck, Fonts, LayerSpec, NativeContent, NativeElement, NativeParagraph, Rect, TalkFiles};
+use slides_engine::{Deck, Fonts, LayerSpec, NativeContent, NativeElement, NativeParagraph, Rect, TalkFiles, render_layer};
 
 use crate::eot::eot_from_ttf;
 use crate::master::{Geometry, LayoutId, layout_defs, layout_xml, master_xml};
@@ -36,6 +36,12 @@ const THEME: &str = "/ppt/theme/theme1.xml";
 const NOTES_THEME: &str = "/ppt/theme/theme2.xml";
 const NOTES_MASTER: &str = "/ppt/notesMasters/notesMaster1.xml";
 const LANG: &str = "en-US";
+/// What a terminal recording's picture is described as, for screen readers.
+const TERMINAL_ALT: &str = "Terminal recording";
+/// The longest edge a terminal recording's picture is drawn at, and the most pixels it's drawn
+/// at for each slide unit.
+const TERMINAL_EDGE: f32 = 3840.0;
+const TERMINAL_SCALE: f32 = 2.0;
 
 /// Slides are 1920 by 1080 units, and a unit is 1/144 inch.
 const SLIDE_WIDTH_IN: f64 = 1920.0 / 144.0;
@@ -178,6 +184,22 @@ impl SlideEnv<'_> {
             }
         }
     }
+}
+
+/// The layers of slide `index` that are terminal recordings, each drawn as the picture
+/// PowerPoint gets of it, by the place of its layer: its last screen, or its panel. It's drawn
+/// as it stands, the layer turning it as it turns anything else.
+fn terminal_pictures(deck: &mut Deck, index: usize) -> Vec<(usize, NativeElement)> {
+    let (specs, fonts, _) = deck.specs_fonts_and_files(index);
+    let mut pictures = Vec::new();
+    for (at, spec) in specs.iter().enumerate().filter(|(_, spec)| spec.terminal.is_some()) {
+        let rect = Rect { x: 0.0, y: 0.0, ..spec.rect };
+        let standing = LayerSpec { rect, rotate: 0.0, ..spec.clone() };
+        let scale = (TERMINAL_EDGE / rect.w.max(rect.h).max(1.0)).min(TERMINAL_SCALE);
+        let pixmap = render_layer(&standing, scale, fonts).pixmap;
+        pictures.push((at, NativeElement { rect, content: NativeContent::Picture { src: None, alt: TERMINAL_ALT.to_string(), pixmap } }));
+    }
+    pictures
 }
 
 /// The links of the slide that aren't written, each once.
@@ -349,6 +371,7 @@ pub fn write_pptx(deck: &mut Deck, files: &dyn TalkFiles) -> Result<PptxOutput, 
                 .into_iter()
                 .map(|tag| format!("Slide {}: {tag} changes as the talk plays, so PowerPoint shows it in its last state", index + 1)),
         );
+        let screens = terminal_pictures(deck, index);
         let specs = deck.specs(index);
         notices.extend(left_out_links(specs).into_iter().map(|url| format!("Slide {}: the link {url:?} was left out: only http, https and mailto links are kept", index + 1)));
         let part = format!("/ppt/slides/slide{}.xml", index + 1);
@@ -363,7 +386,8 @@ pub fn write_pptx(deck: &mut Deck, files: &dyn TalkFiles) -> Result<PptxOutput, 
 
         let (mut shapes, mut effects, mut next_id) = (String::new(), Vec::new(), 2u32);
         for (layer_at, spec) in specs.iter().enumerate() {
-            for (element_at, element) in spec.native.iter().enumerate() {
+            let pictured = screens.iter().filter(|(at, _)| *at == layer_at).map(|(_, element)| element);
+            for (element_at, element) in spec.native.iter().chain(pictured).enumerate() {
                 let id = next_id;
                 next_id += 1;
                 let is_title = title_at == Some((layer_at, element_at));
@@ -440,12 +464,15 @@ mod tests {
             source: None,
             rect: Rect { x: 100.0, y: 100.0, w: 50.0, h: 50.0 },
             rotate: 0.0,
-            items: Vec::new(),
+            items: Vec::new().into(),
             click: None,
             enter: Enter::default(),
             native: vec![element.clone()],
             is_title: false,
             varies: false,
+            video: None,
+            model: None,
+            terminal: None,
         };
         let pkg: SharedPackage = Rc::new(RefCell::new(Package::default()));
         let mut media = MediaStore::default();

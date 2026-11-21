@@ -25,4 +25,6 @@ fn main() {
             };
             opened.expect("Failed to open the window");
         });
+    // The windows are gone: the drawer of 3D models is let go of its device before the end.
+    stagepack_studio::model_view::wait_closed();
 }

@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use tiny_skia::Pixmap;
 
@@ -18,8 +18,8 @@ use crate::text_geometry::{LayerText, RegionBox, TextLayout};
 use crate::timeline::MAX_CLICK;
 use crate::render::device_offset;
 use crate::{
-    ComponentAsks, ComponentInfo, DisplayItem, Fonts, Layer, LayerSpec, LayerTiming, LayoutEnv, Moment, PictureCache, Placing, SlideTimeline,
-    SchemaLoad, TalkComponents, TalkFiles, Transition, builtin_registry, compose, render_layer, talk_theme,
+    ComponentAsks, ComponentInfo, DisplayItem, Fonts, Layer, LayerSpec, LayerTiming, LayoutEnv, Moment, MadeStill, PictureCache, Placing,
+    SlideTimeline, SchemaLoad, MeasureVideo, StillJob, StillWanted, TalkComponents, TalkFiles, TerminalLayer, Transition, VideoLayer, DrawModel, ModelLayer, builtin_registry, compose, render_layer, talk_theme,
 };
 
 /// How many scales of one slide are kept drawn. A zoom or a resize asks for many in a row.
@@ -45,6 +45,8 @@ struct LayerKey {
     /// The step and the bits of the time it was drawn at, for a layer that changes with
     /// them. `drawing` doesn't see colours, so it can't tell those layers apart.
     moment: Option<(u32, u32)>,
+    /// The terminal recording it's the last screen of, if it is one.
+    terminal: Option<String>,
 }
 
 impl LayerKey {
@@ -111,6 +113,8 @@ struct Laid {
     transition: Transition,
     /// Whether it shows a picture from a file of the talk, and so holds that picture in memory.
     holds_pictures: bool,
+    /// The videos whose stills it shows, or the panel shown while one is made.
+    stills: Vec<String>,
     asks: ComponentAsks,
     /// Where each layer's text is, beside `specs`.
     texts: Vec<LayerText>,
@@ -133,17 +137,30 @@ impl Laid {
         self.specs.iter().map(|spec| LayerTiming { click: spec.click, enter: spec.enter }).collect()
     }
 
-    /// The most clicks its layers or components ask for.
+    /// The most clicks its layers or components ask for. A 3D model takes a click for each of
+    /// its views, after the click it appears on, and a terminal recording one for each of its
+    /// stops.
     fn steps(&self) -> u32 {
-        let clicks = self.specs.iter().filter_map(|spec| spec.click).max().unwrap_or(0);
+        let views = self.specs.iter().filter_map(|spec| Some(spec.click.unwrap_or(0) + spec.model.as_ref()?.views.len() as u32));
+        let stops = self.specs.iter().filter_map(|spec| Some(spec.click.unwrap_or(0).saturating_add(spec.terminal.as_ref()?.stops.min(MAX_CLICK as usize) as u32)));
+        let clicks = self.specs.iter().filter_map(|spec| spec.click).chain(views).chain(stops).max().unwrap_or(0);
         clicks.max(self.asks.steps).min(MAX_CLICK)
     }
 }
 
-/// A number that differs when a layer's items sit or measure differently.
-fn drawing_fingerprint(items: &[DisplayItem]) -> u64 {
+/// A number that differs when a layer's items sit or measure differently. A terminal recording's
+/// screen of many items is told by the items it shares with what's kept of the recording, which
+/// are the same as long as its box is, and by the version of the file it was made from, `version`,
+/// as the items of a version since may lie where those of the one before did: a screen has too
+/// many to go through each time it's laid out, and with its box, which the key holds, and its
+/// file, they're all there is to it.
+fn drawing_fingerprint(spec: &LayerSpec, version: Option<&crate::pictures::FileVersion>) -> u64 {
     let mut hasher = DefaultHasher::new();
-    for item in items {
+    if spec.terminal.is_some() && spec.items.len() > 64 {
+        (3u8, spec.items.as_ptr() as usize, spec.items.len(), version).hash(&mut hasher);
+        return hasher.finish();
+    }
+    for item in spec.items.iter() {
         match item {
             DisplayItem::Fill { path, .. } | DisplayItem::Stroke { path, .. } => {
                 let b = path.bounds();
@@ -176,6 +193,11 @@ struct Drawn {
     placed_ordered: Option<Vec<Arc<Layer>>>,
     /// What the editor shows in the slide's empty regions with the deck's placing.
     placed_empty_regions: Option<Vec<Arc<Layer>>>,
+    /// The value of `Deck::layers_asked_for` when these were last asked for.
+    asked: u64,
+    /// What stands in for terminal recordings' layers being drawn aside, or whose screens are
+    /// being shaped aside, by their keys: each made once at this scale.
+    standing: HashMap<LayerKey, Arc<Layer>>,
 }
 
 impl Drawn {
@@ -201,7 +223,7 @@ impl Drawn {
     /// Every layer it holds, some of them perhaps more than once.
     fn layers(&self) -> impl Iterator<Item = &Arc<Layer>> {
         let empty = self.empty_regions.iter().chain(&self.placed_empty_regions).flatten();
-        self.by_key.values().chain(self.placed_by_key.values().map(|(layer, _)| layer)).chain(empty)
+        self.by_key.values().chain(self.placed_by_key.values().map(|(layer, _)| layer)).chain(empty).chain(self.standing.values())
     }
 }
 
@@ -256,6 +278,131 @@ pub struct Deck {
     versions_made: u64,
     /// Where things on one slide are shown that their source doesn't say yet, and the slide.
     placing: Option<(usize, Vec<Placing>)>,
+    /// Layers wanted drawn aside, as they take too long to draw here, and those being drawn: by
+    /// slide, scale and key, each with what its job holds, which is gone once the job is dropped
+    /// undrawn, or what it drew is dropped untaken.
+    draw_jobs: Vec<DrawJob>,
+    drawing: HashMap<(usize, u32, LayerKey), Weak<()>>,
+}
+
+/// The most glyphs and rectangles a terminal recording's layer has that are drawn on the thread
+/// asking for it, when stills are made aside: one with more is drawn aside, about a millisecond
+/// and a half of it.
+const MOST_PIECES_DRAWN_HERE: usize = 4_000;
+
+/// A layer to be drawn on another thread, with fonts of its own: a terminal recording's, whose
+/// screen takes too long to draw where it's asked for. See [`Deck::draw_jobs`].
+pub struct DrawJob {
+    slide: usize,
+    scale: u32,
+    key: LayerKey,
+    /// Cheap to copy: its items are shared with the slide's layout.
+    spec: LayerSpec,
+    fonts: crate::FontsSeed,
+    /// Held until what it drew is taken in: the deck waits for it only while it's held.
+    held: Arc<()>,
+}
+
+impl DrawJob {
+    /// Draws the layer: for a thread other than the window's.
+    pub fn draw(self) -> DrawnLayer {
+        let mut fonts = self.fonts.fonts();
+        let layer = Arc::new(render_layer(&self.spec, f32::from_bits(self.scale), &mut fonts));
+        DrawnLayer { slide: self.slide, scale: self.scale, key: self.key, layer, _held: self.held }
+    }
+}
+
+/// A layer drawn aside, for [`Deck::take_drawn`] to take in.
+pub struct DrawnLayer {
+    slide: usize,
+    scale: u32,
+    key: LayerKey,
+    layer: Arc<Layer>,
+    _held: Arc<()>,
+}
+
+/// How many glyphs and rectangles of a terminal recording's layer are drawn at `scale`: the glyphs
+/// of rows tall enough for text to be drawn, and each cell's fill and underline.
+fn pieces_drawn(spec: &LayerSpec, scale: f32) -> usize {
+    let shapes = |path: &tiny_skia::Path| path.segments().filter(|segment| matches!(segment, tiny_skia::PathSegment::MoveTo(_))).count();
+    spec.items
+        .iter()
+        .map(|item| match item {
+            DisplayItem::Text { text, .. } if text.buffer.metrics().line_height * scale >= crate::render::TERMINAL_TEXT_ROW => {
+                text.buffer.layout_runs().map(|run| run.glyphs.len()).sum::<usize>()
+            }
+            DisplayItem::Fill { path, .. } | DisplayItem::Stroke { path, .. } => shapes(path),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// A layer drawn, and its key.
+type Picture = (LayerKey, Arc<Layer>);
+
+/// What's shown of a terminal recording's layer while it's drawn aside, or while its screen is
+/// shaped and placed aside: what stood in for it at this scale already, or a picture of the
+/// recording, `own`, drawn at this scale, moved or stretched to where it is now, or else one of
+/// `others`, at the nearest scale below this one, or the nearest above, stretched, or else what
+/// stood in for it at any scale, stretched, or else its plain panel. Gives as well the picture at
+/// this scale it was made from, to keep until the layer is drawn.
+fn standing_in(own: &Drawn, others: &HashMap<u32, Drawn>, key: &LayerKey, spec: &LayerSpec, scale: f32, fonts: &mut Fonts) -> (Arc<Layer>, Option<Picture>) {
+    let from = || drawn_of(own, key).map(|(key, layer)| (key.clone(), layer.clone()));
+    if let Some(layer) = own.standing.get(key) {
+        return (layer.clone(), from());
+    }
+    if let Some((from, layer, _)) = resized_layer(own, key, spec, scale) {
+        return (layer, Some(from));
+    }
+    // Positive floats order as their bits do.
+    let nearest = |(at, _): &(u32, &Arc<Layer>)| {
+        let at = f32::from_bits(*at);
+        if at <= scale { (false, (scale - at).to_bits()) } else { (true, (at - scale).to_bits()) }
+    };
+    let pictures = others.iter().filter_map(|(at, drawn)| Some((*at, drawn_of(drawn, key)?.1)));
+    let this = scale.to_bits();
+    let stood_in = std::iter::once((&this, own)).chain(others).filter_map(|(at, drawn)| Some((*at, standing_of(drawn, key)?)));
+    if let Some((_, picture)) = pictures.min_by_key(nearest).or_else(|| stood_in.min_by_key(nearest)) {
+        return (Arc::new(crate::render::stretched_layer(picture, spec, scale)), None);
+    }
+    let panel = LayerSpec { items: spec.items.iter().take(1).cloned().collect(), ..spec.clone() };
+    (Arc::new(render_layer(&panel, scale, fonts)), None)
+}
+
+/// What stood in for a layer of the terminal recording whose layer `key` is, in `drawn`.
+fn standing_of<'a>(drawn: &'a Drawn, key: &LayerKey) -> Option<&'a Arc<Layer>> {
+    key.terminal.as_ref()?;
+    drawn.standing.iter().find(|(other, _)| other.terminal == key.terminal && other.files_generation == key.files_generation).map(|(_, layer)| layer)
+}
+
+/// Wants slide `index`'s layer of `key`, `spec`, drawn aside at `scale`, among `jobs`, unless it's
+/// `drawing` already, and says whether it's newly wanted. It's drawn once, at the scale wanted
+/// last: a job not yet taken for it at another scale is let go of.
+fn want_drawn(
+    jobs: &mut Vec<DrawJob>,
+    drawing: &mut HashMap<(usize, u32, LayerKey), Weak<()>>,
+    fonts: &mut Fonts,
+    (index, scale, key, spec): (usize, f32, &LayerKey, &LayerSpec),
+) -> bool {
+    let at = (index, scale.to_bits(), key.clone());
+    if drawing.get(&at).is_some_and(|held| held.strong_count() > 0) {
+        return false;
+    }
+    jobs.retain(|job| !(job.slide == index && job.key == *key));
+    drawing.retain(|_, held| held.strong_count() > 0);
+    let held = Arc::new(());
+    drawing.insert(at, Arc::downgrade(&held));
+    jobs.push(DrawJob { slide: index, scale: scale.to_bits(), key: key.clone(), spec: spec.clone(), fonts: fonts.seed(), held });
+    true
+}
+
+/// Makes room in `drawn`, a slide's layers by scale, for those at `scale`: of as many scales as are
+/// kept, the one asked for longest ago is let go of.
+fn make_room(drawn: &mut HashMap<u32, Drawn>, scale: u32) {
+    if drawn.len() >= KEPT_SCALES && !drawn.contains_key(&scale) {
+        let oldest = drawn.iter().min_by_key(|(_, drawn)| drawn.asked).map(|(scale, _)| *scale);
+        drawn.retain(|kept, _| Some(*kept) != oldest);
+    }
 }
 
 /// The talk's settings, as far as they decide how a slide looks: not where they sit.
@@ -337,6 +484,8 @@ impl Deck {
             versions_made: slides.len() as u64,
             slides,
             placing: None,
+            draw_jobs: Vec::new(),
+            drawing: HashMap::new(),
         }
     }
 
@@ -462,7 +611,7 @@ impl Deck {
         self.clear_placing();
         self.files = Rc::from(files);
         self.components = TalkComponents::scan_for(self.files.clone(), &self.registry);
-        self.pictures.clear();
+        self.pictures.files_replaced(&*self.files);
         self.files_generation += 1;
         for slide in &mut self.slides {
             slide.laid = None;
@@ -487,6 +636,7 @@ impl Deck {
     /// to find it by. Its components are looked at again too. Pictures read already are kept.
     pub fn files_added(&mut self) -> Vec<usize> {
         self.components.rescan(&self.registry);
+        self.pictures.drop_replaced_stills(&*self.files);
         self.files_generation += 1;
         let talk = self.talk.clone();
         self.take_talk(talk, true, Matching::ByPlace)
@@ -605,6 +755,178 @@ impl Deck {
     /// out on. The slide being asked for keeps its pictures, however much they take alone.
     pub fn set_picture_budget(&mut self, bytes: usize) {
         self.pictures.set_memory_budget(bytes);
+    }
+
+    /// Leaves videos' stills to be made aside from now on, as the window's thread mustn't decode
+    /// a video: `wanted` is told, on the thread laying a slide out, each time one is wanted, and
+    /// [`Self::still_jobs`] then gives it, to be made on another thread and taken in with
+    /// [`Self::take_still`]. Until then a video shows a plain panel, as large as `measure`, which
+    /// decodes nothing, says the video is. Without this, a still is made on the thread that lays
+    /// its slide out.
+    pub fn make_stills_aside(&mut self, wanted: StillWanted, measure: MeasureVideo) {
+        self.pictures.make_stills_aside(wanted, measure);
+    }
+
+    /// The stills wanted to be made aside since last asked.
+    pub fn still_jobs(&mut self) -> Vec<StillJob> {
+        self.pictures.still_jobs()
+    }
+
+    /// Takes in a still made aside, and returns the slides showing it, which are laid out again
+    /// when next asked for.
+    pub fn take_still(&mut self, made: MadeStill) -> Vec<usize> {
+        let Some(made) = self.pictures.take_still(made) else {
+            return Vec::new();
+        };
+        let mut changed = Vec::new();
+        for (index, slide) in self.slides.iter_mut().enumerate() {
+            let at_moment = slide.at_moment.as_ref().map(|(_, laid)| laid);
+            let shows = slide.laid.iter().chain(at_moment).chain(&slide.placed).any(|laid| laid.stills.contains(&made));
+            if !shows {
+                continue;
+            }
+            slide.laid = None;
+            slide.at_moment = None;
+            slide.placed = None;
+            slide.thumbnail = None;
+            for scale in slide.drawn.values_mut() {
+                scale.slide_changed();
+            }
+            self.versions_made += 1;
+            slide.version = self.versions_made;
+            changed.push(index);
+        }
+        for index in &changed {
+            self.slides_holding_pictures.remove(index);
+        }
+        changed
+    }
+
+    /// Whether any video's still is being made aside.
+    pub fn stills_coming(&self) -> bool {
+        self.pictures.stills_coming()
+    }
+
+    /// The plain sentence saying why the video at `source` on slide `index` can't be played, if
+    /// it's a video and its still has been tried and it can't. It's among the slide's notices too.
+    pub fn video_problem(&mut self, index: usize, source: &std::ops::Range<usize>) -> Option<String> {
+        if index >= self.slides.len() {
+            return None;
+        }
+        let src = self.specs(index).iter().find(|spec| spec.source.as_ref() == Some(source))?.video.as_ref()?.src.clone();
+        self.pictures.still_problem(&src).map(|why| why.to_string())
+    }
+
+    /// Draws the talk's 3D models' stills with `draw` from now on: the engine draws no 3D of its
+    /// own. Until it's given something to draw with, a model is a panel saying it can't be drawn
+    /// here. With stills made aside, `draw` is called by [`StillJob::make`], on whatever thread
+    /// makes them.
+    pub fn draw_models_with(&mut self, draw: DrawModel) {
+        self.pictures.draw_models_with(draw);
+    }
+
+    /// The plain sentence saying why the 3D model at `source` on slide `index` can't be drawn, if
+    /// it's a model and its still has been tried and it can't. It's among the slide's notices too.
+    pub fn model_problem(&mut self, index: usize, source: &std::ops::Range<usize>) -> Option<String> {
+        if index >= self.slides.len() {
+            return None;
+        }
+        let on = self.specs(index).iter().find(|spec| spec.source.as_ref() == Some(source))?.model.clone()?;
+        if on.src.is_empty() {
+            return Some(crate::MODEL_NO_FILE.to_string());
+        }
+        let size = crate::pictures::model_still_size(on.rect.w, on.rect.h);
+        self.pictures.model_problem(&on.src, on.view, size).map(|why| why.to_string())
+    }
+
+    /// The plain sentence saying why the terminal recording at `source` on slide `index` can't be
+    /// played, if it's a recording and it's been read and can't be, or it has no file. It's among
+    /// the slide's notices too.
+    pub fn terminal_problem(&mut self, index: usize, source: &std::ops::Range<usize>) -> Option<String> {
+        if index >= self.slides.len() {
+            return None;
+        }
+        let src = self.specs(index).iter().find(|spec| spec.source.as_ref() == Some(source))?.terminal.as_ref()?.src.clone();
+        if src.is_empty() {
+            return Some(crate::TERMINAL_NO_FILE.to_string());
+        }
+        self.pictures.terminal_problem(&src).map(|why| why.to_string())
+    }
+
+    /// Whether a terminal recording on slide `index` is still being read aside: until it's read,
+    /// it's a plain panel, and its stops aren't among the slide's steps.
+    pub fn terminal_pending(&mut self, index: usize) -> bool {
+        if index >= self.slides.len() {
+            return false;
+        }
+        let sources: Vec<String> = self.specs(index).iter().filter_map(|spec| Some(spec.terminal.as_ref()?.src.clone())).collect();
+        sources.iter().any(|src| self.pictures.terminal_coming(src))
+    }
+
+    /// The terminal recordings on slide `index` in its whole state, among its layers as `specs`
+    /// and `layers` give them, with the deck's placing.
+    pub fn terminals(&mut self, index: usize) -> Vec<TerminalLayer> {
+        if index >= self.slides.len() {
+            return Vec::new();
+        }
+        terminals_of(self.specs(index))
+    }
+
+    /// The terminal recordings on slide `index` at `moment`, among its layers as `layers_at`
+    /// gives them then.
+    pub fn terminals_at(&mut self, index: usize, moment: Moment) -> Vec<TerminalLayer> {
+        if index >= self.slides.len() {
+            return Vec::new();
+        }
+        let moment = self.ensure_laid_at(index, moment);
+        terminals_of(&self.slides[index].laid_at(moment).specs)
+    }
+
+    /// The 3D models on slide `index` in its whole state, among its layers as `specs` and
+    /// `layers` give them, with the deck's placing.
+    pub fn models(&mut self, index: usize) -> Vec<ModelLayer> {
+        if index >= self.slides.len() {
+            return Vec::new();
+        }
+        models_of(self.specs(index))
+    }
+
+    /// The 3D models on slide `index` at `moment`, among its layers as `layers_at` gives them then.
+    pub fn models_at(&mut self, index: usize, moment: Moment) -> Vec<ModelLayer> {
+        if index >= self.slides.len() {
+            return Vec::new();
+        }
+        let moment = self.ensure_laid_at(index, moment);
+        models_of(&self.slides[index].laid_at(moment).specs)
+    }
+
+    /// Whether the video `src`, with the still `poster` names if it names one, is drawn as a
+    /// picture once its slide is laid out: its first picture, or that still, could be shown.
+    /// What laying the slide out found is what's said: ask once it's laid out. A still made and
+    /// let go of since, to keep within the budget, was a picture.
+    pub fn video_shows_a_picture(&mut self, src: &str, poster: Option<&str>) -> bool {
+        let src = src.trim();
+        let made = !src.is_empty() && self.pictures.still_problem(src).is_none();
+        let poster = poster.map(str::trim).filter(|poster| !poster.is_empty());
+        made || poster.is_some_and(|poster| self.pictures.get(poster, &*self.files).is_some())
+    }
+
+    /// The videos on slide `index` in its whole state, among its layers as `specs` and `layers`
+    /// give them, with the deck's placing.
+    pub fn videos(&mut self, index: usize) -> Vec<VideoLayer> {
+        if index >= self.slides.len() {
+            return Vec::new();
+        }
+        videos_of(self.specs(index))
+    }
+
+    /// The videos on slide `index` at `moment`, among its layers as `layers_at` gives them then.
+    pub fn videos_at(&mut self, index: usize, moment: Moment) -> Vec<VideoLayer> {
+        if index >= self.slides.len() {
+            return Vec::new();
+        }
+        let moment = self.ensure_laid_at(index, moment);
+        videos_of(&self.slides[index].laid_at(moment).specs)
     }
 
     /// The pixel bytes of the talk's pictures in memory. A picture many slides show counts once.
@@ -1027,31 +1349,50 @@ impl Deck {
     /// The layers of slide `index` at `moment`, which `ensure_laid_at` gave.
     fn drawn_layers(&mut self, index: usize, moment: Moment, scale: f32) -> Vec<Arc<Layer>> {
         let slide = &mut self.slides[index];
-        if slide.drawn.len() >= KEPT_SCALES && !slide.drawn.contains_key(&scale.to_bits()) {
-            slide.drawn.clear();
-        }
-        let SlideState { laid, at_moment, drawn, .. } = slide;
+        make_room(&mut slide.drawn, scale.to_bits());
+        let SlideState { laid, at_moment, drawn: scales, .. } = slide;
         let laid = match at_moment {
             Some((at, laid)) if *at == moment => &*laid,
             _ => laid.as_ref().expect("the slide was just laid out"),
         };
-        let drawn = drawn.entry(scale.to_bits()).or_default();
+        let drawn = scales.entry(scale.to_bits()).or_default();
+        drawn.asked = self.layers_asked_for;
         if let Some((at, ordered)) = &drawn.ordered
             && *at == moment
         {
             return ordered.clone();
         }
-        let mut by_key = HashMap::new();
+        // Apart from the others while it's drawn, as a picture at another scale can stand in.
+        let mut drawn = scales.remove(&scale.to_bits()).unwrap_or_default();
+        let (mut by_key, mut standing) = (HashMap::new(), HashMap::new());
         let mut ordered = Vec::with_capacity(laid.specs.len());
+        let aside = self.pictures.makes_aside();
+        let mut wanted = false;
         for (spec, key) in laid.specs.iter().zip(&laid.keys) {
             let layer = if spec.source.is_some() {
-                let layer = by_key
-                    .get(key)
-                    .or_else(|| drawn.by_key.get(key))
-                    .cloned()
-                    .unwrap_or_else(|| Arc::new(render_layer(spec, scale, &mut self.fonts)));
-                by_key.insert(key.clone(), layer.clone());
-                layer
+                match by_key.get(key).or_else(|| drawn.by_key.get(key)).cloned() {
+                    Some(layer) => {
+                        by_key.insert(key.clone(), layer.clone());
+                        layer
+                    }
+                    // A screen still shaped and placed aside, or too long to draw here and drawn
+                    // aside, has what was drawn of it before stand in, which isn't kept as it; the
+                    // picture it's made from is kept until it's drawn.
+                    None if spec.terminal.as_ref().is_some_and(|on| on.pending) || (aside && spec.terminal.is_some() && pieces_drawn(spec, scale) > MOST_PIECES_DRAWN_HERE) => {
+                        if !spec.terminal.as_ref().is_some_and(|on| on.pending) {
+                            wanted |= want_drawn(&mut self.draw_jobs, &mut self.drawing, &mut self.fonts, (index, scale, key, spec));
+                        }
+                        let (layer, from) = standing_in(&drawn, scales, key, spec, scale, &mut self.fonts);
+                        by_key.extend(from);
+                        standing.insert(key.clone(), layer.clone());
+                        layer
+                    }
+                    None => {
+                        let layer = Arc::new(render_layer(spec, scale, &mut self.fonts));
+                        by_key.insert(key.clone(), layer.clone());
+                        layer
+                    }
+                }
             } else {
                 self.backgrounds
                     .entry((self.theme.clone(), scale.to_bits()))
@@ -1061,8 +1402,39 @@ impl Deck {
             ordered.push(layer);
         }
         drawn.by_key = by_key;
+        drawn.standing = standing;
         drawn.ordered = Some((moment, ordered.clone()));
+        scales.insert(scale.to_bits(), drawn);
+        if wanted {
+            self.pictures.tell_wanted();
+        }
         ordered
+    }
+
+    /// The layers wanted drawn aside since last asked, as stills are made: those of terminal
+    /// recordings whose screens take too long to draw on the thread asking for them. Until each is
+    /// taken in, with [`Self::take_drawn`], what it was drawn as before, stretched, or its plain
+    /// panel, stands in for it. Only while stills are made aside.
+    pub fn draw_jobs(&mut self) -> Vec<DrawJob> {
+        std::mem::take(&mut self.draw_jobs)
+    }
+
+    /// Takes in a layer drawn aside, and gives the slide it's on if it's still shown there, to be
+    /// drawn again.
+    pub fn take_drawn(&mut self, drawn: DrawnLayer) -> Vec<usize> {
+        let DrawnLayer { slide, scale, key, layer, .. } = drawn;
+        self.drawing.remove(&(slide, scale, key.clone()));
+        let Some(state) = self.slides.get_mut(slide) else { return Vec::new() };
+        let at_moment = state.at_moment.as_ref().map(|(_, laid)| laid);
+        if !state.laid.iter().chain(at_moment).chain(&state.placed).any(|laid| laid.keys.contains(&key)) {
+            return Vec::new();
+        }
+        // A scale let go of since isn't brought back.
+        let Some(drawn) = state.drawn.get_mut(&scale) else { return Vec::new() };
+        drawn.by_key.insert(key, layer);
+        drawn.ordered = None;
+        drawn.placing_changed();
+        vec![slide]
     }
 
     /// Forgets how the slides furthest from slide `asked` are laid out, until the pictures in
@@ -1149,9 +1521,10 @@ impl Deck {
         LayerKey {
             text: format!("{}\n{layout}\n{}\n{text}", self.theme, spec.source.is_some()),
             place: place_bits(spec),
-            drawing: drawing_fingerprint(&spec.items),
+            drawing: drawing_fingerprint(spec, spec.terminal.as_ref().and_then(|on| self.pictures.terminal_version(&on.src))),
             files_generation: self.files_generation,
             moment: spec.varies.then_some((moment.step, moment.time.to_bits())),
+            terminal: spec.terminal.as_ref().map(|on| on.src.clone()),
         }
     }
 
@@ -1163,20 +1536,21 @@ impl Deck {
     }
 
     fn lay_out_placed(&mut self, index: usize, moment: Moment, placing: &[Placing]) -> Laid {
+        self.pictures.take_stills_asked();
         let laid = self.with_layout_env(moment, |talk, env| layout_slide_placed(talk, index, env, placing));
+        let stills = self.pictures.take_stills_asked();
         let keys = laid.layers.iter().map(|spec| self.layer_key(index, moment, spec)).collect();
         let notices = laid.notices.into_iter().map(|notice| notice.0).collect();
-        let holds_pictures = laid
-            .layers
-            .iter()
-            .flat_map(|spec| &spec.items)
-            .any(|item| matches!(item, DisplayItem::Picture { src: Some(_), .. }));
+        // A video's still counts as a picture of the talk's.
+        let holds_pictures = !stills.is_empty()
+            || laid.layers.iter().flat_map(|spec| spec.items.iter()).any(|item| matches!(item, DisplayItem::Picture { src: Some(_), .. }));
         Laid {
             specs: laid.layers,
             keys,
             notices,
             transition: laid.transition,
             holds_pictures,
+            stills,
             asks: laid.asks,
             texts: laid.texts,
             empty_regions: laid.empty_regions,
@@ -1254,6 +1628,18 @@ impl Deck {
                     if (rect.w, rect.h) == (spec.rect.w, spec.rect.h) {
                         spec.rect = rect;
                         spec.rotate = rotate;
+                        if let Some(video) = &mut spec.video {
+                            video.rect = rect;
+                            video.rotate = rotate;
+                        }
+                        if let Some(model) = &mut spec.model {
+                            model.rect = rect;
+                            model.rotate = rotate;
+                        }
+                        if let Some(terminal) = &mut spec.terminal {
+                            terminal.rect = rect;
+                            terminal.rotate = rotate;
+                        }
                         laid.keys[at].place = place_bits(spec);
                     } else {
                         laid_again.push((at, range.clone(), placing.clone()));
@@ -1263,6 +1649,7 @@ impl Deck {
         }
         for (at, range, placing) in laid_again {
             let Some((spec, text)) = self.with_layout_env(moment, |talk, env| placed_tag_layer(talk, index, &range, &placing, env)) else { continue };
+            laid.stills.extend(self.pictures.take_stills_asked());
             laid.keys[at] = self.layer_key(index, moment, &spec);
             laid.specs[at] = spec;
             laid.texts[at] = text;
@@ -1278,17 +1665,18 @@ impl Deck {
         self.layers_asked_for += 1;
         self.slides[index].last_used = self.layers_asked_for;
         let slide = &mut self.slides[index];
-        if slide.drawn.len() >= KEPT_SCALES && !slide.drawn.contains_key(&scale.to_bits()) {
-            slide.drawn.clear();
-        }
-        let SlideState { placed, drawn, .. } = slide;
+        make_room(&mut slide.drawn, scale.to_bits());
+        let SlideState { placed, drawn: scales, .. } = slide;
         let placed = placed.as_ref().expect("the slide was just laid out");
-        let drawn = drawn.entry(scale.to_bits()).or_default();
+        let drawn = scales.entry(scale.to_bits()).or_default();
+        drawn.asked = self.layers_asked_for;
         if let Some(ordered) = &drawn.placed_ordered {
             return ordered.clone();
         }
+        let mut drawn = scales.remove(&scale.to_bits()).unwrap_or_default();
         let mut by_key = HashMap::new();
         let mut ordered = Vec::with_capacity(placed.specs.len());
+        let (aside, mut wanted) = (self.pictures.makes_aside(), false);
         for (spec, key) in placed.specs.iter().zip(&placed.keys) {
             let layer = if spec.source.is_none() {
                 self.backgrounds
@@ -1302,7 +1690,22 @@ impl Deck {
                     .get(key)
                     .or_else(|| drawn.placed_by_key.get(key))
                     .cloned()
-                    .or_else(|| moved_layer(drawn, key, scale))
+                    .or_else(|| moved_layer(&drawn, key, scale))
+                    .or_else(|| spec.terminal.as_ref().and_then(|_| resized_layer(&drawn, key, spec, scale).map(|(_, layer, at)| (layer, at))))
+                    .or_else(|| {
+                        // A screen still shaped aside, or too long to draw here and drawn aside, is
+                        // shown as a picture of it at another scale meanwhile, if there's one.
+                        let pending = spec.terminal.as_ref()?.pending;
+                        if !pending {
+                            if !(aside && pieces_drawn(spec, scale) > MOST_PIECES_DRAWN_HERE) {
+                                return None;
+                            }
+                            wanted |= want_drawn(&mut self.draw_jobs, &mut self.drawing, &mut self.fonts, (index, scale, key, spec));
+                        }
+                        let (layer, _) = standing_in(&drawn, scales, key, spec, scale, &mut self.fonts);
+                        let at = DrawnAt::of(&layer, spec.rect.x, spec.rect.y);
+                        Some((layer, at))
+                    })
                     .unwrap_or_else(|| {
                         let layer = Arc::new(render_layer(spec, scale, &mut self.fonts));
                         let at = DrawnAt::of(&layer, spec.rect.x, spec.rect.y);
@@ -1315,9 +1718,73 @@ impl Deck {
         }
         drawn.placed_by_key = by_key;
         drawn.placed_ordered = Some(ordered.clone());
+        scales.insert(scale.to_bits(), drawn);
+        if wanted {
+            self.pictures.tell_wanted();
+        }
         self.keep_within_budget(index);
         ordered
     }
+}
+
+/// A terminal recording's layer of `drawn`, the slide's own, stretched over where `spec`, the same
+/// recording resized, now is: what's shown while it's being resized, as drawing a screen of text
+/// again at each step of a drag would take too long. It's drawn again once the drag ends.
+/// Gives as well the key and picture it was made from.
+fn resized_layer(drawn: &Drawn, key: &LayerKey, spec: &LayerSpec, scale: f32) -> Option<(Picture, Arc<Layer>, DrawnAt)> {
+    let (other, own) = drawn_of(drawn, key)?;
+    let from = (other.clone(), own.clone());
+    // One of the same size and turn is only moved.
+    if other.place[2..] == key.place[2..] {
+        let (x, y) = (f32::from_bits(other.place[0]), f32::from_bits(other.place[1]));
+        let at = DrawnAt::of(own, x, y);
+        return Some((from, at.shown_at(&own.pixmap, spec.rect.x, spec.rect.y, scale), at));
+    }
+    let layer = Arc::new(crate::render::stretched_layer(own, spec, scale));
+    let at = DrawnAt::of(&layer, spec.rect.x, spec.rect.y);
+    Some((from, layer, at))
+}
+
+/// A picture in `drawn` of the terminal recording whose layer `key` is: one from the same text if
+/// there is one, or else any of the same recording, as one resized has had its text written again.
+fn drawn_of<'a>(drawn: &'a Drawn, key: &LayerKey) -> Option<(&'a LayerKey, &'a Arc<Layer>)> {
+    key.terminal.as_ref()?;
+    let same = |other: &LayerKey| other.terminal == key.terminal && other.files_generation == key.files_generation && other.moment == key.moment;
+    let mut any = None;
+    for (other, layer) in drawn.by_key.iter().filter(|(other, _)| same(other)) {
+        if other.text == key.text {
+            return Some((other, layer));
+        }
+        any.get_or_insert((other, layer));
+    }
+    any
+}
+
+/// The terminal recordings among `specs`.
+fn terminals_of(specs: &[LayerSpec]) -> Vec<TerminalLayer> {
+    specs
+        .iter()
+        .enumerate()
+        .filter_map(|(layer, spec)| Some(TerminalLayer { layer, source: spec.source.clone(), click: spec.click, on: spec.terminal.clone()? }))
+        .collect()
+}
+
+/// The 3D models among `specs`.
+fn models_of(specs: &[LayerSpec]) -> Vec<ModelLayer> {
+    specs
+        .iter()
+        .enumerate()
+        .filter_map(|(layer, spec)| Some(ModelLayer { layer, source: spec.source.clone(), click: spec.click, on: spec.model.clone()? }))
+        .collect()
+}
+
+/// The videos among `specs`.
+fn videos_of(specs: &[LayerSpec]) -> Vec<VideoLayer> {
+    specs
+        .iter()
+        .enumerate()
+        .filter_map(|(layer, spec)| Some(VideoLayer { layer, source: spec.source.clone(), click: spec.click, on: spec.video.clone()? }))
+        .collect()
 }
 
 impl SlideState {
@@ -1362,5 +1829,36 @@ impl SlideState {
             Some((at, laid)) if *at == moment => laid,
             _ => self.laid.as_mut().expect("the slide was just laid out"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pictures::FileVersion;
+    use crate::{Enter, Rect, TerminalOn};
+
+    #[test]
+    fn a_busy_screen_of_another_version_of_its_file_is_told_from_the_one_before() {
+        let rect = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        let fill = || DisplayItem::Fill { path: tiny_skia::PathBuilder::from_rect(tiny_skia::Rect::from_xywh(0.0, 0.0, 1.0, 1.0).unwrap()), color: toolkit::Color::rgb(1, 2, 3) };
+        let terminal = TerminalOn { src: "assets/run.cast".to_string(), rect, rotate: 0.0, stops: 0, pending: false };
+        let spec = LayerSpec {
+            source: None,
+            rect,
+            rotate: 0.0,
+            items: (0..65).map(|_| fill()).collect::<Vec<_>>().into(),
+            click: None,
+            enter: Enter::Appear,
+            native: Vec::new(),
+            is_title: false,
+            varies: false,
+            video: None,
+            model: None,
+            terminal: Some(terminal),
+        };
+        let (one, two) = (FileVersion::Hash(1), FileVersion::Hash(2));
+        assert_eq!(drawing_fingerprint(&spec, Some(&one)), drawing_fingerprint(&spec, Some(&one)));
+        assert_ne!(drawing_fingerprint(&spec, Some(&one)), drawing_fingerprint(&spec, Some(&two)));
     }
 }

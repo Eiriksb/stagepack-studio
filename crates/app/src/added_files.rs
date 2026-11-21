@@ -1,6 +1,7 @@
-//! Files added to a talk: pictures, data and components brought in from outside it. What may be
-//! added, under what name, and which of them the talk's text uses, so that a save writes those.
-//! The bytes are kept in memory, in the talk's [`AddedSet`], until a save writes them.
+//! Files added to a talk: pictures, data, terminal recordings, components and videos brought in
+//! from outside it. What may be added, under what name, and which of them the talk's text uses,
+//! so that a save writes those. The bytes are kept in memory, in the talk's [`AddedSet`], until a save writes them; a
+//! video's never are: it's copied into the window's working copy, and held there by its path.
 //!
 //! [`AddedSet`]: slides_engine::AddedSet
 
@@ -41,13 +42,19 @@ pub enum FileKind {
     ComponentSource,
     /// A component built, ready to run.
     ComponentBuild,
+    /// A video, which can be large: it's copied in as a file, never read whole.
+    Video,
+    /// A 3D model, which can be large: it's copied in as a file, as a video is.
+    Model,
+    /// A terminal recording, which is a small text file of the talk's, held as a chart's data is.
+    Recording,
 }
 
 impl FileKind {
     /// The talk's folder the file goes in.
     pub fn folder(self) -> &'static str {
         match self {
-            FileKind::Picture | FileKind::Data => "assets",
+            FileKind::Picture | FileKind::Data | FileKind::Video | FileKind::Model | FileKind::Recording => "assets",
             FileKind::ComponentSource => "components",
             FileKind::ComponentBuild => "build",
         }
@@ -60,13 +67,85 @@ impl FileKind {
             FileKind::Data => &["csv"],
             FileKind::ComponentSource => &["rs"],
             FileKind::ComponentBuild => &["wasm"],
+            FileKind::Video => &["mp4", "m4v", "mov"],
+            FileKind::Model => &["glb", "ply"],
+            FileKind::Recording => &["cast"],
         }
     }
 
     pub(crate) fn is_component(self) -> bool {
         matches!(self, FileKind::ComponentSource | FileKind::ComponentBuild)
     }
+
+    /// Whether a file of this kind can be large, and so is copied in as a file, never read whole.
+    pub fn is_large(self) -> bool {
+        matches!(self, FileKind::Video | FileKind::Model)
+    }
+
+    /// The largest file of this kind that can be added to a talk: for a kind that can be large,
+    /// the most a large file can be; for any other, [`MAX_ADDED_BYTES`].
+    pub fn max_bytes(self) -> u64 {
+        match self {
+            FileKind::Video => MAX_VIDEO_BYTES,
+            FileKind::Model => MAX_MODEL_BYTES,
+            _ => MAX_ADDED_BYTES as u64,
+        }
+    }
+
+    /// What a file of this kind is called in the words a person is shown.
+    pub fn noun(self) -> &'static str {
+        match self {
+            FileKind::Picture => "picture",
+            FileKind::Data => "data file",
+            FileKind::ComponentSource | FileKind::ComponentBuild => "component",
+            FileKind::Video => "video",
+            FileKind::Model => "model",
+            FileKind::Recording => "terminal recording",
+        }
+    }
+
+    /// Every kind, in the order a path's kind is looked for.
+    pub(crate) const ALL: [FileKind; 7] = [
+        FileKind::Picture,
+        FileKind::Data,
+        FileKind::ComponentSource,
+        FileKind::ComponentBuild,
+        FileKind::Video,
+        FileKind::Model,
+        FileKind::Recording,
+    ];
 }
+
+/// The talk's folders that large files, of any kind, go in, each once.
+pub(crate) fn large_folders() -> Vec<&'static str> {
+    let mut folders: Vec<&'static str> = Vec::new();
+    for kind in FileKind::ALL.into_iter().filter(|kind| kind.is_large()) {
+        if !folders.contains(&kind.folder()) {
+            folders.push(kind.folder());
+        }
+    }
+    folders
+}
+
+/// The largest video that can be added to a talk.
+pub const MAX_VIDEO_BYTES: u64 = slides_engine::MAX_LARGE_FILE;
+
+/// The largest 3D model that can be added to a talk.
+pub const MAX_MODEL_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Whether `head`, the first bytes of a file named with the extension `ext`, say it's a 3D model
+/// of that kind: a binary glTF starts with its magic and a version and length, a point cloud
+/// with `ply` and a line end. A name alone doesn't make a model.
+pub(crate) fn model_head_fits(ext: &str, head: &[u8]) -> bool {
+    match ext.to_ascii_lowercase().as_str() {
+        "glb" => head.len() >= 12 && head.starts_with(b"glTF"),
+        "ply" => head.starts_with(b"ply\n") || head.starts_with(b"ply\r"),
+        _ => false,
+    }
+}
+
+/// How many bytes of a model's start [`model_head_fits`] is given.
+pub(crate) const MODEL_HEAD_BYTES: usize = 12;
 
 /// Why a file wasn't added. Its words are the sentence the person adding it is shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,6 +155,24 @@ pub enum NotAdded {
     NotThatKind,
     Unreadable,
     NameTaken,
+    /// A video over [`MAX_VIDEO_BYTES`].
+    VideoTooLarge,
+    /// A model over [`MAX_MODEL_BYTES`].
+    ModelTooLarge,
+    /// A file named as a 3D model that doesn't start as one does.
+    NotAModel,
+    /// A file named as a terminal recording that doesn't start as one does.
+    NotARecording,
+    /// The disk hasn't room for it, as was seen before anything was copied.
+    NoRoom,
+    /// The disk filled up while it was copied.
+    RanOutOfRoom,
+    /// It changed, or went, while it was copied.
+    Changed,
+    /// The copy was cancelled.
+    Cancelled,
+    /// The window keeps nowhere a large file can be copied to until the talk is saved.
+    NowhereToKeep,
 }
 
 impl std::fmt::Display for NotAdded {
@@ -86,7 +183,32 @@ impl std::fmt::Display for NotAdded {
             NotAdded::NotThatKind => "That kind of file can't be used here.",
             NotAdded::Unreadable => "That file couldn't be read.",
             NotAdded::NameTaken => "This talk already has a different file with that name.",
+            NotAdded::VideoTooLarge => "That video is larger than 4 GB, so it wasn't added.",
+            NotAdded::ModelTooLarge => "That model is larger than 256 MB, so it wasn't added.",
+            // As a model put on a slide that isn't one says: one refusal, one sentence.
+            NotAdded::NotAModel => "This file isn't a 3D model.",
+            // As a recording on a slide that isn't one says.
+            NotAdded::NotARecording => "This file isn't a terminal recording.",
+            NotAdded::NoRoom => "There isn't room on the disk for that file, so it wasn't added.",
+            NotAdded::RanOutOfRoom => "The disk filled up while that file was copied, so it wasn't added.",
+            NotAdded::Changed => "That file changed or went while it was copied, so it wasn't added.",
+            NotAdded::Cancelled => "The copy was cancelled, so nothing was added.",
+            NotAdded::NowhereToKeep => "There's nowhere to keep that file until the talk is saved, so it wasn't added.",
         })
+    }
+}
+
+impl NotAdded {
+    /// Why a file of `kind` over its most was refused.
+    pub fn too_large(kind: FileKind) -> NotAdded {
+        match kind {
+            FileKind::Model => NotAdded::ModelTooLarge,
+            FileKind::Video => NotAdded::VideoTooLarge,
+            // Not kinds that can be large: only asked of those that can.
+            FileKind::Picture | FileKind::Data | FileKind::ComponentSource | FileKind::ComponentBuild | FileKind::Recording => {
+                NotAdded::TooLarge
+            }
+        }
     }
 }
 
@@ -177,22 +299,38 @@ fn checked(kind: FileKind, suggested: &str, bytes: Vec<u8>) -> Result<(Vec<u8>, 
     if kind == FileKind::Picture {
         return picture_bytes(bytes, given);
     }
+    if kind.is_large() {
+        // Copied in as a file, by `Document::add_large_file`.
+        return Err(NotAdded::NotThatKind);
+    }
     let allowed = kind.extensions();
     let ext = match given {
         None => allowed[0],
         Some(given) => *allowed.iter().find(|ext| ext.eq_ignore_ascii_case(given)).ok_or(NotAdded::NotThatKind)?,
     };
+    // Whether one can be played is found off the window's thread before it's added; here, only
+    // that it starts as a recording does.
+    if kind == FileKind::Recording && !is_recording(&bytes) {
+        return Err(NotAdded::NotARecording);
+    }
     let fits = match kind {
         FileKind::Data => std::str::from_utf8(&bytes).is_ok(),
+        FileKind::Recording => true,
         // The engine finds the component's tag in its source: one it can't is no component.
         FileKind::ComponentSource => std::str::from_utf8(&bytes).ok().and_then(slides_components::component_tag).is_some(),
         FileKind::ComponentBuild => bytes.starts_with(WASM_MAGIC),
-        FileKind::Picture => unreachable!("a picture is checked above"),
+        FileKind::Picture | FileKind::Video | FileKind::Model => unreachable!("a picture and a large file are checked above"),
     };
     if !fits || (kind.is_component() && component_stem(suggested).is_none()) {
         return Err(NotAdded::NotThatKind);
     }
     Ok((bytes, ext))
+}
+
+/// Whether `bytes` start as a terminal recording that can be played does: with the header of
+/// asciinema's second format, of a screen that can be played. Only its first line is read.
+pub(crate) fn is_recording(bytes: &[u8]) -> bool {
+    slides_terminal::screen_size(bytes).is_some()
 }
 
 /// Where a file being added goes.
@@ -255,13 +393,54 @@ pub(crate) fn place(
     Err(NotAdded::NameTaken)
 }
 
+/// The path a large file of `kind`, called `suggested`, is given in the talk whose files are
+/// `files`: named as [`place`] names a picture, numbered if the name is taken, whatever the case
+/// of its letters, or when `taken` says so. Its extension must be one of `kind`'s.
+pub(crate) fn large_path(files: &dyn TalkFiles, kind: FileKind, suggested: &str, taken: impl Fn(&str) -> bool) -> Result<String, NotAdded> {
+    let (_, given) = split_extension(suggested);
+    let ext = given
+        .and_then(|given| kind.extensions().iter().find(|ext| ext.eq_ignore_ascii_case(given)))
+        .ok_or(NotAdded::NotThatKind)?;
+    let folder = kind.folder();
+    let lower: BTreeSet<String> = files.names_in(folder).iter().map(|path| path.to_ascii_lowercase()).collect();
+    let free = |path: &str| !lower.contains(&path.to_ascii_lowercase()) && files.len(path).is_none() && !taken(path);
+    let stem = safe_stem(suggested);
+    let first = format!("{folder}/{stem}.{ext}");
+    if free(&first) {
+        return Ok(first);
+    }
+    for number in 2..=MAX_NUMBER {
+        let suffix = format!("-{number}");
+        let mut base = stem.clone();
+        base.truncate(MAX_STEM - suffix.len());
+        let path = format!("{folder}/{}{suffix}.{ext}", base.trim_end_matches('-'));
+        if free(&path) {
+            return Ok(path);
+        }
+    }
+    Err(NotAdded::NameTaken)
+}
+
+/// The files of `kind` the talk whose files are `files` has that hold `len` bytes: those a large
+/// file of that length may be the same as.
+pub(crate) fn same_length(files: &dyn TalkFiles, kind: FileKind, len: u64) -> Vec<String> {
+    files
+        .names_in(kind.folder())
+        .into_iter()
+        .filter(|path| {
+            let (_, ext) = split_extension(path);
+            ext.is_some_and(|ext| kind.extensions().iter().any(|allowed| allowed.eq_ignore_ascii_case(ext)))
+        })
+        .filter(|path| files.len(path) == Some(len))
+        .collect()
+}
+
 /// The kind of file that the path `path` is, if it's one [`place`] could have made: a plain name
 /// in one of the folders a file is added to, with an extension a file there can have.
 pub(crate) fn kind_of_path(path: &str) -> Option<FileKind> {
     let (folder, name) = path.split_once('/')?;
     let (stem, ext) = name.rsplit_once('.')?;
-    let kinds = [FileKind::Picture, FileKind::Data, FileKind::ComponentSource, FileKind::ComponentBuild];
-    let kind = kinds.into_iter().find(|kind| kind.folder() == folder && kind.extensions().contains(&ext))?;
+    let kind = FileKind::ALL.into_iter().find(|kind| kind.folder() == folder && kind.extensions().contains(&ext))?;
     let plain = if kind.is_component() {
         component_stem(stem) == Some(stem) && !stem.contains('.')
     } else {

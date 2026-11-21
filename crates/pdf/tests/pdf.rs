@@ -294,3 +294,48 @@ fn a_pdf_of_a_talk_with_every_slide_hidden_still_has_its_pages() {
     let Some(info) = run("pdfinfo", &[&pdf]) else { return };
     assert!(info.contains("Pages:           2"), "{info}");
 }
+
+#[test]
+fn a_pdf_has_the_screens_text() {
+    let cast = slides_terminal::make_test_cast(40, 6, &[(0.1, "o", "$ echo \u{1b}[32mstagepacked\u{1b}[0m\r\n"), (0.4, "o", "stagepacked\r\n$ ")]);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("assets")).unwrap();
+    std::fs::write(dir.path().join("assets/run.cast"), cast).unwrap();
+    let source = "# One\n\n<Terminal src=\"assets/run.cast\" x=\"100\" y=\"300\" w=\"960\" h=\"540\" />\n";
+    let mut deck = Deck::open(Box::new(FolderFiles::new(dir.path().to_path_buf())), Fonts::bundled_only(), source.to_string());
+    let pdf = write_to(&mut deck, dir.path(), "terminal.pdf");
+    let Some(text) = run("pdftotext", &[&pdf, "-"]) else { return };
+    assert!(text.contains("echo stagepacked") && text.matches("stagepacked").count() == 2, "the screen's text is text: {text}");
+    // And looks as the slide does.
+    let Some(difference) = page_difference(&mut deck, &pdf, 1, dir.path()) else { return };
+    assert!(difference < 6.0, "{difference}");
+}
+
+/// Each stream of `pdf` that's packed, unpacked.
+fn streams(pdf: &[u8]) -> Vec<Vec<u8>> {
+    let mut found = Vec::new();
+    let mut at = 0;
+    while let Some(start) = pdf[at..].windows(7).position(|window| window == b"stream\n").map(|start| at + start + 7) {
+        let Some(end) = pdf[start..].windows(9).position(|window| window == b"endstream").map(|end| start + end) else { break };
+        let bytes = pdf[start..end].strip_suffix(b"\n").unwrap_or(&pdf[start..end]);
+        found.extend(miniz_oxide::inflate::decompress_to_vec_zlib(bytes).ok());
+        at = end + 9;
+    }
+    found
+}
+
+#[test]
+fn a_recording_is_drawn_within_its_box_on_the_page() {
+    let cast = slides_terminal::make_test_cast(40, 6, &[(0.1, "o", "$ echo stagepacked\r\n")]);
+    let (_dir, mut deck) = deck_with_files("# One\n\n<Terminal src=\"run.cast\" x=\"100\" y=\"300\" w=\"960\" h=\"540\" />\n", &[("run.cast", &cast)]);
+    let pdf = slides_pdf::write_pdf(&mut deck).unwrap();
+    let page = streams(&pdf).into_iter().map(|stream| String::from_utf8_lossy(&stream).into_owned()).find(|stream| stream.contains("BT")).expect("a page draws text");
+    // The box, in points from the page's foot, is the clip, and the screen's text is drawn within it.
+    let clip = page.find("50 390 m 530 390 l 530 120 l 50 120 l\nh\nW\nn").unwrap_or_else(|| panic!("no clip of the box on the page: {page}"));
+    assert!(page[clip..].contains("BT"), "{page}");
+    // A slide without a recording has none.
+    let (_dir, mut plain) = deck_with_files("# One\n\nWords\n", &[]);
+    let pdf = slides_pdf::write_pdf(&mut plain).unwrap();
+    assert!(streams(&pdf).iter().any(|stream| String::from_utf8_lossy(stream).contains("BT")));
+    assert!(streams(&pdf).iter().all(|stream| !String::from_utf8_lossy(stream).contains("W\nn")));
+}

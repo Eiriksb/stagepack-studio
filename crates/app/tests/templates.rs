@@ -257,7 +257,7 @@ fn placeholder_colours(source: &str, template: &Template) -> Vec<(String, Color)
     let mut colours = Vec::new();
     for spec in deck.placeholder_specs(0) {
         let words = words_of(&spec).join(" ");
-        for item in &spec.items {
+        for item in spec.items.iter() {
             match item {
                 DisplayItem::Stroke { color, .. } => colours.push((format!("the line around {words}"), *color)),
                 DisplayItem::Text { text, .. } => {

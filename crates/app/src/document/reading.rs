@@ -119,8 +119,11 @@ impl Document {
     }
 
     /// The layers of slide `index` at `moment`, first to last, drawn at `scale`.
+    ///
+    /// If laying the slide out goes wrong, it has none: a show goes on.
     pub fn layers_at(&mut self, index: usize, moment: Moment, scale: f32) -> Vec<Arc<Layer>> {
-        self.deck.layers_at(index, moment, scale)
+        let deck = &mut self.deck;
+        laid_out(|| deck.layers_at(index, moment, scale)).unwrap_or_default()
     }
 
     /// When each layer of slide `index` at `moment` appears, in the order of [`Self::layers_at`]

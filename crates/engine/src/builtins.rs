@@ -84,9 +84,59 @@ fn Picture(src: PictureFile) -> Element {
     picture(src.0, 0.0, 0.0)
 }
 
+/// A video on a slide. The engine lays it out itself, as its still, so what this gives is
+/// never shown: it's here for what it takes, and so a talk's own component can't take its name.
+fn video_component() -> NativeComponent {
+    fn schema() -> ComponentSchema {
+        let videos = ["mp4", "m4v", "mov"].map(String::from).to_vec();
+        let pictures = ["png", "jpg", "jpeg", "webp", "svg"].map(String::from).to_vec();
+        let fields = vec![
+            PropField::new("src", PropKind::File(videos), false),
+            PropField::new("poster", PropKind::File(pictures), true),
+            PropField::new("loop", PropKind::Flag, true),
+        ];
+        ComponentSchema::new(crate::elements::VIDEO_TAG, fields, false)
+    }
+    fn render(_: &Props, _: &Ctx) -> Element {
+        Element::Empty
+    }
+    NativeComponent { name: crate::elements::VIDEO_TAG, schema, render }
+}
+
+/// A 3D model on a slide, laid out by the engine itself as its still, as a video is.
+fn model_component() -> NativeComponent {
+    fn schema() -> ComponentSchema {
+        let models = ["glb", "ply"].map(String::from).to_vec();
+        let fields = vec![
+            PropField::new("src", PropKind::File(models), false),
+            PropField::new("turn", PropKind::Choice(vec!["auto".to_string()]), true),
+            PropField::new("view", PropKind::Text, true),
+            PropField::new("views", PropKind::Text, true),
+        ];
+        ComponentSchema::new(crate::elements::MODEL_TAG, fields, false)
+    }
+    fn render(_: &Props, _: &Ctx) -> Element {
+        Element::Empty
+    }
+    NativeComponent { name: crate::elements::MODEL_TAG, schema, render }
+}
+
+/// A terminal recording on a slide, laid out by the engine itself as its last screen.
+fn terminal_component() -> NativeComponent {
+    fn schema() -> ComponentSchema {
+        let fields = vec![PropField::new("src", PropKind::File(vec!["cast".to_string()]), false)];
+        ComponentSchema::new(crate::terminal_screen::TERMINAL_TAG, fields, false)
+    }
+    fn render(_: &Props, _: &Ctx) -> Element {
+        Element::Empty
+    }
+    NativeComponent { name: crate::terminal_screen::TERMINAL_TAG, schema, render }
+}
+
 pub fn builtin_registry() -> Registry {
     let mut registry = Registry::default();
-    for component in [boxed::Box_component(), Shape_component(), Icon_component(), Picture_component(), crate::chart::Chart_component()] {
+    let components = [boxed::Box_component(), Shape_component(), Icon_component(), Picture_component(), crate::chart::Chart_component(), video_component(), model_component(), terminal_component()];
+    for component in components {
         registry.add(component);
     }
     registry

@@ -1,0 +1,40 @@
+[package]
+name = "slides-model"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Makes small models, for tests here and in the other crates.
+make = ["dep:serde_json"]
+# Draws a model off-screen with a graphics device of its own. Kept apart so that what only
+# reads a model, as the engine does, never builds a graphics library.
+draw = ["dep:wgpu", "dep:pollster"]
+# Lets tests here and in the other crates lose a drawer's device, fail to make one, delay it,
+# or hold a model in small buffers.
+test-hooks = ["draw"]
+
+[dependencies]
+# The glTF description only: its JSON read into types. Nothing that opens files, follows a
+# link or decodes a picture on its own.
+gltf = { workspace = true }
+# The one texture a model may hold, PNG or JPEG.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# PNG decoded a row at a time, 16 bits a number made 8 as it's read; the version the picture
+# library uses.
+png = "=0.18.1"
+# JPEG decoded from the stored bytes where they lie, without the copy the picture library makes
+# of them first; the version the picture library uses.
+zune-jpeg = "=0.5.15"
+serde_json = { workspace = true, optional = true }
+# The version the window toolkit builds, as the 3D spike used it: Vulkan, and GL where there's no
+# Vulkan, on Linux; DirectX 12, with its software adapter, on Windows.
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "vulkan", "gles", "dx12", "metal"], optional = true }
+# Waits for the graphics library's answers on the drawer's own thread.
+pollster = { version = "=0.4.0", optional = true }
+
+[dev-dependencies]
+# The tests make their own models.
+slides-model = { path = ".", features = ["make", "draw", "test-hooks"] }
+serde_json = { workspace = true }
+proptest = "1"

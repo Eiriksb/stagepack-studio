@@ -39,13 +39,13 @@ impl Inspector {
                     .into_any_element()
             }
             Widget::Flag => {
-                let checked = value.as_deref() == Some("true");
+                let checked = labels::says_yes(self.form_tag(), value.as_deref());
                 Checkbox::new(id.clone())
                     .checked(checked)
                     .accessibility_label(label.clone())
                     .on_click(cx.listener(move |this, checked: &bool, _, cx| {
-                        let value = if *checked { "true" } else { "false" };
-                        this.write(&attr, Some(value), cx).ok();
+                        let value = labels::written_flag(this.form_tag(), *checked);
+                        this.write(&attr, value, cx).ok();
                         cx.notify();
                     }))
                     .into_any_element()

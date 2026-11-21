@@ -12,14 +12,18 @@
 //!
 //! A thing copied from a slide goes on as its Markdown, the same way, marked as an element.
 //! It, and a copied slide, carry the files they use that the talk has, base64 written: a
-//! pasted file is trusted no more than a dropped one. Its path must be one plain name in
+//! pasted file is trusted no more than a dropped one. A large file, such as a video, is carried
+//! by where it lies instead, with its length and when it last changed, and copied in when it's
+//! pasted, if it's still as it was: in the app that copied it, or another running copy of it. Its path must be one plain name in
 //! `assets`, `components` or `build`, with an extension a file there can have, and its bytes
 //! must be what that kind of file holds. How many there are and how big they say they are is
 //! counted before any is decoded.
 //!
 //! Nothing here touches the window: it's the clipboard's contents, in and out.
 
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -29,6 +33,7 @@ use slides_format::{
 };
 
 use crate::added_files::{FileKind, MAX_ADDED_BYTES, component_stem};
+use crate::large_files::{LargeSource, Looked};
 use crate::text_editing::clean_typed;
 
 /// The name the app's own metadata is kept under.
@@ -85,6 +90,46 @@ pub const NOT_INTO_TEXT: &str = "That can't be pasted into text.";
 pub const NOT_ONE_THING: &str = "That isn't one thing a slide can hold, so it wasn't pasted.";
 /// What the window says when a thing is too big to copy.
 pub const THING_TOO_BIG: &str = "This is too big to copy, so it wasn't copied.";
+
+/// What the window says when `count` videos a paste carried weren't copied, as whoever pasted
+/// said not to: the things that show them have nothing to play.
+pub fn large_left_out(count: usize) -> String {
+    match count {
+        1 => "The video wasn't copied, so it has nothing to play.".to_string(),
+        count => format!("{count} videos weren't copied, so they have nothing to play."),
+    }
+}
+
+/// What the window says when `count` models a paste carried weren't copied, as whoever pasted
+/// said not to.
+pub fn models_left_out(count: usize) -> String {
+    match count {
+        1 => "The model wasn't copied, so there's nothing to show.".to_string(),
+        count => format!("{count} models weren't copied, so there's nothing to show."),
+    }
+}
+
+/// What the window says when the files of `count` models a paste carried are gone, or changed,
+/// since they were copied.
+pub fn models_gone(count: usize) -> String {
+    match count {
+        1 => "The model's file is gone, or has changed since it was copied, so it wasn't copied and there's nothing to show.".to_string(),
+        count => format!("The files of {count} models are gone, or have changed since they were copied, so they weren't copied and there's nothing to show."),
+    }
+}
+
+/// What the window says when the files of `count` videos a paste carried are gone, or changed,
+/// since they were copied.
+pub fn large_gone(count: usize) -> String {
+    match count {
+        1 => "The video's file is gone, or has changed since it was copied, so it wasn't copied and has nothing to play.".to_string(),
+        count => format!("The files of {count} videos are gone, or have changed since they were copied, so they weren't copied and have nothing to play."),
+    }
+}
+
+/// What the window says when a paste would ask whether to copy videos in while another question
+/// is open, and so pastes nothing.
+pub const ANSWER_FIRST: &str = "Answer the question that's open first, then paste again.";
 
 /// What the window says when a pasted component has the name of a different one the talk has,
 /// called `name`.
@@ -194,6 +239,24 @@ struct JsonFile {
     bytes: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     built_from: Option<String>,
+    /// For a large file, where it lies, in place of its bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lies: Option<JsonLies>,
+}
+
+/// Where a large file a copy carries lies: a file on disk, or a file in a pack, by its path in
+/// the talk, with how long it was and when it last changed, in seconds and nanoseconds since
+/// 1970, when it was copied.
+#[derive(Serialize, Deserialize)]
+struct JsonLies {
+    #[serde(default)]
+    file: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    entry: Option<String>,
+    #[serde(default)]
+    len: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    modified: Option<(u64, u32)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -269,6 +332,48 @@ pub struct PastedFiles {
     pub left_out: bool,
     /// Whether they were too many or too big to come at all.
     pub too_large: bool,
+    /// The large files it carries by where they lie, which are copied in as it's pasted.
+    pub large: Vec<PastedLarge>,
+}
+
+/// A large file of the talk's that a copy carries by where it lies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CopiedLarge {
+    /// Its path in the talk.
+    pub path: String,
+    pub source: LargeSource,
+    /// How long it is, and when it last changed, as it's copied.
+    pub looked: Looked,
+}
+
+/// A large file a paste carries by where it lies, as the copy says: it's trusted no more than
+/// that, and copied in only if it's still there, as long, and last changed then.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PastedLarge {
+    /// Its path in the talk it came from: one plain name in the folder for its kind.
+    pub path: String,
+    pub kind: FileKind,
+    pub source: LargeSource,
+    pub len: u64,
+    pub modified: Option<SystemTime>,
+    /// What became of it as the paste copied it in.
+    pub copied: LargeCopied,
+}
+
+/// What became of a large file a paste carries.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum LargeCopied {
+    /// Nothing yet: it's left out.
+    #[default]
+    NotYet,
+    /// It was copied in, and is the talk's file at this path.
+    To(String),
+    /// Whoever pasted said not to copy it.
+    Declined,
+    /// It's gone, or changed, since it was copied.
+    Gone,
+    /// It couldn't be copied in, for this reason.
+    Refused(crate::added_files::NotAdded),
 }
 
 /// What a copied thing or slide holds.
@@ -322,10 +427,17 @@ fn stated_len(base64: &str) -> usize {
 fn pasted_files(files: Vec<JsonFile>, too_large: bool) -> PastedFiles {
     let stated = files.iter().fold(0usize, |sum, file| sum.saturating_add(stated_len(&file.bytes)));
     if too_large || files.len() > MAX_CLIPBOARD_FILES || stated > MAX_CLIPBOARD_FILES_BYTES {
-        return PastedFiles { files: Vec::new(), left_out: false, too_large: true };
+        return PastedFiles { too_large: true, ..PastedFiles::default() };
     }
     let mut pasted = PastedFiles::default();
     for file in files {
+        if file.lies.is_some() {
+            match pasted_large(file).filter(|large| !pasted.large.iter().any(|other| other.path.eq_ignore_ascii_case(&large.path))) {
+                Some(large) => pasted.large.push(large),
+                None => pasted.left_out = true,
+            }
+            continue;
+        }
         match pasted_file(file).filter(|file| !pasted.files.iter().any(|other| other.path.eq_ignore_ascii_case(&file.path))) {
             Some(file) => pasted.files.push(file),
             None => pasted.left_out = true,
@@ -334,9 +446,33 @@ fn pasted_files(files: Vec<JsonFile>, too_large: bool) -> PastedFiles {
     pasted
 }
 
+/// `file`, a large file carried by where it lies, as a paste takes it: its path is a large file's, as
+/// [`pasted_kind`] says, it lies at an absolute path, in a pack under that same path if in one,
+/// and it says it's no bigger than a video can be. Whether it's anywhere a talk's file can be is
+/// asked when it's copied in.
+fn pasted_large(file: JsonFile) -> Option<PastedLarge> {
+    let kind = pasted_kind(&file.path).filter(|kind| kind.is_large())?;
+    let lies = file.lies?;
+    let at = PathBuf::from(&lies.file);
+    if !at.is_absolute() || lies.len > kind.max_bytes() || lies.file.chars().any(char::is_control) {
+        return None;
+    }
+    let source = match lies.entry {
+        Some(entry) if entry == file.path => LargeSource::InPack { pack: at, entry },
+        Some(_) => return None,
+        None => LargeSource::File(at),
+    };
+    let modified = match lies.modified {
+        Some((secs, nanos)) => Some(SystemTime::UNIX_EPOCH.checked_add(Duration::new(secs, nanos.min(999_999_999)))?),
+        None => None,
+    };
+    Some(PastedLarge { path: file.path, kind, source, len: lies.len, modified, copied: LargeCopied::NotYet })
+}
+
 /// `file` as a paste takes it, if its path is one [`pasted_kind`] gives a kind and its bytes are
 /// base64 of no more than [`MAX_ADDED_BYTES`] that hold that kind of file: a picture the engine
-/// reads, UTF-8 data, a component's source the check lets be built, or a WebAssembly module.
+/// reads, UTF-8 data, a terminal recording, a component's source the check lets be built, or a
+/// WebAssembly module.
 fn pasted_file(file: JsonFile) -> Option<PastedFile> {
     let kind = pasted_kind(&file.path)?;
     if stated_len(&file.bytes) > MAX_ADDED_BYTES.saturating_add(3) {
@@ -349,11 +485,14 @@ fn pasted_file(file: JsonFile) -> Option<PastedFile> {
     let fits = match kind {
         FileKind::Picture => slides_engine::picture_format(&bytes).is_some(),
         FileKind::Data => std::str::from_utf8(&bytes).is_ok(),
+        FileKind::Recording => crate::added_files::is_recording(&bytes),
         FileKind::ComponentSource => {
             bytes.len() as u64 <= slides_engine::MAX_SOURCE_BYTES
                 && std::str::from_utf8(&bytes).is_ok_and(|source| slides_components::check_source(&file.path, source).is_ok())
         }
         FileKind::ComponentBuild => bytes.starts_with(WASM_MAGIC),
+        // Carried by where it lies, never as bytes.
+        FileKind::Video | FileKind::Model => false,
     };
     let built_from = file
         .built_from
@@ -376,7 +515,7 @@ pub fn pasted_kind(path: &str) -> Option<FileKind> {
         return None;
     }
     let kinds: &[FileKind] = match folder {
-        "assets" => &[FileKind::Picture, FileKind::Data],
+        "assets" => &[FileKind::Picture, FileKind::Data, FileKind::Video, FileKind::Model, FileKind::Recording],
         "components" => &[FileKind::ComponentSource],
         "build" => &[FileKind::ComponentBuild],
         _ => return None,
@@ -388,22 +527,58 @@ pub fn pasted_kind(path: &str) -> Option<FileKind> {
 /// What copying a thing from a slide, whose own text is `markdown`, and which uses `files`,
 /// puts on the clipboard: see [`slide_entry_with`].
 pub fn element_entry(markdown: &str, files: &[CopiedFile]) -> Option<Entry> {
-    carried_entry(markdown, files, |markdown, files, files_too_large| Payload::Element { version: VERSION, markdown, files, files_too_large })
+    element_entry_with_large(markdown, files, &[])
+}
+
+/// What copying a thing from a slide puts on the clipboard, as [`element_entry`] says, with
+/// `large`, the large files it uses, carried by where they lie.
+pub fn element_entry_with_large(markdown: &str, files: &[CopiedFile], large: &[CopiedLarge]) -> Option<Entry> {
+    carried_entry(markdown, files, large, |markdown, files, files_too_large| Payload::Element { version: VERSION, markdown, files, files_too_large })
 }
 
 /// What copying a slide whose own text is `markdown`, and which uses `files`, puts on the
 /// clipboard, or `None` if its text is more than a paste takes. Files more than
 /// [`MAX_CLIPBOARD_FILES`] or [`MAX_CLIPBOARD_FILES_BYTES`] aren't carried, and the paste says so.
 pub fn slide_entry_with(markdown: &str, files: &[CopiedFile]) -> Option<Entry> {
-    carried_entry(markdown, files, |markdown, files, files_too_large| Payload::Slide { version: VERSION, markdown, files, files_too_large })
+    slide_entry_with_large(markdown, files, &[])
 }
 
-fn carried_entry(markdown: &str, files: &[CopiedFile], payload: impl Fn(String, Vec<JsonFile>, bool) -> Payload) -> Option<Entry> {
+/// What copying a slide puts on the clipboard, as [`slide_entry_with`] says, with `large`, the
+/// large files it uses, carried by where they lie.
+pub fn slide_entry_with_large(markdown: &str, files: &[CopiedFile], large: &[CopiedLarge]) -> Option<Entry> {
+    carried_entry(markdown, files, large, |markdown, files, files_too_large| Payload::Slide { version: VERSION, markdown, files, files_too_large })
+}
+
+/// `large` as the metadata keeps it.
+fn json_large(large: &CopiedLarge) -> JsonFile {
+    let (file, entry) = match &large.source {
+        LargeSource::File(at) => (at.to_string_lossy().into_owned(), None),
+        LargeSource::InPack { pack, entry } => (pack.to_string_lossy().into_owned(), Some(entry.clone())),
+    };
+    let modified = large
+        .looked
+        .modified
+        .and_then(|at| at.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|since| (since.as_secs(), since.subsec_nanos()));
+    JsonFile {
+        path: large.path.clone(),
+        bytes: String::new(),
+        built_from: None,
+        lies: Some(JsonLies { file, entry, len: large.looked.len, modified }),
+    }
+}
+
+fn carried_entry(
+    markdown: &str,
+    files: &[CopiedFile],
+    large: &[CopiedLarge],
+    payload: impl Fn(String, Vec<JsonFile>, bool) -> Payload,
+) -> Option<Entry> {
     if markdown.len() > MAX_BYTES {
         return None;
     }
     let total = files.iter().fold(0usize, |sum, file| sum.saturating_add(file.bytes.len()));
-    let too_large = files.len() > MAX_CLIPBOARD_FILES || total > MAX_CLIPBOARD_FILES_BYTES;
+    let too_large = files.len() + large.len() > MAX_CLIPBOARD_FILES || total > MAX_CLIPBOARD_FILES_BYTES;
     let carried = if too_large {
         Vec::new()
     } else {
@@ -413,7 +588,9 @@ fn carried_entry(markdown: &str, files: &[CopiedFile], payload: impl Fn(String, 
                 path: file.path.clone(),
                 bytes: base64::engine::general_purpose::STANDARD.encode(&file.bytes),
                 built_from: file.built_from.clone(),
+                lies: None,
             })
+            .chain(large.iter().map(json_large))
             .collect()
     };
     let envelope = Envelope { app: payload(markdown.to_string(), carried, too_large) };
