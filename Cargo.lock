@@ -7387,6 +7387,7 @@ dependencies = [
  "slides-pdf",
  "slides-pptx",
  "slides-terminal",
+ "slides-terminal-helper",
  "slides-video",
  "tempfile",
  "toml 0.8.23",

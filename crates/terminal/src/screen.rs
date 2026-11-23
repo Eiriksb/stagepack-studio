@@ -226,7 +226,16 @@ pub struct Screen {
     /// How many cells the rows made so far hold, whatever made them: a measure of the memory
     /// taken since, for the player's account of what it keeps.
     made: u64,
+    /// Whether this is a screen a running program writes on, which answers two questions.
+    live: bool,
+    /// What a live screen has answered and nobody has taken yet.
+    answers: Vec<u8>,
+    /// Whether the program asked for the arrow keys in application mode (mode 1).
+    app_cursor: bool,
 }
+
+/// The most a live screen keeps of answers nobody has taken: a program asking in a loop gets no more.
+const MOST_ANSWERS: usize = 64 * 1024;
 
 /// Two screens are the same if they show the same and go on the same; the work each took
 /// doesn't count, nor which blank rows each keeps to share.
@@ -291,6 +300,36 @@ impl Screen {
             blanks: vec![blank],
             work: 0,
             made: u64::from(width),
+            live: false,
+            answers: Vec::new(),
+            app_cursor: false,
+        }
+    }
+
+    /// A blank screen for a program that is running, which, as every terminal must for shells to
+    /// work, answers two questions: where the cursor is (`CSI 6 n`, and `CSI 5 n` is answered as
+    /// "all well") and what kind of terminal it is (`CSI c`). It answers nothing else, and a screen
+    /// made by [`Screen::new`] answers nothing at all. Answers are taken with [`Screen::take_answers`].
+    pub fn live(width: u16, height: u16) -> Screen {
+        let mut screen = Screen::new(width, height);
+        screen.live = true;
+        screen
+    }
+
+    /// The answers given since they were last taken, bytes for the program's input.
+    pub fn take_answers(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.answers)
+    }
+
+    /// Whether the program asked for the arrow keys as `ESC O A` rather than `ESC [ A`. Only a live
+    /// screen heeds it.
+    pub fn application_cursor(&self) -> bool {
+        self.app_cursor
+    }
+
+    fn answer(&mut self, bytes: &[u8]) {
+        if self.answers.len() + bytes.len() <= MOST_ANSWERS {
+            self.answers.extend_from_slice(bytes);
         }
     }
 
@@ -357,6 +396,11 @@ impl Screen {
 
     /// Reads what a program wrote. A sequence cut off at the end is finished by what's fed next.
     pub fn feed(&mut self, text: &str) {
+        // A screen a program is running on has no end to its work, so what it costs is counted for
+        // each feed, which the caller keeps small.
+        if self.live {
+            self.work = 0;
+        }
         if self.too_costly() {
             return;
         }
@@ -686,6 +730,7 @@ impl Screen {
         self.wrap_next = false;
         self.shown = true;
         self.wraps = true;
+        self.app_cursor = false;
         self.top = 0;
         self.bottom = self.height - 1;
         self.parser = Parser::default();
@@ -725,6 +770,15 @@ impl Screen {
             return;
         }
         match csi.private {
+            0 if self.live && csi.last == b'n' => match csi.param(0, 0) {
+                5 => self.answer(b"\x1b[0n"),
+                6 => {
+                    let reply = format!("\x1b[{};{}R", self.pen.row + 1, self.pen.col + 1);
+                    self.answer(reply.as_bytes());
+                }
+                _ => {}
+            },
+            0 if self.live && csi.last == b'c' && csi.param(0, 0) == 0 && csi.params().len() <= 1 => self.answer(b"\x1b[?1;2c"),
             0 => self.csi_plain(csi),
             b'?' => match csi.last {
                 b'h' => self.modes(csi, true),
@@ -836,6 +890,7 @@ impl Screen {
     fn modes(&mut self, csi: &Csi, on: bool) {
         for mode in csi.params() {
             match mode {
+                1 if self.live => self.app_cursor = on,
                 7 => self.wraps = on,
                 25 => self.shown = on,
                 47 | 1047 => {

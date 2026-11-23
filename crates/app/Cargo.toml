@@ -29,6 +29,8 @@ slides-pptx = { path = "../pptx" }
 slides-video = { path = "../video" }
 # Why a terminal recording can't be read, said as its still says it.
 slides-terminal = { path = "../terminal" }
+# What the app and the live terminal's helper say to each other; with no pseudo-terminal in it.
+slides-terminal-helper = { path = "../terminal-helper", default-features = false }
 toolkit = { path = "../toolkit" }
 unicode-segmentation = "=1.13.3"
 

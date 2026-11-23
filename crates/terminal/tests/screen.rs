@@ -509,6 +509,49 @@ fn nothing_in_a_recording_reaches_out() {
     assert_eq!((screen.width(), screen.height()), (20, 3));
 }
 
+#[test]
+fn a_live_screen_answers_two_questions() {
+    let mut screen = Screen::live(20, 5);
+    screen.feed(&format!("{ESC}[3;5H{ESC}[6n"));
+    assert_eq!(screen.take_answers(), b"\x1b[3;5R");
+    screen.feed(&format!("{ESC}[c{ESC}[0c"));
+    assert_eq!(screen.take_answers(), b"\x1b[?1;2c\x1b[?1;2c");
+    screen.feed(&format!("{ESC}[5n"));
+    assert_eq!(screen.take_answers(), b"\x1b[0n");
+    // Nothing else is answered: the clipboard, the title, the other attributes, a status string.
+    for other in [
+        format!("{ESC}]52;c;?{ESC}\\"),
+        format!("{ESC}]52;c;?\u{7}"),
+        format!("{ESC}]0;title\u{7}"),
+        format!("{ESC}[>c"),
+        format!("{ESC}[=c"),
+        format!("{ESC}[?6n"),
+        format!("{ESC}[18t"),
+        format!("{ESC}P$qm{ESC}\\"),
+        format!("{ESC}[7n"),
+    ] {
+        screen.feed(&other);
+        assert_eq!(screen.take_answers(), b"", "{other:?} was answered");
+    }
+    // Asked in a loop with nobody listening, the answers kept are bounded.
+    for _ in 0..100_000 {
+        screen.feed(&format!("{ESC}[6n"));
+    }
+    assert!(screen.take_answers().len() <= 64 * 1024);
+    // The arrow keys' mode is known to a live screen.
+    assert!(!screen.application_cursor());
+    screen.feed(&format!("{ESC}[?1h"));
+    assert!(screen.application_cursor());
+}
+
+#[test]
+fn a_recording_screen_never_answers() {
+    let mut screen = Screen::new(20, 5);
+    screen.feed(&format!("{ESC}[3;5H{ESC}[6n{ESC}[c{ESC}[5n{ESC}[?1h"));
+    assert_eq!(screen.take_answers(), b"");
+    assert!(!screen.application_cursor());
+}
+
 /// A piece of what a program might write: text, controls, a sequence known here with any
 /// parameters, a string, or bytes of any kind.
 fn piece() -> impl Strategy<Value = String> {
