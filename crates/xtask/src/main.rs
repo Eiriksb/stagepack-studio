@@ -1,7 +1,7 @@
 //! `package`: the dev-only packaging tool.
 //!
 //!   package icon OUT_DIR       draws the icon (PNGs and .ico)
-//!   package notices OUT_FILE   gathers every licence notice
+//!   package notices OUT_FILE   gathers every licence notice (and writes notices/rust-COPYRIGHT.html beside it)
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -14,11 +14,7 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         Some("notices") => {
             let file = PathBuf::from(args.get(1).ok_or("usage: package notices OUT_FILE")?);
-            let text = xtask::notices::notices_for_workspace()?;
-            if let Some(parent) = file.parent().filter(|p| !p.as_os_str().is_empty()) {
-                std::fs::create_dir_all(parent).map_err(|e| format!("can't create {}: {e}", parent.display()))?;
-            }
-            std::fs::write(&file, text).map_err(|e| format!("can't write {}: {e}", file.display()))
+            xtask::notices::write_notices(&file)
         }
         Some(other) => Err(format!("unknown subcommand '{other}' (known: icon, notices)")),
         None => Err("usage: package <icon OUT_DIR | notices OUT_FILE>".into()),

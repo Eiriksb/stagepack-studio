@@ -82,3 +82,30 @@ fn a_package_with_no_licence_fails() {
     assert!(!ok.contains("bare 1.2.3"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_package_with_no_files_gets_the_standard_texts() {
+    let dir = std::env::temp_dir().join(format!("xtask-nofiles-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let manifest = dir.join("Cargo.toml");
+    let json = serde_json::json!({
+        "packages": [
+            {"id": "root 0.1.0", "name": "stagepack-studio", "version": "0.1.0", "license": "MIT", "manifest_path": manifest, "license_file": null},
+            {"id": "dual 1.0.0", "name": "dual", "version": "1.0.0", "license": "MIT OR Apache-2.0", "manifest_path": manifest, "license_file": null}
+        ],
+        "workspace_root": dir,
+        "resolve": {"nodes": [
+            {"id": "root 0.1.0", "deps": [{"pkg": "dual 1.0.0", "dep_kinds": [{"kind": null, "target": null}]}]},
+            {"id": "dual 1.0.0", "deps": []}
+        ]}
+    });
+    let text = notices::notices(json.to_string().as_bytes(), &[]).unwrap();
+    assert!(text.contains("--- MIT (standard text) ---") && text.contains("--- Apache-2.0 (standard text) ---"), "{text}");
+    assert!(text.contains("Apache License"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_toolchain_copyright_file_is_found() {
+    assert!(notices::toolchain_copyright().unwrap().is_file());
+}

@@ -60,6 +60,8 @@ pub fn graph(metadata_json: &[u8]) -> Result<Vec<Package>, String> {
         }
         deps.insert(id, list);
     }
+    // Proc-macro crates (and what they pull in: syn, quote, serde_derive) are kept on purpose: the compiler
+    // bundle ships libserde_derive and libtoolkit_macros as .so files, so they are part of what is shipped.
     let mut todo: Vec<&str> = packages
         .iter()
         .filter(|p| ROOTS.contains(&p["name"].as_str().unwrap_or("")))
@@ -96,17 +98,29 @@ fn is_licence_name(name: &str) -> bool {
     ["LICENSE", "LICENCE", "COPYING", "NOTICE"].iter().any(|p| up.starts_with(p))
 }
 
-/// The licence files in a package's folder, as (file name, text), in name order.
-fn licence_files(p: &Package) -> Vec<(String, String)> {
-    let mut names: BTreeSet<String> = BTreeSet::new();
-    if let Ok(rd) = std::fs::read_dir(&p.dir) {
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if e.path().is_file() && is_licence_name(&name) {
-                names.insert(name);
-            }
+/// Folders that never hold a package's own licence.
+fn skipped_dir(name: &str) -> bool {
+    matches!(name, "target" | "tests" | "test" | "node_modules" | ".git")
+}
+
+fn collect_licence_files(dir: &Path, rel: &str, depth: u32, names: &mut BTreeSet<String>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let path = e.path();
+        let shown = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+        if path.is_file() && is_licence_name(&name) {
+            names.insert(shown);
+        } else if path.is_dir() && depth > 0 && !skipped_dir(&name) {
+            collect_licence_files(&path, &shown, depth - 1, names);
         }
     }
+}
+
+/// The licence files in a package's folder (a few levels deep, skipping test and build folders), as (path, text), in path order.
+fn licence_files(p: &Package) -> Vec<(String, String)> {
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    collect_licence_files(&p.dir, "", 2, &mut names);
     if let Some(f) = &p.licence_file
         && p.dir.join(f).is_file()
     {
@@ -116,6 +130,58 @@ fn licence_files(p: &Package) -> Vec<(String, String)> {
         .into_iter()
         .filter_map(|n| std::fs::read(p.dir.join(&n)).ok().map(|b| (n, String::from_utf8_lossy(&b).into_owned())))
         .collect()
+}
+
+/// The SPDX ids in a licence expression (exceptions after WITH included).
+fn spdx_ids(expr: &str) -> Vec<String> {
+    let cleaned = expr.replace(['(', ')', '/'], " ");
+    let mut ids: Vec<String> = Vec::new();
+    for t in cleaned.split_whitespace() {
+        if matches!(t, "AND" | "OR" | "WITH" | "and" | "or" | "with") {
+            continue;
+        }
+        let id = t.trim_end_matches('+').to_string();
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+/// The toolchain's sysroot.
+fn sysroot() -> Result<PathBuf, String> {
+    let rustc = tool("RUSTC", "rustc");
+    let out = Command::new(&rustc).args(["--print", "sysroot"]).output().map_err(|e| format!("can't run {rustc}: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("{rustc} --print sysroot failed: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    Ok(PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()))
+}
+
+/// The folder of the toolchain's standard licence texts, if it can be found.
+fn toolchain_licence_dir(sysroot: &Path) -> Option<PathBuf> {
+    let mut dirs = vec![sysroot.join("share/doc/rust/licenses")];
+    if let Ok(rd) = std::fs::read_dir(sysroot.join("lib/rustlib/src/rust")) {
+        dirs.extend(rd.flatten().map(|e| e.path()));
+    }
+    dirs.into_iter().find(|d| d.join("Apache-2.0.txt").is_file() && d.join("MIT.txt").is_file())
+}
+
+/// The standard text of an SPDX id, from the toolchain's licence texts, when it has one.
+fn standard_text(id: &str) -> Option<String> {
+    let dir = toolchain_licence_dir(&sysroot().ok()?)?;
+    std::fs::read(dir.join(format!("{id}.txt"))).ok().map(|b| String::from_utf8_lossy(&b).into_owned())
+}
+
+/// The toolchain's full Rust, LLVM and third-party attributions, shipped beside the notices.
+pub fn toolchain_copyright() -> Result<PathBuf, String> {
+    let sysroot = sysroot()?;
+    let file = sysroot.join("share/doc/rust/COPYRIGHT.html");
+    if file.is_file() {
+        Ok(file)
+    } else {
+        Err(format!("the Rust toolchain's COPYRIGHT.html is missing from {}", file.parent().unwrap_or(&sysroot).display()))
+    }
 }
 
 /// The notices for crates in the given platforms' metadata, then `extra`.
@@ -135,7 +201,12 @@ pub fn notices_multi(metadata: &[&[u8]], extra: &[Notice]) -> Result<String, Str
             let expr = p.licence.clone().unwrap_or_else(|| "(no licence expression)".to_string());
             let mut body = String::new();
             if files.is_empty() {
-                body.push_str("No licence file came with this package; its licence is the expression above.\n");
+                body.push_str("No licence file came with this package; the standard text of its licence follows where available.\n");
+                for id in spdx_ids(&expr) {
+                    if let Some(text) = standard_text(&id) {
+                        body.push_str(&format!("\n--- {id} (standard text) ---\n{}\n", text.trim_end()));
+                    }
+                }
             }
             for (name, text) in files {
                 body.push_str(&format!("\n--- {name} ---\n{}\n", text.trim_end()));
@@ -208,15 +279,10 @@ pub fn extra_notices(metadata_json: &[u8]) -> Result<Vec<Notice>, String> {
     });
 
     // The toolchain's own files: the standard library and the LLVM it was built with.
-    let rustc = tool("RUSTC", "rustc");
-    let sysroot = Command::new(&rustc).args(["--print", "sysroot"]).output().map_err(|e| format!("can't run {rustc}: {e}"))?;
-    let sysroot = PathBuf::from(String::from_utf8_lossy(&sysroot.stdout).trim());
-    let mut dirs = vec![sysroot.join("share/doc/rust/licenses")];
-    if let Ok(rd) = std::fs::read_dir(sysroot.join("lib/rustlib/src/rust")) {
-        dirs.extend(rd.flatten().map(|e| e.path()));
-    }
-    let dir = dirs.iter().find(|d| d.join("Apache-2.0.txt").is_file() && d.join("MIT.txt").is_file());
-    let dir = dir.ok_or_else(|| format!("the Rust toolchain's licence files are not in {}/share/doc/rust/licenses", sysroot.display()))?;
+    let sysroot = sysroot()?;
+    let dir = toolchain_licence_dir(&sysroot)
+        .ok_or_else(|| format!("the Rust toolchain's licence files are not in {}/share/doc/rust/licenses", sysroot.display()))?;
+    toolchain_copyright()?;
     let mut texts = Vec::new();
     for f in ["Apache-2.0.txt", "MIT.txt", "LLVM-exception.txt", "NCSA.txt", "BSD-2-Clause.txt", "ISC.txt", "Unicode-3.0.txt"] {
         let path = dir.join(f);
@@ -226,6 +292,10 @@ pub fn extra_notices(metadata_json: &[u8]) -> Result<Vec<Notice>, String> {
             return Err(format!("the Rust toolchain's {f} is missing from {}", dir.display()));
         }
     }
+    texts.insert(
+        0,
+        "Copyright (c) The Rust Project Contributors.\n\nThe compiler bundle contains the Rust compiler, the standard library and LLVM. Their full attributions, \nincluding the third-party code built into them, are in the file notices/rust-COPYRIGHT.html beside this one.".to_string(),
+    );
     extra.push(Notice {
         name: "The Rust toolchain: the standard library and the LLVM it carries".into(),
         licence: "MIT OR Apache-2.0 (the standard library); Apache-2.0 WITH LLVM-exception (LLVM)".into(),
@@ -249,4 +319,15 @@ pub fn notices_for_workspace() -> Result<String, String> {
     let extra = extra_notices(&metas[0])?;
     let refs: Vec<&[u8]> = metas.iter().map(Vec::as_slice).collect();
     notices_multi(&refs, &extra)
+}
+
+/// Writes the notices to `file` and the toolchain's COPYRIGHT.html to `notices/rust-COPYRIGHT.html` beside it.
+pub fn write_notices(file: &Path) -> Result<(), String> {
+    let text = notices_for_workspace()?;
+    let html = toolchain_copyright()?;
+    let parent = file.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let sub = parent.join("notices");
+    std::fs::create_dir_all(&sub).map_err(|e| format!("can't create {}: {e}", sub.display()))?;
+    std::fs::copy(&html, sub.join("rust-COPYRIGHT.html")).map_err(|e| format!("can't copy {}: {e}", html.display()))?;
+    std::fs::write(file, text).map_err(|e| format!("can't write {}: {e}", file.display()))
 }
