@@ -912,6 +912,12 @@ impl Document {
         guarded(|| self.deck.terminal_problem(index, source)).ok().flatten()
     }
 
+    /// Why the command or screen of the terminal at `source` on slide `index` is wrong, if it is:
+    /// one that is never starts.
+    pub fn terminal_run_problem_on(&mut self, index: usize, source: &std::ops::Range<usize>) -> Option<String> {
+        guarded(|| self.deck.terminal_run_problem(index, source)).ok().flatten()
+    }
+
     /// Whether a terminal recording on slide `index` is still being read aside.
     pub fn terminal_pending(&mut self, index: usize) -> bool {
         guarded(|| self.deck.terminal_pending(index)).unwrap_or(false)

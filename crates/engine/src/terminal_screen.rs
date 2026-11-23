@@ -73,18 +73,24 @@ pub(crate) fn read_terminal(tag: &Tag) -> WrittenTerminal {
     }
 }
 
-/// Why a terminal with this `src`, `run`, `cols` and `rows` is a mistake, in a plain sentence, if
-/// it is: it has neither a recording nor a command, its command isn't one that can be run, or its
-/// screen isn't a size one can be. It's read here and nowhere run.
-pub fn terminal_complaint(src: &str, run: Option<&str>, cols: u16, rows: u16) -> Option<String> {
-    if src.is_empty() && run.is_none() {
-        return Some(TERMINAL_NO_FILE.to_string());
-    }
+/// Why a terminal's `run`, `cols` or `rows` is a mistake, in a plain sentence, if it is: its
+/// command isn't one that can be run, or its screen isn't a size one can be. It never says
+/// anything of a missing `src`, which a recording alone can do without. Read here, never run.
+pub fn terminal_run_complaint(run: Option<&str>, cols: u16, rows: u16) -> Option<String> {
     if let Some(Err(why)) = run.map(slides_terminal::split_command) {
         return Some(why);
     }
     let fits = (1..=MOST_SCREEN.0).contains(&cols) && (1..=MOST_SCREEN.1).contains(&rows);
     (!fits).then(|| TERMINAL_BAD_SIZE.to_string())
+}
+
+/// Why a terminal with this `src`, `run`, `cols` and `rows` is a mistake, if it is: it has
+/// neither a recording nor a command, or [`terminal_run_complaint`].
+pub fn terminal_complaint(src: &str, run: Option<&str>, cols: u16, rows: u16) -> Option<String> {
+    if src.is_empty() && run.is_none() {
+        return Some(TERMINAL_NO_FILE.to_string());
+    }
+    terminal_run_complaint(run, cols, rows)
 }
 
 /// The size of a screen of `columns` and `rows` at its own size: [`TERMINAL_ROW`] units a row.
@@ -708,10 +714,11 @@ pub(crate) fn lay_out_terminal(tag: &Tag, wanted: (Option<f32>, Option<f32>), pl
     let written = read_terminal(tag);
     let src = written.src.as_str();
     let complaint = terminal_complaint(src, written.run.as_deref(), written.cols, written.rows);
-    // One with no file, or that complains, is never looked for. One that runs a command and names
-    // no recording has its live screen's size, and nothing is read for it.
-    let (still, screen_size) = if src.is_empty() || complaint.is_some() {
-        (None, if src.is_empty() && complaint.is_none() { Some((written.cols, written.rows)) } else { None })
+    // One with no recording is never looked for. One that runs a command and names no recording
+    // has its live screen's size, and nothing is read for it. One that has a recording shows it
+    // whatever its command or screen says, and the complaint is a notice.
+    let (still, screen_size) = if src.is_empty() {
+        (None, if complaint.is_none() { Some((written.cols, written.rows)) } else { None })
     } else {
         let (still, size) = env.pictures.terminal_still(src, env.files);
         (Some(still), size)
@@ -719,9 +726,11 @@ pub(crate) fn lay_out_terminal(tag: &Tag, wanted: (Option<f32>, Option<f32>), pl
     let (w, h) = box_size(wanted, Some(own_size(screen_size.unwrap_or(SCREEN_UNTIL_READ))));
     let rect = Rect { x: 0.0, y: 0.0, w, h };
     let laid = |items: Placed, stops: usize, problem: Option<String>, pending: bool| LaidTerminal { size: (w, h), items, stops, problem, pending };
-    if let Some(complaint) = complaint {
-        return laid(placeholder_items(&complaint, rect, theme, env.fonts).into(), 0, Some(complaint), false);
+    if let (Some(complaint), true) = (&complaint, src.is_empty()) {
+        return laid(placeholder_items(complaint, rect, theme, env.fonts).into(), 0, Some(complaint.clone()), false);
     }
+    // A recording that's fine says what's wrong with the command beside it, as a notice.
+    let laid = |items: Placed, stops: usize, problem: Option<String>, pending: bool| laid(items, stops, problem.or_else(|| complaint.clone()), pending);
     match still {
         None => laid(command_items(LIVE_LABEL, written.run.as_deref().unwrap_or_default(), rect, theme, env.fonts).into(), 0, None, false),
         Some(TerminalStill::Cannot(why)) => laid(placeholder_items(&why.to_string(), rect, theme, env.fonts).into(), 0, Some(why.to_string()), false),

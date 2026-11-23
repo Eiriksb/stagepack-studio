@@ -584,6 +584,10 @@ fn exports_show_a_live_terminal_as_its_still() {
         // A recording alone is counted as it was, apart from them.
         let notices = said(format!("# One\n\n{live}{recording}"));
         assert_eq!(counted(&notices), ["1 terminal recording was exported as its last screen.", "1 live terminal is shown as its recording or a still."], "{kind:?}: {notices:?}");
+        // One with a good recording and a command that can't run is still its recording.
+        let bad = "<Terminal run=\"\" src=\"assets/run.cast\" x=\"100\" y=\"600\" w=\"640\" h=\"360\" />\n";
+        let notices = said(format!("# One\n\n{bad}"));
+        assert_eq!(counted(&notices), ["1 live terminal is shown as its recording or a still."], "{kind:?}: {notices:?}");
         // Nothing ran: no file was made in the talk's folder, or here.
         assert!(!folder.path().join("ran").exists());
         assert!(!std::path::Path::new("ran").exists());

@@ -1228,7 +1228,6 @@ fn a_bad_live_terminal_says_why() {
         (format!("<Terminal run=\"bash\" cols=\"501\" {place} />"), "A terminal can be 1 to 500 columns and 1 to 200 rows."),
         (format!("<Terminal run=\"bash\" rows=\"201\" {place} />"), "A terminal can be 1 to 500 columns and 1 to 200 rows."),
         (format!("<Terminal run=\"bash\" rows=\"many\" {place} />"), "A terminal can be 1 to 500 columns and 1 to 200 rows."),
-        (format!("<Terminal run=\"bash\" src=\"assets/run.cast\" rows=\"-1\" {place} />"), "A terminal can be 1 to 500 columns and 1 to 200 rows."),
     ];
     for (tag, why) in bad {
         let mut deck = deck_of(&format!("{tag}\n"), &[("assets/run.cast", cast.clone())]);
@@ -1236,6 +1235,16 @@ fn a_bad_live_terminal_says_why() {
         assert_eq!(text_of(&layer), why, "{tag}");
         assert!(deck.notices(0).iter().any(|notice| notice == why), "{tag}: {:?}", deck.notices(0));
         assert_eq!(deck.terminal_problem(0, layer.source.as_ref().unwrap()).as_deref(), Some(why), "{tag}");
+    }
+    // With a good recording, a bad command or size is a notice, and the recording shows and plays.
+    for (extra, why) in [("run=\"\"", "The command to run is empty."), ("run=\"bash\" rows=\"-1\"", "A terminal can be 1 to 500 columns and 1 to 200 rows."), ("rows=\"-1\"", "A terminal can be 1 to 500 columns and 1 to 200 rows.")] {
+        let mut deck = deck_of(&format!("<Terminal src=\"assets/run.cast\" {extra} {place} />\n"), &[("assets/run.cast", make_test_cast(20, 4, &[(0.1, "o", "hello")]))]);
+        let layer = terminal_layer(&mut deck, 0);
+        assert_eq!(text_of(&layer), "hello", "{extra}");
+        assert!(deck.notices(0).iter().any(|notice| notice == why), "{extra}: {:?}", deck.notices(0));
+        let source = layer.source.as_ref().unwrap();
+        assert_eq!(deck.terminal_problem(0, source), None, "{extra}: the recording can be shown");
+        assert_eq!(deck.terminal_run_problem(0, source).as_deref(), Some(why), "{extra}");
     }
     // The biggest and smallest screens are fine.
     for sizes in ["cols=\"1\" rows=\"1\"", "cols=\"500\" rows=\"200\""] {

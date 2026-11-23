@@ -732,4 +732,9 @@ fn nothing_runs_from_the_ai_tool() {
     assert!(said.contains("A terminal can be 1 to 500 columns and 1 to 200 rows."), "{said}");
     assert!(said.contains("The command to run is empty."), "{said}");
     assert!(!talk.join("ran").exists());
+    // A good recording with a bad command still plays, and check says what's wrong with the command.
+    std::fs::write(talk.join("slides.md"), "# Hi\n\n<Terminal run=\"\" src=\"assets/run.cast\" x=\"100\" y=\"100\" w=\"640\" h=\"360\" />\n").unwrap();
+    let output = run(&["check", talk_text], dir.path());
+    assert_eq!(output.status.code(), Some(1));
+    assert!(text(&output.stdout).contains("The command to run is empty."), "{}", text(&output.stdout));
 }

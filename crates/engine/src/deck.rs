@@ -847,15 +847,24 @@ impl Deck {
             return None;
         }
         let on = self.specs(index).iter().find(|spec| spec.source.as_ref() == Some(source))?.terminal.clone()?;
-        if let Some(complaint) = crate::terminal_complaint(&on.src, on.run.as_deref(), on.cols, on.rows) {
-            return Some(complaint);
-        }
-        // One that runs a command and names no recording has no file to be read.
         let src = on.src;
+        // One that names no recording is a mistake if it has no usable command either, and has
+        // no file to be read if it has.
         if src.is_empty() {
-            return None;
+            return crate::terminal_complaint(&src, on.run.as_deref(), on.cols, on.rows);
         }
         self.pictures.terminal_problem(&src).map(|why| why.to_string())
+    }
+
+    /// The plain sentence saying why the command or screen of the terminal at `source` on slide
+    /// `index` is wrong, if it is. A terminal that can't run is still shown as its recording or
+    /// panel, so this is apart from [`Self::terminal_problem`], which is about showing it.
+    pub fn terminal_run_problem(&mut self, index: usize, source: &std::ops::Range<usize>) -> Option<String> {
+        if index >= self.slides.len() {
+            return None;
+        }
+        let on = self.specs(index).iter().find(|spec| spec.source.as_ref() == Some(source))?.terminal.clone()?;
+        crate::terminal_screen::terminal_run_complaint(on.run.as_deref(), on.cols, on.rows)
     }
 
     /// Whether a terminal recording on slide `index` is still being read aside: until it's read,

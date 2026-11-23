@@ -106,6 +106,9 @@ pub fn slide_problems(talk: &mut OpenTalk, index: usize) -> Vec<String> {
                 _ => deck.terminal_problem(index, &range),
             };
             problems.extend(problem);
+            if name == "Terminal" {
+                problems.extend(deck.terminal_run_problem(index, &range));
+            }
         }
         // A problem a tag has is among the slide's notices too.
         let mut once = Vec::new();
