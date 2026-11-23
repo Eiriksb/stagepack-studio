@@ -113,8 +113,15 @@ fn read(file: &Path) -> Stored {
 /// somewhere else, is another thing to say yes to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunKey {
-    pub command: Vec<String>,
-    pub folder: Option<PathBuf>,
+    pub(crate) command: Vec<String>,
+    pub(crate) folder: Option<PathBuf>,
+}
+
+impl RunKey {
+    /// The words, the program as the file it resolves to.
+    pub fn command(&self) -> &[String] {
+        &self.command
+    }
 }
 
 /// What this talk, in this window, has been told about commands: held by the window, not by the
@@ -137,7 +144,7 @@ impl SessionYes {
     }
 
     /// Says yes to `key`, exactly, for the rest of the session.
-    pub fn allow(&mut self, key: &RunKey) {
+    pub(crate) fn allow(&mut self, key: &RunKey) {
         self.refused.retain(|one| one != key);
         if !self.allowed(key) {
             self.allowed.push(key.clone());
@@ -145,11 +152,23 @@ impl SessionYes {
     }
 
     /// Says no to `key`, exactly, for the rest of the session: it isn't asked again.
-    pub fn refuse(&mut self, key: &RunKey) {
+    pub(crate) fn refuse(&mut self, key: &RunKey) {
         self.allowed.retain(|one| one != key);
         if !self.refused(key) {
             self.refused.push(key.clone());
         }
+    }
+
+    /// [`Self::allow`], for tests, which have no one to ask.
+    #[cfg(feature = "test-hooks")]
+    pub fn allow_for_tests(&mut self, key: &RunKey) {
+        self.allow(key);
+    }
+
+    /// [`Self::refuse`], for tests.
+    #[cfg(feature = "test-hooks")]
+    pub fn refuse_for_tests(&mut self, key: &RunKey) {
+        self.refuse(key);
     }
 
     /// Whether `key`, exactly, has been said no to.
@@ -170,15 +189,65 @@ pub enum Decision {
     Refused,
 }
 
-/// Whether `c` is one that can hide: a control, a format character (bidirectional marks and
-/// overrides, zero-width characters, the byte order mark), or a space of any kind but the plain one.
+/// The Default_Ignorable_Code_Point property: characters that draw as nothing, or as blank space.
+/// From DerivedCoreProperties.txt of Unicode 16.0 (the version of the `unicode-properties`
+/// tables this app uses), written out as ranges.
+const DEFAULT_IGNORABLE: &[(u32, u32)] = &[
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+];
+
+/// Whether `c` is one that can hide: one that is Default_Ignorable, the blank braille pattern, or
+/// by its general category a control, a format character, a line or paragraph separator, any
+/// space but the plain one, or a private-use or surrogate code point.
 pub(super) fn hides(c: char) -> bool {
-    c.is_control()
-        || (c.is_whitespace() && c != ' ')
-        || matches!(c as u32,
-            0xAD | 0x600..=0x605 | 0x61C | 0x6DD | 0x70F | 0x8E2 | 0x180E | 0x200B..=0x200F | 0x2028..=0x202E
-            | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB | 0x110BD | 0x1D173..=0x1D17A
-            | 0xE0001 | 0xE0020..=0xE007F)
+    use unicode_properties::{GeneralCategory as Category, UnicodeGeneralCategory as _};
+    let code = c as u32;
+    if code == 0x2800 || DEFAULT_IGNORABLE.iter().any(|&(first, last)| (first..=last).contains(&code)) {
+        return true;
+    }
+    match c.general_category() {
+        Category::Control | Category::Format | Category::LineSeparator | Category::ParagraphSeparator | Category::PrivateUse | Category::Surrogate => true,
+        Category::SpaceSeparator => c != ' ',
+        _ => c.is_whitespace() && c != ' ',
+    }
+}
+
+/// Whether `c` is a combining mark that draws over the character before it.
+fn combining(c: char) -> bool {
+    use unicode_properties::{GeneralCategory as Category, UnicodeGeneralCategory as _};
+    matches!(c.general_category(), Category::NonspacingMark | Category::EnclosingMark)
+}
+
+/// The most combining marks that may follow one another.
+const MOST_COMBINING: usize = 2;
+
+/// Whether `word` has more than [`MOST_COMBINING`] combining marks in a row, which draw over
+/// whatever is near.
+fn stacked(word: &str) -> bool {
+    let mut run = 0;
+    for c in word.chars() {
+        run = if combining(c) { run + 1 } else { 0 };
+        if run > MOST_COMBINING {
+            return true;
+        }
+    }
+    false
 }
 
 /// Why the words of a command can't be run, if they can't: it must be what it looks like, so no
@@ -190,7 +259,7 @@ fn unrunnable(command: &[String]) -> Option<String> {
     }
     for word in command {
         let spaced = word.starts_with(' ') || word.ends_with(' ') || word.contains("  ");
-        if word.chars().any(hides) || spaced {
+        if word.chars().any(hides) || spaced || stacked(word) {
             return Some(
                 "The command to run has a space or a character that can't be seen, so it isn't run. Write it plainly.".to_string(),
             );
@@ -218,7 +287,7 @@ impl Plan {
         self.folder.as_ref()
     }
 
-    /// Whether the program is a file that comes with the talk.
+    /// Whether the talk chose the program's file: it's written as a path, or it's inside the talk.
     pub fn program_in_talk(&self) -> bool {
         self.program.in_talk
     }
@@ -226,12 +295,10 @@ impl Plan {
     /// The words as the question shows them: the program as the file that runs, as `<talk>/name`
     /// if the talk brings it, then the arguments as the command has them.
     pub fn shown_words(&self) -> Vec<String> {
-        let first = match (&self.folder, self.program.in_talk) {
-            (Some(folder), true) => {
-                let inside = self.program.path.strip_prefix(folder.path()).unwrap_or(&self.program.path);
-                format!("<talk>/{}", inside.display())
-            }
-            _ => self.program.path.display().to_string(),
+        let inside = self.folder.as_ref().and_then(|folder| self.program.path.strip_prefix(folder.path()).ok());
+        let first = match inside {
+            Some(inside) => format!("<talk>/{}", inside.display()),
+            None => self.program.path.display().to_string(),
         };
         std::iter::once(first).chain(self.key.command[1..].iter().cloned()).collect()
     }
@@ -244,7 +311,11 @@ pub fn plan_with_path(talk: &TalkPlace, command: &[String], path_var: Option<&Os
         return Err(why);
     }
     let folder = match talk {
-        TalkPlace::Folder(_) => Some(TalkFolder::of(talk).ok_or("This talk's folder can't be found, so nothing is run.")?),
+        TalkPlace::Folder(_) => Some(
+            TalkFolder::of(talk)
+                .filter(|folder| folder.path().to_str().is_some())
+                .ok_or("This talk's folder can't be found, so nothing is run.")?,
+        ),
         TalkPlace::Packed(_) | TalkPlace::Untitled(_) => None,
     };
     let program = resolve_program(&command[0], folder.as_ref().map(TalkFolder::path), path_var)?;
@@ -330,8 +401,9 @@ impl Permit {
         &self.spec
     }
 
-    /// A permit for a test of the session itself, which runs whatever it's given. Nothing else may
-    /// call this: the source is searched for it.
+    /// A permit for a test of the session itself, which runs whatever it's given. It isn't in the
+    /// app: only a build with the `test-hooks` feature has it.
+    #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub fn unchecked_for_tests(spec: StartSpec) -> Permit {
         Permit { spec, scratch: None }

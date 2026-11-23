@@ -16,13 +16,20 @@ pub const RUN_YES_ID: &str = "run-yes";
 /// Not there for a packed or untitled talk, whose yes is never remembered.
 pub const RUN_ALWAYS_ID: &str = "run-always";
 pub const RUN_NO_ID: &str = "run-no";
-/// Each line of the question has this id with its number.
+/// Each word of the command, one to a line, has this id with its number.
 pub const RUN_LINE_ID: &str = "run-line";
+/// The part above the words, which doesn't scroll: where it runs, what to know, the warning.
+pub const RUN_HEAD_ID: &str = "run-head";
+/// Each line of the head after the question has this id with its number.
+pub const RUN_HEAD_LINE_ID: &str = "run-head-line";
+/// The words, which scroll if there are many.
+pub const RUN_WORDS_ID: &str = "run-words";
 
 pub const RUN_QUESTION: &str = "This talk wants to run a program on your computer.";
 pub const RUN_WARNING: &str = "It can do anything you can do. Run it only if you trust this talk.";
 pub const RUN_IN_NEW_FOLDER: &str = "in a new empty folder";
 pub const RUN_PROGRAM_IN_TALK: &str = "The program is a file that comes with this talk.";
+pub const RUN_NOT_ASCII: &str = "Some of this command isn't plain ASCII, so check each letter.";
 
 /// What is asked: the command's words as they will run (the program as the file that runs), and the
 /// folder it would run in for a talk kept in one.
@@ -86,7 +93,8 @@ pub fn ask_to_run(
             };
             let (escape, enter) = (finish.clone(), finish.clone());
             let mono = cx.theme().mono_font_family.clone();
-            let lines = lines_of(&question);
+            let words = word_lines(&question);
+            let head = head_lines(&question);
             dialog
                 .title("Run a program?")
                 .close_button(false)
@@ -95,16 +103,33 @@ pub fn ask_to_run(
                 // Enter with the keyboard on nothing in particular is not a yes.
                 .on_ok(move |_, window, cx| enter(RunAnswer::DontRun, window, cx))
                 .child(
+                    // What the owner must see comes first and stays put; only the words scroll.
                     v_flex()
                         .id(RUN_ASK_ID)
                         .test_support()
                         .aria_label(RUN_QUESTION)
                         .gap_2()
-                        .child(div().child(RUN_QUESTION))
-                        .child(v_flex().font_family(mono).children(lines.into_iter().enumerate().map(|(index, line)| {
-                            div().id((RUN_LINE_ID, index)).test_support().aria_label(line.clone()).child(line)
-                        })))
-                        .child(div().text_sm().child(RUN_WARNING)),
+                        .child(
+                            v_flex()
+                                .id(RUN_HEAD_ID)
+                                .test_support()
+                                .gap_1()
+                                .child(div().child(RUN_QUESTION))
+                                .children(head.into_iter().enumerate().map(|(index, line)| {
+                                    div().id((RUN_HEAD_LINE_ID, index)).test_support().aria_label(line.clone()).text_sm().child(line)
+                                })),
+                        )
+                        .child(
+                            v_flex()
+                                .id(RUN_WORDS_ID)
+                                .test_support()
+                                .max_h(px(240.))
+                                .overflow_y_scroll()
+                                .font_family(mono)
+                                .children(words.into_iter().enumerate().map(|(index, line)| {
+                                    div().id((RUN_LINE_ID, index)).test_support().aria_label(line.clone()).child(line)
+                                })),
+                        ),
                 )
                 .footer(
                     h_flex()
@@ -134,6 +159,9 @@ fn visible(text: &str) -> String {
                 shown.push(c);
             }
             c if super::permission::hides(c) => shown.push_str(&format!("\\u{{{:X}}}", c as u32)),
+            // A letter from outside Latin-1 is shown with what it is, as one that looks like
+            // another can't be told by eye.
+            c if c as u32 > 0xFF => shown.push_str(&format!("{c}[U+{:04X}]", c as u32)),
             c => shown.push(c),
         }
     }
@@ -141,10 +169,9 @@ fn visible(text: &str) -> String {
     shown
 }
 
-/// The lines of the question, one to a line: each word of the command, then where it runs.
-fn lines_of(question: &RunQuestion) -> Vec<SharedString> {
-    let mut lines: Vec<SharedString> = question.command.iter().map(|word| SharedString::from(visible(word))).collect();
-    lines.push("in".into());
+/// The lines above the words: where it runs, what to know about it, and the warning.
+fn head_lines(question: &RunQuestion) -> Vec<SharedString> {
+    let mut lines: Vec<SharedString> = vec!["in".into()];
     lines.push(match &question.folder {
         Some(folder) => visible(&folder.display().to_string()).into(),
         None => RUN_IN_NEW_FOLDER.into(),
@@ -152,5 +179,14 @@ fn lines_of(question: &RunQuestion) -> Vec<SharedString> {
     if question.program_in_talk {
         lines.push(RUN_PROGRAM_IN_TALK.into());
     }
+    if question.command.iter().any(|word| !word.is_ascii()) {
+        lines.push(RUN_NOT_ASCII.into());
+    }
+    lines.push(RUN_WARNING.into());
     lines
+}
+
+/// The words of the command, one to a line, each as it can be seen.
+fn word_lines(question: &RunQuestion) -> Vec<SharedString> {
+    question.command.iter().map(|word| SharedString::from(visible(word))).collect()
 }

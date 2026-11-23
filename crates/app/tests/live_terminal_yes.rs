@@ -17,7 +17,8 @@ use slides_engine::Fonts;
 use stagepack_studio::document::{Document, TalkPlace, UntitledId};
 use stagepack_studio::export::{ExportKind, run_export};
 use stagepack_studio::live_terminal::{
-    Decision, HELPER_ENV, RUN_ALWAYS_ID, RUN_ASK_ID, RUN_IN_NEW_FOLDER, RUN_LINE_ID, RUN_NO_ID, RUN_PROGRAM_IN_TALK, RUN_QUESTION, RUN_YES_ID,
+    Decision, HELPER_ENV, RUN_ALWAYS_ID, RUN_ASK_ID, RUN_HEAD_ID, RUN_HEAD_LINE_ID, RUN_IN_NEW_FOLDER, RUN_LINE_ID, RUN_NO_ID, RUN_NOT_ASCII, RUN_PROGRAM_IN_TALK,
+    RUN_QUESTION, RUN_WARNING, RUN_WORDS_ID, RUN_YES_ID,
     RunPermissions, SessionYes, may_run, may_run_with_path, permit, plan, plan_with_path, start_after_yes,
 };
 use stagepack_studio::present_view::start_show;
@@ -68,11 +69,11 @@ fn the_yes_is_asked_once_per_session() {
     let key = key_of(&talk, &["sh"]);
     let mut session = SessionYes::new();
     assert_eq!(may_run(&talk, &sh, &session, &remembered), Decision::Ask);
-    session.allow(&key);
+    session.allow_for_tests(&key);
     assert_eq!(may_run(&talk, &sh, &session, &remembered), Decision::Run);
     assert_eq!(may_run(&talk, &words(&["sh", "-l"]), &session, &remembered), Decision::Ask, "another command asks again");
     assert_eq!(may_run(&talk, &words(&["ls"]), &session, &remembered), Decision::Ask);
-    session.refuse(&key);
+    session.refuse_for_tests(&key);
     assert!(session.refused(&key) && !session.allowed(&key));
     assert_eq!(may_run(&talk, &sh, &session, &remembered), Decision::Refused);
     assert_eq!(may_run(&talk, &sh, &SessionYes::new(), &remembered), Decision::Ask, "a new session starts over");
@@ -91,11 +92,11 @@ fn a_yes_is_for_where_it_runs_too() {
     let remembered = permissions_in(scratch.path());
     let (in_a, in_b, packed) = (TalkPlace::Folder(a), TalkPlace::Folder(b), TalkPlace::Packed(root.path().join("t.sptx")));
     let mut session = SessionYes::new();
-    session.allow(&key_of(&packed, &["sh"]));
+    session.allow_for_tests(&key_of(&packed, &["sh"]));
     // A pack that is saved as a folder, or a talk moved to another folder, is asked about again.
     assert_eq!(may_run(&packed, &words(&["sh"]), &session, &remembered), Decision::Run);
     assert_eq!(may_run(&in_a, &words(&["sh"]), &session, &remembered), Decision::Ask);
-    session.allow(&key_of(&in_a, &["sh"]));
+    session.allow_for_tests(&key_of(&in_a, &["sh"]));
     assert_eq!(may_run(&in_a, &words(&["sh"]), &session, &remembered), Decision::Run);
     assert_eq!(may_run(&in_b, &words(&["sh"]), &session, &remembered), Decision::Ask);
 }
@@ -122,18 +123,25 @@ fn what_hides_in_a_word_is_refused() {
     let hiding = [
         "a\u{202E}b", "a\u{200B}b", "a\nb", "a\tb", "a\u{2028}b", "a\u{FEFF}b", "a\u{2066}b", "a\u{AD}b", "a\u{85}b", "a\u{A0}b", "a\rb",
         "a   b", "a  b", " lead", "trail ",
+        // Blank or invisible without being Cc, Cf or white space.
+        "a\u{2800}b", "a\u{3164}b", "a\u{115F}b", "a\u{1160}b", "a\u{FFA0}b", "a\u{34F}b", "a\u{FE00}b", "a\u{FE0F}b", "a\u{E0100}b",
+        "a\u{E01EF}b", "a\u{180B}b", "a\u{180D}b", "a\u{180F}b", "a\u{17B4}b", "a\u{17B5}b", "a\u{890}b", "a\u{891}b", "a\u{110CD}b",
+        "a\u{13430}b", "a\u{1343F}b", "a\u{1BCA0}b", "a\u{1BCA3}b", "a\u{E0001}b", "a\u{E0020}b", "a\u{E007F}b", "a\u{E000}b",
+        "a\u{3000}b", "a\u{A0}b", "a\u{2003}b", "a\u{1680}b", "a\u{202F}b", "a\u{205F}b", "a\u{2029}b", "a\u{FFF9}b",
+        // More than two combining marks in a row.
+        "a\u{301}\u{302}\u{303}b",
     ];
     for word in hiding {
         let command = words(&["echo", word]);
         // Even a yes already given isn't one for it.
         let mut session = SessionYes::new();
         if let Ok(plan) = plan(&talk, &command) {
-            session.allow(plan.key());
+            session.allow_for_tests(plan.key());
         }
         assert_eq!(may_run(&talk, &command, &session, &remembered), Decision::Refused, "{word:?}");
     }
-    // An empty argument, one single space, and plain words are what a command is.
-    for fine in [vec!["echo", ""], vec!["echo", "two words"], vec!["echo", "-n", "x y z"]] {
+    // An empty argument, one single space, plain words, Norwegian and two combining marks are what a command is.
+    for fine in [vec!["echo", ""], vec!["echo", "two words"], vec!["echo", "-n", "x y z"], vec!["echo", "blåbærsyltetøy ÆØÅ"], vec!["echo", "e\u{301}\u{302}"]] {
         assert_eq!(may_run(&talk, &words(&fine), &SessionYes::new(), &remembered), Decision::Ask, "{fine:?}");
     }
 }
@@ -186,7 +194,7 @@ fn always_is_for_the_resolved_program() {
     let by_one = path_of(&[&one]);
     let by_other = path_of(&[&other]);
     let kept = plan_with_path(&talk, &words(&["demo"]), Some(&by_one)).unwrap();
-    remembered.remember(kept.folder().unwrap(), &kept.key().command).unwrap();
+    remembered.remember(kept.folder().unwrap(), kept.key().command()).unwrap();
     let session = SessionYes::new();
     assert_eq!(may_run_with_path(&talk, &words(&["demo"]), Some(&by_one), &session, &remembered), Decision::Run);
     assert_eq!(may_run_with_path(&talk, &words(&["demo"]), Some(&by_other), &session, &remembered), Decision::Ask, "it resolves elsewhere now");
@@ -202,7 +210,7 @@ fn always_is_for_one_folder_and_one_command() {
     let mut remembered = permissions_in(scratch.path());
     let sh = words(&["sh"]);
     let kept = plan(&TalkPlace::Folder(a.clone()), &sh).unwrap();
-    remembered.remember(kept.folder().unwrap(), &kept.key().command).unwrap();
+    remembered.remember(kept.folder().unwrap(), kept.key().command()).unwrap();
     let session = SessionYes::new();
     let decide = |place: &TalkPlace, command: &[String]| may_run(place, command, &session, &remembered);
     assert_eq!(decide(&TalkPlace::Folder(a.clone()), &sh), Decision::Run);
@@ -219,7 +227,7 @@ fn always_is_for_one_folder_and_one_command() {
     assert_eq!(decide(&TalkPlace::Packed(a.clone()), &sh), Decision::Ask);
     assert_eq!(decide(&TalkPlace::Untitled(UntitledId(1)), &sh), Decision::Ask);
     let again = permissions_in(scratch.path());
-    assert!(again.always(&a, &kept.key().command) && !again.always(&b, &kept.key().command));
+    assert!(again.always(&a, kept.key().command()) && !again.always(&b, kept.key().command()));
     let renamed = root.path().join("renamed");
     std::fs::rename(&a, &renamed).unwrap();
     assert_eq!(may_run(&TalkPlace::Folder(renamed), &sh, &session, &again), Decision::Ask);
@@ -245,7 +253,7 @@ fn a_talk_cant_give_itself_a_yes() {
     let scratch = tempfile::tempdir().unwrap();
     let sh = words(&["sh"]);
     let canonical = talk.path().canonicalize().unwrap();
-    let real = plan(&TalkPlace::Folder(talk.path().to_path_buf()), &sh).unwrap().key().command.clone();
+    let real = plan(&TalkPlace::Folder(talk.path().to_path_buf()), &sh).unwrap().key().command().to_vec();
     let claim = format!("{{\"always_run\": [{{\"folder\": {:?}, \"command\": {:?}}}]}}", canonical.display().to_string(), real);
     std::fs::write(talk.path().join("terminal-permissions.json"), &claim).unwrap();
     std::fs::create_dir_all(talk.path().join("stagepack-studio")).unwrap();
@@ -258,7 +266,7 @@ fn a_talk_cant_give_itself_a_yes() {
     assert_eq!(may_run(document.place(), &sh, &SessionYes::new(), &own), Decision::Ask);
     let mut own = own;
     let kept = plan(&place, &sh).unwrap();
-    own.remember(kept.folder().unwrap(), &kept.key().command).unwrap();
+    own.remember(kept.folder().unwrap(), kept.key().command()).unwrap();
     assert!(scratch.path().join("terminal-permissions.json").is_file());
     assert_eq!(std::fs::read_to_string(talk.path().join("terminal-permissions.json")).unwrap(), claim);
 }
@@ -272,7 +280,7 @@ fn where_it_runs_and_with_what_comes_from_the_talk() {
     let mut session = SessionYes::new();
     let place = TalkPlace::Folder(folder.path().to_path_buf());
     assert!(matches!(permit(&place, &command, &session, &remembered, (40, 6)), Err(Decision::Ask)));
-    session.allow(plan(&place, &command).unwrap().key());
+    session.allow_for_tests(plan(&place, &command).unwrap().key());
     let granted = permit(&place, &command, &session, &remembered, (40, 6)).unwrap();
     let spec = granted.spec();
     assert_eq!(spec.cwd, canonical);
@@ -282,7 +290,7 @@ fn where_it_runs_and_with_what_comes_from_the_talk() {
     assert_eq!(names, ["TERM", "COLUMNS", "LINES"]);
     // A pack runs in a new empty folder, removed when it's let go of.
     let packed = TalkPlace::Packed(folder.path().join("t.sptx"));
-    session.allow(plan(&packed, &command).unwrap().key());
+    session.allow_for_tests(plan(&packed, &command).unwrap().key());
     let granted = permit(&packed, &command, &session, &remembered, (40, 6)).unwrap();
     let scratch = granted.spec().cwd.clone();
     assert!(scratch.is_dir() && std::fs::read_dir(&scratch).unwrap().next().is_none());
@@ -293,6 +301,102 @@ fn where_it_runs_and_with_what_comes_from_the_talk() {
     // A folder that has gone can't be run in.
     let gone = TalkPlace::Folder(folder.path().join("gone"));
     assert!(matches!(permit(&gone, &command, &session, &remembered, (40, 6)), Err(Decision::Refused)));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_path_folder_inside_the_talk_or_linking_into_it_is_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let folder = root.path().join("talk");
+    program(&folder.join("bin"), "demo");
+    let canonical = folder.canonicalize().unwrap();
+    let talk = TalkPlace::Folder(folder.clone());
+    let real = sys_dir();
+    // The talk's own folder, as written and by a link.
+    let link = root.path().join("elsewhere");
+    std::os::unix::fs::symlink(canonical.join("bin"), &link).unwrap();
+    for entry in [canonical.join("bin"), link] {
+        let path = path_of(&[&entry, &real]);
+        let why = plan_with_path(&talk, &words(&["sh"]), Some(&path)).unwrap_err();
+        assert!(why.contains("comes with this talk"), "{why}");
+    }
+    // A link inside the talk's folder that leads out of it: the folder is the talk's.
+    std::fs::create_dir_all(canonical.join("tools")).unwrap();
+    std::os::unix::fs::symlink(real.join("sh"), canonical.join("tools/sh")).unwrap();
+    let path = path_of(&[&canonical.join("tools"), &real]);
+    assert!(plan_with_path(&talk, &words(&["sh"]), Some(&path)).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_path_that_isnt_text_is_refused() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let root = tempfile::tempdir().unwrap();
+    let odd = root.path().join(std::ffi::OsStr::from_bytes(b"odd\xFFfolder"));
+    let name = program(&odd, "demo");
+    let talk = TalkPlace::Folder(root.path().to_path_buf());
+    let path = path_of(&[&odd]);
+    assert!(plan_with_path(&talk, &words(&["demo"]), Some(&path)).is_err(), "found by the PATH");
+    assert!(plan_with_path(&talk, &[name.to_string_lossy().into_owned()], None).is_err(), "named by a path");
+    // And a talk whose own folder isn't text can't run anything.
+    let in_odd = TalkPlace::Folder(odd);
+    assert!(plan_with_path(&in_odd, &words(&["sh"]), Some(&sys_path())).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_program_written_as_a_path_is_the_talks_choice_wherever_it_is() {
+    let folder = tempfile::tempdir().unwrap();
+    let talk = TalkPlace::Folder(folder.path().to_path_buf());
+    let absolute = sys_dir().join("sh").display().to_string();
+    let one = plan_with_path(&talk, &words(&[&absolute]), Some(&sys_path())).unwrap();
+    assert!(one.program_in_talk(), "the dialog says the talk chose it");
+    // A path is taken as the file it really is.
+    assert_eq!(one.shown_words()[0], Path::new(&absolute).canonicalize().unwrap().display().to_string());
+    let by_name = plan_with_path(&talk, &words(&["sh"]), Some(&sys_path())).unwrap();
+    assert!(!by_name.program_in_talk());
+    // `..` and `.` are settled in the words.
+    let up = plan_with_path(&talk, &words(&["./../x"]), Some(&sys_path()));
+    assert!(up.is_err());
+}
+
+// Windows: the rules are written for it and have not been compiled or run here (no Windows
+// toolchain); they are for the owner's by-hand check.
+#[cfg(windows)]
+#[test]
+fn on_windows_only_an_exe_or_com_is_a_program() {
+    let root = tempfile::tempdir().unwrap();
+    let folder = root.path().join("talk");
+    std::fs::create_dir_all(&folder).unwrap();
+    let bin = root.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for name in ["tool.cmd", "tool.bat", "TOOL2.BAT", "script.ps1", "real.exe", "OLD.COM"] {
+        std::fs::write(bin.join(name), "").unwrap();
+    }
+    let talk = TalkPlace::Folder(folder);
+    let path = path_of(&[&bin]);
+    for refused in ["tool.cmd", "tool.bat", "TOOL2.BAT", "tool.bat.", "script.ps1", "tool"] {
+        assert!(plan_with_path(&talk, &words(&[refused]), Some(&path)).is_err(), "{refused}");
+    }
+    for fine in ["real.exe", "REAL.EXE", "real", "OLD.COM"] {
+        assert!(plan_with_path(&talk, &words(&[fine]), Some(&path)).is_ok(), "{fine}");
+    }
+    for drive_relative in ["C:foo", "C:", "D:x\\y.exe"] {
+        assert!(plan_with_path(&talk, &words(&[drive_relative]), Some(&path)).is_err(), "{drive_relative}");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn on_windows_a_relative_program_is_found_in_the_talk() {
+    let root = tempfile::tempdir().unwrap();
+    let folder = root.path().join("talk");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("tool.exe"), "").unwrap();
+    let talk = TalkPlace::Folder(folder);
+    let found = plan_with_path(&talk, &words(&["./tool.exe"]), None).unwrap();
+    assert!(found.program_in_talk());
+    assert_eq!(found.shown_words()[0], "<talk>/tool.exe");
 }
 
 // The dialog.
@@ -327,6 +431,23 @@ fn lines(typing: &Typing, cx: &mut TestAppContext) -> Vec<String> {
     })
 }
 
+/// The lines above the words, after the question.
+fn head(typing: &Typing, cx: &mut TestAppContext) -> Vec<String> {
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        (0..50usize).map_while(|n| window.try_find((RUN_HEAD_LINE_ID, n)).and_then(|line| line.label().map(str::to_string))).collect()
+    })
+}
+
+/// Where the top of the element `id` is, in the window.
+fn top_of(typing: &Typing, cx: &mut TestAppContext, id: impl Into<gpui_kit::ElementId>) -> f32 {
+    let id = id.into();
+    typing.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        f32::from(window.find(id).bounds().origin.y)
+    })
+}
+
 fn window(cx: &mut TestAppContext) -> (Typing, tempfile::TempDir) {
     let scratch = tempfile::tempdir().unwrap();
     let typing = open(cx, TALK);
@@ -352,10 +473,9 @@ fn the_dialog_shows_the_whole_command(cx: &mut TestAppContext) {
         "\"-c\"".to_string(),
         "\"echo hi \\\"there\\\"\"".to_string(),
         "\"x\\\\y\"".to_string(),
-        "in".to_string(),
-        format!("\"{}\"", folder_of(&typing).display()),
     ];
-    assert_eq!(lines(&typing, cx), expected, "each word quoted on its own line, the program as the file that runs, then where");
+    assert_eq!(lines(&typing, cx), expected, "each word quoted on its own line, the program as the file that runs");
+    assert_eq!(head(&typing, cx), ["in".to_string(), format!("\"{}\"", folder_of(&typing).display()), RUN_WARNING.to_string()]);
     assert!(typing.with_window(cx, |window, cx| {
         window.render_frame(cx);
         window.find(RUN_ASK_ID).label() == Some(RUN_QUESTION)
@@ -373,10 +493,46 @@ fn an_honest_long_command_is_shown_in_full(cx: &mut TestAppContext) {
     let refs: Vec<&str> = command.iter().map(String::as_str).collect();
     assert!(ask(&typing, cx, &refs));
     let shown = lines(&typing, cx);
-    assert_eq!(shown.len(), 60 + 2, "every word, and where");
+    assert_eq!(shown.len(), 60, "every word");
     for (n, line) in shown.iter().enumerate().take(60).skip(1) {
         assert_eq!(line, &format!("\"argument-{n}\""));
     }
+}
+
+#[gpui_kit::test]
+fn what_matters_is_above_the_words_and_stays_put(cx: &mut TestAppContext) {
+    let (typing, _scratch) = window(cx);
+    assert!(ask(&typing, cx, &["echo", "one"]));
+    let short = (top_of(&typing, cx, RUN_HEAD_ID), top_of(&typing, cx, (RUN_HEAD_LINE_ID, 2usize)), top_of(&typing, cx, RUN_WORDS_ID));
+    typing.press(cx, "escape");
+    let mut command = vec!["echo".to_string()];
+    command.extend((1..64).map(|n| format!("argument-{n}")));
+    let refs: Vec<&str> = command.iter().map(String::as_str).collect();
+    assert!(ask(&typing, cx, &refs));
+    assert_eq!(head(&typing, cx).last().map(String::as_str), Some(RUN_WARNING));
+    let long = (top_of(&typing, cx, RUN_HEAD_ID), top_of(&typing, cx, (RUN_HEAD_LINE_ID, 2usize)), top_of(&typing, cx, RUN_WORDS_ID));
+    // The warning is above the words, and a 64-word command moves nothing above them.
+    let last = head(&typing, cx).len() - 1;
+    let warning = top_of(&typing, cx, (RUN_HEAD_LINE_ID, last));
+    assert!(warning < top_of(&typing, cx, (RUN_LINE_ID, 0usize)), "the warning comes before the first word");
+    assert!(warning < top_of(&typing, cx, RUN_WORDS_ID));
+    assert!(short.0 <= short.1 && short.1 < short.2);
+    assert_eq!(short.1, long.1, "the head doesn't move for a long command");
+    // The buttons are in view whatever the length.
+    assert!(showing(&typing, cx, RUN_NO_ID) && showing(&typing, cx, RUN_YES_ID));
+}
+
+#[gpui_kit::test]
+fn letters_outside_ascii_are_pointed_out_and_named(cx: &mut TestAppContext) {
+    let (typing, _scratch) = window(cx);
+    assert!(ask(&typing, cx, &["echo", "plain"]));
+    assert!(!head(&typing, cx).contains(&RUN_NOT_ASCII.to_string()));
+    typing.press(cx, "escape");
+    assert!(ask(&typing, cx, &["echo", "g\u{456}thub", "bl\u{e5}b\u{e6}r"]));
+    assert!(head(&typing, cx).contains(&RUN_NOT_ASCII.to_string()));
+    let shown = lines(&typing, cx);
+    assert!(shown.contains(&"\"g\u{456}[U+0456]thub\"".to_string()), "{shown:?}");
+    assert!(shown.contains(&"\"bl\u{e5}b\u{e6}r\"".to_string()), "Latin-1 is just shown: {shown:?}");
 }
 
 #[gpui_kit::test]
@@ -402,7 +558,7 @@ fn a_program_that_comes_with_the_talk_says_so(cx: &mut TestAppContext) {
     assert!(ask(&typing, cx, &["./tool", "go"]));
     let shown = lines(&typing, cx);
     assert_eq!(shown[0], "\"<talk>/tool\"");
-    assert_eq!(shown.last().map(String::as_str), Some(RUN_PROGRAM_IN_TALK));
+    assert!(head(&typing, cx).contains(&RUN_PROGRAM_IN_TALK.to_string()));
 }
 
 #[gpui_kit::test]
@@ -471,8 +627,8 @@ fn run_is_for_the_session_and_always_is_kept(cx: &mut TestAppContext) {
     assert_eq!(decision(&typing, cx, &["cat"]), Decision::Run);
     let place = TalkPlace::Folder(folder_of(&typing));
     let kept = plan(&place, &words(&["cat"])).unwrap();
-    assert!(permissions_in(scratch.path()).always(&folder_of(&typing), &kept.key().command));
-    assert!(!permissions_in(scratch.path()).always(&folder_of(&typing), &plan(&place, &words(&["sh"])).unwrap().key().command));
+    assert!(permissions_in(scratch.path()).always(&folder_of(&typing), kept.key().command()));
+    assert!(!permissions_in(scratch.path()).always(&folder_of(&typing), plan(&place, &words(&["sh"])).unwrap().key().command()));
 }
 
 #[gpui_kit::test]
@@ -497,8 +653,7 @@ fn a_packed_or_untitled_talk_cant_choose_always(cx: &mut TestAppContext) {
     assert!(ask(&typing, cx, &["sh"]));
     assert!(showing(&typing, cx, RUN_YES_ID));
     assert!(!showing(&typing, cx, RUN_ALWAYS_ID));
-    let shown = lines(&typing, cx);
-    assert_eq!(shown.last().map(String::as_str), Some(RUN_IN_NEW_FOLDER));
+    assert_eq!(head(&typing, cx)[..2], ["in".to_string(), RUN_IN_NEW_FOLDER.to_string()]);
     click_on(&typing, cx, RUN_YES_ID);
     assert_eq!(decision(&typing, cx, &["sh"]), Decision::Run);
     assert!(!places.documents.parent().unwrap().join("terminal-permissions.json").exists());
@@ -642,14 +797,14 @@ fn no_way_round_the_yes(cx: &mut TestAppContext) {
     let command = words(&command);
     assert!(matches!(start_after_yes(&place, &command, &SessionYes::new(), &remembered, &helper, (40, 6)), Err(Decision::Ask)));
     let mut refused = SessionYes::new();
-    refused.refuse(plan(&place, &command).unwrap().key());
+    refused.refuse_for_tests(plan(&place, &command).unwrap().key());
     assert!(matches!(start_after_yes(&place, &command, &refused, &remembered, &helper, (40, 6)), Err(Decision::Refused)));
     empty("the one door, shut");
 
     // Controls: with a yes the same door does start the recording helper, and the real one runs
     // the command, so what was checked above could have failed.
     let mut yes = SessionYes::new();
-    yes.allow(plan(&place, &command).unwrap().key());
+    yes.allow_for_tests(plan(&place, &command).unwrap().key());
     let started = start_after_yes(&place, &command, &yes, &remembered, &helper, (40, 6)).expect("a yes starts it");
     let began = std::time::Instant::now();
     while std::fs::read(&record).unwrap().is_empty() && began.elapsed() < std::time::Duration::from_secs(10) {
@@ -682,19 +837,31 @@ fn open_start_with(cx: &mut TestAppContext, recovery: stagepack_studio::recovery
     })
 }
 
-fn rust_files(folder: &Path, found: &mut Vec<(String, String)>, root: &Path) {
+/// `line` without a trailing `//` comment, one that begins inside a string not counting.
+fn without_comment(line: &str) -> &str {
+    let (mut quoted, mut escaped) = (false, false);
+    let bytes = line.as_bytes();
+    for (at, byte) in bytes.iter().enumerate() {
+        match byte {
+            _ if escaped => escaped = false,
+            b'\\' if quoted => escaped = true,
+            b'"' => quoted = !quoted,
+            b'/' if !quoted && bytes.get(at + 1) == Some(&b'/') => return &line[..at],
+            _ => {}
+        }
+    }
+    line
+}
+
+fn rust_files(folder: &Path, found: &mut Vec<(String, String, String)>, root: &Path) {
     for entry in std::fs::read_dir(folder).unwrap() {
         let path = entry.unwrap().path();
         if path.is_dir() {
             rust_files(&path, found, root);
         } else if path.extension().is_some_and(|extension| extension == "rs") {
-            let text: String = std::fs::read_to_string(&path)
-                .unwrap()
-                .lines()
-                .map(|line| line.split("//").next().unwrap_or(""))
-                .collect::<Vec<_>>()
-                .join("\n");
-            found.push((path.strip_prefix(root).unwrap().display().to_string(), text));
+            let raw = std::fs::read_to_string(&path).unwrap();
+            let text: String = raw.lines().map(without_comment).collect::<Vec<_>>().join("\n");
+            found.push((path.strip_prefix(root).unwrap().display().to_string(), text, raw));
         }
     }
 }
@@ -707,14 +874,30 @@ fn a_program_is_started_from_one_place_and_it_asks() {
     let mut files = Vec::new();
     rust_files(&src, &mut files, &src);
     let outside = |name: &str, allowed: &[&str]| -> Vec<String> {
-        files.iter().filter(|(file, text)| text.contains(name) && !allowed.contains(&file.as_str())).map(|(file, _)| file.clone()).collect()
+        files.iter().filter(|(file, text, _)| text.contains(name) && !allowed.contains(&file.as_str())).map(|(file, _, _)| file.clone()).collect()
+    };
+    // The test hooks are named in comments too, and are looked for there as well: a name on a line
+    // that has a string with `//` in it is still seen.
+    let raw_outside = |name: &str, allowed: &[&str]| -> Vec<String> {
+        files.iter().filter(|(file, _, raw)| raw.contains(name) && !allowed.contains(&file.as_str())).map(|(file, _, _)| file.clone()).collect()
     };
     // Starting a session, in any spelling: only the door (and the definition).
     for spelling in ["Session::start", "Session :: start", "Session as"] {
         let places = outside(spelling, &["live_terminal/session.rs", "live_terminal/permission.rs"]);
         assert!(places.is_empty(), "{spelling}: {places:?}");
     }
-    assert!(outside("unchecked_for_tests", &["live_terminal/permission.rs"]).is_empty());
+    for hook in ["unchecked_for_tests", "allow_for_tests", "refuse_for_tests"] {
+        assert!(raw_outside(hook, &["live_terminal/permission.rs"]).is_empty(), "{hook}");
+    }
+    // And they exist only in a build with the feature.
+    let door_raw = &files.iter().find(|(file, _, _)| file == "live_terminal/permission.rs").unwrap().2;
+    for hook in ["fn unchecked_for_tests", "fn allow_for_tests", "fn refuse_for_tests"] {
+        let at = door_raw.find(hook).unwrap();
+        assert!(door_raw[..at].trim_end().ends_with("#[doc(hidden)]") || door_raw[..at].contains("#[cfg(feature = \"test-hooks\")]"), "{hook}");
+        let before = &door_raw[..at];
+        let attribute = before.rfind("#[cfg(feature = \"test-hooks\")]").expect("behind the feature");
+        assert!(before[attribute..].lines().count() <= 5, "{hook} is behind the feature");
+    }
     assert!(outside("Permit {", &["live_terminal/permission.rs"]).is_empty());
     // The helper is found and run only by the live terminal's own files.
     assert!(outside("Command::new", &["live_terminal/session.rs"]).iter().all(|file| !file.starts_with("live_terminal/")), "a second way to run a program");
@@ -723,7 +906,7 @@ fn a_program_is_started_from_one_place_and_it_asks() {
         assert!(places.is_empty(), "{name}: {places:?}");
     }
     // The door asks first.
-    let door = &files.iter().find(|(file, _)| file == "live_terminal/permission.rs").unwrap().1;
+    let door = &files.iter().find(|(file, _, _)| file == "live_terminal/permission.rs").unwrap().1;
     let body = &door[door.find("pub fn start_after_yes").unwrap()..];
     assert!(body.contains("permit(") && body.contains("Session::start("));
     let made = &door[door.find("pub fn permit").unwrap()..door.find("pub fn start_after_yes").unwrap()];
