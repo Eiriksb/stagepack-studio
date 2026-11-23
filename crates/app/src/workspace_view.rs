@@ -23,7 +23,7 @@ use slides_format::DEFAULT_LAYOUT;
 use crate::animate::Choice;
 use crate::animate_tools::{ChooseAnimation, ChooseEntrance, ChooseTransition};
 use crate::arrange_tools::{AlignThings, DistributeThings, ReorderThing};
-use crate::builds::{self, BuildOutcome, Compile};
+use crate::builds::{self, BuildOutcome, Compile, NEEDS_BUILDING, NO_COMPILER};
 use crate::cargo_file::{self, write_cargo_file};
 use crate::clipboard::ClipboardOp;
 use crate::clipboard_tools::ClipboardTools;
@@ -133,10 +133,7 @@ const SLIDEV_TALK: &str =
 
 const PACKED_EXTENSION: &str = "sptx";
 
-const NEEDS_BUILDING: &str =
-    "Some components in this talk need building to show as they're written.";
 const BUILDING: &str = "Building components…";
-const NO_COMPILER: &str = "This copy of the app has no compiler, so components can't be built.";
 
 pub const OUTSIDE_CHANGE: &str = "This talk was changed outside the app.";
 const UNSAVED_ON_CLOSE: &str = "This talk has changes that haven't been saved.";

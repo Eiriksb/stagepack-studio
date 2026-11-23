@@ -18,6 +18,21 @@ fn run(args: &[&str], home: &Path) -> Output {
         .expect("the program runs")
 }
 
+/// [`run`] with one more environment variable.
+fn run_with(args: &[&str], home: &Path, name: &str, value: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_stagepack-studio"))
+        .args(args)
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env(name, value)
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .output()
+        .expect("the program runs")
+}
+
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -378,4 +393,50 @@ fn a_big_talk_is_checked_quickly() {
     assert!(took < std::time::Duration::from_secs(10), "took {took:?}");
     assert!(output.status.code().is_some_and(|code| code <= 1), "{}", text(&output.stderr));
     eprintln!("checked 300 slides in {took:?}: {}", text(&output.stdout).lines().last().unwrap_or(""));
+}
+
+#[test]
+fn a_slide_that_cant_be_read_says_so_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let talk = dir.path().join("deep");
+    std::fs::create_dir_all(&talk).unwrap();
+    let deep = ">".repeat(100);
+    std::fs::write(talk.join("slides.md"), format!("# Fine\n\n---\n\n{deep} too deep\n")).unwrap();
+    let output = run(&["check", talk.to_str().unwrap()], dir.path());
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output.stdout));
+    let printed = text(&output.stdout);
+    assert_eq!(printed.matches("nested too deeply").count(), 1, "{printed}");
+    assert!(printed.contains("Slide 2: "), "{printed}");
+    assert_eq!(printed.lines().last(), Some("1 problem on 1 slide."), "{printed}");
+}
+
+#[test]
+fn no_compiler_is_said_as_the_window_says_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let talk = components_fixture(dir.path());
+    let nowhere = dir.path().join("no-bundle");
+    let output = run_with(&["check", talk.to_str().unwrap()], dir.path(), "STUDIO_BUNDLE", &nowhere);
+    assert_eq!(output.status.code(), Some(1));
+    let printed = text(&output.stdout);
+    assert!(printed.contains("This copy of the app has no compiler, so components can't be built.\n"), "{printed}");
+    assert!(!printed.contains("need building to show"), "{printed}");
+    assert!(printed.lines().last().unwrap().ends_with(" and in the talk."), "{printed}");
+    assert!(!talk.join("build").exists());
+}
+
+#[test]
+fn the_summary_names_where_the_problems_are() {
+    use stagepack_studio::ai_tool::{Checked, SlideProblems, check_text};
+    let slide = |slide: usize, many: usize| SlideProblems { slide, hidden: false, problems: vec!["x".to_string(); many] };
+    let said = |slides: Vec<SlideProblems>, talk: usize| {
+        let checked = Checked { slides, talk: vec!["y".to_string(); talk] };
+        check_text(&checked).lines().last().unwrap().to_string()
+    };
+    assert_eq!(said(vec![], 0), "No problems found.");
+    assert_eq!(said(vec![], 1), "1 problem in the talk.");
+    assert_eq!(said(vec![], 3), "3 problems in the talk.");
+    assert_eq!(said(vec![slide(2, 1)], 0), "1 problem on 1 slide.");
+    assert_eq!(said(vec![slide(2, 2), slide(5, 1)], 0), "3 problems on 2 slides.");
+    assert_eq!(said(vec![slide(2, 2), slide(5, 1)], 1), "4 problems on 2 slides and in the talk.");
+    assert_eq!(said(vec![slide(2, 1)], 1), "2 problems on 1 slide and in the talk.");
 }

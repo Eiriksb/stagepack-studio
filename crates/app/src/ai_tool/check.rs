@@ -8,14 +8,14 @@ use slides_engine::ComponentState;
 use slides_format::Block;
 
 use super::talk::{OpenTalk, TalkPlace};
-use crate::builds::{build_components, bundled_compiler};
+use crate::builds::{NEEDS_BUILDING, NO_COMPILER, build_components, bundled_compiler};
 use crate::permissions::BuildPermissions;
 
 /// What the window says of a slide it couldn't lay out.
 const COULDNT_LAY_OUT: &str = "This slide couldn't be laid out.";
 
-/// What the window's build bar says when components need building.
-pub(crate) const NEEDS_BUILDING: &str = "Some components in this talk need building to show as they're written.";
+/// What's said when the components couldn't be looked at again after a build.
+const COULDNT_REFRESH: &str = "The talk's components couldn't be looked at again after building.";
 
 /// One slide's complaints.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -44,16 +44,19 @@ impl Checked {
 /// of the app has its compiler; nothing else is ever built.
 pub fn check(talk: &mut OpenTalk, permissions: &BuildPermissions) -> Checked {
     let mut built_problems = Vec::new();
+    let mut talk_problems: Vec<String> = Vec::new();
+    let compiler = bundled_compiler();
     if let TalkPlace::Folder(folder) = talk.place.clone()
         && permissions.always(&folder)
-        && let Some(compile) = bundled_compiler()
+        && let Some(compile) = &compiler
     {
-        built_problems = build_components(&folder, &compile).problems;
+        built_problems = build_components(&folder, compile).problems;
         let deck = &mut talk.deck;
-        let _ = catch_unwind(AssertUnwindSafe(|| deck.refresh_components()));
+        if catch_unwind(AssertUnwindSafe(|| deck.refresh_components())).is_err() {
+            talk_problems.push(COULDNT_REFRESH.to_string());
+        }
     }
 
-    let mut talk_problems: Vec<String> = Vec::new();
     let deck = &talk.deck;
     let own = catch_unwind(AssertUnwindSafe(|| {
         deck.component_problems().iter().map(problem_line).collect::<Vec<_>>()
@@ -61,7 +64,8 @@ pub fn check(talk: &mut OpenTalk, permissions: &BuildPermissions) -> Checked {
     talk_problems.extend(own.unwrap_or_default());
     talk_problems.extend(built_problems.iter().map(problem_line));
     if matches!(talk.place, TalkPlace::Folder(_)) && talk.deck.components().iter().any(|info| info.state != ComponentState::UpToDate) {
-        talk_problems.push(NEEDS_BUILDING.to_string());
+        // As the window's build bar says it: what's needed, or that this copy can't.
+        talk_problems.push(if compiler.is_some() { NEEDS_BUILDING } else { NO_COMPILER }.to_string());
     }
 
     let slides = (0..talk.deck.talk().slides.len())
@@ -83,7 +87,7 @@ fn problem_line(problem: &Diagnostic) -> String {
 }
 
 /// What's wrong with slide `index` (from 0), in the order the window tells it: its parse error,
-/// what laying it out says of it, then what's wrong with each video, model and terminal on it.
+/// what laying it out says of it (its parse error is the first), then what's wrong with each video, model and terminal on it.
 /// Nothing is built. A slide that can't be laid out gives one sentence saying so.
 pub fn slide_problems(talk: &mut OpenTalk, index: usize) -> Vec<String> {
     let deck = &mut talk.deck;
@@ -92,9 +96,6 @@ pub fn slide_problems(talk: &mut OpenTalk, index: usize) -> Vec<String> {
     }
     let found = catch_unwind(AssertUnwindSafe(|| {
         let mut problems: Vec<String> = Vec::new();
-        if let Some(error) = &deck.talk().slides[index].error {
-            problems.push(error.message.clone());
-        }
         problems.extend(deck.notices_whole(index));
         let mut tags = Vec::new();
         tags_on(&deck.talk().slides[index].blocks, &mut tags);
@@ -141,16 +142,14 @@ pub fn check_text(checked: &Checked) -> String {
     for problem in &checked.talk {
         out.push_str(&format!("{problem}\n"));
     }
-    match checked.count() {
-        0 => out.push_str("No problems found.\n"),
-        count => {
-            let slides = checked.slides.len();
-            out.push_str(&format!(
-                "{count} problem{} on {slides} slide{}.\n",
-                if count == 1 { "" } else { "s" },
-                if slides == 1 { "" } else { "s" }
-            ));
-        }
-    }
+    let (count, slides) = (checked.count(), checked.slides.len());
+    let problems = |n: usize| format!("{n} problem{}", if n == 1 { "" } else { "s" });
+    let on = format!("on {slides} slide{}", if slides == 1 { "" } else { "s" });
+    out.push_str(&match (count, slides, checked.talk.len()) {
+        (0, _, _) => "No problems found.\n".to_string(),
+        (_, 0, _) => format!("{} in the talk.\n", problems(count)),
+        (_, _, 0) => format!("{} {on}.\n", problems(count)),
+        _ => format!("{} {on} and in the talk.\n", problems(count)),
+    });
     out
 }

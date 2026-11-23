@@ -31,6 +31,11 @@ pub struct BuildOutcome {
     pub problems: Vec<Diagnostic>,
 }
 
+/// What the window says when some components need building.
+pub(crate) const NEEDS_BUILDING: &str = "Some components in this talk need building to show as they're written.";
+/// What the window says when they need it and this copy of the app can't.
+pub(crate) const NO_COMPILER: &str = "This copy of the app has no compiler, so components can't be built.";
+
 const BUILD_FOLDER: &str = "build";
 const INDEX_FORMAT: u32 = 1;
 
