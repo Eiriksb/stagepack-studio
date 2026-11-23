@@ -291,3 +291,40 @@ fn output_cut_in_a_sequence_does_not_swallow_what_follows() {
     screen.feed("ok");
     assert!(screen_text(&screen).starts_with("ok"), "{screen:?}");
 }
+
+/// What a program is told its folder is on Windows: the verbatim spelling `canonicalize` gives is dropped
+/// when the plain one means the same, and kept when it can't be written plainly. The function works on the
+/// text, so it is tried on every system.
+#[test]
+fn a_verbatim_drive_folder_is_written_plainly_when_it_can_be() {
+    use stagepack_studio::live_terminal::plain_drive_path;
+    let plain = |verbatim: &str| plain_drive_path(verbatim);
+    assert_eq!(plain(r"\\?\C:\Users\me\talk"), Some(r"C:\Users\me\talk".to_string()));
+    assert_eq!(plain(r"\\?\d:\talk with spaces\one.two"), Some(r"d:\talk with spaces\one.two".to_string()));
+    assert_eq!(plain(r"\\?\C:\"), Some(r"C:\".to_string()));
+    assert_eq!(plain(r"\\?\C:"), Some(r"C:\".to_string()));
+    // Already plain, or not a drive: left alone.
+    assert_eq!(plain(r"C:\talk"), None);
+    assert_eq!(plain(r"\\?\UNC\server\share\talk"), None);
+    assert_eq!(plain(r"\\?\Volume{1234}\talk"), None);
+    assert_eq!(plain(r"\\?\C:talk"), None);
+    // A name a plain path can't carry keeps the verbatim form.
+    for name in ["CON", "nul.txt", "COM1", "lpt9", "aux "] {
+        assert_eq!(plain(&format!(r"\\?\C:\talk\{name}")), None, "{name}");
+    }
+    assert_eq!(plain(r"\\?\C:\talk\ends with a dot."), None);
+    assert_eq!(plain(r"\\?\C:\talk\what?"), None);
+    assert!(plain(r"\\?\C:\talk\COM0").is_some() && plain(r"\\?\C:\talk\COMMA").is_some());
+    // Too long to be a plain path.
+    let long = format!(r"\\?\C:\{}", "a".repeat(260));
+    assert_eq!(plain(&long), None);
+}
+
+/// The folder a program is started in is the canonical one everywhere but Windows, where only its spelling changes.
+#[cfg(unix)]
+#[test]
+fn the_folder_is_spelled_as_it_is_off_windows() {
+    use stagepack_studio::live_terminal::spelled_plainly;
+    let path = Path::new("/tmp/talk");
+    assert_eq!(spelled_plainly(path), path);
+}

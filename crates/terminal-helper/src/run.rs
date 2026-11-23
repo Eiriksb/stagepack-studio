@@ -39,12 +39,42 @@ fn say(out: &Out, what: &FromHelper) -> io::Result<()> {
 pub fn main() -> i32 {
     let out: Out = Arc::new(Mutex::new(io::stdout()));
     let (tx, rx) = mpsc::channel();
+    #[cfg(unix)]
+    apart_from_the_terminal(&tx);
     {
         let tx = tx.clone();
         thread::spawn(move || read_input(tx));
     }
     session(&out, &tx, &rx);
     0
+}
+
+/// Keeps the helper out of reach of what a terminal or `pkill` sends: it leaves the app's process group, so
+/// Ctrl+C and a closed terminal don't reach it, ignores the hang-up, interrupt and quit signals that still
+/// might, and turns a terminate signal into an end, so the program's group is ended before the helper goes.
+/// It is only the app closing the input (or telling it to end) that ends the program otherwise.
+#[cfg(unix)]
+fn apart_from_the_terminal(tx: &Sender<Event>) {
+    // SAFETY: plain calls with plain numbers; nothing else is running yet but this thread, so the mask
+    // set here is the one every thread of the helper gets. The program's own start clears both again.
+    unsafe {
+        // Fails when the helper already leads a group of its own, which is as good.
+        libc::setsid();
+        for sig in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT] {
+            libc::signal(sig, libc::SIG_IGN);
+        }
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let mut got = 0;
+            if libc::sigwait(&set, &mut got) == 0 {
+                let _ = tx.send(Event::Gone);
+            }
+        });
+    }
 }
 
 fn read_input(tx: Sender<Event>) {
@@ -105,7 +135,7 @@ fn size_ok(cols: u16, rows: u16) -> bool {
 }
 
 fn failed_to_start(program: &str, why: &str) -> String {
-    let missing = ["No viable candidates", "does not exist", "doesn't exist", "Unable to resolve", "not found"];
+    let missing = ["No viable candidates", "does not exist", "doesn't exist", "Unable to resolve", "not found", "cannot find"];
     if missing.iter().any(|m| why.contains(m)) {
         format!("There's no program called \"{program}\" here.")
     } else if why.contains("not executable") || why.contains("directory") {

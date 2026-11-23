@@ -872,6 +872,7 @@ impl AudienceView {
                     rect: terminal.on.rect,
                     rotate: terminal.on.rotate,
                     keys: keys.as_ref() == Some(&id),
+                    follows: false,
                 })
             })
             .collect();
@@ -888,25 +889,7 @@ impl AudienceView {
     /// given elsewhere it takes them back; either way it's no click of the show's. Says whether it
     /// was one.
     fn press_for_keys(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
-        let Some((_, live)) = self.show.read(cx).owner.clone() else { return false };
-        let Some(slide) = self.current.read(cx).slide_bounds() else { return false };
-        let unit = f32::from(slide.size.width) / slides_engine::SLIDE_WIDTH;
-        if unit <= 0.0 {
-            return false;
-        }
-        let at = (f32::from(position.x - slide.origin.x) / unit, f32::from(position.y - slide.origin.y) / unit);
-        let hit = self.live_on.iter().rev().find_map(|terminal| {
-            let id = LiveId::new(terminal.source.clone()?, terminal.on.run.clone()?);
-            (live.is_running(&id) && inside_turned(terminal.on.rect, terminal.on.rotate, at)).then_some(id)
-        });
-        let handled = match hit {
-            Some(id) => live.give_keys(&id),
-            None => live.release_keys(),
-        };
-        if handled {
-            self.show.update(cx, |_, cx| cx.notify());
-        }
-        handled
+        press_for_keys(&self.show, &self.current, &self.live_on, position, cx)
     }
 
     /// Lays out the slide the next click brings, if it's another, at the scale the audience sees
@@ -1186,6 +1169,45 @@ impl Render for AudienceView {
     }
 }
 
+/// A press at `position` on the slide drawn on `canvas`, whose terminals that run are `terminals`: on a
+/// running one it gives that terminal the keys, and with the keys given elsewhere it takes them back.
+/// Says whether it was one.
+fn press_for_keys(show: &Entity<Presentation>, canvas: &Entity<SlideCanvas>, terminals: &[TerminalLayer], position: Point<Pixels>, cx: &mut App) -> bool {
+    let Some((_, live)) = show.read(cx).owner.clone() else { return false };
+    let Some(slide) = canvas.read(cx).slide_bounds() else { return false };
+    let unit = f32::from(slide.size.width) / slides_engine::SLIDE_WIDTH;
+    if unit <= 0.0 {
+        return false;
+    }
+    let at = (f32::from(position.x - slide.origin.x) / unit, f32::from(position.y - slide.origin.y) / unit);
+    let hit = terminals.iter().rev().find_map(|terminal| {
+        let id = LiveId::new(terminal.source.clone()?, terminal.on.run.clone()?);
+        (live.is_running(&id) && inside_turned(terminal.on.rect, terminal.on.rotate, at)).then_some(id)
+    });
+    let handled = match hit {
+        Some(id) => live.give_keys(&id),
+        None => live.release_keys(),
+    };
+    if handled {
+        show.update(cx, |_, cx| cx.notify());
+    }
+    handled
+}
+
+/// The terminals of `slide` at `moment` that run a command and are there at the place's step.
+fn live_terminals_at(document: &Entity<Document>, place: Place, time: f32, cx: &mut App) -> (Vec<TerminalLayer>, usize) {
+    let moment = Moment { step: place.step, time };
+    document.update(cx, |document, _| {
+        let slide = document.shown_slide(place.slide);
+        let on = document
+            .terminals_at(slide, moment)
+            .into_iter()
+            .filter(|terminal| terminal.on.run.is_some() && terminal.source.is_some() && place.step >= terminal.click.unwrap_or(0))
+            .collect();
+        (on, slide)
+    })
+}
+
 /// What the presenter sees: the slide as it stands, what's next, the notes and the time.
 pub struct PresenterView {
     show: Entity<Presentation>,
@@ -1201,6 +1223,9 @@ pub struct PresenterView {
     /// The wait for the next moment of a slide that moves.
     next_moment: Option<Task<()>>,
     at_the_end: bool,
+    /// The terminals of the current slide that run a command: they show what the audience's window
+    /// draws of them, and a click on one takes the keys, as there.
+    live_on: Vec<TerminalLayer>,
     rehearsing: bool,
     focus_handle: FocusHandle,
     _watching: [Subscription; 3],
@@ -1246,6 +1271,7 @@ impl PresenterView {
             drawn_time: 0.0,
             next_moment: None,
             at_the_end: false,
+            live_on: Vec::new(),
             rehearsing,
             focus_handle,
             _watching: watching,
@@ -1288,6 +1314,7 @@ impl PresenterView {
             self.notes_scroll.set_offset(Point::default());
         }
         show_on(&self.current, &document, place, time, cx);
+        self.live_on = live_terminals_at(&document, place, time, cx).0;
         self.drawn_time = time;
         match upcoming {
             // What the next press brings, as it first looks.
@@ -1301,12 +1328,49 @@ impl PresenterView {
         cx.notify();
     }
 
+    /// Lays the running terminals of the current slide over their layers, to show the pictures the
+    /// audience's window has them draw, and takes them off when none runs.
+    fn apply_live(&mut self, cx: &mut Context<Self>) {
+        let Some((_, live)) = self.show.read(cx).owner.clone() else { return };
+        let keys = live.keys();
+        let places: Vec<LivePlace> = self
+            .live_on
+            .iter()
+            .filter_map(|terminal| {
+                let id = LiveId::new(terminal.source.clone()?, terminal.on.run.clone()?);
+                Some(LivePlace {
+                    layer: terminal.layer,
+                    session: live.weak(&id)?,
+                    rect: terminal.on.rect,
+                    rotate: terminal.on.rotate,
+                    keys: keys.as_ref() == Some(&id),
+                    follows: true,
+                })
+            })
+            .collect();
+        if places.is_empty() {
+            self.current.update(cx, |canvas, cx| canvas.clear_live(cx));
+            return;
+        }
+        let document = self.show.read(cx).document.clone();
+        let fonts = document.update(cx, |document, _| document.fonts_seed());
+        self.current.update(cx, |canvas, cx| canvas.place_live(places, fonts, cx));
+    }
+
+    /// A press on the slide: on a running terminal it takes the keys, as in the audience's window.
+    fn press(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if press_for_keys(&self.show, &self.current, &self.live_on, event.position, cx) {
+            self.focus_handle.focus(window, cx);
+        }
+    }
+
     /// Draws the slide on `current` again if it moves and its time has changed since, and
     /// comes back at its next moment while it moves.
     fn animate(&mut self, cx: &mut Context<Self>) {
         // A show seen only by the presenter starts the slide's time here.
         let now = cx.background_executor().now();
         self.show.update(cx, |show, _| show.first_frame_drawn(now));
+        self.apply_live(cx);
         if !self.moves {
             return;
         }
@@ -1358,6 +1422,7 @@ impl Render for PresenterView {
                     .min_h_0()
                     .w_full()
                     .bg(black())
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| this.press(event, window, cx)))
                     .child(self.current.clone()),
             )
             .child(

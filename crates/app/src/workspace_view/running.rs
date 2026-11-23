@@ -38,11 +38,18 @@ impl WorkspaceView {
     /// whoever has a window to ask in, and what starts a program is only
     /// [`start_after_yes`](crate::live_terminal::start_after_yes), which looks again.
     pub fn try_start_live(&mut self, slide: usize, terminal: &TerminalLayer, cx: &mut Context<Self>) -> LiveStep {
+        self.start_live(slide, terminal, false, cx)
+    }
+
+    /// [`Self::try_start_live`], and with `explicit` (*Start* was pressed, or its question answered)
+    /// a session that is over, ended by itself or failed, is run again in its place, through the
+    /// same yes. The show's own looking never does: a program that ended stays as its last screen.
+    pub(super) fn start_live(&mut self, slide: usize, terminal: &TerminalLayer, explicit: bool, cx: &mut Context<Self>) -> LiveStep {
         let (Some(document), Some(run), Some(source)) = (self.document.clone(), terminal.on.run.clone(), terminal.source.clone()) else {
             return LiveStep::Nothing;
         };
         let id = LiveId::new(source.clone(), run.clone());
-        if self.live.get(&id).is_some() {
+        if self.live.get(&id).is_some_and(|session| !explicit || !session.state().is_over()) {
             return LiveStep::Going;
         }
         // One whose tag or screen is wrong never starts, and says why.
@@ -109,7 +116,7 @@ impl WorkspaceView {
         let Some(document) = self.document.clone() else { return };
         let (slide, terminal) = document.update(cx, |document, _| (document.current(), document.selected_terminal()));
         let Some(terminal) = terminal else { return };
-        match self.try_start_live(slide, &terminal, cx) {
+        match self.start_live(slide, &terminal, true, cx) {
             LiveStep::Ask(command) => {
                 if self.ask_to_run(command, window, cx) {
                     self.start_when_yes = Some((slide, terminal));

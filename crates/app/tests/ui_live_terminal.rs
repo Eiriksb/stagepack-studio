@@ -20,7 +20,7 @@ use stagepack_studio::live_terminal::{
     HELPER_ENV, LiveId, LiveTerminals, MOST_LIVE, Session, NOT_INSTALLED, RUN_ASK_ID, RUN_NO_ID, RUN_YES_ID, RunPermissions, TOO_MANY, threads_running,
 };
 use stagepack_studio::present_view::{COUNTER_ID, Presentation};
-use stagepack_studio::slide_canvas::SlideCanvas;
+use stagepack_studio::slide_canvas::{LIVE_HINT_ID, SlideCanvas};
 use stagepack_studio::slide_editor::{TERMINAL_END_ID, TERMINAL_KEEP_ID, TERMINAL_START_ID};
 
 static ENVIRONMENT: Mutex<()> = Mutex::new(());
@@ -147,6 +147,33 @@ impl Rehearsal {
             window.find(COUNTER_ID).label().map(str::to_string).expect("a counter")
         })
         .unwrap()
+    }
+
+    /// The canvas of the current slide in the presenter's window.
+    fn presenter_canvas(&self, cx: &TestAppContext) -> Entity<SlideCanvas> {
+        let view = cx.read(|cx| self.show.read(cx).presenter()).expect("the presenter's window is open").1;
+        cx.read(|cx| view.read(cx).current().clone())
+    }
+
+    /// A click at (`x`, `y`) on the slide as the presenter's window shows it.
+    fn click_presenter_slide(&self, cx: &mut TestAppContext, x: f32, y: f32) {
+        let canvas = self.presenter_canvas(cx);
+        let slide = canvas.read_with(cx, |canvas, _| canvas.slide_bounds()).expect("the slide is drawn");
+        let unit = f32::from(slide.size.width) / 1920.;
+        let at = slide.origin + Point { x: px(x * unit), y: px(y * unit) };
+        cx.update_window(self.presenter, |_, window, cx| {
+            window.render_frame(cx);
+            let modifiers = Modifiers::default();
+            window.dispatch_event(MouseMoveEvent { position: at, pressed_button: None, modifiers }.to_platform_input(), cx);
+            window.dispatch_event(
+                MouseDownEvent { button: MouseButton::Left, position: at, modifiers, click_count: 1, first_mouse: false }.to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(MouseUpEvent { button: MouseButton::Left, position: at, modifiers, click_count: 1 }.to_platform_input(), cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
     }
 
     fn live_layers(&self, cx: &mut TestAppContext) -> Vec<usize> {
@@ -356,8 +383,8 @@ fn the_keys_go_to_one_place(cx: &mut TestAppContext) {
     press(cx, show.presenter, "x");
     assert!(until(cx, &show.windows(), 10, |_| screen_text(&second).contains('x')));
 
-    // Ctrl+Shift+Escape gives them back, and Right Arrow then moves the show.
-    press(cx, show.presenter, "ctrl-shift-escape");
+    // Ctrl+Shift+Q gives them back, and Right Arrow then moves the show.
+    press(cx, show.presenter, "ctrl-shift-q");
     assert!(live.keys().is_none());
     for window in show.windows() {
         render(cx, window);
@@ -552,8 +579,8 @@ fn typing_in_the_editor_goes_to_the_terminal_only_while_it_has_the_keys(cx: &mut
     typing.press(cx, "delete");
     assert!(until(cx, &windows, 10, |_| screen_text(&session).contains("hi^[[C")), "{}", screen_text(&session));
     assert_eq!(typing.source(cx), before, "none of it was the editor's: Delete took nothing away");
-    // Ctrl+Shift+Escape gives them back: Delete is the editor's again.
-    typing.press(cx, "ctrl-shift-escape");
+    // Ctrl+Shift+Q gives them back: Delete is the editor's again.
+    typing.press(cx, "ctrl-shift-q");
     assert!(live.keys().is_none());
     typing.press(cx, "delete");
     assert_ne!(typing.source(cx), before, "the tag was taken away");
@@ -782,4 +809,117 @@ fn a_kept_recording_is_named_from_the_program_and_never_leaves_its_folder() {
         assert!(!stem.is_empty() && stem.len() <= 40, "{odd:?}");
         assert!(stem.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'), "{odd:?} -> {stem:?}");
     }
+}
+
+#[gpui_kit::test]
+fn the_presenter_sees_the_live_terminal_and_a_click_there_gives_it_the_keys(cx: &mut TestAppContext) {
+    let around = surroundings(Some(&helper::helper_program()));
+    let talk = format!("# One\n\n{}\n", tag("sh -c \"echo shown31508; cat; : 31508\"", 100));
+    let typing = open_talk(cx, &around, &talk);
+    let live = live_of(&typing, cx);
+    let show = rehearse(&typing, cx);
+    say_yes(cx, show.presenter);
+    assert!(until(cx, &show.windows(), 10, |_| live.running() == 1));
+    let session = live.get(&live.ids()[0]).unwrap();
+    assert!(until(cx, &show.windows(), 10, |_| screen_text(&session).contains("shown31508")));
+    // The presenter's own slide has the terminal over its layer, with the picture the audience's has.
+    assert!(until(cx, &show.windows(), 10, |cx| {
+        let canvas = show.presenter_canvas(cx);
+        canvas.read_with(cx, |canvas, _| canvas.live_layers().len() == 1 && canvas.live_pictures().iter().all(Option::is_some))
+    }));
+    let (theirs, ours) = (show.canvas(cx), show.presenter_canvas(cx));
+    assert_eq!(theirs.read_with(cx, |canvas, _| canvas.live_layers()), ours.read_with(cx, |canvas, _| canvas.live_layers()));
+
+    // A click on it in the presenter's window gives it the keys, framed there and in the audience's window.
+    assert!(live.keys().is_none());
+    show.click_presenter_slide(cx, 420., 280.);
+    assert_eq!(live.keys().as_ref(), Some(&live.ids()[0]));
+    for window in show.windows() {
+        render(cx, window);
+    }
+    assert!(ours.read_with(cx, |canvas, _| canvas.live_keys_on()).is_some(), "the frame is drawn in the presenter's view");
+    assert!(theirs.read_with(cx, |canvas, _| canvas.live_keys_on()).is_some());
+    let hinted = cx.update_window(show.presenter, |_, window, cx| {
+        window.render_frame(cx);
+        window.try_find((LIVE_HINT_ID, 0usize)).is_some()
+    });
+    assert!(hinted.unwrap(), "it says how to give the keys back");
+    assert_eq!(show.counter(cx), "1 / 1");
+    press(cx, show.presenter, "q");
+    assert!(until(cx, &show.windows(), 10, |_| screen_text(&session).contains('q')));
+    // A click elsewhere on the presenter's slide takes the keys back.
+    show.click_presenter_slide(cx, 50., 50.);
+    assert!(live.keys().is_none());
+    press(cx, show.presenter, "escape");
+    nothing_left(cx, &[typing.handle], &live, "31508");
+}
+
+/// A helper that is a program that can't start the terminal: it counts each time it is run and ends.
+fn failing_helper(folder: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let script = folder.join("failing-helper");
+    std::fs::write(&script, format!("#!/bin/sh\necho run >> {}\n", folder.join("attempts").display())).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+#[gpui_kit::test]
+fn a_terminal_that_fails_to_start_in_the_show_is_tried_once(cx: &mut TestAppContext) {
+    let folder = tempfile::tempdir().unwrap();
+    let helper = failing_helper(folder.path());
+    let around = surroundings(Some(&helper));
+    let talk = format!("# One\n\n{}\n\n---\n\n# Two\n", tag("sh -c \"exec sleep 31509\"", 100));
+    let typing = open_talk(cx, &around, &talk);
+    let live = live_of(&typing, cx);
+    let show = rehearse(&typing, cx);
+    say_yes(cx, show.presenter);
+    assert!(until(cx, &show.windows(), 10, |_| live.sessions() == 1 && live.running() == 0), "it fails");
+    assert!(until(cx, &show.windows(), 5, |cx| typing.status(cx).is_some()), "it says so");
+    let sentence = typing.status(cx);
+    // Two seconds more, with the slide shown and the show asked for frames: nothing is started again.
+    let end = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < end {
+        for window in show.windows() {
+            render(cx, window);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+        cx.executor().advance_clock(Duration::from_millis(250));
+    }
+    let attempts = std::fs::read_to_string(folder.path().join("attempts")).unwrap_or_default();
+    assert_eq!(attempts.lines().count(), 1, "the helper was run {} times", attempts.lines().count());
+    assert_eq!(live.sessions(), 1, "the failed one is kept");
+    assert!(sentence.as_deref().is_some_and(|said| said.contains("couldn't")), "{sentence:?}");
+    // Going away and coming back doesn't start it again either.
+    press(cx, show.presenter, "right");
+    press(cx, show.presenter, "left");
+    for window in show.windows() {
+        render(cx, window);
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    for window in show.windows() {
+        render(cx, window);
+    }
+    let attempts = std::fs::read_to_string(folder.path().join("attempts")).unwrap_or_default();
+    assert_eq!(attempts.lines().count(), 1);
+    assert!(processes_with("31509").is_empty());
+    press(cx, show.presenter, "escape");
+    nothing_left(cx, &[typing.handle], &live, "31509");
+}
+
+#[gpui_kit::test]
+fn start_runs_a_program_that_ended_again(cx: &mut TestAppContext) {
+    let around = surroundings(Some(&helper::helper_program()));
+    let talk = format!("# One\n\n{}\n", tag("printf again31510", 100));
+    let typing = open_talk(cx, &around, &talk);
+    let live = live_of(&typing, cx);
+    let windows = [typing.handle];
+    let first = start_and_let_end(&typing, cx, &live, &windows);
+    assert!(screen_text(&first).contains("again31510"));
+    // *Start* again: it has its yes, so it runs at once, in a new session in the old one's place.
+    click_on(&typing, cx, TERMINAL_START_ID);
+    assert!(until(cx, &windows, 10, |_| live.get(&live.ids()[0]).is_some_and(|now| !Rc::ptr_eq(&now, &first))), "a new session");
+    let second = live.get(&live.ids()[0]).unwrap();
+    assert!(until(cx, &windows, 10, |_| screen_text(&second).contains("again31510") && second.state().is_over()));
+    assert!(until(cx, &windows, 5, |_| live.sessions() == 1), "the old one is let go of");
+    assert!(!dialog_open(cx, typing.handle), "nothing was asked again");
 }

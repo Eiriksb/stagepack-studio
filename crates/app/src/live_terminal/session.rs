@@ -39,7 +39,7 @@ const ENDING_WAIT: Duration = Duration::from_secs(5);
 const LEAVING_WAIT: Duration = Duration::from_secs(5);
 const BETWEEN_PICTURES: Duration = Duration::from_nanos(1_000_000_000 / MOST_PICTURES_A_SECOND as u64);
 
-const COULDNT_START: &str = "The live terminal couldn't start.";
+const COULDNT_START: &str = "The live terminal's helper couldn't be started.";
 const BROKEN: &str = "The live terminal's helper didn't answer as it should.";
 const STOPPED: &str = "The live terminal stopped unexpectedly.";
 const DIDNT_END: &str = "The terminal's program didn't end when asked, so it was stopped.";
@@ -122,6 +122,29 @@ fn spawn(name: &str, work: impl FnOnce() + Send + 'static) -> bool {
         .is_ok()
 }
 
+/// Like [`spawn`], for a thread of `shared`'s: if it panics, the session is lost, so that it settles, its
+/// keys are let go of and its program is still ended.
+fn spawn_guarded(shared: &Arc<Shared>, name: &str, work: impl FnOnce() + Send + 'static) -> bool {
+    let shared = shared.clone();
+    spawn(name, move || {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
+            lost(&shared);
+        }
+    })
+}
+
+/// A thread of the session panicked: the program is told to end, and the helper is given the time to do it
+/// before it is killed too, and the session says it stopped.
+fn lost(shared: &Arc<Shared>) {
+    shared.say(ToHelper::End);
+    shared.ending.store(true, Ordering::SeqCst);
+    shared.finish(SessionState::Failed(STOPPED.to_string()));
+    lock(&shared.drawing).running = false;
+    if let Some(child) = lock(&shared.child).clone() {
+        spawn("reaping", move || reap(&child, ENDING_WAIT));
+    }
+}
+
 /// What pictures are wanted of the screen.
 #[derive(Default)]
 struct Drawing {
@@ -140,6 +163,8 @@ struct Shared {
     to_helper: Mutex<Option<Sender<ToHelper>>>,
     /// How many bytes of input are queued.
     queued: AtomicUsize,
+    /// Set once the program was started, as the helper said so.
+    started: AtomicBool,
     /// Set once the session has been told to end.
     ending: AtomicBool,
     /// The helper, once it's started, for whoever must end it.
@@ -176,6 +201,7 @@ impl Shared {
     }
 
     fn running(&self) {
+        self.started.store(true, Ordering::SeqCst);
         let mut now = lock(&self.state);
         if *now == SessionState::Starting {
             *now = SessionState::Running;
@@ -227,7 +253,7 @@ impl Shared {
         }
         drawing.running = true;
         let shared = self.clone();
-        if !spawn("drawing", move || draw_pictures(&shared)) {
+        if !spawn_guarded(&shared.clone(), "drawing", move || draw_pictures(&shared)) {
             drawing.running = false;
         }
     }
@@ -276,6 +302,7 @@ impl Session {
             screen: Mutex::new(Screen::live(cols, rows)),
             to_helper: Mutex::new(Some(to_helper)),
             queued: AtomicUsize::new(0),
+            started: AtomicBool::new(false),
             ending: AtomicBool::new(false),
             killed: AtomicBool::new(false),
             child: Mutex::new(None),
@@ -290,7 +317,7 @@ impl Session {
         });
         shared.say(ToHelper::Start(spec));
         let (theirs, helper) = (shared.clone(), helper.to_path_buf());
-        if !spawn("reading", move || read_side(&theirs, &helper, queue)) {
+        if !spawn_guarded(&shared.clone(), "reading", move || read_side(&theirs, &helper, queue)) {
             *lock(&shared.to_helper) = None;
             shared.finish(SessionState::Failed(COULDNT_START.to_string()));
         }
@@ -300,6 +327,12 @@ impl Session {
     /// Where the session is.
     pub fn state(&self) -> SessionState {
         self.shared.state()
+    }
+
+    /// Whether the program was ever started, which tells one that ended or was lost from one that
+    /// never ran.
+    pub fn was_started(&self) -> bool {
+        self.shared.started.load(Ordering::SeqCst)
     }
 
     /// Sends bytes to the program, as typed. Never waits; what's sent faster than the program
@@ -470,7 +503,7 @@ fn read_side(shared: &Arc<Shared>, helper: &Path, queue: Receiver<ToHelper>) {
     }
     {
         let theirs = shared.clone();
-        if !spawn("writing", move || write_side(&theirs, stdin, queue)) {
+        if !spawn_guarded(shared, "writing", move || write_side(&theirs, stdin, queue)) {
             kill(&child);
             reap(&child, Duration::ZERO);
             return gave_up(shared, COULDNT_START);

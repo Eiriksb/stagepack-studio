@@ -11,11 +11,18 @@ pub fn key_bytes(key: &Keystroke) -> Option<Vec<u8>> {
 /// as delete, Tab, Escape, the arrows (`ESC [ A` and so on, or `ESC O A` once the program has asked
 /// for application cursor keys, as `application_cursor` says), Home, End, Page Up and Down, Delete,
 /// the function keys, Alt with text as an escape before it, and Ctrl with a letter as the
-/// control character. Ctrl+Shift+Escape is the show's, to give the keys back, so it sends nothing,
+/// control character. Ctrl+Shift+Q is the show's, to give the keys back, so it sends nothing,
 /// and neither do the shortcuts of the platform key.
 pub fn key_bytes_in(key: &Keystroke, application_cursor: bool) -> Option<Vec<u8>> {
+    key_bytes_on(key, application_cursor, cfg!(target_os = "macos"))
+}
+
+/// [`key_bytes_in`], where `mac` says whether Option on this system makes characters: on a Mac the
+/// Option key gives `@`, `|`, `{` and the like on many layouts, and a key that made a character other
+/// than its own is text, as Terminal.app sends it by default, not an escape before the key.
+pub fn key_bytes_on(key: &Keystroke, application_cursor: bool, mac: bool) -> Option<Vec<u8>> {
     let m = key.modifiers;
-    if m.control && m.shift && key.key == "escape" {
+    if super::gives_keys_back(key) {
         return None;
     }
     if m.platform || m.function {
@@ -70,7 +77,8 @@ pub fn key_bytes_in(key: &Keystroke, application_cursor: bool) -> Option<Vec<u8>
         return Some(if alt_prefixed { [&[0x1b][..], &named].concat() } else { named });
     }
     // AltGr typing: Ctrl and Alt together giving a character is text.
-    let altgr = m.control && m.alt && key.key_char.is_some();
+    let option_text = mac && m.alt && !m.control && key.key_char.as_deref().is_some_and(|text| !text.is_empty() && !text.eq_ignore_ascii_case(name));
+    let altgr = (m.control && m.alt && key.key_char.is_some()) || option_text;
     if m.control && !altgr {
         let mut letters = name.chars();
         let control = match (letters.next(), letters.next()) {
@@ -127,7 +135,7 @@ mod tests {
             (key("ctrl-a"), Some(&[1])),
             (key("ctrl-c"), Some(&[3])),
             (key("ctrl-z"), Some(&[26])),
-            (key("ctrl-shift-escape"), None),
+            (key("ctrl-shift-q"), None),
             (key("cmd-c"), None),
         ];
         for (key, bytes) in table {
@@ -142,6 +150,17 @@ mod tests {
         assert_eq!(key_bytes_in(&key("up"), false).unwrap(), b"\x1b[A");
         // The others don't change.
         assert_eq!(key_bytes_in(&key("pageup"), true).unwrap(), b"\x1b[5~");
+    }
+
+    #[test]
+    fn on_a_mac_option_typed_characters_are_sent_as_the_character_they_make() {
+        // A Norwegian layout: Option+2 is @, Option+7 is |, Option+8 is [.
+        for (source, text) in [("alt-2", "@"), ("alt-7", "|"), ("alt-shift-8", "{"), ("alt-8", "[")] {
+            assert_eq!(key_bytes_on(&typed(source, text), false, true).unwrap(), text.as_bytes(), "{source}");
+        }
+        // Alt and a letter that made itself, or on another system, is still an escape before it.
+        assert_eq!(key_bytes_on(&typed("alt-b", "b"), false, true).unwrap(), b"\x1bb");
+        assert_eq!(key_bytes_on(&typed("alt-2", "@"), false, false).unwrap(), b"\x1b@");
     }
 
     #[test]

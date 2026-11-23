@@ -52,6 +52,52 @@ impl TalkFolder {
     }
 }
 
+/// How a folder is written to a program and to the person: on Windows a path that `canonicalize` made
+/// verbatim (`\\?\C:\talk`) is written plainly (`C:\talk`) when it can be, as `cmd.exe` and other
+/// programs refuse the verbatim form as their folder. Elsewhere, and for any path that has no plain
+/// form, it is the path as it is. This only changes how the folder is spelled: what is checked and what
+/// a yes is for stay the canonical path.
+pub fn spelled_plainly(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(plain) = path.to_str().and_then(plain_drive_path) {
+        return PathBuf::from(plain);
+    }
+    path.to_path_buf()
+}
+
+/// `\\?\C:\folder` as `C:\folder`, if it is a verbatim path to a folder on a drive that can be written
+/// plainly: no part of it a reserved device name, or ending in a dot or a space, or with a character a
+/// plain path can't have, and short enough to be one (under 260 characters). Anything else comes back as
+/// `None`.
+pub fn plain_drive_path(verbatim: &str) -> Option<String> {
+    let rest = verbatim.strip_prefix(r"\\?\")?;
+    let mut chars = rest.chars();
+    let (drive, colon) = (chars.next()?, chars.next()?);
+    if !drive.is_ascii_alphabetic() || colon != ':' {
+        return None;
+    }
+    let after = &rest[2..];
+    if !after.is_empty() && !after.starts_with('\\') {
+        return None;
+    }
+    if rest.len() >= 260 {
+        return None;
+    }
+    const RESERVED: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
+    for part in after.split('\\').filter(|part| !part.is_empty()) {
+        if part.chars().any(|c| c.is_control() || "<>\"/|?*:".contains(c)) || part.ends_with('.') || part.ends_with(' ') {
+            return None;
+        }
+        let stem = part.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
+        let numbered = |name: &str| stem.len() == 4 && stem.starts_with(name) && matches!(stem.as_bytes()[3], b'1'..=b'9');
+        if RESERVED.contains(&stem.as_str()) || numbered("COM") || numbered("LPT") {
+            return None;
+        }
+    }
+    // A bare drive gets its root.
+    Some(if after.is_empty() { format!("{rest}\\") } else { rest.to_string() })
+}
+
 /// The commands the user has said can always run, each in one folder.
 pub struct RunPermissions {
     file: PathBuf,
@@ -449,7 +495,7 @@ pub fn permit(
         other => return Err(other),
     }
     let (cwd, scratch) = match &plan.folder {
-        Some(folder) => (folder.path().to_path_buf(), None),
+        Some(folder) => (spelled_plainly(folder.path()), None),
         None => {
             let scratch = Scratch::make().map_err(|_| Decision::Refused)?;
             (scratch.0.clone(), Some(scratch))

@@ -853,7 +853,7 @@ impl WorkspaceView {
             command: plan.shown_words(),
             program_in_talk: plan.program_in_talk(),
             program_by_path: plan.program_named_by_path(),
-            folder: plan.folder().map(|folder| folder.path().to_path_buf()),
+            folder: plan.folder().map(|folder| crate::live_terminal::spelled_plainly(folder.path())),
         };
         let view = cx.weak_entity();
         ask_to_run(window, cx, question, move |answer, window, cx| {
@@ -887,7 +887,7 @@ impl WorkspaceView {
             // The terminal as it is now: if the talk changed under the question, nothing starts.
             let (slide, now) = document.update(cx, |document, _| (document.current(), document.selected_terminal()));
             if let Some(now) = now.filter(|now| now.source == terminal.source && now.on.run == terminal.on.run) {
-                self.try_start_live(slide, &now, cx);
+                self.start_live(slide, &now, true, cx);
             }
         }
         cx.notify();

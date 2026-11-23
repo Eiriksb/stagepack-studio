@@ -52,9 +52,8 @@ impl LiveId {
 struct Entry {
     id: LiveId,
     session: Rc<Session>,
-    /// Whether it was ever seen running, which tells a program that ended from one that never
-    /// started.
-    was_running: bool,
+    /// Whether its failing to start was said: once.
+    told: bool,
     /// Whether it was seen over, which is what a window draws again for.
     was_over: bool,
 }
@@ -133,7 +132,7 @@ impl LiveTerminals {
             old.session.end();
             inner.ending.push(old.session);
         }
-        inner.running.push(Entry { id, session, was_running: false, was_over: false });
+        inner.running.push(Entry { id, session, told: false, was_over: false });
     }
 
     /// Every id there's a session for, ended or not.
@@ -209,7 +208,7 @@ impl LiveTerminals {
     }
 
     /// Looks at every session: lets go of those that are over, and says what is to be said of
-    /// them. Also says which ones never started.
+    /// them. Also says, once, which ones never started; those are kept, failed.
     pub fn poll(&self) -> Polled {
         let mut polled = Polled::default();
         let mut inner = self.0.borrow_mut();
@@ -221,11 +220,13 @@ impl LiveTerminals {
                 polled.changed = true;
             }
             match entry.session.state() {
-                SessionState::Running => entry.was_running = true,
-                SessionState::Failed(sentence) if !entry.was_running => {
-                    polled.sayings.push(format!("{COULDNT_START}{sentence}"));
-                    polled.failed.push(entry.id.clone());
-                    gone.push(entry.id.clone());
+                // A session that never started is kept, failed, said once, and not started again on its own.
+                SessionState::Failed(sentence) if !entry.session.was_started() => {
+                    if !entry.told {
+                        entry.told = true;
+                        polled.sayings.push(format!("{COULDNT_START}{sentence}"));
+                        polled.failed.push(entry.id.clone());
+                    }
                 }
                 SessionState::Failed(sentence) if sentence == DIDNT_END => {
                     if !polled.sayings.iter().any(|said| said == DIDNT_END) {
@@ -330,12 +331,16 @@ pub struct Polled {
     pub sayings: Vec<String>,
     /// Whether a program ended, so that what shows it is to be drawn again.
     pub changed: bool,
-    /// The sessions that never started, and have been let go of.
+    /// The sessions that never started, as each is first seen to have failed.
     pub failed: Vec<LiveId>,
 }
 
-/// Whether `key` is the one that gives the keys back to the show: Ctrl+Shift+Escape.
+/// What shows in small text at the foot of a terminal that has the keys.
+pub const GIVE_BACK_HINT: &str = "Ctrl+Shift+Q gives the keys back";
+
+/// Whether `key` is the one that gives the keys back to the show: Ctrl+Shift+Q, on every system
+/// (Windows keeps Ctrl+Shift+Escape for its Task Manager).
 pub fn gives_keys_back(key: &Keystroke) -> bool {
     let m = key.modifiers;
-    m.control && m.shift && !m.alt && !m.platform && key.key == "escape"
+    m.control && m.shift && !m.alt && !m.platform && key.key.eq_ignore_ascii_case("q")
 }

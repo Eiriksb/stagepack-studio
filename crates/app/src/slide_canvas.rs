@@ -11,7 +11,7 @@ use slides_engine::{FontsSeed, Layer, ModelLayer, ModelOn, Rect, TerminalLayer, 
 use slides_model::{CantDraw, View};
 
 use crate::document::LargeOpen;
-use crate::live_terminal::{Look as LiveLook, PROGRAM_ENDED, Session};
+use crate::live_terminal::{GIVE_BACK_HINT, Look as LiveLook, PROGRAM_ENDED, Session};
 use crate::model_view::{self, Aim, Turner};
 use crate::present::{LayerLook, SlideLook};
 use crate::replay::{Aim as ReplayAim, Replay, Source as ReplaySource};
@@ -22,6 +22,8 @@ pub use slides_engine::SLIDE_WIDTH;
 
 /// The id of the small words at the foot of a live terminal whose program ended.
 pub const LIVE_ENDED_ID: &str = "live-ended";
+/// The id of the small words at the foot of a live terminal that has the keys.
+pub const LIVE_HINT_ID: &str = "live-hint";
 
 /// How many frames are drawn after a terminal's program ended, for the last pictures of its screen to come.
 const LAST_PICTURES_WAIT: u8 = 20;
@@ -75,6 +77,9 @@ struct LiveOver {
     rect: Rect,
     rotate: f32,
     keys: bool,
+    /// Whether the picture is another window's: this only shows the newest one drawn, and asks
+    /// for none of its own, as the presenter's view does of what the audience's window draws.
+    follows: bool,
     shown: Option<Shown>,
     /// How many frames were drawn since its program ended: its last pictures are still coming.
     after_over: u8,
@@ -87,6 +92,8 @@ pub struct LivePlace {
     pub rect: Rect,
     pub rotate: f32,
     pub keys: bool,
+    /// Whether to show only the pictures another window's canvas has the session draw.
+    pub follows: bool,
 }
 
 /// What shows of a terminal recording's layer.
@@ -955,7 +962,7 @@ impl SlideCanvas {
                 None => None,
             };
             changed |= at.is_none() || shown.is_none();
-            kept.push(LiveOver { layer: terminal.layer, session: terminal.session, rect: terminal.rect, rotate: terminal.rotate, keys: terminal.keys, shown, after_over: 0 });
+            kept.push(LiveOver { layer: terminal.layer, session: terminal.session, rect: terminal.rect, rotate: terminal.rotate, keys: terminal.keys, follows: terminal.follows, shown, after_over: 0 });
         }
         for over in old {
             self.retired_replays.extend(over.shown.map(|shown| shown.image));
@@ -998,11 +1005,12 @@ impl SlideCanvas {
         self.live.iter().map(|over| over.shown.as_ref().map(|shown| shown.image.clone())).collect()
     }
 
-    /// Where each live terminal is on the slide, and whether its program has ended, in order.
-    pub(crate) fn live_boxes(&self) -> Vec<(Rect, bool)> {
+    /// Where each live terminal is on the slide, whether its program has ended, and whether it has the
+    /// keys, in order.
+    pub(crate) fn live_boxes(&self) -> Vec<(Rect, bool, bool)> {
         self.live
             .iter()
-            .map(|over| (over.rect, over.session.upgrade().is_some_and(|session| session.state().is_over())))
+            .map(|over| (over.rect, over.session.upgrade().is_some_and(|session| session.state().is_over()), over.keys))
             .collect()
     }
 
@@ -1013,7 +1021,9 @@ impl SlideCanvas {
         let mut wanted = false;
         for over in &mut self.live {
             let Some(session) = over.session.upgrade() else { continue };
-            session.set_look(LiveLook { rect: over.rect, rotate: over.rotate, scale, fonts: fonts.clone() });
+            if !over.follows {
+                session.set_look(LiveLook { rect: over.rect, rotate: over.rotate, scale, fonts: fonts.clone() });
+            }
             if let Some(shown) = session.latest_shown()
                 && over.shown.as_ref().is_none_or(|had| !Arc::ptr_eq(&had.image, &shown.image))
             {
@@ -1337,8 +1347,8 @@ impl Render for SlideCanvas {
                 self.live_boxes()
                     .into_iter()
                     .enumerate()
-                    .filter(|(_, (_, over))| *over)
-                    .map(|(at, (rect, _))| {
+                    .filter(|(_, (_, over, _))| *over)
+                    .map(|(at, (rect, _, _))| {
                         div()
                             .id((LIVE_ENDED_ID, at))
                             .test_support()
@@ -1355,6 +1365,34 @@ impl Render for SlideCanvas {
                     .collect()
             })
             .unwrap_or_default();
+        // A terminal that has the keys says, small, how to give them back.
+        let hints: Vec<AnyElement> = self
+            .placed
+            .map(|(slide, area)| {
+                let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
+                let across = slide.origin - area.origin;
+                self.live_boxes()
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, (_, over, keys))| *keys && !*over)
+                    .map(|(at, (rect, _, _))| {
+                        div()
+                            .id((LIVE_HINT_ID, at))
+                            .test_support()
+                            .aria_label(GIVE_BACK_HINT)
+                            .absolute()
+                            .left(across.x + px(rect.x * unit))
+                            .top(across.y + px((rect.y + rect.h) * unit - 16.))
+                            .px_1()
+                            .bg(black().opacity(0.6))
+                            .text_xs()
+                            .text_color(white())
+                            .child(GIVE_BACK_HINT)
+                            .into_any_element()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         div()
             .absolute()
             .size_full()
@@ -1362,6 +1400,7 @@ impl Render for SlideCanvas {
             .child(housekeeping)
             .children(runs)
             .children(ended)
+            .children(hints)
     }
 }
 

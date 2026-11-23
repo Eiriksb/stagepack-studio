@@ -451,3 +451,77 @@ mod windows {
         h.until_exited(Duration::from_secs(5));
     }
 }
+
+/// Starts the program that ignores hang-up and terminate, and gives back its pids.
+#[cfg(target_os = "linux")]
+fn stubborn_running() -> (Helper, Vec<u32>) {
+    let mut h = Helper::start(r#"trap "" TERM HUP INT; sleep 1000 & echo PIDS $$ $!; sleep 1000"#);
+    expect_started(&mut h);
+    h.until_output("PIDS ");
+    let end = Instant::now() + Duration::from_secs(5);
+    while pids(&h.output_text()).len() < 2 {
+        assert!(Instant::now() < end);
+        h.next(Duration::from_secs(5));
+    }
+    let all = pids(&h.output_text());
+    (h, all)
+}
+
+#[cfg(target_os = "linux")]
+fn send_signal(pid: u32, sig: &str) {
+    let _ = Command::new("kill").args([&format!("-{sig}"), &pid.to_string()]).status();
+}
+
+#[cfg(target_os = "linux")]
+fn wait_gone(all: &[u32], within: Duration) {
+    let end = Instant::now() + within;
+    while all.iter().any(|p| alive(*p)) {
+        assert!(Instant::now() < end, "something of the group is still running");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A terminal's hang-up, interrupt and quit don't end the helper, so they can't leave the program
+/// behind either: the helper stays, and the program goes when the app lets go.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_terminals_signals_leave_the_helper_standing_and_the_program_goes_with_the_app() {
+    for sig in ["HUP", "INT", "QUIT"] {
+        let (mut h, all) = stubborn_running();
+        let _reap = Reap(all.clone());
+        send_signal(h.child.id(), sig);
+        thread::sleep(Duration::from_millis(400));
+        assert!(h.child.try_wait().unwrap().is_none(), "SIG{sig} ended the helper");
+        assert!(all.iter().all(|p| alive(*p)), "SIG{sig} ended the program early");
+        h.stdin = None;
+        h.until_exited(Duration::from_secs(5));
+        wait_gone(&all, Duration::from_secs(5));
+        h.finish();
+    }
+}
+
+/// `pkill stagepack` sends terminate to the helper: the program's whole group is ended, and said so.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_terminate_signal_ends_the_program() {
+    let (mut h, all) = stubborn_running();
+    let _reap = Reap(all.clone());
+    send_signal(h.child.id(), "TERM");
+    h.until_exited(Duration::from_secs(5));
+    wait_gone(&all, Duration::from_secs(5));
+    h.finish();
+}
+
+/// The helper is no longer in the group of whoever started it, so a terminal's signal to that group misses it.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_helper_leaves_the_starters_group() {
+    let mut h = Helper::new();
+    h.say(&ToHelper::Start(spec("sh", &["-c", "sleep 1"])));
+    expect_started(&mut h);
+    let mine = unsafe { libc::getpgid(0) };
+    let theirs = unsafe { libc::getpgid(h.child.id() as i32) };
+    assert_ne!(mine, theirs);
+    h.until_exited(Duration::from_secs(5));
+    h.finish();
+}

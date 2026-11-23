@@ -67,6 +67,7 @@ impl SlideEditor {
                     rect: runs.terminal.on.rect,
                     rotate: runs.terminal.on.rotate,
                     keys: keys.as_ref() == Some(&runs.id),
+                    follows: false,
                 })
             })
             .collect();
