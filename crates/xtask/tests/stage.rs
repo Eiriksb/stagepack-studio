@@ -71,6 +71,16 @@ fn the_staged_app_needs_nothing_else() {
     }
     assert!(std::fs::read_to_string(out.join("NOTICES.txt")).unwrap().contains("OpenH264"));
 
+    // Nothing of the builder's home or the repository's place is written into a shipped program.
+    let builder = [std::env::var("HOME").unwrap(), repo.display().to_string()];
+    for program in ["stagepack-studio", "stagepack-terminal"] {
+        let bytes = std::fs::read(out.join(program)).unwrap();
+        for path in &builder {
+            let found = bytes.windows(path.len()).any(|window| window == path.as_bytes());
+            assert!(!found, "{program} has {path} written in it");
+        }
+    }
+
     let home = scratch.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
     let app = out.join("stagepack-studio");

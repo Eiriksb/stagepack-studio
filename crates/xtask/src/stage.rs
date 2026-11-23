@@ -80,13 +80,24 @@ pub fn stage(out: &Path, bundle: Option<&Path>) -> Result<u64, String> {
     std::fs::create_dir_all(&out).map_err(|e| format!("can't create {}: {e}", out.display()))?;
 
     // Built one at a time, so that the helper's pseudo-terminal code isn't linked into the app.
+    // In a target folder of their own, with the paths of the machine that builds them written
+    // out of them, so that nothing of the builder's home ends up in a shipped program.
     let cargo = repo.join("scripts/cargo-safe.sh");
-    run(
-        Command::new(&cargo).current_dir(&repo).args(["build", "--release", "-p", "stagepack-studio", "--features", "shipped"]),
-        "building the app",
-    )?;
-    run(Command::new(&cargo).current_dir(&repo).args(["build", "--release", "-p", "slides-terminal-helper"]), "building the helper")?;
-    let release = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from).unwrap_or_else(|| repo.join("target")).join("release");
+    let target = repo.join("target/package-build");
+    let flags = path_free_flags(&repo);
+    let build = |package: &str, features: &[&str]| {
+        let mut command = Command::new(&cargo);
+        command
+            .current_dir(&repo)
+            .env("CARGO_ENCODED_RUSTFLAGS", &flags)
+            .args(["build", "--release", "-p", package, "--target-dir"])
+            .arg(&target)
+            .args(features);
+        command
+    };
+    run(&mut build("stagepack-studio", &["--features", "shipped"]), "building the app")?;
+    run(&mut build("slides-terminal-helper", &[]), "building the helper")?;
+    let release = target.join("release");
     for name in ["stagepack-studio", "stagepack-terminal"] {
         let file = format!("{name}{EXE}");
         std::fs::copy(release.join(&file), out.join(&file)).map_err(|e| format!("can't copy {file}: {e}"))?;
@@ -110,4 +121,19 @@ pub fn stage(out: &Path, bundle: Option<&Path>) -> Result<u64, String> {
         return Err(over_budget(bytes));
     }
     Ok(bytes)
+}
+
+/// Rust flags that write the builder's own folders out of what's built: the cargo home, where
+/// the libraries' sources are, the repository, and the toolchain's home, each as a short stand-in.
+pub fn path_free_flags(repo: &Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let cargo_home = std::env::var_os("CARGO_HOME").map(PathBuf::from).or_else(|| home.as_ref().map(|h| h.join(".cargo")));
+    let rustup_home = std::env::var_os("RUSTUP_HOME").map(PathBuf::from).or_else(|| home.as_ref().map(|h| h.join(".rustup")));
+    let mut flags = Vec::new();
+    for (from, to) in [(cargo_home, "/cargo"), (rustup_home, "/rustup"), (Some(repo.to_path_buf()), "/studio")] {
+        if let Some(from) = from {
+            flags.push(format!("--remap-path-prefix={}={to}", from.display()));
+        }
+    }
+    flags.join("\x1f")
 }
