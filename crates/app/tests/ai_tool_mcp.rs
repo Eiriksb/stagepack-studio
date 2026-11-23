@@ -328,7 +328,7 @@ fn describe_works_on_a_folder_with_no_talk_yet() {
     assert!(reply["result"]["isError"].is_null(), "{reply}");
     let said = text_of(&reply);
     assert!(said.contains("Box") && said.contains("Chart"), "{said}");
-    assert!(said.contains("no talk at"), "{said}");
+    assert!(said.contains("couldn't be opened") && said.contains("slides.md"), "{said}");
     assert_eq!(server.finish(), 0);
 }
 

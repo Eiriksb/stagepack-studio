@@ -257,8 +257,9 @@ fn text_tool(talk: &Path, name: &str) -> Value {
         return match opened {
             Ok(mut opened) => text_result(&describe_text(&describe(Some(&mut opened)))),
             // The tags and settings are still what the AI needs to write the talk.
-            Err(_) => text_result(&format!(
-                "{}\nThe talk's own components aren't listed, because there's no talk at {} yet.\n",
+            // Why it couldn't be opened is said too: a folder with no talk yet, or a broken one.
+            Err(sentence) => text_result(&format!(
+                "{}\nThe talk's own components aren't listed, because the talk at {} couldn't be opened: {sentence}\n",
                 describe_text(&describe(None)),
                 talk.display()
             )),
