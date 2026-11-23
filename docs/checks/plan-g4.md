@@ -66,7 +66,7 @@ On a scratch talk of three slides (a title, a chart from `assets/sales.csv`, a t
 ## Hand checks for the owner
 
 1. On Linux: `claude mcp add stagepack -- stagepack-studio mcp /path/to/an/empty/scratch/folder`, then ask Claude Code to make a three-slide talk with a chart and to look at each slide. It should read the guide, write `slides.md`, call `check` and look at a `picture` of each slide. Open the same folder in the window and see that the pictures match what the window shows.
-2. The same on Windows, from a fresh clone: from PowerShell, `stagepack-studio.exe picture` on a talk and `stagepack-studio.exe mcp` connected to an assistant must work, with no window opening. Standard input and output there must carry the server's lines without a change to them.
+2. The same on Windows, from a fresh clone: from PowerShell in the installed folder, `stagepack-studio picture` (which runs `stagepack-studio.com`, the console twin of the windowed `stagepack-studio.exe`: the prompt must wait for it and `$LASTEXITCODE` must hold its exit status) on a talk and `stagepack-studio mcp` connected to an assistant must work, with no window opening. Standard input and output there must carry the server's lines without a change to them.
 3. Ask the assistant to use a component the talk has that isn't built, and see that `check` says so and the assistant tells you to build it in the app, not that it builds it.
 
 ## The final review

@@ -38,6 +38,7 @@ const COMMANDS: [(&str, &str); 6] = [
 /// A program of the windows subsystem starts with no console, so what a command prints would go nowhere.
 /// Attaches to the terminal that ran it and, where the program was given no output of its own (a pipe or a
 /// file is left alone), points the standard handles at that terminal. Does nothing when there's no terminal.
+/// The console devices are opened for reading and writing, so that std can tell they are consoles and print non-ASCII text properly.
 /// Not run or compiled here: Windows only.
 #[cfg(windows)]
 fn attach_parent_console() {
@@ -51,12 +52,12 @@ fn attach_parent_console() {
         if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
             return;
         }
-        for (which, device, write) in [(STD_INPUT_HANDLE, "CONIN$", false), (STD_OUTPUT_HANDLE, "CONOUT$", true), (STD_ERROR_HANDLE, "CONOUT$", true)] {
+        for (which, device) in [(STD_INPUT_HANDLE, "CONIN$"), (STD_OUTPUT_HANDLE, "CONOUT$"), (STD_ERROR_HANDLE, "CONOUT$")] {
             let current = GetStdHandle(which);
             if !current.is_null() && current != INVALID_HANDLE_VALUE {
                 continue;
             }
-            if let Ok(file) = std::fs::OpenOptions::new().read(!write).write(write).open(device) {
+            if let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(device) {
                 SetStdHandle(which, file.into_raw_handle());
             }
         }

@@ -7,7 +7,7 @@ fn repo() -> PathBuf {
 }
 
 fn read(relative: &str) -> String {
-    std::fs::read_to_string(repo().join(relative)).unwrap_or_else(|e| panic!("can't read {relative}: {e}"))
+    std::fs::read_to_string(repo().join(relative)).unwrap_or_else(|e| panic!("can't read {relative}: {e}")).replace("\r\n", "\n")
 }
 
 fn iss() -> String {
@@ -210,4 +210,24 @@ fn the_shipped_windows_app_has_no_console_but_commands_print_in_the_terminal() {
     assert!(tool.contains("#[cfg(windows)]\nfn attach_parent_console()") && tool.contains("AttachConsole(ATTACH_PARENT_PROCESS)"));
     let manifest = read("crates/app/Cargo.toml");
     assert!(manifest.contains("[target.'cfg(windows)'.dependencies]") && manifest.contains("windows-sys"));
+}
+
+#[test]
+fn windows_gets_a_console_twin_that_a_shell_waits_for() {
+    // Windows only and never run here.
+    let twin = read("crates/app/src/bin/stagepack-studio-console.rs");
+    assert!(twin.contains("stagepack_studio::run_main()") && !twin.contains("windows_subsystem = \"windows\"]"), "the twin is always a console program");
+    let main = read("crates/app/src/main.rs");
+    assert!(main.contains("stagepack_studio::run_main()"));
+    let manifest = read("crates/app/Cargo.toml");
+    assert!(manifest.contains("name = \"stagepack-studio-console\"") && manifest.contains("required-features = [\"windows-console\"]"));
+    // Staged only on Windows, as stagepack-studio.com, and built with the feature that makes it.
+    let stage = read("crates/xtask/src/stage.rs");
+    assert!(stage.contains("\"shipped,windows-console\"") && stage.contains("\"stagepack-studio-console.exe\"") && stage.contains("out.join(\"stagepack-studio.com\")"));
+    let copy = stage.find("stagepack-studio.com").unwrap();
+    assert!(stage[..copy].rfind("if cfg!(windows)").is_some_and(|at| copy - at < 400), "the twin is copied only on Windows");
+    // The installer takes the whole staged folder, so it takes the twin; its comment says so.
+    let text = iss();
+    assert!(text.contains("stagepack-studio.com"));
+    assert_eq!(section(&text, "Files").len(), 1);
 }

@@ -49,6 +49,7 @@ try {
     if (-not $line) { throw 'No version in crates/app/Cargo.toml.' }
     $version = [regex]::Match($line, '^version = "([^"]+)"').Groups[1].Value
     $numeric = [regex]::Match($version, '^\d+(\.\d+){0,3}').Value
+    if (-not $numeric) { throw "The version '$version' does not start with a number." }
 
     # Stage the folder the installer wraps.
     $staged = Join-Path $repo 'target\package-stage'

@@ -49,6 +49,7 @@ OutputBaseFilename=stagepack-studio-{#AppVersion}-windows-x86_64-setup
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
+; The whole staged folder, which holds stagepack-studio.exe (the windowed program) and stagepack-studio.com (its console twin, which a shell waits for).
 Source: "{#StagedDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]

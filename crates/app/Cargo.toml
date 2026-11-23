@@ -8,7 +8,15 @@ license.workspace = true
 name = "stagepack-studio"
 path = "src/main.rs"
 
+# The console twin of the program, built for Windows (see src/bin/stagepack-studio-console.rs).
+[[bin]]
+name = "stagepack-studio-console"
+path = "src/bin/stagepack-studio-console.rs"
+required-features = ["windows-console"]
+
 [features]
+# Builds the console twin.
+windows-console = []
 # Lets the tests start a live terminal session without the owner's yes, and say yes for themselves.
 test-hooks = []
 # The packaged app: it looks for the compiler bundle and the live terminal's helper beside itself only, and ignores STUDIO_BUNDLE and STUDIO_TERMINAL_HELPER.

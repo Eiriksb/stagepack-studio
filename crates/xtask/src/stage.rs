@@ -101,12 +101,23 @@ pub fn stage(out: &Path, bundle: Option<&Path>) -> Result<u64, String> {
             .args(features);
         command
     };
-    run(&mut build("stagepack-studio", &["--features", "shipped"]), "building the app")?;
+    // On Windows the console twin is built with it; on Linux the one program is both.
+    let app = if cfg!(windows) {
+        build("stagepack-studio", &["--features", "shipped,windows-console", "--bin", "stagepack-studio", "--bin", "stagepack-studio-console"])
+    } else {
+        build("stagepack-studio", &["--features", "shipped"])
+    };
+    run(&mut { app }, "building the app")?;
     run(&mut build("slides-terminal-helper", &[]), "building the helper")?;
     let release = target.join("release");
     for name in ["stagepack-studio", "stagepack-terminal"] {
         let file = format!("{name}{EXE}");
         std::fs::copy(release.join(&file), out.join(&file)).map_err(|e| format!("can't copy {file}: {e}"))?;
+    }
+
+    if cfg!(windows) {
+        // What a shell waits for: a console program of the same name that the shell finds first (PATHEXT tries `.COM` before `.EXE`).
+        std::fs::copy(release.join("stagepack-studio-console.exe"), out.join("stagepack-studio.com")).map_err(|e| format!("can't copy stagepack-studio.com: {e}"))?;
     }
 
     match bundle {
