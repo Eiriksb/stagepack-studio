@@ -1,6 +1,8 @@
 //! The yes a talk needs before it runs a program: asked once a session, remembered only for one
 //! folder and one command, never kept in a talk, shown in full, and impossible to go round.
 
+#[path = "support/helper.rs"]
+mod helper;
 #[path = "support/typing.rs"]
 mod typing;
 
@@ -882,25 +884,13 @@ fn recording_helper(dir: &Path, record: &Path) -> PathBuf {
     script
 }
 
-/// The real helper, found in the target folder beside the test's own program, or built there once.
 #[cfg(unix)]
 fn real_helper() -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let target = exe.parent().and_then(Path::parent).unwrap().to_path_buf();
-    let helper = target.join("stagepack-terminal");
-    let release = target.file_name().is_some_and(|name| name == "release");
-    let mut build = std::process::Command::new(std::env!("CARGO"));
-    build.args(["build", "-p", "slides-terminal-helper"]);
-    if release {
-        build.arg("--release");
-    }
-    assert!(build.status().expect("cargo can be run").success(), "the helper couldn't be built");
-    assert!(helper.is_file());
-    helper
+    helper::helper_program()
 }
 
 /// A second window on the folder `path`, as another window of the same talk.
-fn second_window_on(cx: &mut TestAppContext, path: &Path) -> AnyWindowHandle {
+fn second_window_on(cx: &mut TestAppContext, path: &Path) -> (AnyWindowHandle, gpui_kit::Entity<stagepack_studio::workspace_view::WorkspaceView>) {
     let document = Document::open(path, Fonts::bundled_only()).unwrap();
     cx.update(|cx| {
         gpui_kit::init(cx);
@@ -912,7 +902,6 @@ fn second_window_on(cx: &mut TestAppContext, path: &Path) -> AnyWindowHandle {
             |window, cx| cx.new(|cx| stagepack_studio::workspace_view::WorkspaceView::open_with(document, window, cx)),
         )
         .expect("a window")
-        .0
     })
 }
 
@@ -973,7 +962,7 @@ fn no_way_round_the_yes(cx: &mut TestAppContext) {
     empty("the presenter's view");
 
     // A second window of the same folder.
-    let second = second_window_on(cx, &path);
+    let second = second_window_on(cx, &path).0;
     wait(cx, 1_000);
     empty("a second window of the same talk");
     let _ = second;
@@ -1024,6 +1013,68 @@ fn no_way_round_the_yes(cx: &mut TestAppContext) {
     }
     assert!(path.join("ran").exists(), "a real start makes the file, so the check above was live");
     drop(started);
+    // Entering a show on the run slide with no yes asks, over the window the presenter looks at,
+    // and starts nothing until *Run*. *Don't run* and Escape start nothing either.
+    std::fs::write(&record, "").unwrap();
+    for answer in ["Don't run", "Escape", "Run"] {
+        let (handle, view) = second_window_on(cx, &path);
+        wait(cx, 500);
+        cx.simulate_keystrokes(handle, "shift-f5");
+        cx.run_until_parked();
+        let show = view.read_with(cx, |view, _| view.current_show()).expect("a show was started");
+        let (audience, presenter) = cx.read(|cx| {
+            let show = show.read(cx);
+            (show.audience().expect("an audience window").0, show.presenter().expect("a presenter window").0)
+        });
+        let mut asked = false;
+        for _ in 0..40 {
+            for window in [audience, presenter] {
+                cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+            }
+            cx.run_until_parked();
+            asked = cx.update_window(presenter, |_, window, cx| {
+                window.render_frame(cx);
+                window.try_find(RUN_ASK_ID).is_some()
+            })
+            .unwrap();
+            if asked {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(asked, "{answer}: the show asks in the presenter's window");
+        assert!(!cx.update_window(audience, |_, window, cx| { window.render_frame(cx); window.try_find(RUN_ASK_ID).is_some() }).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        empty(&format!("{answer}: the question is open"));
+        match answer {
+            "Don't run" => cx.update_window(presenter, |_, window, cx| window.click(RUN_NO_ID, cx)).unwrap(),
+            "Escape" => cx.simulate_keystrokes(presenter, "escape"),
+            _ => cx.update_window(presenter, |_, window, cx| window.click(RUN_YES_ID, cx)).unwrap(),
+        }
+        cx.run_until_parked();
+        if answer != "Run" {
+            for _ in 0..8 {
+                for window in [audience, presenter] {
+                    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+                }
+                cx.run_until_parked();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            empty(&format!("{answer}: answered"));
+        } else {
+            let began = std::time::Instant::now();
+            while std::fs::read(&record).unwrap().is_empty() && began.elapsed() < std::time::Duration::from_secs(10) {
+                for window in [audience, presenter] {
+                    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+                }
+                cx.run_until_parked();
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            assert!(!std::fs::read(&record).unwrap().is_empty(), "Run starts it, so the record could have shown a start");
+        }
+        cx.update(|cx| show.update(cx, |show, cx| show.end(cx)));
+        cx.run_until_parked();
+    }
     unsafe { std::env::remove_var(HELPER_ENV) };
 }
 
@@ -1107,7 +1158,8 @@ fn a_program_is_started_from_one_place_and_it_asks() {
     // The helper is found and run only by the live terminal's own files.
     assert!(outside("Command::new", &["live_terminal/session.rs"]).iter().all(|file| !file.starts_with("live_terminal/")), "a second way to run a program");
     for name in ["find_helper", "HELPER_ENV"] {
-        let places = outside(name, &["live_terminal/helper.rs", "live_terminal/mod.rs", "live_terminal/permission.rs"]);
+        // The window finds it only to hand its path to the one door, which starts nothing without a yes.
+        let places = outside(name, &["live_terminal/helper.rs", "live_terminal/mod.rs", "live_terminal/permission.rs", "workspace_view/running.rs"]);
         assert!(places.is_empty(), "{name}: {places:?}");
     }
     // The door asks first.

@@ -8,6 +8,7 @@
 mod ask;
 mod helper;
 mod keys;
+mod live;
 mod permission;
 mod resolve;
 mod session;
@@ -17,6 +18,9 @@ pub use ask::{
 };
 pub use helper::{HELPER_ENV, find_helper};
 pub use keys::{key_bytes, key_bytes_in};
+pub use live::{
+    COULDNT_START, DIDNT_END, LiveId, LiveTerminals, MOST_LIVE, NOT_INSTALLED, PROGRAM_ENDED, Polled, TOO_MANY, gives_keys_back,
+};
 pub use permission::{
     Decision, Permit, Plan, RunKey, RunPermissions, SessionYes, TalkFolder, may_run, may_run_with_path, permit, plan, plan_with_path, start_after_yes,
 };

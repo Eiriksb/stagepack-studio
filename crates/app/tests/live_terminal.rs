@@ -2,40 +2,23 @@
 //! what it prints shown, keys sent to it, a broken helper survived, and everything ended.
 #![cfg(unix)]
 
-use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use slides_terminal::{Colour, Screen};
 use slides_terminal_helper::wire::StartSpec;
 use stagepack_studio::live_terminal::{Permit, Session, SessionState, find_helper, split_command, threads_running};
 
+#[path = "support/helper.rs"]
+mod helper;
+
+use helper::helper_program;
+
 /// The tests share the count of threads and the process's memory, so they take turns.
 fn one_at_a_time() -> MutexGuard<'static, ()> {
     static TURN: Mutex<()> = Mutex::new(());
     TURN.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// The helper, found in the target folder beside the test's own program, or built there once.
-fn helper_program() -> PathBuf {
-    static HELPER: OnceLock<PathBuf> = OnceLock::new();
-    HELPER
-        .get_or_init(|| {
-            let exe = std::env::current_exe().unwrap();
-            let target = exe.parent().and_then(Path::parent).unwrap().to_path_buf();
-            let helper = target.join("stagepack-terminal");
-            let release = target.file_name().is_some_and(|name| name == "release");
-            let mut build = std::process::Command::new(std::env!("CARGO"));
-            build.args(["build", "-p", "slides-terminal-helper"]);
-            if release {
-                build.arg("--release");
-            }
-            let status = build.status().expect("cargo can be run");
-            assert!(status.success(), "the helper couldn't be built");
-            assert!(helper.is_file(), "no helper at {}", helper.display());
-            helper
-        })
-        .clone()
 }
 
 /// Starts a session on `spec`, which these tests choose themselves.

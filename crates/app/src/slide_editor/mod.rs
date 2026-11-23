@@ -26,6 +26,7 @@ use crate::document::{Beside, CellMove, Document, EditRefused};
 use crate::selection::{self, Thing};
 use crate::slide_canvas::{ModelFailed, ModelLetGo, SLIDE_WIDTH, SlideCanvas, VideoFailed, VideoLetGo, VideoOpened, letterbox};
 use crate::insert::TEXT_BOX_SIZE;
+use crate::live_terminal::LiveTerminals;
 use crate::text_editing::{Composing, EditingText, clean_typed, one_line, utf16_slice};
 use crate::text_tools::{
     SetTextSize, ToggleBold, ToggleBullets, ToggleItalic, ToggleNumbering, ToggleUnderline,
@@ -39,11 +40,13 @@ mod keys;
 mod marks;
 mod mouse;
 mod render;
+mod running;
 mod selecting;
 mod typing;
 
 pub use arranging::Nudge;
 pub use keys::*;
+pub use running::{LIVE_CONTEXT, TERMINAL_END_ID, TERMINAL_KEEP_ID, TERMINAL_START_ID};
 pub use marks::MarkColors;
 use marks::{shown_on, standing_out_on, caret_box, caret_corners, corners, corners_box, guide_bounds, outline_corners, paint_dashed, paint_outline, paint_polygon, turned};
 
@@ -162,6 +165,8 @@ pub enum EditorEvent {
     Said(SharedString),
     /// What was put on the status line no longer holds, and goes if it's still there.
     Unsaid(SharedString),
+    /// *Start* was pressed on the terminal selected, which runs a command.
+    StartTerminal,
 }
 
 /// What a right-click opened its menu on.
@@ -232,6 +237,8 @@ pub struct SlideEditor {
     playing: Option<selecting::PlayingHere>,
     /// The terminal recording selected that was played, while it's let play.
     replaying: Option<selecting::PlayingHere>,
+    /// The window's live terminals, which this shows and types into.
+    live: LiveTerminals,
     /// The 3D model selected that's being turned, and its layer, while it's let turn.
     turning: Option<(selecting::PlayingHere, usize)>,
     /// Where the pointer was as a drag turning the model last moved it.
@@ -371,11 +378,18 @@ impl SlideEditor {
             painted: MarkColors::default(),
             playing: None,
             replaying: None,
+            live: LiveTerminals::new(),
             turning: None,
             turn_drag: None,
             ime_place: None,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Has the editor show, start and end the live terminals `live`, the window's own.
+    pub fn set_live(&mut self, live: LiveTerminals, cx: &mut Context<Self>) {
+        self.live = live;
+        self.watch_keys_for_terminal(cx);
     }
 
     /// What the pointer shows over the slide, if not the usual: which way a handle under it

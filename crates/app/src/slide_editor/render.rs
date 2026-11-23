@@ -11,6 +11,8 @@ const HANDLE_ROUND: usize = 16;
 impl Render for SlideEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = cx.entity().downgrade();
+        // The terminals running on the slide shown are laid over their layers.
+        self.place_live_terminals(cx);
         let marks = self.marks(cx);
         // Each mark over the slide in the window theme's colour for it, or, where that doesn't
         // stand out from the slide's background, one that does.
@@ -71,6 +73,21 @@ impl Render for SlideEditor {
             _ => (None, false),
         };
         let terminal_playing = terminal.is_some() && self.recording_playing(cx);
+        // A terminal selected that runs a command: *Start*, or *Stop* and *Keep as recording* while
+        // it runs, below its middle.
+        let live_selected = if selecting { self.selected_runs(cx) } else { None };
+        let live_running = live_selected.as_ref().is_some_and(|runs| self.live.is_running(&runs.id));
+        let live_buttons: Vec<(&'static str, &'static str, f32)> = match (&live_selected, live_running) {
+            (None, _) => Vec::new(),
+            (Some(_), false) => vec![(TERMINAL_START_ID, "Start", 40.)],
+            (Some(_), true) => vec![(TERMINAL_END_ID, "Stop", 40.), (TERMINAL_KEEP_ID, "Keep as recording", 80.)],
+        };
+        let live_button = live_selected.as_ref().zip(self.canvas.read(cx).slide_bounds().zip(self.canvas.read(cx).area())).map(|(runs, (slide, area))| {
+            let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
+            let rect = runs.terminal.on.rect;
+            let middle = slide.origin + point(px((rect.x + rect.w / 2.) * unit), px((rect.y + rect.h / 2.) * unit));
+            middle - area.origin
+        });
         // The lines what's dragged snaps to, while the button is down.
         let guides = self.guides().to_vec();
         // A thing being dragged out of the slide's text: a dashed line where it'll go.
@@ -305,7 +322,9 @@ impl Render for SlideEditor {
         )
         .absolute()
         .size_full();
+        let live_keys = self.live_has_keys();
         let key_context = match (selecting, video.is_some(), model.is_some()) {
+            _ if live_keys => LIVE_CONTEXT.to_string(),
             (true, true, _) => format!("{SELECTION_CONTEXT} {VIDEO_CONTEXT}"),
             (true, _, true) => format!("{SELECTION_CONTEXT} {MODEL_CONTEXT}"),
             (true, false, false) if terminal_selected => format!("{SELECTION_CONTEXT} {TERMINAL_CONTEXT}"),
@@ -330,6 +349,8 @@ impl Render for SlideEditor {
             .track_focus(&self.focus_handle)
             .absolute()
             .size_full()
+            // A press on a running terminal gives it the keys, and one elsewhere takes them back.
+            .capture_any_mouse_down(cx.listener(Self::press_for_keys))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             // Before the menu opens: it keeps the press from going further.
             .on_mouse_down(MouseButton::Right, cx.listener(Self::right_down))
@@ -541,6 +562,40 @@ impl Render for SlideEditor {
                                 .child(label),
                         ),
                 )
+            })
+            .when_some(live_button, |this, middle| {
+                this.children(live_buttons.into_iter().map(|(id, label, down)| {
+                    div().absolute().left(middle.x).top(middle.y).child(
+                        div()
+                            .id(id)
+                            .test_support()
+                            .aria_label(label)
+                            .absolute()
+                            // Below its middle, each its own distance down.
+                            .left(px(-80.))
+                            .top(px(down - 16.))
+                            .w(px(160.))
+                            .h(px(32.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .bg(button_color)
+                            .text_color(button_text)
+                            .text_sm()
+                            .cursor_pointer()
+                            // The press is the button's, not the slide's beneath it.
+                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                match id {
+                                    TERMINAL_START_ID => this.start_terminal(cx),
+                                    TERMINAL_END_ID => this.end_terminal(cx),
+                                    _ => {}
+                                }
+                            }))
+                            .child(label),
+                    )
+                }))
             })
             .when_some(model_button, |this, middle| {
                 this.children(model_buttons.into_iter().map(|(id, label, across)| {

@@ -38,9 +38,9 @@ use crate::markdown_panel::MarkdownPanel;
 use crate::notes_panel::{
     NOTES_HEIGHT, NOTES_MAX_HEIGHT, NOTES_MIN_HEIGHT, NotesEdited, NotesFocused, NotesPanel,
 };
-use crate::live_terminal::{Decision, Plan, RunAnswer, RunPermissions, RunQuestion, SessionYes, ask_to_run, may_run, plan};
+use crate::live_terminal::{Decision, LiveTerminals, Plan, RunAnswer, RunPermissions, RunQuestion, SessionYes, ask_to_run, may_run, plan};
 use crate::permissions::BuildPermissions;
-use crate::present_view::{self, Presentation, start_show};
+use crate::present_view::{self, Presentation};
 use crate::recovery::{Found, NotTaken, Recovery};
 use crate::ribbon::{Panels, Ribbon, RibbonTab};
 use crate::save_flow::{CloseAnswer, Effect, SaveFlow, SaveOutcome};
@@ -60,8 +60,11 @@ use crate::slide_strip::{
 use crate::watcher::{self, Change};
 use crate::working_copies::{KEEP_FAILED, KeepFailed, WorkingCopies};
 
+pub use running::LiveStep;
+
 mod editing;
 mod inserting;
+mod running;
 mod saving;
 mod starting;
 
@@ -439,6 +442,12 @@ pub struct WorkspaceView {
     /// The commands this talk has been told yes or no to in this window. A talk opened in the
     /// window gets a new one.
     run_yes: SessionYes,
+    /// The live terminals running in this window, for its show and its editor.
+    live: LiveTerminals,
+    /// What looks at them now and then.
+    live_watch: Option<Task<()>>,
+    /// The terminal *Start* asked about, to be started if the answer is yes.
+    start_when_yes: Option<(usize, slides_engine::TerminalLayer)>,
     /// Whether this talk's folder is one of them.
     always_build: bool,
     /// Where an untitled talk is first saved, in place of the person's Documents folder.
@@ -460,6 +469,8 @@ pub struct WorkspaceView {
     /// The window this is the content of.
     window_handle: AnyWindowHandle,
     _scale_changed: Subscription,
+    /// Ends the window's live terminals when the window is closed.
+    _window_closed: Subscription,
     _document_changed: Option<Subscription>,
     _notes_edited: Subscription,
     _editor_events: Subscription,
@@ -572,10 +583,11 @@ impl WorkspaceView {
             TextTools::new(document.clone(), slide_editor.clone(), tools_focus, window, cx)
         });
         let editor_events =
-            cx.subscribe(&slide_editor, |this, _, event: &EditorEvent, cx| match event {
+            cx.subscribe_in(&slide_editor, window, |this, _, event: &EditorEvent, window, cx| match event {
                 EditorEvent::Edited => this.edited(cx),
                 EditorEvent::Said(said) => this.say(said.clone(), cx),
                 EditorEvent::Unsaid(said) => this.unsay(said, cx),
+                EditorEvent::StartTerminal => this.start_selected_terminal(window, cx),
             });
         let panels = Panels {
             notes: true,
@@ -665,6 +677,8 @@ impl WorkspaceView {
             cx.observe(document, |this, _, cx| {
                 this.working_copies
                     .update(cx, |copies, cx| copies.talk_changed(cx));
+                // A tag taken away, or a `run` changed, ends what ran.
+                this.sync_live(cx);
                 cx.notify();
             })
         });
@@ -682,6 +696,9 @@ impl WorkspaceView {
             .and_then(|document| talk_folder_of(document.read(cx).place()));
         let permissions = BuildPermissions::default_file().map(BuildPermissions::load);
         let run_permissions = RunPermissions::default_file().map(RunPermissions::load);
+        let live = LiveTerminals::new();
+        slide_editor.update(cx, |editor, cx| editor.set_live(live.clone(), cx));
+        let window_closed = Self::end_live_with_window(window, live.clone(), cx);
         let mut view = Self {
             document,
             problem,
@@ -731,6 +748,9 @@ impl WorkspaceView {
             permissions,
             run_permissions,
             run_yes: SessionYes::new(),
+            live,
+            live_watch: None,
+            start_when_yes: None,
             documents: None,
             stagepack: None,
             always_build: false,
@@ -742,6 +762,7 @@ impl WorkspaceView {
             working_copies,
             window_handle: window.window_handle(),
             _scale_changed: scale_changed,
+            _window_closed: window_closed,
             _document_changed: document_changed,
             _notes_edited: notes_edited,
             _editor_events: editor_events,
@@ -835,13 +856,13 @@ impl WorkspaceView {
             folder: plan.folder().map(|folder| folder.path().to_path_buf()),
         };
         let view = cx.weak_entity();
-        ask_to_run(window, cx, question, move |answer, _, cx| {
-            view.update(cx, |view, cx| view.run_answered(&plan, answer, cx)).ok();
+        ask_to_run(window, cx, question, move |answer, window, cx| {
+            view.update(cx, |view, cx| view.run_answered(&plan, answer, window, cx)).ok();
         })
     }
 
     /// Takes in what was answered about running what `plan` says.
-    fn run_answered(&mut self, plan: &Plan, answer: RunAnswer, cx: &mut Context<Self>) {
+    fn run_answered(&mut self, plan: &Plan, answer: RunAnswer, _window: &mut Window, cx: &mut Context<Self>) {
         let key = plan.key();
         match answer {
             RunAnswer::DontRun => self.run_yes.refuse(key),
@@ -857,6 +878,12 @@ impl WorkspaceView {
                     self.say("The permission couldn't be kept, so it's only for now.".to_string(), cx);
                 }
             }
+        }
+        // *Start* asked: a yes starts what it asked about, which looks at the yes again.
+        if let Some((slide, terminal)) = self.start_when_yes.take()
+            && answer != RunAnswer::DontRun
+        {
+            self.try_start_live(slide, &terminal, cx);
         }
         cx.notify();
     }
@@ -1202,9 +1229,10 @@ impl WorkspaceView {
             editor.stop_turning(cx);
         });
         let this = cx.entity().downgrade();
+        let owner = (this.clone(), self.live.clone());
         // Once this window is free again, as the show asks it which screen it's on.
         cx.defer(move |cx| {
-            let show = start_show(document, rehearsing, cx);
+            let show = present_view::start_show_for(document, rehearsing, Some(owner), cx);
             this.update(cx, |this, cx| {
                 if show.read(cx).has_ended() {
                     this.say("Could not open a window for the show.", cx);

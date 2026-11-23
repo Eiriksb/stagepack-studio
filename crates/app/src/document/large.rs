@@ -930,6 +930,11 @@ impl Document {
         guarded(|| self.deck.terminals(current)).unwrap_or_default()
     }
 
+    /// Every terminal on slide `index` of the talk, with its layer, tag and what it names.
+    pub fn terminals_on(&mut self, index: usize) -> Vec<TerminalLayer> {
+        guarded(|| self.deck.terminals(index)).unwrap_or_default()
+    }
+
     /// The terminal recordings on slide `index`, of those a show goes through, at `moment`, among
     /// the layers [`Self::layers_at`] gives then.
     pub fn terminals_at(&mut self, index: usize, moment: slides_engine::Moment) -> Vec<TerminalLayer> {
