@@ -47,10 +47,10 @@ At the run's last commit:
 
 - `scripts/cargo-safe.sh test --workspace` (stops at the first failing test binary) was run first and stopped at `crates/app/tests/export.rs`, where `stagepack_is_asked_to_open_the_file` failed with *Text file busy* (a script written and run at once, while another test in the same run forked). Run alone three times after, it passed each time.
 - `scripts/cargo-safe.sh test --workspace --no-fail-fast` then ran every test binary: 121 test results, **2,626 passed, 1 failed, 56 ignored**. The one failure was `once_the_drawer_is_closing_nothing_starts_another` in `crates/app/tests/ui_model.rs` (a count of drawer threads, `left: 1, right: 0`), which is known to depend on load. Run alone twice after, it passed both times (0.47 s and 0.42 s). Neither failure is in code this plan touched. The ignored ones are the release timing tests and tests that need the compiler bundle.
-- `STUDIO_BUNDLE=$PWD/target/bundle scripts/cargo-safe.sh test -p stagepack-studio --test ai_tool` (the compiler bundle present, so the permitted-build path runs): 23 passed, 0 failed, 0 ignored, including `builds_only_where_always_built`.
+- `STUDIO_BUNDLE=$PWD/target/bundle scripts/cargo-safe.sh test -p stagepack-studio --test ai_tool` (the compiler bundle present, so the permitted-build path runs): 24 passed after fix round 1 (23 before), 0 failed, including `builds_only_where_always_built`.
 - `scripts/cargo-safe.sh test -p stagepack-studio --test ai_tool_mcp`: 7 passed.
 
-The three tests of this task: `guide_prints_the_guide` (the command prints exactly the guide), `the_guide_names_every_built_in` (every built-in tag appears as `<Tag`), and `every_example_in_the_guide_checks_clean` (each of the 17 fenced `markdown` examples in the guide is written as the `slides.md` of a scratch talk, with a made PNG, recording, CSV, model and video in `assets`, and `check` finds nothing; none needed an excused complaint).
+The three tests of this task: `guide_prints_the_guide` (the command prints exactly the guide), `the_guide_names_every_built_in` (every built-in tag appears as `<Tag`), and `every_example_in_the_guide_checks_clean` (each of the 18 fenced `markdown` examples in the guide is written as the `slides.md` of a scratch talk, with a made PNG, recording, CSV, model and video in `assets`, and `check` finds nothing; none needed an excused complaint).
 
 ## A real run, end to end
 
@@ -59,9 +59,9 @@ On a scratch talk of three slides (a title, a chart from `assets/sales.csv`, a t
 - `describe .` printed the layouts, settings and tags; `describe . --json` was 12,621 bytes.
 - `check .` said *No problems found.*, status 0.
 - `outline .` gave `1. Title — "Scratch talk Three slides"`, `2. Content — "Sales"`, `3. Two-columns — "Two sides Left words. Right words." (1 click, notes)`.
-- `guide` printed 10,430 bytes.
+- `guide` printed 11,192 bytes (after fix round 1; 10,430 before).
 - `picture . 3 --step 0 --out s3a.png` said *Slide 3, click 0 of 1, written to s3a.png.* and made a 1,920 by 1,080 PNG; `picture . 3 --out s3b.png --width 800` made an 800 by 450 PNG with the blue box in it (looked at). The scratch data, cache and config folders held nothing afterwards.
-- A scripted session piped into `stagepack-studio mcp .`: `initialize` answered with protocol version 2025-06-18 and `tools` capability; `tools/list` named `describe`, `check`, `outline`, `picture`, `guide`; `tools/call picture` with `slide` 2 and `width` 640 returned an `image/png` content of 17,267 bytes (a PNG) and a text content, *Slide 2.*; `tools/call guide` returned a text of 10,414 characters. The server ended at the end of its input.
+- A scripted session piped into `stagepack-studio mcp .`: `initialize` answered with protocol version 2025-06-18 and `tools` capability; `tools/list` named `describe`, `check`, `outline`, `picture`, `guide`; `tools/call picture` with `slide` 2 and `width` 640 returned an `image/png` content of 17,267 bytes (a PNG) and a text content, *Slide 2.*; `tools/call guide` returned a text of 11,176 characters (10,414 before fix round 1). The server ended at the end of its input.
 
 ## Hand checks for the owner
 

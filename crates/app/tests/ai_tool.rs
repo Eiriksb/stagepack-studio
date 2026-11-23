@@ -610,3 +610,23 @@ fn every_example_in_the_guide_checks_clean() {
         assert_eq!(output.status.code(), Some(0), "example {n} has problems:\n{example}\n{}{}", text(&output.stdout), text(&output.stderr));
     }
 }
+
+#[test]
+fn clicks_in_the_guide_are_as_the_program_reads_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let talk = dir.path().join("talk");
+    std::fs::create_dir_all(&talk).unwrap();
+    let write = |source: &str| std::fs::write(talk.join("slides.md"), source).unwrap();
+    // `each` on a tag is a complaint.
+    write("# A\n\n<Box click=\"each\" x=\"1\" y=\"1\" w=\"9\" h=\"9\" />\n");
+    let said = text(&run(&["check", talk.to_str().unwrap()], dir.path()).stdout);
+    assert!(said.contains("isn't a whole number from 1 to 999"), "{said}");
+    // A tag with no place ignores its click, and says nothing.
+    write("# A\n\n<Shape click=\"2\" fill=\"#ff0000\" />\n");
+    let output = run(&["outline", talk.to_str().unwrap()], dir.path());
+    assert!(!text(&output.stdout).contains("click"), "{}", text(&output.stdout));
+    assert_eq!(run(&["check", talk.to_str().unwrap()], dir.path()).status.code(), Some(0));
+    // Steps run to the highest click used.
+    write("# A\n\n<Box click=\"3\" x=\"1\" y=\"1\" w=\"9\" h=\"9\" />\n");
+    assert!(text(&run(&["outline", talk.to_str().unwrap()], dir.path()).stdout).contains("3 clicks"));
+}

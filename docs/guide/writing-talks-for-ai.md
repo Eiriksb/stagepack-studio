@@ -49,7 +49,7 @@ A heading, paragraphs and lists go into the slide's layout, in its main region. 
 
 ### The settings block
 
-A slide may begin with a block of settings, one `key: value` per line between two `---` lines. The first block opens the file, and the slide's text follows the second `---`. Later, the `---` that ends the last slide opens the next slide's block. The first slide's block also sets the talk:
+A slide may begin with a block of settings, one `key: value` per line between two `---` lines. A line of the form `key: value` between two `---` lines is read as settings, whatever its words, and is not drawn. Don't start a slide with a `---` line and then a line like `Note: x`. The first block opens the file, and the slide's text follows the second `---`. Later, the `---` that ends the last slide opens the next slide's block. The first slide's block also sets the talk:
 
 ```markdown
 ---
@@ -76,7 +76,7 @@ The talk's settings, in the first slide's block: `title`, `color.background`, `c
 
 ### Layouts and regions
 
-A layout is a set of regions that hold the slide's text. The layouts are `title`, `content`, `two-columns`, `section` and `blank`. `describe` gives each one's regions. Text goes to the layout's main region, the one that `describe` says content goes in: `body` for most, `left` for `two-columns`. A heading goes in `title` when the layout has one.
+A layout is a set of regions that hold the slide's text. The layouts are `title`, `content`, `two-columns`, `section` and `blank`. `describe` gives each one's regions. Text goes to the layout's main region, the one that `describe` says content goes in: `body` for most, `left` for `two-columns`. The first heading goes in `title` when the layout has one, unless a `<Region>` line comes before it. Any later heading is ordinary text in the region it is in.
 
 To put text in another region, write `<Region name="right" />` on a line of its own. What follows it, up to the next such line, goes in that region:
 
@@ -135,7 +135,7 @@ What to say. Pause here.
 
 ## Placing a tag
 
-Anything that is not text is a tag. Write it on its own, with its settings as `name="value"`. Give it a place on the slide with `x`, `y`, `w` and `h`. Every tag takes these, and `rotate` in degrees clockwise:
+Anything that is not text is a tag. Write it on its own, with its settings as `name="value"`. Give it a place on the slide with `x`, `y`, `w` and `h`, and turn it with `rotate` in degrees clockwise. Give every tag at least one of `x`, `y`, `w` and `h`: a tag with none is not placed, so its `click`, `enter`, `rotate` and `align` are ignored, and `check` does not complain. Give all four:
 
 ```markdown
 # A shape
@@ -143,7 +143,7 @@ Anything that is not text is a tag. Write it on its own, with its settings as `n
 <Shape kind="ellipse" fill="#2563eb" x="1240" y="300" w="480" h="320" />
 ```
 
-Without a place a tag goes where the layout flows it. The text of a tag that holds content, such as `<Box>`, goes between its opening and closing tags, with a blank line after the opening and before the closing one:
+The text of a tag that holds content, such as `<Box>`, goes between its opening and closing tags, with a blank line after the opening and before the closing one:
 
 ```markdown
 # A box with words
@@ -157,7 +157,7 @@ A note, in a box.
 
 ### Clicks
 
-Without `click`, a thing is there from the start. `click="1"` shows it on the first click, `click="2"` on the second, up to 999. `enter` says how it arrives: `appear` (the default), `fade` or `fly-up`. A slide's steps are 0, then one for each click it uses. The picture's `--step` takes any of them. On text, `click="each"` shows a line at a time. For a chart, `build="true"` steps through its series (see below) and takes clicks of its own.
+Without `click`, a thing is there from the start. On a placed tag, `click` is a whole number: `click="1"` shows it on the first click, `click="2"` on the second, up to 999. `click="each"` on a tag is a problem. `enter` says how it arrives: `appear` (the default), `fade` or `fly-up`. A slide's steps are 0 up to the highest click it uses, so use clicks 1, 2, 3 with none left out. The picture's `--step` takes any of them. To show the text of a region a line at a time, write `click=each` in a `region.NAME:` line of the settings block, as `region.body: click=each enter=fly-up`. For a chart, `build="true"` steps through its series (see below) and takes clicks of its own.
 
 ```markdown
 # Step by step
@@ -165,6 +165,18 @@ Without `click`, a thing is there from the start. `click="1"` shows it on the fi
 <Box x="400" y="300" w="500" h="200" fill="#dbeafe" click="1" enter="fade" />
 
 <Box x="1020" y="300" w="500" h="200" fill="#dcfce7" click="2" enter="fly-up" />
+```
+
+```markdown
+---
+region.body: click=each enter=fly-up
+---
+
+# One line at a time
+
+- First
+- Second
+- Third
 ```
 
 ## The built-in tags
