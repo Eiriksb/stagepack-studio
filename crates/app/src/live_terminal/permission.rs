@@ -293,7 +293,7 @@ impl Plan {
 
     /// Whether the program is a file inside the talk's folder.
     pub fn program_in_talk(&self) -> bool {
-        self.folder.as_ref().is_some_and(|folder| self.program.path.starts_with(folder.path()))
+        self.folder.as_ref().is_some_and(|folder| super::resolve::within(&self.program.path, folder.path()))
     }
 
     /// Whether the talk names the program by a path to a file outside its folder.

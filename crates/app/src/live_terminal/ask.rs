@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::{ActiveTheme as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -25,14 +25,27 @@ pub const RUN_HEAD_ID: &str = "run-head";
 pub const RUN_HEAD_LINE_ID: &str = "run-head-line";
 /// The words, which scroll if there are many.
 pub const RUN_WORDS_ID: &str = "run-words";
+/// The layer over the words that holds their scrollbar.
+pub const RUN_WORDS_BAR_ID: &str = "run-words-bar";
+/// How the words' scrollbar is shown: always, so a list that goes on beyond its box shows it does
+/// before anyone scrolls. (The theme's own way shows a scrollbar only once something is scrolled.)
+pub const RUN_WORDS_SCROLLBAR: ScrollbarMode = ScrollbarMode::Always;
+/// The most the words' box is high.
+const WORDS_HEIGHT: f32 = 240.;
 
 pub const RUN_QUESTION: &str = "This talk wants to run a program on your computer.";
 pub const RUN_WARNING: &str = "It can do anything you can do. Run it only if you trust this talk.";
 pub const RUN_IN_NEW_FOLDER: &str = "in a new empty folder";
 pub const RUN_PROGRAM_IN_TALK: &str = "This program comes with the talk.";
 pub const RUN_PROGRAM_BY_PATH: &str = "The talk names this program by its path.";
-/// More words than this don't fit the list's box, which scrolls.
+/// A command is called long, and the dialog says to scroll through it, if it has more words than
+/// this, more characters in all than [`CHARACTERS_THAT_FIT`], or a word longer than
+/// [`LONGEST_WORD_THAT_FITS`]: any of these may go beyond the words' box. The count is of the
+/// words as they are shown.
 pub const WORDS_THAT_FIT: usize = 8;
+pub const CHARACTERS_THAT_FIT: usize = 300;
+pub const LONGEST_WORD_THAT_FITS: usize = 60;
+pub const RUN_LONG: &str = "This command is long. Scroll to see all of it before you choose.";
 pub const RUN_NOT_ASCII: &str = "Some of this command isn't plain ASCII, so check each letter.";
 
 /// What is asked: the command's words as they will run (the program as the file that runs), and the
@@ -74,6 +87,7 @@ pub fn ask_to_run(
     let answer = Rc::new(answer);
     let no_focus = cx.focus_handle();
     let no_focus_later = no_focus.clone();
+    let words_scroll = ScrollHandle::new();
     // What the dialog does when it's closed some way that isn't one of its buttons.
     let finish = {
         let (answered, answer) = (answered.clone(), answer.clone());
@@ -126,16 +140,34 @@ pub fn ask_to_run(
                                 })),
                         )
                         .child(
-                            div().id(RUN_WORDS_ID).test_support().max_h(px(240.)).overflow_hidden().child(
-                                v_flex()
-                                    .max_h(px(240.))
-                                    .font_family(mono)
-                                    .children(words.into_iter().enumerate().map(|(index, line)| {
-                                        div().id((RUN_LINE_ID, index)).test_support().aria_label(line.clone()).child(line)
-                                    }))
-                                    // With a scrollbar drawn, so that a list that goes on shows it does.
-                                    .overflow_y_scrollbar(),
-                            ),
+                            // The words scroll in their box, with a scrollbar that is always drawn.
+                            div()
+                                .id(RUN_WORDS_ID)
+                                .test_support()
+                                .relative()
+                                .max_h(px(WORDS_HEIGHT))
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .id("run-words-area")
+                                        .max_h(px(WORDS_HEIGHT))
+                                        .overflow_y_scroll()
+                                        .track_scroll(&words_scroll)
+                                        .child(
+                                            v_flex()
+                                                .pr(Scrollbar::width())
+                                                .font_family(mono)
+                                                .children(words.into_iter().enumerate().map(|(index, line)| {
+                                                    div().id((RUN_LINE_ID, index)).test_support().aria_label(line.clone()).child(line)
+                                                })),
+                                        ),
+                                )
+                                .child(
+                                    div().id(RUN_WORDS_BAR_ID).test_support().absolute().inset_0().child(
+                                        Scrollbar::vertical(&words_scroll).id("run-words-scrollbar").mode(RUN_WORDS_SCROLLBAR).viewport_from_layout(),
+                                    ),
+                                ),
                         ),
                 )
                 .footer(
@@ -201,8 +233,8 @@ fn head_lines(question: &RunQuestion) -> Vec<SharedString> {
     if question.command.iter().any(|word| !word.is_ascii()) {
         lines.push(RUN_NOT_ASCII.into());
     }
-    if question.command.len() > WORDS_THAT_FIT {
-        lines.push(format!("This command has {} words. Scroll to see them all before you choose.", question.command.len()).into());
+    if is_long(&word_lines(question)) {
+        lines.push(RUN_LONG.into());
     }
     lines.push(RUN_WARNING.into());
     lines
@@ -211,4 +243,13 @@ fn head_lines(question: &RunQuestion) -> Vec<SharedString> {
 /// The words of the command, one to a line, each as it can be seen.
 fn word_lines(question: &RunQuestion) -> Vec<SharedString> {
     question.command.iter().map(|word| SharedString::from(visible(word))).collect()
+}
+
+/// Whether the words, as shown, may go beyond their box (see [`WORDS_THAT_FIT`]). This is decided
+/// the same way every time from the words, not measured, so the notice is there from the start.
+fn is_long(words: &[SharedString]) -> bool {
+    let length = |word: &SharedString| word.chars().count();
+    words.len() > WORDS_THAT_FIT
+        || words.iter().map(length).sum::<usize>() > CHARACTERS_THAT_FIT
+        || words.iter().any(|word| length(word) > LONGEST_WORD_THAT_FITS)
 }

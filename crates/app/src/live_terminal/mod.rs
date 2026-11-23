@@ -12,12 +12,16 @@ mod permission;
 mod resolve;
 mod session;
 
-pub use ask::{RUN_ALWAYS_ID, RUN_ASK_ID, RUN_HEAD_ID, RUN_HEAD_LINE_ID, RUN_IN_NEW_FOLDER, RUN_LINE_ID, RUN_NOT_ASCII, RUN_NO_ID, RUN_WORDS_ID, RUN_PROGRAM_BY_PATH, RUN_PROGRAM_IN_TALK, RUN_QUESTION, RUN_WARNING, RUN_YES_ID, RunAnswer, RunQuestion, ask_to_run};
+pub use ask::{
+    CHARACTERS_THAT_FIT, LONGEST_WORD_THAT_FITS, RUN_LONG, RUN_WORDS_BAR_ID, RUN_WORDS_SCROLLBAR, WORDS_THAT_FIT, RUN_ALWAYS_ID, RUN_ASK_ID, RUN_HEAD_ID, RUN_HEAD_LINE_ID, RUN_IN_NEW_FOLDER, RUN_LINE_ID, RUN_NOT_ASCII, RUN_NO_ID, RUN_WORDS_ID, RUN_PROGRAM_BY_PATH, RUN_PROGRAM_IN_TALK, RUN_QUESTION, RUN_WARNING, RUN_YES_ID, RunAnswer, RunQuestion, ask_to_run,
+};
 pub use helper::{HELPER_ENV, find_helper};
 pub use keys::{key_bytes, key_bytes_in};
 pub use permission::{
     Decision, Permit, Plan, RunKey, RunPermissions, SessionYes, TalkFolder, may_run, may_run_with_path, permit, plan, plan_with_path, start_after_yes,
 };
 pub use resolve::{Program, resolve_program};
+#[cfg(feature = "test-hooks")]
+pub use resolve::forbid_for_tests;
 pub use session::{Look, MOST_FLOOD_A_SECOND, Session, SessionState, THREAD_NAME, threads_running};
 pub use slides_terminal::split_command;
