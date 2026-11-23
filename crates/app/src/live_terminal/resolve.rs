@@ -53,6 +53,25 @@ fn is_path(word: &str) -> bool {
     word.contains('/') || (cfg!(windows) && (word.contains('\\') || word.contains(':')))
 }
 
+/// Why the file system mustn't be asked about `path` at all, if it mustn't: asking about a network
+/// path makes the computer connect to it, and on Windows send the owner's credentials, before
+/// anyone has said yes. On Windows only a path on a drive is touched; on macOS the automounted
+/// network folders are left alone.
+fn unsafe_to_touch(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        return !matches!(
+            path.components().next(),
+            Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        cfg!(target_os = "macos") && (path.starts_with("/net") || path.starts_with("/Network"))
+    }
+}
+
 /// `given` taken from `folder`, part by part, so that `.` and `..` are settled in the words and
 /// not left to the system (a verbatim Windows path doesn't settle them). A path that names a
 /// drive or a root of its own isn't relative.
@@ -85,8 +104,12 @@ pub fn resolve_program(word: &str, folder: Option<&Path>, path_var: Option<&OsSt
         } else {
             from_folder(folder.ok_or_else(|| missing(word))?, &given).ok_or_else(|| missing(word))?
         };
+        if unsafe_to_touch(&full) {
+            return Err(format!("The program \"{word}\" is on a network folder, so it isn't run."));
+        }
         let path = full.canonicalize().map_err(|_| missing(word))?;
-        if !path.is_absolute() || !is_program(&path) {
+        // Canonical on Windows is a verbatim drive path; anything else is somewhere not to go.
+        if !path.is_absolute() || unsafe_to_touch(&path) || !is_program(&path) {
             return Err(missing(word));
         }
         return Ok(Program { in_talk: true, path });
@@ -98,7 +121,7 @@ pub fn resolve_program(word: &str, folder: Option<&Path>, path_var: Option<&OsSt
         format!("The program \"{word}\" would be one that comes with this talk, not one of yours, so it isn't run.")
     };
     for entry in std::env::split_paths(path_var.unwrap_or_default()) {
-        if !entry.is_absolute() {
+        if !entry.is_absolute() || unsafe_to_touch(&entry) {
             continue;
         }
         // A folder of the PATH inside the talk, or a link to one, is the talk's, whatever is in it.

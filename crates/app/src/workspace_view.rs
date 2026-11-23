@@ -831,6 +831,7 @@ impl WorkspaceView {
         let question = RunQuestion {
             command: plan.shown_words(),
             program_in_talk: plan.program_in_talk(),
+            program_by_path: plan.program_named_by_path(),
             folder: plan.folder().map(|folder| folder.path().to_path_buf()),
         };
         let view = cx.weak_entity();

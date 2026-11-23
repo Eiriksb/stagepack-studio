@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{ActiveTheme as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -28,7 +29,10 @@ pub const RUN_WORDS_ID: &str = "run-words";
 pub const RUN_QUESTION: &str = "This talk wants to run a program on your computer.";
 pub const RUN_WARNING: &str = "It can do anything you can do. Run it only if you trust this talk.";
 pub const RUN_IN_NEW_FOLDER: &str = "in a new empty folder";
-pub const RUN_PROGRAM_IN_TALK: &str = "The program is a file that comes with this talk.";
+pub const RUN_PROGRAM_IN_TALK: &str = "This program comes with the talk.";
+pub const RUN_PROGRAM_BY_PATH: &str = "The talk names this program by its path.";
+/// More words than this don't fit the list's box, which scrolls.
+pub const WORDS_THAT_FIT: usize = 8;
 pub const RUN_NOT_ASCII: &str = "Some of this command isn't plain ASCII, so check each letter.";
 
 /// What is asked: the command's words as they will run (the program as the file that runs), and the
@@ -36,8 +40,10 @@ pub const RUN_NOT_ASCII: &str = "Some of this command isn't plain ASCII, so chec
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunQuestion {
     pub command: Vec<String>,
-    /// Whether the program is a file the talk brings with it.
+    /// Whether the program is a file inside the talk's folder.
     pub program_in_talk: bool,
+    /// Whether the talk names the program by a path, to a file outside its folder.
+    pub program_by_path: bool,
     /// The talk's folder, or none for a packed or untitled talk, which runs in a new empty folder.
     pub folder: Option<PathBuf>,
 }
@@ -120,15 +126,16 @@ pub fn ask_to_run(
                                 })),
                         )
                         .child(
-                            v_flex()
-                                .id(RUN_WORDS_ID)
-                                .test_support()
-                                .max_h(px(240.))
-                                .overflow_y_scroll()
-                                .font_family(mono)
-                                .children(words.into_iter().enumerate().map(|(index, line)| {
-                                    div().id((RUN_LINE_ID, index)).test_support().aria_label(line.clone()).child(line)
-                                })),
+                            div().id(RUN_WORDS_ID).test_support().max_h(px(240.)).overflow_hidden().child(
+                                v_flex()
+                                    .max_h(px(240.))
+                                    .font_family(mono)
+                                    .children(words.into_iter().enumerate().map(|(index, line)| {
+                                        div().id((RUN_LINE_ID, index)).test_support().aria_label(line.clone()).child(line)
+                                    }))
+                                    // With a scrollbar drawn, so that a list that goes on shows it does.
+                                    .overflow_y_scrollbar(),
+                            ),
                         ),
                 )
                 .footer(
@@ -159,6 +166,9 @@ fn visible(text: &str) -> String {
                 shown.push(c);
             }
             c if super::permission::hides(c) => shown.push_str(&format!("\\u{{{:X}}}", c as u32)),
+            // A letter of a right-to-left script is never drawn, as it would turn the line round:
+            // the order seen is the order sent.
+            c if right_to_left(c) => shown.push_str(&format!("[U+{:04X}]", c as u32)),
             // A letter from outside Latin-1 is shown with what it is, as one that looks like
             // another can't be told by eye.
             c if c as u32 > 0xFF => shown.push_str(&format!("{c}[U+{:04X}]", c as u32)),
@@ -167,6 +177,13 @@ fn visible(text: &str) -> String {
     }
     shown.push('"');
     shown
+}
+
+/// Whether `c` is in a block of a right-to-left script: Hebrew, Arabic, Syriac, Thaana, NKo,
+/// Samaritan, Mandaic and the rest of U+0590..U+08FF, the Hebrew and Arabic presentation forms, and
+/// the right-to-left blocks of the supplementary planes (U+10800..U+10FFF, U+1E800..U+1EFFF).
+fn right_to_left(c: char) -> bool {
+    matches!(c as u32, 0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF | 0x10800..=0x10FFF | 0x1E800..=0x1EFFF)
 }
 
 /// The lines above the words: where it runs, what to know about it, and the warning.
@@ -178,9 +195,14 @@ fn head_lines(question: &RunQuestion) -> Vec<SharedString> {
     });
     if question.program_in_talk {
         lines.push(RUN_PROGRAM_IN_TALK.into());
+    } else if question.program_by_path {
+        lines.push(RUN_PROGRAM_BY_PATH.into());
     }
     if question.command.iter().any(|word| !word.is_ascii()) {
         lines.push(RUN_NOT_ASCII.into());
+    }
+    if question.command.len() > WORDS_THAT_FIT {
+        lines.push(format!("This command has {} words. Scroll to see them all before you choose.", question.command.len()).into());
     }
     lines.push(RUN_WARNING.into());
     lines

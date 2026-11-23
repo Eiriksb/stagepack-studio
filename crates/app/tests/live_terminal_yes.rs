@@ -17,7 +17,7 @@ use slides_engine::Fonts;
 use stagepack_studio::document::{Document, TalkPlace, UntitledId};
 use stagepack_studio::export::{ExportKind, run_export};
 use stagepack_studio::live_terminal::{
-    Decision, HELPER_ENV, RUN_ALWAYS_ID, RUN_ASK_ID, RUN_HEAD_ID, RUN_HEAD_LINE_ID, RUN_IN_NEW_FOLDER, RUN_LINE_ID, RUN_NO_ID, RUN_NOT_ASCII, RUN_PROGRAM_IN_TALK,
+    Decision, HELPER_ENV, RUN_ALWAYS_ID, RUN_ASK_ID, RUN_HEAD_ID, RUN_HEAD_LINE_ID, RUN_IN_NEW_FOLDER, RUN_LINE_ID, RUN_NO_ID, RUN_NOT_ASCII, RUN_PROGRAM_BY_PATH, RUN_PROGRAM_IN_TALK,
     RUN_QUESTION, RUN_WARNING, RUN_WORDS_ID, RUN_YES_ID,
     RunPermissions, SessionYes, may_run, may_run_with_path, permit, plan, plan_with_path, start_after_yes,
 };
@@ -350,11 +350,11 @@ fn a_program_written_as_a_path_is_the_talks_choice_wherever_it_is() {
     let talk = TalkPlace::Folder(folder.path().to_path_buf());
     let absolute = sys_dir().join("sh").display().to_string();
     let one = plan_with_path(&talk, &words(&[&absolute]), Some(&sys_path())).unwrap();
-    assert!(one.program_in_talk(), "the dialog says the talk chose it");
+    assert!(one.program_named_by_path() && !one.program_in_talk(), "the dialog says the talk names it by its path");
     // A path is taken as the file it really is.
     assert_eq!(one.shown_words()[0], Path::new(&absolute).canonicalize().unwrap().display().to_string());
     let by_name = plan_with_path(&talk, &words(&["sh"]), Some(&sys_path())).unwrap();
-    assert!(!by_name.program_in_talk());
+    assert!(!by_name.program_in_talk() && !by_name.program_named_by_path());
     // `..` and `.` are settled in the words.
     let up = plan_with_path(&talk, &words(&["./../x"]), Some(&sys_path()));
     assert!(up.is_err());
@@ -517,9 +517,76 @@ fn what_matters_is_above_the_words_and_stays_put(cx: &mut TestAppContext) {
     assert!(warning < top_of(&typing, cx, (RUN_LINE_ID, 0usize)), "the warning comes before the first word");
     assert!(warning < top_of(&typing, cx, RUN_WORDS_ID));
     assert!(short.0 <= short.1 && short.1 < short.2);
-    assert_eq!(short.1, long.1, "the head doesn't move for a long command");
+    assert!(((short.1 - short.0) - (long.1 - long.0)).abs() < 0.01, "the head is laid out the same for a long command");
     // The buttons are in view whatever the length.
     assert!(showing(&typing, cx, RUN_NO_ID) && showing(&typing, cx, RUN_YES_ID));
+}
+
+#[gpui_kit::test]
+fn a_long_list_has_a_scrollbar_and_says_so(cx: &mut TestAppContext) {
+    let (typing, _scratch) = window(cx);
+    assert!(ask(&typing, cx, &["echo", "one"]));
+    assert!(!head(&typing, cx).iter().any(|line| line.contains("Scroll to see")), "a short one says nothing");
+    typing.press(cx, "escape");
+    let mut command = vec!["echo".to_string()];
+    command.extend((1..64).map(|n| format!("argument-{n}")));
+    let refs: Vec<&str> = command.iter().map(String::as_str).collect();
+    assert!(ask(&typing, cx, &refs));
+    let said = head(&typing, cx);
+    let line = "This command has 64 words. Scroll to see them all before you choose.";
+    assert!(said.contains(&line.to_string()), "{said:?}");
+    assert_eq!(said.last().map(String::as_str), Some(RUN_WARNING), "the warning still ends the head");
+    // The list is a box (which draws its scrollbar) that holds less than the command has.
+    let list = bounds_of(&typing, cx, RUN_WORDS_ID).expect("the list");
+    assert!(f32::from(list.size.height) <= 241., "the list is a box");
+    let last = bounds_of(&typing, cx, (RUN_LINE_ID, 63usize));
+    assert!(last.is_none_or(|last| last.bottom() > list.bottom()), "the last word is beyond the box");
+}
+
+#[gpui_kit::test]
+fn right_to_left_letters_are_shown_only_as_codes(cx: &mut TestAppContext) {
+    let (typing, _scratch) = window(cx);
+    assert!(ask(&typing, cx, &["echo", "\u{5d0}\u{5d1}x", "\u{627}", "\u{10800}", "\u{FB1D}", "\u{1E900}"]));
+    let shown = lines(&typing, cx);
+    assert_eq!(
+        shown[1..],
+        ["\"[U+05D0][U+05D1]x\"", "\"[U+0627]\"", "\"[U+10800]\"", "\"[U+FB1D]\"", "\"[U+1E900]\""],
+        "none is drawn"
+    );
+    assert!(head(&typing, cx).contains(&stagepack_studio::live_terminal::RUN_NOT_ASCII.to_string()));
+}
+
+#[gpui_kit::test]
+fn a_program_named_by_a_path_says_whose_it_is(cx: &mut TestAppContext) {
+    let (typing, _scratch) = window(cx);
+    let absolute = sys_dir().join("sh").display().to_string();
+    assert!(ask(&typing, cx, &[&absolute]));
+    assert!(head(&typing, cx).contains(&RUN_PROGRAM_BY_PATH.to_string()));
+    assert!(!head(&typing, cx).contains(&RUN_PROGRAM_IN_TALK.to_string()));
+}
+
+#[test]
+fn what_is_run_on_a_network_path_is_never_touched() {
+    // Windows and macOS only: these have not been compiled or run where this was written.
+    #[cfg(windows)]
+    {
+        let folder = tempfile::tempdir().unwrap();
+        let talk = TalkPlace::Folder(folder.path().to_path_buf());
+        for word in ["//attacker.example/share/x.exe", "\\\\attacker.example\\share\\x.exe", "\\\\?\\UNC\\attacker.example\\share\\x.exe", "\\\\.\\pipe\\x"] {
+            let why = plan_with_path(&talk, &words(&[word]), None).unwrap_err();
+            assert!(why.contains("network folder"), "{word}: {why}");
+        }
+        assert!(plan_with_path(&talk, &words(&["sh", "a\"b"]), None).is_err(), "a double quote in an argument");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let folder = tempfile::tempdir().unwrap();
+        let talk = TalkPlace::Folder(folder.path().to_path_buf());
+        for word in ["/net/host/x", "/Network/Servers/x"] {
+            let why = plan_with_path(&talk, &words(&[word]), None).unwrap_err();
+            assert!(why.contains("network folder"), "{word}: {why}");
+        }
+    }
 }
 
 #[gpui_kit::test]

@@ -12,7 +12,7 @@ mod permission;
 mod resolve;
 mod session;
 
-pub use ask::{RUN_ALWAYS_ID, RUN_ASK_ID, RUN_HEAD_ID, RUN_HEAD_LINE_ID, RUN_IN_NEW_FOLDER, RUN_LINE_ID, RUN_NOT_ASCII, RUN_NO_ID, RUN_WORDS_ID, RUN_PROGRAM_IN_TALK, RUN_QUESTION, RUN_WARNING, RUN_YES_ID, RunAnswer, RunQuestion, ask_to_run};
+pub use ask::{RUN_ALWAYS_ID, RUN_ASK_ID, RUN_HEAD_ID, RUN_HEAD_LINE_ID, RUN_IN_NEW_FOLDER, RUN_LINE_ID, RUN_NOT_ASCII, RUN_NO_ID, RUN_WORDS_ID, RUN_PROGRAM_BY_PATH, RUN_PROGRAM_IN_TALK, RUN_QUESTION, RUN_WARNING, RUN_YES_ID, RunAnswer, RunQuestion, ask_to_run};
 pub use helper::{HELPER_ENV, find_helper};
 pub use keys::{key_bytes, key_bytes_in};
 pub use permission::{

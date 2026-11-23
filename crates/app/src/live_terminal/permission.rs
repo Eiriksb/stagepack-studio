@@ -257,6 +257,10 @@ fn unrunnable(command: &[String]) -> Option<String> {
     if command.is_empty() || command.len() > MOST_COMMAND_WORDS || bytes > MOST_COMMAND_BYTES || command[0].is_empty() {
         return Some("The command to run can't be run.".to_string());
     }
+    // cmd and the C runtime read a quote differently, so what is shown inside one could run as more.
+    if cfg!(windows) && command[1..].iter().any(|word| word.contains('"')) {
+        return Some("On Windows an argument can't hold a double quote, so the command isn't run.".to_string());
+    }
     for word in command {
         let spaced = word.starts_with(' ') || word.ends_with(' ') || word.contains("  ");
         if word.chars().any(hides) || spaced || stacked(word) {
@@ -287,9 +291,14 @@ impl Plan {
         self.folder.as_ref()
     }
 
-    /// Whether the talk chose the program's file: it's written as a path, or it's inside the talk.
+    /// Whether the program is a file inside the talk's folder.
     pub fn program_in_talk(&self) -> bool {
-        self.program.in_talk
+        self.folder.as_ref().is_some_and(|folder| self.program.path.starts_with(folder.path()))
+    }
+
+    /// Whether the talk names the program by a path to a file outside its folder.
+    pub fn program_named_by_path(&self) -> bool {
+        self.program.in_talk && !self.program_in_talk()
     }
 
     /// The words as the question shows them: the program as the file that runs, as `<talk>/name`
