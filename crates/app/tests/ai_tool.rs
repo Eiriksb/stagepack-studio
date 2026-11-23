@@ -683,3 +683,53 @@ fn a_picture_of_a_model_ends_cleanly_and_soon() {
     assert!(matches!(output.status.code(), Some(0 | 1)), "{:?} {}", output.status, text(&output.stderr));
     assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
 }
+
+#[test]
+fn describe_names_run_cols_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = run(&["describe", "--json"], dir.path());
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let tags = json["tags"].as_array().unwrap();
+    let terminal = tags.iter().find(|entry| entry["tag"] == "Terminal").unwrap();
+    let settings = terminal["settings"].as_array().unwrap();
+    let setting = |name: &str| settings.iter().find(|item| item["name"] == name).unwrap_or_else(|| panic!("no {name}: {settings:?}"));
+    for name in ["src", "run", "cols", "rows"] {
+        assert!(setting(name)["meaning"].as_str().is_some_and(|said| said.len() > 10), "{name}");
+        // Either of `src` and `run` will do, so neither is needed alone.
+        assert_eq!(setting(name)["needed"], false, "{name}");
+    }
+    let run_said = setting("run")["meaning"].as_str().unwrap();
+    assert!(run_said.contains("never runs") && run_said.contains("asked first"), "{run_said}");
+    assert!(setting("cols")["meaning"].as_str().unwrap().contains("500"));
+    assert!(setting("rows")["meaning"].as_str().unwrap().contains("200"));
+}
+
+#[test]
+fn nothing_runs_from_the_ai_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let talk = picture_talk(
+        dir.path(),
+        "<Terminal run=\"sh -c 'touch ran'\" src=\"assets/run.cast\" x=\"100\" y=\"100\" w=\"640\" h=\"360\" />\n\n<Terminal run=\"sh -c 'touch ran'\" x=\"1000\" y=\"100\" w=\"640\" h=\"360\" />\n",
+    );
+    std::fs::write(talk.join("assets/run.cast"), slides_terminal::make_demo_cast()).unwrap();
+    let talk_text = talk.to_str().unwrap();
+    let out = dir.path().join("out.png");
+    for args in [vec!["check", talk_text], vec!["outline", talk_text], vec!["describe", talk_text], vec!["picture", talk_text, "1", "--out", out.to_str().unwrap()]] {
+        let output = run(&args, dir.path());
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {}{}", text(&output.stdout), text(&output.stderr));
+    }
+    // Nothing ran, in the talk's folder, the working folder or the home folder.
+    for folder in [talk.as_path(), dir.path(), Path::new(".")] {
+        assert!(!folder.join("ran").exists(), "something ran in {folder:?}");
+    }
+    // A command that can't be read is said, and not run either.
+    std::fs::write(talk.join("slides.md"), "# Hi\n\n<Terminal run=\"\" x=\"100\" y=\"100\" w=\"640\" h=\"360\" />\n\n<Terminal x=\"1000\" y=\"100\" w=\"640\" h=\"360\" />\n\n<Terminal run=\"bash\" cols=\"501\" x=\"100\" y=\"500\" w=\"640\" h=\"360\" />\n").unwrap();
+    let output = run(&["check", talk_text], dir.path());
+    assert_eq!(output.status.code(), Some(1));
+    let said = text(&output.stdout);
+    assert!(said.contains("This terminal has no recording and no command to run."), "{said}");
+    assert!(said.contains("A terminal can be 1 to 500 columns and 1 to 200 rows."), "{said}");
+    assert!(said.contains("The command to run is empty."), "{said}");
+    assert!(!talk.join("ran").exists());
+}

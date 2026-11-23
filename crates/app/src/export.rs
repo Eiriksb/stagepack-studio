@@ -94,7 +94,9 @@ fn make(input: ExportInput, kind: ExportKind) -> Result<(Vec<u8>, Vec<String>), 
             let every: Vec<usize> = (0..deck.slide_count()).collect();
             notices.extend(videos_as_pictures(videos_on(&mut deck, &every)));
             notices.extend(models_as_pictures(models_on(&mut deck, &every)));
-            notices.extend(terminals_as_screens(terminals_on(&mut deck, &every)));
+            let (recordings, live) = terminals_on(&mut deck, &every);
+            notices.extend(terminals_as_screens(recordings));
+            notices.extend(live_terminals_as_stills(live));
             Ok((bytes, notices))
         }
         ExportKind::Pdf => {
@@ -102,7 +104,7 @@ fn make(input: ExportInput, kind: ExportKind) -> Result<(Vec<u8>, Vec<String>), 
             let shown = deck.shown_slides().to_vec();
             let videos = videos_on(&mut deck, &shown);
             let models = models_on(&mut deck, &shown);
-            let terminals = terminals_on(&mut deck, &shown);
+            let (terminals, live) = terminals_on(&mut deck, &shown);
             let mut notices: Vec<String> = shown
                 .into_iter()
                 .flat_map(|index| {
@@ -114,6 +116,7 @@ fn make(input: ExportInput, kind: ExportKind) -> Result<(Vec<u8>, Vec<String>), 
             notices.extend(videos_as_pictures(videos));
             notices.extend(models_as_pictures(models));
             notices.extend(terminals_as_screens(terminals));
+            notices.extend(live_terminals_as_stills(live));
             Ok((bytes, notices))
         }
     }
@@ -177,19 +180,25 @@ fn models_as_pictures(models: usize) -> Option<String> {
 }
 
 /// How many terminal recordings placed on slides `slides` of `deck`'s talk were drawn as their
-/// last screen: one that can't be played is its plain panel, and says so in its own notice.
-/// Asked once the slides are laid out.
-fn terminals_on(deck: &mut Deck, slides: &[usize]) -> usize {
-    let mut shown = 0;
+/// last screen, and how many live terminals, those that name a command to run, were drawn as
+/// their recording or a still: one that can't be shown is its plain panel, and says so in its own
+/// notice. Asked once the slides are laid out. Nothing is run: an export has no way to.
+fn terminals_on(deck: &mut Deck, slides: &[usize]) -> (usize, usize) {
+    let (mut recordings, mut live) = (0, 0);
     for &index in slides {
         for terminal in deck.terminals(index) {
             let Some(source) = terminal.source else { continue };
-            if deck.terminal_problem(index, &source).is_none() {
-                shown += 1;
+            if deck.terminal_problem(index, &source).is_some() {
+                continue;
+            }
+            if terminal.on.run.is_some() {
+                live += 1;
+            } else {
+                recordings += 1;
             }
         }
     }
-    shown
+    (recordings, live)
 }
 
 /// What an export says of the `terminals` it holds, which PowerPoint gets as pictures of their
@@ -199,6 +208,16 @@ fn terminals_as_screens(terminals: usize) -> Option<String> {
         0 => None,
         1 => Some("1 terminal recording was exported as its last screen.".to_string()),
         terminals => Some(format!("{terminals} terminal recordings were exported as their last screen.")),
+    }
+}
+
+/// What an export says of the `live` terminals it holds, each shown as its recording or a still:
+/// nothing, if there are none.
+fn live_terminals_as_stills(live: usize) -> Option<String> {
+    match live {
+        0 => None,
+        1 => Some("1 live terminal is shown as its recording or a still.".to_string()),
+        live => Some(format!("{live} live terminals are shown as their recording or a still.")),
     }
 }
 

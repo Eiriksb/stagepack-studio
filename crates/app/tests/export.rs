@@ -559,3 +559,33 @@ fn exports_say_how_many_recordings_became_their_last_screen() {
         assert!(notices.iter().all(|notice| !notice.contains("couldn't be read")), "{kind:?}: {notices:?}");
     }
 }
+
+#[test]
+fn exports_show_a_live_terminal_as_its_still() {
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::create_dir(folder.path().join("assets")).unwrap();
+    std::fs::write(folder.path().join("assets/run.cast"), slides_terminal::make_test_cast(40, 6, &[(0.1, "o", "$ make\r\ndone\r\n")])).unwrap();
+    let live = "<Terminal run=\"sh -c 'touch ran'\" x=\"100\" y=\"100\" w=\"640\" h=\"360\" />\n";
+    let with_recording = "<Terminal run=\"sh -c 'touch ran'\" src=\"assets/run.cast\" x=\"900\" y=\"100\" w=\"640\" h=\"360\" />\n";
+    let recording = "<Terminal src=\"assets/run.cast\" x=\"900\" y=\"600\" w=\"640\" h=\"360\" />\n";
+    for kind in [ExportKind::PowerPoint, ExportKind::Pdf] {
+        let said = |source: String| {
+            let input = ExportInput { source, files: Arc::new(FolderFiles::new(folder.path().to_path_buf())), talk_fonts: Vec::new() };
+            let (_dir, out) = target(&format!("talk.{}", kind.extension()));
+            let notices = run_export(input, kind, &out).unwrap();
+            assert!(std::fs::metadata(&out).unwrap().len() > 0);
+            notices
+        };
+        let counted = |notices: &[String]| notices.iter().filter(|notice| notice.contains("shown as") || notice.contains("exported as")).cloned().collect::<Vec<String>>();
+        let notices = said(format!("# One\n\n{live}{with_recording}"));
+        assert_eq!(counted(&notices), ["2 live terminals are shown as their recording or a still."], "{kind:?}: {notices:?}");
+        let notices = said(format!("# One\n\n{live}"));
+        assert_eq!(counted(&notices), ["1 live terminal is shown as its recording or a still."], "{kind:?}: {notices:?}");
+        // A recording alone is counted as it was, apart from them.
+        let notices = said(format!("# One\n\n{live}{recording}"));
+        assert_eq!(counted(&notices), ["1 terminal recording was exported as its last screen.", "1 live terminal is shown as its recording or a still."], "{kind:?}: {notices:?}");
+        // Nothing ran: no file was made in the talk's folder, or here.
+        assert!(!folder.path().join("ran").exists());
+        assert!(!std::path::Path::new("ran").exists());
+    }
+}

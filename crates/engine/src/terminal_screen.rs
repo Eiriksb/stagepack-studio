@@ -15,7 +15,7 @@ use toolkit::{Color, Theme};
 
 use crate::elements::box_size;
 use crate::pictures::TerminalStill;
-use crate::placeholder::placeholder_items;
+use crate::placeholder::{command_items, placeholder_items};
 use crate::text::{LINE_HEIGHT, MIN_TEXT_SIZE};
 use crate::{Align, DisplayItem, Fonts, LayoutEnv, Rect, ShapedText, TextRun, shape_text};
 
@@ -24,7 +24,15 @@ pub(crate) const TERMINAL_TAG: &str = "Terminal";
 /// What's said of a recording written in the text, not placed on the slide.
 pub const TERMINAL_IN_TEXT: &str = "This terminal recording plays only when it's placed on the slide. Drag it out of the text to place it.";
 /// What's said of a recording that names no file to play.
-pub const TERMINAL_NO_FILE: &str = "This terminal recording has no file. Insert a terminal recording to choose one.";
+pub const TERMINAL_NO_FILE: &str = "This terminal has no recording and no command to run.";
+/// What's said of a terminal whose columns or rows aren't a size one can be.
+pub const TERMINAL_BAD_SIZE: &str = "A terminal can be 1 to 500 columns and 1 to 200 rows.";
+/// What the panel of a terminal that runs a command, and has no recording, says first.
+const LIVE_LABEL: &str = "Live terminal";
+/// The columns and rows of the live screen of a terminal that doesn't say.
+const LIVE_SCREEN: (u16, u16) = (100, 30);
+/// The most columns and rows a terminal can be.
+const MOST_SCREEN: (u16, u16) = (500, 200);
 /// What the panel of a recording in the text says.
 pub(crate) const TERMINAL_LABEL: &str = "Terminal recording";
 /// How high a row of the screen is at its own size, in slide units.
@@ -44,6 +52,40 @@ const MOST_RUNS_A_ROW: usize = 32;
 /// item. A screen of more has each of its colours drawn as the nearest of 4,096, sixteen levels
 /// of each of red, green and blue.
 const MOST_COLOURS: usize = 65_536;
+
+/// What a terminal's tag says, as it's read: the recording, the command, and the live screen's
+/// size, which is 0 where what's written isn't a number.
+pub(crate) struct WrittenTerminal {
+    pub(crate) src: String,
+    pub(crate) run: Option<String>,
+    pub(crate) cols: u16,
+    pub(crate) rows: u16,
+}
+
+/// `tag`'s `src`, `run`, `cols` and `rows`.
+pub(crate) fn read_terminal(tag: &Tag) -> WrittenTerminal {
+    let size = |name: &str, default: u16| tag.attr(name).map_or(default, |written| written.trim().parse::<u16>().unwrap_or(0));
+    WrittenTerminal {
+        src: tag.attr("src").unwrap_or_default().trim().to_string(),
+        run: tag.attr("run").map(str::to_string),
+        cols: size("cols", LIVE_SCREEN.0),
+        rows: size("rows", LIVE_SCREEN.1),
+    }
+}
+
+/// Why a terminal with this `src`, `run`, `cols` and `rows` is a mistake, in a plain sentence, if
+/// it is: it has neither a recording nor a command, its command isn't one that can be run, or its
+/// screen isn't a size one can be. It's read here and nowhere run.
+pub fn terminal_complaint(src: &str, run: Option<&str>, cols: u16, rows: u16) -> Option<String> {
+    if src.is_empty() && run.is_none() {
+        return Some(TERMINAL_NO_FILE.to_string());
+    }
+    if let Some(Err(why)) = run.map(slides_terminal::split_command) {
+        return Some(why);
+    }
+    let fits = (1..=MOST_SCREEN.0).contains(&cols) && (1..=MOST_SCREEN.1).contains(&rows);
+    (!fits).then(|| TERMINAL_BAD_SIZE.to_string())
+}
 
 /// The size of a screen of `columns` and `rows` at its own size: [`TERMINAL_ROW`] units a row.
 fn own_size((columns, rows): (u16, u16)) -> (f32, f32) {
@@ -663,17 +705,25 @@ pub(crate) struct LaidTerminal {
 /// meanwhile is its picture as it was drawn, stretched, and it's laid out once it's let go. One
 /// whose screen is being shaped and placed aside is its panel alone too, until it's taken in.
 pub(crate) fn lay_out_terminal(tag: &Tag, wanted: (Option<f32>, Option<f32>), placing: bool, theme: &Theme, env: &mut LayoutEnv) -> LaidTerminal {
-    let src = tag.attr("src").unwrap_or_default().trim();
-    // One with no file is never looked for.
-    let (still, screen_size) = if src.is_empty() { (None, None) } else {
+    let written = read_terminal(tag);
+    let src = written.src.as_str();
+    let complaint = terminal_complaint(src, written.run.as_deref(), written.cols, written.rows);
+    // One with no file, or that complains, is never looked for. One that runs a command and names
+    // no recording has its live screen's size, and nothing is read for it.
+    let (still, screen_size) = if src.is_empty() || complaint.is_some() {
+        (None, if src.is_empty() && complaint.is_none() { Some((written.cols, written.rows)) } else { None })
+    } else {
         let (still, size) = env.pictures.terminal_still(src, env.files);
         (Some(still), size)
     };
     let (w, h) = box_size(wanted, Some(own_size(screen_size.unwrap_or(SCREEN_UNTIL_READ))));
     let rect = Rect { x: 0.0, y: 0.0, w, h };
     let laid = |items: Placed, stops: usize, problem: Option<String>, pending: bool| LaidTerminal { size: (w, h), items, stops, problem, pending };
+    if let Some(complaint) = complaint {
+        return laid(placeholder_items(&complaint, rect, theme, env.fonts).into(), 0, Some(complaint), false);
+    }
     match still {
-        None => laid(placeholder_items(TERMINAL_NO_FILE, rect, theme, env.fonts).into(), 0, Some(TERMINAL_NO_FILE.to_string()), false),
+        None => laid(command_items(LIVE_LABEL, written.run.as_deref().unwrap_or_default(), rect, theme, env.fonts).into(), 0, None, false),
         Some(TerminalStill::Cannot(why)) => laid(placeholder_items(&why.to_string(), rect, theme, env.fonts).into(), 0, Some(why.to_string()), false),
         Some(TerminalStill::Coming) => laid(panel_alone(rect), 0, None, false),
         Some(TerminalStill::Laid(_, stops)) if placing => laid(panel_alone(rect), stops, None, false),

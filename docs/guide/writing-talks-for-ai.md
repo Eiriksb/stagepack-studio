@@ -229,12 +229,22 @@ Look here.
 <Model src="assets/box.glb" turn="auto" x="460" y="300" w="1000" h="560" />
 ```
 
-`<Terminal>` plays an asciinema `.cast` recording. `src` is needed:
+`<Terminal>` plays an asciinema `.cast` recording. Give it a `src`, or a `run` (below), or both:
 
 ```markdown
 # A recording
 
 <Terminal src="assets/run.cast" x="460" y="300" w="1000" h="560" />
+```
+
+### Live terminals
+
+`run` is a command for the terminal to run live while the owner presents, such as `run="bash"`. Spaces set its words apart, double quotes group words, and no shell is added. `cols` and `rows` are the size of the live screen, 100 by 30 if you leave them out. You can only write the tag. This tool never runs a command: not `check`, `outline`, `describe`, `picture`, or anything else it does. Only the owner's app runs it, and only after the owner has said yes to that exact command, so tell the owner that the slide has one. Always give a `src` recording beside a `run`: it is what shows when the owner says no, in exports, in thumbnails and when the add-on isn't there. Never write a command that deletes, sends or changes anything.
+
+```markdown
+# A live terminal
+
+<Terminal run="bash" src="assets/run.cast" cols="100" rows="30" x="460" y="300" w="1000" h="560" />
 ```
 
 `<Chart>` draws `kind` `bar`, `line` or `pie`. Give `labels` and `values` set apart by commas, with one value for each label, or `data` naming a CSV file in the talk whose first column holds labels and whose other columns are series:

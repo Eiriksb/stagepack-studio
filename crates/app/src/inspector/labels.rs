@@ -45,7 +45,8 @@ const BUILT_INS: [(&str, &[Setting]); 8] = [
         ],
     ),
     ("Model", &[("turn", "Turns on its own", "`auto` turns the model slowly on its own while the slide shows.")]),
-    // Its place alone: its file is named above, and put on the slide from the Insert tab.
+    // Its place alone: its recording is named above, and put on the slide from the Insert tab; its
+    // command and screen are left to be written, as a model's views are.
     ("Terminal", &[]),
     (
         "Chart",
@@ -63,18 +64,22 @@ const BUILT_INS: [(&str, &[Setting]); 8] = [
 /// The built-ins' arguments the form leaves out: `(tag, argument, meaning)`. A video's, a model's
 /// or a terminal recording's file is named above its fields, and a new one is put on the slide
 /// from the Insert tab; a model's views are set by turning it, and counted under its fields.
-const LEFT_OUT: [(&str, &str, &str); 5] = [
+const LEFT_OUT: [(&str, &str, &str); 8] = [
     ("Video", "src", "The video to play, an MP4 file in the talk, such as `assets/demo.mp4`."),
     ("Model", "src", "The 3D model to show, a `.glb` or `.ply` file in the talk."),
     ("Model", "view", "The view to start from, six numbers set apart by spaces: yaw and pitch in degrees, the distance, then the x, y and z of the point looked at."),
     ("Model", "views", "Views to move through, one for each click, each written as `view` is, with a semicolon between views."),
-    ("Terminal", "src", "The terminal recording to play, an asciinema `.cast` file in the talk."),
+    ("Terminal", "src", "The terminal recording to play, an asciinema `.cast` file in the talk. It is what shows when the terminal doesn't run, so give one alongside `run`."),
+    ("Terminal", "run", "A command to run live in this terminal while presenting, such as `bash`: spaces set its words apart, double quotes group them, and no shell is added. The AI tool never runs it, and the owner of the talk is asked first, each time it's a new command, before anything runs. A terminal needs a `run` or a `src`."),
+    ("Terminal", "cols", "How many columns wide the live screen is, 1 to 500. It is 100 if left out."),
+    ("Terminal", "rows", "How many rows high the live screen is, 1 to 200. It is 30 if left out."),
 ];
 
 /// The built-ins' arguments a talk can't do without: a missing file is a problem. Every other
 /// argument left out is filled in by the engine, and a chart's `labels` and `values` are needed
 /// only when it has no `data`, which their meanings say.
-const NEEDED: [(&str, &str); 4] = [("Picture", "src"), ("Video", "src"), ("Model", "src"), ("Terminal", "src")];
+/// A terminal needs a `src` or a `run`, either one, so neither is listed.
+const NEEDED: [(&str, &str); 3] = [("Picture", "src"), ("Video", "src"), ("Model", "src")];
 
 /// Whether the built-in `tag`'s setting `argument` must be written.
 pub fn needed(tag: &str, argument: &str) -> bool {

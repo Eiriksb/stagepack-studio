@@ -458,7 +458,13 @@ impl Inspector {
         }
         let src = self.talk_attr("src", cx).map(|src| src.trim().to_string()).filter(|src| !src.is_empty());
         let Some(src) = src else {
-            return (None, Some(slides_engine::TERMINAL_NO_FILE.to_string()));
+            // One that runs a command has no recording to say of; the engine says if it's wrong.
+            let run = self.talk_attr("run", cx);
+            let problem = match run {
+                Some(_) => document.update(cx, |document, _| if target.slide == document.current() { document.terminal_problem_on(target.slide, &target.source) } else { None }),
+                None => Some(slides_engine::TERMINAL_NO_FILE.to_string()),
+            };
+            return (None, problem);
         };
         let (known, to_read, problem) = document.update(cx, |document, _| {
             let known = document.recording_facts(&src);

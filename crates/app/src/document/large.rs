@@ -941,7 +941,11 @@ impl Document {
 
     /// Whether the terminal recording selected can be played: it's been read, and can be.
     pub fn selected_terminal_plays(&mut self) -> bool {
-        let Some(source) = self.selected_terminal().and_then(|terminal| terminal.source) else { return false };
+        let Some((source, src)) = self.selected_terminal().and_then(|terminal| Some((terminal.source?, terminal.on.src))) else { return false };
+        // One that only runs a command has no recording to play.
+        if src.is_empty() {
+            return false;
+        }
         let current = self.current();
         !self.terminal_pending(current) && self.terminal_problem_on(current, &source).is_none()
     }

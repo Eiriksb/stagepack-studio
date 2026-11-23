@@ -645,6 +645,10 @@ impl AudienceView {
         self.current.update(cx, |canvas, cx| canvas.place_recordings(&terminals, cx));
         for terminal in &terminals {
             let Some(source) = terminal.source.clone() else { continue };
+            // One that only runs a command has no recording to play.
+            if terminal.on.src.is_empty() {
+                continue;
+            }
             let click = terminal.click.unwrap_or(0);
             if place.step < click {
                 // Back before its click, it stops.
@@ -711,6 +715,9 @@ impl AudienceView {
                 break;
             }
             let Some(source) = terminal.source.clone() else { continue };
+            if terminal.on.src.is_empty() {
+                continue;
+            }
             let readied = self.ready.iter().any(|(_, replay)| replay.layer == terminal.layer && replay.on.src == terminal.on.src);
             if readied || terminal.click.unwrap_or(0) > upcoming.step {
                 continue;

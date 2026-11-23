@@ -512,7 +512,7 @@ pub(crate) fn draw_screen(screen: &Screen, rect: Rect, rotate: f32, scale: f32, 
         varies: false,
         video: None,
         model: None,
-        terminal: Some(TerminalOn { src: String::new(), rect, rotate, stops: 0, pending: false }),
+        terminal: Some(TerminalOn { src: String::new(), run: None, cols: 100, rows: 30, rect, rotate, stops: 0, pending: false }),
     };
     let layer = render_layer(&spec, scale, fonts);
     let placed = Placed::Drawn { x: layer.x, y: layer.y, width: layer.pixmap.width(), height: layer.pixmap.height(), scale, for_rect: rect };
