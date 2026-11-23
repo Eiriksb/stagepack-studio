@@ -27,8 +27,8 @@ use crate::video_player::Shown;
 pub const THREAD_NAME: &str = "live terminal";
 /// The most output a session takes in a second; what comes faster is dropped, not held.
 pub const MOST_FLOOD_A_SECOND: usize = 4 * 1024 * 1024;
-/// The most of each second that may go on showing output.
-const MOST_SHOWING_A_SECOND: Duration = Duration::from_millis(500);
+/// How much output is shown at a time, the screen being let go of between one slice and the next.
+const SLICE: usize = 8 * 1024;
 /// The most bytes of keys and answers waiting to be sent; more are dropped.
 const MOST_QUEUED: usize = 1 << 20;
 /// How long the helper has to say the program ended after being told to end: its own two seconds
@@ -141,6 +141,8 @@ struct Shared {
     queued: AtomicUsize,
     /// Set once the session has been told to end.
     ending: AtomicBool,
+    /// The helper, once it's started, for whoever must end it.
+    child: Mutex<Option<Arc<Mutex<Child>>>>,
     /// Set when the app ended the helper because the program didn't end when asked.
     killed: AtomicBool,
     /// Set when the window has let go of the session.
@@ -272,6 +274,7 @@ impl Session {
             queued: AtomicUsize::new(0),
             ending: AtomicBool::new(false),
             killed: AtomicBool::new(false),
+            child: Mutex::new(None),
             abandoned: AtomicBool::new(false),
             notices: Mutex::new(Vec::new()),
             cast: Mutex::new(Some(Cast::new(cols, rows))),
@@ -387,12 +390,24 @@ impl Drop for Session {
     }
 }
 
-/// Tells the program to end, once.
-fn end(shared: &Shared) {
+/// Tells the program to end, once, and starts the clock on it: the helper is killed if the session isn't
+/// over five seconds from now, whether or not the helper takes what's said to it.
+fn end(shared: &Arc<Shared>) {
     if shared.state().is_over() || shared.ending.swap(true, Ordering::SeqCst) {
         return;
     }
     shared.say(ToHelper::End);
+    let theirs = shared.clone();
+    spawn("ending", move || {
+        if theirs.wait_over(ENDING_WAIT) {
+            return;
+        }
+        // The helper's own end of the program takes two seconds; this is the end of the helper.
+        theirs.killed.store(true, Ordering::SeqCst);
+        if let Some(child) = lock(&theirs.child).clone() {
+            kill(&child);
+        }
+    });
 }
 
 /// The thread that starts the helper and reads what it says.
@@ -415,9 +430,13 @@ fn read_side(shared: &Arc<Shared>, helper: &Path, queue: Receiver<ToHelper>) {
         return gave_up(shared, COULDNT_START);
     };
     let child = Arc::new(Mutex::new(child));
+    *lock(&shared.child) = Some(child.clone());
+    if shared.killed.load(Ordering::SeqCst) {
+        kill(&child);
+    }
     {
-        let (theirs, kept) = (shared.clone(), child.clone());
-        if !spawn("writing", move || write_side(&theirs, &kept, stdin, queue)) {
+        let theirs = shared.clone();
+        if !spawn("writing", move || write_side(&theirs, stdin, queue)) {
             kill(&child);
             reap(&child, Duration::ZERO);
             return gave_up(shared, COULDNT_START);
@@ -431,6 +450,10 @@ fn read_side(shared: &Arc<Shared>, helper: &Path, queue: Receiver<ToHelper>) {
         _ if ended => None,
         Reading::Broken => Some(BROKEN.to_string()),
         Reading::Closed if shared.killed.load(Ordering::SeqCst) => Some(DIDNT_END.to_string()),
+        Reading::Closed if !started && shared.ending.load(Ordering::SeqCst) => {
+            shared.finish(SessionState::Ended(Exit { code: None, signal: None }));
+            None
+        }
         Reading::Closed if !started => Some(COULDNT_START.to_string()),
         Reading::Closed => Some(STOPPED.to_string()),
     };
@@ -483,8 +506,8 @@ fn read_frames(shared: &Arc<Shared>, stdout: impl Read) -> (Reading, bool) {
     let mut input = BufReader::with_capacity(wire::MOST_OUTPUT_CHUNK + 16, stdout);
     let mut started = false;
     let mut pending: Vec<u8> = Vec::new();
-    // What was taken, and how long it took to show, in the second now going.
-    let (mut window, mut taken, mut spent) = (Instant::now(), 0usize, Duration::ZERO);
+    // What was taken in the second now going.
+    let (mut window, mut taken) = (Instant::now(), 0usize);
     loop {
         let (kind, bytes) = match wire::read_frame(&mut input) {
             Ok(Some(frame)) => frame,
@@ -497,19 +520,18 @@ fn read_frames(shared: &Arc<Shared>, stdout: impl Read) -> (Reading, bool) {
             }
             Ok(FromHelper::Output(bytes)) if started => {
                 if window.elapsed() >= Duration::from_secs(1) {
-                    (window, taken, spent) = (Instant::now(), 0, Duration::ZERO);
+                    (window, taken) = (Instant::now(), 0);
                 }
-                // Past the most bytes a second, or past the time that may go on showing them (as on
-                // a slow computer), what comes is dropped.
-                if taken + bytes.len() > MOST_FLOOD_A_SECOND || spent > MOST_SHOWING_A_SECOND {
+                // Past the most bytes a second, what comes is dropped, whole frames at a time, and what
+                // was half read is let go so that the next frame starts clean.
+                if taken + bytes.len() > MOST_FLOOD_A_SECOND {
                     pending.clear();
+                    lock(&shared.screen).cancel_sequence();
                     shared.notice(FLOODED);
                     continue;
                 }
                 taken += bytes.len();
-                let began = Instant::now();
                 output(shared, &mut pending, &bytes);
-                spent += began.elapsed();
             }
             Ok(FromHelper::Exited(exit)) if started => {
                 shared.finish(SessionState::Ended(exit));
@@ -532,11 +554,26 @@ fn output(shared: &Arc<Shared>, pending: &mut Vec<u8>, bytes: &[u8]) {
     if text.is_empty() {
         return;
     }
-    let answers = {
-        let mut screen = lock(&shared.screen);
-        screen.feed(&text);
-        screen.take_answers()
-    };
+    let mut rest = &text[..];
+    while !rest.is_empty() {
+        let mut at = SLICE.min(rest.len());
+        while !rest.is_char_boundary(at) {
+            at += 1;
+        }
+        let (slice, after) = rest.split_at(at);
+        rest = after;
+        let (answers, costly) = {
+            let mut screen = lock(&shared.screen);
+            screen.feed(slice);
+            (screen.take_answers(), screen.too_costly())
+        };
+        if costly {
+            shared.notice(FLOODED);
+        }
+        if !answers.is_empty() {
+            shared.say(ToHelper::Input(answers));
+        }
+    }
     {
         let mut cast = lock(&shared.cast);
         if let Some(recording) = cast.as_mut()
@@ -545,9 +582,6 @@ fn output(shared: &Arc<Shared>, pending: &mut Vec<u8>, bytes: &[u8]) {
             *cast = None;
             shared.notice(RECORDING_FULL);
         }
-    }
-    if !answers.is_empty() {
-        shared.say(ToHelper::Input(answers));
     }
     shared.draw_again();
 }
@@ -587,21 +621,16 @@ fn decode(pending: &mut Vec<u8>, bytes: &[u8]) -> String {
 }
 
 /// The thread that says things to the helper, and sees to the end of a program that won't.
-fn write_side(shared: &Arc<Shared>, child: &Mutex<Child>, mut stdin: impl std::io::Write, queue: Receiver<ToHelper>) {
+fn write_side(shared: &Arc<Shared>, mut stdin: impl std::io::Write, queue: Receiver<ToHelper>) {
     for what in queue {
         if let ToHelper::Input(bytes) = &what {
             shared.queued.fetch_sub(bytes.len(), Ordering::SeqCst);
         }
-        let ending = matches!(what, ToHelper::End);
-        if what.write(&mut stdin).is_err() {
+        // Told to end before the program was started: it never is. The helper is left to see its input close.
+        if matches!(what, ToHelper::Start(_)) && shared.ending.load(Ordering::SeqCst) {
             return;
         }
-        if ending {
-            if !shared.wait_over(ENDING_WAIT) {
-                // The helper's own end of the program takes two seconds; this is the end of the helper.
-                shared.killed.store(true, Ordering::SeqCst);
-                kill(child);
-            }
+        if what.write(&mut stdin).is_err() {
             return;
         }
     }

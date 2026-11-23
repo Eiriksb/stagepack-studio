@@ -316,6 +316,12 @@ impl Screen {
         screen
     }
 
+    /// Lets go of a sequence read halfway, as when some of a program's output was dropped, so that what
+    /// is fed next starts clean.
+    pub fn cancel_sequence(&mut self) {
+        self.parser = Parser::default();
+    }
+
     /// The answers given since they were last taken, bytes for the program's input.
     pub fn take_answers(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.answers)
