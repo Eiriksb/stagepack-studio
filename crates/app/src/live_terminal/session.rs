@@ -383,6 +383,34 @@ impl Session {
     pub fn recorded(&self) -> Option<Vec<u8>> {
         lock(&self.shared.cast).as_ref().map(|cast| cast.bytes.clone())
     }
+
+    /// Whether the session is still short enough to be kept as a recording.
+    pub fn can_keep(&self) -> bool {
+        lock(&self.shared.cast).is_some()
+    }
+}
+
+/// The name, without its folder or extension, a recording kept from a program is given: the
+/// program's file name, whichever way its folders are written, reduced to ASCII letters, digits,
+/// `-` and `_`, anything else a `-` (a run of them one), at most 40 characters, `terminal` if
+/// nothing is left. Nothing in it can lead out of the folder it's put in.
+pub fn recording_stem(program: &str) -> String {
+    let name = program.rsplit(['/', '\\']).next().unwrap_or("");
+    let stem = match name.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => stem,
+        _ => name,
+    };
+    let mut kept = String::new();
+    for c in stem.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            kept.push(c);
+        } else if !kept.ends_with('-') {
+            kept.push('-');
+        }
+    }
+    kept.truncate(40);
+    let kept = kept.trim_matches('-');
+    if kept.is_empty() { "terminal".to_string() } else { kept.to_string() }
 }
 
 impl Drop for Session {

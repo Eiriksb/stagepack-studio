@@ -46,7 +46,7 @@ mod typing;
 
 pub use arranging::Nudge;
 pub use keys::*;
-pub use running::{LIVE_CONTEXT, TERMINAL_END_ID, TERMINAL_KEEP_ID, TERMINAL_START_ID};
+pub use running::{LIVE_CONTEXT, TERMINAL_END_ID, TERMINAL_KEEP_ID, TERMINAL_START_ID, TOO_LONG_TO_KEEP};
 pub use marks::MarkColors;
 use marks::{shown_on, standing_out_on, caret_box, caret_corners, corners, corners_box, guide_bounds, outline_corners, paint_dashed, paint_outline, paint_polygon, turned};
 

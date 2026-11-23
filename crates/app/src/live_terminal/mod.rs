@@ -27,5 +27,5 @@ pub use permission::{
 pub use resolve::{Program, resolve_program};
 #[cfg(feature = "test-hooks")]
 pub use resolve::forbid_for_tests;
-pub use session::{Look, MOST_FLOOD_A_SECOND, Session, SessionState, THREAD_NAME, threads_running};
+pub use session::{Look, MOST_FLOOD_A_SECOND, Session, recording_stem, SessionState, THREAD_NAME, threads_running};
 pub use slides_terminal::split_command;

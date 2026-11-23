@@ -8,6 +8,7 @@ mod helper;
 mod typing;
 
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -16,7 +17,7 @@ use typing::*;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, InputEvent as _, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Modifiers, Point, TestAppContext, px};
 use stagepack_studio::live_terminal::{
-    HELPER_ENV, LiveId, LiveTerminals, MOST_LIVE, NOT_INSTALLED, RUN_ASK_ID, RUN_NO_ID, RUN_YES_ID, RunPermissions, TOO_MANY, threads_running,
+    HELPER_ENV, LiveId, LiveTerminals, MOST_LIVE, Session, NOT_INSTALLED, RUN_ASK_ID, RUN_NO_ID, RUN_YES_ID, RunPermissions, TOO_MANY, threads_running,
 };
 use stagepack_studio::present_view::{COUNTER_ID, Presentation};
 use stagepack_studio::slide_canvas::SlideCanvas;
@@ -683,4 +684,102 @@ fn keys_never_reach_a_program_while_a_question_is_open(cx: &mut TestAppContext) 
     click(cx, show.presenter, RUN_NO_ID);
     press(cx, show.presenter, "escape");
     nothing_left(cx, &[typing.handle], &live, "3131");
+}
+
+/// Starts the terminal on the slide shown with *Start* and *Run*, and waits for its program to
+/// end, as a short one does at once.
+fn start_and_let_end(typing: &Typing, cx: &mut TestAppContext, live: &LiveTerminals, windows: &[AnyWindowHandle]) -> Rc<Session> {
+    let terminal = thing(typing, cx, "<Terminal");
+    let at = typing.at(cx, terminal.rect.x + terminal.rect.w / 5., terminal.rect.y + terminal.rect.h / 5.);
+    typing.click(cx, at);
+    click_on(typing, cx, TERMINAL_START_ID);
+    assert!(until(cx, windows, 5, |cx| bounds_of(typing, cx, RUN_YES_ID).is_some()));
+    click_on(typing, cx, RUN_YES_ID);
+    assert!(until(cx, windows, 10, |_| live.sessions() == 1 && live.running() == 0), "the program ended");
+    live.get(&live.ids()[0]).unwrap()
+}
+
+fn can_undo(typing: &Typing, cx: &TestAppContext) -> bool {
+    typing.document(cx).read_with(cx, |document, _| document.can_undo())
+}
+
+#[gpui_kit::test]
+fn a_session_kept_becomes_the_recording(cx: &mut TestAppContext) {
+    let around = surroundings(Some(&helper::helper_program()));
+    let talk = format!("# One\n\n{}\n", tag("printf hello", 100));
+    let typing = open_talk(cx, &around, &talk);
+    let mut live = live_of(&typing, cx);
+    let windows = [typing.handle];
+    let session = start_and_let_end(&typing, cx, &live, &windows);
+    assert!(session.can_keep());
+    let folder = typing._folder.path().to_path_buf();
+
+    // Kept, then undone: the tag has no `src` again, and a save writes no file.
+    assert!(!typing.source(cx).contains("src="));
+    click_on(&typing, cx, TERMINAL_KEEP_ID);
+    assert!(typing.source(cx).contains("src=\"assets/printf.cast\""), "{}", typing.source(cx));
+    assert!(!folder.join("assets").exists(), "nothing is written until a save");
+    typing.press(cx, "ctrl-z");
+    assert_eq!(typing.source(cx), talk, "Undo takes the src away");
+    typing.press(cx, "ctrl-s");
+    wait(cx, 500);
+    typing.settle(cx);
+    assert!(!folder.join("assets/printf.cast").exists(), "undone, the file isn't saved");
+
+    // Kept again, and saved: the file is there, holding what the screen showed and nothing typed.
+    click_on(&typing, cx, TERMINAL_KEEP_ID);
+    assert!(typing.source(cx).contains("src=\"assets/printf.cast\""));
+    typing.press(cx, "ctrl-s");
+    wait(cx, 500);
+    typing.settle(cx);
+    let kept = std::fs::read(folder.join("assets/printf.cast")).expect("the recording is saved");
+    let text = String::from_utf8(kept.clone()).unwrap();
+    assert!(text.contains("hello"), "{text}");
+    assert!(!text.contains("\"i\""), "no input events: {text}");
+    slides_terminal::read(&kept).expect("it reads as a recording");
+    assert!(can_undo(&typing, cx));
+    drop(session);
+    live.end_all();
+    nothing_left(cx, &windows, &live, "printf hello");
+}
+
+#[gpui_kit::test]
+fn a_kept_recording_plays_like_any_other(cx: &mut TestAppContext) {
+    let around = surroundings(Some(&helper::helper_program()));
+    let talk = format!("# One\n\n{}\n", tag("printf hello", 100));
+    let typing = open_talk(cx, &around, &talk);
+    let mut live = live_of(&typing, cx);
+    let windows = [typing.handle];
+    let _session = start_and_let_end(&typing, cx, &live, &windows);
+    click_on(&typing, cx, TERMINAL_KEEP_ID);
+    assert!(until(cx, &windows, 10, |cx| bounds_of(&typing, cx, stagepack_studio::slide_editor::TERMINAL_PLAY_ID).is_some()), "Play is offered on it");
+    click_on(&typing, cx, stagepack_studio::slide_editor::TERMINAL_PLAY_ID);
+    let canvas = cx.read(|cx| typing.view.read(cx).slide_canvas().clone());
+    assert!(
+        until(cx, &windows, 20, |cx| cx.read(|cx| canvas.read(cx).replay_pictures().first().is_some_and(Option::is_some))),
+        "it played"
+    );
+    live.end_all();
+}
+
+#[test]
+fn a_kept_recording_is_named_from_the_program_and_never_leaves_its_folder() {
+    use stagepack_studio::live_terminal::recording_stem;
+    assert_eq!(recording_stem("/usr/bin/bash"), "bash");
+    assert_eq!(recording_stem("C:\\Windows\\System32\\cmd.exe"), "cmd");
+    assert_eq!(recording_stem("my_prog.v2.exe"), "my_prog-v2");
+    assert_eq!(recording_stem("../../etc/passwd"), "passwd");
+    assert_eq!(recording_stem("..\\..\\evil"), "evil");
+    assert_eq!(recording_stem("a b  c"), "a-b-c");
+    assert_eq!(recording_stem("blåbær"), "bl-b-r");
+    assert_eq!(recording_stem(".."), "terminal");
+    assert_eq!(recording_stem("/"), "terminal");
+    assert_eq!(recording_stem(""), "terminal");
+    assert_eq!(recording_stem("日本語"), "terminal");
+    assert_eq!(recording_stem(&"x".repeat(100)).len(), 40);
+    for odd in ["../x/..", "a/../b", "\\..\\", "x y/z w", "ünï/çödé", "con", "a:b"] {
+        let stem = recording_stem(odd);
+        assert!(!stem.is_empty() && stem.len() <= 40, "{odd:?}");
+        assert!(stem.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'), "{odd:?} -> {stem:?}");
+    }
 }

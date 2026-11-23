@@ -77,10 +77,17 @@ impl Render for SlideEditor {
         // it runs, below its middle.
         let live_selected = if selecting { self.selected_runs(cx) } else { None };
         let live_running = live_selected.as_ref().is_some_and(|runs| self.live.is_running(&runs.id));
-        let live_buttons: Vec<(&'static str, &'static str, f32)> = match (&live_selected, live_running) {
-            (None, _) => Vec::new(),
-            (Some(_), false) => vec![(TERMINAL_START_ID, "Start", 40.)],
-            (Some(_), true) => vec![(TERMINAL_END_ID, "Stop", 40.), (TERMINAL_KEEP_ID, "Keep as recording", 80.)],
+        // What a session showed can be kept while it runs and once it has ended, while it's held.
+        let live_held = live_selected.as_ref().and_then(|runs| self.live.get(&runs.id));
+        let keep_label = match &live_held {
+            Some(session) if !session.can_keep() => TOO_LONG_TO_KEEP,
+            _ => "Keep as recording",
+        };
+        let live_buttons: Vec<(&'static str, &'static str, f32)> = match (&live_selected, live_running, live_held.is_some()) {
+            (None, _, _) => Vec::new(),
+            (Some(_), false, false) => vec![(TERMINAL_START_ID, "Start", 40.)],
+            (Some(_), false, true) => vec![(TERMINAL_START_ID, "Start", 40.), (TERMINAL_KEEP_ID, keep_label, 80.)],
+            (Some(_), true, _) => vec![(TERMINAL_END_ID, "Stop", 40.), (TERMINAL_KEEP_ID, keep_label, 80.)],
         };
         let live_button = live_selected.as_ref().zip(self.canvas.read(cx).slide_bounds().zip(self.canvas.read(cx).area())).map(|(runs, (slide, area))| {
             let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
@@ -584,12 +591,14 @@ impl Render for SlideEditor {
                             .text_color(button_text)
                             .text_sm()
                             .cursor_pointer()
+                            .when(label == TOO_LONG_TO_KEEP, |this| this.opacity(0.5))
                             // The press is the button's, not the slide's beneath it.
                             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 match id {
                                     TERMINAL_START_ID => this.start_terminal(cx),
                                     TERMINAL_END_ID => this.end_terminal(cx),
+                                    TERMINAL_KEEP_ID => this.keep_terminal(cx),
                                     _ => {}
                                 }
                             }))

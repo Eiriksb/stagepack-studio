@@ -7,7 +7,7 @@ use gpui_kit::component::WindowExt as _;
 
 use slides_engine::TerminalLayer;
 
-use crate::live_terminal::{LiveId, gives_keys_back};
+use crate::live_terminal::{LiveId, gives_keys_back, plan, recording_stem, split_command};
 use crate::slide_canvas::LivePlace;
 
 /// What a terminal selected that runs a command has: the one that starts it, the one that ends it
@@ -17,6 +17,9 @@ pub const TERMINAL_END_ID: &str = "terminal-end";
 pub const TERMINAL_KEEP_ID: &str = "terminal-keep";
 
 /// The key context while a live terminal has the keys: none of the editor's keys apply.
+/// What *Keep as recording* says, instead, once the session is longer than a recording may be.
+pub const TOO_LONG_TO_KEEP: &str = "This session is too long to keep.";
+
 pub const LIVE_CONTEXT: &str = "SlideLive";
 
 /// A terminal of the slide shown that runs a command, with who it is.
@@ -101,6 +104,35 @@ impl SlideEditor {
             self.live.end(&runs.id);
             cx.notify();
         }
+    }
+
+    /// *Keep as recording*: what the terminal selected showed so far goes into the talk as a
+    /// recording named from its program, and the tag's `src` names it, as one step Undo takes back.
+    pub(super) fn keep_terminal(&mut self, cx: &mut Context<Self>) {
+        let (Some(runs), Some(document)) = (self.selected_runs(cx), self.document.clone()) else { return };
+        let Some(session) = self.live.get(&runs.id) else { return };
+        // Past the most a recording may hold, it's refused here as the button's label says.
+        let Some(bytes) = session.recorded() else {
+            cx.emit(EditorEvent::Said(TOO_LONG_TO_KEEP.into()));
+            return;
+        };
+        let words = split_command(runs.id.command()).unwrap_or_default();
+        let program = document
+            .update(cx, |document, _| plan(document.place(), &words).ok().and_then(|plan| plan.key().command().first().cloned()))
+            .or_else(|| words.first().cloned())
+            .unwrap_or_default();
+        let stem = recording_stem(&program);
+        let source = runs.terminal.source.clone().unwrap_or_default();
+        let kept = document.update(cx, |document, cx| {
+            let kept = document.keep_terminal_recording(source, &stem, bytes);
+            cx.notify();
+            kept
+        });
+        match kept {
+            Ok(_) => cx.emit(EditorEvent::Edited),
+            Err(why) => cx.emit(EditorEvent::Said(why.to_string().into())),
+        }
+        cx.notify();
     }
 
     /// A press on the slide: on a terminal that runs it gives the terminal the keys, and anywhere

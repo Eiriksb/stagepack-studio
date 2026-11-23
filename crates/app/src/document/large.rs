@@ -961,6 +961,17 @@ impl Document {
         !self.terminal_pending(current) && self.terminal_problem_on(current, &source).is_none()
     }
 
+    /// Keeps `bytes`, what a live terminal showed as a recording, as a file of the talk named as like
+    /// `stem` as is safe, and sets `src` of the terminal at `source` on the slide shown to it, as one
+    /// step named "Change setting". The file goes in as any added file does, so a save writes it only
+    /// while the text uses it: undone, the `src` goes and the file isn't saved. Returns its path.
+    pub fn keep_terminal_recording(&mut self, source: std::ops::Range<usize>, stem: &str, bytes: Vec<u8>) -> Result<String, InsertFailed> {
+        let thing = crate::selection::Selected { slide: self.current(), source };
+        let path = self.add_file(FileKind::Recording, stem, bytes).map_err(InsertFailed::File)?;
+        self.set_attr_of(&thing, "src", Some(&path)).map_err(InsertFailed::Edit)?;
+        Ok(path)
+    }
+
     /// The talk's fonts, to draw with on another thread, as a recording played is.
     pub fn fonts_seed(&mut self) -> slides_engine::FontsSeed {
         self.deck.fonts_mut().seed()
