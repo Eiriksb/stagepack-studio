@@ -39,12 +39,12 @@ done <"$OWN/install-manifest.txt"
 # Is a menu entry with this ID still to be found, in the user's or the system's folders?
 entry_exists() {
     [ -f "$APPS/$1" ] && return 0
-    _old_ifs=$IFS
+    _ee_ifs=$IFS
     IFS=:
     for _d in ${XDG_DATA_DIRS:-/usr/local/share:/usr/share}; do
-        [ -n "$_d" ] && [ -f "$_d/applications/$1" ] && { IFS=$_old_ifs; return 0; }
+        [ -n "$_d" ] && [ -f "$_d/applications/$1" ] && { IFS=$_ee_ifs; return 0; }
     done
-    IFS=$_old_ifs
+    IFS=$_ee_ifs
     return 1
 }
 

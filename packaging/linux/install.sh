@@ -32,6 +32,20 @@ for _png in "$SRC"/icons/icon-*.png; do
 done
 [ -n "$ICONS" ] || refuse "This folder has no icons in it; unpack the .tar.zst again."
 
+# ---- Tidy what a cut-short earlier run of this script left beside the program ----
+# Only folders this script makes: a name ending in .new-<digits> or .old-<digits>, holding one of our installs.
+is_leftover() {
+    case ${1##*-} in '' | *[!0-9]*) return 1 ;; esac
+    [ -d "$1" ] && [ ! -L "$1" ] && [ -f "$1/install-manifest.txt" ] && [ -f "$1/stagepack-studio" ]
+}
+for _stale in "$APP".new-*; do
+    if is_leftover "$_stale"; then rm -rf "$_stale"; fi
+done
+for _stale in "$APP".old-*; do
+    is_leftover "$_stale" || continue
+    if [ ! -e "$APP" ] && [ ! -L "$APP" ]; then mv "$_stale" "$APP"; else rm -rf "$_stale"; fi
+done
+
 # ---- What is already there: nothing that isn't ours is replaced, and nothing is written through a link ----
 if [ -L "$APP" ]; then
     refuse "$APP is a link, and the program won't be put over a link."
@@ -63,6 +77,18 @@ check_icon() {
         refuse "$1 already exists and isn't from Stagepack Studio."
     fi
 }
+# An upgrade must use the folders the first install used, or its entries would be left behind.
+if [ -f "$APP/install-manifest.txt" ]; then
+    while IFS= read -r _l || [ -n "$_l" ]; do
+        case $_l in
+            DATA=* | CONFIG=* | BIN=*)
+                _k=${_l%%=*}
+                eval "_now=\$$_k"
+                [ "${_l#*=}" = "$_now" ] || refuse "The earlier install used $_k=${_l#*=} and this one would use $_now; run the earlier uninstall.sh first, or use the same XDG settings."
+                ;;
+        esac
+    done <"$APP/install-manifest.txt"
+fi
 check_marked "$APPS/stagepack-studio.desktop"
 check_marked "$MIMEDIR/packages/stagepack-studio.xml"
 for _n in $ICONS; do
@@ -146,13 +172,7 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 1' INT TERM HUP
-# Tidy what a cut-short earlier run left beside the program.
-for _stale in "$APP".new-*; do [ -e "$_stale" ] && rm -rf "$_stale"; done
-for _stale in "$APP".old-*; do
-    [ -e "$_stale" ] || continue
-    if [ ! -e "$APP" ]; then mv "$_stale" "$APP"; else rm -rf "$_stale"; fi
-done
-# A hook for the tests only: stop at a chosen step, as a signal would.
+# A hook for the tests only (harmless otherwise): stop at a chosen step, as a signal would.
 hook() { [ "${STAGEPACK_INSTALL_STOP_AT:-}" != "$1" ] || kill -TERM $$; }
 mkdir -p "$(dirname "$APP")"
 mkdir "$NEW"
@@ -178,6 +198,10 @@ fi
 mkdir -p "$BIN" "$APPS" "$MIMEDIR/packages"
 ln -sf "$APP/stagepack-studio" "$BIN/stagepack-studio"
 
+# Checked again just before writing: never written through a link made since the first check.
+no_link() { [ ! -L "$1" ] || refuse "$1 has become a link, and nothing is written through a link."; }
+no_link "$APPS/stagepack-studio.desktop"
+rm -f "$APPS/stagepack-studio.desktop"
 while IFS= read -r _line || [ -n "$_line" ]; do
     case $_line in
         *@EXEC@*) printf '%s%s%s\n' "${_line%%@EXEC@*}" "$EXEC_QUOTED" "${_line#*@EXEC@}" ;;
@@ -185,11 +209,16 @@ while IFS= read -r _line || [ -n "$_line" ]; do
     esac
 done <"$SRC/stagepack-studio.desktop.in" >"$APPS/stagepack-studio.desktop"
 
+no_link "$MIMEDIR/packages/stagepack-studio.xml"
+rm -f "$MIMEDIR/packages/stagepack-studio.xml"
 cp "$SRC/stagepack-studio-mime.xml" "$MIMEDIR/packages/stagepack-studio.xml"
 for _n in $ICONS; do
     mkdir -p "$DATA/icons/hicolor/${_n}x${_n}/apps" "$DATA/icons/hicolor/${_n}x${_n}/mimetypes"
-    cp "$SRC/icons/icon-$_n.png" "$DATA/icons/hicolor/${_n}x${_n}/apps/stagepack-studio.png"
-    cp "$SRC/icons/icon-$_n.png" "$DATA/icons/hicolor/${_n}x${_n}/mimetypes/application-vnd.stagepack.talk.png"
+    for _t in apps/stagepack-studio.png mimetypes/application-vnd.stagepack.talk.png; do
+        no_link "$DATA/icons/hicolor/${_n}x${_n}/$_t"
+        rm -f "$DATA/icons/hicolor/${_n}x${_n}/$_t"
+        cp "$SRC/icons/icon-$_n.png" "$DATA/icons/hicolor/${_n}x${_n}/$_t"
+    done
 done
 
 if command -v update-mime-database >/dev/null 2>&1; then

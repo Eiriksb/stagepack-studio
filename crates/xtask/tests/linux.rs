@@ -528,3 +528,38 @@ fn a_default_of_stars_is_not_expanded() {
     assert_eq!(s.uninstall().status.code(), Some(0));
     assert_eq!(std::fs::read_to_string(&list).unwrap(), format!("[Default Applications]\n{TYPE}=*;\n"));
 }
+
+#[test]
+fn install_leaves_the_users_own_old_and_new_folders_alone() {
+    let s = Scratch::new("sweep-");
+    let lib = s.app().parent().unwrap().to_path_buf();
+    let mine = ["stagepack-studio.old-0.1.0", "stagepack-studio.old-photos", "stagepack-studio.new-ideas", "stagepack-studio.old-123"];
+    for name in mine {
+        std::fs::create_dir_all(lib.join(name)).unwrap();
+        std::fs::write(lib.join(name).join("mine.txt"), name).unwrap();
+    }
+    let before = snapshot(&lib);
+    let out = s.install(package());
+    assert_eq!(out.status.code(), Some(0), "{}", said(&out));
+    for name in mine {
+        assert_eq!(std::fs::read_to_string(lib.join(name).join("mine.txt")).unwrap(), name);
+    }
+    assert!(s.app().join("stagepack-studio").is_file());
+    // And an upgrade (with the user's backup beside it, named by hand) keeps them too.
+    let out = s.install(&newer_package(&s));
+    assert_eq!(out.status.code(), Some(0), "{}", said(&out));
+    let after = snapshot(&lib);
+    for (k, v) in &before {
+        assert_eq!(after.get(k), Some(v), "{k} changed");
+    }
+}
+
+#[test]
+fn an_upgrade_under_other_settings_is_refused() {
+    let s = installed();
+    let before = snapshot(&s.home);
+    let out = s.command("sh").arg(package().join("install.sh")).env("XDG_BIN_HOME", s.home.join("other-bin")).output().unwrap();
+    assert_ne!(out.status.code(), Some(0), "{}", said(&out));
+    assert!(said(&out).contains("earlier install used BIN="), "{}", said(&out));
+    assert_eq!(snapshot(&s.home), before);
+}
