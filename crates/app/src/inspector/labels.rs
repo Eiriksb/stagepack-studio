@@ -3,9 +3,12 @@
 
 use toolkit::{PropField, PropKind};
 
+/// A built-in's setting: `(argument, label, meaning)`.
+type Setting = (&'static str, &'static str, &'static str);
+
 /// A built-in component's settings, by argument, in the order they're shown, with their labels
 /// and what each means: `(argument, label, meaning)`.
-const BUILT_INS: [(&str, &[(&str, &str, &str)]); 8] = [
+const BUILT_INS: [(&str, &[Setting]); 8] = [
     (
         "Shape",
         &[
