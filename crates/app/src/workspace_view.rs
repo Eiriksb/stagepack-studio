@@ -38,7 +38,7 @@ use crate::markdown_panel::MarkdownPanel;
 use crate::notes_panel::{
     NOTES_HEIGHT, NOTES_MAX_HEIGHT, NOTES_MIN_HEIGHT, NotesEdited, NotesFocused, NotesPanel,
 };
-use crate::live_terminal::{Decision, RunAnswer, RunPermissions, RunQuestion, SessionYes, TalkFolder, ask_to_run, may_run};
+use crate::live_terminal::{Decision, Plan, RunAnswer, RunPermissions, RunQuestion, SessionYes, ask_to_run, may_run, plan};
 use crate::permissions::BuildPermissions;
 use crate::present_view::{self, Presentation, start_show};
 use crate::recovery::{Found, NotTaken, Recovery};
@@ -810,35 +810,50 @@ impl WorkspaceView {
     }
 
     /// Asks whether `command` may run, if it hasn't been said yes or no to. The answer is kept
-    /// for the session, and for *Always for this folder* in the app's own permissions. This
-    /// starts nothing: what starts a program asks [`Self::run_decision`] again.
-    pub fn ask_to_run(&mut self, command: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
-        if self.run_decision(&command, cx) != Decision::Ask {
-            return;
-        }
+    /// for the session, and for *Always for this folder* in the app's own permissions. A command
+    /// that can't be run is not asked about: the status line says why. This starts nothing: what
+    /// starts a program asks [`Self::run_decision`] again. It says whether the question was put:
+    /// while another dialog is showing it isn't, and nothing is recorded, so it can be asked again.
+    pub fn ask_to_run(&mut self, command: Vec<String>, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(document) = &self.document else {
-            return;
+            return false;
         };
-        let folder = TalkFolder::of(document.read(cx).place());
-        let question = RunQuestion { command: command.clone(), folder: folder.as_ref().map(|folder| folder.path().to_path_buf()) };
+        let plan = match plan(document.read(cx).place(), &command) {
+            Ok(plan) => plan,
+            Err(why) => {
+                self.say(why, cx);
+                return false;
+            }
+        };
+        if self.run_decision(&command, cx) != Decision::Ask {
+            return false;
+        }
+        let question = RunQuestion {
+            command: plan.shown_words(),
+            program_in_talk: plan.program_in_talk(),
+            folder: plan.folder().map(|folder| folder.path().to_path_buf()),
+        };
         let view = cx.weak_entity();
         ask_to_run(window, cx, question, move |answer, _, cx| {
-            view.update(cx, |view, cx| view.run_answered(&command, answer, folder.as_ref(), cx)).ok();
-        });
+            view.update(cx, |view, cx| view.run_answered(&plan, answer, cx)).ok();
+        })
     }
 
-    /// Takes in what was answered about running `command`.
-    fn run_answered(&mut self, command: &[String], answer: RunAnswer, folder: Option<&TalkFolder>, cx: &mut Context<Self>) {
+    /// Takes in what was answered about running what `plan` says.
+    fn run_answered(&mut self, plan: &Plan, answer: RunAnswer, cx: &mut Context<Self>) {
+        let key = plan.key();
         match answer {
-            RunAnswer::DontRun => self.run_yes.refuse(command),
-            RunAnswer::Run => self.run_yes.allow(command),
+            RunAnswer::DontRun => self.run_yes.refuse(key),
+            RunAnswer::Run => self.run_yes.allow(key),
             RunAnswer::Always => {
-                self.run_yes.allow(command);
-                if let (Some(folder), Some(permissions)) = (folder, &mut self.run_permissions) {
-                    // A permission that can't be written is still a yes for this session.
-                    if permissions.remember(folder, command).is_err() {
-                        self.say("The permission couldn't be kept, so it's only for now.".to_string(), cx);
-                    }
+                self.run_yes.allow(key);
+                let kept = match (plan.folder(), &mut self.run_permissions) {
+                    (Some(folder), Some(permissions)) => permissions.remember(folder, &key.command).is_ok(),
+                    _ => false,
+                };
+                // A permission that can't be written is still a yes for this session.
+                if !kept {
+                    self.say("The permission couldn't be kept, so it's only for now.".to_string(), cx);
                 }
             }
         }

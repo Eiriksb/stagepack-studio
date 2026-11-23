@@ -22,11 +22,15 @@ pub const RUN_LINE_ID: &str = "run-line";
 pub const RUN_QUESTION: &str = "This talk wants to run a program on your computer.";
 pub const RUN_WARNING: &str = "It can do anything you can do. Run it only if you trust this talk.";
 pub const RUN_IN_NEW_FOLDER: &str = "in a new empty folder";
+pub const RUN_PROGRAM_IN_TALK: &str = "The program is a file that comes with this talk.";
 
-/// What is asked: the command's words, and the folder it would run in for a talk kept in one.
+/// What is asked: the command's words as they will run (the program as the file that runs), and the
+/// folder it would run in for a talk kept in one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunQuestion {
     pub command: Vec<String>,
+    /// Whether the program is a file the talk brings with it.
+    pub program_in_talk: bool,
     /// The talk's folder, or none for a packed or untitled talk, which runs in a new empty folder.
     pub folder: Option<PathBuf>,
 }
@@ -42,11 +46,16 @@ pub enum RunAnswer {
 }
 
 /// Asks `question` in `window`, and tells `answer` what was chosen, once. While another dialog
-/// is showing, nothing is asked and `answer` hears `DontRun`.
-pub fn ask_to_run(window: &mut Window, cx: &mut App, question: RunQuestion, answer: impl Fn(RunAnswer, &mut Window, &mut App) + 'static) {
+/// is showing nothing is asked, `answer` hears nothing, and this says `false`: the person has
+/// said neither yes nor no, so the question is for the caller to ask again.
+pub fn ask_to_run(
+    window: &mut Window,
+    cx: &mut App,
+    question: RunQuestion,
+    answer: impl Fn(RunAnswer, &mut Window, &mut App) + 'static,
+) -> bool {
     if window.has_active_dialog(cx) {
-        answer(RunAnswer::DontRun, window, cx);
-        return;
+        return false;
     }
     let answered = Rc::new(Cell::new(false));
     let answer = Rc::new(answer);
@@ -111,15 +120,37 @@ pub fn ask_to_run(window: &mut Window, cx: &mut App, question: RunQuestion, answ
     });
     // The keyboard starts on Don't run.
     window.defer(cx, move |window, cx| no_focus_later.focus(window, cx));
+    true
+}
+
+/// `text` as it can be seen: quoted, with a quote or a backslash escaped as the tag does, and
+/// anything that hides written out, so what shows is exactly what runs.
+fn visible(text: &str) -> String {
+    let mut shown = String::from("\"");
+    for c in text.chars() {
+        match c {
+            '"' | '\\' => {
+                shown.push('\\');
+                shown.push(c);
+            }
+            c if super::permission::hides(c) => shown.push_str(&format!("\\u{{{:X}}}", c as u32)),
+            c => shown.push(c),
+        }
+    }
+    shown.push('"');
+    shown
 }
 
 /// The lines of the question, one to a line: each word of the command, then where it runs.
 fn lines_of(question: &RunQuestion) -> Vec<SharedString> {
-    let mut lines: Vec<SharedString> = question.command.iter().map(|word| SharedString::from(word.clone())).collect();
+    let mut lines: Vec<SharedString> = question.command.iter().map(|word| SharedString::from(visible(word))).collect();
     lines.push("in".into());
     lines.push(match &question.folder {
-        Some(folder) => folder.display().to_string().into(),
+        Some(folder) => visible(&folder.display().to_string()).into(),
         None => RUN_IN_NEW_FOLDER.into(),
     });
+    if question.program_in_talk {
+        lines.push(RUN_PROGRAM_IN_TALK.into());
+    }
     lines
 }

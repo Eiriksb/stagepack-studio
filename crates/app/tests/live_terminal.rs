@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use slides_terminal::{Colour, Screen};
 use slides_terminal_helper::wire::StartSpec;
-use stagepack_studio::live_terminal::{Session, SessionState, find_helper, split_command, threads_running};
+use stagepack_studio::live_terminal::{Permit, Session, SessionState, find_helper, split_command, threads_running};
 
 /// The tests share the count of threads and the process's memory, so they take turns.
 fn one_at_a_time() -> MutexGuard<'static, ()> {
@@ -36,6 +36,11 @@ fn helper_program() -> PathBuf {
             helper
         })
         .clone()
+}
+
+/// Starts a session on `spec`, which these tests choose themselves.
+fn start(helper: &Path, spec: StartSpec) -> Session {
+    Session::start(helper, Permit::unchecked_for_tests(spec))
 }
 
 fn spec(program: &str, args: &[&str], cwd: &Path) -> StartSpec {
@@ -76,7 +81,7 @@ fn no_threads_left() -> bool {
 fn a_session_shows_what_the_program_prints() {
     let _turn = one_at_a_time();
     let dir = tempfile::tempdir().unwrap();
-    let session = Session::start(&helper_program(), sh("printf '\\033[31mred\\033[0m'; sleep 5", dir.path()));
+    let session = start(&helper_program(), sh("printf '\\033[31mred\\033[0m'; sleep 5", dir.path()));
     assert!(within(Duration::from_secs(3), || screen_text(&session.screen()).starts_with("red")), "{:?}", session.screen());
     let screen = session.screen();
     let r = screen.cell(0, 0).unwrap();
@@ -91,7 +96,7 @@ fn a_session_shows_what_the_program_prints() {
 fn keys_reach_the_program() {
     let _turn = one_at_a_time();
     let dir = tempfile::tempdir().unwrap();
-    let session = Session::start(&helper_program(), spec("cat", &[], dir.path()));
+    let session = start(&helper_program(), spec("cat", &[], dir.path()));
     assert!(within(Duration::from_secs(3), || session.state() == SessionState::Running));
     session.send_keys(b"hi\r");
     // The terminal echoes the typing, and cat prints the line again.
@@ -135,7 +140,7 @@ fn a_flood_is_dropped_not_held() {
     let _turn = one_at_a_time();
     let dir = tempfile::tempdir().unwrap();
     let before = resident_peak_kb();
-    let session = Session::start(&helper_program(), sh("yes | head -c 40000000", dir.path()));
+    let session = start(&helper_program(), sh("yes | head -c 40000000", dir.path()));
     assert!(within(Duration::from_secs(30), || session.state().is_over()), "{:?}", session.state());
     assert!(matches!(session.state(), SessionState::Ended(_)), "{:?}", session.state());
     let grown = resident_peak_kb().saturating_sub(before);
@@ -168,7 +173,7 @@ fn a_broken_helper_is_survived() {
     let not_executable = dir.path().join("plain");
     std::fs::write(&not_executable, "just words").unwrap();
     for helper in [Path::new("/bin/true"), &noisy, &huge, &dir.path().join("missing"), &not_executable] {
-        let session = Session::start(helper, sh("echo hi", dir.path()));
+        let session = start(helper, sh("echo hi", dir.path()));
         assert!(within(Duration::from_secs(3), || session.state().is_over()), "{helper:?}: {:?}", session.state());
         let SessionState::Failed(why) = session.state() else { panic!("{helper:?}: {:?}", session.state()) };
         assert!(why.ends_with('.') && why.len() > 10, "{why:?}");
@@ -176,7 +181,7 @@ fn a_broken_helper_is_survived() {
     }
     // One that reads nothing and never leaves, its input filled so that nothing more can be written to it,
     // is killed five seconds after the end is asked for, and the session says why.
-    let session = Session::start(&silent, sh("echo hi", dir.path()));
+    let session = start(&silent, sh("echo hi", dir.path()));
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(session.state(), SessionState::Starting);
     for _ in 0..30 {
@@ -201,7 +206,7 @@ fn process_is_running(word: &str) -> bool {
 fn ending_a_session_ends_its_program() {
     let _turn = one_at_a_time();
     let dir = tempfile::tempdir().unwrap();
-    let session = Session::start(&helper_program(), sh("exec sleep 7351", dir.path()));
+    let session = start(&helper_program(), sh("exec sleep 7351", dir.path()));
     assert!(within(Duration::from_secs(5), || process_is_running("sleep 7351")));
     drop(session);
     assert!(within(Duration::from_secs(5), || !process_is_running("sleep 7351")), "the program was left running");
@@ -212,7 +217,7 @@ fn ending_a_session_ends_its_program() {
 fn a_session_is_recorded() {
     let _turn = one_at_a_time();
     let dir = tempfile::tempdir().unwrap();
-    let session = Session::start(&helper_program(), sh("printf one; sleep 0.3; printf two", dir.path()));
+    let session = start(&helper_program(), sh("printf one; sleep 0.3; printf two", dir.path()));
     assert!(within(Duration::from_secs(8), || session.state().is_over()), "{:?}", session.state());
     let cast = session.recorded().expect("it fits");
     let recording = slides_terminal::read(&cast).expect("a recording that can be read");
@@ -252,7 +257,7 @@ fn the_screen_answers_a_program_that_asks_and_nothing_else() {
     let dir = tempfile::tempdir().unwrap();
     // The program asks where the cursor is and prints what the terminal says, as a shell does.
     let script = "stty raw -echo; printf '\\033[3;5H\\033[6n'; dd bs=1 count=6 2>/dev/null | od -c | head -1; sleep 1";
-    let session = Session::start(&helper_program(), sh(script, dir.path()));
+    let session = start(&helper_program(), sh(script, dir.path()));
     assert!(within(Duration::from_secs(5), || screen_text(&session.screen()).contains("033")), "{:?}", session.screen());
     assert!(screen_text(&session.screen()).contains("3   ;   5   R"), "{:?}", session.screen());
     drop(session);
@@ -265,7 +270,7 @@ fn pictures_are_drawn_off_the_windows_thread_and_stop_with_the_session() {
     use stagepack_studio::live_terminal::Look;
     let _turn = one_at_a_time();
     let dir = tempfile::tempdir().unwrap();
-    let session = Session::start(&helper_program(), sh("printf hello; sleep 0.3; printf ' again'; sleep 5", dir.path()));
+    let session = start(&helper_program(), sh("printf hello; sleep 0.3; printf ' again'; sleep 5", dir.path()));
     let look = Look { rect: Rect { x: 10.0, y: 10.0, w: 400.0, h: 200.0 }, rotate: 0.0, scale: 1.0, fonts: Fonts::bundled_only().seed() };
     session.set_look(look);
     assert!(within(Duration::from_secs(10), || session.latest_picture().is_some()));
@@ -284,7 +289,7 @@ fn a_session_ended_while_starting_never_starts_its_program() {
     let _turn = one_at_a_time();
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("marker");
-    let session = Session::start(&helper_program(), sh(&format!("touch {}; sleep 5", marker.display()), dir.path()));
+    let session = start(&helper_program(), sh(&format!("touch {}; sleep 5", marker.display()), dir.path()));
     session.end();
     assert!(within(Duration::from_secs(8), || session.state().is_over()), "{:?}", session.state());
     assert!(matches!(session.state(), SessionState::Ended(_)), "{:?}", session.state());

@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 use gpui_kit::{Keystroke, RenderImage};
 use slides_engine::{Fonts, FontsSeed, Rect};
 use slides_terminal::{MOST_BYTES, MOST_EVENTS, Screen};
-use slides_terminal_helper::wire::{self, Exit, FromHelper, MOST_COLS, MOST_ROWS, StartSpec, ToHelper};
+use super::permission::{Permit, ScratchFolder};
+use slides_terminal_helper::wire::{self, Exit, FromHelper, MOST_COLS, MOST_ROWS, ToHelper};
 
 use super::keys::key_bytes_in;
 use crate::replay::{MOST_PICTURES_A_SECOND, draw_screen};
@@ -258,12 +259,15 @@ impl Cast {
 /// One live terminal session. Dropping it ends the program.
 pub struct Session {
     shared: Arc<Shared>,
+    /// The folder the program runs in, if the session made one: removed with the session.
+    _scratch: Option<ScratchFolder>,
 }
 
 impl Session {
     /// Starts the helper at `helper` with `spec`, on threads of its own: this never waits. If the helper
     /// can't be started, or isn't one, the session says so in its state.
-    pub fn start(helper: &Path, spec: StartSpec) -> Session {
+    pub fn start(helper: &Path, permit: Permit) -> Session {
+        let (spec, scratch) = permit.into_parts();
         let (cols, rows) = (spec.cols.clamp(1, MOST_COLS), spec.rows.clamp(1, MOST_ROWS));
         let (to_helper, queue) = mpsc::channel();
         let shared = Arc::new(Shared {
@@ -290,7 +294,7 @@ impl Session {
             *lock(&shared.to_helper) = None;
             shared.finish(SessionState::Failed(COULDNT_START.to_string()));
         }
-        Session { shared }
+        Session { shared, _scratch: scratch }
     }
 
     /// Where the session is.
@@ -412,7 +416,9 @@ fn end(shared: &Arc<Shared>) {
 
 /// The thread that starts the helper and reads what it says.
 fn read_side(shared: &Arc<Shared>, helper: &Path, queue: Receiver<ToHelper>) {
-    let mut command = Command::new(helper);
+    let mut command = Command::new(helper.canonicalize().unwrap_or_else(|_| helper.to_path_buf()));
+    // The helper starts nowhere near the talk: the program it runs is given its own folder.
+    command.current_dir(std::env::temp_dir());
     command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
     #[cfg(windows)]
     {
