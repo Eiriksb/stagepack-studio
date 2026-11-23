@@ -11,11 +11,18 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 
 use super::{check, check_text, describe, describe_text, open_talk, outline, outline_text, picture};
-use super::{DEFAULT_WIDTH, GUIDE, LEAST_WIDTH, MOST_WIDTH};
+use super::{GUIDE, LEAST_WIDTH};
 use crate::permissions::BuildPermissions;
 
 /// The longest line the server reads, in bytes.
 const LONGEST_LINE: usize = 4 * 1024 * 1024;
+/// The width a picture has through the server when none is asked for, and the widest it may be:
+/// an assistant takes a smaller picture than a file does.
+const DEFAULT_WIDTH: u32 = 1280;
+const MOST_WIDTH: u32 = 1920;
+/// A picture over this many bytes is drawn again narrower, and not narrower than `NARROWEST`.
+const LARGEST_PNG: usize = 3_500_000;
+const NARROWEST: u32 = 640;
 /// The protocol versions this server knows, newest first.
 const VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
@@ -175,13 +182,13 @@ fn tools() -> Value {
         },
         {
             "name": "picture",
-            "description": "A slide drawn as a PNG at a click step, with the slide's complaints.",
+            "description": "A slide drawn as a PNG at a click step, with the slide's complaints. A picture over 3.5 MB is drawn again narrower, and the text says the width used.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "slide": { "type": "integer", "minimum": 1, "description": "The slide's number, from 1." },
                     "step": { "type": "integer", "minimum": 0, "description": "The click step, from 0. The slide's last when left out." },
-                    "width": { "type": "integer", "minimum": LEAST_WIDTH, "maximum": MOST_WIDTH, "description": format!("Pixels wide; {DEFAULT_WIDTH} when left out.") },
+                    "width": { "type": "integer", "minimum": LEAST_WIDTH, "maximum": MOST_WIDTH, "description": format!("Pixels wide, {LEAST_WIDTH} to {MOST_WIDTH}; {DEFAULT_WIDTH} when left out.") },
                 },
                 "required": ["slide"],
             },
@@ -245,12 +252,23 @@ fn text_tool(talk: &Path, name: &str) -> Value {
     if name == "guide" {
         return text_result(GUIDE);
     }
-    let mut opened = match open_talk(talk) {
+    let opened = open_talk(talk);
+    if name == "describe" {
+        return match opened {
+            Ok(mut opened) => text_result(&describe_text(&describe(Some(&mut opened)))),
+            // The tags and settings are still what the AI needs to write the talk.
+            Err(_) => text_result(&format!(
+                "{}\nThe talk's own components aren't listed, because there's no talk at {} yet.\n",
+                describe_text(&describe(None)),
+                talk.display()
+            )),
+        };
+    }
+    let mut opened = match opened {
         Ok(opened) => opened,
         Err(sentence) => return failure(&sentence),
     };
     match name {
-        "describe" => text_result(&describe_text(&describe(Some(&mut opened)))),
         "outline" => text_result(&outline_text(&outline(&mut opened))),
         _ => {
             // The owner's own permissions, read and never written.
@@ -266,23 +284,33 @@ fn draw(talk: &Path, slide: u64, step: Option<u64>, width: Option<u64>) -> Value
         Err(sentence) => return failure(&sentence),
     };
     let slide = usize::try_from(slide).unwrap_or(usize::MAX);
-    let width = width.map_or(DEFAULT_WIDTH, |width| width as u32);
-    match picture(&mut opened, slide, step.map(|step| step as u32), width) {
-        Ok(made) => {
-            let clicks = match made.steps {
-                0 => String::new(),
-                steps => format!(", click {} of {steps}", made.step),
-            };
-            let mut text = format!("Slide {}{clicks}.\n", made.slide);
-            for problem in &made.problems {
-                text.push_str(&format!("Slide {}: {problem}\n", made.slide));
-            }
-            json!({ "content": [
-                { "type": "image", "data": base64::engine::general_purpose::STANDARD.encode(&made.png), "mimeType": "image/png" },
-                { "type": "text", "text": text },
-            ] })
+    let asked = width.map_or(DEFAULT_WIDTH, |width| width as u32);
+    let step = step.map(|step| step as u32);
+    let mut width = asked;
+    loop {
+        let made = match picture(&mut opened, slide, step, width) {
+            Ok(made) => made,
+            Err(sentence) => return failure(&sentence),
+        };
+        if made.png.len() > LARGEST_PNG && width > NARROWEST {
+            width = (width * 3 / 4).max(NARROWEST);
+            continue;
         }
-        Err(sentence) => failure(&sentence),
+        let clicks = match made.steps {
+            0 => String::new(),
+            steps => format!(", click {} of {steps}", made.step),
+        };
+        let mut text = format!("Slide {}{clicks}.\n", made.slide);
+        if width != asked {
+            text.push_str(&format!("The picture is {width} pixels wide, not {asked}, so that it is small enough to send.\n"));
+        }
+        for problem in &made.problems {
+            text.push_str(&format!("Slide {}: {problem}\n", made.slide));
+        }
+        return json!({ "content": [
+            { "type": "image", "data": base64::engine::general_purpose::STANDARD.encode(&made.png), "mimeType": "image/png" },
+            { "type": "text", "text": text },
+        ] });
     }
 }
 

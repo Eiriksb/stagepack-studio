@@ -22,7 +22,7 @@ A slide is 1920 units wide and 1080 high. Every position and size below is in th
 - `describe` says what a talk may hold: layouts, settings, and every built-in tag with each of its settings. Call it with no talk or with one. With a talk, it adds the talk's own built components. This guide shows each tag once. `describe` is the full list, and it is always right.
 - `check` says every problem, slide by slide, as the app's window would show it. No problems means the talk is sound. Run it after every change.
 - `outline` gives each slide's number, layout, first words, number of clicks, whether it is hidden and whether it has notes.
-- `picture` draws one slide as a PNG. Give it the slide number, and optionally a step (`--step N`, default the last, which is the whole slide) and a width (`--width W`, 64 to 3840, default 1920). The picture is how you see overlap, overflow, colours and whether a thing is where you meant. Look at every slide you write, and at each step of a slide that has clicks.
+- `picture` draws one slide as a PNG. Give it the slide number, and optionally a step (default the last, which is the whole slide) and a width. On the command line these are `--step N` and `--width W` (64 to 3840, default 1920). Through the server they are the arguments `slide`, `step` and `width` (64 to 1920, default 1280), and a picture over 3.5 MB is drawn again narrower, which the reply says. The picture is how you see overlap, overflow, colours and whether a thing is where you meant. Look at every slide you write, and at each step of a slide that has clicks.
 - `guide` prints this guide.
 
 On the command line the picture needs `--out FILE.png`. Through the server, the picture comes back in the reply.
@@ -259,7 +259,7 @@ Look here.
 
 A talk may have its own tags, written in Rust in `components/`, and built into `build/`. `describe` with the talk lists the ones that are built, with their settings. Use them as you use a built-in tag.
 
-The tool never builds a component. It builds only in a folder where the owner has set *Always build this folder* in the app, and only when the app has its compiler. A packed talk is never built. Otherwise a component that is not built, or built from an older file, is reported by `check` as a problem. Tell the owner to open the talk in the app and build it. Don't try to work around it.
+The tool builds a component only for a folder the owner has set to *Always build this folder* in the app, and only when the app has its compiler. It never builds in any other folder, and never a packed talk. Otherwise a component that is not built, or built from an older file, is reported by `check` as a problem. Tell the owner to open the talk in the app and build it. Don't try to work around it.
 
 ## The loop
 

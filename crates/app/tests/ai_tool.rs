@@ -630,3 +630,56 @@ fn clicks_in_the_guide_are_as_the_program_reads_them() {
     write("# A\n\n<Box click=\"3\" x=\"1\" y=\"1\" w=\"9\" h=\"9\" />\n");
     assert!(text(&run(&["outline", talk.to_str().unwrap()], dir.path()).stdout).contains("3 clicks"));
 }
+
+#[test]
+fn check_marks_a_hidden_slide() {
+    let dir = tempfile::tempdir().unwrap();
+    let talk = dir.path().join("hid");
+    std::fs::create_dir_all(&talk).unwrap();
+    std::fs::write(talk.join("slides.md"), "# Fine\n\n---\nhidden: true\n---\n\n# Gone\n\n<Picture src=\"assets/missing.png\" x=\"100\" y=\"100\" w=\"300\" h=\"200\" />\n").unwrap();
+    let output = run(&["check", talk.to_str().unwrap()], dir.path());
+    assert_eq!(output.status.code(), Some(1));
+    assert!(text(&output.stdout).starts_with("Slide 2 (hidden): "), "{}", text(&output.stdout));
+}
+
+#[test]
+fn a_picture_is_never_written_over_a_file_that_isnt_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let talk = picture_talk(dir.path(), "# Hi\n");
+    let talk_text = talk.to_str().unwrap();
+    let before = std::fs::read(talk.join("slides.md")).unwrap();
+    let over = talk.join("slides.md");
+    let output = run(&["picture", talk_text, "1", "--out", over.to_str().unwrap()], dir.path());
+    assert_eq!(output.status.code(), Some(2), "{}", text(&output.stdout));
+    assert_eq!(std::fs::read(&over).unwrap(), before);
+    assert_eq!(text(&output.stderr).trim_end().lines().count(), 1);
+    // A .png name over a file that isn't a PNG.
+    let fake = dir.path().join("notes.PNG");
+    std::fs::write(&fake, "my notes").unwrap();
+    let output = run(&["picture", talk_text, "1", "--out", fake.to_str().unwrap()], dir.path());
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(std::fs::read_to_string(&fake).unwrap(), "my notes");
+    // Not a .png name.
+    let text_file = dir.path().join("x.txt");
+    let output = run(&["picture", talk_text, "1", "--out", text_file.to_str().unwrap()], dir.path());
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!text_file.exists());
+    // A picture of a picture is fine, as is a new .PNG.
+    let again = dir.path().join("again.PNG");
+    for _ in 0..2 {
+        let output = run(&["picture", talk_text, "1", "--out", again.to_str().unwrap()], dir.path());
+        assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    }
+}
+
+#[test]
+fn a_picture_of_a_model_ends_cleanly_and_soon() {
+    let dir = tempfile::tempdir().unwrap();
+    let talk = picture_talk(dir.path(), "<Model src=\"assets/box.glb\" x=\"100\" y=\"100\" w=\"640\" h=\"360\" />\n");
+    std::fs::write(talk.join("assets/box.glb"), slides_model::make_test_glb(slides_model::MadeGlb::Boxes)).unwrap();
+    let out = dir.path().join("out.png");
+    let started = std::time::Instant::now();
+    let output = run(&["picture", talk.to_str().unwrap(), "1", "--out", out.to_str().unwrap()], dir.path());
+    assert!(matches!(output.status.code(), Some(0 | 1)), "{:?} {}", output.status, text(&output.stderr));
+    assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
+}

@@ -216,6 +216,7 @@ fn read_picture_args(args: &[OsString]) -> Result<PictureArgs, Failed> {
 fn run_picture(args: &[OsString]) -> Result<i32, Failed> {
     let given = read_picture_args(args)?;
     let out = given.out.ok_or_else(|| Failed("The picture command needs --out FILE.png to write the picture to.".to_string()))?;
+    check_out(&out)?;
     let [talk_path, slide] = given.words.as_slice() else {
         return Err(Failed("The picture command needs a talk and a slide number.".to_string()));
     };
@@ -228,6 +229,24 @@ fn run_picture(args: &[OsString]) -> Result<i32, Failed> {
     say(&picture_text(&made, &out.display().to_string()));
     report_peak();
     Ok(if made.problems.is_empty() { 0 } else { 1 })
+}
+
+/// Whether `out` may be written as a picture: its name ends in `.png`, and a file already there
+/// is a PNG, so a mistyped name can't replace a talk's own file.
+fn check_out(out: &std::path::Path) -> Result<(), Failed> {
+    let png = out.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("png"));
+    if !png {
+        return Err(Failed(format!("The picture goes to a file that ends in .png, and {} doesn't.", out.display())));
+    }
+    if out.exists() {
+        let mut start = [0u8; 8];
+        let is_png = std::fs::File::open(out).and_then(|mut file| std::io::Read::read_exact(&mut file, &mut start)).is_ok()
+            && start == [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        if !is_png {
+            return Err(Failed(format!("{} is already a file and isn't a picture, so it won't be written over.", out.display())));
+        }
+    }
+    Ok(())
 }
 
 /// For tests: with `STUDIO_REPORT_PEAK` set, says on standard error the most memory this run

@@ -8,6 +8,8 @@ fn main() {
     // `stagepack-studio outline TALK` and the other commands print and end, with no window.
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     if let Some(status) = stagepack_studio::ai_tool::run_command(&args) {
+        // A drawer a picture or a check started is let go of its device before the end.
+        stagepack_studio::model_view::close_drawer(std::time::Duration::from_secs(10));
         stagepack_studio::model_view::wait_closed();
         std::process::exit(status);
     }

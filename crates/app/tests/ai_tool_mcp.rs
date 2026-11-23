@@ -316,3 +316,49 @@ fn a_message_must_say_jsonrpc_2() {
     assert_eq!(server.ask(json!({ "jsonrpc": "2.0", "id": 5, "method": "ping" }))["id"], 5);
     assert_eq!(server.finish(), 0);
 }
+
+#[test]
+fn describe_works_on_a_folder_with_no_talk_yet() {
+    let dir = tempfile::tempdir().unwrap();
+    let talk = dir.path().join("new");
+    std::fs::create_dir_all(&talk).unwrap();
+    let mut server = Server::start(&talk, dir.path());
+    initialize(&mut server);
+    let reply = server.call("describe", json!({}));
+    assert!(reply["result"]["isError"].is_null(), "{reply}");
+    let said = text_of(&reply);
+    assert!(said.contains("Box") && said.contains("Chart"), "{said}");
+    assert!(said.contains("no talk at"), "{said}");
+    assert_eq!(server.finish(), 0);
+}
+
+#[test]
+fn a_picture_with_a_noisy_photo_is_sent_small_enough() {
+    let dir = tempfile::tempdir().unwrap();
+    let talk = dir.path().join("noisy");
+    std::fs::create_dir_all(talk.join("assets")).unwrap();
+    // Random pixels: a photograph's worst case for a PNG.
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut image = image::RgbImage::new(1920, 1080);
+    for pixel in image.pixels_mut() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        pixel.0 = [state as u8, (state >> 8) as u8, (state >> 16) as u8];
+    }
+    image.save(talk.join("assets/noise.png")).unwrap();
+    std::fs::write(talk.join("slides.md"), "<Picture src=\"assets/noise.png\" x=\"0\" y=\"0\" w=\"1920\" h=\"1080\" />\n").unwrap();
+    let mut server = Server::start(&talk, dir.path());
+    initialize(&mut server);
+    let reply = server.call("picture", json!({ "slide": 1 }));
+    let content = &reply["result"]["content"];
+    let png = base64::engine::general_purpose::STANDARD.decode(content[0]["data"].as_str().unwrap()).unwrap();
+    assert!(png.len() <= 3_500_000, "{} bytes", png.len());
+    let width = image::load_from_memory(&png).unwrap().width();
+    assert!((640..1280).contains(&width), "{width}");
+    assert!(content[1]["text"].as_str().unwrap().contains(&format!("{width} pixels wide")), "{reply}");
+    // The server's own limit is 1920.
+    let reply = server.call("picture", json!({ "slide": 1, "width": 3000 }));
+    assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    assert_eq!(server.finish(), 0);
+}

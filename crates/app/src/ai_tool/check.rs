@@ -131,12 +131,13 @@ fn tags_on(blocks: &[Block], found: &mut Vec<(String, std::ops::Range<usize>)>) 
     }
 }
 
-/// The result as plain text: a `Slide N: problem` line each, the talk's, then a last line.
+/// The result as plain text: a `Slide N: problem` line each (`Slide N (hidden): problem` for a hidden slide), the talk's, then a last line.
 pub fn check_text(checked: &Checked) -> String {
     let mut out = String::new();
     for slide in &checked.slides {
         for problem in &slide.problems {
-            out.push_str(&format!("Slide {}: {problem}\n", slide.slide));
+            let hidden = if slide.hidden { " (hidden)" } else { "" };
+            out.push_str(&format!("Slide {}{hidden}: {problem}\n", slide.slide));
         }
     }
     for problem in &checked.talk {
