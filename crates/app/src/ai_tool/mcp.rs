@@ -124,9 +124,12 @@ fn answer(talk: &Path, bytes: &[u8]) -> Option<Value> {
         Some(id) if id.is_number() || id.is_string() => Some(id.clone()),
         Some(_) => return Some(error_reply(&Value::Null, INVALID_REQUEST, "A request's id is a number or a string.")),
     };
+    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return id.map(|id| error_reply(&id, INVALID_REQUEST, "A message says \"jsonrpc\": \"2.0\"."));
+    }
     let Some(method) = object.get("method").and_then(Value::as_str) else {
-        // A reply to something, or not a request at all.
-        return id.map(|id| error_reply(&id, INVALID_REQUEST, "A request has a method."));
+        // A client's reply to something: this server asks nothing, so there's nothing to answer.
+        return None;
     };
     let params = object.get("params").cloned().unwrap_or(Value::Null);
     // A notification gets no answer, whatever it says.
@@ -222,12 +225,17 @@ fn call(talk: &Path, params: &Value) -> Result<Value, String> {
             let slide = whole(&arguments, "slide", 1, u64::MAX)?.ok_or("The picture tool needs a slide number.")?;
             let step = whole(&arguments, "step", 0, u32::MAX as u64)?;
             let width = whole(&arguments, "width", LEAST_WIDTH as u64, MOST_WIDTH as u64)?;
-            catch_unwind(AssertUnwindSafe(|| draw(talk, slide, step, width)))
+            guarded(|| draw(talk, slide, step, width))
         }
-        "describe" | "check" | "outline" | "guide" => catch_unwind(AssertUnwindSafe(|| text_tool(talk, name))),
+        "describe" | "check" | "outline" | "guide" => guarded(|| text_tool(talk, name)),
         other => return Err(format!("This server has no tool {other}.")),
     };
-    Ok(ran.unwrap_or_else(|_| failure("Something went wrong drawing this talk.")))
+    Ok(ran)
+}
+
+/// Runs a tool; a panic in it is a failed call, not a dead server.
+fn guarded(tool: impl FnOnce() -> Value) -> Value {
+    catch_unwind(AssertUnwindSafe(tool)).unwrap_or_else(|_| failure("Something went wrong drawing this talk."))
 }
 
 fn failure(sentence: &str) -> Value {
@@ -280,5 +288,18 @@ fn draw(talk: &Path, slide: u64, step: Option<u64>, width: Option<u64>) -> Value
             ] })
         }
         Err(sentence) => failure(&sentence),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_panic_in_a_tool_is_a_failed_call() {
+        let reply = guarded(|| panic!("a slide that can't be laid out"));
+        assert_eq!(reply["isError"], true);
+        assert_eq!(reply["content"][0]["text"], "Something went wrong drawing this talk.");
+        assert_eq!(guarded(|| text_result("fine"))["content"][0]["text"], "fine");
     }
 }

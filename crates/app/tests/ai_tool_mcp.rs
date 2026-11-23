@@ -272,7 +272,7 @@ fn the_server_writes_nothing() {
 }
 
 #[test]
-fn a_path_that_isnt_a_talk_ends_the_command() {
+fn nothing_at_the_path_ends_the_command() {
     let dir = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_stagepack-studio"))
         .args(["mcp", dir.path().join("nothing").to_str().unwrap()])
@@ -284,4 +284,35 @@ fn a_path_that_isnt_a_talk_ends_the_command() {
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn an_empty_folder_serves_until_a_talk_is_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let talk = dir.path().join("new");
+    std::fs::create_dir_all(&talk).unwrap();
+    let mut server = Server::start(&talk, dir.path());
+    initialize(&mut server);
+    let reply = server.call("outline", json!({}));
+    assert_eq!(reply["result"]["isError"], true, "{reply}");
+    assert!(text_of(&reply).contains("slides.md"), "{reply}");
+    std::fs::write(talk.join("slides.md"), "# Hello there\n").unwrap();
+    let reply = server.call("outline", json!({}));
+    assert!(reply["result"]["isError"].is_null(), "{reply}");
+    assert!(text_of(&reply).contains("1. "), "{reply}");
+    assert_eq!(server.finish(), 0);
+}
+
+#[test]
+fn a_message_must_say_jsonrpc_2() {
+    let dir = tempfile::tempdir().unwrap();
+    let talk = scratch_talk(dir.path());
+    let mut server = Server::start(&talk, dir.path());
+    let reply = server.ask_raw(r#"{"jsonrpc":"1.0","id":4,"method":"ping"}"#);
+    assert_eq!((code(&reply), reply["id"].clone()), (-32600, json!(4)));
+    assert_eq!(code(&server.ask_raw(r#"{"id":"a","method":"ping"}"#)), -32600);
+    // A client's response to nothing we asked: no answer.
+    server.send_raw(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{}}\n");
+    assert_eq!(server.ask(json!({ "jsonrpc": "2.0", "id": 5, "method": "ping" }))["id"], 5);
+    assert_eq!(server.finish(), 0);
 }

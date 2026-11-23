@@ -151,8 +151,14 @@ fn run_check(args: &[OsString]) -> Result<i32, Failed> {
 
 fn run_mcp(args: &[OsString]) -> Result<i32, Failed> {
     let given = read_args("mcp", args, false)?;
-    // Opened once now so a path that isn't a talk is said at the start; each call opens it again.
-    the_talk("mcp", &given)?;
+    // Only a path with something at it is needed now: the talk may be written after the server
+    // starts, and each call opens it afresh and says plainly if it isn't a talk yet.
+    let [path] = given.words.as_slice() else {
+        return Err(Failed("The mcp command needs one talk: a folder or a .sptx file.".to_string()));
+    };
+    if !path.exists() {
+        return Err(Failed(format!("There's no talk at {}.", path.display())));
+    }
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     serve(&given.words[0], stdin.lock(), stdout.lock()).map_err(|error| Failed(format!("The server stopped: {error}.")))?;
