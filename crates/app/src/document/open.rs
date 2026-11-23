@@ -210,6 +210,8 @@ impl Document {
             selection: None,
             selected: None,
             selection_slide: None,
+            keeping_moves: false,
+            moves: Vec::new(),
             picks: 0,
             next_session: 0,
             message: None,

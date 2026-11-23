@@ -70,6 +70,8 @@ struct Setup {
     /// The file the window's build permissions are kept in, read again for each window, as
     /// another may have changed it.
     permissions: Option<PathBuf>,
+    /// The same for the commands always allowed to run.
+    run_permissions: Option<PathBuf>,
     documents: Option<PathBuf>,
     really_watch: bool,
     stagepack: Option<Option<PathBuf>>,
@@ -136,6 +138,7 @@ impl WorkspaceView {
             bundle: self.bundle.clone(),
             editor_projects: self.editor_projects.clone(),
             permissions: self.permissions.as_ref().map(|permissions| permissions.file().to_path_buf()),
+            run_permissions: self.run_permissions.as_ref().map(|permissions| permissions.file().to_path_buf()),
             documents: self.documents.clone(),
             really_watch: self.really_watch,
             stagepack: self.stagepack.clone(),
@@ -150,6 +153,7 @@ impl WorkspaceView {
         self.editor_projects = setup.editor_projects;
         self.permissions = setup.permissions.map(BuildPermissions::load);
         self.always_build = self.is_always_built();
+        self.run_permissions = setup.run_permissions.map(RunPermissions::load);
         self.documents = setup.documents;
         self.really_watch = setup.really_watch;
         self.stagepack = setup.stagepack;

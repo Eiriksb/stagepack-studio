@@ -38,6 +38,8 @@ const NOTES_MASTER: &str = "/ppt/notesMasters/notesMaster1.xml";
 const LANG: &str = "en-US";
 /// What a terminal recording's picture is described as, for screen readers.
 const TERMINAL_ALT: &str = "Terminal recording";
+/// What a picture of a terminal that names a command and no recording is described as.
+const LIVE_TERMINAL_ALT: &str = "Live terminal";
 /// The longest edge a terminal recording's picture is drawn at, and the most pixels it's drawn
 /// at for each slide unit.
 const TERMINAL_EDGE: f32 = 3840.0;
@@ -197,7 +199,7 @@ fn terminal_pictures(deck: &mut Deck, index: usize) -> Vec<(usize, NativeElement
         let standing = LayerSpec { rect, rotate: 0.0, ..spec.clone() };
         let scale = (TERMINAL_EDGE / rect.w.max(rect.h).max(1.0)).min(TERMINAL_SCALE);
         let pixmap = render_layer(&standing, scale, fonts).pixmap;
-        pictures.push((at, NativeElement { rect, content: NativeContent::Picture { src: None, alt: TERMINAL_ALT.to_string(), pixmap } }));
+        pictures.push((at, NativeElement { rect, content: NativeContent::Picture { src: None, alt: if spec.terminal.as_ref().is_some_and(|on| on.src.is_empty()) { LIVE_TERMINAL_ALT } else { TERMINAL_ALT }.to_string(), pixmap } }));
     }
     pictures
 }

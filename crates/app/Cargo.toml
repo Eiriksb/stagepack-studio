@@ -8,6 +8,10 @@ license.workspace = true
 name = "stagepack-studio"
 path = "src/main.rs"
 
+[features]
+# Lets the tests start a live terminal session without the owner's yes, and say yes for themselves.
+test-hooks = []
+
 [dependencies]
 base64 = "=0.22.1"
 # For the local time zone. Already built for the kit, so it adds nothing.
@@ -29,13 +33,19 @@ slides-pptx = { path = "../pptx" }
 slides-video = { path = "../video" }
 # Why a terminal recording can't be read, said as its still says it.
 slides-terminal = { path = "../terminal" }
+# What the app and the live terminal's helper say to each other; with no pseudo-terminal in it.
+slides-terminal-helper = { path = "../terminal-helper", default-features = false }
 toolkit = { path = "../toolkit" }
 unicode-segmentation = "=1.13.3"
+# Which characters hide in a command the owner is asked to say yes to.
+unicode-properties = { version = "=0.1.3", default-features = false, features = ["general-category"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
+# The tests of the live terminal start sessions themselves.
+stagepack-studio = { path = ".", features = ["test-hooks"] }
 gpui-kit = { version = "=0.9.0", features = ["test-support"] }
 # The tests make their own videos.
 slides-video = { path = "../video", features = ["make"] }

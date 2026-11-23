@@ -2,15 +2,16 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::*;
-use slides_engine::{Layer, ModelLayer, ModelOn, Rect, TerminalLayer, TerminalOn, VideoLayer, VideoOn, to_bgra_frame};
+use slides_engine::{FontsSeed, Layer, ModelLayer, ModelOn, Rect, TerminalLayer, TerminalOn, VideoLayer, VideoOn, to_bgra_frame};
 use slides_model::{CantDraw, View};
 
 use crate::document::LargeOpen;
+use crate::live_terminal::{GIVE_BACK_HINT, Look as LiveLook, PROGRAM_ENDED, Session};
 use crate::model_view::{self, Aim, Turner};
 use crate::present::{LayerLook, SlideLook};
 use crate::replay::{Aim as ReplayAim, Replay, Source as ReplaySource};
@@ -18,6 +19,17 @@ use crate::video_player::{Placed, Player, Shown, Turning, discard, open_and_play
 
 /// The width of a 16:9 slide, in slide units.
 pub use slides_engine::SLIDE_WIDTH;
+
+/// The id of the small words at the foot of a live terminal whose program ended.
+pub const LIVE_ENDED_ID: &str = "live-ended";
+/// The id of the small words at the foot of a live terminal that has the keys.
+pub const LIVE_HINT_ID: &str = "live-hint";
+
+/// How many frames are drawn after a terminal's program ended, for the last pictures of its screen to come.
+const LAST_PICTURES_WAIT: u8 = 20;
+
+/// How wide the frame is that shows which live terminal has the keys, in the window's pixels.
+pub const KEYS_FRAME_WIDTH: f32 = 3.0;
 
 /// How far the slide can grow or shrink before its layers are drawn again. Below this they
 /// are stretched to fit, so a resize doesn't draw the slide again for every pixel.
@@ -55,7 +67,34 @@ struct Sprite {
 /// A layer to paint, how far below its place it is, whether it's painted itself, the pictures of
 /// videos and models over it, each with where its layer is now, and the plain panel of a
 /// recording started over it that has no picture yet, with its box and how far it's turned.
-type RunSprite = (Sprite, f32, bool, Vec<(Shown, Rect)>, Option<(Rect, f32)>);
+type RunSprite = (Sprite, f32, bool, Vec<(Shown, Rect)>, Option<(Rect, f32)>, Option<(Rect, f32)>);
+
+/// A live terminal over a layer of the slide: where it is, whether it has the keys, and the
+/// picture of its screen last taken. The session isn't kept alive by this.
+struct LiveOver {
+    layer: usize,
+    session: Weak<Session>,
+    rect: Rect,
+    rotate: f32,
+    keys: bool,
+    /// Whether the picture is another window's: this only shows the newest one drawn, and asks
+    /// for none of its own, as the presenter's view does of what the audience's window draws.
+    follows: bool,
+    shown: Option<Shown>,
+    /// How many frames were drawn since its program ended: its last pictures are still coming.
+    after_over: u8,
+}
+
+/// A live terminal to lay over its layer: see [`SlideCanvas::place_live`].
+pub struct LivePlace {
+    pub layer: usize,
+    pub session: Weak<Session>,
+    pub rect: Rect,
+    pub rotate: f32,
+    pub keys: bool,
+    /// Whether to show only the pictures another window's canvas has the session draw.
+    pub follows: bool,
+}
 
 /// What shows of a terminal recording's layer.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -130,6 +169,9 @@ pub struct SlideCanvas {
     replays_released: Rc<Cell<usize>>,
     /// When the recordings' counts were last written out, and what they were then.
     replays_counted: Option<(std::time::Instant, usize, usize)>,
+    /// The live terminals laid over their layers, and the fonts they're drawn with.
+    live: Vec<LiveOver>,
+    live_fonts: Option<FontsSeed>,
 }
 
 /// Set, to anything, to have a window playing a video write how many of its pictures were
@@ -906,6 +948,101 @@ impl SlideCanvas {
         cx.notify();
     }
 
+    /// Lays `terminals`, live ones, over their layers, in place of those laid before, drawn with
+    /// `fonts`. A terminal laid again keeps the picture it shows until a newer one is drawn.
+    pub fn place_live(&mut self, terminals: Vec<LivePlace>, fonts: FontsSeed, cx: &mut Context<Self>) {
+        let before = self.live.len();
+        let mut kept: Vec<LiveOver> = Vec::new();
+        let mut old = std::mem::take(&mut self.live);
+        let mut changed = false;
+        for terminal in terminals {
+            let at = old.iter().position(|over| over.layer == terminal.layer && Weak::ptr_eq(&over.session, &terminal.session));
+            let shown = match at {
+                Some(at) => old.remove(at).shown,
+                None => None,
+            };
+            changed |= at.is_none() || shown.is_none();
+            kept.push(LiveOver { layer: terminal.layer, session: terminal.session, rect: terminal.rect, rotate: terminal.rotate, keys: terminal.keys, follows: terminal.follows, shown, after_over: 0 });
+        }
+        for over in old {
+            self.retired_replays.extend(over.shown.map(|shown| shown.image));
+            changed = true;
+        }
+        self.live = kept;
+        self.live_fonts = Some(fonts);
+        if changed || before != self.live.len() {
+            cx.notify();
+        }
+    }
+
+    /// Takes the live terminals off their layers, each showing its still again.
+    pub fn clear_live(&mut self, cx: &mut Context<Self>) {
+        if self.live.is_empty() {
+            return;
+        }
+        for over in std::mem::take(&mut self.live) {
+            self.retired_replays.extend(over.shown.map(|shown| shown.image));
+        }
+        cx.notify();
+    }
+
+    /// The layer of the live terminal that has the keys here, if one does: the one drawn with its
+    /// frame.
+    #[doc(hidden)]
+    pub fn live_keys_on(&self) -> Option<usize> {
+        self.live.iter().find(|over| over.keys).map(|over| over.layer)
+    }
+
+    /// The layers a live terminal lies over here.
+    #[doc(hidden)]
+    pub fn live_layers(&self) -> Vec<usize> {
+        self.live.iter().map(|over| over.layer).collect()
+    }
+
+    /// The picture each live terminal shows now, in the order they were laid.
+    #[doc(hidden)]
+    pub fn live_pictures(&self) -> Vec<Option<Arc<RenderImage>>> {
+        self.live.iter().map(|over| over.shown.as_ref().map(|shown| shown.image.clone())).collect()
+    }
+
+    /// Where each live terminal is on the slide, whether its program has ended, and whether it has the
+    /// keys, in order.
+    pub(crate) fn live_boxes(&self) -> Vec<(Rect, bool, bool)> {
+        self.live
+            .iter()
+            .map(|over| (over.rect, over.session.upgrade().is_some_and(|session| session.state().is_over()), over.keys))
+            .collect()
+    }
+
+    /// Takes the newest picture of each live terminal, without waiting, telling its session where
+    /// and at what scale to draw. Asks the window for another frame while any program runs.
+    fn advance_live(&mut self, window: &mut Window) {
+        let (Some(scale), Some(fonts)) = (self.scale, self.live_fonts.clone()) else { return };
+        let mut wanted = false;
+        for over in &mut self.live {
+            let Some(session) = over.session.upgrade() else { continue };
+            if !over.follows {
+                session.set_look(LiveLook { rect: over.rect, rotate: over.rotate, scale, fonts: fonts.clone() });
+            }
+            if let Some(shown) = session.latest_shown()
+                && over.shown.as_ref().is_none_or(|had| !Arc::ptr_eq(&had.image, &shown.image))
+            {
+                self.replays_made += 1;
+                self.retired_replays.extend(over.shown.replace(shown).map(|had| had.image));
+            }
+            if session.state().is_over() {
+                over.after_over = over.after_over.saturating_add(1);
+                wanted |= over.after_over < LAST_PICTURES_WAIT;
+            } else {
+                over.after_over = 0;
+                wanted = true;
+            }
+        }
+        if wanted {
+            window.request_animation_frame();
+        }
+    }
+
     /// Takes the newest pictures of the recordings playing, without waiting for any, and asks
     /// the window for another frame while any has a picture to come.
     fn advance_recordings(&mut self, window: &mut Window) {
@@ -991,13 +1128,20 @@ impl SlideCanvas {
                 .filter(|replay| replay.layer == index)
                 .filter_map(|replay| Some((replay.shown()?.clone(), replay.on.rect)))
                 .collect();
+            let live: Vec<(Shown, Rect)> = self
+                .live
+                .iter()
+                .filter(|over| over.layer == index)
+                .filter_map(|over| Some((over.shown.clone()?, over.rect)))
+                .collect();
+            let frame = self.live.iter().find(|over| over.layer == index && over.keys).map(|over| (over.rect, over.rotate));
             // A recording started shows its plain panel until its first picture, never its still,
             // its last screen, which would give away what's to come.
             let panel = self.recording_panel(index);
             // A model drawn live, or a recording played, shows in place of its still, which would
             // show through around it.
-            let still = model.is_empty() && replay.is_empty() && panel.is_none();
-            let sprite = (sprite.clone(), look.offset_y, still, over.into_iter().chain(model).chain(replay).collect(), panel);
+            let still = model.is_empty() && replay.is_empty() && live.is_empty() && panel.is_none();
+            let sprite = (sprite.clone(), look.offset_y, still, over.into_iter().chain(model).chain(replay).chain(live).collect(), panel, frame);
             match runs.last_mut() {
                 Some(run) if run.opacity == look.opacity => run.sprites.push(sprite),
                 _ => runs.push(Run {
@@ -1040,6 +1184,7 @@ fn paint_sprites(
     area: Bounds<Pixels>,
     drawn_at: Option<f32>,
     offset_x: f32,
+    frame_color: Hsla,
     window: &mut Window,
 ) {
     let scale_factor = window.scale_factor();
@@ -1050,7 +1195,7 @@ fn paint_sprites(
     let to_window = drawn_at.map_or(1.0, |drawn_at| scale / drawn_at) / scale_factor;
     let width = f32::from(slide.size.width);
     let unit = width / SLIDE_WIDTH;
-    for (Sprite { layer, image }, offset_y, painted, over, panel) in sprites {
+    for (Sprite { layer, image }, offset_y, painted, over, panel, frame) in sprites {
         let place = Bounds {
             origin: slide.origin
                 + point(
@@ -1114,6 +1259,21 @@ fn paint_sprites(
                 .paint_image(slide, place, Corners::default(), shown.image, 0, false)
                 .ok();
         }
+        // The frame of the terminal that has the keys, 3 pixels wide, turned with its box.
+        if let Some((rect, rotate)) = frame {
+            let (middle_x, middle_y) = (rect.x + rect.w / 2., rect.y + rect.h / 2.);
+            let (sin, cos) = rotate.to_radians().sin_cos();
+            let corners = [(rect.x, rect.y), (rect.x + rect.w, rect.y), (rect.x + rect.w, rect.y + rect.h), (rect.x, rect.y + rect.h)].map(|(x, y)| {
+                let (dx, dy) = (x - middle_x, y - middle_y);
+                let (x, y) = (middle_x + dx * cos - dy * sin, middle_y + dx * sin + dy * cos);
+                slide.origin + point(px(x * unit + offset_x * width), px((y + offset_y) * unit))
+            });
+            let mut path = PathBuilder::stroke(px(KEYS_FRAME_WIDTH));
+            path.add_polygon(&corners, true);
+            if let Ok(path) = path.build() {
+                window.paint_path(path, frame_color);
+            }
+        }
     }
 }
 
@@ -1122,6 +1282,7 @@ impl Render for SlideCanvas {
         self.advance_videos(window, cx);
         self.advance_models(window, cx);
         self.advance_recordings(window);
+        self.advance_live(window);
         let retired = std::mem::take(&mut self.retired);
         let frames = std::mem::take(&mut self.retired_frames);
         let released = self.frames_released.clone();
@@ -1163,6 +1324,7 @@ impl Render for SlideCanvas {
         .size_full();
 
         let drawn_at = self.scale;
+        let frame_color = cx.theme().primary;
         let SlideLook { opacity, offset_x } = self.slide_look;
         // An image takes its opacity from the element around it, and that's what the runs are for.
         let runs = self.runs().into_iter().map(|run| {
@@ -1170,18 +1332,75 @@ impl Render for SlideCanvas {
                 canvas(
                     |_, _, _| {},
                     move |area, _, window, _| {
-                        paint_sprites(run.sprites, area, drawn_at, offset_x, window)
+                        paint_sprites(run.sprites, area, drawn_at, offset_x, frame_color, window)
                     },
                 )
                 .size_full(),
             )
         });
+        // A terminal whose program ended says so, small, at its foot.
+        let ended: Vec<AnyElement> = self
+            .placed
+            .map(|(slide, area)| {
+                let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
+                let across = slide.origin - area.origin;
+                self.live_boxes()
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, (_, over, _))| *over)
+                    .map(|(at, (rect, _, _))| {
+                        div()
+                            .id((LIVE_ENDED_ID, at))
+                            .test_support()
+                            .aria_label(PROGRAM_ENDED)
+                            .absolute()
+                            .left(across.x + px(rect.x * unit))
+                            .top(across.y + px((rect.y + rect.h) * unit - 16.))
+                            .w(px(rect.w * unit))
+                            .text_xs()
+                            .text_color(white())
+                            .child(PROGRAM_ENDED)
+                            .into_any_element()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // A terminal that has the keys says, small, how to give them back.
+        let hints: Vec<AnyElement> = self
+            .placed
+            .map(|(slide, area)| {
+                let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
+                let across = slide.origin - area.origin;
+                self.live_boxes()
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, (_, over, keys))| *keys && !*over)
+                    .map(|(at, (rect, _, _))| {
+                        div()
+                            .id((LIVE_HINT_ID, at))
+                            .test_support()
+                            .aria_label(GIVE_BACK_HINT)
+                            .absolute()
+                            .left(across.x + px(rect.x * unit))
+                            .top(across.y + px((rect.y + rect.h) * unit - 16.))
+                            .px_1()
+                            .bg(black().opacity(0.6))
+                            .text_xs()
+                            .text_color(white())
+                            .child(GIVE_BACK_HINT)
+                            .into_any_element()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         div()
             .absolute()
             .size_full()
             .opacity(opacity)
             .child(housekeeping)
             .children(runs)
+            .children(ended)
+            .children(hints)
     }
 }
 

@@ -3,7 +3,7 @@
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use gpui_kit::component::{ActiveTheme as _, TitleBar, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, TitleBar, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use slides_engine::{Enter, LayerTiming, ModelLayer, Moment, TerminalLayer, Transition, VideoLayer};
@@ -13,10 +13,11 @@ use crate::present::{
     ENTER_SECONDS, MOMENTS_PER_SECOND, Moved, Place, ScreenInfo, Session, TRANSITION_SECONDS,
     WindowPlan, choose_windows, clock_text, layer_look, moment_time, slide_looks,
 };
+use crate::live_terminal::{LiveId, LiveTerminals, gives_keys_back};
 use crate::model_view::{Aim, aim_at, inside_turned};
 use crate::replay::{Aim as ReplayAim, MOST_PLAYING, Replay, Source as ReplaySource};
-use crate::slide_canvas::{ModelLetGo, ScaleChanged, SlideCanvas, VideoLetGo, VideoOpened};
-use crate::workspace_view::APP_ID;
+use crate::slide_canvas::{LivePlace, ModelLetGo, ScaleChanged, SlideCanvas, VideoLetGo, VideoOpened};
+use crate::workspace_view::{APP_ID, LiveStep, WorkspaceView};
 
 pub const AUDIENCE_ID: &str = "audience";
 pub const CURRENT_ID: &str = "current-slide";
@@ -26,6 +27,13 @@ pub const TIMER_ID: &str = "timer";
 pub const COUNTER_ID: &str = "counter";
 
 const KEY_CONTEXT: &str = "Show";
+
+/// The key context of a show's window while a live terminal has the keys: none of the show's keys
+/// apply, so every key goes to the program.
+pub const KEYS_HELD_CONTEXT: &str = "ShowTerminal";
+
+/// The window whose talk a show belongs to, and the live terminals it shares.
+pub type Owner = (WeakEntity<WorkspaceView>, LiveTerminals);
 
 const END_OF_THE_TALK: &str = "End of the talk";
 
@@ -100,12 +108,22 @@ pub struct Presentation {
     audience: Option<ShowWindow<AudienceView>>,
     presenter: Option<ShowWindow<PresenterView>>,
     ended: bool,
+    /// The window of the talk, if it's one that runs live terminals, and what it runs.
+    owner: Option<Owner>,
+    /// Whether a question about running a command is on its way to a window.
+    ask_pending: bool,
     _talk_changed: Subscription,
     _window_closed: Subscription,
+    _owner_changed: Option<Subscription>,
 }
 
 impl Presentation {
-    fn new(document: Entity<Document>, cx: &mut Context<Self>) -> Self {
+    fn new(document: Entity<Document>, owner: Option<Owner>, cx: &mut Context<Self>) -> Self {
+        // What the window of the talk does about a terminal, its yes among it, shows here.
+        let owner_changed = owner
+            .as_ref()
+            .and_then(|(workspace, _)| workspace.upgrade())
+            .map(|workspace| cx.observe(&workspace, |_, _, cx| cx.notify()));
         let talk_changed = cx.observe(&document, |this, _, cx| this.talk_changed(cx));
         let this = cx.entity().downgrade();
         let window_closed = cx.on_window_closed(move |cx, closed| {
@@ -122,8 +140,11 @@ impl Presentation {
             audience: None,
             presenter: None,
             ended: false,
+            owner,
+            ask_pending: false,
             _talk_changed: talk_changed,
             _window_closed: window_closed,
+            _owner_changed: owner_changed,
         }
     }
 
@@ -135,6 +156,50 @@ impl Presentation {
     /// The presenter's window and what's in it, if the show has one and it's open.
     pub fn presenter(&self) -> Option<(AnyWindowHandle, Entity<PresenterView>)> {
         self.presenter.as_ref()?.get()
+    }
+
+    /// Whether a live terminal has the keys: then every key goes to its program.
+    fn keys_held(&self) -> bool {
+        self.owner.as_ref().is_some_and(|(_, live)| live.keys().is_some())
+    }
+
+    /// A key while a live terminal may have the keys: if one has them, the key goes to it, except
+    /// the one that gives them back. Says whether the key was dealt with.
+    fn key_for_live(&mut self, key: &Keystroke, cx: &mut Context<Self>) -> bool {
+        let Some((_, live)) = self.owner.clone() else { return false };
+        if live.keys().is_none() {
+            return false;
+        }
+        if gives_keys_back(key) {
+            live.release_keys();
+            cx.notify();
+            return true;
+        }
+        live.send(key)
+    }
+
+    /// Asks, in the window the presenter looks at, whether `command` may run, unless that's
+    /// already on its way.
+    fn ask_for_live(&mut self, command: Vec<String>, cx: &mut Context<Self>) {
+        if self.ask_pending {
+            return;
+        }
+        let Some((workspace, _)) = self.owner.clone() else { return };
+        let Some(window) = self.presenter.as_ref().map(|shown| shown.window).or(self.audience.as_ref().map(|shown| shown.window)) else { return };
+        self.ask_pending = true;
+        // Nothing typed meanwhile reaches a program.
+        if let Some((_, live)) = &self.owner {
+            live.release_keys();
+        }
+        let show = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            window
+                .update(cx, |_, window, cx| {
+                    workspace.update(cx, |workspace, cx| workspace.ask_to_run(command, window, cx)).ok();
+                })
+                .ok();
+            show.update(cx, |show, _| show.ask_pending = false).ok();
+        });
     }
 
     /// Whether the show is over, or never got a window to run in.
@@ -214,6 +279,13 @@ impl Presentation {
         if std::mem::replace(&mut self.ended, true) {
             return;
         }
+        // What was started ends with the show.
+        if let Some((workspace, live)) = self.owner.clone() {
+            live.set_show_on(false);
+            if workspace.update(cx, |workspace, cx| workspace.end_live(cx)).is_err() {
+                live.clone().end_all();
+            }
+        }
         let windows = self.windows();
         // Not yet, as the key that ended the show may still be busy in one of them.
         cx.defer(move |cx| {
@@ -238,6 +310,9 @@ impl Presentation {
         presenter: Option<ShowWindow<PresenterView>>,
     ) {
         self.ended = audience.is_none() && presenter.is_none();
+        if let Some((_, live)) = &self.owner {
+            live.set_show_on(!self.ended);
+        }
         self.audience = audience;
         self.presenter = presenter;
     }
@@ -393,19 +468,68 @@ fn redraw_at_next_moment<V: 'static>(
     }));
 }
 
+/// Whether a question is open in one of the show's `windows`, `here` being one of them. While one
+/// is, the show's keys and clicks don't move the show.
+fn dialog_in(windows: [Option<AnyWindowHandle>; 2], here: &mut Window, cx: &mut App) -> bool {
+    windows.into_iter().flatten().any(|handle| {
+        if handle == here.window_handle() {
+            here.has_active_dialog(cx)
+        } else {
+            handle.update(cx, |_, window, cx| window.has_active_dialog(cx)).unwrap_or(false)
+        }
+    })
+}
+
 /// The root of a show's window, with the show's keys, and a title bar if `title` says what
 /// to put on one. A full-screen window has none.
 fn window_root(
     show: &Entity<Presentation>,
     focus_handle: &FocusHandle,
     title: Option<&'static str>,
+    keys_held: bool,
 ) -> Div {
-    let (next, previous, end) = (show.clone(), show.clone(), show.clone());
+    let (next, previous, end, keyed) = (show.clone(), show.clone(), show.clone(), show.clone());
     v_flex()
-        .key_context(KEY_CONTEXT)
+        .key_context(if keys_held { KEYS_HELD_CONTEXT } else { KEY_CONTEXT })
         .track_focus(focus_handle)
-        .on_action(move |_: &ShowNext, _, cx| next.update(cx, |show, cx| show.next(cx)))
-        .on_action(move |_: &ShowPrevious, _, cx| previous.update(cx, |show, cx| show.previous(cx)))
+        // While a live terminal has the keys, none of the show's own bindings apply: this has every
+        // key, the arrows and Escape included, but the one that gives them back.
+        .on_key_down(move |event, window, cx| {
+            // While a question is open no key goes to a program.
+            let windows = keyed.read(cx).windows();
+            if dialog_in(windows, window, cx) {
+                return;
+            }
+            if keyed.update(cx, |show, cx| show.key_for_live(&event.keystroke, cx)) {
+                cx.stop_propagation();
+                return;
+            }
+            // The program ended since this window was drawn: the key is the show's, as it would be.
+            if keys_held && !keyed.read(cx).keys_held() && !event.keystroke.modifiers.modified() {
+                let action: Option<Box<dyn Action>> = match event.keystroke.key.as_str() {
+                    "right" | "pagedown" | "space" | "enter" => Some(Box::new(ShowNext)),
+                    "left" | "pageup" | "backspace" => Some(Box::new(ShowPrevious)),
+                    "escape" => Some(Box::new(EndShow)),
+                    _ => None,
+                };
+                if let Some(action) = action {
+                    window.dispatch_action(action, cx);
+                    cx.stop_propagation();
+                }
+            }
+        })
+        .on_action(move |_: &ShowNext, window, cx| {
+            let windows = next.read(cx).windows();
+            if !dialog_in(windows, window, cx) {
+                next.update(cx, |show, cx| show.next(cx))
+            }
+        })
+        .on_action(move |_: &ShowPrevious, window, cx| {
+            let windows = previous.read(cx).windows();
+            if !dialog_in(windows, window, cx) {
+                previous.update(cx, |show, cx| show.previous(cx))
+            }
+        })
         .on_action(move |_: &EndShow, _, cx| end.update(cx, |show, cx| show.end(cx)))
         .size_full()
         .when_some(title, |this, title| {
@@ -448,6 +572,13 @@ pub struct AudienceView {
     /// The recordings of the slide the next click brings, readied at their start, each with the
     /// slide: the slide shows with their first pictures already drawn.
     ready: Vec<(usize, Replay)>,
+    /// The terminals of the show's place that run a command, and the slide they're on.
+    live_on: Vec<TerminalLayer>,
+    live_slide: usize,
+    /// Whether what they may do has been looked at since the place or the window's say changed.
+    live_checked: bool,
+    /// Whether the press last let go of was on a terminal, and so is no click of the show's.
+    swallow_click: bool,
     rehearsing: bool,
     focus_handle: FocusHandle,
     _watching: [Subscription; 9],
@@ -499,6 +630,10 @@ impl AudienceView {
             replayed_at: None,
             replayed_back: false,
             ready: Vec::new(),
+            live_on: Vec::new(),
+            live_slide: 0,
+            live_checked: false,
+            swallow_click: false,
             rehearsing,
             focus_handle,
             _watching: watching,
@@ -620,6 +755,13 @@ impl AudienceView {
             let slide = document.shown_slide(place.slide);
             (document.terminals_at(slide, moment), document.terminal_pending(slide), slide)
         });
+        self.live_on = terminals
+            .iter()
+            .filter(|terminal| terminal.on.run.is_some() && terminal.source.is_some() && place.step >= terminal.click.unwrap_or(0))
+            .cloned()
+            .collect();
+        self.live_slide = slide;
+        self.live_checked = false;
         let was = self.replayed_at.replace(place);
         let afresh = was.is_none_or(|was| was.slide != place.slide);
         // Drawn again at the same place, it was come to as it was.
@@ -645,6 +787,10 @@ impl AudienceView {
         self.current.update(cx, |canvas, cx| canvas.place_recordings(&terminals, cx));
         for terminal in &terminals {
             let Some(source) = terminal.source.clone() else { continue };
+            // One that only runs a command has no recording to play.
+            if terminal.on.src.is_empty() {
+                continue;
+            }
             let click = terminal.click.unwrap_or(0);
             if place.step < click {
                 // Back before its click, it stops.
@@ -685,6 +831,67 @@ impl AudienceView {
         }
     }
 
+    /// Has the window of the talk start the terminals of the slide shown that run a command, those
+    /// with a yes, and asks about those without one. Looks once for each place and each change of
+    /// what the window says.
+    fn drive_live(&mut self, cx: &mut Context<Self>) {
+        if self.live_checked {
+            return;
+        }
+        self.live_checked = true;
+        let Some((workspace, _)) = self.show.read(cx).owner.clone() else { return };
+        let (slide, terminals) = (self.live_slide, self.live_on.clone());
+        for terminal in terminals {
+            let step = workspace.update(cx, |workspace, cx| workspace.try_start_live(slide, &terminal, cx));
+            if let Ok(LiveStep::Ask(command)) = step {
+                self.show.update(cx, |show, cx| show.ask_for_live(command, cx));
+            }
+        }
+    }
+
+    /// Lays the running terminals of the slide shown over their layers, those that run, and takes
+    /// them off when none does.
+    fn apply_live(&mut self, cx: &mut Context<Self>) {
+        let Some((_, live)) = self.show.read(cx).owner.clone() else { return };
+        // Keys held by a terminal this slide doesn't show are given back.
+        if let Some(held) = live.keys()
+            && !self.live_on.iter().any(|terminal| terminal.source.clone().zip(terminal.on.run.clone()).is_some_and(|(source, run)| LiveId::new(source, run) == held))
+        {
+            live.release_keys();
+            self.show.update(cx, |_, cx| cx.notify());
+        }
+        let keys = live.keys();
+        let places: Vec<LivePlace> = self
+            .live_on
+            .iter()
+            .filter_map(|terminal| {
+                let id = LiveId::new(terminal.source.clone()?, terminal.on.run.clone()?);
+                Some(LivePlace {
+                    layer: terminal.layer,
+                    session: live.weak(&id)?,
+                    rect: terminal.on.rect,
+                    rotate: terminal.on.rotate,
+                    keys: keys.as_ref() == Some(&id),
+                    follows: false,
+                })
+            })
+            .collect();
+        if places.is_empty() {
+            self.current.update(cx, |canvas, cx| canvas.clear_live(cx));
+            return;
+        }
+        let document = self.show.read(cx).document.clone();
+        let fonts = document.update(cx, |document, _| document.fonts_seed());
+        self.current.update(cx, |canvas, cx| canvas.place_live(places, fonts, cx));
+    }
+
+    /// A press on the slide: on a running terminal it gives that terminal the keys, and with the keys
+    /// given elsewhere it takes them back; either way it's no click of the show's. Says whether it
+    /// was one.
+    fn press_for_keys(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        press_for_keys(&self.show, &self.current, &self.live_on, position, cx)
+    }
+
     /// Lays out the slide the next click brings, if it's another, at the scale the audience sees
     /// it at, so that what it shows is ready by the time it's there: a busy recording's screen,
     /// drawn aside, has been, rather than its plain panel showing first. Its recordings there from
@@ -711,6 +918,9 @@ impl AudienceView {
                 break;
             }
             let Some(source) = terminal.source.clone() else { continue };
+            if terminal.on.src.is_empty() {
+                continue;
+            }
             let readied = self.ready.iter().any(|(_, replay)| replay.layer == terminal.layer && replay.on.src == terminal.on.src);
             if readied || terminal.click.unwrap_or(0) > upcoming.step {
                 continue;
@@ -772,7 +982,12 @@ impl AudienceView {
 
     /// A press on a model may begin turning it by hand: once it moves. A plain click on it is a
     /// click of the show's, and draws nothing.
-    fn press(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+    fn press(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.swallow_click = self.press_for_keys(event.position, cx);
+        if self.swallow_click {
+            // The keys are asked for by this window, which has them from now on.
+            self.focus_handle.focus(window, cx);
+        }
         self.turned = false;
         self.turn_drag = self.model_at(event.position, cx).map(|model| (model, event.position, false));
     }
@@ -868,6 +1083,8 @@ impl AudienceView {
     fn animate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let now = cx.background_executor().now();
         self.show.update(cx, |show, _| show.first_frame_drawn(now));
+        self.drive_live(cx);
+        self.apply_live(cx);
         if self.moves
             && let Some(timings) =
                 catch_up(&self.show, &self.current, &mut self.drawn_time, now, cx)
@@ -903,6 +1120,7 @@ impl AudienceView {
                 canvas.stop_videos(cx);
                 canvas.stop_models(cx);
                 canvas.stop_recordings(cx);
+                canvas.clear_live(cx);
             }
         });
         if arrival.is_some() || revealing.is_some() {
@@ -919,7 +1137,7 @@ impl Render for AudienceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.animate(window, cx);
         let title = self.rehearsing.then_some("Audience");
-        window_root(&self.show, &self.focus_handle, title)
+        window_root(&self.show, &self.focus_handle, title, self.show.read(cx).keys_held())
             .bg(black())
             .child(
                 div()
@@ -930,12 +1148,17 @@ impl Render for AudienceView {
                     .min_h_0()
                     .w_full()
                     // A press on a model turns it, the wheel zooms it, and neither is a click.
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, cx| this.press(event, cx)))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| this.press(event, window, cx)))
                     .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| this.drag(event, cx)))
                     .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, cx| this.let_go(cx)))
                     .on_scroll(cx.listener(|this, event: &ScrollEvent, window, cx| this.wheel(event, window, cx)))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if std::mem::take(&mut this.turned) {
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if std::mem::take(&mut this.turned) || std::mem::take(&mut this.swallow_click) {
+                            return;
+                        }
+                        // While a question is open, a click on the slide is not the show's.
+                        let windows = this.show.read(cx).windows();
+                        if dialog_in(windows, window, cx) {
                             return;
                         }
                         this.show.update(cx, |show, cx| show.next(cx));
@@ -944,6 +1167,45 @@ impl Render for AudienceView {
                     .child(self.current.clone()),
             )
     }
+}
+
+/// A press at `position` on the slide drawn on `canvas`, whose terminals that run are `terminals`: on a
+/// running one it gives that terminal the keys, and with the keys given elsewhere it takes them back.
+/// Says whether it was one.
+fn press_for_keys(show: &Entity<Presentation>, canvas: &Entity<SlideCanvas>, terminals: &[TerminalLayer], position: Point<Pixels>, cx: &mut App) -> bool {
+    let Some((_, live)) = show.read(cx).owner.clone() else { return false };
+    let Some(slide) = canvas.read(cx).slide_bounds() else { return false };
+    let unit = f32::from(slide.size.width) / slides_engine::SLIDE_WIDTH;
+    if unit <= 0.0 {
+        return false;
+    }
+    let at = (f32::from(position.x - slide.origin.x) / unit, f32::from(position.y - slide.origin.y) / unit);
+    let hit = terminals.iter().rev().find_map(|terminal| {
+        let id = LiveId::new(terminal.source.clone()?, terminal.on.run.clone()?);
+        (live.is_running(&id) && inside_turned(terminal.on.rect, terminal.on.rotate, at)).then_some(id)
+    });
+    let handled = match hit {
+        Some(id) => live.give_keys(&id),
+        None => live.release_keys(),
+    };
+    if handled {
+        show.update(cx, |_, cx| cx.notify());
+    }
+    handled
+}
+
+/// The terminals of `slide` at `moment` that run a command and are there at the place's step.
+fn live_terminals_at(document: &Entity<Document>, place: Place, time: f32, cx: &mut App) -> (Vec<TerminalLayer>, usize) {
+    let moment = Moment { step: place.step, time };
+    document.update(cx, |document, _| {
+        let slide = document.shown_slide(place.slide);
+        let on = document
+            .terminals_at(slide, moment)
+            .into_iter()
+            .filter(|terminal| terminal.on.run.is_some() && terminal.source.is_some() && place.step >= terminal.click.unwrap_or(0))
+            .collect();
+        (on, slide)
+    })
 }
 
 /// What the presenter sees: the slide as it stands, what's next, the notes and the time.
@@ -961,6 +1223,9 @@ pub struct PresenterView {
     /// The wait for the next moment of a slide that moves.
     next_moment: Option<Task<()>>,
     at_the_end: bool,
+    /// The terminals of the current slide that run a command: they show what the audience's window
+    /// draws of them, and a click on one takes the keys, as there.
+    live_on: Vec<TerminalLayer>,
     rehearsing: bool,
     focus_handle: FocusHandle,
     _watching: [Subscription; 3],
@@ -1006,6 +1271,7 @@ impl PresenterView {
             drawn_time: 0.0,
             next_moment: None,
             at_the_end: false,
+            live_on: Vec::new(),
             rehearsing,
             focus_handle,
             _watching: watching,
@@ -1048,6 +1314,7 @@ impl PresenterView {
             self.notes_scroll.set_offset(Point::default());
         }
         show_on(&self.current, &document, place, time, cx);
+        self.live_on = live_terminals_at(&document, place, time, cx).0;
         self.drawn_time = time;
         match upcoming {
             // What the next press brings, as it first looks.
@@ -1061,12 +1328,49 @@ impl PresenterView {
         cx.notify();
     }
 
+    /// Lays the running terminals of the current slide over their layers, to show the pictures the
+    /// audience's window has them draw, and takes them off when none runs.
+    fn apply_live(&mut self, cx: &mut Context<Self>) {
+        let Some((_, live)) = self.show.read(cx).owner.clone() else { return };
+        let keys = live.keys();
+        let places: Vec<LivePlace> = self
+            .live_on
+            .iter()
+            .filter_map(|terminal| {
+                let id = LiveId::new(terminal.source.clone()?, terminal.on.run.clone()?);
+                Some(LivePlace {
+                    layer: terminal.layer,
+                    session: live.weak(&id)?,
+                    rect: terminal.on.rect,
+                    rotate: terminal.on.rotate,
+                    keys: keys.as_ref() == Some(&id),
+                    follows: true,
+                })
+            })
+            .collect();
+        if places.is_empty() {
+            self.current.update(cx, |canvas, cx| canvas.clear_live(cx));
+            return;
+        }
+        let document = self.show.read(cx).document.clone();
+        let fonts = document.update(cx, |document, _| document.fonts_seed());
+        self.current.update(cx, |canvas, cx| canvas.place_live(places, fonts, cx));
+    }
+
+    /// A press on the slide: on a running terminal it takes the keys, as in the audience's window.
+    fn press(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if press_for_keys(&self.show, &self.current, &self.live_on, event.position, cx) {
+            self.focus_handle.focus(window, cx);
+        }
+    }
+
     /// Draws the slide on `current` again if it moves and its time has changed since, and
     /// comes back at its next moment while it moves.
     fn animate(&mut self, cx: &mut Context<Self>) {
         // A show seen only by the presenter starts the slide's time here.
         let now = cx.background_executor().now();
         self.show.update(cx, |show, _| show.first_frame_drawn(now));
+        self.apply_live(cx);
         if !self.moves {
             return;
         }
@@ -1118,6 +1422,7 @@ impl Render for PresenterView {
                     .min_h_0()
                     .w_full()
                     .bg(black())
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| this.press(event, window, cx)))
                     .child(self.current.clone()),
             )
             .child(
@@ -1160,7 +1465,7 @@ impl Render for PresenterView {
             .text_lg()
             .child(self.notes.clone());
 
-        window_root(&self.show, &self.focus_handle, title)
+        window_root(&self.show, &self.focus_handle, title, self.show.read(cx).keys_held())
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(
@@ -1282,10 +1587,22 @@ pub fn start_show(
     rehearsing: bool,
     cx: &mut App,
 ) -> Entity<Presentation> {
+    start_show_for(document, rehearsing, None, cx)
+}
+
+/// [`start_show`] for a talk open in a window, `owner`, which has the say over what a terminal
+/// on a slide runs, and shares the live terminals with the show. A show without one runs nothing:
+/// every terminal shows its recording or still.
+pub fn start_show_for(
+    document: Entity<Document>,
+    rehearsing: bool,
+    owner: Option<Owner>,
+    cx: &mut App,
+) -> Entity<Presentation> {
     let (audience_options, presenter_options) = plan_windows(rehearsing, cx);
     // A show of a talk no window shows makes its stills itself.
     crate::video_player::make_stills(&document, cx);
-    let show = cx.new(|cx| Presentation::new(document, cx));
+    let show = cx.new(|cx| Presentation::new(document, owner, cx));
     let audience = gpui_kit::open_window(audience_options, cx, |window, cx| {
         cx.new(|cx| AudienceView::new(show.clone(), rehearsing, window, cx))
     })

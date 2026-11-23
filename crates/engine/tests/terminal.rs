@@ -223,6 +223,7 @@ fn a_recording_that_cant_be_read_is_a_panel_saying_why() {
     // With no file, it says so.
     let mut deck = deck_of("<Terminal x=\"0\" w=\"640\" h=\"360\" />\n", &[]);
     let layer = terminal_layer(&mut deck, 0);
+    assert_eq!(TERMINAL_NO_FILE, "This terminal has no recording and no command to run.");
     assert_eq!(text_of(&layer), TERMINAL_NO_FILE);
     assert!(deck.notices(0).iter().any(|notice| notice == TERMINAL_NO_FILE));
     assert_eq!(deck.terminal_problem(0, layer.source.as_ref().unwrap()).as_deref(), Some(TERMINAL_NO_FILE));
@@ -916,7 +917,7 @@ fn a_busy_screen_dragged_at_a_new_scale_is_drawn_aside() {
 
 #[test]
 fn a_recording_still_being_shaped_is_the_same_recording() {
-    let on = TerminalOn { src: "assets/run.cast".to_string(), rect: Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }, rotate: 0.0, stops: 2, pending: true };
+    let on = TerminalOn { src: "assets/run.cast".to_string(), run: None, cols: 100, rows: 30, rect: Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }, rotate: 0.0, stops: 2, pending: true };
     assert_eq!(on, TerminalOn { pending: false, ..on.clone() });
 }
 
@@ -1143,4 +1144,112 @@ fn a_screen_of_letters_shaped_one_at_a_time_is_laid_out_aside() {
     println!("a screen of 3,990 Tamil letters each its own colour laid out where it's asked for in at most {slowest:?}");
     assert!(slowest < std::time::Duration::from_millis(8), "{slowest:?}");
     assert!(!deck.still_jobs().is_empty(), "shaped aside");
+}
+
+/// Files that say each one they're asked for, to see what a deck reads.
+struct Spy(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl TalkFiles for Spy {
+    fn read(&self, path: &str) -> Option<Vec<u8>> {
+        self.0.lock().unwrap().push(path.to_string());
+        None
+    }
+    fn stamp(&self, path: &str) -> Option<(u64, std::time::SystemTime)> {
+        self.0.lock().unwrap().push(path.to_string());
+        None
+    }
+}
+
+#[test]
+fn a_live_terminal_without_a_recording_shows_its_command() {
+    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut deck = Deck::open(Box::new(Spy(asked.clone())), Fonts::bundled_only(), "# One\n\n<Terminal run=\"bash -l\" x=\"0\" y=\"0\" w=\"640\" h=\"360\" />\n".to_string());
+    let layer = terminal_layer(&mut deck, 0);
+    let said = text_of(&layer);
+    assert_eq!(said, "Live terminal bash -l");
+    assert_eq!((layer.rect.w, layer.rect.h), (640.0, 360.0));
+    let on = layer.terminal.clone().unwrap();
+    assert_eq!((on.src.as_str(), on.run.as_deref(), on.cols, on.rows), ("", Some("bash -l"), 100, 30));
+    assert_eq!(deck.terminal_problem(0, layer.source.as_ref().unwrap()), None);
+    assert!(deck.notices(0).is_empty(), "{:?}", deck.notices(0));
+    // Both lines are in the monospaced font.
+    for item in layer.items.iter() {
+        if let DisplayItem::Text { text, .. } = item {
+            let glyph = text.buffer.layout_runs().next().unwrap().glyphs.first().unwrap();
+            let mut fonts = Fonts::bundled_only();
+            assert_eq!(fonts.system.db().face(glyph.font_id).unwrap().families[0].0, "JetBrains Mono");
+        }
+    }
+    // No size says its live screen is 100 by 30; sized, it is the box that says it.
+    let mut deck = Deck::open(Box::new(Spy(asked.clone())), Fonts::bundled_only(), "# One\n\n<Terminal run=\"bash\" cols=\"40\" rows=\"10\" x=\"0\" />\n".to_string());
+    let layer = terminal_layer(&mut deck, 0);
+    let (w, h) = terminal_size(40, 10);
+    assert_eq!((layer.rect.w, layer.rect.h), (w, h));
+    // A command too long for the line is cut to one, ending in an ellipsis.
+    let long = "x".repeat(300);
+    let mut deck = Deck::open(Box::new(Spy(asked.clone())), Fonts::bundled_only(), format!("# One\n\n<Terminal run=\"{long}\" x=\"0\" y=\"0\" w=\"400\" h=\"200\" />\n"));
+    let layer = terminal_layer(&mut deck, 0);
+    let cut = text_of(&layer);
+    assert!(cut.starts_with("Live terminal xx") && cut.ends_with('\u{2026}') && cut.len() < 100, "{cut}");
+    assert!(layer.items.iter().all(|item| match item {
+        DisplayItem::Text { text, x, .. } => *x >= 0.0 && x + text.width <= 400.0,
+        _ => true,
+    }));
+    // Nothing was read, or asked about, for any of them: a deck looks only for its own build.
+    deck.draw_jobs();
+    let asked = asked.lock().unwrap();
+    assert!(asked.iter().all(|path| path == "build/index.json"), "{asked:?}");
+}
+
+#[test]
+fn a_live_terminal_with_a_recording_shows_the_recording() {
+    let cast = make_test_cast(20, 4, &[(0.1, "o", "hello")]);
+    let files = [("assets/run.cast", cast)];
+    let mut alone = deck_of("<Terminal src=\"assets/run.cast\" x=\"0\" y=\"0\" w=\"640\" h=\"360\" />\n", &files);
+    let mut live = deck_of("<Terminal src=\"assets/run.cast\" run=\"bash\" x=\"0\" y=\"0\" w=\"640\" h=\"360\" />\n", &files);
+    let (alone, live) = (terminal_layer(&mut alone, 0), terminal_layer(&mut live, 0));
+    assert_eq!(text_of(&live), "hello");
+    assert_eq!(text_of(&alone), text_of(&live));
+    assert_eq!(fills(&alone), fills(&live));
+    assert_eq!((alone.rect.w, alone.rect.h), (live.rect.w, live.rect.h));
+    assert_eq!(live.terminal.as_ref().unwrap().run.as_deref(), Some("bash"));
+    assert_ne!(alone.terminal, live.terminal, "the command is part of what it is");
+}
+
+#[test]
+fn a_bad_live_terminal_says_why() {
+    let place = "x=\"0\" y=\"0\" w=\"640\" h=\"360\"";
+    let cast = make_test_cast(20, 4, &[]);
+    let bad = [
+        (format!("<Terminal {place} />"), "This terminal has no recording and no command to run."),
+        (format!("<Terminal run=\"\" {place} />"), "The command to run is empty."),
+        (format!("<Terminal run='say \"hi' {place} />"), "The command to run has a quote that isn't closed."),
+        (format!("<Terminal run=\"bash\" cols=\"0\" {place} />"), "A terminal can be 1 to 500 columns and 1 to 200 rows."),
+        (format!("<Terminal run=\"bash\" cols=\"501\" {place} />"), "A terminal can be 1 to 500 columns and 1 to 200 rows."),
+        (format!("<Terminal run=\"bash\" rows=\"201\" {place} />"), "A terminal can be 1 to 500 columns and 1 to 200 rows."),
+        (format!("<Terminal run=\"bash\" rows=\"many\" {place} />"), "A terminal can be 1 to 500 columns and 1 to 200 rows."),
+    ];
+    for (tag, why) in bad {
+        let mut deck = deck_of(&format!("{tag}\n"), &[("assets/run.cast", cast.clone())]);
+        let layer = terminal_layer(&mut deck, 0);
+        assert_eq!(text_of(&layer), why, "{tag}");
+        assert!(deck.notices(0).iter().any(|notice| notice == why), "{tag}: {:?}", deck.notices(0));
+        assert_eq!(deck.terminal_problem(0, layer.source.as_ref().unwrap()).as_deref(), Some(why), "{tag}");
+    }
+    // With a good recording, a bad command or size is a notice, and the recording shows and plays.
+    for (extra, why) in [("run=\"\"", "The command to run is empty."), ("run=\"bash\" rows=\"-1\"", "A terminal can be 1 to 500 columns and 1 to 200 rows."), ("rows=\"-1\"", "A terminal can be 1 to 500 columns and 1 to 200 rows.")] {
+        let mut deck = deck_of(&format!("<Terminal src=\"assets/run.cast\" {extra} {place} />\n"), &[("assets/run.cast", make_test_cast(20, 4, &[(0.1, "o", "hello")]))]);
+        let layer = terminal_layer(&mut deck, 0);
+        assert_eq!(text_of(&layer), "hello", "{extra}");
+        assert!(deck.notices(0).iter().any(|notice| notice == why), "{extra}: {:?}", deck.notices(0));
+        let source = layer.source.as_ref().unwrap();
+        assert_eq!(deck.terminal_problem(0, source), None, "{extra}: the recording can be shown");
+        assert_eq!(deck.terminal_run_problem(0, source).as_deref(), Some(why), "{extra}");
+    }
+    // The biggest and smallest screens are fine.
+    for sizes in ["cols=\"1\" rows=\"1\"", "cols=\"500\" rows=\"200\""] {
+        let mut deck = deck_of(&format!("<Terminal run=\"bash\" {sizes} {place} />\n"), &[]);
+        let layer = terminal_layer(&mut deck, 0);
+        assert_eq!(deck.terminal_problem(0, layer.source.as_ref().unwrap()), None, "{sizes}");
+    }
 }

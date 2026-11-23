@@ -151,6 +151,10 @@ pub struct Document {
     /// Where the slide the things are picked on is in the talk's text, which an area picked is
     /// followed through an edit by.
     selection_slide: Option<Range<usize>>,
+    /// Whether the changes made to the text are kept for whoever follows places in it, and those not
+    /// yet taken.
+    keeping_moves: bool,
+    moves: Vec<slides_format::Change>,
     /// Counts the times a thing was picked or let go of, rather than followed through an edit.
     picks: u64,
     /// The number the next time of typing on a slide gets.

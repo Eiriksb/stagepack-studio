@@ -120,13 +120,21 @@ pub struct TerminalLayer {
     pub on: TerminalOn,
 }
 
-/// A terminal recording on a slide: the file it plays, where it plays, as its layer is placed,
+/// A terminal on a slide: the recording it plays, the command it runs, where it plays, as its layer is placed,
 /// and how many times it stops until the next click, once its file has been read: none until
 /// then, or if it can't be played. Two are the same recording, playing the same, whether or not
 /// either's screen is still being shaped.
 #[derive(Clone, Debug)]
 pub struct TerminalOn {
+    /// The recording it plays or is the last screen of: empty if it names none.
     pub src: String,
+    /// The command it runs when it's run live, as it's written, if it names one. The engine only
+    /// reads it: nothing here ever starts it.
+    pub run: Option<String>,
+    /// The columns and rows of its live screen: 100 by 30 if it doesn't say. A figure it wrote
+    /// that isn't a number of columns or rows at all is 0.
+    pub cols: u16,
+    pub rows: u16,
     pub rect: Rect,
     pub rotate: f32,
     pub stops: usize,
@@ -137,6 +145,6 @@ pub struct TerminalOn {
 
 impl PartialEq for TerminalOn {
     fn eq(&self, other: &TerminalOn) -> bool {
-        (&self.src, self.rect, self.rotate, self.stops) == (&other.src, other.rect, other.rotate, other.stops)
+        (&self.src, &self.run, self.cols, self.rows, self.rect, self.rotate, self.stops) == (&other.src, &other.run, other.cols, other.rows, other.rect, other.rotate, other.stops)
     }
 }
