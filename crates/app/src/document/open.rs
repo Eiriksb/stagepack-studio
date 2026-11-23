@@ -287,3 +287,14 @@ fn read_talk_fonts(mut names: Vec<String>, files: &dyn TalkFiles) -> Vec<Arc<Vec
     }
     fonts
 }
+
+/// The fonts a talk in `folder` carries, read through `files`.
+pub(crate) fn fonts_in_folder(folder: &Path, files: &dyn TalkFiles) -> Vec<Arc<Vec<u8>>> {
+    read_talk_fonts(font_names_in_folder(folder), files)
+}
+
+/// The fonts a packed talk carries.
+pub(crate) fn fonts_in_pack(packed: &slides_engine::PackedFiles) -> Vec<Arc<Vec<u8>>> {
+    let names = packed.names().into_iter().filter(|name| is_talk_font(name)).collect();
+    read_talk_fonts(names, packed)
+}
