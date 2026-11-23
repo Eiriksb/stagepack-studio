@@ -1,0 +1,252 @@
+//! The licence notices: every crate in the app's and the helper's dependency graph, the fonts, the Rust toolchain and OpenH264.
+
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// The two programs whose dependency graphs are shipped.
+pub const ROOTS: [&str; 2] = ["stagepack-studio", "slides-terminal-helper"];
+/// The platforms shipped.
+pub const PLATFORMS: [&str; 2] = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"];
+
+/// A notice that is not a crate: a name, its licence and the licence texts.
+#[derive(Clone, Debug)]
+pub struct Notice {
+    pub name: String,
+    pub licence: String,
+    pub texts: Vec<String>,
+}
+
+/// A package in a dependency graph.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Package {
+    pub name: String,
+    pub version: String,
+    pub licence: Option<String>,
+    pub dir: PathBuf,
+    pub licence_file: Option<String>,
+}
+
+impl Package {
+    pub fn label(&self) -> String {
+        format!("{} {}", self.name, self.version)
+    }
+}
+
+fn parse(json: &[u8]) -> Result<Value, String> {
+    serde_json::from_slice(json).map_err(|e| format!("cargo metadata is not JSON: {e}"))
+}
+
+/// Every package reached from the roots over normal dependencies only.
+pub fn graph(metadata_json: &[u8]) -> Result<Vec<Package>, String> {
+    let meta = parse(metadata_json)?;
+    let packages = meta["packages"].as_array().ok_or("cargo metadata has no packages")?;
+    let mut by_id: BTreeMap<&str, &Value> = BTreeMap::new();
+    for p in packages {
+        by_id.insert(p["id"].as_str().ok_or("a package has no id")?, p);
+    }
+    let nodes = meta["resolve"]["nodes"].as_array().ok_or("cargo metadata has no resolve graph")?;
+    let mut deps: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for n in nodes {
+        let id = n["id"].as_str().ok_or("a node has no id")?;
+        let mut list = Vec::new();
+        for d in n["deps"].as_array().into_iter().flatten() {
+            // Only edges that are a normal dependency for some target: dev and build edges are not shipped.
+            let normal = d["dep_kinds"].as_array().is_some_and(|ks| ks.iter().any(|k| k["kind"].is_null()));
+            if normal {
+                list.push(d["pkg"].as_str().ok_or("a dependency has no id")?);
+            }
+        }
+        deps.insert(id, list);
+    }
+    let mut todo: Vec<&str> = packages
+        .iter()
+        .filter(|p| ROOTS.contains(&p["name"].as_str().unwrap_or("")))
+        .filter_map(|p| p["id"].as_str())
+        .collect();
+    if todo.is_empty() {
+        return Err(format!("none of {ROOTS:?} is in the workspace"));
+    }
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    while let Some(id) = todo.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        todo.extend(deps.get(id).into_iter().flatten().copied());
+    }
+    let mut out = Vec::new();
+    for id in seen {
+        let p = by_id.get(id).ok_or_else(|| format!("{id} is in the graph but not in the packages"))?;
+        let manifest = p["manifest_path"].as_str().ok_or("a package has no manifest path")?;
+        out.push(Package {
+            name: p["name"].as_str().unwrap_or_default().to_string(),
+            version: p["version"].as_str().unwrap_or_default().to_string(),
+            licence: p["license"].as_str().filter(|s| !s.trim().is_empty()).map(str::to_string),
+            dir: Path::new(manifest).parent().unwrap_or(Path::new("")).to_path_buf(),
+            licence_file: p["license_file"].as_str().map(str::to_string),
+        });
+    }
+    out.sort_by(|a, b| (&a.name, &a.version).cmp(&(&b.name, &b.version)));
+    Ok(out)
+}
+
+fn is_licence_name(name: &str) -> bool {
+    let up = name.to_ascii_uppercase();
+    ["LICENSE", "LICENCE", "COPYING", "NOTICE"].iter().any(|p| up.starts_with(p))
+}
+
+/// The licence files in a package's folder, as (file name, text), in name order.
+fn licence_files(p: &Package) -> Vec<(String, String)> {
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    if let Ok(rd) = std::fs::read_dir(&p.dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if e.path().is_file() && is_licence_name(&name) {
+                names.insert(name);
+            }
+        }
+    }
+    if let Some(f) = &p.licence_file
+        && p.dir.join(f).is_file()
+    {
+        names.insert(f.clone());
+    }
+    names
+        .into_iter()
+        .filter_map(|n| std::fs::read(p.dir.join(&n)).ok().map(|b| (n, String::from_utf8_lossy(&b).into_owned())))
+        .collect()
+}
+
+/// The notices for crates in the given platforms' metadata, then `extra`.
+pub fn notices_multi(metadata: &[&[u8]], extra: &[Notice]) -> Result<String, String> {
+    // Crates with the same licence and the same texts are listed together.
+    let mut groups: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for m in metadata {
+        for p in graph(m)? {
+            if !seen.insert(p.label()) {
+                continue;
+            }
+            let files = licence_files(&p);
+            if p.licence.is_none() && files.is_empty() {
+                return Err(format!("{} has no licence field and no licence file", p.label()));
+            }
+            let expr = p.licence.clone().unwrap_or_else(|| "(no licence expression)".to_string());
+            let mut body = String::new();
+            if files.is_empty() {
+                body.push_str("No licence file came with this package; its licence is the expression above.\n");
+            }
+            for (name, text) in files {
+                body.push_str(&format!("\n--- {name} ---\n{}\n", text.trim_end()));
+            }
+            groups.entry((expr, body)).or_default().insert(p.label());
+        }
+    }
+    let mut out = String::from(
+        "Stagepack Studio: licence notices\n\nThe packages below are part of this program. Each is listed with its licence and the licence files that came with it.\n",
+    );
+    for ((expr, body), names) in &groups {
+        out.push_str("\n================================================================\n");
+        out.push_str(&format!("Packages: {}\nLicence: {expr}\n{body}", names.iter().cloned().collect::<Vec<_>>().join(", ")));
+    }
+    for n in extra {
+        out.push_str("\n================================================================\n");
+        out.push_str(&format!("{}\nLicence: {}\n", n.name, n.licence));
+        for t in &n.texts {
+            out.push_str(&format!("\n{}\n", t.trim_end()));
+        }
+    }
+    Ok(out)
+}
+
+/// The notices for one platform's metadata, then `extra`.
+pub fn notices(metadata_json: &[u8], extra: &[Notice]) -> Result<String, String> {
+    notices_multi(&[metadata_json], extra)
+}
+
+fn tool(var: &str, default: &str) -> String {
+    std::env::var(var).ok().filter(|s| !s.is_empty()).unwrap_or_else(|| default.to_string())
+}
+
+/// `cargo metadata` for a platform, locked.
+pub fn run_metadata(platform: &str) -> Result<Vec<u8>, String> {
+    let out = Command::new(tool("CARGO", "cargo"))
+        .args(["metadata", "--format-version", "1", "--locked", "--filter-platform", platform])
+        .output()
+        .map_err(|e| format!("can't run cargo metadata: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("cargo metadata for {platform} failed: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    Ok(out.stdout)
+}
+
+fn read(path: &Path) -> Result<String, String> {
+    std::fs::read(path).map(|b| String::from_utf8_lossy(&b).into_owned()).map_err(|e| format!("can't read {}: {e}", path.display()))
+}
+
+/// The fonts', the toolchain's (and LLVM's) and OpenH264's notices.
+pub fn extra_notices(metadata_json: &[u8]) -> Result<Vec<Notice>, String> {
+    let meta = parse(metadata_json)?;
+    let root = PathBuf::from(meta["workspace_root"].as_str().ok_or("cargo metadata has no workspace root")?);
+    let mut extra = Vec::new();
+
+    extra.push(Notice {
+        name: "Stagepack Studio".into(),
+        licence: "MIT".into(),
+        texts: vec![read(&root.join("LICENSE"))?],
+    });
+
+    let fonts = root.join("crates/engine/assets/fonts");
+    extra.push(Notice {
+        name: "Fonts: Inter, JetBrains Mono and Noto Color Emoji".into(),
+        licence: "OFL-1.1".into(),
+        texts: ["Inter-LICENSE.txt", "JetBrainsMono-OFL.txt", "NotoColorEmoji-OFL.txt"]
+            .iter()
+            .map(|f| read(&fonts.join(f)).map(|t| format!("--- {f} ---\n{t}")))
+            .collect::<Result<_, _>>()?,
+    });
+
+    // The toolchain's own files: the standard library and the LLVM it was built with.
+    let rustc = tool("RUSTC", "rustc");
+    let sysroot = Command::new(&rustc).args(["--print", "sysroot"]).output().map_err(|e| format!("can't run {rustc}: {e}"))?;
+    let sysroot = PathBuf::from(String::from_utf8_lossy(&sysroot.stdout).trim());
+    let mut dirs = vec![sysroot.join("share/doc/rust/licenses")];
+    if let Ok(rd) = std::fs::read_dir(sysroot.join("lib/rustlib/src/rust")) {
+        dirs.extend(rd.flatten().map(|e| e.path()));
+    }
+    let dir = dirs.iter().find(|d| d.join("Apache-2.0.txt").is_file() && d.join("MIT.txt").is_file());
+    let dir = dir.ok_or_else(|| format!("the Rust toolchain's licence files are not in {}/share/doc/rust/licenses", sysroot.display()))?;
+    let mut texts = Vec::new();
+    for f in ["Apache-2.0.txt", "MIT.txt", "LLVM-exception.txt", "NCSA.txt", "BSD-2-Clause.txt", "ISC.txt", "Unicode-3.0.txt"] {
+        let path = dir.join(f);
+        if path.is_file() {
+            texts.push(format!("--- {f} ---\n{}", read(&path)?));
+        } else if matches!(f, "Apache-2.0.txt" | "MIT.txt" | "LLVM-exception.txt") {
+            return Err(format!("the Rust toolchain's {f} is missing from {}", dir.display()));
+        }
+    }
+    extra.push(Notice {
+        name: "The Rust toolchain: the standard library and the LLVM it carries".into(),
+        licence: "MIT OR Apache-2.0 (the standard library); Apache-2.0 WITH LLVM-exception (LLVM)".into(),
+        texts,
+    });
+
+    // OpenH264's source, bundled by openh264-sys2.
+    let sys2 = graph(metadata_json)?.into_iter().find(|p| p.name == "openh264-sys2").ok_or("openh264-sys2 is not in the dependency graph")?;
+    let file = sys2.dir.join("upstream/LICENSE");
+    extra.push(Notice {
+        name: "OpenH264 (the H.264 decoder, built from source bundled in openh264-sys2)".into(),
+        licence: "BSD-2-Clause".into(),
+        texts: vec![read(&file)?],
+    });
+    Ok(extra)
+}
+
+/// Every notice, from this workspace as `cargo metadata` sees it for both platforms.
+pub fn notices_for_workspace() -> Result<String, String> {
+    let metas: Vec<Vec<u8>> = PLATFORMS.iter().map(|p| run_metadata(p)).collect::<Result<_, _>>()?;
+    let extra = extra_notices(&metas[0])?;
+    let refs: Vec<&[u8]> = metas.iter().map(Vec::as_slice).collect();
+    notices_multi(&refs, &extra)
+}
