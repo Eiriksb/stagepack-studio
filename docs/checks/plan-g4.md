@@ -71,4 +71,12 @@ On a scratch talk of three slides (a title, a chart from `assets/sales.csv`, a t
 
 ## The final review
 
-To be written by the controller.
+A whole-branch review on the most capable model read the design, the plan, the rulings and the diff from `plan-g`, and ran the built program on scratch talks. Its verdict was *ready after fixes*: three important findings and four minor ones, all fixed in one wave (b72750e) and checked by a scoped re-review, which found each fixed.
+
+- **Important:** `describe` over MCP failed on a folder with no talk yet, which is the guide's first step; it now lists the built-ins and says why the talk couldn't be opened (976dc01). A slide holding a photo made an MCP picture of 11 MB at the default width and 40 MB at the widest, over the 5 MB an assistant takes; over MCP a picture is now 1,280 wide by default and 1,920 at most, and is drawn narrower, down to 640, until its PNG is under 3.5 MB. A command could end while the 3D drawer still held the graphics device; every command now closes the drawer first.
+- **Minor:** `picture --out` could overwrite any file, the talk's `slides.md` included; it now writes only a `.png` name and replaces only a PNG. `check` didn't mark hidden slides in its text. The guide said both that the tool never builds and that it builds where *Always build this folder* is set, and described `picture` only by its command-line options.
+- **Checked and found sound:** a link, `..` or an absolute path in a talk never reads outside it; building follows the window's rule on the folder's canonical path; nothing but replies reaches the server's standard output; every first argument that isn't a command name opens a window as before; slides and steps are numbered alike in every tool.
+
+After the fixes, the whole suite: **2,633 passed, 0 failed, 56 ignored** (`scripts/cargo-safe.sh test --workspace --no-fail-fast`, without a compiler bundle). With `STUDIO_BUNDLE` set to the bundle in `target/bundle`, `--test ai_tool` 27 passed and `--test ai_tool_mcp` 9 passed.
+
+Still by hand: that a command drawing a 3D model ends cleanly on a computer with a graphics card (this one has none, so the drawer's device was never held here), and everything on Windows.
