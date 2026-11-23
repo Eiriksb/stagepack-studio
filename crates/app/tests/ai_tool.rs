@@ -202,3 +202,30 @@ fn describe_with_a_talk_adds_its_components() {
     let json: serde_json::Value = serde_json::from_slice(&none.stdout).unwrap();
     assert!(json["tags"].as_array().unwrap().iter().all(|entry| entry["tag"] != "Score"));
 }
+
+#[test]
+fn only_a_file_is_needed_and_the_rest_have_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = run(&["describe", "--json"], dir.path());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let setting = |tag: &str, name: &str| {
+        let tag = json["tags"].as_array().unwrap().iter().find(|entry| entry["tag"] == tag).unwrap();
+        tag["settings"].as_array().unwrap().iter().find(|item| item["name"] == name).unwrap().clone()
+    };
+    for (tag, name) in [("Box", "radius"), ("Shape", "outline-width")] {
+        let item = setting(tag, name);
+        assert_eq!(item["needed"], false, "{tag} {name}");
+        assert_eq!(item["default"], "0", "{tag} {name}");
+    }
+    assert_eq!(setting("Video", "src")["needed"], true);
+    assert!(setting("Video", "src")["default"].is_null());
+    assert_eq!(setting("Chart", "kind")["default"], "bar");
+    assert_eq!(setting("Chart", "labels")["needed"], false);
+
+    // Left out, they lay out without a notice.
+    let talk = dir.path().join("talk");
+    std::fs::create_dir_all(&talk).unwrap();
+    std::fs::write(talk.join("slides.md"), "# One\n\n<Box />\n\n<Shape />\n").unwrap();
+    let mut open = stagepack_studio::ai_tool::open_talk(&talk).unwrap();
+    assert!(open.deck.notices_whole(0).is_empty(), "{:?}", open.deck.notices_whole(0));
+}

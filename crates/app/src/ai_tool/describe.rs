@@ -32,7 +32,10 @@ pub struct FieldInfo {
     pub name: String,
     /// `text`, `whole number`, `number`, `yes or no`, `colour`, `file` or `choice`.
     pub kind: String,
+    /// Whether the talk can't do without it. Any other left out is filled in with its default.
     pub needed: bool,
+    /// What it is when left out; none for a needed or empty one.
+    pub default: Option<String>,
     /// What the form panel calls it; none for a setting the form leaves out.
     pub label: Option<String>,
     pub meaning: Option<String>,
@@ -124,14 +127,22 @@ fn kind_name(kind: &PropKind) -> &'static str {
     }
 }
 
-fn field(prop: &PropField, label: Option<String>, meaning: Option<&str>, colour: bool) -> FieldInfo {
+fn field(tag: &str, prop: &PropField, label: Option<String>, meaning: Option<&str>, colour: bool, built_in: bool) -> FieldInfo {
     let choices = match &prop.kind {
         PropKind::File(extensions) => extensions.clone(),
         PropKind::Choice(values) => values.clone(),
         _ => Vec::new(),
     };
+    let needed = built_in && labels::needed(tag, &prop.name);
+    let default = match &prop.kind {
+        _ if needed || prop.optional => None,
+        PropKind::Whole | PropKind::Number => Some("0".to_string()),
+        PropKind::Flag => Some("false".to_string()),
+        PropKind::Choice(values) => values.first().cloned(),
+        _ => None,
+    };
     let kind = if colour { "colour" } else { kind_name(&prop.kind) };
-    FieldInfo { name: prop.name.clone(), kind: kind.to_string(), needed: !prop.optional, label, meaning: meaning.map(str::to_string), choices }
+    FieldInfo { name: prop.name.clone(), kind: kind.to_string(), needed, default, label, meaning: meaning.map(str::to_string), choices }
 }
 
 /// A tag's settings: a built-in's as the form shows them, in its order, then those it leaves
@@ -142,12 +153,12 @@ fn fields(tag: &str, props: &[PropField], built_in: bool) -> Vec<FieldInfo> {
     for (shown, label) in &shown {
         let Some(prop) = props.iter().find(|prop| prop.name == shown.name) else { continue };
         let meaning = built_in.then(|| labels::meaning(tag, &prop.name)).flatten();
-        out.push(field(prop, Some(label.clone()), meaning, shown.kind == PropKind::Color));
+        out.push(field(tag, prop, Some(label.clone()), meaning, shown.kind == PropKind::Color, built_in));
     }
     for prop in props {
         if !shown.iter().any(|(shown, _)| shown.name == prop.name) {
             let meaning = built_in.then(|| labels::meaning(tag, &prop.name)).flatten();
-            out.push(field(prop, None, meaning, false));
+            out.push(field(tag, prop, None, meaning, false, built_in));
         }
     }
     out
@@ -210,16 +221,19 @@ pub fn describe_text(described: &Description) -> String {
     settings_text("Talk settings", &described.talk_settings, &mut text);
     settings_text("Slide settings", &described.slide_settings, &mut text);
     settings_text("Placement, which every placed tag takes", &described.placement, &mut text);
-    text.push_str("Tags\n");
+    text.push_str("Tags\n  A setting left out takes its default, or is empty, unless it is marked needed.\n");
     for tag in &described.tags {
         let own = if tag.built_in { "" } else { ", this talk's own" };
         let content = if tag.takes_content { ", takes content between its tags" } else { "" };
         text.push_str(&format!("  <{}{}{}>\n", tag.tag, own, content));
         for item in &tag.settings {
-            let needed = if item.needed { "needed" } else { "optional" };
-            text.push_str(&format!("    {} ({}, {needed})", item.name, item.kind));
+            let needed = if item.needed { ", needed" } else { "" };
+            text.push_str(&format!("    {} ({}{needed})", item.name, item.kind));
             if let Some(meaning) = &item.meaning {
                 text.push_str(&format!(" — {meaning}"));
+            }
+            if let Some(default) = &item.default {
+                text.push_str(&format!(" Default {default}."));
             }
             if !item.choices.is_empty() {
                 let which = if item.kind == "file" { "File types" } else { "One of" };

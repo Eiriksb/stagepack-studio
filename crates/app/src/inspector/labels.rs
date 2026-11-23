@@ -52,10 +52,10 @@ const BUILT_INS: [(&str, &[Setting]); 8] = [
         &[
             ("kind", "Kind", "Which chart to draw: `bar`, `line` or `pie`."),
             ("title", "Title", "A heading to show above the chart."),
-            ("labels", "Labels", "The name of each bar, point or slice, set apart by commas."),
-            ("values", "Values", "The number for each label, set apart by commas."),
+            ("labels", "Labels", "The name of each bar, point or slice, set apart by commas. Needed unless `data` is given, and `values` must have one number for each label."),
+            ("values", "Values", "The number for each label, set apart by commas. Needed unless `data` is given, and there must be one for each label."),
             ("data", "Data file", "A CSV file in the talk to take the labels and values from instead."),
-            ("build", "Build up by clicks", "Shows the chart a bar, point or slice at a time, one for each click."),
+            ("build", "Build up by clicks", "Shows the chart a series at a time, or for one series a bar, point or slice at a time, one for each click."),
         ],
     ),
 ];
@@ -70,6 +70,16 @@ const LEFT_OUT: [(&str, &str, &str); 5] = [
     ("Model", "views", "Views to move through, one for each click, each written as `view` is, with a semicolon between views."),
     ("Terminal", "src", "The terminal recording to play, an asciinema `.cast` file in the talk."),
 ];
+
+/// The built-ins' arguments a talk can't do without: a missing file is a problem. Every other
+/// argument left out is filled in by the engine, and a chart's `labels` and `values` are needed
+/// only when it has no `data`, which their meanings say.
+const NEEDED: [(&str, &str); 4] = [("Picture", "src"), ("Video", "src"), ("Model", "src"), ("Terminal", "src")];
+
+/// Whether the built-in `tag`'s setting `argument` must be written.
+pub fn needed(tag: &str, argument: &str) -> bool {
+    NEEDED.contains(&(tag, argument))
+}
 
 /// What the built-in `tag`'s setting `argument` means, in a plain sentence, or `None` for a
 /// setting it doesn't have.
