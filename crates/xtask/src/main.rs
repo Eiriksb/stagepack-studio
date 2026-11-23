@@ -2,6 +2,7 @@
 //!
 //!   package icon OUT_DIR       draws the icon (PNGs and .ico)
 //!   package notices OUT_FILE   gathers every licence notice (and writes notices/rust-COPYRIGHT.html beside it)
+//!   package linux [--staged DIR] [--bundle DIR]   packs the Linux .tar.zst into target/package (stages first unless DIR is given)
 //!   package stage OUT_DIR [--bundle DIR]   stages the installed app folder from shipped release builds (keep OUT_DIR inside target/)
 
 use std::path::PathBuf;
@@ -29,8 +30,34 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("The app folder {} is {} MB.", out.display(), bytes.div_ceil(1024 * 1024));
             Ok(())
         }
-        Some(other) => Err(format!("unknown subcommand '{other}' (known: icon, notices, stage)")),
-        None => Err("usage: package <icon OUT_DIR | notices OUT_FILE | stage OUT_DIR [--bundle DIR]>".into()),
+        Some("linux") => {
+            const USAGE: &str = "usage: package linux [--staged DIR] [--bundle DIR]";
+            let (mut staged, mut bundle) = (None, None);
+            let mut rest = args[1..].iter();
+            while let Some(flag) = rest.next() {
+                let value = PathBuf::from(rest.next().ok_or(USAGE)?);
+                match flag.as_str() {
+                    "--staged" => staged = Some(value),
+                    "--bundle" => bundle = Some(value),
+                    _ => return Err(USAGE.into()),
+                }
+            }
+            let repo = xtask::stage::repo_root();
+            let staged = match staged {
+                Some(dir) => dir,
+                None => {
+                    let dir = repo.join("target/package-stage");
+                    xtask::stage::stage(&dir, bundle.as_deref())?;
+                    dir
+                }
+            };
+            let tarball = xtask::linux::pack(&staged, &repo.join("target/package"))?;
+            let bytes = std::fs::metadata(&tarball).map_err(|e| e.to_string())?.len();
+            println!("{} is {} MB.", tarball.display(), bytes.div_ceil(1024 * 1024));
+            Ok(())
+        }
+        Some(other) => Err(format!("unknown subcommand '{other}' (known: icon, notices, stage, linux)")),
+        None => Err("usage: package <icon OUT_DIR | notices OUT_FILE | stage OUT_DIR [--bundle DIR] | linux [--staged DIR] [--bundle DIR]>".into()),
     }
 }
 
