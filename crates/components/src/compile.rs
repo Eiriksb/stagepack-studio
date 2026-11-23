@@ -35,11 +35,16 @@ pub struct Bundle {
 impl Bundle {
     /// `STUDIO_BUNDLE` if set, or else a `bundle` folder beside the executable.
     pub fn find() -> Option<Bundle> {
-        let root = match std::env::var_os("STUDIO_BUNDLE") {
-            Some(root) => PathBuf::from(root),
-            None => std::env::current_exe().ok()?.parent()?.join("bundle"),
-        };
-        Bundle::in_folder(root)
+        match std::env::var_os("STUDIO_BUNDLE") {
+            Some(root) => Bundle::in_folder(PathBuf::from(root)),
+            None => Bundle::find_beside_exe(),
+        }
+    }
+
+    /// A `bundle` folder beside the executable and nowhere else, whatever the environment says:
+    /// where a shipped build looks.
+    pub fn find_beside_exe() -> Option<Bundle> {
+        Bundle::in_folder(std::env::current_exe().ok()?.parent()?.join("bundle"))
     }
 
     fn in_folder(root: PathBuf) -> Option<Bundle> {

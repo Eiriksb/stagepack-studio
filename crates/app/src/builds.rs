@@ -39,9 +39,19 @@ pub(crate) const NO_COMPILER: &str = "This copy of the app has no compiler, so c
 const BUILD_FOLDER: &str = "build";
 const INDEX_FORMAT: u32 = 1;
 
+/// The compiler bundle this copy of the app builds with: named by `STUDIO_BUNDLE` if that's set,
+/// else beside the program. A shipped build (the `shipped` feature) looks beside the program only.
+pub fn find_bundle() -> Option<Bundle> {
+    if cfg!(feature = "shipped") {
+        Bundle::find_beside_exe()
+    } else {
+        Bundle::find()
+    }
+}
+
 /// The compiler that ships with the app, if this copy of it has one.
 pub fn bundled_compiler() -> Option<Compile> {
-    let bundle = Bundle::find()?;
+    let bundle = find_bundle()?;
     Some(Arc::new(move |file: &str, source: &str| {
         slides_components::compile(&bundle, file, source)
     }))

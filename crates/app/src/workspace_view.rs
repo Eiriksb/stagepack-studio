@@ -743,7 +743,7 @@ impl WorkspaceView {
             show: None,
             talk_folder,
             compile: builds::bundled_compiler(),
-            bundle: Bundle::find(),
+            bundle: builds::find_bundle(),
             editor_projects: cargo_file::default_projects_root(),
             permissions,
             run_permissions,

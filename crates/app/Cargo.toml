@@ -11,6 +11,8 @@ path = "src/main.rs"
 [features]
 # Lets the tests start a live terminal session without the owner's yes, and say yes for themselves.
 test-hooks = []
+# The packaged app: it looks for the compiler bundle and the live terminal's helper beside itself only, and ignores STUDIO_BUNDLE and STUDIO_TERMINAL_HELPER.
+shipped = []
 
 [dependencies]
 base64 = "=0.22.1"

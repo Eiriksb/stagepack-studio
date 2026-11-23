@@ -9856,6 +9856,9 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "slides-engine",
+ "slides-terminal-helper",
+ "tempfile",
  "tiny-skia",
 ]
 
