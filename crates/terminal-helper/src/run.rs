@@ -100,6 +100,10 @@ fn session(out: &Out, tx: &Sender<Event>, rx: &Receiver<Event>) {
     let _ = say(out, &FromHelper::Exited(exit));
 }
 
+fn size_ok(cols: u16, rows: u16) -> bool {
+    (1..=wire::MOST_COLS).contains(&cols) && (1..=wire::MOST_ROWS).contains(&rows)
+}
+
 fn failed_to_start(program: &str, why: &str) -> String {
     let missing = ["No viable candidates", "does not exist", "doesn't exist", "Unable to resolve", "not found"];
     if missing.iter().any(|m| why.contains(m)) {
@@ -127,8 +131,8 @@ fn start(spec: &StartSpec) -> Result<Live, String> {
     if program.is_empty() {
         return Err("There's no program to run.".into());
     }
-    if spec.cols == 0 || spec.rows == 0 {
-        return Err("The terminal's size isn't right.".into());
+    if !size_ok(spec.cols, spec.rows) {
+        return Err("A terminal can be 1 to 500 columns and 1 to 200 rows.".into());
     }
     if !spec.cwd.is_dir() {
         return Err(format!("The folder \"{}\" isn't there.", spec.cwd.display()));
@@ -140,10 +144,14 @@ fn start(spec: &StartSpec) -> Result<Live, String> {
     let mut cmd = CommandBuilder::new(program);
     cmd.args(&spec.args);
     cmd.cwd(&spec.cwd);
+    // A terminal's own words, unless the app says otherwise.
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLUMNS", spec.cols.to_string());
+    cmd.env("LINES", spec.rows.to_string());
     for (k, v) in &spec.env {
         cmd.env(k, v);
     }
-    let child = pair
+    let mut child = pair
         .slave
         .spawn_command(cmd)
         .map_err(|e| failed_to_start(program, &format!("{e:#}")))?;
@@ -166,7 +174,13 @@ fn start(spec: &StartSpec) -> Result<Live, String> {
             }
         }
     });
-    let group = Group::of(child.as_ref());
+    let group = match Group::of(child.as_ref()) {
+        Ok(group) => group,
+        Err(why) => {
+            let _ = child.kill();
+            return Err(why);
+        }
+    };
     Ok(Live {
         master: Some(pair.master),
         reader: Some(reader),
@@ -219,7 +233,7 @@ impl Live {
     }
 
     fn resize(&self, cols: u16, rows: u16) {
-        if cols == 0 || rows == 0 {
+        if !size_ok(cols, rows) {
             return;
         }
         if let Some(master) = &self.master {
@@ -230,7 +244,10 @@ impl Live {
     /// Ends the program and everything it started, and says how it ended.
     fn end(&mut self, rx: &Receiver<Event>) -> Exit {
         let deadline = Instant::now() + POLITE;
-        self.group.ask_politely(self.master.take());
+        if self.group.exists() {
+            self.group.ask_politely();
+        }
+        self.master = None;
         let mut exit = None;
         while exit.is_none() && Instant::now() < deadline {
             match rx.recv_timeout(Duration::from_millis(20)) {
@@ -248,8 +265,9 @@ impl Live {
     fn after_end(&mut self, rx: &Receiver<Event>, exit: Exit) -> Exit {
         let deadline = Instant::now() + POLITE;
         if self.group.exists() {
-            self.group.ask_politely(self.master.take());
+            self.group.ask_politely();
         }
+        self.master = None;
         self.after_end_until(rx, Some(exit), deadline)
     }
 
@@ -265,7 +283,9 @@ impl Live {
             }
         }
         self.group.force();
-        let _ = self.killer.kill();
+        if exit.is_none() {
+            let _ = self.killer.kill();
+        }
         // The leader's end is waited for a little longer, as it is only a signal away now.
         let until = Instant::now() + DRAIN;
         while exit.is_none() && Instant::now() < until {
@@ -300,8 +320,8 @@ struct Group(Option<i32>);
 #[cfg(unix)]
 impl Group {
     /// The program was started as the leader of a session of its own, so its process group is its pid.
-    fn of(child: &(dyn portable_pty::Child + Send + Sync)) -> Group {
-        Group(child.process_id().map(|p| p as i32))
+    fn of(child: &(dyn portable_pty::Child + Send + Sync)) -> Result<Group, String> {
+        Ok(Group(child.process_id().map(|p| p as i32)))
     }
 
     fn signal(&self, sig: i32) {
@@ -311,6 +331,7 @@ impl Group {
         }
     }
 
+    /// Whether anything of the program's group is still there.
     fn exists(&self) -> bool {
         match self.0 {
             // SAFETY: signal 0 only asks whether the group is there.
@@ -319,10 +340,9 @@ impl Group {
         }
     }
 
-    fn ask_politely(&self, master: Option<Box<dyn portable_pty::MasterPty + Send>>) {
+    fn ask_politely(&self) {
         self.signal(libc::SIGHUP);
         self.signal(libc::SIGTERM);
-        drop(master);
     }
 
     fn force(&self) {
@@ -333,19 +353,4 @@ impl Group {
 }
 
 #[cfg(windows)]
-struct Group;
-
-#[cfg(windows)]
-impl Group {
-    fn of(_child: &(dyn portable_pty::Child + Send + Sync)) -> Group {
-        Group
-    }
-    fn exists(&self) -> bool {
-        false
-    }
-    /// Closing the pseudo-console is the polite end.
-    fn ask_politely(&self, master: Option<Box<dyn portable_pty::MasterPty + Send>>) {
-        drop(master);
-    }
-    fn force(&self) {}
-}
+use crate::winjob::Group;

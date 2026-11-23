@@ -2,3 +2,5 @@
 pub mod wire;
 #[cfg(feature = "run")]
 pub mod run;
+#[cfg(all(feature = "run", windows))]
+mod winjob;

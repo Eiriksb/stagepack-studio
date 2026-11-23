@@ -314,3 +314,140 @@ fn the_helper_says_nothing_on_stderr() {
     h.child.stderr.take().unwrap().read_to_string(&mut err).unwrap();
     assert_eq!(err, "");
 }
+
+#[test]
+fn a_terminal_too_big_is_refused() {
+    let mut h = Helper::new();
+    let mut s = spec("sh", &["-c", "true"]);
+    s.cols = 501;
+    h.say(&ToHelper::Start(s));
+    match h.next(Duration::from_secs(10)) {
+        Some(FromHelper::Failed(why)) => assert!(why.contains("1 to 500 columns"), "{why}"),
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    h.finish();
+    let mut h = Helper::new();
+    let mut s = spec("sh", &["-c", "true"]);
+    s.rows = 201;
+    h.say(&ToHelper::Start(s));
+    assert!(matches!(h.next(Duration::from_secs(10)), Some(FromHelper::Failed(_))));
+    h.finish();
+}
+
+#[test]
+fn a_resize_too_big_keeps_the_size() {
+    let mut h = Helper::start("read x; stty size");
+    expect_started(&mut h);
+    h.say(&ToHelper::Resize(501, 40));
+    h.say(&ToHelper::Resize(0, 40));
+    thread::sleep(Duration::from_millis(200));
+    h.say(&ToHelper::Input(b"\r".to_vec()));
+    h.until_output("30 100");
+    h.until_exited(Duration::from_secs(10));
+}
+
+#[test]
+fn the_terminals_own_words_are_set() {
+    let mut h = Helper::new();
+    let mut s = spec("sh", &["-c", "echo T=$TERM C=$COLUMNS L=$LINES"]);
+    s.env.clear();
+    s.cols = 90;
+    s.rows = 25;
+    h.say(&ToHelper::Start(s));
+    expect_started(&mut h);
+    h.until_exited(Duration::from_secs(10));
+    assert!(h.output_text().contains("T=xterm-256color C=90 L=25"), "{:?}", h.output_text());
+}
+
+#[test]
+fn the_apps_environment_wins() {
+    let mut h = Helper::new();
+    let mut s = spec("sh", &["-c", "echo T=$TERM"]);
+    s.env = vec![("TERM".into(), "dumb".into())];
+    h.say(&ToHelper::Start(s));
+    expect_started(&mut h);
+    h.until_exited(Duration::from_secs(10));
+    assert!(h.output_text().contains("T=dumb"), "{:?}", h.output_text());
+}
+
+/// The most the helper's memory has been, in kilobytes.
+#[cfg(target_os = "linux")]
+fn peak_kb(pid: u32) -> u64 {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmHWM:"))
+                .and_then(|l| l.split_whitespace().nth(1)?.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_flood_does_not_swell_the_helper() {
+    let mut h = Helper::start("yes | head -c 50000000");
+    expect_started(&mut h);
+    let pid = h.child.id();
+    let mut peak = 0;
+    let end = Instant::now() + Duration::from_secs(60);
+    let mut total = 0usize;
+    loop {
+        assert!(Instant::now() < end, "the flood never ended");
+        match h.next(Duration::from_secs(30)) {
+            Some(FromHelper::Output(b)) => {
+                total += b.len();
+                assert!(b.len() <= wire::MOST_OUTPUT_CHUNK);
+                h.output.clear();
+                peak = peak.max(peak_kb(pid));
+            }
+            Some(FromHelper::Exited(_)) => break,
+            Some(_) => {}
+            None => panic!("ended without Exited"),
+        }
+    }
+    peak = peak.max(peak_kb(pid));
+    h.finish();
+    assert!(total > 1_000_000, "only {total} bytes came");
+    assert!(peak < 64 * 1024, "the helper reached {peak} kB");
+}
+
+#[cfg(windows)]
+mod windows {
+    use super::*;
+
+    fn start_cmd(line: &str) -> Helper {
+        let mut h = Helper::new();
+        h.say(&ToHelper::Start(spec("cmd", &["/c", line])));
+        h
+    }
+
+    #[test]
+    fn a_program_runs_and_its_output_comes_back_on_windows() {
+        let mut h = start_cmd("echo hello & exit 3");
+        expect_started(&mut h);
+        let exit = h.until_exited(Duration::from_secs(10));
+        assert!(h.output_text().contains("hello"));
+        assert_eq!(exit.code, Some(3));
+    }
+
+    #[test]
+    fn every_program_ends_when_told_on_windows() {
+        // A child that outlasts the program's own end, started with `start /b`.
+        let mut h = start_cmd("start /b ping -n 1000 127.0.0.1 >nul & ping -n 1000 127.0.0.1 >nul");
+        expect_started(&mut h);
+        thread::sleep(Duration::from_millis(500));
+        let told = Instant::now();
+        h.say(&ToHelper::End);
+        h.until_exited(Duration::from_secs(5));
+        assert!(told.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_closed_input_ends_the_program_on_windows() {
+        let mut h = start_cmd("ping -n 1000 127.0.0.1 >nul");
+        expect_started(&mut h);
+        h.stdin = None;
+        h.until_exited(Duration::from_secs(5));
+    }
+}

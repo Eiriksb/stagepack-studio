@@ -8,6 +8,9 @@ use std::path::PathBuf;
 
 /// The most bytes one frame may carry.
 pub const MOST_FRAME: u32 = 1 << 20;
+/// The biggest terminal: columns and rows.
+pub const MOST_COLS: u16 = 500;
+pub const MOST_ROWS: u16 = 200;
 /// The most bytes of the program's output in one `Output` frame.
 pub const MOST_OUTPUT_CHUNK: usize = 64 * 1024;
 
