@@ -3,6 +3,7 @@
 
 mod check;
 mod describe;
+mod guide;
 mod mcp;
 mod outline;
 mod picture;
@@ -19,6 +20,7 @@ use crate::permissions::BuildPermissions;
 pub use check::{Checked, SlideProblems, check, check_text, slide_problems};
 pub use describe::{Description, FieldInfo, LayoutInfo, SettingInfo, TagInfo, describe, describe_text};
 pub use picture::{DEFAULT_WIDTH, LEAST_WIDTH, MOST_WIDTH, Picture, picture, picture_text};
+pub use guide::GUIDE;
 pub use mcp::serve;
 pub use outline::{OutlineSlide, outline, outline_text};
 pub use talk::{OpenTalk, TalkPlace, open_talk};
@@ -49,6 +51,7 @@ pub fn run_command(args: &[OsString]) -> Option<i32> {
         "outline" => run_outline(rest),
         "picture" => run_picture(rest),
         "mcp" => run_mcp(rest),
+        "guide" => Ok(run_guide(rest)),
         other => Err(Failed(format!("The {other} command isn't ready yet."))),
     };
     Some(match done {
@@ -147,6 +150,12 @@ fn run_check(args: &[OsString]) -> Result<i32, Failed> {
         say(&check_text(&checked));
     }
     Ok(if checked.count() == 0 { 0 } else { 1 })
+}
+
+/// Prints the guide.
+fn run_guide(_args: &[OsString]) -> i32 {
+    say(GUIDE);
+    0
 }
 
 fn run_mcp(args: &[OsString]) -> Result<i32, Failed> {

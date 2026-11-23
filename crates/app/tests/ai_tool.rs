@@ -549,3 +549,64 @@ fn models_and_recordings_are_drawn() {
     // The model's box shows at least its plain panel, if the drawer found no device; with one it's drawn.
     assert!(differs(100, 100, 740, 460), "the model's box is blank");
 }
+
+/// The guide, as the program has it.
+const GUIDE: &str = include_str!("../../../docs/guide/writing-talks-for-ai.md");
+
+#[test]
+fn guide_prints_the_guide() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = run(&["guide"], dir.path());
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(text(&output.stdout), GUIDE);
+}
+
+#[test]
+fn the_guide_names_every_built_in() {
+    for tag in slides_engine::builtin_registry().names() {
+        assert!(GUIDE.contains(&format!("<{tag}")), "the guide never shows <{tag}");
+    }
+}
+
+/// The fenced blocks marked `markdown` in `guide`, each the text between its fences. A fence is
+/// as long as the one that closes it.
+fn markdown_examples(guide: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut lines = guide.lines();
+    while let Some(line) = lines.next() {
+        let marks = line.chars().take_while(|c| *c == '`' || *c == '~').count();
+        if marks < 3 || line[marks..].trim() != "markdown" {
+            continue;
+        }
+        let fence: String = line[..marks].to_string();
+        let mut body = String::new();
+        for next in lines.by_ref() {
+            if next.starts_with(&fence) && next.trim_end() == fence {
+                break;
+            }
+            body.push_str(next);
+            body.push('\n');
+        }
+        found.push(body);
+    }
+    found
+}
+
+#[test]
+fn every_example_in_the_guide_checks_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    let examples = markdown_examples(GUIDE);
+    assert!(examples.len() >= 15, "only {} examples found", examples.len());
+    for (n, example) in examples.iter().enumerate() {
+        let talk = dir.path().join(format!("example{n}"));
+        std::fs::create_dir_all(talk.join("assets")).unwrap();
+        std::fs::write(talk.join("slides.md"), example).unwrap();
+        std::fs::write(talk.join("assets/photo.png"), flat_png([200, 120, 40])).unwrap();
+        std::fs::write(talk.join("assets/run.cast"), slides_terminal::make_demo_cast()).unwrap();
+        std::fs::write(talk.join("assets/sales.csv"), "Quarter,Sales\nQ1,120\nQ2,180\nQ3,150\nQ4,240\n").unwrap();
+        std::fs::write(talk.join("assets/box.glb"), slides_model::make_test_glb(slides_model::MadeGlb::Boxes)).unwrap();
+        std::fs::write(talk.join("assets/clip.mp4"), slides_video::make_test_video(64, 36, 3, 10, |_| [255, 0, 0, 255].repeat(64 * 36))).unwrap();
+        let output = run(&["check", talk.to_str().unwrap()], dir.path());
+        assert_eq!(output.status.code(), Some(0), "example {n} has problems:\n{example}\n{}{}", text(&output.stdout), text(&output.stderr));
+    }
+}

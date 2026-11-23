@@ -11,7 +11,7 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 
 use super::{check, check_text, describe, describe_text, open_talk, outline, outline_text, picture};
-use super::{DEFAULT_WIDTH, LEAST_WIDTH, MOST_WIDTH};
+use super::{DEFAULT_WIDTH, GUIDE, LEAST_WIDTH, MOST_WIDTH};
 use crate::permissions::BuildPermissions;
 
 /// The longest line the server reads, in bytes.
@@ -23,11 +23,6 @@ const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
 const NO_SUCH_METHOD: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
-
-/// What the `guide` tool says. The guide for writing talks replaces this one function.
-fn guide_text() -> String {
-    "The guide for writing talks isn't in this copy of the app yet. Call describe to see what a talk may hold, and check after each change.".to_string()
-}
 
 /// One line of input.
 enum Line {
@@ -248,7 +243,7 @@ fn text_result(text: &str) -> Value {
 
 fn text_tool(talk: &Path, name: &str) -> Value {
     if name == "guide" {
-        return text_result(&guide_text());
+        return text_result(GUIDE);
     }
     let mut opened = match open_talk(talk) {
         Ok(opened) => opened,
