@@ -12,6 +12,10 @@
 #ifndef StagedDir
 #error Pass the staged app folder: ISCC /DAppVersion=0.1.0 /DStagedDir=<staged folder> stagepack-studio.iss
 #endif
+; Inno wants up to four plain numbers for the file version (0.2.0-beta would be refused), so the script passes those apart.
+#ifndef AppVersionNumeric
+#define AppVersionNumeric AppVersion
+#endif
 #ifndef OutDir
 #define OutDir SourcePath + "..\..\target\package"
 #endif
@@ -23,7 +27,7 @@ AppId={{D5D431CE-0EB9-45EB-8110-EB9518B4C9F1}
 AppName=Stagepack Studio
 AppVersion={#AppVersion}
 AppPublisher=Stagepack Studio
-VersionInfoVersion={#AppVersion}
+VersionInfoVersion={#AppVersionNumeric}
 DefaultDirName={localappdata}\Programs\Stagepack Studio
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
@@ -32,7 +36,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 WizardStyle=modern
 SetupIconFile={#StagedDir}\icons\stagepack-studio.ico
-UninstallDisplayIcon={app}\stagepack-studio.exe
+UninstallDisplayIcon={app}\icons\stagepack-studio.ico
 ChangesAssociations=yes
 CloseApplications=yes
 RestartApplications=no
@@ -48,7 +52,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Source: "{#StagedDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{autoprograms}\Stagepack Studio"; Filename: "{app}\stagepack-studio.exe"
+Name: "{autoprograms}\Stagepack Studio"; Filename: "{app}\stagepack-studio.exe"; IconFilename: "{app}\icons\stagepack-studio.ico"
 
 [Registry]
 ; .sptx opens with Stagepack Studio by default. Other programs stay offered under Open with:

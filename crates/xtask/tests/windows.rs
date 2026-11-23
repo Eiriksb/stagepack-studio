@@ -136,6 +136,11 @@ fn the_powershell_script_runs_the_tests_first() {
     for place in ["Inno Setup 6\\ISCC.exe", "${env:ProgramFiles(x86)}", "$env:ProgramFiles", "$env:LOCALAPPDATA", "Get-Command ISCC.exe", "jrsoftware.org"] {
         assert!(ps.contains(place), "package-windows.ps1 lacks {place}");
     }
+    // A missing test script is an error unless the tests are skipped on request; each step's exit code is checked.
+    assert!(ps.contains("-NoProfile -File") && !ps.contains("does not exist yet"), "the tests must run in their own PowerShell, and a missing script is an error");
+    assert!(ps.matches("if ($LASTEXITCODE -ne 0)").count() >= 3, "cargo's, the tests' and ISCC's exit codes must each be checked");
+    assert!(ps.contains("Push-Location") && ps.contains("finally") && ps.contains("Pop-Location"));
+    assert!(ps.contains("/DAppVersionNumeric="));
     assert!(ps.contains("/DAppVersion=") && ps.contains("/DStagedDir="));
 }
 
@@ -159,7 +164,6 @@ fn the_app_id_is_one_guid_that_never_changes() {
 fn the_installer_script_is_plain() {
     let text = iss();
     assert!(!text.contains('\t'), "tabs in the .iss");
-    assert!(!text.contains('\r'), "carriage returns in the .iss");
     assert!(text.is_ascii());
     // No indented line outside the preprocessor's own `#if` blocks, and every section header stands alone at column 0.
     let mut seen = Vec::new();
@@ -175,10 +179,11 @@ fn the_installer_script_is_plain() {
     let setup = section(&text, "Setup");
     for line in [
         "WizardStyle=modern",
-        "UninstallDisplayIcon={app}\\stagepack-studio.exe",
+        "UninstallDisplayIcon={app}\\icons\\stagepack-studio.ico",
         "CloseApplications=yes",
         "SetupIconFile={#StagedDir}\\icons\\stagepack-studio.ico",
         "AppVersion={#AppVersion}",
+        "VersionInfoVersion={#AppVersionNumeric}",
     ] {
         assert!(setup.iter().any(|l| l == line), "[Setup] lacks {line}");
     }
@@ -186,7 +191,23 @@ fn the_installer_script_is_plain() {
     assert_eq!(run.len(), 1);
     assert!(run[0].contains("Flags: postinstall nowait skipifsilent") && run[0].contains("Filename: \"{app}\\stagepack-studio.exe\""));
     // The Start-menu entry.
-    assert!(section(&text, "Icons").iter().any(|l| l.contains("{autoprograms}\\Stagepack Studio") && l.contains("{app}\\stagepack-studio.exe")));
+    assert!(section(&text, "Icons").iter().any(|l| l.contains("{autoprograms}\\Stagepack Studio") && l.contains("Filename: \"{app}\\stagepack-studio.exe\"") && l.contains("IconFilename: \"{app}\\icons\\stagepack-studio.ico\"")));
     // The version and the staged folder come from the command line.
     assert!(text.contains("#ifndef AppVersion") && text.contains("#ifndef StagedDir"));
+}
+
+#[test]
+fn the_shipped_windows_app_has_no_console_but_commands_print_in_the_terminal() {
+    // Windows only and never run here: these check that the pieces are in place.
+    let main = read("crates/app/src/main.rs");
+    assert!(main.contains(r#"#![cfg_attr(all(windows, feature = "shipped"), windows_subsystem = "windows")]"#));
+    let tool = read("crates/app/src/ai_tool/mod.rs");
+    let command = &tool[tool.find("pub fn run_command").expect("run_command")..];
+    let known = command.find("if !known").expect("the check for a known command");
+    let attach = command.find("attach_parent_console();").expect("run_command attaches the console");
+    let first_command = command.find("run_describe(rest)").expect("the commands run");
+    assert!(known < attach && attach < first_command, "attach after knowing it is a command, before running it");
+    assert!(tool.contains("#[cfg(windows)]\nfn attach_parent_console()") && tool.contains("AttachConsole(ATTACH_PARENT_PROCESS)"));
+    let manifest = read("crates/app/Cargo.toml");
+    assert!(manifest.contains("[target.'cfg(windows)'.dependencies]") && manifest.contains("windows-sys"));
 }

@@ -87,8 +87,8 @@ pub fn stage(out: &Path, bundle: Option<&Path>) -> Result<u64, String> {
     // Built one at a time, so that the helper's pseudo-terminal code isn't linked into the app.
     // In a target folder of their own, with the paths of the machine that builds them written
     // out of them, so that nothing of the builder's home ends up in a shipped program.
-    // On Linux cargo runs in a memory-limited scope; Windows has no such wrapper.
-    let cargo = if cfg!(windows) { PathBuf::from("cargo") } else { repo.join("scripts/cargo-safe.sh") };
+    // On Linux cargo runs in a memory-limited scope; Windows has no such wrapper, so the cargo that ran `package` builds.
+    let cargo = if cfg!(windows) { std::env::var_os("CARGO").map_or_else(|| PathBuf::from("cargo"), PathBuf::from) } else { repo.join("scripts/cargo-safe.sh") };
     let target = repo.join("target/package-build");
     let flags = path_free_flags(&repo);
     let build = |package: &str, features: &[&str]| {

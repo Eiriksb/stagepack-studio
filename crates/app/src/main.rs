@@ -1,3 +1,6 @@
+// The shipped program on Windows has no console window of its own; a command run from a terminal attaches to that terminal (see `ai_tool::attach_parent_console`).
+#![cfg_attr(all(windows, feature = "shipped"), windows_subsystem = "windows")]
+
 use std::path::PathBuf;
 
 use stagepack_studio::app_assets::AppAssets;
