@@ -1,7 +1,7 @@
 #!/bin/sh
-# Stagepack Studio: takes away exactly what install.sh put in place, using the list it kept
-# (install-manifest.txt, in the program's folder). Never touches the app's data folder
-# (~/.local/share/stagepack-studio) or anything it didn't write.
+# Stagepack Studio: takes away what install.sh put in place, and only that: each file is removed
+# only if it is still ours (it carries our marker, or is the very icon we installed, or is the link
+# to our program). Never touches the app's data folder (~/.local/share/stagepack-studio).
 #
 #   sh ~/.local/lib/stagepack-studio/uninstall.sh
 set -eu
@@ -11,85 +11,83 @@ refuse() {
     exit 1
 }
 say() { printf '%s\n' "$*"; }
-trim() {
-    _p=$1
-    while :; do
-        case $_p in
-            */) _p=${_p%/} ;;
-            *) break ;;
-        esac
-    done
-    printf '%s' "$_p"
-}
-NL='
-'
-TYPE=application/vnd.stagepack.talk
-ENTRY=stagepack-studio.desktop
 
-[ -n "${HOME:-}" ] || refuse "HOME isn't set, so there is no home folder to work in."
-HOME=$(trim "$HOME")
-[ -n "$HOME" ] || refuse "HOME is the top of the disk, which is not a home folder."
-case $HOME in /*) ;; *) refuse "HOME is a relative path, so there is no clear home folder." ;; esac
-[ "$(id -u)" != 0 ] || refuse "This is for one user and must not be run as root."
-for _var in XDG_DATA_HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_BIN_HOME; do
-    eval "_val=\${$_var:-}"
-    case $_val in
-        '' | /*) ;;
-        *) refuse "$_var is a relative path, and it has to be a full path." ;;
+OWN=$(cd "$(dirname "$0")" && pwd -P)
+[ "${OWN##*/}" = stagepack-studio ] && [ -f "$OWN/install-manifest.txt" ] && [ -f "$OWN/paths.sh" ] || refuse "This isn't an installed copy of Stagepack Studio (there is no install-manifest.txt beside it)."
+
+# The manifest only holds the settings install used and the default it replaced; they are read as
+# text (never run), and checked by the same rules as at install.
+PREV_CONFIG=
+PREV_APPS=
+NEW_CONFIG=
+NEW_APPS=
+while IFS= read -r _l || [ -n "$_l" ]; do
+    case $_l in
+        DATA=*) XDG_DATA_HOME=${_l#*=} ;;
+        CONFIG=*) XDG_CONFIG_HOME=${_l#*=} ;;
+        BIN=*) XDG_BIN_HOME=${_l#*=} ;;
+        prev_config=*) PREV_CONFIG=${_l#*=} ;;
+        prev_apps=*) PREV_APPS=${_l#*=} ;;
+        new_config=*) NEW_CONFIG=${_l#*=} ;;
+        new_apps=*) NEW_APPS=${_l#*=} ;;
     esac
-done
-DATA=$(trim "${XDG_DATA_HOME:-$HOME/.local/share}")
-CONFIG=$(trim "${XDG_CONFIG_HOME:-$HOME/.config}")
-BIN=$(trim "${XDG_BIN_HOME:-$HOME/.local/bin}")
-CACHE=$(trim "${XDG_CACHE_HOME:-$HOME/.cache}")
-[ -n "$DATA" ] && [ -n "$CONFIG" ] && [ -n "$BIN" ] || refuse "One of the folders is the top of the disk."
+done <"$OWN/install-manifest.txt"
+# shellcheck source=paths.sh
+. "$OWN/paths.sh"
+[ "$(cd "$APP" 2>/dev/null && pwd -P)" = "$OWN" ] || refuse "This folder isn't where the settings in its install-manifest.txt say Stagepack Studio was installed."
 
-APP=$(cd "$(dirname "$0")" && pwd -P)
-[ "${APP##*/}" = stagepack-studio ] && [ -f "$APP/install-manifest.txt" ] || refuse "This isn't an installed copy of Stagepack Studio (there is no install-manifest.txt beside it)."
-case "$APP/" in "$DATA/stagepack-studio/"*) refuse "This folder is inside the app's data folder, which is never touched." ;; esac
-
-MANIFEST=$(cat "$APP/install-manifest.txt")
-
-# Only paths under the user's own folders, written out in full, are ever touched.
-inside_ours() {
-    case $1 in
-        *"/../"* | */.. | */. | "") return 1 ;;
-    esac
-    for _root in "$HOME" "$DATA" "$CONFIG" "$BIN" "$CACHE" "$(dirname "$APP")"; do
-        case $1 in "$_root"/*) return 0 ;; esac
+# Is a menu entry with this ID still to be found, in the user's or the system's folders?
+entry_exists() {
+    [ -f "$APPS/$1" ] && return 0
+    _old_ifs=$IFS
+    IFS=:
+    for _d in ${XDG_DATA_DIRS:-/usr/local/share:/usr/share}; do
+        [ -n "$_d" ] && [ -f "$_d/applications/$1" ] && { IFS=$_old_ifs; return 0; }
     done
-    return 1
-}
-in_manifest() {
-    case "$NL$MANIFEST$NL" in *"$NL$1$NL"*) return 0 ;; esac
+    IFS=$_old_ifs
     return 1
 }
 
-# Our entry comes out of a mimeapps.list; the file goes only if we made it and nothing else is in it.
-strip_default() {
+# Our entry comes out of a mimeapps.list. In the default list the program it replaced goes back
+# if that program is still installed. The file goes only if we made it and nothing else is in it.
+fix_list() {
     _file=$1
-    _made=$2
+    _prev=$2
+    _made=$3
     [ -f "$_file" ] || return 0
     _tmp="$_file.stagepack-$$"
     _changed=0
+    _sec=
     while IFS= read -r _line || [ -n "$_line" ]; do
         case $_line in
+            "["*"]"*)
+                _sec=$_line
+                printf '%s\n' "$_line"
+                ;;
             "$TYPE="*)
                 _rest=
                 _hit=0
-                _vals=${_line#*=}
                 _old_ifs=$IFS
                 IFS=';'
-                for _v in $_vals; do
+                for _v in ${_line#*=}; do
                     if [ "$_v" = "$ENTRY" ]; then _hit=1; elif [ -n "$_v" ]; then _rest="$_rest$_v;"; fi
                 done
-                IFS=$_old_ifs
                 if [ $_hit = 1 ]; then
                     _changed=1
-                    [ -z "$_rest" ] || printf '%s=%s\n' "$TYPE" "$_rest"
+                    _back=
+                    if [ "$_sec" = "[Default Applications]" ]; then
+                        for _v in $_prev; do
+                            if entry_exists "$_v"; then _back="$_back$_v;"; fi
+                        done
+                    fi
+                    IFS=$_old_ifs
+                    _all="$_back$_rest"
+                    [ -z "$_all" ] || printf '%s=%s\n' "$TYPE" "$_all"
                 else
+                    IFS=$_old_ifs
                     printf '%s\n' "$_line"
                 fi
+                IFS=$_old_ifs
                 ;;
             *) printf '%s\n' "$_line" ;;
         esac
@@ -101,60 +99,51 @@ strip_default() {
     fi
 }
 
+# Removes a file only when it is ours; says so when it leaves one.
+remove_marked() {
+    if [ -f "$1" ] && [ ! -L "$1" ] && grep -qF "$MARK" "$1"; then rm -f "$1"; elif [ -e "$1" ] || [ -L "$1" ]; then say "Left $1, which is no longer Stagepack Studio's."; fi
+}
+remove_icon() {
+    if [ -f "$1" ] && [ ! -L "$1" ] && cmp -s "$1" "$OWN/icons/icon-$2.png"; then rm -f "$1"; elif [ -e "$1" ] || [ -L "$1" ]; then say "Left $1, which is no longer Stagepack Studio's."; fi
+}
+
 main() {
     cd /
     say "Removing Stagepack Studio from $APP and the entries it added. Your data folder $DATA/stagepack-studio is not touched."
-    _dirs=
-    _trees=
-    while IFS= read -r _entry; do
-        _kind=${_entry%% *}
-        _path=${_entry#? }
-        [ -n "$_entry" ] || continue
-        inside_ours "$_path" || { say "Skipped $_path (not a place install.sh writes)."; continue; }
-        case $_kind in
-            f)
-                if [ -L "$_path" ]; then
-                    case $(readlink "$_path") in
-                        "$APP"/*) rm -f "$_path" ;;
-                        *) say "Left $_path, which is a link to something else." ;;
-                    esac
-                elif [ -f "$_path" ]; then
-                    rm -f "$_path"
-                fi
-                ;;
-            d) _dirs="$_path${_dirs:+$NL$_dirs}" ;;
-            t) _trees="$_path${_trees:+$NL$_trees}" ;;
-            a) strip_default "$_path" 0 ;;
-            A) strip_default "$_path" 1 ;;
-        esac
-    done <<LIST
-$MANIFEST
-LIST
+    set -f
+    if [ -L "$BIN/stagepack-studio" ] && [ "$(readlink "$BIN/stagepack-studio")" = "$APP/stagepack-studio" ]; then
+        rm -f "$BIN/stagepack-studio"
+    elif [ -e "$BIN/stagepack-studio" ] || [ -L "$BIN/stagepack-studio" ]; then
+        say "Left $BIN/stagepack-studio, which is not our link."
+    fi
+    remove_marked "$APPS/stagepack-studio.desktop"
+    remove_marked "$MIMEDIR/packages/stagepack-studio.xml"
+    set +f
+    for _png in "$OWN"/icons/icon-*.png; do
+        [ -e "$_png" ] || continue
+        _n=${_png##*/icon-}
+        _n=${_n%.png}
+        remove_icon "$DATA/icons/hicolor/${_n}x${_n}/apps/stagepack-studio.png" "$_n"
+        remove_icon "$DATA/icons/hicolor/${_n}x${_n}/mimetypes/application-vnd.stagepack.talk.png" "$_n"
+    done
+    set -f
+    fix_list "$CONFIG/mimeapps.list" "$PREV_CONFIG" "$NEW_CONFIG"
+    fix_list "$APPS/mimeapps.list" "$PREV_APPS" "$NEW_APPS"
+    set +f
 
-    # The shared databases: rebuilt without us, unless the whole thing was ours to start with.
-    if [ -d "$DATA/mime" ]; then
-        if [ -n "$_trees" ] && [ -z "$(ls -A "$DATA/mime/packages" 2>/dev/null)" ]; then
-            case $_trees in *"$DATA/mime"*) rm -rf "$DATA/mime" ;; esac
-        elif command -v update-mime-database >/dev/null 2>&1; then
-            update-mime-database "$DATA/mime" >/dev/null 2>&1 || true
-        fi
+    # The shared databases are rebuilt without us.
+    if [ -d "$MIMEDIR" ] && command -v update-mime-database >/dev/null 2>&1; then
+        update-mime-database "$MIMEDIR" >/dev/null 2>&1 || true
     fi
-    if [ -d "$DATA/applications" ] && ! in_manifest "f $DATA/applications/mimeinfo.cache" && command -v update-desktop-database >/dev/null 2>&1; then
-        update-desktop-database "$DATA/applications" >/dev/null 2>&1 || true
+    if [ -d "$APPS" ] && command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$APPS" >/dev/null 2>&1 || true
     fi
-    if [ -f "$DATA/icons/hicolor/icon-theme.cache" ] && command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    if [ -f "$DATA/icons/hicolor/index.theme" ] && command -v gtk-update-icon-cache >/dev/null 2>&1; then
         gtk-update-icon-cache -f -t "$DATA/icons/hicolor" >/dev/null 2>&1 || true
     fi
 
-    # The program's own folder, then the empty folders install.sh made, innermost first.
+    # The program's own folder: the only folder ever removed.
     rm -rf "$APP"
-    if [ -n "$_dirs" ]; then
-        while IFS= read -r _d; do
-            rmdir "$_d" 2>/dev/null || true
-        done <<LIST
-$_dirs
-LIST
-    fi
     say "Done. Stagepack Studio is removed."
 }
 

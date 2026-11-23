@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// The files in `packaging/linux` that go beside the app in the package (the scripts are made executable).
-const PACKAGING_FILES: [&str; 4] = ["install.sh", "uninstall.sh", "stagepack-studio.desktop.in", "stagepack-studio-mime.xml"];
+const PACKAGING_FILES: [&str; 5] = ["install.sh", "uninstall.sh", "paths.sh", "stagepack-studio.desktop.in", "stagepack-studio-mime.xml"];
 
 /// The app's version, from `crates/app/Cargo.toml`.
 pub fn version() -> Result<String, String> {

@@ -134,6 +134,13 @@ fn snapshot(root: &Path) -> BTreeMap<String, String> {
     into
 }
 
+/// What a home holds that an uninstall must leave as it found it: files and links, not folders, and
+/// not what the system's own tools generate (the mime database and the menu cache). Folders made for
+/// our files may stay, which is the rule: the only folder uninstall removes is the program's own.
+fn kept(snapshot: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    snapshot.into_iter().filter(|(k, v)| v != "dir" && !k.starts_with(".local/share/mime/") && !k.ends_with("applications/mimeinfo.cache")).collect()
+}
+
 #[test]
 fn install_puts_everything_in_its_place() {
     install_in(Scratch::new("plain-home-"), false);
@@ -189,7 +196,7 @@ fn install_in(s: Scratch, spaced: bool) {
     // Taking it away leaves the home as it was.
     let out = s.uninstall();
     assert_eq!(out.status.code(), Some(0), "{}", said(&out));
-    assert_eq!(snapshot(&s.home), pristine);
+    assert_eq!(kept(snapshot(&s.home)), kept(pristine));
 }
 
 /// The environment changes a refusal case makes: a variable set, or removed (`None`).
@@ -200,7 +207,7 @@ fn install_refuses_what_it_shouldnt_touch() {
     let pkg = package();
     // Each case changes a fresh scratch home and must leave it exactly as it was.
     type Case = (&'static str, fn(&mut Scratch) -> Env);
-    let cases: [Case; 15] = [
+    let cases: [Case; 24] = [
         ("HOME unset", |_| vec![("HOME", None)]),
         ("HOME empty", |_| vec![("HOME", Some("".into()))]),
         ("HOME is /", |_| vec![("HOME", Some("/".into()))]),
@@ -240,6 +247,30 @@ fn install_refuses_what_it_shouldnt_touch() {
         }),
         // XDG_DATA_HOME=<home>/lib puts the program at <home>/lib/stagepack-studio, the app's own data folder.
         ("the program would land in the data folder", |s| vec![("XDG_DATA_HOME", Some(s.home.join("lib")))]),
+        ("XDG_DATA_HOME is the home itself", |s| vec![("XDG_DATA_HOME", Some(s.home.clone()))]),
+        ("XDG_DATA_HOME outside the home", |s| vec![("XDG_DATA_HOME", Some(s.root.join("elsewhere/share")))]),
+        ("XDG_DATA_HOME has a .. in it", |s| vec![("XDG_DATA_HOME", Some(s.home.join(".local/share/stagepack-studio/..")))]),
+        ("XDG_DATA_HOME is the app's data folder", |s| vec![("XDG_DATA_HOME", Some(s.home.join(".local/share/stagepack-studio")))]),
+        ("XDG_DATA_HOME is inside the app's data folder", |s| vec![("XDG_DATA_HOME", Some(s.home.join(".local/share/stagepack-studio/lib/x")))]),
+        ("XDG_BIN_HOME is inside the app's data folder", |s| vec![("XDG_BIN_HOME", Some(s.home.join(".local/share/stagepack-studio/bin")))]),
+        ("a symlinked menu entry", |s| {
+            std::fs::create_dir_all(s.data.join("applications")).unwrap();
+            std::fs::create_dir_all(s.home.join("dotfiles")).unwrap();
+            std::fs::write(s.home.join("dotfiles/mine.desktop"), "mine").unwrap();
+            std::os::unix::fs::symlink(s.home.join("dotfiles/mine.desktop"), s.data.join("applications/stagepack-studio.desktop")).unwrap();
+            vec![]
+        }),
+        ("someone else's icon", |s| {
+            let dir = s.data.join("icons/hicolor/48x48/apps");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("stagepack-studio.png"), "my own icon").unwrap();
+            vec![]
+        }),
+        ("a menu entry that isn't ours", |s| {
+            std::fs::create_dir_all(s.data.join("applications")).unwrap();
+            std::fs::write(s.data.join("applications/stagepack-studio.desktop"), "[Desktop Entry]\nName=Mine\n").unwrap();
+            vec![]
+        }),
         ("a quote in the path", |s| vec![("XDG_DATA_HOME", Some(s.home.join("a\"b/share")))]),
     ];
     for (name, change) in cases {
@@ -316,10 +347,7 @@ fn upgrade_and_uninstall_keep_the_data() {
     let out = s.uninstall();
     assert_eq!(out.status.code(), Some(0), "{}", said(&out));
     assert_eq!(snapshot(&data), before_data, "uninstalling changed the data folder");
-    let after = snapshot(&s.home);
-    let extra: Vec<_> = after.iter().filter(|(k, v)| before_all.get(*k) != Some(*v)).collect();
-    assert!(extra.is_empty(), "left behind or changed: {extra:#?}");
-    assert_eq!(after.len(), before_all.len(), "something went missing");
+    assert_eq!(kept(snapshot(&s.home)), kept(before_all), "left behind, changed or missing");
 }
 
 #[test]
@@ -329,7 +357,8 @@ fn stagepack_stays_under_open_with() {
     std::fs::create_dir_all(s.data.join("applications")).unwrap();
     std::fs::write(s.data.join("applications/stagepack.desktop"), theirs).unwrap();
     std::fs::create_dir_all(&s.config).unwrap();
-    std::fs::write(s.config.join("mimeapps.list"), format!("[Default Applications]\n{TYPE}=stagepack.desktop;\n")).unwrap();
+    let original_list = format!("[Added Associations]\n{TYPE}=stagepack.desktop;\n\n[Default Applications]\n{TYPE}=stagepack.desktop;\n");
+    std::fs::write(s.config.join("mimeapps.list"), &original_list).unwrap();
     let their_files = snapshot(&s.data.join("applications")).into_iter().filter(|(k, _)| k.starts_with("stagepack.desktop")).collect::<Vec<_>>();
 
     let out = s.install(package());
@@ -346,7 +375,8 @@ fn stagepack_stays_under_open_with() {
     let after = snapshot(&s.data.join("applications")).into_iter().filter(|(k, _)| k.starts_with("stagepack.desktop")).collect::<Vec<_>>();
     assert_eq!(after, their_files);
     let list = std::fs::read_to_string(s.config.join("mimeapps.list")).unwrap();
-    assert!(!list.contains("stagepack-studio.desktop"), "our default was left in mimeapps.list: {list}");
+    assert_eq!(list, original_list, "Stagepack's own default should be back, byte for byte");
+    assert_eq!(s.xdg_mime(&["query", "default", TYPE]), "stagepack.desktop");
     assert!(!s.data.join("applications/stagepack-studio.desktop").exists());
 }
 
@@ -385,4 +415,116 @@ fn the_tarball_unpacks_to_one_folder() {
     let out = s.install(&unpacked.join(&top));
     assert_eq!(out.status.code(), Some(0), "{}", said(&out));
     assert_eq!(s.uninstall().status.code(), Some(0));
+}
+
+/// Installs into a fresh scratch home and returns it.
+fn installed() -> Scratch {
+    let s = Scratch::new("fix-");
+    let out = s.install(package());
+    assert_eq!(out.status.code(), Some(0), "{}", said(&out));
+    s
+}
+
+#[test]
+fn uninstall_removes_only_what_install_wrote() {
+    let s = installed();
+    // A planted manifest naming the owner's files, the home and a path with .. in it.
+    std::fs::create_dir_all(s.home.join("Documents")).unwrap();
+    std::fs::write(s.home.join("Documents/thesis.txt"), "mine").unwrap();
+    let data = s.data.join("stagepack-studio");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("permissions.json"), "{}").unwrap();
+    let manifest = s.app().join("install-manifest.txt");
+    let mut text = std::fs::read_to_string(&manifest).unwrap();
+    for line in [format!("f {}/Documents/thesis.txt", s.home.display()), format!("f {}", data.join("permissions.json").display()), format!("d {}", s.home.display()), format!("f {}/Documents/../Documents/thesis.txt", s.home.display()), format!("t {}", s.home.display())] {
+        text.push_str(&line);
+        text.push('\n');
+    }
+    std::fs::write(&manifest, text).unwrap();
+    // A menu entry the owner has since replaced stays too.
+    std::fs::write(s.data.join("applications/stagepack-studio.desktop"), "[Desktop Entry]\nName=Mine now\n").unwrap();
+    let before = snapshot(&s.home.join("Documents"));
+    let out = s.uninstall();
+    assert_eq!(out.status.code(), Some(0), "{}", said(&out));
+    assert_eq!(snapshot(&s.home.join("Documents")), before);
+    assert!(data.join("permissions.json").exists());
+    assert!(s.data.join("applications/stagepack-studio.desktop").exists(), "an entry that isn't ours was removed");
+    assert!(said(&out).contains("Left "), "{}", said(&out));
+    assert!(!s.app().exists() && s.home.exists());
+}
+
+#[test]
+fn uninstall_refuses_a_manifest_that_points_at_the_data_folder() {
+    let s = installed();
+    let manifest = s.app().join("install-manifest.txt");
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    let data = s.data.join("stagepack-studio");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("a"), "x").unwrap();
+    let tampered: String = text.lines().map(|l| if l.starts_with("DATA=") { format!("DATA={}\n", data.display()) } else { format!("{l}\n") }).collect();
+    std::fs::write(&manifest, tampered).unwrap();
+    let out = s.uninstall();
+    assert_ne!(out.status.code(), Some(0));
+    assert!(data.join("a").exists() && s.app().exists());
+    // Uninstalling in an environment other than install's still works, by the recorded settings.
+    std::fs::write(&manifest, text).unwrap();
+    let mut command = s.command("sh");
+    command.arg(s.app().join("uninstall.sh")).env_remove("XDG_DATA_HOME").env_remove("XDG_CONFIG_HOME").env_remove("XDG_BIN_HOME");
+    // (the scratch data folder is the default one, so make it the recorded one explicitly)
+    let out = command.output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", said(&out));
+    assert!(!s.app().exists());
+    assert!(!s.bin.join("stagepack-studio").exists());
+}
+
+#[test]
+fn install_never_writes_through_a_link() {
+    let s = Scratch::new("link-");
+    // Installing over a dotfiles link is refused (see the refusal cases); an old link of ours after an install stays a link.
+    let out = s.install(package());
+    assert_eq!(out.status.code(), Some(0), "{}", said(&out));
+    let entry = s.data.join("applications/stagepack-studio.desktop");
+    let mine = s.home.join("dotfiles/mine.desktop");
+    std::fs::create_dir_all(mine.parent().unwrap()).unwrap();
+    std::fs::write(&mine, "mine").unwrap();
+    std::fs::remove_file(&entry).unwrap();
+    std::os::unix::fs::symlink(&mine, &entry).unwrap();
+    let out = s.install(package());
+    assert_ne!(out.status.code(), Some(0));
+    assert_eq!(std::fs::read_to_string(&mine).unwrap(), "mine");
+    let out = s.uninstall();
+    assert_eq!(out.status.code(), Some(0), "{}", said(&out));
+    assert_eq!(std::fs::read_to_string(&mine).unwrap(), "mine", "uninstall removed through a link");
+}
+
+#[test]
+fn a_cut_short_install_tidies_up() {
+    for stop in ["copy", "swap"] {
+        // First install cut during the copy, and an upgrade cut between the two moves.
+        let s = Scratch::new("cut-");
+        let lib = s.app().parent().unwrap().to_path_buf();
+        if stop == "swap" {
+            assert_eq!(s.install(package()).status.code(), Some(0));
+        }
+        let before = snapshot(&s.home);
+        let out = s.command("sh").arg(package().join("install.sh")).env("STAGEPACK_INSTALL_STOP_AT", stop).output().unwrap();
+        assert_ne!(out.status.code(), Some(0), "{stop}: {}", said(&out));
+        let names: Vec<_> = std::fs::read_dir(&lib).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+        assert!(names.iter().all(|n| n == "stagepack-studio"), "{stop}: scratch copies left: {names:?}");
+        if stop == "swap" {
+            assert_eq!(snapshot(&s.home), before, "the old install should be back exactly");
+        } else {
+            assert!(!s.app().exists());
+        }
+        assert!(said(&out).contains("stopped before finishing"));
+    }
+}
+
+#[test]
+fn a_default_of_stars_is_not_expanded() {
+    let s = installed();
+    let list = s.config.join("mimeapps.list");
+    std::fs::write(&list, format!("[Default Applications]\n{TYPE}=stagepack-studio.desktop;*;\n")).unwrap();
+    assert_eq!(s.uninstall().status.code(), Some(0));
+    assert_eq!(std::fs::read_to_string(&list).unwrap(), format!("[Default Applications]\n{TYPE}=*;\n"));
 }

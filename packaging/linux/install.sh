@@ -15,64 +15,24 @@ refuse() {
 }
 say() { printf '%s\n' "$*"; }
 
-# Strips trailing slashes ("/" becomes empty).
-trim() {
-    _p=$1
-    while :; do
-        case $_p in
-            */) _p=${_p%/} ;;
-            *) break ;;
-        esac
-    done
-    printf '%s' "$_p"
-}
-
-NL='
-'
-
-# ---- Who and where: refuse anything that isn't a normal user's home ----
-[ -n "${HOME:-}" ] || refuse "HOME isn't set, so there is no home folder to install into."
-HOME=$(trim "$HOME")
-[ -n "$HOME" ] || refuse "HOME is the top of the disk, which is not a home folder to install into."
-case $HOME in /*) ;; *) refuse "HOME is a relative path, so there is no clear home folder to install into." ;; esac
-[ "$(id -u)" != 0 ] || refuse "This installs for one user and must not be run as root; run it as the user who will use the program."
-for _var in XDG_DATA_HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_BIN_HOME; do
-    eval "_val=\${$_var:-}"
-    case $_val in
-        '' | /*) ;;
-        *) refuse "$_var is a relative path, and it has to be a full path." ;;
-    esac
-done
-
-if [ -n "${XDG_DATA_HOME:-}" ]; then
-    DATA=$(trim "$XDG_DATA_HOME")
-    [ -n "$DATA" ] || refuse "XDG_DATA_HOME is the top of the disk, which is not a data folder to install into."
-    _up=$(dirname "$DATA")
-    [ "$_up" != / ] || refuse "XDG_DATA_HOME is too close to the top of the disk to put the program beside it."
-    APP="$_up/lib/stagepack-studio"
-else
-    DATA="$HOME/.local/share"
-    APP="$HOME/.local/lib/stagepack-studio"
-fi
-CONFIG=$(trim "${XDG_CONFIG_HOME:-$HOME/.config}")
-BIN=$(trim "${XDG_BIN_HOME:-$HOME/.local/bin}")
-[ -n "$CONFIG" ] && [ -n "$BIN" ] || refuse "A folder named for the install is the top of the disk."
-for _p in "$HOME" "$DATA" "$CONFIG" "$BIN" "$APP"; do
-    case $_p in *"$NL"*) refuse "A folder name has a line break in it." ;; esac
-done
-case "$APP/" in "$DATA/stagepack-studio/"*) refuse "The program would land inside the app's data folder $DATA/stagepack-studio, which is never written to." ;; esac
-case "$DATA/" in "$APP/"*) refuse "The data folder is inside where the program would go." ;; esac
+SRC=$(cd "$(dirname "$0")" && pwd -P)
+[ -f "$SRC/paths.sh" ] || refuse "This folder isn't a complete Stagepack Studio package (paths.sh is missing); unpack the .tar.zst again."
+# shellcheck source=paths.sh
+. "$SRC/paths.sh"
 
 # ---- The folder this script is in must be a whole staged app ----
-SRC=$(cd "$(dirname "$0")" && pwd -P)
-for _part in stagepack-studio stagepack-terminal bundle/bin/rustc; do
+for _part in stagepack-studio stagepack-terminal bundle/bin/rustc stagepack-studio.desktop.in stagepack-studio-mime.xml icons uninstall.sh; do
     [ -e "$SRC/$_part" ] || refuse "This folder isn't a complete Stagepack Studio package ($_part is missing); unpack the .tar.zst again."
 done
-for _part in stagepack-studio.desktop.in stagepack-studio-mime.xml icons uninstall.sh; do
-    [ -e "$SRC/$_part" ] || refuse "This folder isn't a complete Stagepack Studio package ($_part is missing); unpack the .tar.zst again."
+ICONS=
+for _png in "$SRC"/icons/icon-*.png; do
+    [ -e "$_png" ] || continue
+    _n=${_png##*/icon-}
+    ICONS="$ICONS ${_n%.png}"
 done
+[ -n "$ICONS" ] || refuse "This folder has no icons in it; unpack the .tar.zst again."
 
-# ---- What is already there ----
+# ---- What is already there: nothing that isn't ours is replaced, and nothing is written through a link ----
 if [ -L "$APP" ]; then
     refuse "$APP is a link, and the program won't be put over a link."
 elif [ -e "$APP" ] && [ ! -d "$APP" ]; then
@@ -85,6 +45,30 @@ if [ -L "$BIN/stagepack-studio" ]; then
 elif [ -e "$BIN/stagepack-studio" ]; then
     refuse "$BIN/stagepack-studio already exists and isn't a link from an earlier install."
 fi
+# A file of ours (it carries the marker) may be replaced; a link, a folder or anyone else's file may not.
+check_marked() {
+    if [ -L "$1" ]; then
+        refuse "$1 is a link, and nothing is written through a link."
+    elif [ -e "$1" ] && { [ ! -f "$1" ] || ! grep -qF "$MARK" "$1"; }; then
+        refuse "$1 already exists and isn't from Stagepack Studio."
+    fi
+}
+check_icon() {
+    if [ -L "$1" ]; then
+        refuse "$1 is a link, and nothing is written through a link."
+    elif [ -e "$1" ]; then
+        [ -f "$1" ] || refuse "$1 already exists and isn't from Stagepack Studio."
+        cmp -s "$1" "$SRC/icons/icon-$2.png" && return 0
+        [ -f "$APP/icons/icon-$2.png" ] && cmp -s "$1" "$APP/icons/icon-$2.png" && return 0
+        refuse "$1 already exists and isn't from Stagepack Studio."
+    fi
+}
+check_marked "$APPS/stagepack-studio.desktop"
+check_marked "$MIMEDIR/packages/stagepack-studio.xml"
+for _n in $ICONS; do
+    check_icon "$DATA/icons/hicolor/${_n}x${_n}/apps/stagepack-studio.png" "$_n"
+    check_icon "$DATA/icons/hicolor/${_n}x${_n}/mimetypes/application-vnd.stagepack.talk.png" "$_n"
+done
 
 # The Exec line: quoted when the path needs it, as the Desktop Entry specification says.
 EXEC_PATH="$APP/stagepack-studio"
@@ -93,16 +77,6 @@ case $EXEC_PATH in
     *[!A-Za-z0-9_./+:,@=-]*) EXEC_QUOTED="\"$EXEC_PATH\"" ;;
     *) EXEC_QUOTED=$EXEC_PATH ;;
 esac
-
-APPS="$DATA/applications"
-MIMEDIR="$DATA/mime"
-ICONS=
-for _png in "$SRC"/icons/icon-*.png; do
-    [ -e "$_png" ] || continue
-    _n=${_png##*/icon-}
-    ICONS="$ICONS ${_n%.png}"
-done
-[ -n "$ICONS" ] || refuse "This folder has no icons in it; unpack the .tar.zst again."
 
 say "Stagepack Studio will be installed for you only:"
 say "  program         $APP"
@@ -113,75 +87,97 @@ say "  icons           $DATA/icons/hicolor/<size>/apps and mimetypes"
 say "  default for .sptx files  set in $CONFIG/mimeapps.list"
 say "Your data folder $DATA/stagepack-studio is not touched."
 
-# ---- The manifest: what uninstall.sh will take away (paths outside the program's folder) ----
+# ---- What the manifest keeps: the settings used, and the default this install replaces ----
 OLD_MANIFEST=
 [ -f "$APP/install-manifest.txt" ] && OLD_MANIFEST=$(cat "$APP/install-manifest.txt")
-MANIFEST=$OLD_MANIFEST
-add() {
-    case "$NL$MANIFEST$NL" in *"$NL$1$NL"*) return 0 ;; esac
-    MANIFEST="${MANIFEST:+$MANIFEST$NL}$1"
-}
-# Notes the folders that don't exist yet and will be made for `$1`, outermost first.
-note_dirs() {
-    _list=
-    _q=$1
-    while [ ! -e "$_q" ] && [ "$_q" != / ] && [ -n "$_q" ]; do
-        _list="$_q${_list:+$NL$_list}"
-        _q=$(dirname "$_q")
-    done
-    [ -z "$_list" ] || while IFS= read -r _d; do add "d $_d"; done <<LIST
-$_list
+old_value() {
+    while IFS= read -r _l || [ -n "$_l" ]; do
+        case $_l in "$1="*) printf '%s' "${_l#*=}"; return 0 ;; esac
+    done <<LIST
+$OLD_MANIFEST
 LIST
 }
-note_dirs "$(dirname "$APP")"
-note_dirs "$BIN"
-note_dirs "$APPS"
-note_dirs "$DATA/icons"
-note_dirs "$CONFIG"
-[ -e "$MIMEDIR" ] || { note_dirs "$DATA"; add "t $MIMEDIR"; }
-add "f $BIN/stagepack-studio"
-add "f $APPS/stagepack-studio.desktop"
-add "f $MIMEDIR/packages/stagepack-studio.xml"
-for _n in $ICONS; do
-    add "f $DATA/icons/hicolor/${_n}x${_n}/apps/stagepack-studio.png"
-    add "f $DATA/icons/hicolor/${_n}x${_n}/mimetypes/application-vnd.stagepack.talk.png"
-done
-[ -e "$APPS/mimeinfo.cache" ] || add "f $APPS/mimeinfo.cache"
-[ -e "$DATA/icons/hicolor/icon-theme.cache" ] || add "f $DATA/icons/hicolor/icon-theme.cache"
-for _list in "$CONFIG/mimeapps.list" "$APPS/mimeapps.list"; do
-    if [ -e "$_list" ]; then add "a $_list"; else add "A $_list"; fi
-done
-# Folders made for the icons (only listed when they're new).
-for _n in $ICONS; do
-    note_dirs "$DATA/icons/hicolor/${_n}x${_n}/apps"
-    note_dirs "$DATA/icons/hicolor/${_n}x${_n}/mimetypes"
-done
+# The default for our type in a mimeapps.list's [Default Applications], other programs only.
+default_in() {
+    [ -f "$1" ] || return 0
+    _sec=
+    _v=
+    while IFS= read -r _l || [ -n "$_l" ]; do
+        case $_l in
+            "["*"]"*) _sec=$_l ;;
+            "$TYPE="*) [ "$_sec" = "[Default Applications]" ] && { _v=${_l#*=}; break; } ;;
+        esac
+    done <"$1"
+    _out=
+    set -f
+    _old_ifs=$IFS
+    IFS=';'
+    for _t in $_v; do
+        [ -z "$_t" ] || [ "$_t" = "$ENTRY" ] || _out="$_out$_t;"
+    done
+    IFS=$_old_ifs
+    set +f
+    printf '%s' "$_out"
+}
+PREV_CONFIG=$(old_value prev_config)
+PREV_APPS=$(old_value prev_apps)
+[ -n "$PREV_CONFIG" ] || PREV_CONFIG=$(default_in "$CONFIG/mimeapps.list")
+[ -n "$PREV_APPS" ] || PREV_APPS=$(default_in "$APPS/mimeapps.list")
+NEW_CONFIG=$(old_value new_config)
+NEW_APPS=$(old_value new_apps)
+[ -e "$CONFIG/mimeapps.list" ] || NEW_CONFIG=1
+[ -e "$APPS/mimeapps.list" ] || NEW_APPS=1
+MANIFEST="DATA=$DATA${NL}CONFIG=$CONFIG${NL}BIN=$BIN${NL}prev_config=$PREV_CONFIG${NL}prev_apps=$PREV_APPS${NL}new_config=$NEW_CONFIG${NL}new_apps=$NEW_APPS"
 
 # ---- Put the program in place: copy beside it, then swap, so a failure leaves the old one ----
 NEW="$APP.new-$$"
 OLD="$APP.old-$$"
-trap '_s=$?; rm -rf "$NEW"; [ "$_s" -eq 0 ] || printf "install.sh: stopped before finishing. Run uninstall.sh from %s to tidy up if anything was half done.\n" "$APP" >&2' EXIT
+SWAPPED=0
+cleanup() {
+    _s=$?
+    trap - EXIT INT TERM HUP
+    if [ "$SWAPPED" = 0 ] && [ -d "$OLD" ] && [ ! -e "$APP" ]; then mv "$OLD" "$APP"; fi
+    if [ "$SWAPPED" = 1 ]; then rm -rf "$OLD"; fi
+    rm -rf "$NEW"
+    if [ "$_s" -ne 0 ]; then
+        printf 'install.sh: stopped before finishing. An earlier install, if there was one, is still in place; run uninstall.sh from %s to tidy up anything half done (an empty folder may be left behind).\n' "$APP" >&2
+    fi
+    exit "$_s"
+}
+trap cleanup EXIT
+trap 'exit 1' INT TERM HUP
+# Tidy what a cut-short earlier run left beside the program.
+for _stale in "$APP".new-*; do [ -e "$_stale" ] && rm -rf "$_stale"; done
+for _stale in "$APP".old-*; do
+    [ -e "$_stale" ] || continue
+    if [ ! -e "$APP" ]; then mv "$_stale" "$APP"; else rm -rf "$_stale"; fi
+done
+# A hook for the tests only: stop at a chosen step, as a signal would.
+hook() { [ "${STAGEPACK_INSTALL_STOP_AT:-}" != "$1" ] || kill -TERM $$; }
 mkdir -p "$(dirname "$APP")"
-rm -rf "$NEW" "$OLD"
 mkdir "$NEW"
 cp -a "$SRC/." "$NEW/"
+hook copy
 printf '%s\n' "$MANIFEST" >"$NEW/install-manifest.txt"
 if [ -d "$APP" ]; then
     mv "$APP" "$OLD"
+    hook swap
     if ! mv "$NEW" "$APP"; then
         mv "$OLD" "$APP"
-        refuse "Couldn't move the new program into place; the old one is still there."
+        printf 'install.sh: couldn'"'"'t move the new program into place; the old one is still there.\n' >&2
+        exit 1
     fi
+    SWAPPED=1
     rm -rf "$OLD"
 else
     mv "$NEW" "$APP"
+    SWAPPED=1
 fi
 
 # ---- The rest, all under the user's folders ----
 mkdir -p "$BIN" "$APPS" "$MIMEDIR/packages"
 ln -sf "$APP/stagepack-studio" "$BIN/stagepack-studio"
 
-: >"$APPS/stagepack-studio.desktop"
 while IFS= read -r _line || [ -n "$_line" ]; do
     case $_line in
         *@EXEC@*) printf '%s%s%s\n' "${_line%%@EXEC@*}" "$EXEC_QUOTED" "${_line#*@EXEC@}" ;;
