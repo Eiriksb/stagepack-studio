@@ -322,7 +322,7 @@ impl Render for SlideEditor {
         )
         .absolute()
         .size_full();
-        let live_keys = self.live_has_keys();
+        let live_keys = self.live_has_keys(cx);
         let key_context = match (selecting, video.is_some(), model.is_some()) {
             _ if live_keys => LIVE_CONTEXT.to_string(),
             (true, true, _) => format!("{SELECTION_CONTEXT} {VIDEO_CONTEXT}"),

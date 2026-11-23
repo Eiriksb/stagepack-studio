@@ -187,6 +187,10 @@ impl Presentation {
         let Some((workspace, _)) = self.owner.clone() else { return };
         let Some(window) = self.presenter.as_ref().map(|shown| shown.window).or(self.audience.as_ref().map(|shown| shown.window)) else { return };
         self.ask_pending = true;
+        // Nothing typed meanwhile reaches a program.
+        if let Some((_, live)) = &self.owner {
+            live.release_keys();
+        }
         let show = cx.entity().downgrade();
         cx.defer(move |cx| {
             window
@@ -490,9 +494,28 @@ fn window_root(
         .track_focus(focus_handle)
         // While a live terminal has the keys, none of the show's own bindings apply: this has every
         // key, the arrows and Escape included, but the one that gives them back.
-        .on_key_down(move |event, _, cx| {
+        .on_key_down(move |event, window, cx| {
+            // While a question is open no key goes to a program.
+            let windows = keyed.read(cx).windows();
+            if dialog_in(windows, window, cx) {
+                return;
+            }
             if keyed.update(cx, |show, cx| show.key_for_live(&event.keystroke, cx)) {
                 cx.stop_propagation();
+                return;
+            }
+            // The program ended since this window was drawn: the key is the show's, as it would be.
+            if keys_held && !keyed.read(cx).keys_held() && !event.keystroke.modifiers.modified() {
+                let action: Option<Box<dyn Action>> = match event.keystroke.key.as_str() {
+                    "right" | "pagedown" | "space" | "enter" => Some(Box::new(ShowNext)),
+                    "left" | "pageup" | "backspace" => Some(Box::new(ShowPrevious)),
+                    "escape" => Some(Box::new(EndShow)),
+                    _ => None,
+                };
+                if let Some(action) = action {
+                    window.dispatch_action(action, cx);
+                    cx.stop_propagation();
+                }
             }
         })
         .on_action(move |_: &ShowNext, window, cx| {
@@ -830,6 +853,13 @@ impl AudienceView {
     /// them off when none does.
     fn apply_live(&mut self, cx: &mut Context<Self>) {
         let Some((_, live)) = self.show.read(cx).owner.clone() else { return };
+        // Keys held by a terminal this slide doesn't show are given back.
+        if let Some(held) = live.keys()
+            && !self.live_on.iter().any(|terminal| terminal.source.clone().zip(terminal.on.run.clone()).is_some_and(|(source, run)| LiveId::new(source, run) == held))
+        {
+            live.release_keys();
+            self.show.update(cx, |_, cx| cx.notify());
+        }
         let keys = live.keys();
         let places: Vec<LivePlace> = self
             .live_on

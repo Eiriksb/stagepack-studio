@@ -92,6 +92,7 @@ impl WorkspaceView {
                 match start_after_yes(&place, &command, &self.run_yes, remembered, &helper, size) {
                     Ok(session) => {
                         self.live.add(id, session);
+                        document.update(cx, |document, _| document.keep_moves(true));
                         self.watch_live(cx);
                         cx.notify();
                         LiveStep::Going
@@ -143,12 +144,17 @@ impl WorkspaceView {
 
     /// Ends the terminals whose tag was taken away, or whose `run` was changed, by an edit.
     pub(super) fn sync_live(&mut self, cx: &mut Context<Self>) {
-        if self.live.is_idle() {
-            return;
-        }
         let Some(document) = self.document.clone() else {
             return;
         };
+        // Each tag goes along with the edits made before it.
+        for change in document.update(cx, |document, _| document.take_moves()) {
+            self.live.follow(&change);
+        }
+        if self.live.is_idle() {
+            document.update(cx, |document, _| document.keep_moves(false));
+            return;
+        }
         let tags: Vec<LiveId> = document.update(cx, |document, _| {
             (0..document.slide_count())
                 .flat_map(|slide| document.terminals_on(slide))
@@ -171,7 +177,8 @@ impl WorkspaceView {
                 let more = this
                     .update(cx, |this, cx| {
                         let polled = this.live.poll();
-                        for sentence in polled.sayings {
+                        let had_sayings = !polled.sayings.is_empty();
+                        for sentence in polled.sayings.clone() {
                             this.say(sentence, cx);
                         }
                         // A program that has ended is shown as such.
@@ -179,7 +186,10 @@ impl WorkspaceView {
                         if !more {
                             this.live_watch = None;
                         }
-                        cx.notify();
+                        // Drawn again only for what changed: not for every look.
+                        if !more || polled.changed || had_sayings {
+                            cx.notify();
+                        }
                         more
                     })
                     .unwrap_or(false);

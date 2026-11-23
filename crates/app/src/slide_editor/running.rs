@@ -3,6 +3,8 @@
 
 use super::*;
 
+use gpui_kit::component::WindowExt as _;
+
 use slides_engine::TerminalLayer;
 
 use crate::live_terminal::{LiveId, gives_keys_back};
@@ -75,8 +77,17 @@ impl SlideEditor {
     }
 
     /// Whether a live terminal has the keys, here.
-    pub(super) fn live_has_keys(&self) -> bool {
-        !self.live.show_on() && self.live.keys().is_some()
+    /// A terminal that isn't drawn here, on the slide shown, has no keys: they go back.
+    pub(super) fn live_has_keys(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.live.show_on() {
+            return false;
+        }
+        let Some(held) = self.live.keys() else { return false };
+        if self.running_here(cx).iter().any(|runs| runs.id == held) {
+            return true;
+        }
+        self.live.release_keys();
+        false
     }
 
     /// *Start*: the window starts the terminal selected, asking first if it has to.
@@ -124,8 +135,13 @@ impl SlideEditor {
 
     /// A key while a live terminal has the keys: it goes to the program, except the one that gives
     /// the keys back, and nothing else, the window's bindings included, takes it.
-    fn key_for_terminal(&mut self, key: &Keystroke, cx: &mut Context<Self>) {
-        if !self.live_has_keys() {
+    fn key_for_terminal(&mut self, key: &Keystroke, window: &mut Window, cx: &mut Context<Self>) {
+        // A question open: the keys are its, and the terminal has none from now on.
+        if self.live.keys().is_some() && window.has_active_dialog(cx) {
+            self.live.release_keys();
+            return;
+        }
+        if !self.live_has_keys(cx) {
             return;
         }
         if gives_keys_back(key) {
@@ -134,9 +150,9 @@ impl SlideEditor {
             cx.notify();
             return;
         }
-        if self.live.send(key) {
-            cx.stop_propagation();
-        }
+        // Whatever it sends, nothing else, the window's bindings included, takes the key.
+        self.live.send(key);
+        cx.stop_propagation();
     }
 
     /// Has the editor take the keys before any binding of the window does, while a terminal has
@@ -148,7 +164,7 @@ impl SlideEditor {
             if !focus.is_focused(window) {
                 return;
             }
-            editor.update(cx, |editor, cx| editor.key_for_terminal(&event.keystroke, cx)).ok();
+            editor.update(cx, |editor, cx| editor.key_for_terminal(&event.keystroke, window, cx)).ok();
         });
         self._subscriptions.push(watching);
     }

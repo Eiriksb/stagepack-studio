@@ -558,3 +558,129 @@ fn typing_in_the_editor_goes_to_the_terminal_only_while_it_has_the_keys(cx: &mut
     assert_ne!(typing.source(cx), before, "the tag was taken away");
     nothing_left(cx, &windows, &live, "31306");
 }
+
+/// Starts the terminal on the slide shown in the editor with *Start* and *Run*.
+fn start_here(typing: &Typing, cx: &mut TestAppContext, live: &LiveTerminals, windows: &[AnyWindowHandle]) {
+    let terminal = thing(typing, cx, "<Terminal");
+    let at = typing.at(cx, terminal.rect.x + terminal.rect.w / 5., terminal.rect.y + terminal.rect.h / 5.);
+    typing.click(cx, at);
+    click_on(typing, cx, TERMINAL_START_ID);
+    assert!(until(cx, windows, 5, |cx| bounds_of(typing, cx, RUN_YES_ID).is_some()));
+    click_on(typing, cx, RUN_YES_ID);
+    assert!(until(cx, windows, 10, |_| live.running() == 1));
+}
+
+fn reload(typing: &Typing, cx: &mut TestAppContext, source: String) {
+    let document = typing.document(cx);
+    cx.update(|cx| {
+        document.update(cx, |document, cx| {
+            document.reload(Some(source));
+            cx.notify();
+        })
+    });
+    cx.run_until_parked();
+}
+
+#[gpui_kit::test]
+fn typing_above_a_running_tag_keeps_it_running(cx: &mut TestAppContext) {
+    let around = surroundings(Some(&helper::helper_program()));
+    let talk = format!("# One\n\nhello\n\n---\n\n# Two\n\n{}\n", tag("sh -c \"cat; : 31309\"", 100));
+    let typing = open_talk(cx, &around, &talk);
+    let live = live_of(&typing, cx);
+    let windows = [typing.handle];
+    go_to(&typing, cx, 1);
+    start_here(&typing, cx, &live, &windows);
+    let id = live.ids()[0].clone();
+    let session = live.get(&id).unwrap();
+    // An edit on the first slide moves the tag and ends nothing.
+    reload(&typing, cx, talk.replacen("hello", "hello there, all of you", 1));
+    wait(cx, 1_000);
+    assert_eq!(live.running(), 1);
+    assert!(std::rc::Rc::ptr_eq(&live.get(&live.ids()[0]).unwrap(), &session), "the same session");
+    assert!(live.ids()[0].source().start > id.source().start, "its place was followed");
+    assert!(!processes_with("31309").is_empty());
+    // Taking the tag away ends it.
+    reload(&typing, cx, "# One\n\nhello there, all of you\n\n---\n\n# Two\n".to_string());
+    nothing_left(cx, &windows, &live, "31309");
+}
+
+#[gpui_kit::test]
+fn keys_stay_only_with_a_terminal_that_is_shown(cx: &mut TestAppContext) {
+    let around = surroundings(Some(&helper::helper_program()));
+    let talk = format!("# One\n\n---\n\n# Two\n\n{}\n", tag("sh -c \"cat; : 31310\"", 100));
+    let typing = open_talk(cx, &around, &talk);
+    let live = live_of(&typing, cx);
+    let windows = [typing.handle];
+    go_to(&typing, cx, 1);
+    start_here(&typing, cx, &live, &windows);
+    let session = live.get(&live.ids()[0]).unwrap();
+    let terminal = thing(&typing, cx, "<Terminal");
+    let at = typing.at(cx, terminal.rect.x + terminal.rect.w / 5., terminal.rect.y + terminal.rect.h / 5.);
+    typing.click(cx, at);
+    assert!(live.keys().is_some());
+    // The slide changes, as from the strip: the keys go back.
+    let document = typing.document(cx);
+    cx.update(|cx| document.update(cx, |document, cx| {
+        document.go_to(0);
+        cx.notify();
+    }));
+    typing.settle(cx);
+    assert!(live.keys().is_none());
+    typing.press(cx, "h");
+    typing.press(cx, "i");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!screen_text(&session).contains("hi"), "{}", screen_text(&session));
+    // Coming back doesn't bring them back.
+    cx.update(|cx| document.update(cx, |document, cx| {
+        document.go_to(1);
+        cx.notify();
+    }));
+    typing.settle(cx);
+    assert!(live.keys().is_none());
+    // Nor does a show starting from the ribbon find them taken.
+    typing.click(cx, at);
+    assert!(live.keys().is_some());
+    cx.update_window(typing.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(stagepack_studio::ribbon::TAB_SLIDE_SHOW_ID, cx);
+        window.render_frame(cx);
+        window.click(stagepack_studio::ribbon::REHEARSE_ID, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let show = typing.view.read_with(cx, |view, _| view.current_show()).expect("a show");
+    let presenter = cx.read(|cx| show.read(cx).presenter().unwrap().0);
+    let audience = cx.read(|cx| show.read(cx).audience().unwrap().0);
+    let rehearsal = Rehearsal { show, audience, presenter };
+    for window in rehearsal.windows() {
+        render(cx, window);
+    }
+    assert!(live.keys().is_none());
+    press(cx, rehearsal.presenter, "right");
+    assert_eq!(rehearsal.counter(cx), "2 / 2", "the show moves");
+    press(cx, rehearsal.presenter, "escape");
+    nothing_left(cx, &[typing.handle], &live, "31310");
+}
+
+#[gpui_kit::test]
+fn keys_never_reach_a_program_while_a_question_is_open(cx: &mut TestAppContext) {
+    let around = surroundings(Some(&helper::helper_program()));
+    let talk = format!("# One\n\n{}\n\n{}\n", tag("sh -c \"cat; : 31311\"", 100), tag("sh -c \"exec sleep 31312\"", 1000));
+    let typing = open_talk(cx, &around, &talk);
+    let live = live_of(&typing, cx);
+    let show = rehearse(&typing, cx);
+    say_yes(cx, show.presenter);
+    assert!(until(cx, &show.windows(), 10, |_| live.running() == 1));
+    // The second command asks; meanwhile the first is clicked.
+    assert!(until(cx, &show.windows(), 5, |cx| dialog_open(cx, show.presenter)));
+    show.click_slide(cx, 420., 280.);
+    let session = live.get(&live.ids()[0]).unwrap();
+    press(cx, show.audience, "x");
+    press(cx, show.presenter, "y");
+    std::thread::sleep(Duration::from_millis(400));
+    let text = screen_text(&session);
+    assert!(!text.contains('x') && !text.contains('y'), "{text}");
+    click(cx, show.presenter, RUN_NO_ID);
+    press(cx, show.presenter, "escape");
+    nothing_left(cx, &[typing.handle], &live, "3131");
+}

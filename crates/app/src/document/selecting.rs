@@ -343,9 +343,25 @@ impl Document {
         Ok(changed)
     }
 
+    /// Has the document keep each change made to the text, for [`Self::take_moves`], or stop.
+    pub fn keep_moves(&mut self, keep: bool) {
+        self.keeping_moves = keep;
+        if !keep {
+            self.moves.clear();
+        }
+    }
+
+    /// The changes made to the text since they were last taken, in order, while they're kept.
+    pub fn take_moves(&mut self) -> Vec<Change> {
+        std::mem::take(&mut self.moves)
+    }
+
     /// Moves the selection along with `change`, just made to the talk's text: each block to
     /// where its text went, or away if that went, and each area with its slide.
     pub(super) fn follow(&mut self, change: &Change) {
+        if self.keeping_moves {
+            self.moves.push(change.clone());
+        }
         // The box being typed in moves as the thing selected does; if it can't be followed,
         // typing there ends.
         if let Some(editing) = &mut self.editing {

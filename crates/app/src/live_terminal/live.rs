@@ -55,6 +55,8 @@ struct Entry {
     /// Whether it was ever seen running, which tells a program that ended from one that never
     /// started.
     was_running: bool,
+    /// Whether it was seen over, which is what a window draws again for.
+    was_over: bool,
 }
 
 #[derive(Default)]
@@ -94,9 +96,15 @@ impl LiveTerminals {
         self.0.borrow().running.iter().filter(|entry| !entry.session.state().is_over()).count()
     }
 
+    /// How many programs are running or still being ended: those count toward the most there may be.
+    pub fn alive(&self) -> usize {
+        let inner = self.0.borrow();
+        inner.running.iter().map(|entry| &entry.session).chain(inner.ending.iter()).filter(|session| !session.state().is_over()).count()
+    }
+
     /// Whether no more may be started.
     pub fn is_full(&self) -> bool {
-        self.running() >= MOST_LIVE
+        self.alive() >= MOST_LIVE
     }
 
     /// How many sessions there are in all, those ending included.
@@ -125,7 +133,7 @@ impl LiveTerminals {
             old.session.end();
             inner.ending.push(old.session);
         }
-        inner.running.push(Entry { id, session, was_running: false });
+        inner.running.push(Entry { id, session, was_running: false, was_over: false });
     }
 
     /// Every id there's a session for, ended or not.
@@ -166,6 +174,30 @@ impl LiveTerminals {
         self.poll().sayings
     }
 
+    /// Follows every tag through `change`, made to the talk's text: a tag moved by an edit before it
+    /// keeps running; one the edit took away ends.
+    pub fn follow(&self, change: &slides_format::Change) {
+        let mut gone = Vec::new();
+        {
+            let mut inner = self.0.borrow_mut();
+            let mut keys = inner.keys.clone();
+            for entry in &mut inner.running {
+                let was = entry.id.clone();
+                match crate::selection::moved(&entry.id.source, change) {
+                    Some(source) => entry.id.source = source,
+                    None => gone.push(was.clone()),
+                }
+                if keys.as_ref() == Some(&was) && !gone.contains(&was) {
+                    keys = Some(entry.id.clone());
+                }
+            }
+            inner.keys = keys;
+        }
+        for id in gone {
+            self.end(&id);
+        }
+    }
+
     /// Ends the programs of every session whose tag isn't among `tags` any more: the tag was
     /// taken away, or its `run` changed.
     pub fn keep_only(&self, tags: &[LiveId]) {
@@ -183,6 +215,11 @@ impl LiveTerminals {
         let mut inner = self.0.borrow_mut();
         let mut gone = Vec::new();
         for entry in &mut inner.running {
+            let over = entry.session.state().is_over();
+            if over != entry.was_over {
+                entry.was_over = over;
+                polled.changed = true;
+            }
             match entry.session.state() {
                 SessionState::Running => entry.was_running = true,
                 SessionState::Failed(sentence) if !entry.was_running => {
@@ -272,7 +309,12 @@ impl LiveTerminals {
 
     /// Sets whether a show of the talk is on.
     pub fn set_show_on(&self, on: bool) {
-        self.0.borrow_mut().show_on = on;
+        let mut inner = self.0.borrow_mut();
+        if inner.show_on != on {
+            // Whoever had the keys doesn't have them in the other place.
+            inner.keys = None;
+        }
+        inner.show_on = on;
     }
 
     /// Whether a show of the talk is on.
@@ -286,6 +328,8 @@ impl LiveTerminals {
 pub struct Polled {
     /// What the status line is to say.
     pub sayings: Vec<String>,
+    /// Whether a program ended, so that what shows it is to be drawn again.
+    pub changed: bool,
     /// The sessions that never started, and have been let go of.
     pub failed: Vec<LiveId>,
 }

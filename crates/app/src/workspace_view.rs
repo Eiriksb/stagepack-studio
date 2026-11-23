@@ -880,10 +880,15 @@ impl WorkspaceView {
             }
         }
         // *Start* asked: a yes starts what it asked about, which looks at the yes again.
-        if let Some((slide, terminal)) = self.start_when_yes.take()
+        if let Some((_, terminal)) = self.start_when_yes.take()
             && answer != RunAnswer::DontRun
+            && let Some(document) = self.document.clone()
         {
-            self.try_start_live(slide, &terminal, cx);
+            // The terminal as it is now: if the talk changed under the question, nothing starts.
+            let (slide, now) = document.update(cx, |document, _| (document.current(), document.selected_terminal()));
+            if let Some(now) = now.filter(|now| now.source == terminal.source && now.on.run == terminal.on.run) {
+                self.try_start_live(slide, &now, cx);
+            }
         }
         cx.notify();
     }

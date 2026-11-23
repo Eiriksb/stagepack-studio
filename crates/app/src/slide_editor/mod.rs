@@ -277,6 +277,10 @@ impl SlideEditor {
             cx.on_focus_out(&focus_handle, window, |this, _, window, cx| {
                 // A drag ends, writing nothing.
                 this.end_drag(cx);
+                // The keyboard went elsewhere: no terminal has it from the editor any more.
+                if !this.live.show_on() {
+                    this.live.release_keys();
+                }
                 // The keyboard went elsewhere: what was typed is in the talk, and typing ends,
                 // unless it went to the text tools.
                 if !this.tools_have_keyboard(window, cx) {
@@ -295,6 +299,9 @@ impl SlideEditor {
             // recording playing.
             cx.observe_window_activation(window, |this, window, cx| {
                 if !window.is_window_active() {
+                    if !this.live.show_on() {
+                        this.live.release_keys();
+                    }
                     this.end_drag(cx);
                     this.stop_video(cx);
                     this.stop_recording(cx);
