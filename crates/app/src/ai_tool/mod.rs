@@ -1,6 +1,7 @@
 //! Commands that use a talk without opening a window, for an AI or a script to run: what a
 //! talk holds, said in text or JSON. Nothing here starts the window toolkit.
 
+mod check;
 mod describe;
 mod outline;
 mod talk;
@@ -9,6 +10,9 @@ use std::ffi::OsString;
 use std::io::Write as _;
 use std::path::PathBuf;
 
+use crate::permissions::BuildPermissions;
+
+pub use check::{Checked, SlideProblems, check, check_text, slide_problems};
 pub use describe::{Description, FieldInfo, LayoutInfo, SettingInfo, TagInfo, describe, describe_text};
 pub use outline::{OutlineSlide, outline, outline_text};
 pub use talk::{OpenTalk, TalkPlace, open_talk};
@@ -35,6 +39,7 @@ pub fn run_command(args: &[OsString]) -> Option<i32> {
     let done = match name {
         "help" | "--help" | "-h" => Ok(help()),
         "describe" => run_describe(rest),
+        "check" => run_check(rest),
         "outline" => run_outline(rest),
         other => Err(Failed(format!("The {other} command isn't ready yet."))),
     };
@@ -120,4 +125,18 @@ fn run_describe(args: &[OsString]) -> Result<i32, Failed> {
         say(&describe_text(&described));
     }
     Ok(0)
+}
+
+fn run_check(args: &[OsString]) -> Result<i32, Failed> {
+    let given = read_args("check", args, true)?;
+    let mut talk = the_talk("check", &given)?;
+    // The owner's own permissions, read and never written.
+    let permissions = BuildPermissions::load(BuildPermissions::default_file().unwrap_or_default());
+    let checked = check(&mut talk, &permissions);
+    if given.json {
+        say(&(serde_json::to_string_pretty(&checked).unwrap_or_default() + "\n"));
+    } else {
+        say(&check_text(&checked));
+    }
+    Ok(if checked.count() == 0 { 0 } else { 1 })
 }

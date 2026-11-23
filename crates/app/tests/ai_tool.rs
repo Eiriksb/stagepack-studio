@@ -229,3 +229,153 @@ fn only_a_file_is_needed_and_the_rest_have_defaults() {
     let mut open = stagepack_studio::ai_tool::open_talk(&talk).unwrap();
     assert!(open.deck.notices_whole(0).is_empty(), "{:?}", open.deck.notices_whole(0));
 }
+
+/// A talk of three slides where slide 2 names a picture that isn't there and slide 3 a video
+/// that is a text file.
+fn talk_with_two_problems(dir: &Path) -> std::path::PathBuf {
+    let talk = dir.join("broken");
+    std::fs::create_dir_all(talk.join("assets")).unwrap();
+    std::fs::write(talk.join("assets/clip.mp4"), "this is not a video\n").unwrap();
+    std::fs::write(
+        talk.join("slides.md"),
+        "# Fine\n\n---\n\n# Gone\n\n<Picture src=\"assets/missing.png\" x=\"100\" y=\"100\" w=\"300\" h=\"200\" />\n\n---\n\n# Clip\n\n<Video src=\"assets/clip.mp4\" x=\"100\" y=\"100\" w=\"300\" h=\"200\" />\n",
+    )
+    .unwrap();
+    talk
+}
+
+#[test]
+fn check_says_each_problem_by_slide() {
+    let dir = tempfile::tempdir().unwrap();
+    let talk = talk_with_two_problems(dir.path());
+    let path = talk.to_str().unwrap();
+
+    // What the engine says of those slides, taken from it.
+    let mut open = stagepack_studio::ai_tool::open_talk(&talk).unwrap();
+    let picture = open.deck.notices_whole(1);
+    let video = stagepack_studio::ai_tool::slide_problems(&mut open, 2);
+    assert_eq!(picture.len(), 1, "{picture:?}");
+    assert!(video.iter().any(|said| said == "This file isn't a video."), "{video:?}");
+
+    let output = run(&["check", path], dir.path());
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output.stderr));
+    let printed = text(&output.stdout);
+    assert!(printed.contains(&format!("Slide 2: {}", picture[0])), "{printed}");
+    assert!(printed.contains("Slide 3: This file isn't a video."), "{printed}");
+    assert!(!printed.contains("Slide 1:"), "{printed}");
+    assert_eq!(printed.lines().last(), Some("2 problems on 2 slides."), "{printed}");
+
+    let output = run(&["check", path, "--json"], dir.path());
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let slides = json["slides"].as_array().unwrap();
+    let numbers: Vec<u64> = slides.iter().map(|slide| slide["slide"].as_u64().unwrap()).collect();
+    assert_eq!(numbers, [2, 3]);
+    assert_eq!(slides[0]["hidden"], false);
+    assert_eq!(slides[0]["problems"][0], picture[0].as_str());
+    assert_eq!(json["talk"], serde_json::json!([]));
+
+    let clean = scratch_talk(dir.path());
+    let output = run(&["check", clean.to_str().unwrap()], dir.path());
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stdout));
+    assert_eq!(text(&output.stdout), "No problems found.\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_out_of_the_talk_is_a_complaint() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = dir.path().join("outside.png");
+    std::fs::write(&outside, "OUTSIDE-SECRET-BYTES").unwrap();
+    let talk = dir.path().join("linked");
+    std::fs::create_dir_all(talk.join("assets")).unwrap();
+    std::os::unix::fs::symlink(&outside, talk.join("assets/x.png")).unwrap();
+    std::fs::write(talk.join("slides.md"), "# One\n\n<Picture src=\"assets/x.png\" x=\"100\" y=\"100\" w=\"300\" h=\"200\" />\n").unwrap();
+    let output = run(&["check", talk.to_str().unwrap()], dir.path());
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output.stdout));
+    let printed = text(&output.stdout);
+    assert!(printed.contains("Slide 1: "), "{printed}");
+    assert!(!printed.contains("OUTSIDE-SECRET"), "{printed}");
+    assert!(!text(&output.stderr).contains("OUTSIDE-SECRET"));
+}
+
+fn components_fixture(into: &Path) -> std::path::PathBuf {
+    fn copy(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                copy(&entry.path(), &to.join(entry.file_name()));
+            } else {
+                std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+            }
+        }
+    }
+    let talk = into.join("components-talk");
+    copy(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/components"), &talk);
+    let _ = std::fs::remove_dir_all(talk.join("build"));
+    talk
+}
+
+#[test]
+fn builds_only_where_always_built() {
+    let dir = tempfile::tempdir().unwrap();
+    let talk = components_fixture(dir.path());
+    let path = talk.to_str().unwrap();
+
+    // No permission: the unbuilt components are reported, and nothing is built.
+    let output = run(&["check", path], dir.path());
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output.stdout));
+    let printed = text(&output.stdout);
+    assert!(printed.contains("needs building"), "{printed}");
+    assert!(!talk.join("build").exists());
+
+    // The owner has said this folder is always built, in the app's own file.
+    let kept = dir.path().join("data/stagepack-studio");
+    std::fs::create_dir_all(&kept).unwrap();
+    let canonical = talk.canonicalize().unwrap();
+    std::fs::write(kept.join("build-permissions.json"), serde_json::json!({ "always_build": [canonical] }).to_string()).unwrap();
+
+    // A packed copy of the talk never builds, permission or not.
+    let packed = dir.path().join("components.sptx");
+    slides_engine::pack_folder(&talk, &packed, "test").unwrap();
+    let output = run(&["check", packed.to_str().unwrap()], dir.path());
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output.stdout));
+    assert!(!talk.join("build").exists());
+
+    // The folder is built only where this copy of the app has its compiler, as the app finds it.
+    let bundled = std::env::var_os("STUDIO_BUNDLE").is_some() && slides_components::Bundle::find().is_some();
+    if !bundled {
+        eprintln!("skipping the permitted build: no compiler bundle (set STUDIO_BUNDLE)");
+        let output = run(&["check", path], dir.path());
+        assert_eq!(output.status.code(), Some(1), "{}", text(&output.stdout));
+        assert!(!talk.join("build").exists());
+        return;
+    }
+    let output = run(&["check", path], dir.path());
+    assert_eq!(output.status.code(), Some(0), "{}{}", text(&output.stdout), text(&output.stderr));
+    assert!(talk.join("build").is_dir());
+}
+
+#[test]
+fn a_big_talk_is_checked_quickly() {
+    let dir = tempfile::tempdir().unwrap();
+    let talk = dir.path().join("big");
+    std::fs::create_dir_all(&talk).unwrap();
+    let mut slides = String::new();
+    for n in 1..=300 {
+        if n > 1 {
+            slides.push_str("\n---\n\n");
+        }
+        slides.push_str(&format!(
+            "# Slide {n}\n\nSome words on slide {n}, enough to wrap onto a second line of the slide.\n\n<Box x=\"100\" y=\"500\" w=\"300\" h=\"100\" fill=\"#336699\" />\n\n<Chart kind=\"bar\" labels=\"A,B,C\" values=\"3,5,2\" x=\"600\" y=\"300\" w=\"500\" h=\"300\" />\n"
+        ));
+    }
+    std::fs::write(talk.join("slides.md"), slides).unwrap();
+    let started = std::time::Instant::now();
+    let output = run(&["check", talk.to_str().unwrap()], dir.path());
+    let took = started.elapsed();
+    assert!(took < std::time::Duration::from_secs(10), "took {took:?}");
+    assert!(output.status.code().is_some_and(|code| code <= 1), "{}", text(&output.stderr));
+    eprintln!("checked 300 slides in {took:?}: {}", text(&output.stdout).lines().last().unwrap_or(""));
+}
