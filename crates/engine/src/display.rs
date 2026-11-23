@@ -80,6 +80,13 @@ pub struct Layer {
     pub y: i32,
 }
 
+/// So that layers held alone and layers shared with the deck are drawn by the same code.
+impl AsRef<Layer> for Layer {
+    fn as_ref(&self) -> &Layer {
+        self
+    }
+}
+
 /// A 3D model among a slide's layers: the place of its layer among them, where its tag is
 /// written, the click it appears on, and what it shows.
 #[derive(Clone, Debug, PartialEq)]

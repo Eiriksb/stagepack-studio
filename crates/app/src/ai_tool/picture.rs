@@ -4,7 +4,7 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use slides_engine::{Moment, Pixmap, SLIDE_WIDTH, compose_shared};
+use slides_engine::{Moment, Pixmap, SLIDE_WIDTH, compose};
 
 use super::check::slide_problems;
 use super::talk::OpenTalk;
@@ -59,7 +59,7 @@ pub fn picture(talk: &mut OpenTalk, slide: usize, step: Option<u32>, width: u32)
             .filter(|(_, timing)| timing.click.is_none_or(|click| click <= step))
             .map(|(layer, _)| layer)
             .collect();
-        compose_shared(&mut pixmap, &shown);
+        compose(&mut pixmap, &shown);
         let png = pixmap.encode_png().map_err(|error| format!("Slide {slide} couldn't be made into a picture: {error}."))?;
         Ok((png, step, steps))
     }));
