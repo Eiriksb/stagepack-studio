@@ -4,16 +4,20 @@
 mod check;
 mod describe;
 mod outline;
+mod picture;
 mod talk;
 
 use std::ffi::OsString;
 use std::io::Write as _;
 use std::path::PathBuf;
 
+use slides_engine::write_atomically;
+
 use crate::permissions::BuildPermissions;
 
 pub use check::{Checked, SlideProblems, check, check_text, slide_problems};
 pub use describe::{Description, FieldInfo, LayoutInfo, SettingInfo, TagInfo, describe, describe_text};
+pub use picture::{DEFAULT_WIDTH, LEAST_WIDTH, MOST_WIDTH, Picture, picture, picture_text};
 pub use outline::{OutlineSlide, outline, outline_text};
 pub use talk::{OpenTalk, TalkPlace, open_talk};
 
@@ -41,6 +45,7 @@ pub fn run_command(args: &[OsString]) -> Option<i32> {
         "describe" => run_describe(rest),
         "check" => run_check(rest),
         "outline" => run_outline(rest),
+        "picture" => run_picture(rest),
         other => Err(Failed(format!("The {other} command isn't ready yet."))),
     };
     Some(match done {
@@ -139,4 +144,72 @@ fn run_check(args: &[OsString]) -> Result<i32, Failed> {
         say(&check_text(&checked));
     }
     Ok(if checked.count() == 0 { 0 } else { 1 })
+}
+
+/// What `picture` was given besides the talk and the slide.
+struct PictureArgs {
+    words: Vec<PathBuf>,
+    step: Option<u32>,
+    width: u32,
+    out: Option<PathBuf>,
+}
+
+fn read_picture_args(args: &[OsString]) -> Result<PictureArgs, Failed> {
+    let mut given = PictureArgs { words: Vec::new(), step: None, width: DEFAULT_WIDTH, out: None };
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.to_str() {
+            Some(name @ ("--step" | "--width" | "--out")) => {
+                let value = args.next().ok_or_else(|| Failed(format!("{name} needs a value after it.")))?;
+                match name {
+                    "--out" => given.out = Some(PathBuf::from(value)),
+                    _ => {
+                        let shown = value.to_string_lossy();
+                        let number = shown
+                            .parse::<u32>()
+                            .map_err(|_| Failed(format!("{name} needs a whole number, and {shown} isn't one.")))?;
+                        if name == "--step" {
+                            given.step = Some(number);
+                        } else {
+                            given.width = number;
+                        }
+                    }
+                }
+            }
+            Some(option) if option.starts_with('-') && option.len() > 1 => {
+                return Err(Failed(format!("The picture command has no option {option}. Try `help`.")));
+            }
+            _ => given.words.push(PathBuf::from(arg)),
+        }
+    }
+    Ok(given)
+}
+
+fn run_picture(args: &[OsString]) -> Result<i32, Failed> {
+    let given = read_picture_args(args)?;
+    let out = given.out.ok_or_else(|| Failed("The picture command needs --out FILE.png to write the picture to.".to_string()))?;
+    let [talk_path, slide] = given.words.as_slice() else {
+        return Err(Failed("The picture command needs a talk and a slide number.".to_string()));
+    };
+    let slide = slide.to_string_lossy();
+    let slide: usize = slide.parse().map_err(|_| Failed(format!("The slide must be a whole number, and {slide} isn't one.")))?;
+    let mut talk = open_talk(talk_path).map_err(Failed)?;
+    let made = picture(&mut talk, slide, given.step, given.width).map_err(Failed)?;
+    write_atomically(&out, |file| file.write_all(&made.png))
+        .map_err(|error| Failed(format!("Could not write {}: {error}.", out.display())))?;
+    say(&picture_text(&made, &out.display().to_string()));
+    report_peak();
+    Ok(if made.problems.is_empty() { 0 } else { 1 })
+}
+
+/// For tests: with `STUDIO_REPORT_PEAK` set, says on standard error the most memory this run
+/// held at once, as Linux counts it. Otherwise it does nothing.
+fn report_peak() {
+    if std::env::var_os("STUDIO_REPORT_PEAK").is_none() {
+        return;
+    }
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    if let Some(line) = status.lines().find(|line| line.starts_with("VmHWM:")) {
+        let _ = writeln!(std::io::stderr(), "peak memory {}", line.trim_start_matches("VmHWM:").trim());
+    }
 }

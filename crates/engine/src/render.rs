@@ -349,6 +349,13 @@ pub fn compose(target: &mut Pixmap, layers: &[Layer]) {
     }
 }
 
+/// Draws layers shared with the deck over `target`, first to last, as [`compose`] does.
+pub fn compose_shared(target: &mut Pixmap, layers: &[std::sync::Arc<Layer>]) {
+    for layer in layers {
+        target.draw_pixmap(layer.x, layer.y, Pixmap::as_ref(&layer.pixmap), &PixmapPaint::default(), Transform::identity(), None);
+    }
+}
+
 /// A picture `width` by `height` already in straight BGRA, as the window's image type holds
 /// pixels, or `None` if it isn't that size.
 pub fn bgra_frame(width: u32, height: u32, bgra: Vec<u8>) -> Option<image::Frame> {

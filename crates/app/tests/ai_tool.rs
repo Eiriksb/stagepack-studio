@@ -440,3 +440,112 @@ fn the_summary_names_where_the_problems_are() {
     assert_eq!(said(vec![slide(2, 2), slide(5, 1)], 1), "4 problems on 2 slides and in the talk.");
     assert_eq!(said(vec![slide(2, 1)], 1), "2 problems on 1 slide and in the talk.");
 }
+
+/// A talk folder with `slides.md` set to `source`, on a white background.
+fn picture_talk(dir: &Path, source: &str) -> std::path::PathBuf {
+    let talk = dir.join("pictured");
+    std::fs::create_dir_all(talk.join("assets")).unwrap();
+    std::fs::write(talk.join("slides.md"), format!("---\nbackground: \"#ffffff\"\n---\n\n{source}")).unwrap();
+    talk
+}
+
+fn pixel(png: &[u8], x: u32, y: u32) -> [u8; 3] {
+    let image = image::load_from_memory(png).unwrap().to_rgb8();
+    image.get_pixel(x, y).0
+}
+
+#[test]
+fn a_picture_is_the_slide_at_its_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let talk = picture_talk(dir.path(), "<Shape kind=\"rect\" fill=\"#ff0000\" x=\"0\" y=\"0\" w=\"1920\" h=\"1080\" click=\"1\" />\n");
+    let talk = talk.to_str().unwrap();
+    let out = dir.path().join("out.png");
+    let out_text = out.to_str().unwrap();
+    let output = run(&["picture", talk, "1", "--step", "0", "--out", out_text], dir.path());
+    assert_eq!(output.status.code(), Some(0), "{}{}", text(&output.stderr), text(&output.stdout));
+    let png = std::fs::read(&out).unwrap();
+    assert_eq!(pixel(&png, 960, 540), [255, 255, 255]);
+    assert!(text(&output.stdout).contains("Slide 1, click 0 of 1, written to"), "{}", text(&output.stdout));
+
+    for args in [vec!["picture", talk, "1", "--step", "1", "--out", out_text], vec!["picture", talk, "1", "--out", out_text]] {
+        let output = run(&args, dir.path());
+        assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+        assert_eq!(pixel(&std::fs::read(&out).unwrap(), 960, 540), [255, 0, 0]);
+    }
+    let output = run(&["picture", talk, "1", "--width", "640", "--out", out_text], dir.path());
+    assert_eq!(output.status.code(), Some(0));
+    let image = image::load_from_memory(&std::fs::read(&out).unwrap()).unwrap();
+    assert_eq!((image.width(), image.height()), (640, 360));
+    assert_eq!(pixel(&std::fs::read(&out).unwrap(), 320, 180), [255, 0, 0]);
+}
+
+#[test]
+fn bad_numbers_are_said_plainly() {
+    let dir = tempfile::tempdir().unwrap();
+    let talk = picture_talk(dir.path(), "<Shape kind=\"rect\" fill=\"#ff0000\" x=\"0\" y=\"0\" w=\"1920\" h=\"1080\" click=\"1\" />\n");
+    let talk = talk.to_str().unwrap();
+    let out = dir.path().join("none.png");
+    let out_text = out.to_str().unwrap();
+    for extra in [vec!["0"], vec!["99"], vec!["1", "--step", "5"], vec!["1", "--width", "10"], vec!["1", "--width", "100000"]] {
+        let mut args = vec!["picture", talk];
+        args.extend(extra.iter());
+        args.extend(["--out", out_text]);
+        let output = run(&args, dir.path());
+        assert_eq!(output.status.code(), Some(2), "{extra:?}");
+        let said = text(&output.stderr);
+        assert_eq!(said.trim_end().lines().count(), 1, "{extra:?}: {said}");
+        assert_eq!(text(&output.stdout), "");
+        assert!(!out.exists(), "{extra:?}");
+    }
+    let output = run(&["picture", talk, "99", "--out", out_text], dir.path());
+    assert!(text(&output.stderr).contains("This talk has 1 slide, so there's no slide 99."), "{}", text(&output.stderr));
+}
+
+/// A still, one flat colour, as PNG bytes.
+fn flat_png(colour: [u8; 3]) -> Vec<u8> {
+    let image = image::RgbImage::from_pixel(64, 36, image::Rgb(colour));
+    let mut bytes = Vec::new();
+    image.write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png).unwrap();
+    bytes
+}
+
+#[test]
+fn a_slide_with_a_big_video_is_drawn_from_its_still() {
+    let dir = tempfile::tempdir().unwrap();
+    let talk = picture_talk(dir.path(), "<Video src=\"assets/big.mp4\" poster=\"assets/still.png\" x=\"480\" y=\"270\" w=\"960\" h=\"540\" />\n");
+    std::fs::write(talk.join("assets/still.png"), flat_png([0, 0, 255])).unwrap();
+    let big = std::fs::File::create(talk.join("assets/big.mp4")).unwrap();
+    big.set_len(400 * 1024 * 1024).unwrap();
+    drop(big);
+    let out = dir.path().join("out.png");
+    let output = run_with(&["picture", talk.to_str().unwrap(), "1", "--out", out.to_str().unwrap()], dir.path(), "STUDIO_REPORT_PEAK", Path::new("1"));
+    let said = text(&output.stderr);
+    assert!(output.status.code() == Some(0) || output.status.code() == Some(1), "{said}");
+    assert_eq!(pixel(&std::fs::read(&out).unwrap(), 960, 540), [0, 0, 255], "{said}{}", text(&output.stdout));
+    let peak: u64 = said
+        .lines()
+        .find_map(|line| line.strip_prefix("peak memory "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|kilobytes| kilobytes.parse().ok())
+        .unwrap_or_else(|| panic!("no peak reported: {said}"));
+    assert!(peak < 256 * 1024, "the picture took {peak} kB at its peak");
+}
+
+#[test]
+fn models_and_recordings_are_drawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let talk = picture_talk(
+        dir.path(),
+        "<Model src=\"assets/box.glb\" x=\"100\" y=\"100\" w=\"640\" h=\"360\" />\n\n<Terminal src=\"assets/run.cast\" x=\"1000\" y=\"500\" w=\"640\" h=\"360\" />\n",
+    );
+    std::fs::write(talk.join("assets/box.glb"), slides_model::make_test_glb(slides_model::MadeGlb::Boxes)).unwrap();
+    std::fs::write(talk.join("assets/run.cast"), slides_terminal::make_demo_cast()).unwrap();
+    let out = dir.path().join("out.png");
+    let output = run(&["picture", talk.to_str().unwrap(), "1", "--out", out.to_str().unwrap()], dir.path());
+    assert!(output.status.code() == Some(0) || output.status.code() == Some(1), "{}", text(&output.stderr));
+    let image = image::load_from_memory(&std::fs::read(&out).unwrap()).unwrap().to_rgb8();
+    let differs = |x0: u32, y0: u32, x1: u32, y1: u32| (y0..y1).any(|y| (x0..x1).any(|x| image.get_pixel(x, y).0 != [255, 255, 255]));
+    assert!(differs(1000, 500, 1640, 860), "the recording's box is blank");
+    // The model's box shows at least its plain panel, if the drawer found no device; with one it's drawn.
+    assert!(differs(100, 100, 740, 460), "the model's box is blank");
+}
