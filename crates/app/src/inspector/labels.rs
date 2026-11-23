@@ -3,42 +3,81 @@
 
 use toolkit::{PropField, PropKind};
 
-/// A built-in component's settings, by argument, in the order they're shown, with their labels.
-const BUILT_INS: [(&str, &[(&str, &str)]); 8] = [
-    ("Shape", &[("kind", "Shape"), ("fill", "Fill"), ("outline", "Outline"), ("outline-width", "Outline width")]),
+/// A built-in component's settings, by argument, in the order they're shown, with their labels
+/// and what each means: `(argument, label, meaning)`.
+const BUILT_INS: [(&str, &[(&str, &str, &str)]); 8] = [
+    (
+        "Shape",
+        &[
+            ("kind", "Shape", "Which shape to draw."),
+            ("fill", "Fill", "The colour inside the shape, as `#rrggbb`."),
+            ("outline", "Outline", "The colour of the line round the shape, as `#rrggbb`."),
+            ("outline-width", "Outline width", "How thick the outline is, in slide units."),
+        ],
+    ),
     (
         "Box",
         &[
-            ("fill", "Fill"),
-            ("outline", "Outline"),
-            ("outline-width", "Outline width"),
-            ("radius", "Corner radius"),
-            ("padding", "Padding"),
+            ("fill", "Fill", "The colour inside the box, as `#rrggbb`."),
+            ("outline", "Outline", "The colour of the line round the box, as `#rrggbb`."),
+            ("outline-width", "Outline width", "How thick the outline is, in slide units."),
+            ("radius", "Corner radius", "How round the box's corners are, in slide units."),
+            ("padding", "Padding", "How much room is left between the box's edge and what is inside it, in slide units."),
         ],
     ),
-    ("Icon", &[("name", "Icon"), ("size", "Size"), ("color", "Colour")]),
-    ("Picture", &[("src", "Picture")]),
-    ("Video", &[("loop", "Loop"), ("poster", "Still picture")]),
-    ("Model", &[("turn", "Turns on its own")]),
+    (
+        "Icon",
+        &[
+            ("name", "Icon", "The name of the icon to draw."),
+            ("size", "Size", "How big the icon is, in slide units."),
+            ("color", "Colour", "The icon's colour, as `#rrggbb`."),
+        ],
+    ),
+    ("Picture", &[("src", "Picture", "The picture to show, a picture file in the talk, such as `assets/logo.png`.")]),
+    (
+        "Video",
+        &[
+            ("loop", "Loop", "Plays the video again from the start when it ends."),
+            ("poster", "Still picture", "A picture to show in place of the video's first frame."),
+        ],
+    ),
+    ("Model", &[("turn", "Turns on its own", "`auto` turns the model slowly on its own while the slide shows.")]),
     // Its place alone: its file is named above, and put on the slide from the Insert tab.
     ("Terminal", &[]),
     (
         "Chart",
         &[
-            ("kind", "Kind"),
-            ("title", "Title"),
-            ("labels", "Labels"),
-            ("values", "Values"),
-            ("data", "Data file"),
-            ("build", "Build up by clicks"),
+            ("kind", "Kind", "Which chart to draw: `bar`, `line` or `pie`."),
+            ("title", "Title", "A heading to show above the chart."),
+            ("labels", "Labels", "The name of each bar, point or slice, set apart by commas."),
+            ("values", "Values", "The number for each label, set apart by commas."),
+            ("data", "Data file", "A CSV file in the talk to take the labels and values from instead."),
+            ("build", "Build up by clicks", "Shows the chart a bar, point or slice at a time, one for each click."),
         ],
     ),
 ];
 
-/// The built-ins' arguments the form leaves out: `(tag, argument)`. A video's, a model's or a
-/// terminal recording's file is named above its fields, and a new one is put on the slide from
-/// the Insert tab; a model's views are set by turning it, and counted under its fields.
-const LEFT_OUT: [(&str, &str); 5] = [("Video", "src"), ("Model", "src"), ("Model", "view"), ("Model", "views"), ("Terminal", "src")];
+/// The built-ins' arguments the form leaves out: `(tag, argument, meaning)`. A video's, a model's
+/// or a terminal recording's file is named above its fields, and a new one is put on the slide
+/// from the Insert tab; a model's views are set by turning it, and counted under its fields.
+const LEFT_OUT: [(&str, &str, &str); 5] = [
+    ("Video", "src", "The video to play, an MP4 file in the talk, such as `assets/demo.mp4`."),
+    ("Model", "src", "The 3D model to show, a `.glb` or `.ply` file in the talk."),
+    ("Model", "view", "The view to start from, six numbers set apart by spaces: yaw and pitch in degrees, the distance, then the x, y and z of the point looked at."),
+    ("Model", "views", "Views to move through, one for each click, each written as `view` is, with a semicolon between views."),
+    ("Terminal", "src", "The terminal recording to play, an asciinema `.cast` file in the talk."),
+];
+
+/// What the built-in `tag`'s setting `argument` means, in a plain sentence, or `None` for a
+/// setting it doesn't have.
+pub fn meaning(tag: &str, argument: &str) -> Option<&'static str> {
+    let (_, known) = BUILT_INS.iter().find(|(name, _)| *name == tag)?;
+    known
+        .iter()
+        .find(|(name, _, _)| *name == argument)
+        .map(|(_, _, meaning)| *meaning)
+        .or_else(|| LEFT_OUT.iter().find(|(t, a, _)| *t == tag && *a == argument).map(|(_, _, meaning)| *meaning))
+}
 
 /// The built-ins' arguments that are ticked or not, though they take a word: `(tag, argument)`.
 /// A model's `turn` is `auto`, ticked, or left out.
@@ -74,7 +113,7 @@ pub fn ordered(tag: &str, props: &[PropField]) -> Vec<(PropField, String)> {
     };
     let mut ordered: Vec<(PropField, String)> = known
         .iter()
-        .filter_map(|(name, label)| {
+        .filter_map(|(name, label, _)| {
             let prop = props.iter().find(|prop| prop.name == *name)?;
             let colour = COLOURS.contains(&(tag, prop.name.as_str())) && prop.kind == PropKind::Text;
             let flag = FLAGS.contains(&(tag, prop.name.as_str()));
@@ -87,7 +126,7 @@ pub fn ordered(tag: &str, props: &[PropField]) -> Vec<(PropField, String)> {
         })
         .collect();
     for prop in props {
-        if !known.iter().any(|(name, _)| *name == prop.name) && !LEFT_OUT.contains(&(tag, prop.name.as_str())) {
+        if !known.iter().any(|(name, _, _)| *name == prop.name) && !LEFT_OUT.iter().any(|(t, a, _)| *t == tag && *a == prop.name) {
             ordered.push((prop.clone(), plain(&prop.name)));
         }
     }
@@ -211,6 +250,19 @@ pub fn attribute(argument: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_built_in_setting_has_a_meaning() {
+        let registry = slides_engine::builtin_registry();
+        assert_eq!(registry.names().len(), 8);
+        for tag in registry.names() {
+            let schema = (registry.get(tag).expect("a built-in").schema)();
+            for prop in &schema.props {
+                let said = meaning(tag, &prop.name);
+                assert!(said.is_some_and(|said| !said.is_empty()), "{tag} {} has no meaning", prop.name);
+            }
+        }
+    }
 
     #[test]
     fn a_name_reads_as_words() {

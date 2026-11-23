@@ -1,6 +1,7 @@
 //! Commands that use a talk without opening a window, for an AI or a script to run: what a
 //! talk holds, said in text or JSON. Nothing here starts the window toolkit.
 
+mod describe;
 mod outline;
 mod talk;
 
@@ -8,6 +9,7 @@ use std::ffi::OsString;
 use std::io::Write as _;
 use std::path::PathBuf;
 
+pub use describe::{Description, FieldInfo, LayoutInfo, SettingInfo, TagInfo, describe, describe_text};
 pub use outline::{OutlineSlide, outline, outline_text};
 pub use talk::{OpenTalk, TalkPlace, open_talk};
 
@@ -32,6 +34,7 @@ pub fn run_command(args: &[OsString]) -> Option<i32> {
     let rest = &args[2..];
     let done = match name {
         "help" | "--help" | "-h" => Ok(help()),
+        "describe" => run_describe(rest),
         "outline" => run_outline(rest),
         other => Err(Failed(format!("The {other} command isn't ready yet."))),
     };
@@ -100,6 +103,21 @@ fn run_outline(args: &[OsString]) -> Result<i32, Failed> {
         say(&(serde_json::to_string_pretty(&slides).unwrap_or_default() + "\n"));
     } else {
         say(&outline_text(&slides));
+    }
+    Ok(0)
+}
+
+fn run_describe(args: &[OsString]) -> Result<i32, Failed> {
+    let given = read_args("describe", args, true)?;
+    let mut talk = match given.words.as_slice() {
+        [] => None,
+        _ => Some(the_talk("describe", &given)?),
+    };
+    let described = describe(talk.as_mut());
+    if given.json {
+        say(&(serde_json::to_string_pretty(&described).unwrap_or_default() + "\n"));
+    } else {
+        say(&describe_text(&described));
     }
     Ok(0)
 }

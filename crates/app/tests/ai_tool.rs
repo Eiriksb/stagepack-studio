@@ -122,3 +122,83 @@ fn help_names_every_command() {
     assert!(text(&output.stderr).contains("--frobnicate"));
     assert_eq!(text(&output.stdout), "");
 }
+
+const SCORE_SOURCE: &str = include_str!("../../components/tests/fixtures/v1/score.rs");
+const SCORE_BUILD: &[u8] = include_bytes!("../../components/tests/fixtures/v1/score.wasm");
+
+fn names(json: &serde_json::Value, key: &str) -> Vec<String> {
+    json[key].as_array().unwrap().iter().map(|item| item["name"].as_str().unwrap().to_string()).collect()
+}
+
+#[test]
+fn describe_without_a_talk_lists_every_built_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = run(&["describe", "--json"], dir.path());
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let tags = json["tags"].as_array().unwrap();
+    for tag in ["Shape", "Box", "Icon", "Picture", "Video", "Model", "Terminal", "Chart"] {
+        let found = tags.iter().find(|entry| entry["tag"] == tag).unwrap_or_else(|| panic!("no {tag}"));
+        assert_eq!(found["built_in"], true);
+    }
+    let video = tags.iter().find(|entry| entry["tag"] == "Video").unwrap();
+    let settings = video["settings"].as_array().unwrap();
+    let src = settings.iter().find(|item| item["name"] == "src").unwrap();
+    assert_eq!(src["needed"], true);
+    assert!(src["meaning"].as_str().unwrap().len() > 10);
+    assert!(settings.iter().any(|item| item["name"] == "loop" && item["label"] == "Loop"));
+    for tag in tags {
+        for item in tag["settings"].as_array().unwrap() {
+            assert!(item["meaning"].as_str().is_some_and(|said| !said.is_empty()), "{tag}: {item}");
+        }
+    }
+
+    let layouts = json["layouts"].as_array().unwrap();
+    let named: Vec<&str> = layouts.iter().map(|layout| layout["name"].as_str().unwrap()).collect();
+    assert_eq!(named, ["title", "content", "two-columns", "section", "blank"]);
+    assert_eq!(layouts[2]["regions"], serde_json::json!(["title", "left", "right"]));
+    assert_eq!(layouts[2]["main"], "left");
+
+    assert_eq!(names(&json, "placement"), ["x", "y", "w", "h", "rotate", "click", "enter", "align"]);
+    let enter = json["placement"].as_array().unwrap().iter().find(|item| item["name"] == "enter").unwrap();
+    assert_eq!(enter["values"], serde_json::json!(["appear", "fade", "fly-up"]));
+    assert!(names(&json, "slide_settings").contains(&"transition".to_string()));
+    assert!(names(&json, "talk_settings").contains(&"color.background".to_string()));
+}
+
+#[test]
+fn describe_as_text_has_a_heading_per_part() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = run(&["describe"], dir.path());
+    assert_eq!(output.status.code(), Some(0));
+    let printed = text(&output.stdout);
+    for heading in ["Layouts\n", "Talk settings\n", "Slide settings\n", "Placement", "Tags\n"] {
+        assert!(printed.contains(heading), "{heading}\n{printed}");
+    }
+    assert!(printed.contains("src (file, needed) — The video to play"), "{printed}");
+}
+
+#[test]
+fn describe_with_a_talk_adds_its_components() {
+    let dir = tempfile::tempdir().unwrap();
+    let talk = dir.path().join("talk");
+    std::fs::create_dir_all(talk.join("components")).unwrap();
+    std::fs::write(talk.join("slides.md"), "# One\n").unwrap();
+    std::fs::write(talk.join("components/score.rs"), SCORE_SOURCE).unwrap();
+    let compile: stagepack_studio::builds::Compile = std::sync::Arc::new(|_: &str, _: &str| Ok(SCORE_BUILD.to_vec()));
+    let built = stagepack_studio::builds::build_components(&talk, &compile);
+    assert_eq!(built.built, ["Score"], "{:?}", built.problems);
+
+    let output = run(&["describe", talk.to_str().unwrap(), "--json"], dir.path());
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let score = json["tags"].as_array().unwrap().iter().find(|entry| entry["tag"] == "Score").expect("Score is listed");
+    assert_eq!(score["built_in"], false);
+    let settings: Vec<&str> = score["settings"].as_array().unwrap().iter().map(|item| item["name"].as_str().unwrap()).collect();
+    assert_eq!(settings, ["team", "points", "colour"]);
+    assert!(score["settings"][0]["meaning"].is_null());
+
+    let none = run(&["describe", "--json"], dir.path());
+    let json: serde_json::Value = serde_json::from_slice(&none.stdout).unwrap();
+    assert!(json["tags"].as_array().unwrap().iter().all(|entry| entry["tag"] != "Score"));
+}

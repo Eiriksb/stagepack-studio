@@ -4,15 +4,12 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use serde::Serialize;
-use slides_format::text_flows;
+use slides_format::{DEFAULT_LAYOUT, text_flows};
 
 use super::talk::OpenTalk;
 
 /// How many characters of a slide's text its outline shows.
 const FIRST_WORDS: usize = 80;
-
-/// The layout a slide has without a `layout:` setting.
-const DEFAULT_LAYOUT: &str = "content";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct OutlineSlide {
