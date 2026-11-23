@@ -69,6 +69,15 @@ pub fn run_export_reading_with(
     Ok(notices)
 }
 
+/// The fonts a talk is drawn with: the system's, and then its own.
+pub(crate) fn fonts_with(talk_fonts: Vec<Arc<Vec<u8>>>) -> Fonts {
+    let mut fonts = Fonts::with_system_fallback();
+    for font in talk_fonts {
+        fonts.load_talk_font(font);
+    }
+    fonts
+}
+
 /// The exported file's bytes, and what the user should hear about the slides.
 fn make(input: ExportInput, kind: ExportKind) -> Result<(Vec<u8>, Vec<String>), String> {
     let ExportInput {
@@ -76,11 +85,7 @@ fn make(input: ExportInput, kind: ExportKind) -> Result<(Vec<u8>, Vec<String>), 
         files,
         talk_fonts,
     } = input;
-    let mut fonts = Fonts::with_system_fallback();
-    for font in talk_fonts {
-        fonts.load_talk_font(font);
-    }
-    let mut deck = Deck::open(Box::new(files.clone()), fonts, source);
+    let mut deck = Deck::open(Box::new(files.clone()), fonts_with(talk_fonts), source);
     // Drawn here and now, on this thread, as each slide is laid out.
     deck.draw_models_with(Arc::new(crate::model_view::draw_still));
     match kind {

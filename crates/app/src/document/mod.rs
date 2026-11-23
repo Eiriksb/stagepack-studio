@@ -51,6 +51,7 @@ mod files;
 mod inserting;
 mod large;
 mod open;
+pub(crate) use open::{fonts_in_folder, fonts_in_pack};
 mod reading;
 mod saving;
 mod selecting;
