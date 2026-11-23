@@ -38,6 +38,7 @@ use crate::markdown_panel::MarkdownPanel;
 use crate::notes_panel::{
     NOTES_HEIGHT, NOTES_MAX_HEIGHT, NOTES_MIN_HEIGHT, NotesEdited, NotesFocused, NotesPanel,
 };
+use crate::live_terminal::{Decision, RunAnswer, RunPermissions, RunQuestion, SessionYes, TalkFolder, ask_to_run, may_run};
 use crate::permissions::BuildPermissions;
 use crate::present_view::{self, Presentation, start_show};
 use crate::recovery::{Found, NotTaken, Recovery};
@@ -432,6 +433,12 @@ pub struct WorkspaceView {
     /// Which folders are built whenever their components change, if the app has somewhere
     /// to keep that.
     permissions: Option<BuildPermissions>,
+    /// The commands remembered as always allowed to run, in which folders, if the app has
+    /// somewhere to keep that.
+    run_permissions: Option<RunPermissions>,
+    /// The commands this talk has been told yes or no to in this window. A talk opened in the
+    /// window gets a new one.
+    run_yes: SessionYes,
     /// Whether this talk's folder is one of them.
     always_build: bool,
     /// Where an untitled talk is first saved, in place of the person's Documents folder.
@@ -674,6 +681,7 @@ impl WorkspaceView {
             .as_ref()
             .and_then(|document| talk_folder_of(document.read(cx).place()));
         let permissions = BuildPermissions::default_file().map(BuildPermissions::load);
+        let run_permissions = RunPermissions::default_file().map(RunPermissions::load);
         let mut view = Self {
             document,
             problem,
@@ -721,6 +729,8 @@ impl WorkspaceView {
             bundle: Bundle::find(),
             editor_projects: cargo_file::default_projects_root(),
             permissions,
+            run_permissions,
+            run_yes: SessionYes::new(),
             documents: None,
             stagepack: None,
             always_build: false,
@@ -782,6 +792,57 @@ impl WorkspaceView {
     pub fn set_permissions_for_test(&mut self, permissions: BuildPermissions) {
         self.permissions = Some(permissions);
         self.always_build = self.is_always_built();
+    }
+
+    /// Keeps which commands are always run in `permissions`, in place of the app's own.
+    pub fn set_run_permissions_for_test(&mut self, permissions: RunPermissions) {
+        self.run_permissions = Some(permissions);
+    }
+
+    /// What may be done about running `command`, the words of a talk's `run`, for this talk now.
+    pub fn run_decision(&self, command: &[String], cx: &App) -> Decision {
+        let Some(document) = &self.document else {
+            return Decision::Refused;
+        };
+        let none = RunPermissions::load(PathBuf::new());
+        let remembered = self.run_permissions.as_ref().unwrap_or(&none);
+        may_run(document.read(cx).place(), command, &self.run_yes, remembered)
+    }
+
+    /// Asks whether `command` may run, if it hasn't been said yes or no to. The answer is kept
+    /// for the session, and for *Always for this folder* in the app's own permissions. This
+    /// starts nothing: what starts a program asks [`Self::run_decision`] again.
+    pub fn ask_to_run(&mut self, command: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.run_decision(&command, cx) != Decision::Ask {
+            return;
+        }
+        let Some(document) = &self.document else {
+            return;
+        };
+        let folder = TalkFolder::of(document.read(cx).place());
+        let question = RunQuestion { command: command.clone(), folder: folder.as_ref().map(|folder| folder.path().to_path_buf()) };
+        let view = cx.weak_entity();
+        ask_to_run(window, cx, question, move |answer, _, cx| {
+            view.update(cx, |view, cx| view.run_answered(&command, answer, folder.as_ref(), cx)).ok();
+        });
+    }
+
+    /// Takes in what was answered about running `command`.
+    fn run_answered(&mut self, command: &[String], answer: RunAnswer, folder: Option<&TalkFolder>, cx: &mut Context<Self>) {
+        match answer {
+            RunAnswer::DontRun => self.run_yes.refuse(command),
+            RunAnswer::Run => self.run_yes.allow(command),
+            RunAnswer::Always => {
+                self.run_yes.allow(command);
+                if let (Some(folder), Some(permissions)) = (folder, &mut self.run_permissions) {
+                    // A permission that can't be written is still a yes for this session.
+                    if permissions.remember(folder, command).is_err() {
+                        self.say("The permission couldn't be kept, so it's only for now.".to_string(), cx);
+                    }
+                }
+            }
+        }
+        cx.notify();
     }
 
     /// Saves an untitled talk, and anything made from it, in `folder` first, in place of the
