@@ -10,7 +10,12 @@ const EXE: &str = if cfg!(windows) { ".exe" } else { "" };
 
 /// The repository's folder.
 pub fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().expect("the repository folder exists")
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().expect("the repository folder exists");
+    // Windows spells a canonical path with a `\\?\` prefix that the compiler never prints, so a remap of it would match nothing.
+    match path.to_str().and_then(|p| p.strip_prefix(r"\\?\")) {
+        Some(plain) if cfg!(windows) => PathBuf::from(plain),
+        _ => path,
+    }
 }
 
 fn run(command: &mut Command, what: &str) -> Result<(), String> {
@@ -82,7 +87,8 @@ pub fn stage(out: &Path, bundle: Option<&Path>) -> Result<u64, String> {
     // Built one at a time, so that the helper's pseudo-terminal code isn't linked into the app.
     // In a target folder of their own, with the paths of the machine that builds them written
     // out of them, so that nothing of the builder's home ends up in a shipped program.
-    let cargo = repo.join("scripts/cargo-safe.sh");
+    // On Linux cargo runs in a memory-limited scope; Windows has no such wrapper.
+    let cargo = if cfg!(windows) { PathBuf::from("cargo") } else { repo.join("scripts/cargo-safe.sh") };
     let target = repo.join("target/package-build");
     let flags = path_free_flags(&repo);
     let build = |package: &str, features: &[&str]| {
@@ -105,7 +111,7 @@ pub fn stage(out: &Path, bundle: Option<&Path>) -> Result<u64, String> {
 
     match bundle {
         Some(made) => copy_tree(made, &out.join("bundle"))?,
-        None => run(Command::new("bash").current_dir(&repo).arg(repo.join("scripts/make-bundle.sh")).arg(out.join("bundle")), "making the bundle")?,
+        None => run(&mut bundle_command(&repo, &out.join("bundle")), "making the bundle")?,
     }
 
     std::fs::create_dir_all(out.join("guide")).map_err(|e| e.to_string())?;
@@ -123,10 +129,26 @@ pub fn stage(out: &Path, bundle: Option<&Path>) -> Result<u64, String> {
     Ok(bytes)
 }
 
+/// The command that makes the compiler bundle in `dest`: `make-bundle.sh` on Linux, `make-bundle.ps1` on Windows
+/// (run by PowerShell 7 if it is installed, else the PowerShell that comes with Windows).
+fn bundle_command(repo: &Path, dest: &Path) -> Command {
+    let mut command;
+    if cfg!(windows) {
+        let shell = if Command::new("pwsh").arg("-Version").output().is_ok() { "pwsh" } else { "powershell" };
+        command = Command::new(shell);
+        command.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(repo.join("scripts/make-bundle.ps1")).arg("-Out").arg(dest);
+    } else {
+        command = Command::new("bash");
+        command.arg(repo.join("scripts/make-bundle.sh")).arg(dest);
+    }
+    command.current_dir(repo);
+    command
+}
+
 /// Rust flags that write the builder's own folders out of what's built: the cargo home, where
 /// the libraries' sources are, the repository, and the toolchain's home, each as a short stand-in.
 pub fn path_free_flags(repo: &Path) -> String {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
     let cargo_home = std::env::var_os("CARGO_HOME").map(PathBuf::from).or_else(|| home.as_ref().map(|h| h.join(".cargo")));
     let rustup_home = std::env::var_os("RUSTUP_HOME").map(PathBuf::from).or_else(|| home.as_ref().map(|h| h.join(".rustup")));
     let mut flags = Vec::new();

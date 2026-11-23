@@ -3,6 +3,7 @@
 //!   package icon OUT_DIR       draws the icon (PNGs and .ico)
 //!   package notices OUT_FILE   gathers every licence notice (and writes notices/rust-COPYRIGHT.html beside it)
 //!   package linux [--staged DIR] [--bundle DIR]   packs the Linux .tar.zst into target/package (stages first unless DIR is given)
+//!   package windows-folder OUT_DIR [--bundle DIR]   the same as stage, on Windows (refuses elsewhere)
 //!   package stage OUT_DIR [--bundle DIR]   stages the installed app folder from shipped release builds (keep OUT_DIR inside target/)
 
 use std::path::PathBuf;
@@ -18,15 +19,19 @@ fn run(args: &[String]) -> Result<(), String> {
             let file = PathBuf::from(args.get(1).ok_or("usage: package notices OUT_FILE")?);
             xtask::notices::write_notices(&file)
         }
-        Some("stage") => {
-            const USAGE: &str = "usage: package stage OUT_DIR [--bundle DIR]";
-            let out = PathBuf::from(args.get(1).ok_or(USAGE)?);
+        Some(command @ ("stage" | "windows-folder")) => {
+            let usage = format!("usage: package {command} OUT_DIR [--bundle DIR]");
+            let out = PathBuf::from(args.get(1).ok_or(usage.as_str())?);
             let bundle = match args.get(2).map(String::as_str) {
                 None => None,
                 Some("--bundle") if args.len() == 4 => Some(PathBuf::from(&args[3])),
-                Some(_) => return Err(USAGE.into()),
+                Some(_) => return Err(usage.clone()),
             };
-            let bytes = xtask::stage::stage(&out, bundle.as_deref())?;
+            let bytes = if command == "windows-folder" {
+                xtask::windows::windows_folder(&out, bundle.as_deref())?
+            } else {
+                xtask::stage::stage(&out, bundle.as_deref())?
+            };
             println!("The app folder {} is {} MB.", out.display(), bytes.div_ceil(1024 * 1024));
             Ok(())
         }
@@ -56,8 +61,8 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("{} is {} MB.", tarball.display(), bytes.div_ceil(1024 * 1024));
             Ok(())
         }
-        Some(other) => Err(format!("unknown subcommand '{other}' (known: icon, notices, stage, linux)")),
-        None => Err("usage: package <icon OUT_DIR | notices OUT_FILE | stage OUT_DIR [--bundle DIR] | linux [--staged DIR] [--bundle DIR]>".into()),
+        Some(other) => Err(format!("unknown subcommand '{other}' (known: icon, notices, stage, windows-folder, linux)")),
+        None => Err("usage: package <icon OUT_DIR | notices OUT_FILE | stage OUT_DIR [--bundle DIR] | windows-folder OUT_DIR [--bundle DIR] | linux [--staged DIR] [--bundle DIR]>".into()),
     }
 }
 
