@@ -97,4 +97,10 @@ The helper now leaves the app's process group, ignores hang-up, interrupt and qu
 
 ## The final review
 
-To be written by the controller.
+A whole-branch review on the most capable model read the design, the plan, the rulings and the diff from `plan-g`, and probed the built helper. It found no way to start a program without the yes. Its verdict was *ready after fixes*: six important findings (a program left running after Ctrl+C or `pkill` in the launching terminal; a failing terminal started again five times a second in the show; *Start* doing nothing after a program ended; Ctrl+Shift+Escape taken by Windows; a `\\?\` folder `cmd.exe` refuses; the presenter's view showing only a still) and eight minor ones. All were fixed in one wave (c7aceb8), described above. A re-review found each fixed, repeated the signal probe on the rebuilt helper (SIGINT, SIGHUP and SIGQUIT ignored, the program ended when the helper's input closes; SIGTERM and `pkill` end both within 5 s; nothing left behind), checked that the yes was not weakened, and gave *ready to merge*.
+
+Before that, the yes alone had four security rounds on the most capable model and three automated security checks; what they found and what was done is in `docs/superpowers/plans/2026-11-23-live-content-plan-g5-decisions.md`.
+
+After the fixes, the whole suite (`scripts/cargo-safe.sh test --workspace --no-fail-fast`, without a compiler bundle): **2,730 passed, 3 failed, 56 ignored.** The three were time limits on a talk's own components, run while the machine was heavily loaded by an unrelated program: `talk_components::a_component_placing_its_content_many_times_shows_a_box` (25 s against 6) and two in `ui_palette` (*took too long*). Run alone afterwards, all three passed (the first in 0.16 s, `ui_palette` 20 of 20). G5 doesn't touch components.
+
+Still by hand: everything on Windows, starting with whether it compiles, and the Linux and Mac checks above.
