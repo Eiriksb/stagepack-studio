@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
-# Builds the compiler bundle and runs the tests that need it.
+# Builds the compiler bundle and runs the tests that need it: the ones marked "needs the
+# compiler bundle", and the AI tool's build with the owner's permission.
+# (The timing tests and the packaging tests have their own steps in test-all.sh.)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 scripts/make-bundle.sh target/bundle
-STUDIO_BUNDLE=$PWD/target/bundle scripts/cargo-safe.sh test --workspace -- --ignored
+export STUDIO_BUNDLE=$PWD/target/bundle
+status=0
+scripts/cargo-safe.sh test -p slides-components --test compile --test examples --no-fail-fast -- --ignored || status=1
+scripts/cargo-safe.sh test -p stagepack-studio --test builds --no-fail-fast -- --ignored || status=1
+scripts/cargo-safe.sh test -p stagepack-studio --test ai_tool --no-fail-fast || status=1
+exit $status

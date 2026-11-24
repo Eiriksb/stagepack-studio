@@ -35,6 +35,38 @@ const COMMANDS: [(&str, &str); 6] = [
     ("mcp", "mcp TALK   the Model Context Protocol server for a talk, on standard input and output"),
 ];
 
+/// A program of the windows subsystem starts with no console, so what a command prints would go nowhere.
+/// Attaches to the terminal that ran it and, where the program was given no output of its own (a pipe or a
+/// file is left alone), points the standard handles at that terminal. Does nothing when there's no terminal.
+/// The console devices are opened for reading and writing, so that std can tell they are consoles and print non-ASCII text properly.
+/// Not run or compiled here: Windows only.
+#[cfg(windows)]
+fn attach_parent_console() {
+    use std::os::windows::io::IntoRawHandle;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+    };
+    // SAFETY: plain calls into the console API; a handle we open is handed over to the process and never closed.
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            return;
+        }
+        for (which, device) in [(STD_INPUT_HANDLE, "CONIN$"), (STD_OUTPUT_HANDLE, "CONOUT$"), (STD_ERROR_HANDLE, "CONOUT$")] {
+            let current = GetStdHandle(which);
+            if !current.is_null() && current != INVALID_HANDLE_VALUE {
+                continue;
+            }
+            if let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(device) {
+                SetStdHandle(which, file.into_raw_handle());
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_parent_console() {}
+
 /// Runs the command `args[1]` names, if it names one, and returns its exit status after it has
 /// printed. `None` when it doesn't, so the program opens a window as it always has.
 pub fn run_command(args: &[OsString]) -> Option<i32> {
@@ -43,6 +75,7 @@ pub fn run_command(args: &[OsString]) -> Option<i32> {
     if !known {
         return None;
     }
+    attach_parent_console();
     let rest = &args[2..];
     let done = match name {
         "help" | "--help" | "-h" => Ok(help()),

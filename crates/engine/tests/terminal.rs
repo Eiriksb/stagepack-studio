@@ -1176,7 +1176,7 @@ fn a_live_terminal_without_a_recording_shows_its_command() {
     for item in layer.items.iter() {
         if let DisplayItem::Text { text, .. } = item {
             let glyph = text.buffer.layout_runs().next().unwrap().glyphs.first().unwrap();
-            let mut fonts = Fonts::bundled_only();
+            let fonts = Fonts::bundled_only();
             assert_eq!(fonts.system.db().face(glyph.font_id).unwrap().families[0].0, "JetBrains Mono");
         }
     }

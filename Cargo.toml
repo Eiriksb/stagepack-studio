@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/app", "crates/components", "crates/engine", "crates/format", "crates/pdf", "crates/pptx", "crates/toolkit", "crates/toolkit-macros", "crates/video", "crates/model", "crates/terminal", "crates/terminal-helper"]
+members = ["crates/app", "crates/components", "crates/engine", "crates/format", "crates/pdf", "crates/pptx", "crates/toolkit", "crates/toolkit-macros", "crates/video", "crates/model", "crates/terminal", "crates/terminal-helper", "crates/xtask"]
 
 [workspace.package]
 edition = "2024"
@@ -24,3 +24,9 @@ debug = false
 # Pictures in a model are decoded within the time a model is read in, even in a build for tests.
 [profile.dev.package.zune-jpeg]
 opt-level = 3
+
+# What is shipped: slower to build, smaller and faster to run.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

@@ -35,3 +35,40 @@ scripts/cargo-safe.sh run -- fixtures/showcase
 ```
 
 The first `run` opens the start screen; the second opens a talk straight away.
+
+## Install
+
+Two packages are made, one per system. Both install for the current user only: no administrator rights, no password, no internet. The program holds everything it needs, including the compiler for a talk's own components and the helper for live terminals (which stays off until a talk asks for a command and you say yes). It's about 560 MB installed. Neither package has been signed, and there is no automatic update; to upgrade, install the newer package over the old one. A talk's data folder (permissions, saved-but-unsaved work) is never touched by installing, upgrading or uninstalling.
+
+**Linux** (x86_64): unpack `stagepack-studio-<version>-linux-x86_64.tar.zst` and run its `install.sh`. It needs glibc 2.39 or later (Ubuntu 24.04, Debian 13, Fedora 40 or newer) and the libraries `libxkbcommon`, `libxkbcommon-x11`, `libxcb` and `libstdc++`, which a desktop system nearly always has; `install.sh` checks that the program starts and, if it can't, says why and changes nothing.
+
+```bash
+tar --use-compress-program=zstd -xf stagepack-studio-0.1.0-linux-x86_64.tar.zst
+cd stagepack-studio-0.1.0
+sh install.sh
+```
+
+The program goes to `~/.local/lib/stagepack-studio`, a link to it in `~/.local/bin`, and the menu entry, the `.sptx` file type and the icons in their usual places under `~/.local/share`. `.sptx` files open in Stagepack Studio, also where Stagepack is installed (whose own type for them, `application/x-stagepack`, is taken over as well), and another program that lists them stays under *Open with*; uninstalling gives each type its earlier default back. `~/.local/lib/stagepack-studio/uninstall.sh` takes it all away again. If `~/.local/bin` isn't on your `PATH`, add it to run `stagepack-studio` from a terminal.
+
+**Windows** (x86_64): run `stagepack-studio-<version>-windows-x86_64-setup.exe`. It installs under `%LOCALAPPDATA%\Programs\Stagepack Studio`, adds a Start menu entry, makes `.sptx` open in Stagepack Studio (the program that opened them before stays under *Open with*, also after uninstalling, but uninstalling doesn't make it the default again) and registers an uninstaller under *Installed apps*. In a terminal, run commands as `.\stagepack-studio` from the app's folder; the folder is not on the `PATH`. The program has two files, `stagepack-studio.exe` (what a double-click starts) and `stagepack-studio.com` (what a terminal runs, which waits for a command to finish); an AI assistant's MCP command should name the `.com` in full. The Windows build has not been run yet; see `docs/checks/plan-e.md`.
+
+## Build the packages
+
+Run the tests first with `scripts/test-all.sh` (or `scripts\test-all.ps1` on Windows; `--quick` / `-Quick` skips the slow steps). Each package is built on its own system, since nothing for Windows can be built on Linux.
+
+Linux, with Rust and `zstd`:
+
+```bash
+scripts/make-bundle.sh target/bundle                 # the compiler bundle, once
+scripts/cargo-safe.sh run --release -p xtask --bin package -- linux --bundle target/bundle
+```
+
+This makes `target/package/stagepack-studio-<version>-linux-x86_64.tar.zst`. The folder it packs is made by `package stage` from release builds, and fails if it is over 600 MB.
+
+Windows, in PowerShell, with Rust (the `x86_64-pc-windows-msvc` and `wasm32-unknown-unknown` targets) and [Inno Setup](https://jrsoftware.org/isdl.php) 6.3 or newer:
+
+```powershell
+scripts\package-windows.ps1
+```
+
+This runs `scripts\test-all.ps1 -Quick` (skip with `-SkipTests`), stages the folder, and makes `target\package\stagepack-studio-<version>-windows-x86_64-setup.exe`. Pass `-Bundle <dir>` to reuse a bundle made by `scripts\make-bundle.ps1`.

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Stagepack Studio
+GenericName=Presentation editor
+Comment=Write and present talks
+Exec=@EXEC@ %f
+Icon=stagepack-studio
+Terminal=false
+X-Stagepack-Studio=1
+Categories=Office;Presentation;
+MimeType=application/vnd.stagepack.talk;application/x-stagepack;

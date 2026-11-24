@@ -7396,6 +7396,7 @@ dependencies = [
  "unicode-properties",
  "unicode-segmentation",
  "wat",
+ "windows-sys 0.61.2",
  "zip",
 ]
 
@@ -9850,6 +9851,17 @@ name = "xmp-writer"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9440ea3e5aeabb0ac63af70daf835274065238cdd0cec83418f417eae38bacee"
+
+[[package]]
+name = "xtask"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "slides-engine",
+ "slides-terminal-helper",
+ "tempfile",
+ "tiny-skia",
+]
 
 [[package]]
 name = "y4m"
