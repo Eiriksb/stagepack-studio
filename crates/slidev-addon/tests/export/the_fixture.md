@@ -150,7 +150,7 @@ clicks: 3
 
 # What we counted
 
-<v-clicks>
+<v-clicks at="1">
 
 - Starfish, by colour
 - Anemones, open and closed

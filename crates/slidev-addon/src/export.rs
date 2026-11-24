@@ -88,11 +88,13 @@ pub fn fold(name: &str) -> String {
     name.chars()
         .map(|c| {
             let one = |mapped: Vec<char>| (mapped.len() == 1).then(|| mapped[0]);
+            // A lower case of more than one character is only `İ`'s, `i` and a dot above, and
+            // Go's simple lower case of it is `i`: the first.
+            let lower_of = |c: char| c.to_lowercase().next();
             let upper = one(c.to_uppercase().collect());
-            let lower = one(c.to_lowercase().collect());
-            let lower_of_upper = upper.and_then(|upper| one(upper.to_lowercase().collect()));
-            let least = [Some(c), upper, lower, lower_of_upper].into_iter().flatten().min().unwrap_or(c);
-            one(least.to_lowercase().collect()).unwrap_or(least)
+            let lower_of_upper = upper.and_then(lower_of);
+            let least = [Some(c), upper, lower_of(c), lower_of_upper].into_iter().flatten().min().unwrap_or(c);
+            lower_of(least).unwrap_or(least)
         })
         .collect()
 }
@@ -562,8 +564,8 @@ impl<'a> Exporter<'a> {
             "theme: default\ntitle: {}\ncanvasWidth: 1920\naspectRatio: 16/9\ncolorSchema: {}\nfonts:\n  sans: {}\n  mono: {}\n  provider: none\n",
             yaml_string(title),
             if is_dark(&self.theme.background) { "dark" } else { "light" },
-            yaml_string(&self.theme.font),
-            yaml_string(&self.theme.mono),
+            yaml_string(&escape::font_name(&self.theme.font)),
+            yaml_string(&escape::font_name(&self.theme.mono)),
         );
         // How each slide is arrived at. Slidev plays a slide's own transition on leaving it,
         // so each slide is given the next shown slide's. Slides it never shows, hidden ones and
@@ -797,18 +799,15 @@ impl<'a> Exporter<'a> {
         let line = region_line(slide, region.name);
         let (rect, rotate, moved) = placement(line, region);
         let (click, enter) = region_timing(line);
-        let content = if moved { self.inside((rect.x, rect.y), rotate != 0.0, |this| this.blocks(blocks)) } else { self.blocks(blocks) };
+        let (content, steps) = if moved { self.inside((rect.x, rect.y), rotate != 0.0, |this| this.blocks_counted(blocks)) } else { self.blocks_counted(blocks) };
         let content = match click {
             RegionClick::Each => {
-                let steps = match blocks {
-                    [Block::List { items, .. }] => items.len(),
-                    _ => blocks.len(),
-                };
                 self.clicked((steps as u32).min(MAX_CLICK));
                 if enter == Enter::FlyUp {
                     self.notice(NoticeKind::Approximation, format!("The {} region comes in a piece at a time, and in Slidev each piece fades in rather than flying up.", region.name));
                 }
-                wrap("v-clicks", &[], "", &content)
+                // From click 1, as the engine shows them, not after what came before on the slide.
+                wrap("v-clicks", &[], " at=\"1\"", &content)
             }
             _ => content,
         };
@@ -826,16 +825,31 @@ impl<'a> Exporter<'a> {
 
     /// Blocks, each followed by a blank line.
     fn blocks(&mut self, blocks: &[&Block]) -> String {
+        self.blocks_counted(blocks).0
+    }
+
+    /// Blocks, each followed by a blank line, and how many clicks Slidev's `<v-clicks>` takes
+    /// to show them: one for each element written, or for a list alone each of its items, or
+    /// for a table alone each row of its body. Each block written is one element: what isn't
+    /// written isn't counted.
+    fn blocks_counted(&mut self, blocks: &[&Block]) -> (String, usize) {
         let mut out = String::new();
+        let mut written = Vec::new();
         for block in blocks {
-            let written = self.block(block);
-            if written.trim().is_empty() {
+            let text = self.block(block);
+            if text.trim().is_empty() {
                 continue;
             }
-            out.push_str(written.trim_end());
+            out.push_str(text.trim_end());
             out.push_str("\n\n");
+            written.push((*block, text.starts_with("<div v-pre>")));
         }
-        out
+        let count = match written.as_slice() {
+            [(Block::List { items, .. }, _)] => items.len(),
+            [(Block::Table { rows, .. }, false)] => rows.len().saturating_sub(1),
+            all => all.len(),
+        };
+        (out, count)
     }
 
     fn block(&mut self, block: &Block) -> String {
@@ -1096,7 +1110,8 @@ impl<'a> Exporter<'a> {
                 css.extend(timing_css);
                 let children: Vec<&Block> = tag.children.iter().collect();
                 let content = if positioned { self.inside(origin, turned, |this| this.blocks(&children)) } else { self.blocks(&children) };
-                if css.is_empty() && attrs.is_empty() { content } else { wrap("div", &css, &attrs, &content) }
+                // Always one element, as Slidev counts the elements a region shown a piece at a time holds.
+                wrap("div", &css, &attrs, &content)
             }
             "Picture" => {
                 let Some(url) = self.asset(tag.attr("src").unwrap_or_default(), "picture") else { return String::new() };
@@ -1205,7 +1220,9 @@ impl<'a> Exporter<'a> {
 fn code_span(code: &str, in_table: bool) -> String {
     // Slidev's slide splitter reads `<!--` anywhere outside a fence, so in code it's HTML with
     // the entity, as Slidev writes inline code itself, with `v-pre`.
-    if escape::opens_comment(code) {
+    // A span fenced with three backticks or more at the start of a line would open a fence for
+    // that splitter too, so it's HTML as well.
+    if escape::opens_comment(code) || longest_run(code, '`') >= 2 {
         return format!("<code v-pre>{}</code>", escape::text(code, false));
     }
     let longest = longest_run(code, '`');

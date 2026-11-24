@@ -76,7 +76,7 @@ clicks: 4
 
 # Clicks
 
-<v-clicks>
+<v-clicks at="1">
 
 - One
 - Two

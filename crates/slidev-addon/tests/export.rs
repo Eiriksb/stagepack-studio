@@ -168,6 +168,61 @@ fn transitions_hidden_and_notes() {
     assert_eq!(report.notices, vec![notice(4, NoticeKind::Approximation, "transition: spin isn't none, fade or push, so this slide has none.")]);
 }
 
+/// The `clicks:` of each slide of `markdown`, if it has one.
+fn clicks(markdown: &str) -> Vec<Option<u32>> {
+    slides_of(markdown).iter().map(|(keys, _)| keys.lines().find_map(|line| line.strip_prefix("clicks: ")).map(|n| n.parse().unwrap())).collect()
+}
+
+#[test]
+fn a_region_shown_a_piece_at_a_time_takes_the_clicks_slidev_counts() {
+    // `clicks:` replaces Slidev's own count, so it has to be at least that: for a table alone,
+    // each row of its body; for a list alone, each top-level item; otherwise each element.
+    let each = "---\nregion.body: click=each\n---\n\n";
+    let slides = [
+        format!("{each}# A table\n\n| A | B |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\n| 5 | 6 |\n"),
+        format!("{each}# A list in a list\n\n- One\n  - One and a half\n  - One and three quarters\n- Two\n"),
+        format!("{each}# A Text with no style\n\n<Text>\n\nFirst.\n\nSecond.\n\n</Text>\n\nThird.\n"),
+        format!("{each}# A missing picture\n\nWords.\n\n![](assets/none.png)\n\nMore words.\n"),
+        // The fly-up's click is the slide's last, and Slidev doesn't count it.
+        format!("{each}# A fly-up last\n\n- One\n- Two\n\n<Box x=\"100\" y=\"800\" w=\"300\" h=\"100\" click=\"3\" enter=\"fly-up\">\n\nLast\n\n</Box>\n"),
+    ];
+    let (bundle, _) = export_with(&slides.join("\n"), Vec::new());
+    let markdown = slides_md(&bundle);
+    assert_eq!(clicks(&markdown), [Some(3), Some(2), Some(2), Some(2), Some(3)], "{markdown}");
+    let bodies = slides_of(&markdown);
+    // The unstyled Text is one element, and each region starts at click 1.
+    assert!(bodies[2].1.contains("<v-clicks at=\"1\">\n\n<div>\n\nFirst.\n\nSecond.\n\n</div>\n\nThird.\n\n</v-clicks>"), "{}", bodies[2].1);
+}
+
+#[test]
+fn a_backtick_line_in_a_pre_fence_doesnt_open_a_fence_for_slidev() {
+    let source = "# Fenced\n\n````markdown\n<!-- a comment -->\n```html\n  ```\n````\n\n---\n\n# Second\n\n---\n\n# Third\n";
+    let (bundle, _) = export_with(source, Vec::new());
+    let markdown = slides_md(&bundle);
+    let slides = slides_of(&markdown);
+    assert_eq!(slides.len(), 3, "{markdown}");
+    assert!(slides[0].1.contains("<pre v-pre><code>&lt;!-- a comment --&gt;\n&#96;``html\n  &#96;``</code></pre>"), "{}", slides[0].1);
+    // No line, after any white space, starts with backticks, as Slidev's splitter reads them.
+    assert!(!markdown.lines().any(|line| line.trim_start().starts_with("```")), "{markdown}");
+    // An inline span fenced with three backticks is HTML too, as it could start a line.
+    let (bundle, _) = export_with("`` a ``` b ``\n\n---\n\n# Second\n", Vec::new());
+    let markdown = slides_md(&bundle);
+    assert_eq!(slides_of(&markdown).len(), 2, "{markdown}");
+    assert!(markdown.contains("<code v-pre>a \\`\\`\\` b</code>"), "{markdown}");
+}
+
+#[test]
+fn a_font_name_cant_break_out_of_its_quotes() {
+    let source = "---\nfont: Evil\"; color: red; x: {a} [b]\nfont.mono: Mono, \"Other\"\n---\n\n# Fonts\n";
+    let (bundle, _) = export_with(source, Vec::new());
+    let markdown = slides_md(&bundle);
+    let keys = headmatter(&markdown);
+    assert!(keys.contains(&("fonts.sans".into(), "\"Evil color: red x: a b\"".into())), "{keys:?}");
+    assert!(keys.contains(&("fonts.mono".into(), "\"Mono Other\"".into())), "{keys:?}");
+    assert!(markdown.contains("font-family: \"Evil color: red x: a b\", sans-serif;"));
+    assert!(markdown.contains("--slidev-code-font-family: \"Mono Other\", monospace;"));
+}
+
 fn transitions(markdown: &str) -> Vec<String> {
     slides_of(markdown).iter().map(|(keys, _)| keys.lines().find_map(|line| line.strip_prefix("transition: ")).expect("every slide has its transition").to_string()).collect()
 }
@@ -325,7 +380,7 @@ fn a_hidden_first_slide_leaves_the_style_on_the_others() {
 
 #[test]
 fn names_are_taken_for_code_as_stagepack_folds_them() {
-    for name in ["a.ts", "a.TS", "a.tſ", "public/poſtcss.config.png", "public/PostCSS.config.png", "public/\u{212A}.vue", "setup/x.png", "public/Index.HTML"] {
+    for name in ["a.ts", "a.TS", "a.tſ", "public/vİte.config.png", "public/unocss.conf\u{130}g.png", "public/poſtcss.config.png", "public/PostCSS.config.png", "public/\u{212A}.vue", "setup/x.png", "public/Index.HTML"] {
         assert!(is_code_name(name), "{name}");
     }
     for name in ["a.png", "public/postcss.png", "public/settings.png"] {

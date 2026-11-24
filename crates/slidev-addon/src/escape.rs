@@ -93,9 +93,12 @@ pub fn pre_lines(code: &str) -> String {
     code.split('\n')
         .map(|line| {
             let line = html(line).replace('{', "&#123;").replace('}', "&#125;");
-            match line.chars().next() {
-                Some('-') => format!("&#45;{}", &line[1..]),
-                Some(':') => format!("&#58;{}", &line[1..]),
+            // Backticks after any white space open a fence for Slidev's splitter.
+            let blank = line.len() - line.trim_start().len();
+            match line[blank..].chars().next() {
+                Some('-') => format!("{}&#45;{}", &line[..blank], &line[blank + 1..]),
+                Some(':') => format!("{}&#58;{}", &line[..blank], &line[blank + 1..]),
+                Some('`') => format!("{}&#96;{}", &line[..blank], &line[blank + 1..]),
                 _ => line,
             }
         })
@@ -156,11 +159,16 @@ pub fn link(url: &str) -> Option<String> {
     Some(out)
 }
 
-/// The CSS name of the font `family`, in double quotes, with what could end the quote or
-/// the rule left out.
+/// The font `family`'s name, with what could end a quote or a CSS rule left out, and what
+/// YAML or Slidev's own list of fonts would read as more than a name.
+pub fn font_name(family: &str) -> String {
+    let kept: String = family.chars().filter(|c| !c.is_control() && !matches!(c, '"' | '\'' | '\\' | '<' | '>' | ';' | '{' | '}' | '[' | ']' | ',')).collect();
+    kept.trim().to_string()
+}
+
+/// The CSS name of the font `family`, in double quotes, as [`font_name`] keeps it.
 pub fn font_family(family: &str) -> String {
-    let kept: String = family.chars().filter(|c| !c.is_control() && !matches!(c, '"' | '\\' | '<' | '>' | ';' | '{' | '}')).collect();
-    format!("\"{}\"", kept.trim())
+    format!("\"{}\"", font_name(family))
 }
 
 /// A code block's language, kept to the characters a language's name has. Slidev reads more
@@ -221,6 +229,7 @@ mod tests {
     #[test]
     fn code_in_a_pre_reads_as_itself() {
         assert_eq!(pre_lines("---\n::right::\n<!-- x -->\n{{ y }}"), "&#45;--\n&#58;:right::\n&lt;!-- x --&gt;\n&#123;&#123; y &#125;&#125;");
+        assert_eq!(pre_lines("  ```html\n\t---"), "  &#96;``html\n\t&#45;--");
     }
 
     #[test]
