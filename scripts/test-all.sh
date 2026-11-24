@@ -23,7 +23,7 @@ case "${1:-}" in
   --only) only=${2:-}; [ -n "$only" ] || { echo "usage: scripts/test-all.sh --only STEP" >&2; exit 2; } ;;
   --list)
     printf '%s\t%s\n' \
-      clippy "clippy on the workspace (warnings counted; CLIPPY_STRICT=1 makes them errors)" \
+      clippy "clippy on the workspace, warnings are errors (CLIPPY_LAX=1 only counts them)" \
       workspace "the workspace's tests" \
       components "the components' tests, with the compiler bundle" \
       release "the release-only timing tests" \
@@ -49,11 +49,9 @@ release_tests() {
 }
 
 # Each step takes the names of failed tests (none on the first run) and filters to them.
-# The plan asks for warnings to be errors. The workspace isn't clean today (see docs/checks/plan-e.md),
-# so by default a warning is counted and printed, and only an error fails the step; CLIPPY_STRICT=1
-# makes warnings errors.
+# Warnings are errors. CLIPPY_LAX=1 only counts them (an error still fails the step).
 step_clippy() {
-  if [ "${CLIPPY_STRICT:-0}" = 1 ]; then
+  if [ "${CLIPPY_LAX:-0}" != 1 ]; then
     $CARGO clippy --workspace --all-targets -- -D warnings
     return
   fi
@@ -61,7 +59,7 @@ step_clippy() {
   $CARGO clippy --workspace --all-targets > "$out" 2>&1
   code=$?
   cat "$out"
-  echo "clippy warnings: $(grep '^warning' "$out" | grep -vc 'generated') (CLIPPY_STRICT=1 makes them errors)"
+  echo "clippy warnings: $(grep '^warning' "$out" | grep -vc 'generated') (CLIPPY_LAX=1: not errors)"
   return $code
 }
 step_workspace() { $CARGO test --workspace --no-fail-fast -- ${1:+--exact "$@"}; }
@@ -79,7 +77,7 @@ step_release() {
   fi
   local status=0 line
   set -f   # a '*' in the list is a word, not a pattern
-  while read -r line; do
+  while read -r -u 3 line; do
     set -- $line
     local pkg=$1 file=$2
     shift 2
@@ -89,7 +87,7 @@ step_release() {
       # --include-ignored: in a release build a test marked cfg_attr(debug_assertions, ignore) isn't ignored.
       $CARGO test --release -p "$pkg" --test "$file" -- --include-ignored --exact "$@" || status=1
     fi
-  done < <(release_tests)
+  done 3< <(release_tests)
   set +f
   return $status
 }
@@ -134,11 +132,12 @@ for name in "${steps[@]}"; do
   if [ "$name" != clippy ] && [ "${#names[@]}" -gt 0 ]; then
     echo "--- A loaded machine can fail a test that is timed. Rerunning only: ${names[*]}"
     "step_$name" "${names[@]}" 2>&1 | tee "$log_dir/$name-rerun.log"
-    if [ "${PIPESTATUS[0]}" -eq 0 ]; then
+    # Passed only if cargo said ok and its log shows at least one test passed (a name that matches nothing exits 0).
+    if [ "${PIPESTATUS[0]}" -eq 0 ] && grep -Eq 'test result: ok\. [1-9][0-9]* passed' "$log_dir/$name-rerun.log"; then
       results+=("$name: FAILED the first time (${#names[@]} tests), ok on the rerun alone: ${names[*]}")
       echo "--- the rerun passed; both results are in the summary and the step still counts as FAILED"
     else
-      results+=("$name: FAILED, and failed again alone: ${names[*]}")
+      results+=("$name: FAILED, and not shown to pass alone (failed, or ran no test): ${names[*]}")
     fi
   else
     results+=("$name: FAILED")

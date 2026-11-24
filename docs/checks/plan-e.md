@@ -19,9 +19,9 @@ One per-user package for each system, and one script per system that runs every 
 
 | Step | Result |
 |---|---|
-| clippy | ok, with **1 warning**: `unused_mut` at `crates/engine/tests/terminal.rs:1179`. The plan asks for `-D warnings`, which fails on that one line; I did not touch unrelated code. By default the step passes and counts warnings; `CLIPPY_STRICT=1` / `-Strict` makes them errors (and fails today). |
+| clippy | ok in the full run with **1 warning** (`unused_mut` at `crates/engine/tests/terminal.rs:1179`, as the step then only counted warnings). Fix round 1 removed the `mut`; the step is now `-D warnings` by default (`CLIPPY_LAX=1` / `-Lax` only counts them) and `clippy --workspace --all-targets -- -D warnings` passes. |
 | workspace | **FAILED the first time, ok on the rerun alone.** 137 test results: 2,765 passed, 3 failed, 58 ignored. The three were timing tests: `what_a_recording_keeps_is_bounded` (2.08 s), `a_big_talk_is_checked_quickly` (21.6 s) and `a_picture_of_a_model_ends_cleanly_and_soon` (20.8 s). Rerun alone: all three passed. An earlier full run of this step on a quieter machine passed all 137 results (2,765 passed, 0 failed, 58 ignored). |
-| components | ok: `slides-components` compile 4 and examples 1, `builds` 2 (all ignored without the bundle), `ai_tool` 29. |
+| components | ok: `slides-components` compile 4 and examples 1, `builds` 2 (ignored tests, run with the bundle), `ai_tool` 29. |
 | release | see below. |
 | packaging | ok: xtask `linux` 11, `stage` 2, `test_all` 2, `windows` 10, `xtask` 6; ignored tests: the tarball (59 s) and `the_staged_app_needs_nothing_else` (497 s) both passed. |
 
@@ -48,12 +48,13 @@ These were found in review or while building and left, by ruling, as not blockin
 - **Staging:** the size check uses the size on disk, not the apparent size; there's no test that the folder holds nothing extra beyond the layout; the string `STUDIO_TERMINAL_HELPER` is still in a shipped binary (it isn't read).
 - **Linux scripts:** a `SIGKILL` in the middle of a copy leaves a `stagepack-studio.new-<pid>` folder beside the app folder (the next install sweeps only our own); uninstalling leaves empty folders and rebuilt desktop and MIME caches, not removing what we didn't create.
 - **Windows scripts:** `repo_root()` on a UNC path isn't handled. `scripts/test-all.ps1` leaves out the Linux package's tests (they need `bash` and `zstd`) and has never run; its `-Quick` skips the release step and the staged-app test.
-- **The test scripts:** a rerun of the release step builds the whole workspace in release (about 25 minutes here) where one target would do; a failing step still ends the script with status 1 even when its rerun passed (the summary says both); the one clippy warning above.
+- **The test scripts:** a rerun of the release step builds the whole workspace in release (about 25 minutes here) where one target would do; a failing step still ends the script with status 1 even when its rerun passed (the summary says both).
 
 ## Hand checks for the owner
 
 On Windows, from a fresh clone, with PowerShell (none of this has run):
 
+0. **The scripts first.** In PowerShell run `scripts\test-all.ps1 -List`, then `scripts\test-all.ps1 -Quick`, before anything else: neither PowerShell script has ever run, and a failure here is a fix round.
 1. **Build at all.** The Windows code in the app, the helper and the console twin has never been compiled. Install Rust (with `x86_64-pc-windows-msvc` and `wasm32-unknown-unknown`) and **Inno Setup 6.3 or newer**, then run `scripts\package-windows.ps1`. It runs `scripts\test-all.ps1 -Quick` first. Compile errors, a failing test, a stage over 600 MB or an Inno error come back as a fix round; they are expected, not a surprise.
 2. `target\package\stagepack-studio-0.1.0-windows-x86_64-setup.exe` is made. Install it under a **fresh Windows user with no Rust and no admin rights**. No password is asked, nothing needs the internet, and it installs under `%LOCALAPPDATA%\Programs\Stagepack Studio`.
 3. Double-click a `.sptx` file: it opens in Stagepack Studio, with no console window. Right-click, *Open with*: Stagepack Studio is listed, and so is any other program that was there before.

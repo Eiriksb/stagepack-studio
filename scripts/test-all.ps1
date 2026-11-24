@@ -4,7 +4,7 @@
 #   scripts\test-all.ps1            everything
 #   scripts\test-all.ps1 -Quick     skips the release timing step and the slow packaging tests
 #   scripts\test-all.ps1 -List      prints the steps and stops
-#   scripts\test-all.ps1 -Strict    clippy warnings are errors
+#   scripts\test-all.ps1 -Lax       clippy warnings are only counted, not errors
 #
 # A failed step doesn't stop the later ones. The summary lists each step as ok or FAILED and
 # the script exits 1 if any failed. A step that fails on a test is rerun once on those tests
@@ -12,7 +12,7 @@
 param(
     [switch]$Quick,
     [switch]$List,
-    [switch]$Strict
+    [switch]$Lax
 )
 Set-StrictMode -Version Latest
 # Each step checks $LASTEXITCODE itself; a native command's stderr must not stop the script.
@@ -20,7 +20,7 @@ $ErrorActionPreference = 'Continue'
 
 # The steps, in order. The test reads the names from here.
 $steps = @(
-    @{ Name = 'clippy';     Text = 'clippy on the workspace (warnings counted; -Strict makes them errors)' },
+    @{ Name = 'clippy';     Text = 'clippy on the workspace, warnings are errors (-Lax only counts them)' },
     @{ Name = 'workspace';  Text = "the workspace's tests" },
     @{ Name = 'components'; Text = "the components' tests, with the compiler bundle" },
     @{ Name = 'release';    Text = 'the release-only timing tests' },
@@ -52,7 +52,7 @@ $releaseTests = @(
 # Each step takes the names of failed tests (none on the first run), runs, and returns its
 # worst exit code. Output goes to the screen and to the step's log.
 function Invoke-Step([string]$Name, [string[]]$Only, [string]$Log) {
-    $worst = 0
+    $script:worst = 0
     $run = {
         param([string[]]$CargoArgs)
         & cargo @CargoArgs 2>&1 | Tee-Object -FilePath $Log -Append | Out-Host
@@ -62,13 +62,11 @@ function Invoke-Step([string]$Name, [string[]]$Only, [string]$Log) {
     if ($Only.Count -gt 0) { $exact = @('--exact') + $Only }
     switch ($Name) {
         'clippy' {
-            # The plan asks for warnings to be errors. The workspace isn't clean on Linux today (see
-            # docs/checks/plan-e.md), so by default only an error fails the step; -Strict makes
-            # warnings errors.
-            if ($Strict) {
-                & $run @('clippy', '--workspace', '--all-targets', '--', '-D', 'warnings')
-            } else {
+            # Warnings are errors; -Lax only counts them.
+            if ($Lax) {
                 & $run @('clippy', '--workspace', '--all-targets')
+            } else {
+                & $run @('clippy', '--workspace', '--all-targets', '--', '-D', 'warnings')
             }
         }
         'workspace' {
@@ -77,7 +75,7 @@ function Invoke-Step([string]$Name, [string[]]$Only, [string]$Log) {
         'components' {
             if ($Only.Count -eq 0) {
                 & powershell -NoProfile -File (Join-Path $PSScriptRoot 'test-components.ps1') 2>&1 | Tee-Object -FilePath $Log -Append | Out-Host
-                if ($LASTEXITCODE -ne 0) { $worst = $LASTEXITCODE }
+                if ($LASTEXITCODE -ne 0) { $script:worst = $LASTEXITCODE }
             } else {
                 $env:STUDIO_BUNDLE = Join-Path $repo 'target/bundle'
                 & $run (@('test', '--workspace', '--no-fail-fast', '--', '--include-ignored') + $exact)
@@ -102,14 +100,17 @@ function Invoke-Step([string]$Name, [string[]]$Only, [string]$Log) {
                 & $run (@('test', '-p', 'xtask', '--no-fail-fast', '--', '--include-ignored') + $exact)
             } else {
                 # The Linux package's tests (linux.rs) need bash and zstd, so Windows runs the others.
-                & $run @('test', '-p', 'xtask', '--no-fail-fast', '--lib', '--test', 'xtask', '--test', 'stage', '--test', 'windows')
+                $pk = @('test', '-p', 'xtask', '--no-fail-fast', '--lib', '--test', 'xtask', '--test', 'stage', '--test', 'windows')
+                # test_all's first test runs bash, so it is only run where bash is found.
+                if (Get-Command bash -ErrorAction SilentlyContinue) { $pk += @('--test', 'test_all') }
+                & $run $pk
                 if (-not $Quick) {
                     & $run @('test', '-p', 'xtask', '--test', 'stage', '--no-fail-fast', '--', '--ignored')
                 }
             }
         }
     }
-    return $worst
+    return $script:worst
 }
 
 Push-Location $repo
@@ -136,11 +137,12 @@ try {
             $rerun = Join-Path $logDir "$name-rerun.log"
             if (Test-Path $rerun) { Remove-Item $rerun }
             $again = Invoke-Step $name $names $rerun
-            if ($again -eq 0) {
+            # Passed only if cargo said ok and the log shows at least one test passed (a name that matches nothing exits 0).
+            if ($again -eq 0 -and (Select-String -Path $rerun -Pattern 'test result: ok\. [1-9][0-9]* passed' -Quiet)) {
                 $results += "${name}: FAILED the first time ($($names.Count) tests), ok on the rerun alone: $($names -join ' ')"
                 Write-Host '--- the rerun passed; both results are in the summary and the step still counts as FAILED'
             } else {
-                $results += "${name}: FAILED, and failed again alone: $($names -join ' ')"
+                $results += "${name}: FAILED, and not shown to pass alone (failed, or ran no test): $($names -join ' ')"
             }
         } else {
             $results += "${name}: FAILED"

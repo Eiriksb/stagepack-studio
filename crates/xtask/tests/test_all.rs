@@ -32,6 +32,14 @@ fn test_all_ps1_names_the_same_steps() {
     assert!(text.contains("[switch]$Quick") && text.contains("[switch]$List"));
     assert!(text.contains("$ErrorActionPreference = 'Continue'") && text.contains("$LASTEXITCODE"));
     assert!(text.trim_end().ends_with("exit 0") && text.contains("exit 1"));
+    // The step function must return the one variable its scriptblock writes (it once didn't, so every
+    // step but one looked ok), and a rerun counts only when a test passed.
+    assert!(text.contains("$script:worst = 0") && text.contains("return $script:worst"));
+    assert!(text.contains("{ $script:worst = $LASTEXITCODE }"));
+    assert!(!text.contains("$worst") || text.matches("$worst").count() == text.matches("$script:worst").count());
+    assert!(text.contains("-Pattern 'test result: ok\\. [1-9][0-9]* passed'"));
+    // Clippy is strict unless -Lax.
+    assert!(text.contains("if ($Lax)") && text.contains("'-D', 'warnings'"));
     // The same release tests and the twin of test-components.sh exist.
     let sh = std::fs::read_to_string(repo().join("scripts/test-all.sh")).unwrap();
     for test in sh.lines().filter(|l| l.contains("slides-") || l.contains("stagepack-studio ui_")).flat_map(|l| l.split_whitespace().skip(2)) {
