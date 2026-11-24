@@ -39,7 +39,7 @@ pub struct Installed {
 pub enum InstalledState {
     /// Checked and loaded, ready to run.
     Ready(Addon),
-    /// It can't be used, for the reason the sentence gives. It can only be removed.
+    /// It can't be used, for the reason the sentence gives. It can be removed, or replaced by getting it again.
     Damaged(String),
 }
 
@@ -272,11 +272,16 @@ pub fn update_from_bytes(app_folder: &Path, bytes: &[u8]) -> Result<Installed, S
 
 /// Whether an export, an import, an install or a removal holds the add-on under `app_folder`
 /// just now, so that an install would have to wait for it.
+///
+/// It never makes the lock file, and looks for a link first, so that nothing is made behind one.
 pub fn is_busy(app_folder: &Path) -> bool {
-    let addons = app_folder.join(ADDONS_FOLDER);
-    // A lock file that can't be opened isn't one held: the install says what's wrong.
-    let Ok(file) = Lock::open(&addons) else { return false };
-    addons.is_dir() && file.try_lock().is_err()
+    // The install refuses a link, and says so.
+    if is_linked(app_folder) {
+        return false;
+    }
+    // A lock file that isn't there, or can't be opened, isn't one held: the install says what's wrong.
+    let opened = std::fs::OpenOptions::new().read(true).write(true).open(app_folder.join(ADDONS_FOLDER).join(".lock"));
+    opened.is_ok_and(|file| file.try_lock().is_err())
 }
 
 /// What an export or an import holds while it runs the add-on, so that no install or removal

@@ -401,12 +401,14 @@ pub fn download(source: &Source, index: &Index, cancel: &AtomicBool, progress: &
     Ok(bytes)
 }
 
-/// Whether `offered` is a later version than `installed`, both three numbers. A version that
-/// isn't is never later, nor is one before it.
+/// Whether `offered` is a later version than `installed`. One on offer that isn't three numbers
+/// is never later. One installed that isn't, as one from a file may be, is older than any that
+/// is, so that it can always be updated.
 pub fn newer(installed: &str, offered: &str) -> bool {
     match (numbers(installed), numbers(offered)) {
+        (_, None) => false,
+        (None, Some(_)) => true,
         (Some(installed), Some(offered)) => offered > installed,
-        _ => false,
     }
 }
 

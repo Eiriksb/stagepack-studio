@@ -135,7 +135,7 @@ fn the_addons_dialog_shows_not_installed_then_installed(cx: &mut TestAppContext)
     assert!(problem.contains("signature") && !problem.contains('\n'), "{problem}");
     assert_eq!(label_of(&typing, cx, ADDON_STATE_ID).as_deref(), Some("Installed, version 0.1.0"));
 
-    // A damaged one shows as damaged, with Remove alone, which takes it away.
+    // A damaged one shows as damaged, with Remove, which takes it away, and Get again.
     let wasm = root.path().join("app/addons/slidev/addon.wasm");
     let mut bytes = std::fs::read(&wasm).unwrap();
     bytes[0] ^= 1;
@@ -144,7 +144,7 @@ fn the_addons_dialog_shows_not_installed_then_installed(cx: &mut TestAppContext)
     show_add_ons(&typing, cx);
     let state = label_of(&typing, cx, ADDON_STATE_ID).unwrap();
     assert!(state.starts_with("Damaged: ") && state.contains("signature"), "{state}");
-    assert!(shows(&typing, cx, ADDON_REMOVE_ID) && !shows(&typing, cx, ADDON_INSTALL_ID));
+    assert!(shows(&typing, cx, ADDON_REMOVE_ID) && shows(&typing, cx, ADDON_GET_ID) && !shows(&typing, cx, ADDON_INSTALL_ID));
     click_on(&typing, cx, ADDON_REMOVE_ID);
     settle_work(&typing, cx);
     assert_eq!(label_of(&typing, cx, ADDON_STATE_ID).as_deref(), Some("Not installed"));
@@ -750,4 +750,92 @@ fn start_up_makes_no_request(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(hits(&server), 0);
     assert_eq!(stagepack_studio::addons::fetch::requests_for_test(), asked);
+}
+
+/// Damages the add-on installed under `app`, as a file changed since would.
+fn damage(app: &Path) {
+    let wasm = app.join("addons/slidev/addon.wasm");
+    let mut bytes = std::fs::read(&wasm).unwrap();
+    bytes[0] ^= 1;
+    std::fs::write(&wasm, bytes).unwrap();
+}
+
+#[gpui_kit::test]
+fn a_damaged_install_is_replaced_by_get_again(cx: &mut TestAppContext) {
+    let _one = one_at_a_time();
+    test_key();
+    let (server, files) = add_on_server();
+    let root = tempfile::tempdir().unwrap();
+    let app = root.path().join("app");
+    // As an app update to another Slidev leaves the add-on made for the old one; a later version
+    // is installed, so that Get isn't refused as going back.
+    stagepack_studio::addons::install_from_bytes(&app, &package_at("0.3.0")).unwrap();
+    damage(&app);
+    offer(&server, &files, "0.2.0");
+    let typing = open_start(cx, root.path());
+    show_add_ons(&typing, cx);
+    assert!(label_of(&typing, cx, ADDON_STATE_ID).unwrap().starts_with("Damaged: "));
+    assert!(shows(&typing, cx, ADDON_GET_ID) && shows(&typing, cx, ADDON_REMOVE_ID));
+    assert_eq!(label_of(&typing, cx, ADDON_GET_ID).as_deref(), Some("Get again"));
+    assert!(!shows(&typing, cx, ADDON_CHECK_ID) && !shows(&typing, cx, ADDON_UPDATE_ID));
+
+    click_on(&typing, cx, ADDON_GET_ID);
+    wait_until(&typing, cx, "the install", |typing, cx| state_is(typing, cx, "Installed, version 0.2.0"));
+    assert_eq!(addons_folder(&app), ["slidev"]);
+    assert!(!shows(&typing, cx, ADDON_GET_ID) && !shows(&typing, cx, ADDON_PROBLEM_ID));
+}
+
+#[gpui_kit::test]
+fn a_busy_get_keeps_nothing_it_could_not_use(cx: &mut TestAppContext) {
+    use stagepack_studio::addons::dialog::downloads_held_for_test;
+    let _one = one_at_a_time();
+    test_key();
+    let (server, files) = add_on_server();
+    let root = tempfile::tempdir().unwrap();
+    let app = root.path().join("app");
+    std::fs::create_dir_all(app.join("addons")).unwrap();
+    let typing = open_start(cx, root.path());
+    show_add_ons(&typing, cx);
+    let gate = offer_gated(&server, &files, "0.2.0");
+    click_on(&typing, cx, ADDON_GET_ID);
+    wait_until(&typing, cx, "the download", |typing, cx| label_of(typing, cx, ADDON_PROGRESS_ID).is_some_and(|said| said.starts_with("Downloading… ")));
+
+    // Something holds the add-ons folder as it downloads: Get says so, and as Get never uses a
+    // download kept, none is.
+    let in_use = stagepack_studio::addons::in_use(&app);
+    open_gate(&gate);
+    wait_until(&typing, cx, "the problem", |typing, cx| shows(typing, cx, ADDON_PROBLEM_ID));
+    assert_eq!(label_of(&typing, cx, ADDON_PROBLEM_ID).as_deref(), Some(stagepack_studio::addons::BUSY));
+    assert_eq!(downloads_held_for_test(&app), 0);
+    assert!(shows(&typing, cx, ADDON_GET_ID));
+    drop(in_use);
+}
+
+#[gpui_kit::test]
+fn a_kept_download_goes_once_a_check_finds_another(cx: &mut TestAppContext) {
+    use stagepack_studio::addons::dialog::downloads_held_for_test;
+    let _one = one_at_a_time();
+    test_key();
+    let (server, files) = add_on_server();
+    let root = tempfile::tempdir().unwrap();
+    let app = root.path().join("app");
+    stagepack_studio::addons::install_from_bytes(&app, &package_at("0.1.0")).unwrap();
+    let typing = open_start(cx, root.path());
+    show_add_ons(&typing, cx);
+    let gate = offer_gated(&server, &files, "0.2.0");
+    click_on(&typing, cx, ADDON_CHECK_ID);
+    wait_until(&typing, cx, "the check", |typing, cx| shows(typing, cx, ADDON_UPDATE_ID));
+    click_on(&typing, cx, ADDON_UPDATE_ID);
+    wait_until(&typing, cx, "the download", |typing, cx| label_of(typing, cx, ADDON_PROGRESS_ID).is_some_and(|said| said.starts_with("Downloading… ")));
+    let in_use = stagepack_studio::addons::in_use(&app);
+    open_gate(&gate);
+    wait_until(&typing, cx, "the problem", |typing, cx| shows(typing, cx, ADDON_PROBLEM_ID));
+    assert_eq!(downloads_held_for_test(&app), 1, "0.2.0 is kept for the next Update");
+    drop(in_use);
+
+    // A later check finds 0.3.0 on offer instead: 0.2.0 is no use now, and goes.
+    offer(&server, &files, "0.3.0");
+    click_on(&typing, cx, ADDON_CHECK_ID);
+    wait_until(&typing, cx, "the check", |typing, cx| label_of(typing, cx, ADDON_NEWS_ID).as_deref() == Some("Version 0.3.0 is available"));
+    assert_eq!(downloads_held_for_test(&app), 0);
 }

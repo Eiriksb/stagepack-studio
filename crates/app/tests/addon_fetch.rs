@@ -468,9 +468,14 @@ fn newer_compares_numbers() {
     assert!(!fetch::newer("0.1.10", "0.1.9"));
     assert!(!fetch::newer("0.2.0", "0.2.0"));
     assert!(!fetch::newer("1.0.0", "0.9.9"));
-    for malformed in ["0.2", "0.2.0.1", "v0.2.0", "0.2.x", "", "0.2.0-beta", "+1.0.0", " 1.0.0", "0..1"] {
+    for malformed in ["0.2", "0.2.0.1", "v0.2.0", "0.2.x", "", "0.2.0-beta", "+1.0.0", " 1.0.0", "0..1", "01.2.3"] {
+        // One on offer that isn't three numbers is never later.
         assert!(!fetch::newer("0.1.0", malformed), "{malformed:?}");
-        assert!(!fetch::newer(malformed, "9.9.9"), "{malformed:?}");
+        assert!(!fetch::newer(malformed, malformed), "{malformed:?}");
+        // One installed that isn't, as from a file, is older than any that is, so that it can
+        // always be updated.
+        assert!(fetch::newer(malformed, "9.9.9"), "{malformed:?}");
+        assert!(fetch::newer(malformed, "0.0.0"), "{malformed:?}");
     }
 }
 

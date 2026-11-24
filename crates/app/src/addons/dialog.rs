@@ -58,6 +58,19 @@ fn megabytes(bytes: u64) -> String {
     if bytes > 0 && bytes < 100_000 { "0.1".to_string() } else { format!("{:.1}", bytes as f64 / 1e6) }
 }
 
+/// The downloads had, by the app folder they were for, for the tests that pin when they're let go.
+#[cfg(feature = "test-hooks")]
+static DOWNLOADS: std::sync::Mutex<Vec<(PathBuf, std::sync::Weak<Vec<u8>>)>> = std::sync::Mutex::new(Vec::new());
+
+/// How many of the downloads had for `app_folder` are still held, by a dialog keeping one or a
+/// job going on.
+#[cfg(feature = "test-hooks")]
+pub fn downloads_held_for_test(app_folder: &std::path::Path) -> usize {
+    let mut downloads = DOWNLOADS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    downloads.retain(|(_, download)| download.strong_count() > 0);
+    downloads.iter().filter(|(folder, _)| folder == app_folder).count()
+}
+
 /// What the dialog shows, kept while it's open.
 pub struct AddOns {
     /// The app's data folder, which add-ons are kept in, if the system has one.
@@ -106,8 +119,8 @@ enum Told {
     Checked(Index),
     Installed,
     Failed(String),
-    /// The download of the release was had, but an export or an import held the add-on, so it
-    /// is kept for the next *Update*.
+    /// The download of the release an Update was for was had, but an export or an import held
+    /// the add-on, so it is kept for the next *Update*.
     Busy(Index, Arc<Vec<u8>>),
 }
 
@@ -200,6 +213,10 @@ impl AddOns {
                     Status::Installed(_) => (Some(NEWEST.into()), None),
                     Status::NotInstalled | Status::Damaged(_) => (None, None),
                 };
+                // A download kept of another release than the one on offer now is no use.
+                if self.kept.as_ref().is_some_and(|(kept, _)| self.offered.as_ref() != Some(kept)) {
+                    self.kept = None;
+                }
             }
             Told::Installed => {
                 self.fetching = None;
@@ -214,6 +231,7 @@ impl AddOns {
                 // Another window may have installed meanwhile.
                 self.look_again(cx);
             }
+            // Only an Update says this: it is the only job that would use what's kept.
             Told::Busy(index, bytes) => {
                 if let Some(before) = self.fetching.take() {
                     (self.news, self.offered) = (before.news, before.offered);
@@ -323,6 +341,8 @@ impl Drop for AddOns {
 /// Does `job` for the add-on under `app_folder`, from `source`, telling `tell` how far it has got,
 /// until `cancel` is set; and gives what it came to.
 fn run(job: Job, app_folder: &std::path::Path, source: &fetch::Source, cancel: &AtomicBool, tell: &mpsc::Sender<Told>) -> Told {
+    // Only an Update keeps a download the add-on was too busy for: a Get never looks for one.
+    let keeps = matches!(job, Job::Update(..));
     let (index, kept) = match job {
         Job::Check => return fetch::check(source, cancel).map_or_else(Told::Failed, Told::Checked),
         Job::Get => match fetch::check(source, cancel) {
@@ -355,7 +375,12 @@ fn run(job: Job, app_folder: &std::path::Path, source: &fetch::Source, cancel: &
                 let _ = tell.send(Told::Progress(done, total));
             };
             match fetch::download(source, &index, cancel, &progress) {
-                Ok(bytes) => Arc::new(bytes),
+                Ok(bytes) => {
+                    let bytes = Arc::new(bytes);
+                    #[cfg(feature = "test-hooks")]
+                    DOWNLOADS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((app_folder.to_path_buf(), Arc::downgrade(&bytes)));
+                    bytes
+                }
                 Err(sentence) => return Told::Failed(sentence),
             }
         }
@@ -366,7 +391,7 @@ fn run(job: Job, app_folder: &std::path::Path, source: &fetch::Source, cancel: &
     let _ = tell.send(Told::Installing);
     match super::update_from_bytes(app_folder, &bytes) {
         Ok(_) => Told::Installed,
-        Err(sentence) if sentence == BUSY => Told::Busy(index, bytes),
+        Err(sentence) if sentence == BUSY && keeps => Told::Busy(index, bytes),
         Err(sentence) => Told::Failed(sentence),
     }
 }
@@ -384,6 +409,8 @@ impl Render for AddOns {
         let running = fetching.is_some();
         let installed = matches!(self.status, Status::Installed(_));
         let not_installed = matches!(self.status, Status::NotInstalled);
+        // A damaged install, as an app update to another Slidev leaves one, is replaced by Get.
+        let damaged = matches!(self.status, Status::Damaged(_));
         let can_update = !running && installed && self.offered.is_some();
         v_flex()
             .id(ADDONS_DIALOG_ID)
@@ -437,12 +464,12 @@ impl Render for AddOns {
                                         .on_click(cx.listener(|this, _, window, cx| this.ask_to_install(window, cx))),
                                 )
                             })
-                            .when(!running && not_installed, |this| {
+                            .when(!running && (not_installed || damaged), |this| {
                                 this.child(
                                     Button::new(ADDON_GET_ID)
                                         .small()
                                         .primary()
-                                        .label("Get")
+                                        .label(if damaged { "Get again" } else { "Get" })
                                         .disabled(busy)
                                         .on_click(cx.listener(|this, _, _, cx| this.start(Job::Get, cx))),
                                 )

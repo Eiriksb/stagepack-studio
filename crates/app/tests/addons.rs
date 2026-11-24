@@ -747,3 +747,35 @@ fn an_install_cut_short_is_put_back_before_an_export_holds_it() {
     assert!(matches!(loaded, Some(addons::Installed { state: InstalledState::Ready(_), .. })));
     assert!(addons_folder.join("slidev/addon.wasm").is_file());
 }
+
+#[test]
+fn a_version_installed_that_isnt_three_numbers_can_be_updated() {
+    test_key();
+    let app = tempfile::tempdir().unwrap();
+    let package = |version: &str| package_signed(&answering_guest_at(&export_answer(), version), version, test_key());
+    // As from a file: a version the app can't compare.
+    addons::install_from_bytes(app.path(), &package("1.0.0-rc1")).unwrap();
+    assert_eq!(addons::update_from_bytes(app.path(), &package("0.2.0")).unwrap().version, "0.2.0");
+    // An update to one that isn't three numbers is never taken as later.
+    let refused = addons::update_from_bytes(app.path(), &package("0.3.0-rc1")).unwrap_err();
+    assert!(refused.contains("0.2.0 is installed already"), "{refused}");
+}
+
+#[test]
+fn is_busy_never_makes_a_lock_file() {
+    let app = tempfile::tempdir().unwrap();
+    assert!(!addons::is_busy(app.path()));
+    std::fs::create_dir_all(app.path().join("addons")).unwrap();
+    assert!(!addons::is_busy(app.path()));
+    assert!(!app.path().join("addons/.lock").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn is_busy_makes_nothing_behind_a_linked_add_ons_folder() {
+    let app = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), app.path().join("addons")).unwrap();
+    assert!(!addons::is_busy(app.path()));
+    assert_eq!(std::fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+}
