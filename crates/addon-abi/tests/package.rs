@@ -114,6 +114,36 @@ fn the_wrong_key_is_refused() {
 }
 
 #[test]
+fn a_signature_only_a_lax_check_takes_is_refused() {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    // The identity point as the key, and R = identity, S = 0 as the signature: the plain check
+    // takes that for any message, the strict one refuses the weak key.
+    let mut identity = [0; 32];
+    identity[0] = 1;
+    let mut sig = [0; 64];
+    sig[0] = 1;
+    let manifest_bytes = serde_json::to_vec(&manifest()).unwrap();
+    let message = signed_message(&manifest_bytes, WASM);
+    let lax = VerifyingKey::from_bytes(&identity).unwrap();
+    assert!(lax.verify(&message, &Signature::from_bytes(&sig)).is_ok(), "the plain check takes it, so this tests the strict one");
+    let bytes = zip_of(&[("addon.json", &manifest_bytes), ("addon.wasm", WASM), ("addon.sig", &sig)]);
+    let error = read_package(&bytes, &identity).unwrap_err();
+    assert!(error.contains("signature"), "{error}");
+}
+
+#[test]
+fn a_zip_saying_it_holds_many_entries_is_refused_before_they_are_read() {
+    let key = key(7);
+    let mut bytes = signed(&manifest(), WASM, &key);
+    // The end-of-directory record, the last 22 bytes of a zip with no comment: its two entry counts.
+    let end = bytes.len() - 22;
+    assert_eq!(bytes[end..end + 4], [0x50, 0x4b, 0x05, 0x06]);
+    bytes[end + 8..end + 12].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+    let error = read_package(&bytes, &public(&key)).unwrap_err();
+    assert!(error.contains("exactly 3"), "{error}");
+}
+
+#[test]
 fn a_short_signature_is_refused() {
     let key = key(7);
     let manifest_bytes = serde_json::to_vec(&manifest()).unwrap();
@@ -147,9 +177,13 @@ fn extra_entries_or_unsafe_names_are_refused() {
     // the second name is changed in the bytes, where it is spelt the same length.
     let twice = zip_of(&[three[0], three[1], ("addon.wasx", WASM)]);
     let twice = replace(&twice, b"addon.wasx", b"addon.wasm");
-    // The zip reader keeps one of the two, so the package is an entry short of the three.
     let error = read_package(&twice, &public(&key)).unwrap_err();
-    assert!(error.contains("exactly 3"), "{error}");
+    assert!(error.contains("twice"), "{error}");
+    // And as a fourth entry, where the zip reader would see three names and keep the last copy.
+    let four = zip_of(&[three[0], three[1], ("addon.wasx", b"another module"), three[2]]);
+    let four = replace(&four, b"addon.wasx", b"addon.wasm");
+    let error = read_package(&four, &public(&key)).unwrap_err();
+    assert!(error.contains("twice"), "{error}");
 
     let error = read_package(b"not a zip at all", &public(&key)).unwrap_err();
     assert!(error.contains("zip"), "{error}");

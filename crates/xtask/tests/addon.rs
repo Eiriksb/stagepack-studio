@@ -66,6 +66,14 @@ fn a_key_file_others_can_read_is_refused() {
     let error = xtask::addon::read_signing_key(&key_file).unwrap_err();
     assert!(error.contains("0600"), "{error}");
 
+    // Nor is a key made in a folder others can read.
+    let open = scratch.path().join("open");
+    std::fs::create_dir(&open).unwrap();
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let error = xtask::addon::keygen(&open.join("addon-signing.key")).unwrap_err();
+    assert!(error.contains("0700"), "{error}");
+    assert!(!open.join("addon-signing.key").exists());
+
     let short = scratch.path().join("short.key");
     std::fs::write(&short, [1; 31]).unwrap();
     std::fs::set_permissions(&short, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -76,7 +84,7 @@ fn a_key_file_others_can_read_is_refused() {
 #[test]
 fn the_built_in_key_is_a_public_key() {
     let key = xtask::addon::built_in_key().unwrap();
-    assert!(VerifyingKey::from_bytes(&key).is_ok());
+    assert!(!VerifyingKey::from_bytes(&key).unwrap().is_weak());
     assert!(key.iter().any(|b| *b != key[0]), "the built-in key looks like a placeholder");
 }
 

@@ -48,8 +48,11 @@ pub struct AddonManifest {
     pub slidev: String,
 }
 
-/// A package whose signature was checked, and whose manifest is one the app takes.
+/// A package whose signature was checked, and whose manifest is one the app takes. Only
+/// [`read_package`] makes one (it can't be built outside this crate), so holding one means
+/// the check was made.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Package {
     pub manifest: AddonManifest,
     pub wasm: Vec<u8>,
@@ -57,6 +60,10 @@ pub struct Package {
     pub manifest_bytes: Vec<u8>,
     pub sig: [u8; SIG_BYTES],
 }
+
+/// The most entries a zip may say it holds before its directory is read at all. A package
+/// holds 3; this lets a few more through only so that the sentence can say which is wrong.
+const MAX_LISTED_ENTRIES: u64 = 8;
 
 /// What is signed: `sha256(addon.json) || sha256(addon.wasm)`.
 pub fn signed_message(manifest_bytes: &[u8], wasm: &[u8]) -> [u8; 64] {
@@ -98,12 +105,20 @@ pub fn read_package(bytes: &[u8], key: &[u8; 32]) -> Result<Package, String> {
         return Err(format!("The add-on file is {} bytes, over the {} MiB an add-on package may take.", bytes.len(), MAX_PACKAGE_BYTES >> 20));
     }
     let key = VerifyingKey::from_bytes(key).map_err(|_| "The add-on key built into the app isn't an ed25519 public key.".to_string())?;
-    let mut archive = ZipArchive::new(Cursor::new(bytes)).map_err(|_| "The add-on file isn't a zip archive that can be read.".to_string())?;
+    let not_a_zip = || "The add-on file isn't a zip archive that can be read.".to_string();
+    // The count the zip gives for itself, so that a directory of many entries is never read in.
+    let listed = listed_entries(bytes).ok_or_else(not_a_zip)?;
+    if listed > MAX_LISTED_ENTRIES {
+        return Err(wrong_count(listed));
+    }
+    let mut archive = ZipArchive::new(Cursor::new(bytes)).map_err(|_| not_a_zip())?;
+    // The zip reader keeps one entry of a name it finds twice, so this is asked of it before
+    // the entries are counted: other zip tools would show the copy it left out.
+    if archive.has_duplicate_names() {
+        return Err("The add-on file holds an entry twice.".into());
+    }
     if archive.len() != ENTRIES.len() {
-        return Err(format!(
-            "The add-on file holds {} entries, where a package holds exactly 3: addon.json, addon.wasm and addon.sig.",
-            archive.len()
-        ));
+        return Err(wrong_count(archive.len() as u64));
     }
 
     // Where each of the three is in the zip, found from the zip's own directory, unpacking nothing.
@@ -118,9 +133,8 @@ pub fn read_package(bytes: &[u8], key: &[u8; 32]) -> Result<Package, String> {
             .iter()
             .position(|entry| *entry == name)
             .ok_or_else(|| format!("The add-on file has an entry named {name:?}, which isn't one of the names a package holds."))?;
-        if at[slot].replace(index).is_some() {
-            return Err(format!("The add-on file has the entry {name:?} twice."));
-        }
+        // With no name twice and three entries, each of the three is found once.
+        at[slot] = Some(index);
         if file.encrypted() || !file.is_file() {
             return Err(format!("The add-on file's {name} isn't a plain file."));
         }
@@ -165,6 +179,26 @@ pub fn read_package(bytes: &[u8], key: &[u8; 32]) -> Result<Package, String> {
         }
     }
     Ok(Package { manifest, wasm, manifest_bytes, sig })
+}
+
+fn wrong_count(count: u64) -> String {
+    format!("The add-on file holds {count} entries, where a package holds exactly 3: addon.json, addon.wasm and addon.sig.")
+}
+
+/// The number of entries the zip in `bytes` says it holds, from its end-of-directory record
+/// (the larger of its two counts), or `None` if it has none. A zip64 count reads as 65 535.
+fn listed_entries(bytes: &[u8]) -> Option<u64> {
+    const RECORD: usize = 22;
+    let earliest = bytes.len().saturating_sub(RECORD + usize::from(u16::MAX));
+    (earliest..=bytes.len().checked_sub(RECORD)?).rev().find_map(|at| {
+        let record = &bytes[at..at + RECORD];
+        let comment = usize::from(u16::from_le_bytes([record[20], record[21]]));
+        (record[..4] == [0x50, 0x4b, 0x05, 0x06] && at + RECORD + comment == bytes.len()).then(|| {
+            let on_disk = u16::from_le_bytes([record[8], record[9]]);
+            let total = u16::from_le_bytes([record[10], record[11]]);
+            u64::from(on_disk.max(total))
+        })
+    })
 }
 
 fn limit(slot: usize) -> u64 {

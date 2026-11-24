@@ -10008,6 +10008,7 @@ dependencies = [
  "slides-terminal-helper",
  "tempfile",
  "tiny-skia",
+ "zeroize",
 ]
 
 [[package]]

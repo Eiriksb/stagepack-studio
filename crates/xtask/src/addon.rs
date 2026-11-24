@@ -33,15 +33,25 @@ pub fn built_in_key() -> Result<[u8; 32], String> {
 }
 
 /// Makes a new signing key in `path` and gives back its public half. The file is made with
-/// mode 0600, and its folder, if it isn't there yet, with mode 0700. A file that is there
-/// already is never written over.
+/// mode 0600, and its folder, if it isn't there yet, with mode 0700; a folder that is there
+/// already and that others can open is refused. A file that is there already is never written
+/// over, and one that couldn't be written in full is taken away again.
 pub fn keygen(path: &Path) -> Result<[u8; 32], String> {
-    if let Some(folder) = path.parent().filter(|f| !f.as_os_str().is_empty() && !f.exists()) {
+    let folder = path.parent().filter(|f| !f.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    if !folder.exists() {
         let mut builder = std::fs::DirBuilder::new();
         builder.recursive(true);
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
         builder.create(folder).map_err(|e| format!("can't create {}: {e}", folder.display()))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(folder).map_err(|e| format!("can't read {}: {e}", folder.display()))?.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(format!("the folder {} can be opened by others (mode {mode:o}); make it mode 0700 first.", folder.display()));
+        }
     }
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -52,7 +62,12 @@ pub fn keygen(path: &Path) -> Result<[u8; 32], String> {
         _ => format!("can't create {}: {e}", path.display()),
     })?;
     let key = SigningKey::generate(&mut rand_core::OsRng);
-    file.write_all(key.as_bytes()).and_then(|()| file.sync_all()).map_err(|e| format!("can't write {}: {e}", path.display()))?;
+    if let Err(e) = file.write_all(key.as_bytes()).and_then(|()| file.sync_all()) {
+        drop(file);
+        // The file was made by this run, so taking it away leaves nothing of anyone's.
+        let _ = std::fs::remove_file(path);
+        return Err(format!("can't write {}: {e}", path.display()));
+    }
     Ok(key.verifying_key().to_bytes())
 }
 
@@ -71,8 +86,9 @@ pub fn read_signing_key(path: &Path) -> Result<SigningKey, String> {
     if meta.len() != 32 {
         return Err(format!("the key file {} is {} bytes, where a key file is 32.", path.display(), meta.len()));
     }
-    let mut secret = [0; 32];
-    file.read_exact(&mut secret).map_err(|e| format!("can't read the key file {}: {e}", path.display()))?;
+    // Wiped when it goes, as the signing key itself is.
+    let mut secret = zeroize::Zeroizing::new([0; 32]);
+    file.read_exact(&mut secret[..]).map_err(|e| format!("can't read the key file {}: {e}", path.display()))?;
     Ok(SigningKey::from_bytes(&secret))
 }
 
