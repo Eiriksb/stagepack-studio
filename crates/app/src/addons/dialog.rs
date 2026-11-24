@@ -90,9 +90,9 @@ struct Fetching {
 
 /// What is asked of the add-on's releases.
 enum Job {
-    /// The latest release, downloaded and installed.
+    /// The release the index of the app's line names, downloaded and installed.
     Get,
-    /// Whether the latest release is later than what's installed.
+    /// Whether the release the index names is later than what's installed.
     Check,
     /// The release a check found, downloaded and installed; or installed from the bytes kept
     /// of it, downloaded already, when an export or an import held the add-on last time.

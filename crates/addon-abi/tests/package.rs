@@ -287,3 +287,26 @@ fn the_parts_of_a_read_package_verify_again_and_a_changed_part_does_not() {
     let refused = verify_parts(&package.manifest_bytes, &package.wasm, &package.sig, &public(&self::key(8))).unwrap_err();
     assert!(refused.contains("signature doesn't match"), "{refused}");
 }
+
+#[test]
+fn each_compatibility_line_has_an_index_of_its_own_that_never_moves() {
+    use addon_abi::package::{index_file, index_url, INDEX_TAG, PACKAGE_PREFIX};
+    assert_eq!(INDEX_TAG, "index");
+    assert_eq!(index_file(1, "53.0.0"), "index-abi1-slidev53.json");
+    // Only Slidev's major version names the line.
+    assert_eq!(index_file(1, "53.2.7"), "index-abi1-slidev53.json");
+    assert_eq!(index_file(2, "54.0.0"), "index-abi2-slidev54.json");
+    // In the release tagged `index`, beside the packages' own releases.
+    assert_eq!(index_url(1, "53.0.0"), format!("{PACKAGE_PREFIX}index/index-abi1-slidev53.json"));
+    assert_eq!(index_url(1, "53.0.0"), "https://github.com/Eiriksb/stagepack-studio-addons/releases/download/index/index-abi1-slidev53.json");
+}
+
+#[test]
+fn a_version_is_three_numbers_without_leading_zeros() {
+    use addon_abi::package::version_numbers;
+    assert_eq!(version_numbers("0.1.0"), Some((0, 1, 0)));
+    assert_eq!(version_numbers("10.20.30"), Some((10, 20, 30)));
+    for odd in ["01.2.3", "1.02.3", "1.2.03", "0.2", "0.2.0.1", "v0.2.0", "0.2.x", "", "0.2.0-beta", "+1.0.0", " 1.0.0", "0..1", "-1.0.0", "99999999999999999999.0.0"] {
+        assert_eq!(version_numbers(odd), None, "{odd:?}");
+    }
+}

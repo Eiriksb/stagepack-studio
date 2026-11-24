@@ -48,20 +48,44 @@ pub struct AddonManifest {
     pub slidev: String,
 }
 
-/// The file a release publishes beside its package, naming it.
-pub const INDEX_FILE: &str = "index.json";
-
-/// Where the latest release's index is.
-pub const INDEX_URL: &str = "https://github.com/Eiriksb/stagepack-studio-addons/releases/latest/download/index.json";
-/// What every package's address starts with.
+/// What every package's address starts with, and every index's: the repository's release files.
 pub const PACKAGE_PREFIX: &str = "https://github.com/Eiriksb/stagepack-studio-addons/releases/download/";
+
+/// The tag of the one release that holds the indexes, a file for each line of apps: an app asks
+/// only for its own line's, which is always at the same address, so an app that has shipped
+/// keeps finding the last add-on made for it, whatever is published for later apps.
+pub const INDEX_TAG: &str = "index";
+
+/// The index file of the apps that take add-on interface `abi` and write for Slidev `slidev`:
+/// `index-abi<abi>-slidev<major>.json`, by Slidev's major version only.
+pub fn index_file(abi: u32, slidev: &str) -> String {
+    let major: String = slidev.chars().take_while(char::is_ascii_digit).collect();
+    format!("index-abi{abi}-slidev{major}.json")
+}
+
+/// Where the index of that line is: [`index_file`] in the release tagged [`INDEX_TAG`].
+pub fn index_url(abi: u32, slidev: &str) -> String {
+    format!("{PACKAGE_PREFIX}{INDEX_TAG}/{}", index_file(abi, slidev))
+}
+
+/// The three numbers of `version`, `X.Y.Z`, with no leading zeros, signs or anything else: the
+/// versions an index offers, and the only ones the app compares. The app and the packaging tool
+/// both ask this, so they can't disagree on what a version is.
+pub fn version_numbers(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.split('.').map(|part| {
+        let digits = !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()) && (part == "0" || !part.starts_with('0'));
+        if digits { part.parse::<u64>().ok() } else { None }
+    });
+    let numbers = (parts.next()??, parts.next()??, parts.next()??);
+    parts.next().is_none().then_some(numbers)
+}
 
 /// The tag of the release that publishes version `version`: `slidev-v<version>`.
 pub fn release_tag(version: &str) -> String {
     format!("{ADDON_NAME}-v{version}")
 }
 
-/// What `index.json` says of the package a release offers. It proves nothing: the app takes it
+/// What an index file says of the package offered to its line of apps. It proves nothing: the app takes it
 /// only to know what to download, and checks the download against it, and then against the
 /// package's own signed `addon.json`. The packaging tool writes it and the app reads it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

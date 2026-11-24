@@ -8,7 +8,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use addon_abi::package::{package_file_name, read_package, release_tag, write_package, AddonManifest, Index, ADDON_NAME, INDEX_FILE, PACKAGE_PREFIX};
+use addon_abi::package::{index_file, package_file_name, read_package, release_tag, version_numbers, write_package, AddonManifest, Index, ADDON_NAME, INDEX_TAG, PACKAGE_PREFIX};
 use addon_abi::ABI_VERSION;
 use ed25519_dalek::{Signer, SigningKey};
 use sha2::{Digest, Sha256};
@@ -139,15 +139,15 @@ pub fn is_built_in(key_file: &Path) -> Result<bool, String> {
     Ok(read_signing_key(key_file)?.verifying_key().to_bytes() == built_in_key()?)
 }
 
-/// Writes `index.json` in the folder of `package`, for the release that publishes it: the
-/// package is read with `public` first, so an index is only ever made for a package the app
-/// would take, and its `size`, `sha256` and `url` are the package's own. The file name must be
-/// the one `package addon` gives. Gives back the file and what it says.
+/// Writes the index of `package`'s line of apps, `index-abi<abi>-slidev<major>.json`, in the
+/// folder of `package`: the package is read with `public` first, so an index is only ever made
+/// for a package the app would take, and its `size`, `sha256` and `url` are the package's own.
+/// The file name must be the one `package addon` gives, and the version three numbers as the app
+/// reads them. Gives back the file and what it says.
 pub fn write_release_index(package: &Path, public: &[u8; 32]) -> Result<(PathBuf, Index), String> {
     let bytes = std::fs::read(package).map_err(|e| format!("can't read {}: {e}", package.display()))?;
     let manifest = read_package(&bytes, public).map_err(|e| format!("{} isn't a package the app takes: {e}", package.display()))?.manifest;
-    let version_ok = manifest.version.split('.').count() == 3 && manifest.version.split('.').all(|n| !n.is_empty() && n.len() <= 9 && n.bytes().all(|b| b.is_ascii_digit()));
-    if !version_ok {
+    if version_numbers(&manifest.version).is_none() {
         return Err(format!("the version {} isn't three numbers.", manifest.version));
     }
     let name = package_file_name(&manifest);
@@ -165,15 +165,27 @@ pub fn write_release_index(package: &Path, public: &[u8; 32]) -> Result<(PathBuf
     };
     let mut text = serde_json::to_string_pretty(&index).map_err(|e| format!("can't write the index: {e}"))?;
     text.push('\n');
-    let file = package.with_file_name(INDEX_FILE);
+    let file = package.with_file_name(index_file(manifest.abi, &manifest.slidev));
     std::fs::write(&file, text).map_err(|e| format!("can't write {}: {e}", file.display()))?;
     Ok((file, index))
 }
 
-/// The owner's steps after `index`, for `package addon-release` to print.
+/// The repository the add-on is published in.
+const RELEASES_REPO: &str = "Eiriksb/stagepack-studio-addons";
+
+/// The owner's steps after `index`, for `package addon-release` to print: the package in a
+/// release of its own, then its index in place of the line's earlier one, in the release tagged
+/// [`INDEX_TAG`], which is made once, before the first.
 pub fn publishing_steps(package: &Path, index_file: &Path, index: &Index) -> String {
     format!(
-        "To publish (the full steps are in docs/guide/publishing-the-addon.md):\n  gh release create {tag} {package} {index} --repo Eiriksb/stagepack-studio-addons --title \"Slidev add-on {version}\" --latest\nThe newest release must always hold {INDEX_FILE}. Never upload the signing key.",
+        "To publish (the full steps are in docs/guide/publishing-the-addon.md):\n\
+         Once only, before the first release (skip it if the release {INDEX_TAG} is there already):\n  \
+         gh release create {INDEX_TAG} --repo {RELEASES_REPO} --title \"Add-on index\" --notes \"The index files the app reads, one for each line of apps. Never delete them.\"\n\
+         The package, in a release of its own:\n  \
+         gh release create {tag} {package} --repo {RELEASES_REPO} --title \"Slidev add-on {version}\" --notes \"Slidev add-on {version}\"\n\
+         Then its index, in place of the earlier one, once the package is up:\n  \
+         gh release upload {INDEX_TAG} {index} --clobber --repo {RELEASES_REPO}\n\
+         Never upload the signing key.",
         tag = release_tag(&index.version),
         package = package.display(),
         index = index_file.display(),

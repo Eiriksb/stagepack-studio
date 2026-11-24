@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use addon_abi::package::{read_package, write_package, AddonManifest, Index, INDEX_FILE, PACKAGE_PREFIX};
+use addon_abi::package::{read_package, write_package, AddonManifest, Index, PACKAGE_PREFIX};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 
@@ -135,7 +135,8 @@ fn the_release_index_matches_its_package() {
     let bytes = std::fs::read(&package).unwrap();
 
     let (file, written) = xtask::addon::write_release_index(&package, &public).unwrap();
-    assert_eq!(file, scratch.path().join("package").join(INDEX_FILE));
+    // Named for its line of apps: add-on interface 1, Slidev 53.
+    assert_eq!(file, scratch.path().join("package").join("index-abi1-slidev53.json"));
 
     // The app's own type reads it, and it says what the package beside it is.
     let index: Index = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
@@ -147,9 +148,22 @@ fn the_release_index_matches_its_package() {
     // The address is the one the published steps' tag makes, under the prefix the app insists on.
     assert_eq!(index.url, format!("{PACKAGE_PREFIX}slidev-v1.2.3/slidev-1.2.3.spaddon"));
     let steps = xtask::addon::publishing_steps(&package, &file, &index);
-    assert!(steps.contains("gh release create slidev-v1.2.3 "), "{steps}");
-    assert!(steps.contains("--repo Eiriksb/stagepack-studio-addons") && steps.contains("--latest"), "{steps}");
-    assert!(steps.contains("slidev-1.2.3.spaddon") && steps.contains("index.json"), "{steps}");
+    let lines: Vec<&str> = steps.lines().map(str::trim).collect();
+    // The package in a release of its own, with notes so that gh asks nothing, and not marked
+    // latest, which nothing reads.
+    let create = lines.iter().find(|line| line.starts_with("gh release create slidev-v1.2.3 ")).unwrap_or_else(|| panic!("{steps}"));
+    assert!(create.contains(&package.display().to_string()) && !create.contains("index-abi"), "{create}");
+    assert!(create.contains("--repo Eiriksb/stagepack-studio-addons") && create.contains("--title \"Slidev add-on 1.2.3\""), "{create}");
+    assert!(create.contains("--notes ") && !create.contains("--latest"), "{create}");
+    // Then the index, put in place of the line's earlier one in the release tagged index.
+    let upload = format!("gh release upload index {} --clobber --repo Eiriksb/stagepack-studio-addons", file.display());
+    let at_upload = lines.iter().position(|line| *line == upload).unwrap_or_else(|| panic!("{steps}"));
+    assert!(lines.iter().position(|line| line == create).unwrap() < at_upload, "the package goes up before its index: {steps}");
+    // And, once only, the release that holds the indexes.
+    let once = lines.iter().find(|line| line.starts_with("gh release create index ")).unwrap_or_else(|| panic!("{steps}"));
+    assert!(once.contains("--repo Eiriksb/stagepack-studio-addons") && once.contains("--title \"Add-on index\"") && once.contains("--notes "), "{once}");
+    assert!(lines.iter().position(|line| line == once).unwrap() < at_upload, "{steps}");
+    assert!(!steps.contains("--latest"), "{steps}");
 
     // A package the key didn't sign gets no index, and nor does one under the wrong name.
     let other = SigningKey::from_bytes(&[8; 32]).verifying_key().to_bytes();
@@ -158,11 +172,14 @@ fn the_release_index_matches_its_package() {
     let copy = other_dir.join("slidev-1.2.3.spaddon");
     std::fs::copy(&package, &copy).unwrap();
     assert!(xtask::addon::write_release_index(&copy, &other).is_err());
-    assert!(!other_dir.join(INDEX_FILE).exists());
+    assert_eq!(std::fs::read_dir(&other_dir).unwrap().count(), 1, "no index was written");
     let renamed = other_dir.join("slidev-9.9.9.spaddon");
     std::fs::copy(&package, &renamed).unwrap();
     assert!(xtask::addon::write_release_index(&renamed, &public).unwrap_err().contains("must be called"));
     // A version that isn't three numbers gets none.
-    let odd = scratch_package(&scratch.path().join("odd"), &key, "1.2");
-    assert!(xtask::addon::write_release_index(&odd, &public).unwrap_err().contains("three numbers"));
+    // Nor does one with a leading zero, which the app wouldn't read as a version.
+    for version in ["1.2", "01.2.3"] {
+        let odd = scratch_package(&scratch.path().join("odd").join(version), &key, version);
+        assert!(xtask::addon::write_release_index(&odd, &public).unwrap_err().contains("three numbers"), "{version}");
+    }
 }

@@ -68,7 +68,7 @@ fn a_good_index_and_package_install() {
     let (server, served) = late_server();
     let index = index_of(&server, &package, "0.2.0");
     *served.lock().unwrap() = Some((json(&index), path_of(&server, &index.url), package.clone()));
-    // The index is reached by a redirect, as GitHub's latest release sends it.
+    // The index is reached by a redirect, as GitHub sends a release file on to its storage.
     let hops = Server::start({
         let to = server.url("/index.json");
         move |_| redirect(&to)
@@ -476,9 +476,14 @@ fn http_is_refused_without_the_test_hook() {
 
     // Nor is plain http anywhere else, nor an address the official one isn't.
     let official = fetch::Source::official();
-    assert_eq!(official.index_url, fetch::INDEX_URL);
+    assert_eq!(official.index_url, *fetch::INDEX_URL);
     assert_eq!(official.package_prefix, fetch::PACKAGE_PREFIX);
-    assert_eq!(fetch::INDEX_URL, "https://github.com/Eiriksb/stagepack-studio-addons/releases/latest/download/index.json");
+    // The index of the app's own line, add-on interface 1 and Slidev 53, which never moves.
+    assert_eq!(*fetch::INDEX_URL, "https://github.com/Eiriksb/stagepack-studio-addons/releases/download/index/index-abi1-slidev53.json");
+    assert_eq!(*fetch::INDEX_URL, addon_abi::package::index_url(addon_abi::ABI_VERSION, addons::SLIDEV_VERSION));
+    // It is reached as a package is, by a release file's address that GitHub sends on to its
+    // storage, so it passes the same checks.
+    assert!(fetch::INDEX_URL.starts_with(fetch::PACKAGE_PREFIX));
     assert_eq!(fetch::PACKAGE_PREFIX, "https://github.com/Eiriksb/stagepack-studio-addons/releases/download/");
     for url in ["http://example.invalid/index.json", "http://localhost:1/index.json", "ftp://example.invalid/index.json"] {
         let source = fetch::Source { index_url: url.into(), package_prefix: "http://example.invalid/".into() };

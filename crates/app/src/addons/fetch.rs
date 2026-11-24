@@ -1,5 +1,6 @@
-//! Getting the Slidev add-on over the network, only when the owner asks: a small `index.json`
-//! from a fixed https address, naming the package, then the package itself. Both are read
+//! Getting the Slidev add-on over the network, only when the owner asks: a small index from a
+//! fixed https address, the one of the app's own line of add-on interface and Slidev, naming the
+//! package, then the package itself. Both are read
 //! within hard caps of size and time, and the download is checked against the index, then by
 //! its signature, then against the index again by its signed `addon.json`. The index proves
 //! nothing; only the signature decides what runs.
@@ -14,13 +15,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub use addon_abi::package::Index;
-use addon_abi::package::{read_package, ADDON_NAME};
+use addon_abi::package::{index_url, read_package, version_numbers as numbers, ADDON_NAME};
 use sha2::{Digest, Sha256};
 
 use super::{key, SLIDEV_VERSION};
 
-// The addresses are shared with the packaging tool, which writes the index, so they can't drift.
-pub use addon_abi::package::{INDEX_URL, PACKAGE_PREFIX};
+// The addresses are made as the packaging tool makes them, which writes the index, so they can't drift.
+pub use addon_abi::package::PACKAGE_PREFIX;
+
+/// Where the index of the app's own line is: the one for add-on interface [`addon_abi::ABI_VERSION`]
+/// and Slidev [`SLIDEV_VERSION`]'s major version, in the release tagged `index`. It never moves,
+/// so an app keeps finding the last add-on made for it, whatever is published for later apps.
+pub static INDEX_URL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| index_url(addon_abi::ABI_VERSION, SLIDEV_VERSION));
 
 /// The most an index may be.
 pub const MAX_INDEX_BYTES: u64 = 64 * 1024;
@@ -54,7 +60,7 @@ pub struct Source {
 impl Source {
     /// The add-on's releases.
     pub fn official() -> Source {
-        Source { index_url: INDEX_URL.to_string(), package_prefix: PACKAGE_PREFIX.to_string() }
+        Source { index_url: INDEX_URL.clone(), package_prefix: PACKAGE_PREFIX.to_string() }
     }
 }
 
@@ -176,7 +182,7 @@ fn is_loopback(url: &str) -> bool {
     url.starts_with("http://127.0.0.1:")
 }
 
-/// The latest release's index from `source`, if it is one the app takes. `cancel` stops it.
+/// The index of the app's line from `source`, if it is one the app takes. `cancel` stops it.
 pub fn check(source: &Source, cancel: &AtomicBool) -> Result<Index, String> {
     if !allowed(&source.index_url) {
         return Err("The add-on's index isn't at an https address, so the app won't ask for it.".into());
@@ -273,16 +279,6 @@ pub fn newer(installed: &str, offered: &str) -> bool {
         (Some(installed), Some(offered)) => offered > installed,
         _ => false,
     }
-}
-
-/// The three numbers of `version`, `X.Y.Z`, with no leading zeros, signs or anything else.
-fn numbers(version: &str) -> Option<(u64, u64, u64)> {
-    let mut parts = version.split('.').map(|part| {
-        let digits = !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()) && (part == "0" || !part.starts_with('0'));
-        if digits { part.parse::<u64>().ok() } else { None }
-    });
-    let numbers = (parts.next()??, parts.next()??, parts.next()??);
-    parts.next().is_none().then_some(numbers)
 }
 
 /// What is being fetched, for its caps and sentences.
