@@ -11,7 +11,14 @@ const STEPS: [&str; 5] = ["clippy", "workspace", "components", "release", "packa
 
 #[test]
 fn test_all_lists_its_steps() {
-    let out = Command::new("bash").arg(repo().join("scripts/test-all.sh")).arg("--list").output().unwrap();
+    let script = repo().join("scripts/test-all.sh");
+    // On Windows `bash` may be WSL's launcher, which can't read a Windows path, or not there at all.
+    let can_run = Command::new("bash").arg("-c").arg("[ -r \"$0\" ]").arg(&script).status().is_ok_and(|s| s.success());
+    if !can_run {
+        eprintln!("skipped: bash can't run {}", script.display());
+        return;
+    }
+    let out = Command::new("bash").arg(&script).arg("--list").output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let text = String::from_utf8_lossy(&out.stdout);
     let names: Vec<&str> = text.lines().map(|l| l.split('\t').next().unwrap()).collect();
@@ -49,4 +56,21 @@ fn test_all_ps1_names_the_same_steps() {
         }
     }
     assert!(repo().join("scripts/test-components.ps1").is_file());
+}
+
+#[test]
+fn test_all_ps1_runs_the_same_everywhere() {
+    let text = std::fs::read_to_string(repo().join("scripts/test-all.ps1")).unwrap().replace("\r\n", "\n");
+    // test_all skips its bash test itself, so it is always run, whatever `bash` is.
+    assert!(text.contains("'--test', 'test_all'") && !text.contains("Get-Command bash"));
+    // The components run under the PowerShell that runs this script.
+    assert!(text.contains("(Get-Process -Id $PID).Path"));
+    assert!(!text.contains("& powershell "));
+    // $LASTEXITCODE is set before anything reads it (StrictMode stops on an unset variable).
+    let set = text.find("$global:LASTEXITCODE = 0").expect("$LASTEXITCODE is set first");
+    assert!(text.lines().position(|l| l.contains("$global:LASTEXITCODE = 0")) < text.lines().position(|l| l.contains("function Invoke-Step")) && set > 0);
+    // A rerun of the components doesn't leave STUDIO_BUNDLE set for the later steps.
+    let at = text.find("$env:STUDIO_BUNDLE = ").expect("the rerun sets STUDIO_BUNDLE");
+    let rest = &text[at..];
+    assert!(text[..at].contains("$saved = $env:STUDIO_BUNDLE") && rest.contains("$env:STUDIO_BUNDLE = $saved"), "STUDIO_BUNDLE must be put back");
 }

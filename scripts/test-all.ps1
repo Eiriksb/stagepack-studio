@@ -17,6 +17,11 @@ param(
 Set-StrictMode -Version Latest
 # Each step checks $LASTEXITCODE itself; a native command's stderr must not stop the script.
 $ErrorActionPreference = 'Continue'
+# Read after each native command; set now so that StrictMode never meets it unset.
+$global:LASTEXITCODE = 0
+# The components' script runs under the PowerShell that runs this one (Windows PowerShell or PowerShell 7).
+$shell = (Get-Process -Id $PID).Path
+if (-not $shell) { $shell = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' } else { 'powershell' } }
 
 # The steps, in order. The test reads the names from here.
 $steps = @(
@@ -74,11 +79,17 @@ function Invoke-Step([string]$Name, [string[]]$Only, [string]$Log) {
         }
         'components' {
             if ($Only.Count -eq 0) {
-                & powershell -NoProfile -File (Join-Path $PSScriptRoot 'test-components.ps1') 2>&1 | Tee-Object -FilePath $Log -Append | Out-Host
+                & $shell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'test-components.ps1') 2>&1 | Tee-Object -FilePath $Log -Append | Out-Host
                 if ($LASTEXITCODE -ne 0) { $script:worst = $LASTEXITCODE }
             } else {
+                # For this one command only, as in test-all.sh: the later steps must not inherit it.
+                $saved = $env:STUDIO_BUNDLE
                 $env:STUDIO_BUNDLE = Join-Path $repo 'target/bundle'
-                & $run (@('test', '--workspace', '--no-fail-fast', '--', '--include-ignored') + $exact)
+                try {
+                    & $run (@('test', '--workspace', '--no-fail-fast', '--', '--include-ignored') + $exact)
+                } finally {
+                    $env:STUDIO_BUNDLE = $saved
+                }
             }
         }
         'release' {
@@ -100,9 +111,8 @@ function Invoke-Step([string]$Name, [string[]]$Only, [string]$Log) {
                 & $run (@('test', '-p', 'xtask', '--no-fail-fast', '--', '--include-ignored') + $exact)
             } else {
                 # The Linux package's tests (linux.rs) need bash and zstd, so Windows runs the others.
-                $pk = @('test', '-p', 'xtask', '--no-fail-fast', '--lib', '--test', 'xtask', '--test', 'stage', '--test', 'windows')
-                # test_all's first test runs bash, so it is only run where bash is found.
-                if (Get-Command bash -ErrorAction SilentlyContinue) { $pk += @('--test', 'test_all') }
+                # test_all's bash test skips itself where bash can't run the script (none, or WSL's launcher).
+                $pk = @('test', '-p', 'xtask', '--no-fail-fast', '--lib', '--test', 'xtask', '--test', 'stage', '--test', 'windows', '--test', 'test_all')
                 & $run $pk
                 if (-not $Quick) {
                     & $run @('test', '-p', 'xtask', '--test', 'stage', '--no-fail-fast', '--', '--ignored')

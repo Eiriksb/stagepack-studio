@@ -39,7 +39,7 @@ try {
         $testScript = Join-Path $PSScriptRoot 'test-all.ps1'
         if (-not (Test-Path $testScript)) { Write-Host "scripts\test-all.ps1 is missing, so the tests cannot run (use -SkipTests to build without them)."; exit 1 }
         $shell = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' } else { 'powershell' }
-        & $shell -NoProfile -File $testScript -Quick
+        & $shell -NoProfile -ExecutionPolicy Bypass -File $testScript -Quick
         if ($LASTEXITCODE -ne 0) { Write-Host 'The tests failed, so no installer was made.'; exit 1 }
     }
 
