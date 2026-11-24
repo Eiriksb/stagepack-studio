@@ -42,7 +42,7 @@ pub struct Baked {
 }
 
 /// The folder under `public/` that the pictures the app drew go in.
-const BAKED_FOLDER: &str = "stagepack-baked/";
+pub(crate) const BAKED_FOLDER: &str = "stagepack-baked/";
 /// How many numbered names a file is tried at before it's left out.
 const MAX_RENAMES: usize = 100;
 

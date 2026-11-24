@@ -23,6 +23,8 @@ test-hooks = []
 shipped = []
 
 [dependencies]
+# The add-on interface, and the signed add-on package the Add-ons dialog installs from.
+addon-abi = { path = "../addon-abi" }
 base64 = "=0.22.1"
 # For the local time zone. Already built for the kit, so it adds nothing.
 chrono = { version = "=0.4.45", default-features = false, features = ["clock"] }
@@ -47,6 +49,10 @@ slides-terminal = { path = "../terminal" }
 slides-terminal-helper = { path = "../terminal-helper", default-features = false }
 toolkit = { path = "../toolkit" }
 unicode-segmentation = "=1.13.3"
+# The id of a Slidev talk exported for Stagepack.
+uuid = { version = "=1.29.2", features = ["v4"] }
+# Reading a Slidev talk made for Stagepack, and writing one, as a zip.
+zip = { version = "=9.5.0", default-features = false, features = ["deflate"] }
 # Which characters hide in a command the owner is asked to say yes to.
 unicode-properties = { version = "=0.1.3", default-features = false, features = ["general-category"] }
 
@@ -73,4 +79,9 @@ proptest = "=1.12.0"
 tempfile = "3"
 wat = "=1"
 toml = "=0.8.23"
-zip = { version = "=9.5.0", default-features = false, features = ["deflate"] }
+# The add-on tests sign their own packages, with a key made up for them.
+ed25519-dalek = { version = "=2.2.0" }
+# And the round trip builds the real add-on, as `package addon` does.
+xtask = { path = "../xtask" }
+# And checks what it wrote against the names Stagepack takes for code.
+slidev-addon = { path = "../slidev-addon" }

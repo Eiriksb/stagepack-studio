@@ -698,3 +698,15 @@ fn a_yaml_block_after_javascripts_white_space_is_front_matter() {
     let talk = assert_parses(&slides_md(&bundle));
     assert_eq!(talk.slides[1].settings.as_ref().and_then(|settings| settings.get("layout")), Some("section"));
 }
+
+#[test]
+fn a_picture_the_app_drew_for_an_export_comes_back_said_to_be_one() {
+    let png = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/slidev-export/assets/photo.png")).unwrap();
+    let source = "# Drawn\n\n<img src=\"/stagepack-baked/1-0.png\" alt=\"\" />\n\n![A photo](/photo.png)\n";
+    let (bundle, report) = import_with(source, vec![file("public/stagepack-baked/1-0.png", &png), file("public/photo.png", &png)]);
+    let frozen: Vec<&Notice> = report.notices.iter().filter(|notice| notice.kind == NoticeKind::Frozen).collect();
+    assert_eq!(frozen.len(), 1, "{:?}", report.notices);
+    assert_eq!(frozen[0].slide, Some(1));
+    assert!(frozen[0].text.contains("1-0.png"), "{}", frozen[0].text);
+    assert!(bundle.iter().any(|(name, _)| name.ends_with("1-0.png")));
+}

@@ -278,3 +278,228 @@ pub fn open_in_stagepack(executable: &Path, file: &Path) -> std::io::Result<()> 
     std::thread::spawn(move || stagepack.wait());
     Ok(())
 }
+
+/// The file name to suggest for a Slidev export of the talk called `name`.
+pub fn slidev_file_name(name: &str) -> String {
+    format!("{} (Slidev).{}", file_stem_for(name), SLIDEV_EXTENSION)
+}
+
+/// The extension of a Slidev talk made for Stagepack.
+pub const SLIDEV_EXTENSION: &str = "sptx";
+
+/// What a video too large to go to the add-on says, by its file `name`.
+fn video_left_out(name: &str) -> String {
+    format!("{name} is too large to include; copy it into public/ yourself.")
+}
+
+/// The endings of the videos a talk can hold, which are the first left out of an export to Slidev
+/// that would be too large.
+const VIDEO_KINDS: [&str; 3] = ["mp4", "m4v", "mov"];
+
+fn is_video(name: &str) -> bool {
+    name.rsplit_once('.').is_some_and(|(_, ending)| VIDEO_KINDS.iter().any(|kind| ending.eq_ignore_ascii_case(kind)))
+}
+
+/// Writes the talk to `out` as a Slidev talk made for Stagepack, through the Slidev add-on
+/// `addon`: its `slides.md`, the files it shows under `public/`, and Stagepack's manifest, with
+/// `id` and created and updated `now`. The parts Slidev can't draw are drawn here as pictures.
+/// It returns what the user should hear: what was left out, and the add-on's own notices.
+pub fn export_slidev(
+    input: ExportInput,
+    addon: &slides_components::addon::Addon,
+    out: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+    id: &str,
+) -> Result<Vec<String>, String> {
+    export_slidev_reading_with(input, addon, out, now, id, |make| make())
+}
+
+/// [`export_slidev`], reading the talk inside `reading`, as [`run_export_reading_with`] does.
+pub fn export_slidev_reading_with(
+    input: ExportInput,
+    addon: &slides_components::addon::Addon,
+    out: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+    id: &str,
+    reading: impl FnOnce(&mut dyn FnMut() -> Result<(Vec<u8>, Vec<String>), String>) -> Result<(Vec<u8>, Vec<String>), String>,
+) -> Result<Vec<String>, String> {
+    let mut input = Some(input);
+    let mut make_it = || match input.take() {
+        Some(input) => catch_unwind(AssertUnwindSafe(|| make_slidev(input, addon, out, now, id)))
+            .unwrap_or_else(|_| Err("the exporter stopped on something in this talk".to_string())),
+        None => Err("the exporter stopped on something in this talk".to_string()),
+    };
+    let (bytes, notices) = reading(&mut make_it).map_err(|problem| format!("Could not export {}: {problem}", out.display()))?;
+    write_atomically(out, |file| file.write_all(&bytes)).map_err(|error| format!("Could not write {}: {error}", out.display()))?;
+    Ok(notices)
+}
+
+/// How many bytes `files` take in a bundle.
+fn bundle_bytes<'a>(files: impl IntoIterator<Item = (&'a str, u64)>) -> u64 {
+    files.into_iter().map(|(name, len)| 8 + name.len() as u64 + len).sum()
+}
+
+/// The talk's files a Slidev export may show, as the talk names them: every file a picture, a
+/// video or another tag names, and the talk's fonts.
+fn named_files(deck: &Deck) -> Vec<String> {
+    fn walk(blocks: &[Block], found: &mut std::collections::BTreeSet<String>) {
+        for block in blocks {
+            match block {
+                Block::Picture { src, .. } => {
+                    found.insert(src.trim().to_string());
+                }
+                Block::Tag(tag) => {
+                    for attr in &tag.attrs {
+                        if attr.name == "src" || attr.name == "poster" {
+                            found.insert(attr.value.trim().to_string());
+                        }
+                    }
+                    walk(&tag.children, found);
+                }
+                Block::List { items, .. } => items.iter().for_each(|item| walk(item, found)),
+                _ => {}
+            }
+        }
+    }
+    let mut found = std::collections::BTreeSet::new();
+    for slide in &deck.talk().slides {
+        walk(&slide.blocks, &mut found);
+    }
+    found.into_iter().filter(|name| !name.is_empty() && name != crate::addons::SLIDES_FILE).collect()
+}
+
+/// The exported zip's bytes, and what the user should hear.
+fn make_slidev(
+    input: ExportInput,
+    addon: &slides_components::addon::Addon,
+    out: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+    id: &str,
+) -> Result<(Vec<u8>, Vec<String>), String> {
+    use slides_components::addon::MAX_BUNDLE_BYTES;
+
+    let ExportInput { source, files, talk_fonts } = input;
+    let mut deck = Deck::open(Box::new(files.clone()), fonts_with(talk_fonts), source.clone());
+    deck.draw_models_with(Arc::new(crate::model_view::draw_still));
+    let baked = crate::addons::bake::bake(&mut deck);
+    let title = deck.title().filter(|title| !title.trim().is_empty()).unwrap_or_else(|| {
+        let stem = out.file_stem().map_or_else(String::new, |stem| stem.to_string_lossy().into_owned());
+        stem.strip_suffix(" (Slidev)").unwrap_or(&stem).to_string()
+    });
+    let args = serde_json::json!({ "title": title }).to_string();
+
+    let mut names = crate::addons::Names::default();
+    let mut wanted: Vec<(String, u64)> = Vec::new();
+    let fonts = files.names_in("assets/fonts");
+    for name in named_files(&deck).into_iter().chain(fonts) {
+        let Some(name) = slides_engine::normalise(&name).filter(|name| name != crate::addons::SLIDES_FILE) else { continue };
+        if wanted.iter().any(|(known, _)| *known == name) {
+            continue;
+        }
+        // One the talk doesn't hold is the add-on's to say.
+        let Some(len) = files.len(&name).or_else(|| files.read(&name).map(|bytes| bytes.len() as u64)) else { continue };
+        if names.take(&name) {
+            wanted.push((name, len));
+        }
+    }
+    let mut notices: Vec<String> = names.notice().into_iter().map(|notice| notice.text).collect();
+
+    // Over the most a bundle may hold, the largest videos are left out first, linked by name.
+    let fixed = 8 + bundle_bytes([(".op", 6), (".args.json", args.len() as u64), (crate::addons::SLIDES_FILE, source.len() as u64)])
+        + bundle_bytes(baked.iter().map(|(name, data)| (name.as_str(), data.len() as u64)));
+    let mut total = fixed + bundle_bytes(wanted.iter().map(|(name, len)| (name.as_str(), *len)));
+    let mut left_out = Vec::new();
+    while total > MAX_BUNDLE_BYTES as u64 {
+        let Some((at, _)) = wanted.iter().enumerate().filter(|(_, (name, _))| is_video(name) && !left_out.contains(name)).max_by_key(|(_, (_, len))| *len) else {
+            return Err(format!(
+                "the talk's files come to more than {} MiB, the most the Slidev add-on can be given, even without its videos",
+                MAX_BUNDLE_BYTES >> 20
+            ));
+        };
+        let name = wanted[at].0.clone();
+        total -= wanted[at].1;
+        wanted[at].1 = 0;
+        notices.push(video_left_out(&name));
+        left_out.push(name);
+    }
+
+    let mut bundle: addon_abi::Bundle = vec![(crate::addons::SLIDES_FILE.to_string(), source.into_bytes())];
+    for (name, _) in &wanted {
+        // A video left out is given empty, so that the talk still names it.
+        let data = if left_out.contains(name) {
+            Vec::new()
+        } else {
+            read_whole(files.as_ref(), name).ok_or_else(|| format!("{name} couldn't be read"))?
+        };
+        bundle.push((name.clone(), data));
+    }
+    bundle.extend(baked);
+    let (given, report) = addon.run("export", &args, bundle).map_err(|error| error.to_string())?;
+
+    let mut slides = None;
+    let mut manifest_title = None;
+    let mut public = Vec::new();
+    // The public names of the videos given empty, which the user copies in.
+    let empty_videos: Vec<String> = left_out.iter().filter_map(|name| name.rsplit('/').next()).map(str::to_string).collect();
+    for (name, data) in given {
+        if name == addon_abi::MANIFEST {
+            let fields: serde_json::Value = serde_json::from_slice(&data).map_err(|_| "the Slidev add-on gave back a manifest that can't be read".to_string())?;
+            manifest_title = fields.get("title").and_then(|title| title.as_str()).map(str::to_string);
+        } else if name == crate::addons::SLIDES_FILE {
+            slides = Some(data);
+        } else if name.starts_with("public/") && addon_abi::safe_name(&name) {
+            if data.is_empty() && name.rsplit('/').next().is_some_and(|file| empty_videos.iter().any(|video| video == file)) {
+                continue;
+            }
+            public.push((name, data));
+        }
+    }
+    let slides = slides.ok_or("the Slidev add-on gave back no slides")?;
+    let manifest = serde_json::json!({
+        "format": 1,
+        "id": id,
+        "title": manifest_title.unwrap_or(title),
+        "created": now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "updated": now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "slidev": crate::addons::SLIDEV_VERSION,
+        "entry": crate::addons::SLIDES_FILE,
+        "meta": {},
+    });
+    let manifest = serde_json::to_vec_pretty(&manifest).expect("a manifest is always JSON");
+    let bytes = slidev_zip(&slides, &manifest, &public).map_err(|error| format!("the zip couldn't be made: {error}"))?;
+    notices.extend(report.notices.into_iter().map(|notice| match notice.slide {
+        Some(slide) => format!("Slide {slide}: {}", notice.text),
+        None => notice.text,
+    }));
+    Ok((bytes, notices))
+}
+
+/// The whole of the talk's file `name`.
+fn read_whole(files: &(dyn TalkFiles + Send + Sync), name: &str) -> Option<Vec<u8>> {
+    if let Some(bytes) = files.read(name) {
+        return Some(bytes);
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut files.open(name)?, &mut bytes).ok()?;
+    Some(bytes)
+}
+
+/// The zip of a Slidev talk made for Stagepack: `slides.md` first, then the manifest, then the
+/// files under `public/`, which are pictures, video and fonts, and stored as they are.
+fn slidev_zip(slides: &[u8], manifest: &[u8], public: &[(String, Vec<u8>)]) -> zip::result::ZipResult<Vec<u8>> {
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let mut writer = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let text = SimpleFileOptions::DEFAULT.compression_method(CompressionMethod::Deflated);
+    let stored = SimpleFileOptions::DEFAULT.compression_method(CompressionMethod::Stored);
+    writer.start_file(crate::addons::SLIDES_FILE, text)?;
+    writer.write_all(slides)?;
+    writer.start_file(slides_engine::STAGEPACK_MANIFEST, text)?;
+    writer.write_all(manifest)?;
+    for (name, data) in public {
+        writer.start_file(name.as_str(), stored.large_file(data.len() as u64 >= u64::from(u32::MAX)))?;
+        writer.write_all(data)?;
+    }
+    Ok(writer.finish()?.into_inner())
+}

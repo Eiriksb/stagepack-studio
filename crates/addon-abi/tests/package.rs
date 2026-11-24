@@ -2,7 +2,7 @@
 
 use std::io::Write;
 
-use addon_abi::package::{read_package, signed_message, write_package, AddonManifest, MAX_MANIFEST_BYTES, MAX_WASM_BYTES};
+use addon_abi::package::{read_package, signed_message, verify_parts, write_package, AddonManifest, MAX_MANIFEST_BYTES, MAX_WASM_BYTES};
 use ed25519_dalek::{Signer, SigningKey};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
@@ -238,4 +238,19 @@ fn a_wrong_abi_or_name_is_refused() {
     // A manifest that isn't one, however well signed.
     let error = read_package(&entries_signed(b"{\"name\":\"slidev\"}", WASM, &key), &public(&key)).unwrap_err();
     assert!(error.contains("addon.json"), "{error}");
+}
+
+#[test]
+fn the_parts_of_a_read_package_verify_again_and_a_changed_part_does_not() {
+    let key = key(7);
+    let package = read_package(&signed(&manifest(), WASM, &key), &public(&key)).unwrap();
+    assert_eq!(verify_parts(&package.manifest_bytes, &package.wasm, &package.sig, &public(&key)), Ok(manifest()));
+    let mut wasm = package.wasm.clone();
+    wasm[9] ^= 1;
+    let refused = verify_parts(&package.manifest_bytes, &wasm, &package.sig, &public(&key)).unwrap_err();
+    assert!(refused.contains("signature doesn't match"), "{refused}");
+    let refused = verify_parts(&package.manifest_bytes, &package.wasm, &package.sig[..63], &public(&key)).unwrap_err();
+    assert!(refused.contains("63 bytes"), "{refused}");
+    let refused = verify_parts(&package.manifest_bytes, &package.wasm, &package.sig, &public(&self::key(8))).unwrap_err();
+    assert!(refused.contains("signature doesn't match"), "{refused}");
 }

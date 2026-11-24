@@ -16,6 +16,14 @@ try {
     if ($LASTEXITCODE -ne 0) { $status = 1 }
     & cargo test -p slides-format --test wasm_build --no-fail-fast -- --ignored
     if ($LASTEXITCODE -ne 0) { $status = 1 }
+    # The Slidev add-on, built for WebAssembly: run as the app runs it, signed as it's shipped,
+    # and through the app from one end to the other.
+    & cargo test -p slidev-addon --test wasm --no-fail-fast -- --ignored
+    if ($LASTEXITCODE -ne 0) { $status = 1 }
+    & cargo test -p xtask --test addon --no-fail-fast -- --ignored package_addon_signs_what_read_package_accepts
+    if ($LASTEXITCODE -ne 0) { $status = 1 }
+    & cargo test -p stagepack-studio --test slidev_round --no-fail-fast -- --ignored
+    if ($LASTEXITCODE -ne 0) { $status = 1 }
 } finally {
     Pop-Location
 }

@@ -12,7 +12,7 @@ use serde::Deserialize;
 use slides_format::{layout_names, parse_talk, split_slides, LayoutNames};
 
 use crate::escape;
-use crate::export::{colour, is_code_name, px, SLIDES};
+use crate::export::{colour, is_code_name, px, BAKED_FOLDER, SLIDES};
 use crate::headmatter::{self, Value};
 use crate::html::{self, OpenTag};
 
@@ -2263,6 +2263,14 @@ impl Convert<'_, '_> {
                 && self.run.files.contains_key(candidate.as_str())
                 && let Some(name) = self.run.asset(&candidate)
             {
+                // A part the app drew for an export comes back as the picture it was drawn as.
+                if candidate.strip_prefix("public/").is_some_and(|rest| rest.starts_with(BAKED_FOLDER)) {
+                    let file = candidate.rsplit('/').next().unwrap_or(&candidate);
+                    self.notice(
+                        NoticeKind::Frozen,
+                        format!("The picture {} is of a part Stagepack Studio drew for Slidev, so it comes back as a picture that can't be edited as the part was.", shortened(file, 80)),
+                    );
+                }
                 return Ok(name);
             }
         }

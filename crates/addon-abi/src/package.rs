@@ -161,12 +161,29 @@ pub fn read_package(bytes: &[u8], key: &[u8; 32]) -> Result<Package, String> {
     let sig: [u8; SIG_BYTES] = unpack(2)?
         .try_into()
         .map_err(|sig: Vec<u8>| format!("The add-on's addon.sig is {} bytes, where a signature is {SIG_BYTES}.", sig.len()))?;
+    let manifest = verify_parts(&manifest_bytes, &wasm, &sig, key.as_bytes())?;
+    Ok(Package { manifest, wasm, manifest_bytes, sig })
+}
 
-    key.verify_strict(&signed_message(&manifest_bytes, &wasm), &Signature::from_bytes(&sig))
+/// The manifest of the add-on made of `manifest_bytes` (`addon.json`), `wasm` (`addon.wasm`)
+/// and `sig` (`addon.sig`), if `sig` is their signature by `key` and the manifest is one the
+/// app takes; otherwise one sentence on what is wrong. It is the check [`read_package`]
+/// makes of a package, made again of an add-on once it's installed.
+pub fn verify_parts(manifest_bytes: &[u8], wasm: &[u8], sig: &[u8], key: &[u8; 32]) -> Result<AddonManifest, String> {
+    let key = VerifyingKey::from_bytes(key).map_err(|_| "The add-on key built into the app isn't an ed25519 public key.".to_string())?;
+    for (slot, len) in [manifest_bytes.len(), wasm.len()].into_iter().enumerate() {
+        if len as u64 > limit(slot) {
+            let name = ENTRIES[slot];
+            return Err(format!("The add-on's {name} is {len} bytes, over the {} a package's {name} may take.", limit_text(slot)));
+        }
+    }
+    let sig: [u8; SIG_BYTES] =
+        sig.try_into().map_err(|_| format!("The add-on's addon.sig is {} bytes, where a signature is {SIG_BYTES}.", sig.len()))?;
+    key.verify_strict(&signed_message(manifest_bytes, wasm), &Signature::from_bytes(&sig))
         .map_err(|_| "The add-on's signature doesn't match: it wasn't signed with Stagepack's key, or it was changed after it was signed.".to_string())?;
 
     let manifest: AddonManifest =
-        serde_json::from_slice(&manifest_bytes).map_err(|e| format!("The add-on's addon.json isn't an add-on manifest: {e}."))?;
+        serde_json::from_slice(manifest_bytes).map_err(|e| format!("The add-on's addon.json isn't an add-on manifest: {e}."))?;
     if manifest.name != ADDON_NAME {
         return Err(format!("The add-on is named {:?}, where the only add-on Stagepack takes is \"{ADDON_NAME}\".", manifest.name));
     }
@@ -178,7 +195,7 @@ pub fn read_package(bytes: &[u8], key: &[u8; 32]) -> Result<Package, String> {
             return Err(format!("The add-on's {field} {value:?} isn't a version number."));
         }
     }
-    Ok(Package { manifest, wasm, manifest_bytes, sig })
+    Ok(manifest)
 }
 
 fn wrong_count(count: u64) -> String {
