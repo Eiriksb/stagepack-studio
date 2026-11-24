@@ -45,7 +45,7 @@ fn install_from_file_puts_three_files_in_addons_slidev() {
     assert_eq!(installed_names(app.path()), ["addon.json", "addon.sig", "addon.wasm"]);
     // Nothing else is left beside it, the folder it was written in first among them.
     let beside: Vec<_> = std::fs::read_dir(app.path().join("addons")).unwrap().map(|e| e.unwrap().file_name()).collect();
-    assert_eq!(beside, ["slidev"]);
+    assert_eq!(beside.iter().filter(|name| *name != ".lock").collect::<Vec<_>>(), ["slidev"]);
     assert_eq!(ready_version(app.path()).as_deref(), Some("0.1.0"));
 
     // A later version takes its place.
@@ -292,7 +292,9 @@ fn an_export_still_too_large_without_its_videos_is_refused() {
     std::fs::write(folder.path().join("slides.md"), source).unwrap();
     let out = folder.path().join("out.sptx");
     let refused = export_slidev(input_for(folder.path()), &addon, &out, now(), ID).unwrap_err();
-    assert!(refused.contains("512 MiB"), "{refused}");
+    assert!(refused.contains("320 MiB"), "{refused}");
+    // It has no videos, so it says nothing of leaving them out.
+    assert!(!refused.contains("videos"), "{refused}");
     assert!(!out.exists());
 }
 
@@ -332,7 +334,17 @@ fn names_left_out_of_an_import_are_listed_once_twenty_at_most() {
     let talk = dir.path().join("many.sptx");
     let mut zip = zip::ZipWriter::new(std::fs::File::create(&talk).unwrap());
     let options = zip::write::SimpleFileOptions::default();
-    let mut names: Vec<String> = vec!["stagepack.json".into(), "slides.md".into(), "public/Photo.png".into(), "public/photo.png".into()];
+    let mut names: Vec<String> = vec![
+        "stagepack.json".into(),
+        "slides.md".into(),
+        "public/Photo.png".into(),
+        "public/photo.png".into(),
+        // The same name composed and decomposed, as macOS would take it: one file there.
+        "public/caf\u{e9}.png".into(),
+        "public/cafe\u{301}.png".into(),
+        // Stagepack's own, in another case.
+        "Vendor/cli.js".into(),
+    ];
     names.extend((0..25).map(|n| format!("public/.hidden-{n:02}")));
     for name in &names {
         zip.start_file(name.as_str(), options).unwrap();
@@ -344,8 +356,12 @@ fn names_left_out_of_an_import_are_listed_once_twenty_at_most() {
     let left: Vec<_> = report.notices.iter().filter(|notice| notice.text.contains("hidden-")).collect();
     assert_eq!(left.len(), 1, "{left:?}");
     assert!(left[0].text.contains("public/photo.png"), "a name differing only in case is left out: {}", left[0].text);
-    assert!(left[0].text.contains("and 6 more"), "{}", left[0].text);
-    assert!(!report.notices.iter().any(|notice| notice.text.contains("vendor")));
+    // photo.png, the decomposed café.png, then 18 of the 25 hidden: 7 more.
+    assert!(left[0].text.contains("cafe\u{301}.png"), "the decomposed name is left out: {}", left[0].text);
+    assert!(!left[0].text.contains("caf\u{e9}.png"), "the first of the two stays: {}", left[0].text);
+    assert!(left[0].text.contains("and 7 more"), "{}", left[0].text);
+    assert!(left[0].text.starts_with("27 files"), "{}", left[0].text);
+    assert!(report.notices.iter().any(|notice| notice.text == stagepack_studio::addons::VENDOR_NOTICE));
 }
 
 mod probes {
@@ -384,4 +400,63 @@ fn a_part_that_changes_on_clicks_has_a_picture_for_each_and_one_that_moves_has_o
     // Each step's picture is of that step.
     let step = |at: &str| baked.iter().find(|(name, _)| name == at).unwrap().1.clone();
     assert_ne!(step("baked/1/0@0.png"), step("baked/1/0@3.png"));
+}
+
+#[test]
+fn a_video_that_would_take_the_export_past_the_add_ons_memory_is_left_out() {
+    let addon = slides_components::addon::Addon::load(&answering_guest(&export_answer())).unwrap();
+    // 200 MiB of video and 200 MiB of picture: under the 512 MiB a bundle may be, over the 320 MiB
+    // the add-on can hold three times over.
+    let folder = talk_with_a_video(200 * 1024 * 1024);
+    let picture = std::fs::File::create(folder.path().join("assets/photo.png")).unwrap();
+    picture.set_len(200 * 1024 * 1024).unwrap();
+    assert_eq!(stagepack_studio::export::SLIDEV_EXPORT_BUDGET, 320 * 1024 * 1024);
+    let out = folder.path().join("out.sptx");
+    let warnings = export_slidev(input_for(folder.path()), &addon, &out, now(), ID).unwrap();
+    assert!(warnings.iter().any(|warning| warning == "assets/long.mp4 is too large to include; copy it into public/ yourself."), "{warnings:?}");
+}
+
+#[test]
+fn an_install_cut_short_between_its_two_moves_puts_the_earlier_one_back() {
+    test_key();
+    let app = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    addons::install_from_file(app.path(), &package_file(scratch.path(), &answering_guest(&export_answer()), "0.1.0")).unwrap();
+    // As if the app stopped once the earlier add-on was moved aside.
+    std::fs::rename(app.path().join("addons/slidev"), app.path().join("addons/.slidev-old-0123")).unwrap();
+    assert_eq!(addons::status(app.path()), addons::Status::Installed("0.1.0".into()));
+    assert!(app.path().join("addons/slidev/addon.wasm").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn an_add_ons_folder_that_is_a_link_is_not_written_through() {
+    test_key();
+    let app = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), app.path().join("addons")).unwrap();
+    let refused = addons::install_from_file(app.path(), &package_file(scratch.path(), &answering_guest(&export_answer()), "0.1.0")).unwrap_err();
+    assert!(refused.contains("link"), "{refused}");
+    assert_eq!(std::fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn a_part_inside_a_turned_box_is_placed_in_slide_units_and_turned_with_it() {
+    let source = "# Inside\n\n<Box x=\"400\" y=\"300\" w=\"600\" h=\"400\" rotate=\"15\" fill=\"#fde68a\">\n\n<Icon name=\"arrow-right\" size=\"96\" />\n\n</Box>\n";
+    let mut deck = Deck::open(Box::new(FolderFiles::new(fixture())), Fonts::with_system_fallback(), source.to_string());
+    let baked = addons::bake::bake(&mut deck);
+    let (_, index) = baked.iter().find(|(name, _)| name == "baked/index.json").unwrap();
+    let index: Vec<serde_json::Value> = serde_json::from_slice(index).unwrap();
+    let icon = index.iter().find(|entry| entry["tag"] == "Icon").expect("the icon is drawn");
+    assert_eq!(icon["rotate"], 0.0, "the box turns it, not its own turn");
+    let (x, y) = (icon["x"].as_f64().unwrap(), icon["y"].as_f64().unwrap());
+    // Inside the box, as it is before it's turned.
+    // Inside the box, as it is before it's turned: at its top left, past the box's padding.
+    assert!((400.0..1000.0).contains(&x) && (300.0..700.0).contains(&y), "{icon}");
+    assert!((x - 424.0).abs() < 1.0 && (y - 324.0).abs() < 1.0, "{icon}");
+    // And its picture is of the icon, not of the box's fill alone.
+    let picture = image::load_from_memory(&baked.iter().find(|(name, _)| name == "baked/1/0.png").unwrap().1).unwrap().to_rgba8();
+    let fill = image::Rgba([0xfd, 0xe6, 0x8a, 0xff]);
+    assert!(picture.pixels().any(|pixel| *pixel != fill && pixel[3] > 0), "the icon's picture is only the box's fill");
 }

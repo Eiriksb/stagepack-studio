@@ -92,3 +92,43 @@ fn slidev_round() {
         );
     }
 }
+
+#[test]
+#[ignore = "builds the add-on for WebAssembly"]
+fn slidev_round_just_under_the_budget() {
+    let scratch = tempfile::tempdir().unwrap();
+    test_key();
+    let key_file = scratch.path().join("keys/addon-signing.key");
+    std::fs::create_dir_all(key_file.parent().unwrap()).unwrap();
+    std::fs::write(&key_file, TEST_SEED).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(key_file.parent().unwrap(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let (package, _) = xtask::addon::package_addon(&key_file, &scratch.path().join("package")).unwrap();
+    let installed = addons::install_from_file(&scratch.path().join("app"), &package).unwrap();
+    let InstalledState::Ready(addon) = installed.state else { panic!("the add-on is damaged") };
+
+    // Two pictures that aren't videos, so nothing can be left out, coming to 8 MiB under the
+    // budget with everything else the bundle holds.
+    let talk = scratch.path().join("talk");
+    std::fs::create_dir_all(talk.join("assets")).unwrap();
+    let each = (stagepack_studio::export::SLIDEV_EXPORT_BUDGET - 8 * 1024 * 1024) / 2;
+    let mut source = String::from("# Large pictures\n\n");
+    for n in 0..2 {
+        let file = std::fs::File::create(talk.join(format!("assets/big-{n}.png"))).unwrap();
+        file.set_len(each).unwrap();
+        source.push_str(&format!("![Big](assets/big-{n}.png)\n\n"));
+    }
+    std::fs::write(talk.join("slides.md"), &source).unwrap();
+    let files: Arc<dyn TalkFiles + Send + Sync> = Arc::new(FolderFiles::new(talk.clone()));
+    let out = scratch.path().join("big (Slidev).sptx");
+    let warnings = export_slidev(ExportInput { source, files, talk_fonts: Vec::new() }, &addon, &out, chrono::Utc::now(), &uuid::Uuid::new_v4().to_string())
+        .unwrap_or_else(|problem| panic!("an export under the budget fails: {problem}"));
+    println!("export warnings: {warnings:#?}");
+    let zip = zip::ZipArchive::new(std::fs::File::open(&out).unwrap()).unwrap();
+    let names: Vec<String> = zip.file_names().map(|name| name.unwrap().into_owned()).collect();
+    assert!(names.iter().any(|name| name == "public/big-0.png") && names.iter().any(|name| name == "public/big-1.png"), "{names:?}");
+}

@@ -243,6 +243,7 @@ impl WorkspaceView {
         let Some(app_folder) = self.app_folder.clone() else {
             return;
         };
+        let file = path.clone();
         cx.spawn_in(window, async move |this, cx| {
             let imported = cx
                 .background_spawn(async move {
@@ -257,7 +258,7 @@ impl WorkspaceView {
                     }
                 })
                 .await;
-            this.update_in(cx, |this, window, cx| this.show_imported(imported, window, cx)).ok();
+            this.update_in(cx, |this, window, cx| this.show_imported(file, imported, window, cx)).ok();
         })
         .detach();
     }
@@ -265,11 +266,13 @@ impl WorkspaceView {
     /// Shows what an import made, as a new presentation, and the report on it; or why it couldn't.
     fn show_imported(
         &mut self,
+        file: PathBuf,
         imported: Result<(String, Vec<slides_engine::NewFile>, addon_abi::Report), String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.document.is_some() {
+            self.say("The talk read from Slidev wasn't shown, as another was opened here meanwhile.", cx);
             return;
         }
         let made = imported.and_then(|(slides, files, report)| {
@@ -289,6 +292,9 @@ impl WorkspaceView {
                     self.say_on_start(problem, false, cx);
                 } else {
                     self.problem = Some(problem.into());
+                    // What the window offered before it tried, it offers again.
+                    let stagepack = self.stagepack.clone().unwrap_or_else(installed_stagepack);
+                    self.stagepack_offer = stagepack.map(|executable| StagepackOffer { file, executable });
                     cx.notify();
                 }
             }

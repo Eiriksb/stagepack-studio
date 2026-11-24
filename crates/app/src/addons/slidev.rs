@@ -34,9 +34,7 @@ pub(crate) struct Names {
 impl Names {
     /// Whether `name` can be given, noting it as left out if not.
     pub(crate) fn take(&mut self, name: &str) -> bool {
-        // `unicode-normalization` isn't among the app's dependencies, so names are told apart
-        // by their lower case alone.
-        if safe_name(name) && self.seen.insert(name.to_lowercase()) {
+        if safe_name(name) && self.seen.insert(folded(name)) {
             return true;
         }
         self.left_out.push(name.to_string());
@@ -60,6 +58,12 @@ impl Names {
         };
         Some(Notice { slide: None, kind: NoticeKind::LeftOut, text })
     }
+}
+
+/// `name` as a file system that ignores letter case and normalisation sees it, as macOS and
+/// Windows do: composed (NFC), then in lower case. Two names with the same form are one file there.
+pub(crate) fn folded(name: &str) -> String {
+    icu_normalizer::ComposingNormalizerBorrowed::new_nfc().normalize(name).to_lowercase()
 }
 
 /// `name` with what can't be shown on a line as a `?`.
@@ -115,18 +119,21 @@ fn read_talk(file: &Path) -> Result<(Bundle, String, Vec<Notice>), String> {
         if found.is_dir() {
             continue;
         }
-        if name == STAGEPACK_MANIFEST {
+        // As a file system that ignores letter case would find them.
+        let lower = name.to_ascii_lowercase();
+        if lower == STAGEPACK_MANIFEST {
             entry = manifest_entry(&mut found).unwrap_or(entry);
             continue;
         }
-        if name.starts_with(VENDOR) {
+        if lower.starts_with(VENDOR) {
             vendor = true;
             continue;
         }
-        if found.is_symlink() || found.encrypted() || !names.take(&name) {
-            if found.is_symlink() || found.encrypted() {
-                names.left_out.push(name);
-            }
+        if found.is_symlink() || found.encrypted() {
+            names.left_out.push(name);
+            continue;
+        }
+        if !names.take(&name) {
             continue;
         }
         let size = found.size();

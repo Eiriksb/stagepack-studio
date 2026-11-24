@@ -99,21 +99,62 @@ fn wrong_slidev(slidev: &str) -> String {
     format!("The add-on writes for Slidev {}, where Stagepack's talks are for Slidev {SLIDEV_VERSION}.", slides_components::shortened(slidev, 40))
 }
 
-/// Whether anything of the add-on is installed under `app_folder`.
+/// Whether anything of the add-on is installed under `app_folder`. An install cut short between
+/// moving the earlier add-on aside and putting the new one in place is put back first.
 fn is_there(app_folder: &Path) -> bool {
-    addon_folder(app_folder).exists()
+    let folder = addon_folder(app_folder);
+    if std::fs::symlink_metadata(&folder).is_err() {
+        put_back_cut_short(app_folder);
+    }
+    folder.exists()
+}
+
+/// When an install stopped after moving the earlier add-on aside, and before putting the new one
+/// in its place, puts the earlier one back, if nothing else is installing now.
+fn put_back_cut_short(app_folder: &Path) {
+    let addons = app_folder.join(ADDONS_FOLDER);
+    if !addons.is_dir() || refuse_links(&addons).is_err() {
+        return;
+    }
+    let Ok(_lock) = Lock::try_take(&addons) else { return };
+    put_back_cut_short_locked(app_folder);
+}
+
+/// What a look at the installed files went by: each one's length and when it was last changed,
+/// and the key it was checked with.
+type Stamps = (Vec<Option<(u64, std::time::SystemTime)>>, [u8; 32]);
+
+/// The status found last for each app folder, with what it went by, so that a window opening
+/// doesn't read and check the add-on again when nothing of it has changed.
+static LOOKED_AT: std::sync::Mutex<Vec<(PathBuf, Stamps, Status)>> = std::sync::Mutex::new(Vec::new());
+
+fn stamps(app_folder: &Path) -> Stamps {
+    let folder = addon_folder(app_folder);
+    let files = [MANIFEST_ENTRY, WASM_ENTRY, SIG_ENTRY]
+        .iter()
+        .map(|name| std::fs::metadata(folder.join(name)).ok().and_then(|metadata| Some((metadata.len(), metadata.modified().ok()?))))
+        .collect();
+    (files, key::addon_key())
 }
 
 /// What's installed under `app_folder`, found by checking its signature but without loading it,
-/// which takes a moment longer.
+/// which takes a moment longer. It's checked again only once one of its files has changed.
 pub fn status(app_folder: &Path) -> Status {
     if !is_there(app_folder) {
         return Status::NotInstalled;
     }
-    match verified(app_folder) {
+    let stamped = stamps(app_folder);
+    let mut looked_at = LOOKED_AT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, _, status)) = looked_at.iter().find(|(folder, was, _)| folder == app_folder && *was == stamped) {
+        return status.clone();
+    }
+    let status = match verified(app_folder) {
         Ok((version, _)) => Status::Installed(version),
         Err((_, sentence)) => Status::Damaged(sentence),
-    }
+    };
+    looked_at.retain(|(folder, _, _)| folder != app_folder);
+    looked_at.push((app_folder.to_path_buf(), stamped, status.clone()));
+    status
 }
 
 /// The add-on installed under `app_folder`, checked and loaded, or `None` if there's none.
@@ -159,6 +200,10 @@ pub fn install_from_file(app_folder: &Path, file: &Path) -> Result<Installed, St
     let addon = loaded(&package.wasm)?;
     let addons = app_folder.join(ADDONS_FOLDER);
     std::fs::create_dir_all(&addons).map_err(|error| format!("The add-on couldn't be installed: the app's folder can't be written to ({error})."))?;
+    refuse_links(&addons)?;
+    // One install or removal at a time, from whichever window.
+    let _lock = Lock::take(&addons)?;
+    put_back_cut_short_locked(app_folder);
     sweep_leftovers(&addons);
     let fresh = addons.join(format!(".{SLIDEV_FOLDER}-new-{}", unique()));
     let written = (|| -> std::io::Result<()> {
@@ -216,11 +261,75 @@ pub fn remove(app_folder: &Path) -> Result<(), String> {
         return Ok(());
     }
     let addons = app_folder.join(ADDONS_FOLDER);
+    if std::fs::symlink_metadata(&addons).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(LINKED.to_string());
+    }
+    let _lock = Lock::take(&addons)?;
     // Moved aside first, so that the add-on is gone at once, even if some of it can't be deleted.
     let gone = addons.join(format!(".{SLIDEV_FOLDER}-removed-{}", unique()));
     std::fs::rename(&folder, &gone).map_err(|error| format!("The add-on couldn't be removed ({error})."))?;
     let _ = std::fs::remove_dir_all(&gone);
     Ok(())
+}
+
+/// What install and remove say of an add-ons folder that is a link.
+const LINKED: &str = "The add-ons folder, or the Slidev add-on's, is a link to somewhere else, so the app won't write there.";
+
+/// Refuses an `addons` folder, or a Slidev folder in it, that is a link: what's installed is
+/// written only where the app keeps it.
+fn refuse_links(addons: &Path) -> Result<(), String> {
+    for path in [addons.to_path_buf(), addons.join(SLIDEV_FOLDER)] {
+        if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            return Err(LINKED.to_string());
+        }
+    }
+    Ok(())
+}
+
+/// [`put_back_cut_short`], with the lock already held.
+fn put_back_cut_short_locked(app_folder: &Path) {
+    let addons = app_folder.join(ADDONS_FOLDER);
+    let folder = addon_folder(app_folder);
+    if std::fs::symlink_metadata(&folder).is_ok() {
+        return;
+    }
+    let prefix = format!(".{SLIDEV_FOLDER}-old-");
+    let Ok(entries) = std::fs::read_dir(&addons) else { return };
+    let old: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix) && entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
+        .collect();
+    if let [old] = &old[..] {
+        let _ = std::fs::rename(old, &folder);
+    }
+}
+
+/// The lock on `addons/.lock`, held by one install or removal at a time, in this process or
+/// another. It goes when it's dropped.
+struct Lock {
+    /// Held only so that the lock is.
+    _file: std::fs::File,
+}
+
+impl Lock {
+    fn open(addons: &Path) -> std::io::Result<std::fs::File> {
+        std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(addons.join(".lock"))
+    }
+
+    /// Waits for the lock.
+    fn take(addons: &Path) -> Result<Lock, String> {
+        let file = Lock::open(addons).map_err(|error| format!("The app's add-ons folder can't be written to ({error})."))?;
+        file.lock().map_err(|error| format!("The app's add-ons folder can't be locked ({error})."))?;
+        Ok(Lock { _file: file })
+    }
+
+    /// The lock, if nothing else holds it now.
+    fn try_take(addons: &Path) -> Result<Lock, ()> {
+        let file = Lock::open(addons).map_err(|_| ())?;
+        file.try_lock().map_err(|_| ())?;
+        Ok(Lock { _file: file })
+    }
 }
 
 /// Deletes what an install or a removal that stopped part way left in `addons`.

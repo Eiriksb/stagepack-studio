@@ -49,6 +49,9 @@ slides-terminal = { path = "../terminal" }
 slides-terminal-helper = { path = "../terminal-helper", default-features = false }
 toolkit = { path = "../toolkit" }
 unicode-segmentation = "=1.13.3"
+# Telling apart the names of a talk's files as macOS does: by their composed (NFC) form.
+# Already built for the links in text, so it adds nothing.
+icu_normalizer = { version = "=2.4.0", default-features = false, features = ["compiled_data"] }
 # The id of a Slidev talk exported for Stagepack.
 uuid = { version = "=1.29.2", features = ["v4"] }
 # Reading a Slidev talk made for Stagepack, and writing one, as a zip.

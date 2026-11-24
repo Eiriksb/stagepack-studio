@@ -4,6 +4,12 @@
 //!
 //! The add-on finds each by its slide, counted from 1, and its `n`: the tags of a slide that are
 //! drawn here, counted from 0 in the order they're written, those inside others too.
+//!
+//! A part is drawn as the layer it's in, cut to its box, as the engine has no way to draw one
+//! part of a layer alone. So what else of that layer lies under the box, the fill of a box it's
+//! in or text running past it, is in its picture too, and a part beside it that changes on a
+//! click makes it look as though it does. Slidev draws those again under it, which matches as
+//! long as Slidev lays them out as the app does.
 
 use addon_abi::Bundle;
 use serde::Serialize;
@@ -83,7 +89,17 @@ pub fn bake(deck: &mut Deck) -> Bundle {
         let varying = deck.varying_tags(slide);
         for (n, tag) in tags {
             let Some(element) = layout.element(&tag.range) else { continue };
-            let rect = element.rect;
+            // The layout gives a part inside a turned box where it ends up once the box is
+            // turned; the add-on wants it where it is before, as the box turns it in Slidev too.
+            let rect = if element.placed || element.rotate == 0.0 {
+                element.rect
+            } else {
+                let (specs, _, _) = deck.specs_fonts_and_files(slide);
+                match holding_layer(specs, &tag) {
+                    Some(holder) => unturned(element.rect, holder.rect, element.rotate),
+                    None => element.rect,
+                }
+            };
             if !(rect.w > 0.0 && rect.h > 0.0) {
                 continue;
             }
@@ -142,6 +158,15 @@ fn picture(deck: &mut Deck, slide: usize, tag: &Tag, rect: Rect, scale: f32, mom
     let left = (rect.x * scale).round() as i64 - i64::from(layer.x);
     let top = (rect.y * scale).round() as i64 - i64::from(layer.y);
     cut(&layer.pixmap, left, top, width, height)?.encode_png().ok()
+}
+
+/// `rect`, turned by `degrees` about the centre of `around`, as it was before it was turned.
+fn unturned(rect: Rect, around: Rect, degrees: f32) -> Rect {
+    let (sin, cos) = (-f64::from(degrees)).to_radians().sin_cos();
+    let pivot = (f64::from(around.x) + f64::from(around.w) / 2.0, f64::from(around.y) + f64::from(around.h) / 2.0);
+    let centre = (f64::from(rect.x) + f64::from(rect.w) / 2.0 - pivot.0, f64::from(rect.y) + f64::from(rect.h) / 2.0 - pivot.1);
+    let back = (pivot.0 + centre.0 * cos - centre.1 * sin, pivot.1 + centre.0 * sin + centre.1 * cos);
+    Rect { x: (back.0 - f64::from(rect.w) / 2.0) as f32, y: (back.1 - f64::from(rect.h) / 2.0) as f32, ..rect }
 }
 
 /// The layer `tag` is drawn in: the last of the slide's, but its background, whose source holds it.

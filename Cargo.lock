@@ -7517,6 +7517,7 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "gpui-kit",
+ "icu_normalizer",
  "image",
  "libc",
  "miniz_oxide 0.8.9",
