@@ -142,7 +142,7 @@ A talk is already plain text, which is the part an AI is good at. What it lacks 
 - **What it is:** a small separate program that runs a command in a terminal of its own and passes the screen and the keys to and from the app. The slide's tag names the command: a shell, or `docker run …` for a container, or anything else. The app doesn't manage Docker or virtual machines; it runs what the tag says (my call).
 - **Off unless connected (owner's answer).** Without the add-on, or without a yes, the slide shows the terminal's still, or its recording if it has one.
 - **The yes:** the first time a talk would start a command in a session, the app shows the command in full and asks. The answer is per talk and per session, never remembered for a packed talk, and remembered for a folder only if the owner says *Always for this folder*. Nothing starts when a talk opens; a terminal starts when the presenter reaches its slide or presses *Start*.
-- **Typing while presenting:** a click on the terminal gives it the keys, shown by a frame. A key chosen for the purpose gives them back to the show (my call: Ctrl+Shift+Escape, changeable). Until then the arrow keys go to the terminal, not the show.
+- **Typing while presenting:** a click on the terminal gives it the keys, shown by a frame. A key chosen for the purpose gives them back to the show (my call: Ctrl+Shift+Q, changeable; Windows keeps Ctrl+Shift+Escape for Task Manager). Until then the arrow keys go to the terminal, not the show.
 - **Recording:** a session can be saved as a recording for G3, which is how a risky demo becomes a safe one.
 - **Ending:** leaving the talk or closing the window ends what was started, and says so if it won't end.
 

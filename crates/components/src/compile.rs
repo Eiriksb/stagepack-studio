@@ -35,11 +35,16 @@ pub struct Bundle {
 impl Bundle {
     /// `STUDIO_BUNDLE` if set, or else a `bundle` folder beside the executable.
     pub fn find() -> Option<Bundle> {
-        let root = match std::env::var_os("STUDIO_BUNDLE") {
-            Some(root) => PathBuf::from(root),
-            None => std::env::current_exe().ok()?.parent()?.join("bundle"),
-        };
-        Bundle::in_folder(root)
+        match std::env::var_os("STUDIO_BUNDLE") {
+            Some(root) => Bundle::in_folder(PathBuf::from(root)),
+            None => Bundle::find_beside_exe(),
+        }
+    }
+
+    /// A `bundle` folder beside the executable and nowhere else, whatever the environment says:
+    /// where a shipped build looks.
+    pub fn find_beside_exe() -> Option<Bundle> {
+        Bundle::in_folder(std::env::current_exe().ok()?.parent()?.join("bundle"))
     }
 
     fn in_folder(root: PathBuf) -> Option<Bundle> {
@@ -162,6 +167,10 @@ fn rustc_command(root: &Path, scratch: &Path) -> Command {
     if let Some(root) = std::env::var_os("SYSTEMROOT") {
         command.env("SYSTEMROOT", root);
     }
+    // The shipped app has no console, so Windows would give the compiler (a console program) a
+    // window of its own on every build; CREATE_NO_WINDOW keeps it hidden.
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut command, 0x0800_0000);
     command
 }
 

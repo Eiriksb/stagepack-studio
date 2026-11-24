@@ -492,7 +492,13 @@ fn slowed(shared: &Shared) {
 /// `look` gives.
 fn draw(screen: &Screen, look: Look, fonts: &mut Fonts, at: Duration) -> Option<Shown> {
     let scale = look.scale?;
-    let Look { rect, rotate, .. } = look;
+    Some(draw_screen(screen, look.rect, look.rotate, scale, fonts, at.as_secs_f64()))
+}
+
+/// `screen` drawn as a recording's layer is, in `rect`, turned by `rotate`, at `scale`: laid out as
+/// the engine lays out a terminal's screen and drawn as the engine draws a layer. A replay and a live
+/// terminal both draw their pictures here, so that they look alike. `at` is when it's from, in seconds.
+pub(crate) fn draw_screen(screen: &Screen, rect: Rect, rotate: f32, scale: f32, fonts: &mut Fonts, at: f64) -> Shown {
     let items = screen_items(screen, Rect { x: 0.0, y: 0.0, w: rect.w, h: rect.h }, fonts);
     let spec = LayerSpec {
         source: None,
@@ -506,10 +512,10 @@ fn draw(screen: &Screen, look: Look, fonts: &mut Fonts, at: Duration) -> Option<
         varies: false,
         video: None,
         model: None,
-        terminal: Some(TerminalOn { src: String::new(), rect, rotate, stops: 0, pending: false }),
+        terminal: Some(TerminalOn { src: String::new(), run: None, cols: 100, rows: 30, rect, rotate, stops: 0, pending: false }),
     };
     let layer = render_layer(&spec, scale, fonts);
     let placed = Placed::Drawn { x: layer.x, y: layer.y, width: layer.pixmap.width(), height: layer.pixmap.height(), scale, for_rect: rect };
     let image = RenderImage::new(vec![to_bgra_frame(&layer.pixmap)]);
-    Some(Shown { image: Arc::new(image), at: at.as_secs_f64(), placed })
+    Shown { image: Arc::new(image), at, placed }
 }

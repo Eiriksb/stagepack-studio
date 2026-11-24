@@ -213,6 +213,8 @@ pub fn name_of(talk: &Talk, slide: usize, range: &Range<usize>) -> Option<String
             // Text boxes, as the Insert tab and the format name them.
             "Text" | "Box" => "Text box".to_string(),
             // As the Insert tab names it.
+            // A terminal that runs a command and names no recording is a live terminal.
+            "Terminal" if tag.attr("run").is_some() && tag.attr("src").is_none_or(|src| src.trim().is_empty()) => "Live terminal".to_string(),
             "Terminal" => "Terminal recording".to_string(),
             name => spaced(name),
         },

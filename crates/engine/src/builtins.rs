@@ -121,10 +121,17 @@ fn model_component() -> NativeComponent {
     NativeComponent { name: crate::elements::MODEL_TAG, schema, render }
 }
 
-/// A terminal recording on a slide, laid out by the engine itself as its last screen.
+/// A terminal on a slide, laid out by the engine itself as its recording's last screen or a panel
+/// naming its command.
 fn terminal_component() -> NativeComponent {
     fn schema() -> ComponentSchema {
-        let fields = vec![PropField::new("src", PropKind::File(vec!["cast".to_string()]), false)];
+        // Either `src` or `run` is wanted, so neither is needed alone.
+        let fields = vec![
+            PropField::new("src", PropKind::File(vec!["cast".to_string()]), true),
+            PropField::new("run", PropKind::Text, true),
+            PropField::new("cols", PropKind::Whole, true),
+            PropField::new("rows", PropKind::Whole, true),
+        ];
         ComponentSchema::new(crate::terminal_screen::TERMINAL_TAG, fields, false)
     }
     fn render(_: &Props, _: &Ctx) -> Element {

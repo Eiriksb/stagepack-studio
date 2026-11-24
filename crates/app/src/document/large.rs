@@ -912,6 +912,12 @@ impl Document {
         guarded(|| self.deck.terminal_problem(index, source)).ok().flatten()
     }
 
+    /// Why the command or screen of the terminal at `source` on slide `index` is wrong, if it is:
+    /// one that is never starts.
+    pub fn terminal_run_problem_on(&mut self, index: usize, source: &std::ops::Range<usize>) -> Option<String> {
+        guarded(|| self.deck.terminal_run_problem(index, source)).ok().flatten()
+    }
+
     /// Whether a terminal recording on slide `index` is still being read aside.
     pub fn terminal_pending(&mut self, index: usize) -> bool {
         guarded(|| self.deck.terminal_pending(index)).unwrap_or(false)
@@ -922,6 +928,11 @@ impl Document {
     pub fn terminals_here(&mut self) -> Vec<TerminalLayer> {
         let current = self.current();
         guarded(|| self.deck.terminals(current)).unwrap_or_default()
+    }
+
+    /// Every terminal on slide `index` of the talk, with its layer, tag and what it names.
+    pub fn terminals_on(&mut self, index: usize) -> Vec<TerminalLayer> {
+        guarded(|| self.deck.terminals(index)).unwrap_or_default()
     }
 
     /// The terminal recordings on slide `index`, of those a show goes through, at `moment`, among
@@ -941,9 +952,24 @@ impl Document {
 
     /// Whether the terminal recording selected can be played: it's been read, and can be.
     pub fn selected_terminal_plays(&mut self) -> bool {
-        let Some(source) = self.selected_terminal().and_then(|terminal| terminal.source) else { return false };
+        let Some((source, src)) = self.selected_terminal().and_then(|terminal| Some((terminal.source?, terminal.on.src))) else { return false };
+        // One that only runs a command has no recording to play.
+        if src.is_empty() {
+            return false;
+        }
         let current = self.current();
         !self.terminal_pending(current) && self.terminal_problem_on(current, &source).is_none()
+    }
+
+    /// Keeps `bytes`, what a live terminal showed as a recording, as a file of the talk named as like
+    /// `stem` as is safe, and sets `src` of the terminal at `source` on the slide shown to it, as one
+    /// step named "Change setting". The file goes in as any added file does, so a save writes it only
+    /// while the text uses it: undone, the `src` goes and the file isn't saved. Returns its path.
+    pub fn keep_terminal_recording(&mut self, source: std::ops::Range<usize>, stem: &str, bytes: Vec<u8>) -> Result<String, InsertFailed> {
+        let thing = crate::selection::Selected { slide: self.current(), source };
+        let path = self.add_file(FileKind::Recording, stem, bytes).map_err(InsertFailed::File)?;
+        self.set_attr_of(&thing, "src", Some(&path)).map_err(InsertFailed::Edit)?;
+        Ok(path)
     }
 
     /// The talk's fonts, to draw with on another thread, as a recording played is.

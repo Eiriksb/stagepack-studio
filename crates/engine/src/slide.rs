@@ -15,7 +15,7 @@ use crate::{
     Align, ComponentAsks, DisplayItem, Enter, Fonts, LayerSpec, LayoutDef, Moment, Notice, PictureCache, Rect, RegionDef, TalkComponents, TalkFiles, TextRun,
     Transition, VideoOn, ModelOn, TerminalOn, layout_by_name, shape_text,
 };
-use crate::terminal_screen::{LaidTerminal, TERMINAL_TAG, lay_out_terminal};
+use crate::terminal_screen::{LaidTerminal, TERMINAL_TAG, lay_out_terminal, read_terminal};
 
 /// How wide and high a slide is, in slide units.
 pub const SLIDE_WIDTH: f32 = 1920.0;
@@ -410,7 +410,7 @@ fn terminal_layer(tag: &Tag, place: &TagPlace, placing: bool, theme: &Theme, env
     }
     let rect = Rect { x: place.x.unwrap_or(0.0), y: place.y.unwrap_or(0.0), w, h };
     let rotate = place.rotate.unwrap_or(0.0);
-    let src = tag.attr("src").unwrap_or_default().trim().to_string();
+    let written = read_terminal(tag);
     LayerSpec {
         source: Some(tag.range.clone()),
         rect,
@@ -423,7 +423,7 @@ fn terminal_layer(tag: &Tag, place: &TagPlace, placing: bool, theme: &Theme, env
         varies: false,
         video: None,
         model: None,
-        terminal: Some(TerminalOn { src, rect, rotate, stops, pending }),
+        terminal: Some(TerminalOn { src: written.src, run: written.run, cols: written.cols, rows: written.rows, rect, rotate, stops, pending }),
     }
 }
 

@@ -343,8 +343,9 @@ fn fill_cells(target: &mut PixmapMut, path: &tiny_skia::Path, color: Color, at: 
 }
 
 /// Draws the layers over `target`, first to last.
-pub fn compose(target: &mut Pixmap, layers: &[Layer]) {
+pub fn compose(target: &mut Pixmap, layers: &[impl AsRef<Layer>]) {
     for layer in layers {
+        let layer = layer.as_ref();
         target.draw_pixmap(layer.x, layer.y, Pixmap::as_ref(&layer.pixmap), &PixmapPaint::default(), Transform::identity(), None);
     }
 }

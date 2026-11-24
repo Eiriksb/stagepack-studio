@@ -9,6 +9,7 @@
 //! than crashing or hanging.
 
 mod cast;
+mod command;
 mod parse;
 mod player;
 mod screen;
@@ -19,6 +20,7 @@ pub use cast::{
     Event, MOST_BYTES, MOST_EVENTS, MOST_GAP, MOST_HEADER, MOST_HEIGHT, MOST_TEXT, MOST_LENGTH, MOST_OUTPUT, MOST_WIDTH, Mark, Recording,
     RecordingFacts, What, facts, played, read, screen_size,
 };
+pub use command::{MOST_COMMAND_BYTES, MOST_COMMAND_WORDS, split_command};
 #[cfg(feature = "make")]
 pub use cast::{make_demo_cast, make_test_cast};
 pub use player::{KEPT_EVERY, MOST_KEPT_BYTES, MOST_KEPT_SCREENS, Player};

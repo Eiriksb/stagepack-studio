@@ -31,12 +31,27 @@ pub struct BuildOutcome {
     pub problems: Vec<Diagnostic>,
 }
 
+/// What the window says when some components need building.
+pub(crate) const NEEDS_BUILDING: &str = "Some components in this talk need building to show as they're written.";
+/// What the window says when they need it and this copy of the app can't.
+pub(crate) const NO_COMPILER: &str = "This copy of the app has no compiler, so components can't be built.";
+
 const BUILD_FOLDER: &str = "build";
 const INDEX_FORMAT: u32 = 1;
 
+/// The compiler bundle this copy of the app builds with: named by `STUDIO_BUNDLE` if that's set,
+/// else beside the program. A shipped build (the `shipped` feature) looks beside the program only.
+pub fn find_bundle() -> Option<Bundle> {
+    if cfg!(feature = "shipped") {
+        Bundle::find_beside_exe()
+    } else {
+        Bundle::find()
+    }
+}
+
 /// The compiler that ships with the app, if this copy of it has one.
 pub fn bundled_compiler() -> Option<Compile> {
-    let bundle = Bundle::find()?;
+    let bundle = find_bundle()?;
     Some(Arc::new(move |file: &str, source: &str| {
         slides_components::compile(&bundle, file, source)
     }))

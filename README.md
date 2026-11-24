@@ -35,3 +35,39 @@ scripts/cargo-safe.sh run -- fixtures/showcase
 ```
 
 The first `run` opens the start screen; the second opens a talk straight away.
+
+## Install
+
+Two packages are made, one per system. Both install for the current user only: no administrator rights, no password, no internet. The program holds everything it needs, including the compiler for a talk's own components and the helper for live terminals (which stays off until a talk asks for a command and you say yes). It's about 560 MB installed. Neither package has been signed, and there is no automatic update; to upgrade, install the newer package over the old one. A talk's data folder (permissions, saved-but-unsaved work) is never touched by installing, upgrading or uninstalling.
+
+**Linux** (x86_64): unpack `stagepack-studio-<version>-linux-x86_64.tar.zst` and run its `install.sh`. It runs on Ubuntu 22.04, Debian 12 or newer (it needs glibc 2.35 or later) and needs the libraries `libxkbcommon`, `libxkbcommon-x11`, `libxcb` and `libstdc++`, and for its window a Vulkan driver (`libvulkan`) and, on Wayland, `libwayland-client` (on Debian and Ubuntu: `libxkbcommon0 libxkbcommon-x11-0 libxcb1 libstdc++6 libvulkan1 libwayland-client0`), which a desktop system nearly always has; `install.sh` checks that the program starts and, if it can't, says why and changes nothing.
+
+```bash
+tar --use-compress-program=zstd -xf stagepack-studio-0.1.0-linux-x86_64.tar.zst
+cd stagepack-studio-0.1.0
+sh install.sh
+```
+
+The program goes to `~/.local/lib/stagepack-studio`, a link to it in `~/.local/bin`, and the menu entry, the `.sptx` file type and the icons in their usual places under `~/.local/share`. `.sptx` files open in Stagepack Studio, also where Stagepack is installed (whose own type for them, `application/x-stagepack`, is taken over as well), and another program that lists them stays under *Open with*; uninstalling gives each type its earlier default back. `~/.local/lib/stagepack-studio/uninstall.sh` takes it all away again. If `~/.local/bin` isn't on your `PATH`, add it to run `stagepack-studio` from a terminal.
+
+**Windows** (x86_64): run `stagepack-studio-<version>-windows-x86_64-setup.exe`. It installs under `%LOCALAPPDATA%\Programs\Stagepack Studio`, adds a Start menu entry, makes `.sptx` open in Stagepack Studio (the program that opened them before stays under *Open with*, and uninstalling makes it the default again if it is still installed), adds the app's folder to your user `PATH` and registers an uninstaller under *Installed apps*. In a new terminal, run commands as `stagepack-studio`. The program has two files, `stagepack-studio.exe` (what a double-click starts) and `stagepack-studio.com` (what a terminal runs, which waits for a command to finish); a terminal finds the `.com` first, and an AI assistant's MCP command can be `stagepack-studio.com` (restart the assistant after installing, since a program that was already open keeps the old `PATH`). Uninstalling takes the folder off the `PATH` again and leaves the rest of it as it was. The Windows build has not been run yet; see `docs/checks/plan-e.md`.
+
+## Build the packages
+
+Run the tests first with `scripts/test-all.sh` (or `scripts\test-all.ps1` on Windows; `--quick` / `-Quick` skips the slow steps). Each package is built on its own system, since nothing for Windows can be built on Linux.
+
+Linux, with Docker (one you can run without sudo: the `docker` group, or rootless Docker), Rust and `binutils`:
+
+```bash
+scripts/package-linux.sh                # add --bundle-fresh to make the compiler bundle again
+```
+
+This builds the release, the compiler bundle and the package in an Ubuntu 22.04 container (the image `stagepack-studio-build:22.04`, with cargo's downloads kept in the volume `stagepack-studio-cargo`), so that the package needs no glibc newer than 2.35. It makes `target/package/stagepack-studio-<version>-linux-x86_64.tar.zst`, then checks every program and library in it with `package glibc-check`; if one needs more, it deletes the tarball and fails. A tarball that passes gets the marker `target/package/.built-in-ubuntu-22.04` beside it, holding the commit it was built from, and `test-all.sh` installs it on Ubuntu 22.04 and Debian 12 only when that marker is there (otherwise it says why it skipped that test). The script refuses to run as root, mounts the repo read-only with only `target/` writable, and Ctrl-C stops its container. The folder it packs is made by `package stage` from release builds, and fails if it is over 600 MB. A package built straight on the host (`package linux --bundle target/bundle`) needs the host's glibc, so it is for trying things out only; it removes the marker.
+
+Windows, in PowerShell, with Rust (the `x86_64-pc-windows-msvc` and `wasm32-unknown-unknown` targets) and [Inno Setup](https://jrsoftware.org/isdl.php) 6.3 or newer:
+
+```powershell
+scripts\package-windows.ps1
+```
+
+This runs `scripts\test-all.ps1 -Quick` (skip with `-SkipTests`), stages the folder, and makes `target\package\stagepack-studio-<version>-windows-x86_64-setup.exe`. Pass `-Bundle <dir>` to reuse a bundle made by `scripts\make-bundle.ps1`.

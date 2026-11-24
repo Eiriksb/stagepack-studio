@@ -846,11 +846,25 @@ impl Deck {
         if index >= self.slides.len() {
             return None;
         }
-        let src = self.specs(index).iter().find(|spec| spec.source.as_ref() == Some(source))?.terminal.as_ref()?.src.clone();
+        let on = self.specs(index).iter().find(|spec| spec.source.as_ref() == Some(source))?.terminal.clone()?;
+        let src = on.src;
+        // One that names no recording is a mistake if it has no usable command either, and has
+        // no file to be read if it has.
         if src.is_empty() {
-            return Some(crate::TERMINAL_NO_FILE.to_string());
+            return crate::terminal_complaint(&src, on.run.as_deref(), on.cols, on.rows);
         }
         self.pictures.terminal_problem(&src).map(|why| why.to_string())
+    }
+
+    /// The plain sentence saying why the command or screen of the terminal at `source` on slide
+    /// `index` is wrong, if it is. A terminal that can't run is still shown as its recording or
+    /// panel, so this is apart from [`Self::terminal_problem`], which is about showing it.
+    pub fn terminal_run_problem(&mut self, index: usize, source: &std::ops::Range<usize>) -> Option<String> {
+        if index >= self.slides.len() {
+            return None;
+        }
+        let on = self.specs(index).iter().find(|spec| spec.source.as_ref() == Some(source))?.terminal.clone()?;
+        crate::terminal_screen::terminal_run_complaint(on.run.as_deref(), on.cols, on.rows)
     }
 
     /// Whether a terminal recording on slide `index` is still being read aside: until it's read,
@@ -1842,7 +1856,7 @@ mod tests {
     fn a_busy_screen_of_another_version_of_its_file_is_told_from_the_one_before() {
         let rect = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
         let fill = || DisplayItem::Fill { path: tiny_skia::PathBuilder::from_rect(tiny_skia::Rect::from_xywh(0.0, 0.0, 1.0, 1.0).unwrap()), color: toolkit::Color::rgb(1, 2, 3) };
-        let terminal = TerminalOn { src: "assets/run.cast".to_string(), rect, rotate: 0.0, stops: 0, pending: false };
+        let terminal = TerminalOn { src: "assets/run.cast".to_string(), run: None, cols: 100, rows: 30, rect, rotate: 0.0, stops: 0, pending: false };
         let spec = LayerSpec {
             source: None,
             rect,

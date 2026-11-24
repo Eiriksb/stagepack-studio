@@ -29,7 +29,16 @@ if (Test-Path $build) { Remove-Item $build -Recurse -Force }
 # The libraries' panic messages name their source files, and they end up in every build.
 $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
 $env:CARGO_ENCODED_RUSTFLAGS = "--remap-path-prefix=$cargoHome=/cargo$([char]0x1f)--remap-path-prefix=$repo=/studio"
-cargo build --release -q -p toolkit --target $wasm --target-dir $build
+# The proc-macro DLLs (built for this PC, loaded by the bundle's rustc) carry the C runtime, so that they
+# load on a PC without the Visual C++ redistributable. Under --target cargo gives host builds no rust
+# flags at all, so they go through host.rustflags, which needs cargo's -Zhost-config: RUSTC_BOOTSTRAP
+# allows it on a stable toolchain, for this one build only.
+$env:RUSTC_BOOTSTRAP = '1'
+try {
+    cargo build --release -q -p toolkit --target $wasm --target-dir $build -Zhost-config -Ztarget-applies-to-host --config 'target-applies-to-host=false' --config "host.rustflags=['-C', 'target-feature=+crt-static']"
+} finally {
+    Remove-Item Env:RUSTC_BOOTSTRAP
+}
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 Copy-Item "$build/$wasm/release/libtoolkit.rlib" "$Out/toolkit/"
 Copy-Item "$build/$wasm/release/deps/*.rlib", "$build/$wasm/release/deps/*.rmeta" "$Out/toolkit/deps/"
