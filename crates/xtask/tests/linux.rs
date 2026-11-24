@@ -629,3 +629,59 @@ fn an_upgrade_under_other_settings_is_refused() {
     assert!(said(&out).contains("earlier install used BIN="), "{}", said(&out));
     assert_eq!(snapshot(&s.home), before);
 }
+
+/// The package folder again, with a program that can't start here, as on a system with too old a glibc.
+fn unstartable_package(s: &Scratch) -> PathBuf {
+    let dir = s.root.join("unstartable/stagepack-studio-9.9.9");
+    std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+    assert!(Command::new("cp").arg("-al").arg(package()).arg(&dir).status().unwrap().success());
+    let program = dir.join("stagepack-studio");
+    std::fs::remove_file(&program).unwrap();
+    std::fs::write(&program, "#!/bin/sh\necho \"stagepack-studio: /lib/x86_64-linux-gnu/libc.so.6: version \\`GLIBC_2.39' not found\" >&2\nexit 127\n").unwrap();
+    std::fs::set_permissions(&program, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    dir
+}
+
+#[test]
+fn a_program_that_cant_start_here_is_not_installed() {
+    // A first install: refused, and nothing is left.
+    let s = Scratch::new("cant-start-");
+    let broken = unstartable_package(&s);
+    let before = snapshot(&s.home);
+    let out = s.install(&broken);
+    let text = said(&out);
+    assert_ne!(out.status.code(), Some(0), "{text}");
+    assert_eq!(text.lines().filter(|l| l.starts_with("install.sh:")).count(), 1, "one sentence expected: {text}");
+    assert!(text.contains("GLIBC_2.39' not found") && text.contains("glibc 2.39") && text.contains("Nothing was changed."), "{text}");
+    assert_eq!(snapshot(&s.home), before);
+
+    // An upgrade: refused, and the earlier install is exactly as it was.
+    let s = installed();
+    let broken = unstartable_package(&s);
+    let before = snapshot(&s.home);
+    let out = s.install(&broken);
+    let text = said(&out);
+    assert_ne!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("GLIBC_2.39' not found") && text.contains("Nothing was changed."), "{text}");
+    assert!(!text.contains("stopped before finishing"), "{text}");
+    assert_eq!(snapshot(&s.home), before, "the earlier install should be untouched");
+}
+
+#[test]
+fn what_install_says_matches_what_it_did() {
+    let s = Scratch::new("say-");
+    let out = s.install(package());
+    assert_eq!(out.status.code(), Some(0), "{}", said(&out));
+    assert!(!said(&out).contains("restart"), "a first install has nothing to restart: {}", said(&out));
+    // An upgrade: a running copy keeps the old, deleted folder until it restarts.
+    let out = s.install(package());
+    assert_eq!(out.status.code(), Some(0), "{}", said(&out));
+    assert!(said(&out).contains("If Stagepack Studio is running, restart it."), "{}", said(&out));
+    // Stopped once the new program is in place: it mustn't say the earlier one still is.
+    let out = s.command("sh").arg(package().join("install.sh")).env("STAGEPACK_INSTALL_STOP_AT", "placed").output().unwrap();
+    let text = said(&out);
+    assert_ne!(out.status.code(), Some(0), "{text}");
+    assert!(!text.contains("is still in place") && !text.contains("Nothing was changed"), "{text}");
+    assert!(text.contains("The new program is in place") && text.contains("install.sh again"), "{text}");
+    assert!(s.app().join("stagepack-studio").is_file());
+}

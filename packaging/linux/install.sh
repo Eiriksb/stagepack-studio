@@ -9,8 +9,16 @@
 # Running it again upgrades. uninstall.sh (kept inside the installed folder) takes it all away again.
 set -eu
 
+# Before the new program is in place nothing has changed; after, it has, and saying so matters.
+SWAPPED=0
+REFUSED=0
 refuse() {
-    printf 'install.sh: %s Nothing was changed.\n' "$*" >&2
+    REFUSED=1
+    if [ "$SWAPPED" = 1 ]; then
+        printf 'install.sh: %s The new program is in place but the install isn'"'"'t finished; run install.sh again once that is fixed, or uninstall.sh from %s.\n' "$*" "$APP" >&2
+    else
+        printf 'install.sh: %s Nothing was changed.\n' "$*" >&2
+    fi
     exit 1
 }
 say() { printf '%s\n' "$*"; }
@@ -166,15 +174,20 @@ MANIFEST="DATA=$DATA${NL}CONFIG=$CONFIG${NL}BIN=$BIN$PREVS${NL}new_config=$NEW_C
 # ---- Put the program in place: copy beside it, then swap, so a failure leaves the old one ----
 NEW="$APP.new-$$"
 OLD="$APP.old-$$"
-SWAPPED=0
+UPGRADE=0
+[ -d "$APP" ] && UPGRADE=1
 cleanup() {
     _s=$?
     trap - EXIT INT TERM HUP
     if [ "$SWAPPED" = 0 ] && [ -d "$OLD" ] && [ ! -e "$APP" ]; then mv "$OLD" "$APP"; fi
     if [ "$SWAPPED" = 1 ]; then rm -rf "$OLD"; fi
     rm -rf "$NEW"
-    if [ "$_s" -ne 0 ]; then
-        printf 'install.sh: stopped before finishing. An earlier install, if there was one, is still in place; run uninstall.sh from %s to tidy up anything half done (an empty folder may be left behind).\n' "$APP" >&2
+    if [ "$_s" -ne 0 ] && [ "$REFUSED" = 0 ]; then
+        if [ "$SWAPPED" = 1 ]; then
+            printf 'install.sh: stopped before finishing. The new program is in place, but its menu entry, file type or icons may not be; run install.sh again to finish, or uninstall.sh from %s to take it away.\n' "$APP" >&2
+        else
+            printf 'install.sh: stopped before finishing. An earlier install, if there was one, is still in place; run uninstall.sh from %s to tidy up anything half done (an empty folder may be left behind).\n' "$APP" >&2
+        fi
     fi
     exit "$_s"
 }
@@ -182,16 +195,38 @@ trap cleanup EXIT
 trap 'exit 1' INT TERM HUP
 # A hook for the tests only (harmless otherwise): stop at a chosen step, as a signal would.
 hook() { [ "${STAGEPACK_INSTALL_STOP_AT:-}" != "$1" ] || kill -TERM $$; }
+# The topmost folder this run makes for the program, so that a refusal below can take it away again.
+MADE_TOP=
+_d=$(dirname "$APP")
+while [ ! -d "$_d" ]; do
+    MADE_TOP=$_d
+    _d=$(dirname "$_d")
+done
 mkdir -p "$(dirname "$APP")"
 mkdir "$NEW"
 cp -a "$SRC/." "$NEW/"
 hook copy
 printf '%s\n' "$MANIFEST" >"$NEW/install-manifest.txt"
+
+# The new program must start here: a system older than the one it was built on can't load it, and
+# the menu entry would then do nothing, silently. Run from the copy, where it will be run from.
+if ! "$NEW/stagepack-studio" help >/dev/null 2>"$NEW/.start-check"; then
+    _why=$(head -c 400 "$NEW/.start-check" | tr '\n' ' ')
+    _why=${_why%"${_why##*[! ]}"}
+    rm -rf "$NEW"
+    if [ -n "$MADE_TOP" ]; then
+        _d=$(dirname "$APP")
+        while rmdir "$_d" 2>/dev/null && [ "$_d" != "$MADE_TOP" ]; do _d=$(dirname "$_d"); done
+    fi
+    refuse "The program can't start on this system (${_why:-it gave no reason}). It needs glibc 2.39 or later, libxkbcommon, libxkbcommon-x11, libxcb and libstdc++; an earlier install, if there was one, is still in place."
+fi
+rm -f "$NEW/.start-check"
 if [ -d "$APP" ]; then
     mv "$APP" "$OLD"
     hook swap
     if ! mv "$NEW" "$APP"; then
         mv "$OLD" "$APP"
+        REFUSED=1
         printf 'install.sh: couldn'"'"'t move the new program into place; the old one is still there.\n' >&2
         exit 1
     fi
@@ -201,6 +236,7 @@ else
     mv "$NEW" "$APP"
     SWAPPED=1
 fi
+hook placed
 
 # ---- The rest, all under the user's folders ----
 mkdir -p "$BIN" "$APPS" "$MIMEDIR/packages"
@@ -253,3 +289,5 @@ case ":${PATH:-}:" in
     *) say "Note: $BIN isn't on your PATH; add it to run 'stagepack-studio' from a terminal. The menu entry works without it." ;;
 esac
 say "To remove it: sh \"$APP/uninstall.sh\""
+# A running copy still runs from the old folder, which is gone: it finds no compiler until it restarts.
+if [ "$UPGRADE" = 1 ]; then say "If Stagepack Studio is running, restart it."; fi
