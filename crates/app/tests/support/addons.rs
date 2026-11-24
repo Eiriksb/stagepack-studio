@@ -56,7 +56,13 @@ const ANSWER_AT: usize = 65536;
 
 /// A made-up add-on called `slidev` whose `run` gives back `bundle`, whatever it is given.
 pub fn answering_guest(bundle: &Bundle) -> Vec<u8> {
-    let info = br#"{"name":"slidev","version":"0.1.0","operations":["export","import"]}"#;
+    answering_guest_at(bundle, "0.1.0")
+}
+
+/// [`answering_guest`], saying it is at `version`.
+pub fn answering_guest_at(bundle: &Bundle, version: &str) -> Vec<u8> {
+    let info = format!(r#"{{"name":"slidev","version":"{version}","operations":["export","import"]}}"#);
+    let info = info.as_bytes();
     let answer = encode(bundle);
     // The input goes after the answer, a page on.
     let heap = (ANSWER_AT + answer.len()).div_ceil(65536) * 65536 + 65536;

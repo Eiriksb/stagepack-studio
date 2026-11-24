@@ -85,14 +85,29 @@ fn named_version(manifest: &[u8]) -> Option<String> {
 
 /// The installed add-on's version, if its files are there and its signature holds, checked
 /// with the key the app was built with, and the Slidev it writes for is the app's.
-fn verified(app_folder: &Path) -> Result<(String, Vec<u8>), (Option<String>, String)> {
+///
+/// The files are read under the add-ons folder's lock, shared, so that an install swapping the
+/// folder isn't seen half done. With `wait`, it waits for an install going on to finish;
+/// without, it reads anyway, for a look that is checked again once the files change.
+fn verified(app_folder: &Path, wait: bool) -> Result<(String, Vec<u8>), (Option<String>, String)> {
+    let addons = app_folder.join(ADDONS_FOLDER);
+    let _shared = if wait { Lock::shared(&addons) } else { Lock::try_shared(&addons) };
     let (manifest, wasm, sig) = read_installed(app_folder).map_err(|sentence| (None, sentence))?;
+    drop(_shared);
     let version = named_version(&manifest);
     let checked = verify_parts(&manifest, &wasm, &sig, &key::addon_key()).map_err(|sentence| (version.clone(), sentence))?;
     if checked.slidev != SLIDEV_VERSION {
         return Err((version, wrong_slidev(&checked.slidev)));
     }
     Ok((checked.version, wasm))
+}
+
+/// What status and load say of an add-ons folder that is a link.
+const LINKED_READ: &str = "The add-ons folder, or the Slidev add-on's, is a link to somewhere else, so the app won't use it.";
+
+/// Whether the add-ons folder under `app_folder`, or the Slidev add-on's, is a link.
+fn is_linked(app_folder: &Path) -> bool {
+    refuse_links(&app_folder.join(ADDONS_FOLDER)).is_err()
 }
 
 fn wrong_slidev(slidev: &str) -> String {
@@ -140,6 +155,9 @@ fn stamps(app_folder: &Path) -> Stamps {
 /// What's installed under `app_folder`, found by checking its signature but without loading it,
 /// which takes a moment longer. It's checked again only once one of its files has changed.
 pub fn status(app_folder: &Path) -> Status {
+    if is_linked(app_folder) {
+        return Status::Damaged(LINKED_READ.to_string());
+    }
     if !is_there(app_folder) {
         return Status::NotInstalled;
     }
@@ -148,7 +166,7 @@ pub fn status(app_folder: &Path) -> Status {
     if let Some((_, _, status)) = looked_at.iter().find(|(folder, was, _)| folder == app_folder && *was == stamped) {
         return status.clone();
     }
-    let status = match verified(app_folder) {
+    let status = match verified(app_folder, false) {
         Ok((version, _)) => Status::Installed(version),
         Err((_, sentence)) => Status::Damaged(sentence),
     };
@@ -159,11 +177,14 @@ pub fn status(app_folder: &Path) -> Status {
 
 /// The add-on installed under `app_folder`, checked and loaded, or `None` if there's none.
 pub fn load(app_folder: &Path) -> Option<Installed> {
+    if is_linked(app_folder) {
+        return Some(Installed { version: String::new(), state: InstalledState::Damaged(LINKED_READ.to_string()) });
+    }
     if !is_there(app_folder) {
         return None;
     }
-    Some(match verified(app_folder) {
-        Ok((version, wasm)) => match loaded(&wasm) {
+    Some(match verified(app_folder, true) {
+        Ok((version, wasm)) => match loaded(&wasm, &version) {
             Ok(addon) => Installed { version, state: InstalledState::Ready(addon) },
             Err(sentence) => Installed { version, state: InstalledState::Damaged(sentence) },
         },
@@ -171,12 +192,20 @@ pub fn load(app_folder: &Path) -> Option<Installed> {
     })
 }
 
-/// The add-on `wasm`, loaded, if it is the Slidev add-on and does both its operations.
-fn loaded(wasm: &[u8]) -> Result<Addon, String> {
+/// The add-on `wasm`, loaded, if it is the Slidev add-on at `version`, as its signed `addon.json`
+/// says, and does both its operations.
+fn loaded(wasm: &[u8], version: &str) -> Result<Addon, String> {
     let addon = Addon::load(wasm).map_err(|error| error.to_string())?;
     let info = addon.info();
     if info.name != addon_abi::package::ADDON_NAME {
         return Err(format!("The add-on says it is {:?}, not the Slidev add-on.", slides_components::shortened(&info.name, 40)));
+    }
+    if info.version != version {
+        return Err(format!(
+            "The add-on says it is version {}, where its addon.json says {}.",
+            slides_components::shortened(&info.version, 40),
+            slides_components::shortened(version, 40)
+        ));
     }
     for operation in ["export", "import"] {
         if !info.operations.iter().any(|known| known == operation) {
@@ -197,7 +226,7 @@ pub fn install_from_file(app_folder: &Path, file: &Path) -> Result<Installed, St
     if package.manifest.slidev != SLIDEV_VERSION {
         return Err(wrong_slidev(&package.manifest.slidev));
     }
-    let addon = loaded(&package.wasm)?;
+    let addon = loaded(&package.wasm, &package.manifest.version)?;
     let addons = app_folder.join(ADDONS_FOLDER);
     std::fs::create_dir_all(&addons).map_err(|error| format!("The add-on couldn't be installed: the app's folder can't be written to ({error})."))?;
     refuse_links(&addons)?;
@@ -237,6 +266,10 @@ pub fn install_from_file(app_folder: &Path, file: &Path) -> Result<Installed, St
     }
     sync_folder(&addons);
     if had_one {
+        // Renamed before it's deleted, so that only an install cut short leaves an `-old-` folder
+        // behind, which would be put back.
+        let gone = addons.join(format!(".{SLIDEV_FOLDER}-removed-{}", unique()));
+        let old = if std::fs::rename(&old, &gone).is_ok() { gone } else { old };
         let _ = std::fs::remove_dir_all(&old);
     }
     Ok(Installed { version: package.manifest.version, state: InstalledState::Ready(addon) })
@@ -264,13 +297,18 @@ pub fn remove(app_folder: &Path) -> Result<(), String> {
     if std::fs::symlink_metadata(&addons).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err(LINKED.to_string());
     }
-    let _lock = Lock::take(&addons)?;
+    // Never waited for: it is asked for on the window's thread.
+    let Ok(_lock) = Lock::try_take(&addons) else { return Err(BUSY.to_string()) };
     // Moved aside first, so that the add-on is gone at once, even if some of it can't be deleted.
     let gone = addons.join(format!(".{SLIDEV_FOLDER}-removed-{}", unique()));
     std::fs::rename(&folder, &gone).map_err(|error| format!("The add-on couldn't be removed ({error})."))?;
-    let _ = std::fs::remove_dir_all(&gone);
+    // With what an earlier install left, so that none of it is put back as the add-on.
+    sweep_leftovers(&addons);
     Ok(())
 }
+
+/// What remove says while an install holds the add-ons folder.
+pub const BUSY: &str = "An add-on is being installed; try again in a moment.";
 
 /// What install and remove say of an add-ons folder that is a link.
 const LINKED: &str = "The add-ons folder, or the Slidev add-on's, is a link to somewhere else, so the app won't write there.";
@@ -329,6 +367,21 @@ impl Lock {
         let file = Lock::open(addons).map_err(|_| ())?;
         file.try_lock().map_err(|_| ())?;
         Ok(Lock { _file: file })
+    }
+
+    /// The lock shared, for reading what's installed, once no install holds it; or `None` if the
+    /// lock file can't be had, as when nothing was ever installed.
+    fn shared(addons: &Path) -> Option<Lock> {
+        let file = Lock::open(addons).ok()?;
+        file.lock_shared().ok()?;
+        Some(Lock { _file: file })
+    }
+
+    /// The lock shared, if no install holds it now.
+    fn try_shared(addons: &Path) -> Option<Lock> {
+        let file = Lock::open(addons).ok()?;
+        file.try_lock_shared().ok()?;
+        Some(Lock { _file: file })
     }
 }
 

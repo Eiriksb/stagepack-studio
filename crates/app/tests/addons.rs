@@ -49,7 +49,7 @@ fn install_from_file_puts_three_files_in_addons_slidev() {
     assert_eq!(ready_version(app.path()).as_deref(), Some("0.1.0"));
 
     // A later version takes its place.
-    let file = package_file(scratch.path(), &answering_guest(&export_answer()), "0.2.0");
+    let file = package_file(scratch.path(), &answering_guest_at(&export_answer(), "0.2.0"), "0.2.0");
     assert_eq!(addons::install_from_file(app.path(), &file).unwrap().version, "0.2.0");
     assert_eq!(ready_version(app.path()).as_deref(), Some("0.2.0"));
     assert_eq!(installed_names(app.path()), ["addon.json", "addon.sig", "addon.wasm"]);
@@ -236,6 +236,18 @@ fn now() -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::parse_from_rfc3339("2026-11-24T09:30:00Z").unwrap().to_utc()
 }
 
+/// A report's notices as lines, each by its slide.
+fn texts(report: &addon_abi::Report) -> Vec<String> {
+    report
+        .notices
+        .iter()
+        .map(|notice| match notice.slide {
+            Some(slide) => format!("Slide {slide}: {}", notice.text),
+            None => notice.text.clone(),
+        })
+        .collect()
+}
+
 const ID: &str = "0b5c7a4e-3f1d-4c2a-9e8b-6d5f4a3b2c1d";
 
 #[test]
@@ -245,7 +257,7 @@ fn an_export_over_the_limit_leaves_video_out_with_a_notice() {
     let out_dir = tempfile::tempdir().unwrap();
     let out = out_dir.path().join("A long video (Slidev).sptx");
 
-    let warnings = export_slidev(input_for(folder.path()), &addon, &out, now(), ID).unwrap();
+    let warnings = texts(&export_slidev(input_for(folder.path()), &addon, &out, now(), ID).unwrap());
     assert!(
         warnings.iter().any(|warning| warning == "assets/long.mp4 is too large to include; copy it into public/ yourself."),
         "{warnings:?}"
@@ -273,7 +285,7 @@ fn an_export_over_the_limit_leaves_video_out_with_a_notice() {
     // A video that fits goes in whole: only one too large for the bundle is left out.
     let small = talk_with_a_video(1024);
     let out = out_dir.path().join("small.sptx");
-    let warnings = export_slidev(input_for(small.path()), &addon, &out, now(), ID).unwrap();
+    let warnings = texts(&export_slidev(input_for(small.path()), &addon, &out, now(), ID).unwrap());
     assert!(!warnings.iter().any(|warning| warning.contains("too large")), "{warnings:?}");
 }
 
@@ -412,7 +424,7 @@ fn a_video_that_would_take_the_export_past_the_add_ons_memory_is_left_out() {
     picture.set_len(200 * 1024 * 1024).unwrap();
     assert_eq!(stagepack_studio::export::SLIDEV_EXPORT_BUDGET, 320 * 1024 * 1024);
     let out = folder.path().join("out.sptx");
-    let warnings = export_slidev(input_for(folder.path()), &addon, &out, now(), ID).unwrap();
+    let warnings = texts(&export_slidev(input_for(folder.path()), &addon, &out, now(), ID).unwrap());
     assert!(warnings.iter().any(|warning| warning == "assets/long.mp4 is too large to include; copy it into public/ yourself."), "{warnings:?}");
 }
 
@@ -451,12 +463,230 @@ fn a_part_inside_a_turned_box_is_placed_in_slide_units_and_turned_with_it() {
     let icon = index.iter().find(|entry| entry["tag"] == "Icon").expect("the icon is drawn");
     assert_eq!(icon["rotate"], 0.0, "the box turns it, not its own turn");
     let (x, y) = (icon["x"].as_f64().unwrap(), icon["y"].as_f64().unwrap());
-    // Inside the box, as it is before it's turned.
     // Inside the box, as it is before it's turned: at its top left, past the box's padding.
     assert!((400.0..1000.0).contains(&x) && (300.0..700.0).contains(&y), "{icon}");
     assert!((x - 424.0).abs() < 1.0 && (y - 324.0).abs() < 1.0, "{icon}");
+    // Turning a part about the box's centre keeps its size: the icon's own.
+    let (w, h) = (icon["w"].as_f64().unwrap(), icon["h"].as_f64().unwrap());
+    assert!((w - 96.0).abs() < 1.0 && (h - 96.0).abs() < 1.0, "{icon}");
     // And its picture is of the icon, not of the box's fill alone.
     let picture = image::load_from_memory(&baked.iter().find(|(name, _)| name == "baked/1/0.png").unwrap().1).unwrap().to_rgba8();
     let fill = image::Rgba([0xfd, 0xe6, 0x8a, 0xff]);
     assert!(picture.pixels().any(|pixel| *pixel != fill && pixel[3] > 0), "the icon's picture is only the box's fill");
+}
+
+#[test]
+fn the_add_ons_path_rule_is_the_engines() {
+    for path in ["photo.png", "./photo.png", "a/../photo.png", "assets//x/./../a.png", "/photo.png", "../photo.png", "a/../../b", "", ".", "media/"] {
+        assert_eq!(addon_abi::normalise(path), slides_engine::normalise(path), "{path:?}");
+    }
+}
+
+/// A Stagepack talk whose zip holds `vendor` files under `vendor/` and `own` files of its own,
+/// besides its manifest and Markdown.
+fn talk_of_many(dir: &Path, vendor: usize, own: usize) -> std::path::PathBuf {
+    use std::io::Write as _;
+
+    let talk = dir.join("many.sptx");
+    let mut zip = zip::ZipWriter::new(std::io::BufWriter::new(std::fs::File::create(&talk).unwrap()));
+    let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    zip.add_directory("vendor/", options).unwrap();
+    for (name, data) in [("stagepack.json", &br#"{"format":1,"entry":"slides.md"}"#[..]), ("slides.md", b"# Many\n")] {
+        zip.start_file(name, options).unwrap();
+        zip.write_all(data).unwrap();
+    }
+    for n in 0..vendor {
+        zip.start_file(format!("vendor/node_modules/theme/{n}.js"), options).unwrap();
+    }
+    for n in 0..own {
+        zip.start_file(format!("public/{n}.txt"), options).unwrap();
+    }
+    zip.finish().unwrap();
+    talk
+}
+
+#[test]
+fn a_talk_bundling_many_packages_imports_without_them() {
+    let addon = slides_components::addon::Addon::load(&answering_guest(&import_answer())).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (slides, _, report) = stagepack_studio::addons::import_slidev(&talk_of_many(dir.path(), 12_000, 0), &addon).unwrap();
+    assert!(slides.starts_with("# From Slidev"));
+    assert!(report.notices.iter().any(|notice| notice.text == stagepack_studio::addons::VENDOR_NOTICE));
+
+    // Its own files are what count: 9 998 with the slides fit, and one more doesn't.
+    assert!(stagepack_studio::addons::import_slidev(&talk_of_many(dir.path(), 0, 9_997), &addon).is_ok());
+    let refused = stagepack_studio::addons::import_slidev(&talk_of_many(dir.path(), 0, 9_998), &addon).unwrap_err();
+    assert!(refused.contains("more than 9998 files"), "{refused}");
+}
+
+/// `bytes`, a zip, with `insert` put just before its end record, which is its last 22 bytes.
+fn before_the_end_record(bytes: &[u8], insert: &[u8]) -> Vec<u8> {
+    let end = bytes.len() - 22;
+    let mut out = bytes[..end].to_vec();
+    out.extend(insert);
+    out.extend(&bytes[end..]);
+    out
+}
+
+#[test]
+fn a_talk_whose_zip_lists_a_huge_directory_is_refused_before_it_is_read() {
+    let addon = slides_components::addon::Addon::load(&answering_guest(&import_answer())).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let talk = stagepack_talk(dir.path());
+    let bytes = std::fs::read(&talk).unwrap();
+
+    // The end record's directory size, at 12..16, said to be 4 GiB less two bytes.
+    let mut large = bytes.clone();
+    let end = large.len() - 22;
+    large[end + 12..end + 16].copy_from_slice(&0xffff_fffeu32.to_le_bytes());
+    std::fs::write(&talk, &large).unwrap();
+    let refused = stagepack_studio::addons::import_slidev(&talk, &addon).unwrap_err();
+    assert!(refused.contains("list of entries"), "{refused}");
+
+    // A zip64 end record, which a locator before the end record points to, listing a million entries.
+    let at = (bytes.len() - 22) as u64;
+    let mut zip64 = vec![0x50, 0x4b, 0x06, 0x06];
+    zip64.extend(44u64.to_le_bytes());
+    zip64.extend([45, 0, 45, 0]);
+    zip64.extend([0u8; 8]);
+    zip64.extend(1_000_000u64.to_le_bytes());
+    zip64.extend(1_000_000u64.to_le_bytes());
+    zip64.extend(100u64.to_le_bytes());
+    zip64.extend(0u64.to_le_bytes());
+    let mut locator = vec![0x50, 0x4b, 0x06, 0x07];
+    locator.extend(0u32.to_le_bytes());
+    locator.extend(at.to_le_bytes());
+    locator.extend(1u32.to_le_bytes());
+    std::fs::write(&talk, before_the_end_record(&bytes, &[zip64, locator].concat())).unwrap();
+    let refused = stagepack_studio::addons::import_slidev(&talk, &addon).unwrap_err();
+    assert!(refused.contains("200000 entries"), "{refused}");
+}
+
+#[test]
+fn names_the_add_on_gives_back_that_would_be_one_file_are_kept_once() {
+    // An import's assets, composed and decomposed.
+    let mut answer = import_answer();
+    answer.push(file("assets/caf\u{e9}.png", b"one"));
+    answer.push(file("assets/cafe\u{301}.png", b"two"));
+    let addon = slides_components::addon::Addon::load(&answering_guest(&answer)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (_, files, report) = stagepack_studio::addons::import_slidev(&stagepack_talk(dir.path()), &addon).unwrap();
+    let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["assets/photo.png", "assets/caf\u{e9}.png"]);
+    assert!(report.notices.iter().any(|notice| notice.text.contains("cafe\u{301}.png") && notice.text.starts_with("1 file the add-on gave back")), "{:?}", report.notices);
+
+    // And an export's files under public/, composed and decomposed. Letter case alone the add-on's
+    // answer can't differ in at all.
+    let mut answer = export_answer();
+    answer.push(file("public/caf\u{e9}.png", b"one"));
+    answer.push(file("public/cafe\u{301}.png", b"two"));
+    let addon = slides_components::addon::Addon::load(&answering_guest(&answer)).unwrap();
+    let folder = talk_with_a_video(1024);
+    let out = folder.path().join("out.sptx");
+    let warnings = texts(&export_slidev(input_for(folder.path()), &addon, &out, now(), ID).unwrap());
+    assert_eq!(zip_names(&out), ["slides.md", "stagepack.json", "public/photo.png", "public/caf\u{e9}.png"]);
+    assert!(warnings.iter().any(|warning| warning.contains("public/cafe\u{301}.png")), "{warnings:?}");
+}
+
+#[test]
+fn exporting_again_over_an_export_keeps_its_id_and_when_it_was_made() {
+    let addon = slides_components::addon::Addon::load(&answering_guest(&export_answer())).unwrap();
+    let folder = talk_with_a_video(1024);
+    let out = folder.path().join("again.sptx");
+    export_slidev(input_for(folder.path()), &addon, &out, now(), ID).unwrap();
+    let later = now() + chrono::Duration::hours(2);
+    export_slidev(input_for(folder.path()), &addon, &out, later, "11111111-2222-4333-8444-555555555555").unwrap();
+    let manifest: serde_json::Value = serde_json::from_slice(&zip_entry(&out, "stagepack.json")).unwrap();
+    assert_eq!(manifest["id"], ID);
+    assert_eq!(manifest["created"], "2026-11-24T09:30:00Z");
+    assert_eq!(manifest["updated"], "2026-11-24T11:30:00Z");
+}
+
+#[test]
+fn a_module_saying_another_version_than_its_manifest_is_refused() {
+    test_key();
+    let app = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    // Signed as 0.2.0, where the module says it is 0.1.0.
+    let file = package_file(scratch.path(), &answering_guest(&export_answer()), "0.2.0");
+    let refused = addons::install_from_file(app.path(), &file).unwrap_err();
+    assert!(refused.contains("version 0.1.0") && refused.contains("0.2.0"), "{refused}");
+    assert!(!app.path().join("addons/slidev").exists());
+}
+
+#[test]
+fn remove_isnt_undone_by_what_an_earlier_install_left() {
+    test_key();
+    let app = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    addons::install_from_file(app.path(), &package_file(scratch.path(), &answering_guest(&export_answer()), "0.1.0")).unwrap();
+    // As if an earlier install's old folder couldn't be deleted.
+    let left = app.path().join("addons/.slidev-old-0123");
+    std::fs::create_dir(&left).unwrap();
+    for name in ["addon.json", "addon.wasm", "addon.sig"] {
+        std::fs::copy(app.path().join("addons/slidev").join(name), left.join(name)).unwrap();
+    }
+    addons::remove(app.path()).unwrap();
+    assert_eq!(addons::status(app.path()), addons::Status::NotInstalled);
+    assert!(addons::load(app.path()).is_none());
+    assert!(!left.exists());
+}
+
+#[test]
+fn remove_doesnt_wait_for_an_install_going_on() {
+    test_key();
+    let app = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    addons::install_from_file(app.path(), &package_file(scratch.path(), &answering_guest(&export_answer()), "0.1.0")).unwrap();
+    // The lock an install holds, held here.
+    let lock = std::fs::OpenOptions::new().write(true).open(app.path().join("addons/.lock")).unwrap();
+    lock.lock().unwrap();
+    assert_eq!(addons::remove(app.path()).unwrap_err(), addons::BUSY);
+    assert!(app.path().join("addons/slidev/addon.wasm").is_file());
+    lock.unlock().unwrap();
+    addons::remove(app.path()).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn an_add_ons_folder_that_is_a_link_is_not_read_through() {
+    test_key();
+    let app = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    // A real install, elsewhere, which the app's folder only links to.
+    addons::install_from_file(elsewhere.path(), &package_file(scratch.path(), &answering_guest(&export_answer()), "0.1.0")).unwrap();
+    std::os::unix::fs::symlink(elsewhere.path().join("addons"), app.path().join("addons")).unwrap();
+    assert!(matches!(addons::status(app.path()), addons::Status::Damaged(sentence) if sentence.contains("link")));
+    assert!(matches!(addons::load(app.path()), Some(addons::Installed { state: InstalledState::Damaged(sentence), .. }) if sentence.contains("link")));
+}
+
+#[test]
+fn parts_that_change_on_clicks_past_the_budget_are_one_picture_with_a_notice() {
+    let mut registry = slides_engine::builtin_registry();
+    registry.add(probes::Tally_component());
+    let source = "# Changing\n\n<Tally x=\"100\" y=\"300\" w=\"300\" h=\"200\" />\n";
+    let mut deck = Deck::with_registry(Box::new(FolderFiles::new(fixture())), Fonts::bundled_only(), source.to_string(), registry);
+    let (baked, notices) = addons::bake::bake_within(&mut deck, u64::MAX, 3);
+    let mut names: Vec<&str> = baked.iter().map(|(name, _)| name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["baked/1/0.png", "baked/index.json"]);
+    let (_, index) = baked.iter().find(|(name, _)| name == "baked/index.json").unwrap();
+    let index: Vec<serde_json::Value> = serde_json::from_slice(index).unwrap();
+    assert_eq!(index[0]["steps"], serde_json::json!([]));
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!((notices[0].slide, notices[0].kind), (Some(1), NoticeKind::Frozen));
+    assert!(notices[0].text.starts_with("The Tally changes on clicks"), "{notices:?}");
+}
+
+#[test]
+fn an_export_the_add_on_fails_says_so_in_one_sentence() {
+    let addon = slides_components::addon::Addon::load(&answering_guest(&vec![file(addon_abi::ERROR, b"The talk has no slides.md to export.")])).unwrap();
+    let folder = talk_with_a_video(1024);
+    let out = folder.path().join("failed.sptx");
+    let refused = export_slidev(input_for(folder.path()), &addon, &out, now(), ID).unwrap_err();
+    let start = format!("Could not export {}: the add-on couldn't finish: ", out.display());
+    assert!(refused.starts_with(&start), "{refused}");
+    assert!(refused.ends_with('.') && !refused.ends_with(".."), "{refused}");
+    assert_eq!(refused.matches(". ").count(), 0, "one sentence: {refused}");
 }

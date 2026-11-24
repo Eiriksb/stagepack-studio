@@ -468,11 +468,24 @@ pub(super) fn start_problem(path: &Path) -> &'static str {
 
 const NOT_A_PRESENTATION: &str = "That file isn't a presentation made with this app.";
 
-/// The most notices the report on an import lists, before it says how many more there are.
-const MOST_REPORTED: usize = 200;
+/// The most notices the report on an import or an export lists, before it says how many more there are.
+pub(super) const MOST_REPORTED: usize = 200;
 
 /// The report on what an import couldn't carry over as it was, by slide, the whole talk's first.
 fn show_import_report(report: addon_abi::Report, window: &mut Window, cx: &mut App) {
+    show_report(
+        IMPORT_REPORT_ID,
+        "Imported from Slidev",
+        "This presentation isn't saved yet. What couldn't be carried over as it was:",
+        report,
+        window,
+        cx,
+    );
+}
+
+/// The report `id`, titled `title`, on what an import or an export couldn't carry over as it
+/// was: `intro`, then by slide, the whole talk's first, [`MOST_REPORTED`] at most.
+pub(super) fn show_report(id: &'static str, title: &'static str, intro: &'static str, report: addon_abi::Report, window: &mut Window, cx: &mut App) {
     let mut notices = report.notices;
     notices.sort_by_key(|notice| notice.slide);
     let more = notices.len().saturating_sub(MOST_REPORTED);
@@ -480,22 +493,22 @@ fn show_import_report(report: addon_abi::Report, window: &mut Window, cx: &mut A
     let notices = std::rc::Rc::new(notices);
     window.open_dialog(cx, move |dialog, _, _| {
         dialog
-            .title("Imported from Slidev")
+            .title(title)
             .child(
                 v_flex()
-                    .id(IMPORT_REPORT_ID)
+                    .id(id)
                     .test_support()
                     .max_h(px(420.))
                     .overflow_y_scroll()
                     .gap_1()
-                    .child("This presentation isn't saved yet. What couldn't be carried over as it was:")
+                    .child(intro)
                     .children(report_rows(&notices, more)),
             )
             .footer(h_flex().justify_end().child(Button::new("import-report-close").label("OK").on_click(|_, window, cx| window.close_dialog(cx))))
     });
 }
 
-/// The rows of the report on an import: a heading for each slide, then its notices, and how
+/// The rows of the report on an import or an export: a heading for each slide, then its notices, and how
 /// many more there are than `notices`.
 fn report_rows(notices: &[addon_abi::Notice], more: usize) -> Vec<AnyElement> {
     let said = |id: String, words: SharedString| div().id(SharedString::from(id)).test_support().aria_label(words.clone()).child(words);

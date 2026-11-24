@@ -145,6 +145,8 @@ pub const OFFER_ADD_ONS_ID: &str = "offer-add-ons";
 pub const EXPORT_SLIDEV_ITEM_ID: &str = "export-slidev";
 /// The report on what an import couldn't carry over.
 pub const IMPORT_REPORT_ID: &str = "import-report";
+/// The report on what an export to Slidev couldn't carry over as it was.
+pub const EXPORT_REPORT_ID: &str = "export-report";
 
 const PACKED_EXTENSION: &str = "sptx";
 
@@ -295,6 +297,41 @@ fn open_talk_window_with(path: PathBuf, recovery: Option<Recovery>, app_folder: 
     })?;
     cx.activate(true);
     Ok(())
+}
+
+/// What writing a file out has to say: a few notices, for the status line, or a report on what
+/// couldn't be carried over, for a dialog of its own.
+enum Written {
+    Said(Vec<String>),
+    Report(addon_abi::Report),
+}
+
+/// The files of the talks open in the app's windows, `this` window's included: a packed talk's
+/// file, and a folder talk's Markdown.
+fn open_talk_files(this: &WorkspaceView, cx: &Context<WorkspaceView>) -> Vec<PathBuf> {
+    let file_of = |document: &Entity<Document>| match document.read(cx).place() {
+        TalkPlace::Packed(file) => Some(file.clone()),
+        TalkPlace::Folder(folder) => Some(folder.join(SLIDES_FILE)),
+        TalkPlace::Untitled(_) => None,
+    };
+    let mut files: Vec<PathBuf> = this.document.as_ref().and_then(file_of).into_iter().collect();
+    // The other windows' views: this one is being updated, so it is read as `this`.
+    for view in starting::open_views(cx).into_iter().filter(|view| view.entity_id() != cx.entity_id()) {
+        files.extend(view.read(cx).document.as_ref().and_then(file_of));
+    }
+    files
+}
+
+/// Whether `a` and `b` are the one file, a link to it included, as far as the system can tell.
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if let (Ok(a), Ok(b)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+            return a.dev() == b.dev() && a.ino() == b.ino();
+        }
+    }
+    matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
 }
 
 /// How the status line talks about a kind of writing.
@@ -1559,15 +1596,17 @@ impl WorkspaceView {
 
     /// Asks where to put what `job` will write, then runs it on a background task and says how
     /// it went. `job` is made once the place is chosen, so it has the talk as it is by then,
-    /// with typing done since settled too.
+    /// with typing done since settled too. A place that is the file of a talk open in a window,
+    /// this one's included, is refused: writing there would take the talk away.
     fn write_out<Job>(
         &mut self,
         suggest: impl FnOnce(&str) -> String,
         wording: Wording,
         job: impl FnOnce(&Document) -> Job + 'static,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) where
-        Job: FnOnce(&Path) -> Result<Vec<String>, String> + Send + 'static,
+        Job: FnOnce(&Path) -> Result<Written, String> + Send + 'static,
     {
         self.settle_typing(cx);
         let Some(document) = &self.document else {
@@ -1576,7 +1615,7 @@ impl WorkspaceView {
         let document = document.read(cx);
         let suggested = suggest(&document.name());
         let chosen = cx.prompt_for_new_path(&self.save_folder(document), Some(&suggested));
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let out = match chosen.await {
                 Ok(Ok(Some(out))) => out,
                 Ok(Err(error)) => {
@@ -1591,6 +1630,10 @@ impl WorkspaceView {
                 |name| name.to_string_lossy().into_owned(),
             );
             let job = this.update(cx, |this, cx| {
+                if open_talk_files(this, cx).iter().any(|open| same_file(open, &out)) {
+                    this.say(format!("{name} is a talk open in a window, so it wasn't written over."), cx);
+                    return None;
+                }
                 // Typing may have gone on while the dialog was up.
                 this.settle_typing(cx);
                 this.say(format!("{} {name}…", wording.doing), cx);
@@ -1602,17 +1645,30 @@ impl WorkspaceView {
                 return;
             };
             let outcome = cx.background_spawn(async move { job(&out) }).await;
-            let said = match outcome {
-                Ok(notices) if notices.is_empty() => format!("{} {name}.", wording.done),
-                Ok(notices) => format!("{} {name}. {}", wording.done, notices.join(" · ")),
-                Err(problem) => problem,
-            };
-            this.update(cx, |this, cx| this.say(said, cx)).ok();
+            this.update_in(cx, |this, window, cx| {
+                let said = match outcome {
+                    Ok(Written::Said(notices)) if notices.is_empty() => format!("{} {name}.", wording.done),
+                    Ok(Written::Said(notices)) => format!("{} {name}. {}", wording.done, notices.join(" · ")),
+                    Ok(Written::Report(report)) if report.notices.is_empty() => format!("{} {name}.", wording.done),
+                    Ok(Written::Report(report)) => {
+                        let count = report.notices.len();
+                        starting::show_report(EXPORT_REPORT_ID, "Exported to Slidev", "What couldn't be carried over as it was:", report, window, cx);
+                        if count == 1 {
+                            format!("{} {name}, with 1 note.", wording.done)
+                        } else {
+                            format!("{} {name}, with {count} notes.", wording.done)
+                        }
+                    }
+                    Err(problem) => problem,
+                };
+                this.say(said, cx);
+            })
+            .ok();
         })
         .detach();
     }
 
-    fn export(&mut self, kind: ExportKind, cx: &mut Context<Self>) {
+    fn export(&mut self, kind: ExportKind, window: &mut Window, cx: &mut Context<Self>) {
         self.write_out(
             move |name| format!("{}.{}", export::file_stem_for(name), kind.extension()),
             EXPORTING,
@@ -1620,8 +1676,9 @@ impl WorkspaceView {
                 let (input, readers) = (document.export_input(), document.readers());
                 // After a save replacing the pack that's running, and keeping one from replacing
                 // it until it's done.
-                move |out: &Path| export::run_export_reading_with(input, kind, out, |make| readers.while_reading(make))
+                move |out: &Path| export::run_export_reading_with(input, kind, out, |make| readers.while_reading(make)).map(Written::Said)
             },
+            window,
             cx,
         );
     }
@@ -1667,7 +1724,7 @@ impl WorkspaceView {
 
     /// Exports the talk to Slidev through the Slidev add-on, as a file Stagepack opens. Without
     /// the add-on, it says where to install it.
-    fn export_slidev(&mut self, cx: &mut Context<Self>) {
+    fn export_slidev(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(app_folder) = self.app_folder.clone().filter(|_| self.slidev_export_ready()) else {
             self.say(SLIDEV_NOT_INSTALLED, cx);
             return;
@@ -1684,12 +1741,14 @@ impl WorkspaceView {
                         Some(crate::addons::Installed { state: crate::addons::InstalledState::Damaged(sentence), .. }) => {
                             return Err(format!("The Slidev add-on can't be used: {sentence}"));
                         }
-                        None => return Err(SLIDEV_NOT_INSTALLED.to_string()),
+                        None => return Err(format!("{SLIDEV_NOT_INSTALLED}.")),
                     };
                     let id = uuid::Uuid::new_v4().to_string();
                     export::export_slidev_reading_with(input, &addon, out, chrono::Utc::now(), &id, |make| readers.while_reading(make))
+                        .map(Written::Report)
                 }
             },
+            window,
             cx,
         );
     }
@@ -2102,11 +2161,11 @@ impl Render for WorkspaceView {
             .on_action(
                 cx.listener(|this, _: &SetUpForCodeEditor, _, cx| this.set_up_for_code_editor(cx)),
             )
-            .on_action(cx.listener(|this, _: &ExportPowerPoint, _, cx| {
-                this.export(ExportKind::PowerPoint, cx)
+            .on_action(cx.listener(|this, _: &ExportPowerPoint, window, cx| {
+                this.export(ExportKind::PowerPoint, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ExportPdf, _, cx| this.export(ExportKind::Pdf, cx)))
-            .on_action(cx.listener(|this, _: &ExportSlidev, _, cx| this.export_slidev(cx)))
+            .on_action(cx.listener(|this, _: &ExportPdf, window, cx| this.export(ExportKind::Pdf, window, cx)))
+            .on_action(cx.listener(|this, _: &ExportSlidev, window, cx| this.export_slidev(window, cx)))
             .on_action(cx.listener(|this, _: &ShowAddOns, window, cx| this.show_add_ons(window, cx)))
             .on_action(cx.listener(|this, _: &Present, _, cx| this.present(false, cx)))
             .on_action(cx.listener(|this, _: &Rehearse, _, cx| this.present(true, cx)))

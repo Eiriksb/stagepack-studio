@@ -16,7 +16,7 @@ use stagepack_studio::permissions::BuildPermissions;
 use stagepack_studio::recovery::Recovery;
 use stagepack_studio::start_screen::{START_OPEN_FILE_ID, START_PROBLEM_ID};
 use stagepack_studio::workspace_view::{
-    self, EXPORT_SLIDEV_ITEM_ID, ExportSlidev, IMPORT_REPORT_ID, OFFER_ADD_ONS_ID, SLIDEV_NOT_INSTALLED, ShowAddOns, WorkspaceView,
+    self, EXPORT_REPORT_ID, EXPORT_SLIDEV_ITEM_ID, ExportSlidev, IMPORT_REPORT_ID, OFFER_ADD_ONS_ID, SLIDEV_NOT_INSTALLED, ShowAddOns, WorkspaceView,
 };
 use support::*;
 use typing::*;
@@ -183,10 +183,65 @@ fn slidev_export_is_disabled_until_installed(cx: &mut TestAppContext) {
     cx.simulate_new_path_selection(move |_| Some(chosen));
     settle_work(&typing, cx);
     let status = typing.status(cx).unwrap_or_default();
-    assert!(status.starts_with("Exported Rock pools (Slidev).sptx."), "{status}");
-    // The add-on's notice is among what it says.
-    assert!(status.contains("Slide 2: The gauge may not sit where it does on the slide."), "{status}");
+    assert_eq!(status, "Exported Rock pools (Slidev).sptx, with 1 note.");
+    // The add-on's notice is in the report, by its slide.
+    assert!(shows(&typing, cx, EXPORT_REPORT_ID));
+    let report = labels_within(&typing, cx, EXPORT_REPORT_ID);
+    for line in ["Slide 2", "The gauge may not sit where it does on the slide."] {
+        assert!(report.iter().any(|label| label == line), "{line:?} isn't in {report:?}");
+    }
     assert!(out.is_file());
+}
+
+/// A window on `source`, packed, with an add-on that gives back `answer` installed for it.
+fn packed_with_addon(cx: &mut TestAppContext, source: &str, answer: &addon_abi::Bundle) -> (Typing, tempfile::TempDir) {
+    test_key();
+    let root = tempfile::tempdir().unwrap();
+    let app = root.path().join("app");
+    stagepack_studio::addons::install_from_file(&app, &package_file(root.path(), &answering_guest(answer), "0.1.0")).unwrap();
+    let typing = open_packed(cx, source);
+    cx.update(|cx| typing.view.update(cx, |view, cx| view.set_app_folder_for_test(app, cx)));
+    typing.settle(cx);
+    (typing, root)
+}
+
+/// Asks for Export ▸ Slidev… and answers the Save dialog with `out`.
+fn export_slidev_to(typing: &Typing, cx: &mut TestAppContext, out: PathBuf) {
+    typing.with_window(cx, |window, cx| window.dispatch_action(Box::new(ExportSlidev), cx));
+    cx.run_until_parked();
+    assert!(cx.did_prompt_for_new_path(), "a Save dialog is showing");
+    cx.simulate_new_path_selection(move |_| Some(out));
+    settle_work(typing, cx);
+}
+
+#[gpui_kit::test]
+fn slidev_export_wont_write_over_the_open_talk(cx: &mut TestAppContext) {
+    let (typing, _root) = packed_with_addon(cx, "# Rock pools\n", &export_answer());
+    let hash = Sha256::digest(std::fs::read(&typing.file).unwrap());
+    export_slidev_to(&typing, cx, typing.file.clone());
+    assert_eq!(typing.status(cx).as_deref(), Some("talk.sptx is a talk open in a window, so it wasn't written over."));
+    assert_eq!(Sha256::digest(std::fs::read(&typing.file).unwrap()), hash, "the open talk is as it was");
+
+    // Nor over the talk open in another window.
+    let (other, _other_root) = packed_with_addon(cx, "# Another\n", &export_answer());
+    let hash = Sha256::digest(std::fs::read(&other.file).unwrap());
+    export_slidev_to(&typing, cx, other.file.clone());
+    assert!(typing.status(cx).unwrap_or_default().ends_with("is a talk open in a window, so it wasn't written over."));
+    assert_eq!(Sha256::digest(std::fs::read(&other.file).unwrap()), hash);
+}
+
+#[gpui_kit::test]
+fn an_export_with_many_notes_lists_200_and_how_many_more(cx: &mut TestAppContext) {
+    let mut answer = export_answer();
+    answer.retain(|(name, _)| name != addon_abi::REPORT);
+    answer.push(report((1..=250).map(|n| notice(Some(n), addon_abi::NoticeKind::Approximation, &format!("Note {n}."))).collect()));
+    let (typing, root) = packed_with_addon(cx, "# Rock pools\n", &answer);
+    export_slidev_to(&typing, cx, root.path().join("out.sptx"));
+    assert_eq!(typing.status(cx).as_deref(), Some("Exported out.sptx, with 250 notes."));
+    let report = labels_within(&typing, cx, EXPORT_REPORT_ID);
+    assert!(report.iter().any(|label| label == "Note 200."), "{report:?}");
+    assert!(!report.iter().any(|label| label == "Note 201."), "{report:?}");
+    assert!(report.iter().any(|label| label == "and 50 more"), "{report:?}");
 }
 
 #[gpui_kit::test]

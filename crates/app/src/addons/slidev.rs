@@ -43,6 +43,22 @@ impl Names {
 
     /// The one notice that names the files left out, if any were.
     pub(crate) fn notice(&self) -> Option<Notice> {
+        self.notice_saying(
+            "1 file was left out, as its name can't be given to the add-on",
+            "files were left out, as their names can't be given to the add-on",
+        )
+    }
+
+    /// The one notice that names the files the add-on gave back and the talk can't hold, if any.
+    pub(crate) fn given_back_notice(&self) -> Option<Notice> {
+        self.notice_saying(
+            "1 file the add-on gave back was left out, as its name can't be one of the talk's",
+            "files the add-on gave back were left out, as their names can't be the talk's",
+        )
+    }
+
+    /// The notice, saying `one` of one file and `many`, after the count, of more.
+    fn notice_saying(&self, one: &str, many: &str) -> Option<Notice> {
         let left = &self.left_out;
         if left.is_empty() {
             return None;
@@ -51,11 +67,7 @@ impl Names {
         if left.len() > LEFT_OUT_LISTED {
             names.push(format!("and {} more", left.len() - LEFT_OUT_LISTED));
         }
-        let text = if left.len() == 1 {
-            format!("1 file was left out, as its name can't be given to the add-on: {}.", names.join(", "))
-        } else {
-            format!("{} files were left out, as their names can't be given to the add-on: {}.", left.len(), names.join(", "))
-        };
+        let text = if left.len() == 1 { format!("{one}: {}.", names.join(", ")) } else { format!("{} {many}: {}.", left.len(), names.join(", ")) };
         Some(Notice { slide: None, kind: NoticeKind::LeftOut, text })
     }
 }
@@ -81,15 +93,19 @@ pub fn import_slidev(file: &Path, addon: &Addon) -> Result<(String, Vec<NewFile>
     let (out, report) = addon.run("import", &args, files).map_err(|error| error.to_string())?;
     let mut slides = None;
     let mut assets = Vec::new();
+    // Two names the same but for letter case or normalisation would be one file once the talk
+    // is saved on macOS or Windows, so the second is left out.
+    let mut given = Names::default();
     for (name, data) in out {
         if name == SLIDES {
             slides = Some(String::from_utf8(data).map_err(|_| "The add-on gave back slides that aren't text.".to_string())?);
-        } else if name.starts_with("assets/") && safe_name(&name) {
+        } else if name.starts_with("assets/") && given.take(&name) {
             assets.push((name, data));
         }
     }
     let slides = slides.ok_or("The add-on gave back no slides.")?;
     let mut all = notices;
+    all.extend(given.given_back_notice());
     all.extend(report.notices);
     Ok((slides, assets, Report { notices: all }))
 }
@@ -98,12 +114,22 @@ pub fn import_slidev(file: &Path, addon: &Addon) -> Result<(String, Vec<NewFile>
 /// what the app says itself of the files it leaves out.
 fn read_talk(file: &Path) -> Result<(Bundle, String, Vec<Notice>), String> {
     let unreadable = || "The Slidev talk can't be read: it isn't a zip file, or it's damaged.".to_string();
-    let opened = std::fs::File::open(file).map_err(|_| "The Slidev talk isn't there any more, or can't be read.".to_string())?;
-    let mut zip = zip::ZipArchive::new(opened).map_err(|_| unreadable())?;
-    // Room for the add-on's own two.
-    if zip.len() > MAX_FILES - 2 {
-        return Err(format!("The Slidev talk holds more than {} files, so it can't be imported.", MAX_FILES - 2));
+    let mut opened = std::fs::File::open(file).map_err(|_| "The Slidev talk isn't there any more, or can't be read.".to_string())?;
+    // What the zip says of its directory, before the zip reader reads all of it in.
+    let listed = listed_entries(&mut opened).ok_or_else(unreadable)?;
+    let too_many = || format!("The Slidev talk's zip lists more than {MAX_LISTED} entries, so it can't be imported.");
+    if listed.entries > MAX_LISTED {
+        return Err(too_many());
     }
+    if listed.directory_size > MAX_DIRECTORY_BYTES {
+        return Err(format!("The Slidev talk's zip says its list of entries takes more than {} MiB, so it can't be imported.", MAX_DIRECTORY_BYTES >> 20));
+    }
+    let mut zip = zip::ZipArchive::new(opened).map_err(|_| unreadable())?;
+    if zip.len() as u64 > MAX_LISTED {
+        return Err(too_many());
+    }
+    // Room for the add-on's own two, counting only what is given to it.
+    let too_many_files = || format!("The Slidev talk holds more than {} files, so it can't be imported.", MAX_FILES - 2);
     let too_large = || format!("The Slidev talk's files come to more than {} MiB, so it can't be imported.", MAX_BUNDLE_BYTES >> 20);
     let mut names = Names::default();
     let mut vendor = false;
@@ -136,6 +162,9 @@ fn read_talk(file: &Path) -> Result<(Bundle, String, Vec<Notice>), String> {
         if !names.take(&name) {
             continue;
         }
+        if files.len() >= MAX_FILES - 2 {
+            return Err(too_many_files());
+        }
         let size = found.size();
         total = total.saturating_add(size).saturating_add(8 + name.len() as u64);
         if total > MAX_BUNDLE_BYTES as u64 {
@@ -155,6 +184,56 @@ fn read_talk(file: &Path) -> Result<(Bundle, String, Vec<Notice>), String> {
     }
     notices.extend(names.notice());
     Ok((files, entry, notices))
+}
+
+/// The most entries a Slidev talk's zip may list, counting directories and Stagepack's own
+/// packages under `vendor/`, which aren't given to the add-on. Far more than a talk holds, so
+/// only a zip made to make the reader work for ever is refused.
+const MAX_LISTED: u64 = 200_000;
+/// The most a Slidev talk's zip may say its central directory takes, for [`MAX_LISTED`] entries
+/// of long names.
+const MAX_DIRECTORY_BYTES: u64 = 64 * 1024 * 1024;
+
+/// What the end of a zip says of its directory: the most entries and the largest directory any
+/// of its end records gives, the zip64 one where there is one.
+struct Listed {
+    entries: u64,
+    directory_size: u64,
+}
+
+/// What the zip in `file` says of its directory, from its end records, or `None` if it has none
+/// or names a zip64 record that isn't there.
+fn listed_entries(file: &mut std::fs::File) -> Option<Listed> {
+    use std::io::{Seek as _, SeekFrom};
+
+    let len = file.seek(SeekFrom::End(0)).ok()?;
+    let start = len.saturating_sub(addon_abi::package::END_SEARCH_BYTES as u64);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut tail = Vec::new();
+    (&mut *file).take(len - start).read_to_end(&mut tail).ok()?;
+    let records = addon_abi::package::end_records(&tail);
+    let mut listed = Listed { entries: 0, directory_size: 0 };
+    for record in &records {
+        let (entries, size) = match record.zip64_at {
+            None => (record.entries, record.directory_size),
+            Some(at) => {
+                // The zip64 end record: its signature, then the two counts at 24 and 32, and the
+                // directory's size at 40.
+                let mut zip64 = [0; 56];
+                file.seek(SeekFrom::Start(at)).ok()?;
+                file.read_exact(&mut zip64).ok()?;
+                if zip64[..4] != [0x50, 0x4b, 0x06, 0x06] {
+                    return None;
+                }
+                let field = |at: usize| u64::from_le_bytes(zip64[at..at + 8].try_into().expect("eight bytes"));
+                (field(24).max(field(32)), field(40))
+            }
+        };
+        listed.entries = listed.entries.max(entries);
+        listed.directory_size = listed.directory_size.max(size);
+    }
+    file.seek(SeekFrom::Start(0)).ok()?;
+    (!records.is_empty()).then_some(listed)
 }
 
 /// The Markdown Stagepack's manifest names as the talk's, if it names one that can be.

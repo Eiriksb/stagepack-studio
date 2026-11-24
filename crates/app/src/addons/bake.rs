@@ -11,7 +11,7 @@
 //! click makes it look as though it does. Slidev draws those again under it, which matches as
 //! long as Slidev lays them out as the app does.
 
-use addon_abi::Bundle;
+use addon_abi::{Bundle, Notice, NoticeKind};
 use serde::Serialize;
 use slides_engine::{Deck, LayerSpec, Moment, Pixmap, Rect, render_layer};
 use slides_format::{Block, Tag};
@@ -28,6 +28,11 @@ const DRAWN_BY_SLIDEV: [&str; 4] = ["Box", "Shape", "Text", "Picture"];
 const MOST_STEPS: u32 = 99;
 /// How far into a slide a part that changes on its own is looked at again, to tell that it does.
 const LATER: f32 = 0.75;
+/// The most the pictures of parts that change on clicks may come to, a picture for each click,
+/// across the talk. Past it, a part is one picture, of how it ends up.
+pub const MOST_STEPPED_BYTES: u64 = 96 * 1024 * 1024;
+/// The most pictures of parts that change on clicks, across the talk.
+pub const MOST_STEPPED_FILES: usize = 2_000;
 
 /// One part drawn, as `baked/index.json` lists it: where it is on the slide, in slide units
 /// before anything it's in is turned, the clicks it changes on, and whether it changes on its
@@ -72,7 +77,15 @@ fn baked_tags<'a>(blocks: &'a [Block], found: &mut Vec<&'a Tag>) {
 /// `baked/index.json`. A part that isn't drawn on its slide, as one in a slide that can't be
 /// read, is left out, and the add-on says so.
 pub fn bake(deck: &mut Deck) -> Bundle {
+    bake_within(deck, MOST_STEPPED_BYTES, MOST_STEPPED_FILES).0
+}
+
+/// [`bake`], with the pictures of parts that change on clicks coming to no more than
+/// `most_bytes` and `most_files`, and a notice for each part shown as one picture instead.
+pub fn bake_within(deck: &mut Deck, most_bytes: u64, most_files: usize) -> (Bundle, Vec<Notice>) {
     let mut bundle = Bundle::new();
+    let mut notices = Vec::new();
+    let (mut stepped_bytes, mut stepped_files) = (0u64, 0usize);
     let mut index = Vec::new();
     for slide in 0..deck.slide_count() {
         if deck.talk().slides[slide].error.is_some() {
@@ -120,7 +133,20 @@ pub fn bake(deck: &mut Deck) -> Bundle {
                         pictures.push((step, drawn));
                     }
                 }
-                if pictures.len() > 1 {
+                let bytes = pictures.iter().map(|(_, png)| png.len() as u64).sum::<u64>();
+                let fits = stepped_bytes + bytes <= most_bytes && stepped_files + pictures.len() <= most_files;
+                if pictures.len() > 1 && !fits {
+                    notices.push(Notice {
+                        slide: Some(slide + 1),
+                        kind: NoticeKind::Frozen,
+                        text: format!(
+                            "The {} changes on clicks, and is one picture of how it ends up, as a picture for each click would make the export too large.",
+                            slides_components::shortened(&tag.name, 40)
+                        ),
+                    });
+                } else if pictures.len() > 1 {
+                    stepped_bytes += bytes;
+                    stepped_files += pictures.len();
                     for (step, png) in pictures {
                         bundle.push((format!("baked/{}/{n}@{step}.png", slide + 1), png));
                         steps.push(step);
@@ -137,7 +163,7 @@ pub fn bake(deck: &mut Deck) -> Bundle {
         }
     }
     bundle.push((INDEX.to_string(), serde_json::to_vec(&index).expect("the list of parts drawn is always JSON")));
-    bundle
+    (bundle, notices)
 }
 
 /// The picture of the part `tag` of slide `slide`, which is drawn at `rect` on it, as a PNG
