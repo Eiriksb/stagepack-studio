@@ -132,8 +132,21 @@ const MARKDOWN_WIDTH: Pixels = px(380.);
 const MARKDOWN_MIN_WIDTH: Pixels = px(240.);
 const MARKDOWN_MAX_WIDTH: Pixels = px(800.);
 
-const SLIDEV_TALK: &str =
+pub const SLIDEV_TALK: &str =
     "This is a Slidev talk made for Stagepack, so this app can't open it yet.";
+
+/// What Export ▸ Slidev… says while the Slidev add-on isn't installed.
+pub const SLIDEV_NOT_INSTALLED: &str = "Install the Slidev add-on from File ▸ Add-ons";
+/// What the window says while a Slidev talk made for Stagepack is imported.
+pub const IMPORTING_SLIDEV: &str = "Reading the Slidev talk…";
+/// The button that opens the Add-ons dialog, beside a Slidev talk this app can't open yet.
+pub const OFFER_ADD_ONS_ID: &str = "offer-add-ons";
+/// Export ▸ Slidev….
+pub const EXPORT_SLIDEV_ITEM_ID: &str = "export-slidev";
+/// The report on what an import couldn't carry over.
+pub const IMPORT_REPORT_ID: &str = "import-report";
+/// The report on what an export to Slidev couldn't carry over as it was.
+pub const EXPORT_REPORT_ID: &str = "export-report";
 
 const PACKED_EXTENSION: &str = "sptx";
 
@@ -162,6 +175,8 @@ actions!(
         SetUpForCodeEditor,
         ExportPowerPoint,
         ExportPdf,
+        ExportSlidev,
+        ShowAddOns,
         Present,
         Rehearse,
         NewSlide,
@@ -264,11 +279,16 @@ pub fn bind_keys(cx: &mut App) {
 /// Opens the talk at `path`, a folder or a packed file, in a window of its own. Its unsaved
 /// changes are kept safe in `recovery`, if there's one.
 pub fn open_talk_window(path: PathBuf, recovery: Option<Recovery>, cx: &mut App) -> Result<()> {
+    open_talk_window_with(path, recovery, BuildPermissions::app_folder(), cx)
+}
+
+/// [`open_talk_window`], with add-ons looked for in `app_folder`.
+fn open_talk_window_with(path: PathBuf, recovery: Option<Recovery>, app_folder: Option<PathBuf>, cx: &mut App) -> Result<()> {
     let path = std::path::absolute(&path).unwrap_or(path);
     let options = WorkspaceView::window_options(cx);
     gpui_kit::open_window(options, cx, |window, cx| {
         cx.new(|cx| {
-            let mut view = WorkspaceView::open(path, window, cx);
+            let mut view = WorkspaceView::open_with_addons(path, app_folder, window, cx);
             if let Some(recovery) = recovery {
                 view.use_recovery(recovery, cx);
             }
@@ -277,6 +297,41 @@ pub fn open_talk_window(path: PathBuf, recovery: Option<Recovery>, cx: &mut App)
     })?;
     cx.activate(true);
     Ok(())
+}
+
+/// What writing a file out has to say: a few notices, for the status line, or a report on what
+/// couldn't be carried over, for a dialog of its own.
+enum Written {
+    Said(Vec<String>),
+    Report(addon_abi::Report),
+}
+
+/// The files of the talks open in the app's windows, `this` window's included: a packed talk's
+/// file, and a folder talk's Markdown.
+fn open_talk_files(this: &WorkspaceView, cx: &Context<WorkspaceView>) -> Vec<PathBuf> {
+    let file_of = |document: &Entity<Document>| match document.read(cx).place() {
+        TalkPlace::Packed(file) => Some(file.clone()),
+        TalkPlace::Folder(folder) => Some(folder.join(SLIDES_FILE)),
+        TalkPlace::Untitled(_) => None,
+    };
+    let mut files: Vec<PathBuf> = this.document.as_ref().and_then(file_of).into_iter().collect();
+    // The other windows' views: this one is being updated, so it is read as `this`.
+    for view in starting::open_views(cx).into_iter().filter(|view| view.entity_id() != cx.entity_id()) {
+        files.extend(view.read(cx).document.as_ref().and_then(file_of));
+    }
+    files
+}
+
+/// Whether `a` and `b` are the one file, a link to it included, as far as the system can tell.
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if let (Ok(a), Ok(b)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+            return a.dev() == b.dev() && a.ino() == b.ino();
+        }
+    }
+    matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
 }
 
 /// How the status line talks about a kind of writing.
@@ -358,6 +413,13 @@ pub struct WorkspaceView {
     /// it.
     recovery: Option<Recovery>,
     stagepack_offer: Option<StagepackOffer>,
+    /// Whether the window shows a Slidev talk it can't open, which the Slidev add-on would.
+    offers_add_ons: bool,
+    /// The app's data folder, where add-ons are kept, if the window has one. Only the app's
+    /// own windows look there, so a test's never touches the person's.
+    app_folder: Option<PathBuf>,
+    /// The Slidev add-on, as last looked at.
+    addon_status: crate::addons::Status,
     slide_canvas: Entity<SlideCanvas>,
     /// The slide as it's typed on, over the canvas.
     slide_editor: Entity<SlideEditor>,
@@ -492,17 +554,37 @@ impl WorkspaceView {
     /// nothing edits a packed file in place. If it can't be opened, the window says why, in the
     /// start screen's plain words.
     pub fn open(path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::open_with_addons(path, None, window, cx)
+    }
+
+    /// [`Self::open`], with add-ons looked for in `app_folder`: a Slidev talk made for Stagepack
+    /// is read through the Slidev add-on if it's installed there.
+    pub fn open_with_addons(path: PathBuf, app_folder: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         match read_talk(&path, Fonts::with_system_fallback()) {
             Ok(document) => {
                 let mut view = Self::open_with(document, window, cx);
+                view.set_app_folder(app_folder, cx);
                 view.opened_from_path = true;
                 if path.is_dir() {
                     view.follow_saves(path, cx);
                 }
                 view
             }
-            Err(OpenProblem::SlidevTalk) => Self::for_slidev_talk(path, installed_stagepack(), window, cx),
-            Err(OpenProblem::Other(_)) => Self::build(None, Some(starting::start_problem(&path).into()), window, cx),
+            Err(OpenProblem::SlidevTalk) => {
+                let mut view = Self::for_slidev_talk(path.clone(), installed_stagepack(), window, cx);
+                view.set_app_folder(app_folder, cx);
+                if view.slidev_export_ready() {
+                    view.problem = Some(IMPORTING_SLIDEV.into());
+                    view.stagepack_offer = None;
+                    view.import_slidev_talk(path, window, cx);
+                }
+                view
+            }
+            Err(OpenProblem::Other(_)) => {
+                let mut view = Self::build(None, Some(starting::start_problem(&path).into()), window, cx);
+                view.app_folder = app_folder;
+                view
+            }
         }
     }
 
@@ -544,6 +626,7 @@ impl WorkspaceView {
     ) -> Self {
         let mut view = Self::build(None, Some(SLIDEV_TALK.into()), window, cx);
         view.stagepack_offer = stagepack.map(|executable| StagepackOffer { file, executable });
+        view.offers_add_ons = true;
         view
     }
 
@@ -705,6 +788,9 @@ impl WorkspaceView {
             start_screen: None,
             recovery: None,
             stagepack_offer: None,
+            offers_add_ons: false,
+            app_folder: None,
+            addon_status: crate::addons::Status::NotInstalled,
             slide_canvas,
             slide_editor,
             notices,
@@ -906,6 +992,11 @@ impl WorkspaceView {
             return documents.clone();
         }
         document.place().directory()
+    }
+
+    /// Looks for add-ons in `app_folder`, in place of the app's data folder.
+    pub fn set_app_folder_for_test(&mut self, app_folder: PathBuf, cx: &mut Context<Self>) {
+        self.set_app_folder(Some(app_folder), cx);
     }
 
     /// Takes Stagepack to be at `stagepack`, or nowhere, in place of where it's installed.
@@ -1494,7 +1585,7 @@ impl WorkspaceView {
             this.update_in(cx, |this, window, cx| {
                 if this.shows_start_screen() {
                     this.open_here(path, window, cx);
-                } else if let Err(error) = open_talk_window(path, this.recovery.clone(), cx) {
+                } else if let Err(error) = open_talk_window_with(path, this.recovery.clone(), this.app_folder.clone(), cx) {
                     this.say(format!("Could not open a window for that talk: {error}"), cx);
                 }
             })
@@ -1505,25 +1596,26 @@ impl WorkspaceView {
 
     /// Asks where to put what `job` will write, then runs it on a background task and says how
     /// it went. `job` is made once the place is chosen, so it has the talk as it is by then,
-    /// with typing done since settled too.
+    /// with typing done since settled too. A place that is the file of a talk open in a window,
+    /// this one's included, is refused: writing there would take the talk away.
     fn write_out<Job>(
         &mut self,
-        extension: Option<&str>,
+        suggest: impl FnOnce(&str) -> String,
         wording: Wording,
         job: impl FnOnce(&Document) -> Job + 'static,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) where
-        Job: FnOnce(&Path) -> Result<Vec<String>, String> + Send + 'static,
+        Job: FnOnce(&Path) -> Result<Written, String> + Send + 'static,
     {
         self.settle_typing(cx);
         let Some(document) = &self.document else {
             return;
         };
         let document = document.read(cx);
-        let stem = export::file_stem_for(&document.name());
-        let suggested = extension.map_or_else(|| stem.clone(), |ext| format!("{stem}.{ext}"));
+        let suggested = suggest(&document.name());
         let chosen = cx.prompt_for_new_path(&self.save_folder(document), Some(&suggested));
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let out = match chosen.await {
                 Ok(Ok(Some(out))) => out,
                 Ok(Err(error)) => {
@@ -1538,6 +1630,10 @@ impl WorkspaceView {
                 |name| name.to_string_lossy().into_owned(),
             );
             let job = this.update(cx, |this, cx| {
+                if open_talk_files(this, cx).iter().any(|open| same_file(open, &out)) {
+                    this.say(format!("{name} is a talk open in a window, so it wasn't written over."), cx);
+                    return None;
+                }
                 // Typing may have gone on while the dialog was up.
                 this.settle_typing(cx);
                 this.say(format!("{} {name}…", wording.doing), cx);
@@ -1549,26 +1645,40 @@ impl WorkspaceView {
                 return;
             };
             let outcome = cx.background_spawn(async move { job(&out) }).await;
-            let said = match outcome {
-                Ok(notices) if notices.is_empty() => format!("{} {name}.", wording.done),
-                Ok(notices) => format!("{} {name}. {}", wording.done, notices.join(" · ")),
-                Err(problem) => problem,
-            };
-            this.update(cx, |this, cx| this.say(said, cx)).ok();
+            this.update_in(cx, |this, window, cx| {
+                let said = match outcome {
+                    Ok(Written::Said(notices)) if notices.is_empty() => format!("{} {name}.", wording.done),
+                    Ok(Written::Said(notices)) => format!("{} {name}. {}", wording.done, notices.join(" · ")),
+                    Ok(Written::Report(report)) if report.notices.is_empty() => format!("{} {name}.", wording.done),
+                    Ok(Written::Report(report)) => {
+                        let count = report.notices.len();
+                        starting::show_report(EXPORT_REPORT_ID, "Exported to Slidev", "What couldn't be carried over as it was:", report, window, cx);
+                        if count == 1 {
+                            format!("{} {name}, with 1 note.", wording.done)
+                        } else {
+                            format!("{} {name}, with {count} notes.", wording.done)
+                        }
+                    }
+                    Err(problem) => problem,
+                };
+                this.say(said, cx);
+            })
+            .ok();
         })
         .detach();
     }
 
-    fn export(&mut self, kind: ExportKind, cx: &mut Context<Self>) {
+    fn export(&mut self, kind: ExportKind, window: &mut Window, cx: &mut Context<Self>) {
         self.write_out(
-            Some(kind.extension()),
+            move |name| format!("{}.{}", export::file_stem_for(name), kind.extension()),
             EXPORTING,
             move |document| {
                 let (input, readers) = (document.export_input(), document.readers());
                 // After a save replacing the pack that's running, and keeping one from replacing
                 // it until it's done.
-                move |out: &Path| export::run_export_reading_with(input, kind, out, |make| readers.while_reading(make))
+                move |out: &Path| export::run_export_reading_with(input, kind, out, |make| readers.while_reading(make)).map(Written::Said)
             },
+            window,
             cx,
         );
     }
@@ -1590,6 +1700,61 @@ impl WorkspaceView {
         self.say(said, cx);
     }
 
+    /// Looks for add-ons in `app_folder` from now on, and at what's there now.
+    pub(crate) fn set_app_folder(&mut self, app_folder: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.app_folder = app_folder;
+        self.look_at_addons(cx);
+    }
+
+    /// Looks again at whether the Slidev add-on is installed, and draws what that changes.
+    fn look_at_addons(&mut self, cx: &mut Context<Self>) {
+        self.addon_status = self.app_folder.as_deref().map_or(crate::addons::Status::NotInstalled, crate::addons::status);
+        cx.notify();
+    }
+
+    /// Whether the Slidev add-on is installed, as last looked at, and so Export ▸ Slidev… is on.
+    pub fn slidev_export_ready(&self) -> bool {
+        matches!(self.addon_status, crate::addons::Status::Installed(_))
+    }
+
+    /// Opens the Add-ons dialog.
+    fn show_add_ons(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        crate::addons::dialog::open(self.app_folder.clone(), window, cx);
+    }
+
+    /// Exports the talk to Slidev through the Slidev add-on, as a file Stagepack opens. Without
+    /// the add-on, it says where to install it.
+    fn export_slidev(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(app_folder) = self.app_folder.clone().filter(|_| self.slidev_export_ready()) else {
+            self.say(SLIDEV_NOT_INSTALLED, cx);
+            return;
+        };
+        self.write_out(
+            export::slidev_file_name,
+            EXPORTING,
+            move |document| {
+                let (input, readers) = (document.export_input(), document.readers());
+                move |out: &Path| {
+                    // Loaded here, off the window's thread, and checked again as it is; and held
+                    // in use until the export is done, so that no update swaps it meanwhile.
+                    let (_in_use, loaded) = crate::addons::load_in_use(&app_folder);
+                    let addon = match loaded {
+                        Some(crate::addons::Installed { state: crate::addons::InstalledState::Ready(addon), .. }) => addon,
+                        Some(crate::addons::Installed { state: crate::addons::InstalledState::Damaged(sentence), .. }) => {
+                            return Err(format!("The Slidev add-on can't be used: {sentence}"));
+                        }
+                        None => return Err(format!("{SLIDEV_NOT_INSTALLED}.")),
+                    };
+                    let id = uuid::Uuid::new_v4().to_string();
+                    export::export_slidev_reading_with(input, &addon, out, chrono::Utc::now(), &id, |make| readers.while_reading(make))
+                        .map(Written::Report)
+                }
+            },
+            window,
+            cx,
+        );
+    }
+
     fn open_in_stagepack(&mut self, cx: &mut Context<Self>) {
         let Some(offer) = &self.stagepack_offer else {
             return;
@@ -1606,6 +1771,14 @@ fn read_talk(path: &Path, fonts: Fonts) -> Result<Document, OpenProblem> {
         Document::open(path, fonts).map_err(OpenProblem::Other)
     } else {
         Document::open_packed(path, fonts)
+    }
+}
+
+/// Has every window look again at whether the Slidev add-on is installed, as it has just been
+/// installed or taken away.
+pub fn refresh_addon_status(cx: &mut App) {
+    for view in starting::open_views(cx) {
+        view.update(cx, |view, cx| view.look_at_addons(cx));
     }
 }
 
@@ -1639,6 +1812,8 @@ fn file_menu(packed: Option<bool>, for_code_editor: bool) -> impl IntoElement {
                 .separator()
                 .menu_with_disabled("Save", Box::new(Save), no_talk)
                 .menu_with_disabled("Save As…", Box::new(SaveAs), no_talk)
+                .separator()
+                .menu("Add-ons…", Box::new(ShowAddOns))
                 .when(for_code_editor && packed == Some(false), |menu| {
                     menu.separator()
                         .menu("Set up for a code editor", Box::new(SetUpForCodeEditor))
@@ -1646,7 +1821,9 @@ fn file_menu(packed: Option<bool>, for_code_editor: bool) -> impl IntoElement {
         })
 }
 
-fn export_menu(has_talk: bool) -> impl IntoElement {
+/// The Export menu. `slidev_ready` says whether the Slidev add-on is installed, without which
+/// Export ▸ Slidev… is off, and says why.
+fn export_menu(has_talk: bool, slidev_ready: bool) -> impl IntoElement {
     Button::new(EXPORT_MENU_ID)
         .ghost()
         .small()
@@ -1654,6 +1831,21 @@ fn export_menu(has_talk: bool) -> impl IntoElement {
         .dropdown_menu(move |menu, _, _| {
             menu.menu_with_disabled("PowerPoint…", Box::new(ExportPowerPoint), !has_talk)
                 .menu_with_disabled("PDF…", Box::new(ExportPdf), !has_talk)
+                .menu_element_with_disabled(Box::new(ExportSlidev), !(has_talk && slidev_ready), move |_, _| {
+                    let words: SharedString = if slidev_ready {
+                        "Slidev…".into()
+                    } else {
+                        format!("Slidev… ({SLIDEV_NOT_INSTALLED})").into()
+                    };
+                    div()
+                        .id(EXPORT_SLIDEV_ITEM_ID)
+                        .test_support()
+                        .aria_label(words)
+                        .child("Slidev…")
+                        .when(!slidev_ready, |item| {
+                            item.tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new(SLIDEV_NOT_INSTALLED).build(window, cx))
+                        })
+                })
         })
 }
 
@@ -1815,6 +2007,7 @@ impl Render for WorkspaceView {
             .chain(self.watch_problem.as_deref())
             .collect();
         let offers_stagepack = self.stagepack_offer.is_some();
+        let offers_add_ons = self.offers_add_ons && !self.slidev_export_ready();
         let focus_handle = self.focus_handle.clone();
         let canvas = div()
             .id(CANVAS_ID)
@@ -1836,14 +2029,29 @@ impl Render for WorkspaceView {
                         .gap_3()
                         .p_4()
                         .child(problem)
-                        .when(offers_stagepack, |this| {
+                        .when(offers_stagepack || offers_add_ons, |this| {
                             this.child(
-                                Button::new(OPEN_IN_STAGEPACK_ID)
-                                    .primary()
-                                    .label("Open in Stagepack")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.open_in_stagepack(cx)
-                                    })),
+                                h_flex()
+                                    .gap_2()
+                                    .when(offers_stagepack, |this| {
+                                        this.child(
+                                            Button::new(OPEN_IN_STAGEPACK_ID)
+                                                .primary()
+                                                .label("Open in Stagepack")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.open_in_stagepack(cx)
+                                                })),
+                                        )
+                                    })
+                                    .when(offers_add_ons, |this| {
+                                        this.child(
+                                            Button::new(OFFER_ADD_ONS_ID)
+                                                .label("Add-ons…")
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.show_add_ons(window, cx)
+                                                })),
+                                        )
+                                    }),
                             )
                         }),
                 )
@@ -1955,10 +2163,12 @@ impl Render for WorkspaceView {
             .on_action(
                 cx.listener(|this, _: &SetUpForCodeEditor, _, cx| this.set_up_for_code_editor(cx)),
             )
-            .on_action(cx.listener(|this, _: &ExportPowerPoint, _, cx| {
-                this.export(ExportKind::PowerPoint, cx)
+            .on_action(cx.listener(|this, _: &ExportPowerPoint, window, cx| {
+                this.export(ExportKind::PowerPoint, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ExportPdf, _, cx| this.export(ExportKind::Pdf, cx)))
+            .on_action(cx.listener(|this, _: &ExportPdf, window, cx| this.export(ExportKind::Pdf, window, cx)))
+            .on_action(cx.listener(|this, _: &ExportSlidev, window, cx| this.export_slidev(window, cx)))
+            .on_action(cx.listener(|this, _: &ShowAddOns, window, cx| this.show_add_ons(window, cx)))
             .on_action(cx.listener(|this, _: &Present, _, cx| this.present(false, cx)))
             .on_action(cx.listener(|this, _: &Rehearse, _, cx| this.present(true, cx)))
             .size_full()
@@ -1970,7 +2180,7 @@ impl Render for WorkspaceView {
                         .gap_1()
                         .items_center()
                         .child(file_menu(packed, self.bundle.is_some() && self.talk_folder.is_some()))
-                        .child(export_menu(packed.is_some()))
+                        .child(export_menu(packed.is_some(), self.slidev_export_ready()))
                         .child(
                             div()
                                 .id(TITLE_ID)

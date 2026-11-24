@@ -59,6 +59,29 @@ fn every_dependency_has_its_notice() {
 }
 
 #[test]
+fn the_slidev_add_ons_crates_have_their_notices_under_its_heading() {
+    let metas: Vec<Vec<u8>> = PLATFORMS.iter().map(|p| notices::run_metadata(p).unwrap()).collect();
+    let addon = notices::run_metadata(notices::ADDON_PLATFORM).unwrap();
+    let graph = notices::addon_graph(&addon, &notices::run_addon_tree().unwrap()).unwrap();
+    let refs: Vec<&[u8]> = metas.iter().map(Vec::as_slice).collect();
+    let text = notices::notices_with_addon(&refs, Some(graph.clone()), &[]).unwrap();
+    let heading = text.find(&format!("\n{}\n", notices::ADDON_HEADING)).expect("the add-on has its heading");
+    let after = &text[heading..];
+    // Its own crates, those only it uses among them.
+    for name in ["slidev-addon", "addon-abi", "slides-format", "yaml-rust2", "hashlink", "serde_json"] {
+        let package = graph.iter().find(|p| p.name == name).unwrap_or_else(|| panic!("{name} isn't in the add-on's graph"));
+        assert!(after.contains(&package.label()), "{} is missing under the add-on's heading", package.label());
+    }
+    for p in &graph {
+        assert!(after.contains(&p.label()), "{} is missing under the add-on's heading", p.label());
+    }
+    // Its dev-dependencies are not built into it, nor what only the app turns on in addon-abi.
+    for name in ["slides-components", "wasmtime", "zip", "ed25519-dalek"] {
+        assert!(!graph.iter().any(|p| p.name == name), "{name} is listed as built into the add-on");
+    }
+}
+
+#[test]
 fn a_package_with_no_licence_fails() {
     let dir = std::env::temp_dir().join(format!("xtask-nolicence-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

@@ -11,14 +11,20 @@ use super::*;
 /// whatever is made or opened from it there.
 pub fn open_start_window(recovery: Option<Recovery>, cx: &mut App) -> Result<()> {
     let options = WorkspaceView::window_options(cx);
-    gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| WorkspaceView::for_start(recovery, window, cx)))?;
+    gpui_kit::open_window(options, cx, |window, cx| {
+        cx.new(|cx| {
+            let mut view = WorkspaceView::for_start(recovery, window, cx);
+            view.set_app_folder(BuildPermissions::app_folder(), cx);
+            view
+        })
+    })?;
     cx.activate(true);
     Ok(())
 }
 
 /// The views of the app's windows that can be looked at now: every one but the window being
 /// updated, if any.
-fn open_views(cx: &App) -> Vec<Entity<WorkspaceView>> {
+pub(super) fn open_views(cx: &App) -> Vec<Entity<WorkspaceView>> {
     cx.windows()
         .into_iter()
         .filter_map(|window| window.downcast::<gpui_kit::base::Root>())
@@ -75,6 +81,7 @@ struct Setup {
     documents: Option<PathBuf>,
     really_watch: bool,
     stagepack: Option<Option<PathBuf>>,
+    app_folder: Option<PathBuf>,
 }
 
 impl WorkspaceView {
@@ -142,6 +149,7 @@ impl WorkspaceView {
             documents: self.documents.clone(),
             really_watch: self.really_watch,
             stagepack: self.stagepack.clone(),
+            app_folder: self.app_folder.clone(),
         }
     }
 
@@ -157,6 +165,7 @@ impl WorkspaceView {
         self.documents = setup.documents;
         self.really_watch = setup.really_watch;
         self.stagepack = setup.stagepack;
+        self.set_app_folder(setup.app_folder, cx);
         if let Some(recovery) = setup.recovery {
             if self.working_copies.read(cx).recovery().is_none() {
                 self.use_recovery(recovery, cx);
@@ -179,6 +188,7 @@ impl WorkspaceView {
             StartEvent::OpenFolder => self.ask_to_open(true, window, cx),
             StartEvent::BringBack(id) => self.bring_back_from_start(id, window, cx),
             StartEvent::OpenInStagepack => self.open_in_stagepack(cx),
+            StartEvent::OpenAddOns => self.show_add_ons(window, cx),
         }
     }
 
@@ -205,12 +215,91 @@ impl WorkspaceView {
         match read_talk(&path, Fonts::with_system_fallback()) {
             Ok(document) => self.show(document, window, cx),
             Err(OpenProblem::SlidevTalk) => {
+                // Looked at again, as it may have been installed in another window.
+                self.look_at_addons(cx);
+                if self.slidev_export_ready() {
+                    self.say_on_start(IMPORTING_SLIDEV, false, cx);
+                    self.import_slidev_talk(path, window, cx);
+                    return;
+                }
                 let stagepack = self.stagepack.clone().unwrap_or_else(installed_stagepack);
                 self.stagepack_offer = stagepack.map(|executable| StagepackOffer { file: path, executable });
                 let offers = self.stagepack_offer.is_some();
-                self.say_on_start(SLIDEV_TALK, offers, cx);
+                if let Some(start) = self.start_screen().cloned() {
+                    start.update(cx, |start, cx| start.set_problem_offering(Some(SLIDEV_TALK.into()), offers, true, cx));
+                } else {
+                    self.say(SLIDEV_TALK, cx);
+                }
             }
             Err(OpenProblem::Other(_)) => self.say_on_start(start_problem(&path), false, cx),
+        }
+    }
+
+    /// Reads the Slidev talk made for Stagepack at `path` through the Slidev add-on, off the
+    /// window's thread, and shows what it makes in this window as a new presentation, which has
+    /// no file of its own until it's saved, with a report on what couldn't be carried over. The
+    /// file at `path` is only read.
+    pub(super) fn import_slidev_talk(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(app_folder) = self.app_folder.clone() else {
+            return;
+        };
+        let file = path.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let imported = cx
+                .background_spawn(async move {
+                    // Held in use until the import is done, so that no update swaps it meanwhile.
+                    let (_in_use, loaded) = crate::addons::load_in_use(&app_folder);
+                    match loaded {
+                        Some(crate::addons::Installed { state: crate::addons::InstalledState::Ready(addon), .. }) => {
+                            crate::addons::import_slidev(&path, &addon)
+                        }
+                        Some(crate::addons::Installed { state: crate::addons::InstalledState::Damaged(sentence), .. }) => {
+                            Err(format!("The Slidev add-on can't be used: {sentence}"))
+                        }
+                        None => Err(SLIDEV_TALK.to_string()),
+                    }
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| this.show_imported(file, imported, window, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// Shows what an import made, as a new presentation, and the report on it; or why it couldn't.
+    fn show_imported(
+        &mut self,
+        file: PathBuf,
+        imported: Result<(String, Vec<slides_engine::NewFile>, addon_abi::Report), String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.document.is_some() {
+            self.say("The talk read from Slidev wasn't shown, as another was opened here meanwhile.", cx);
+            return;
+        }
+        let made = imported.and_then(|(slides, files, report)| {
+            let files = files.into_iter().map(|(name, data)| (name, std::sync::Arc::from(data))).collect();
+            let document = Document::untitled_with(UntitledId::random(), slides, files, Vec::new(), Fonts::with_system_fallback())?;
+            Ok((document, report))
+        });
+        match made {
+            Ok((mut document, report)) => {
+                document.set_untitled_number(free_untitled_number(cx));
+                self.problem = None;
+                self.show(document, window, cx);
+                show_import_report(report, window, cx);
+            }
+            Err(problem) => {
+                if self.start_screen().is_some() {
+                    self.say_on_start(problem, false, cx);
+                } else {
+                    self.problem = Some(problem.into());
+                    // What the window offered before it tried, it offers again.
+                    let stagepack = self.stagepack.clone().unwrap_or_else(installed_stagepack);
+                    self.stagepack_offer = stagepack.map(|executable| StagepackOffer { file, executable });
+                    cx.notify();
+                }
+            }
         }
     }
 
@@ -319,6 +408,7 @@ impl WorkspaceView {
             .on_action(cx.listener(|this, _: &NewPresentation, _, cx| this.new_presentation(cx)))
             .on_action(cx.listener(|this, _: &OpenFolder, window, cx| this.ask_to_open(true, window, cx)))
             .on_action(cx.listener(|this, _: &OpenPacked, window, cx| this.ask_to_open(false, window, cx)))
+            .on_action(cx.listener(|this, _: &ShowAddOns, window, cx| this.show_add_ons(window, cx)))
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
@@ -328,7 +418,7 @@ impl WorkspaceView {
                         .gap_1()
                         .items_center()
                         .child(file_menu(None, false))
-                        .child(export_menu(false))
+                        .child(export_menu(false, self.slidev_export_ready()))
                         .child(
                             div()
                                 .id(TITLE_ID)
@@ -379,3 +469,82 @@ pub(super) fn start_problem(path: &Path) -> &'static str {
 }
 
 const NOT_A_PRESENTATION: &str = "That file isn't a presentation made with this app.";
+
+/// The most notices the report on an import or an export lists, before it says how many more there are.
+pub(super) const MOST_REPORTED: usize = 200;
+
+/// The report on what an import couldn't carry over as it was, by slide, the whole talk's first.
+fn show_import_report(report: addon_abi::Report, window: &mut Window, cx: &mut App) {
+    show_report(
+        IMPORT_REPORT_ID,
+        "Imported from Slidev",
+        "This presentation isn't saved yet. What couldn't be carried over as it was:",
+        report,
+        window,
+        cx,
+    );
+}
+
+/// The report `id`, titled `title`, on what an import or an export couldn't carry over as it
+/// was: `intro`, then by slide, the whole talk's first, [`MOST_REPORTED`] at most.
+pub(super) fn show_report(id: &'static str, title: &'static str, intro: &'static str, report: addon_abi::Report, window: &mut Window, cx: &mut App) {
+    let mut notices = report.notices;
+    notices.sort_by_key(|notice| notice.slide);
+    let more = notices.len().saturating_sub(MOST_REPORTED);
+    notices.truncate(MOST_REPORTED);
+    let notices = std::rc::Rc::new(notices);
+    window.open_dialog(cx, move |dialog, _, _| {
+        dialog
+            .title(title)
+            .child(
+                v_flex()
+                    .id(id)
+                    .test_support()
+                    .max_h(px(420.))
+                    .overflow_y_scroll()
+                    .gap_1()
+                    .child(intro)
+                    .children(report_rows(&notices, more)),
+            )
+            .footer(h_flex().justify_end().child(Button::new("import-report-close").label("OK").on_click(|_, window, cx| window.close_dialog(cx))))
+    });
+}
+
+/// The rows of the report on an import or an export: a heading for each slide, then its notices, and how
+/// many more there are than `notices`.
+fn report_rows(notices: &[addon_abi::Notice], more: usize) -> Vec<AnyElement> {
+    let said = |id: String, words: SharedString| div().id(SharedString::from(id)).test_support().aria_label(words.clone()).child(words);
+    let mut rows: Vec<AnyElement> = Vec::new();
+    if notices.is_empty() {
+        rows.push(said("import-all-carried".into(), "Everything was carried over.".into()).into_any_element());
+    }
+    let mut heading = None;
+    for (at, notice) in notices.iter().enumerate() {
+        if heading != Some(notice.slide) {
+            heading = Some(notice.slide);
+            let words: SharedString = match notice.slide {
+                Some(slide) => format!("Slide {slide}").into(),
+                None => "Whole talk".into(),
+            };
+            rows.push(div().pt_2().font_weight(FontWeight::BOLD).child(said(format!("import-slide-{at}"), words)).into_any_element());
+        }
+        let kind = match notice.kind {
+            addon_abi::NoticeKind::Placeholder => "Placeholder",
+            addon_abi::NoticeKind::Approximation => "Approximate",
+            addon_abi::NoticeKind::LeftOut => "Left out",
+            addon_abi::NoticeKind::Frozen => "Picture",
+        };
+        rows.push(
+            h_flex()
+                .gap_2()
+                .text_sm()
+                .child(div().w(px(96.)).flex_none().child(kind))
+                .child(said(format!("import-notice-{at}"), notice.text.clone().into()))
+                .into_any_element(),
+        );
+    }
+    if more > 0 {
+        rows.push(said("import-more".into(), format!("and {more} more").into()).into_any_element());
+    }
+    rows
+}

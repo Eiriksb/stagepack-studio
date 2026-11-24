@@ -93,6 +93,8 @@ pub enum StartEvent {
     BringBack(UntitledId),
     /// Open the file that couldn't be opened in Stagepack.
     OpenInStagepack,
+    /// Opens the Add-ons dialog, for a file the Slidev add-on would open.
+    OpenAddOns,
 }
 
 pub struct StartScreen {
@@ -108,6 +110,8 @@ pub struct StartScreen {
     problem: Option<SharedString>,
     /// Whether to offer opening it in Stagepack.
     offers_stagepack: bool,
+    /// Whether it offers the Add-ons dialog beside the problem.
+    offers_add_ons: bool,
     /// The read of the presentations from last time, while it runs.
     _reading: Option<Task<()>>,
     /// The list is read again as the window comes to the front, so that what's listed and when
@@ -136,6 +140,7 @@ impl StartScreen {
             unreadable: 0,
             problem: None,
             offers_stagepack: false,
+            offers_add_ons: false,
             _reading: None,
         };
         screen.refresh(cx);
@@ -157,8 +162,14 @@ impl StartScreen {
     /// Says `problem` under the buttons, or nothing, offering to open the file in Stagepack
     /// too if `offers_stagepack`.
     pub fn set_problem(&mut self, problem: Option<SharedString>, offers_stagepack: bool, cx: &mut Context<Self>) {
+        self.set_problem_offering(problem, offers_stagepack, false, cx);
+    }
+
+    /// [`Self::set_problem`], offering the Add-ons dialog too if `offers_add_ons`.
+    pub fn set_problem_offering(&mut self, problem: Option<SharedString>, offers_stagepack: bool, offers_add_ons: bool, cx: &mut Context<Self>) {
         self.problem = problem;
         self.offers_stagepack = offers_stagepack;
+        self.offers_add_ons = offers_add_ons;
         cx.notify();
     }
 
@@ -414,6 +425,14 @@ impl Render for StartScreen {
                                             .small()
                                             .label("Open in Stagepack")
                                             .on_click(cx.listener(|_, _, _, cx| cx.emit(StartEvent::OpenInStagepack))),
+                                    )
+                                })
+                                .when(self.offers_add_ons, |this| {
+                                    this.child(
+                                        Button::new(workspace_view::OFFER_ADD_ONS_ID)
+                                            .small()
+                                            .label("Add-ons…")
+                                            .on_click(cx.listener(|_, _, _, cx| cx.emit(StartEvent::OpenAddOns))),
                                     )
                                 }),
                         )

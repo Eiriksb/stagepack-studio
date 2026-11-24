@@ -1,6 +1,7 @@
 //! A talk's own components: checking their source, compiling them to WebAssembly, and
-//! running them in a sandbox.
+//! running them in a sandbox. And the add-ons the app runs in a sandbox of the same kind.
 
+pub mod addon;
 mod compile;
 mod index;
 mod sandbox;

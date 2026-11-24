@@ -27,7 +27,7 @@ if (-not $shell) { $shell = if (Get-Command pwsh -ErrorAction SilentlyContinue) 
 $steps = @(
     @{ Name = 'clippy';     Text = 'clippy on the workspace, warnings are errors (-Lax only counts them)' },
     @{ Name = 'workspace';  Text = "the workspace's tests" },
-    @{ Name = 'components'; Text = "the components' tests, with the compiler bundle" },
+    @{ Name = 'components'; Text = "the components' tests, with the compiler bundle, and the Slidev add-on built for WebAssembly" },
     @{ Name = 'release';    Text = 'the release-only timing tests' },
     @{ Name = 'packaging';  Text = 'the packaging tests (xtask)' }
 )

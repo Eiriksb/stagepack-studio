@@ -1163,6 +1163,14 @@ impl Deck {
         (&self.slides[index].laid_at(moment).specs, &mut self.fonts, &*self.files)
     }
 
+    /// A slide's specs at `moment`, as [`Self::layers_at`] draws them, with the fonts they are
+    /// drawn with: for drawing one part of the slide as it is at a click or a time. Never with a
+    /// placing.
+    pub fn specs_and_fonts_at(&mut self, index: usize, moment: Moment) -> (&[LayerSpec], &mut Fonts) {
+        let moment = self.ensure_laid_at(index, moment);
+        (&self.slides[index].laid_at(moment).specs, &mut self.fonts)
+    }
+
     /// The talk's look.
     pub fn theme(&self) -> toolkit::Theme {
         talk_theme(&self.talk)

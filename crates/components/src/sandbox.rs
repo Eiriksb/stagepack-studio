@@ -28,11 +28,11 @@ pub const MAX_PROPS: usize = 64;
 /// The longest path of an asset that can be read. Far longer than any real one.
 pub const MAX_ASSET_PATH_BYTES: usize = 256;
 
-/// How often the clock that stops a component ticks.
-const TICK: Duration = Duration::from_millis(10);
+/// How often the clocks that stop a component, or an add-on, tick.
+pub(crate) const TICK: Duration = Duration::from_millis(10);
 const MAX_ASSET_READS: u32 = 64;
 /// More than any component needs: each element takes a pointer's worth of memory.
-const MAX_TABLE_ELEMENTS: usize = 100_000;
+pub(crate) const MAX_TABLE_ELEMENTS: usize = 100_000;
 const READ_ASSET: (&str, &str) = ("toolkit", "read_asset");
 const EXPORTS: [&str; 4] = ["abi_version", "alloc", "schema", "render"];
 
@@ -273,7 +273,7 @@ impl Running {
     }
 }
 
-fn unpack(packed: u64) -> (usize, usize) {
+pub(crate) fn unpack(packed: u64) -> (usize, usize) {
     ((packed >> 32) as usize, (packed & 0xffff_ffff) as usize)
 }
 

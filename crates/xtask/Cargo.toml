@@ -15,8 +15,16 @@ name = "package"
 path = "src/main.rs"
 
 [dependencies]
+# The signed add-on package, as the app reads it.
+addon-abi = { path = "../addon-abi" }
+# Making the owner's signing key and signing the add-on with it.
+ed25519-dalek = { version = "=2.2.0", features = ["rand_core"] }
+rand_core = { version = "=0.6.4", features = ["getrandom"] }
 serde_json = { workspace = true }
+sha2 = "=0.10.9"
 tiny-skia = "=0.11.4"
+# The key file's bytes, wiped once they are read.
+zeroize = "=1.9.1"
 
 [dev-dependencies]
 slides-terminal-helper = { path = "../terminal-helper", default-features = false }

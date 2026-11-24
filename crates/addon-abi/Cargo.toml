@@ -1,0 +1,24 @@
+[package]
+name = "addon-abi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[features]
+# The signed `.spaddon` package, for the app and the packaging tool. The add-on itself builds
+# without it, so that no zip or signature code ends up in the WebAssembly module.
+default = ["package"]
+package = ["dep:ed25519-dalek", "dep:sha2", "dep:zip"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Checking a package's signature only: nothing here signs or makes a key.
+ed25519-dalek = { version = "=2.2.0", default-features = false, optional = true }
+sha2 = { version = "=0.10.9", optional = true }
+zip = { version = "=9.5.0", default-features = false, features = ["deflate"], optional = true }
+
+[dev-dependencies]
+# The tests sign their own packages, with keys they make.
+ed25519-dalek = { version = "=2.2.0" }
+zip = { version = "=9.5.0", default-features = false, features = ["deflate"] }

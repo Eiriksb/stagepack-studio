@@ -1,0 +1,21 @@
+[package]
+name = "slidev-addon"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+# A native library, for the tests, and a WebAssembly module, which is the add-on itself.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+addon-abi = { path = "../addon-abi", default-features = false }
+serde = { workspace = true }
+serde_json = { workspace = true }
+slides-format = { path = "../format" }
+# The front matter of a Slidev talk, read as YAML and never evaluated.
+yaml-rust2 = { version = "=0.13.2", default-features = false }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# The tests that run the built add-on the way the app does.
+slides-components = { path = "../components" }

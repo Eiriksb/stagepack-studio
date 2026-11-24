@@ -1,4 +1,5 @@
-//! The licence notices: every crate in the app's and the helper's dependency graph, the fonts, the Rust toolchain and OpenH264.
+//! The licence notices: every crate in the app's and the helper's dependency graph, the fonts, the Rust toolchain and OpenH264,
+//! then, under a heading of its own, every crate built into the Slidev add-on.
 
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -9,6 +10,13 @@ use std::process::Command;
 pub const ROOTS: [&str; 2] = ["stagepack-studio", "slides-terminal-helper"];
 /// The platforms shipped.
 pub const PLATFORMS: [&str; 2] = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"];
+/// The Slidev add-on, whose dependency graph is shipped inside its `.spaddon`. The package holds
+/// only its three files, so its notices are in the app's, under [`ADDON_HEADING`].
+pub const ADDON_ROOT: &str = "slidev-addon";
+/// The platform the add-on is built for.
+pub const ADDON_PLATFORM: &str = "wasm32-unknown-unknown";
+/// The heading the add-on's notices are under.
+pub const ADDON_HEADING: &str = "The Slidev add-on";
 
 /// A notice that is not a crate: a name, its licence and the licence texts.
 #[derive(Clone, Debug)]
@@ -40,6 +48,48 @@ fn parse(json: &[u8]) -> Result<Value, String> {
 
 /// Every package reached from the roots over normal dependencies only.
 pub fn graph(metadata_json: &[u8]) -> Result<Vec<Package>, String> {
+    graph_of(metadata_json, &ROOTS)
+}
+
+/// Every package built into the Slidev add-on: of those reached from [`ADDON_ROOT`] in
+/// `metadata_json`, the ones `built` names, as `name version`. `cargo metadata` gives the
+/// workspace's features all at once, so its graph holds what other members turn on in the
+/// add-on's crates too; [`run_addon_tree`] gives what the add-on alone is built with.
+pub fn addon_graph(metadata_json: &[u8], built: &BTreeSet<String>) -> Result<Vec<Package>, String> {
+    let graph = graph_of(metadata_json, &[ADDON_ROOT])?;
+    if let Some(missing) = built.iter().find(|label| !graph.iter().any(|p| p.label() == **label)) {
+        return Err(format!("{missing} is built into the add-on but isn't in its graph"));
+    }
+    Ok(graph.into_iter().filter(|p| built.contains(&p.label())).collect())
+}
+
+/// The packages the add-on alone is built with for [`ADDON_PLATFORM`], over normal
+/// dependencies, as `name version`: what `cargo tree` resolves for it, features and all.
+pub fn run_addon_tree() -> Result<BTreeSet<String>, String> {
+    let out = Command::new(tool("CARGO", "cargo"))
+        .args(["tree", "--locked", "-p", ADDON_ROOT, "--target", ADDON_PLATFORM, "-e", "normal", "--prefix", "none", "-f", "{p}"])
+        .output()
+        .map_err(|e| format!("can't run cargo tree: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("cargo tree for {ADDON_ROOT} failed: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let built: BTreeSet<String> = text
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            let (name, version) = (words.next()?, words.next()?.strip_prefix('v')?);
+            Some(format!("{name} {version}"))
+        })
+        .collect();
+    if built.is_empty() {
+        return Err(format!("cargo tree gave no packages for {ADDON_ROOT}"));
+    }
+    Ok(built)
+}
+
+/// Every package reached from `roots` over normal dependencies only.
+fn graph_of(metadata_json: &[u8], roots: &[&str]) -> Result<Vec<Package>, String> {
     let meta = parse(metadata_json)?;
     let packages = meta["packages"].as_array().ok_or("cargo metadata has no packages")?;
     let mut by_id: BTreeMap<&str, &Value> = BTreeMap::new();
@@ -64,11 +114,11 @@ pub fn graph(metadata_json: &[u8]) -> Result<Vec<Package>, String> {
     // bundle ships libserde_derive and libtoolkit_macros as .so files, so they are part of what is shipped.
     let mut todo: Vec<&str> = packages
         .iter()
-        .filter(|p| ROOTS.contains(&p["name"].as_str().unwrap_or("")))
+        .filter(|p| roots.contains(&p["name"].as_str().unwrap_or("")))
         .filter_map(|p| p["id"].as_str())
         .collect();
     if todo.is_empty() {
-        return Err(format!("none of {ROOTS:?} is in the workspace"));
+        return Err(format!("none of {roots:?} is in the workspace"));
     }
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     while let Some(id) = todo.pop() {
@@ -184,13 +234,12 @@ pub fn toolchain_copyright() -> Result<PathBuf, String> {
     }
 }
 
-/// The notices for crates in the given platforms' metadata, then `extra`.
-pub fn notices_multi(metadata: &[&[u8]], extra: &[Notice]) -> Result<String, String> {
-    // Crates with the same licence and the same texts are listed together.
+/// The packages' notices, those with the same licence and the same texts listed together.
+fn grouped(packages: impl IntoIterator<Item = Package>) -> Result<String, String> {
     let mut groups: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    for m in metadata {
-        for p in graph(m)? {
+    {
+        for p in packages {
             if !seen.insert(p.label()) {
                 continue;
             }
@@ -214,19 +263,43 @@ pub fn notices_multi(metadata: &[&[u8]], extra: &[Notice]) -> Result<String, Str
             groups.entry((expr, body)).or_default().insert(p.label());
         }
     }
-    let mut out = String::from(
-        "Stagepack Studio: licence notices\n\nThe packages below are part of this program. Each is listed with its licence and the licence files that came with it.\n",
-    );
+    let mut out = String::new();
     for ((expr, body), names) in &groups {
         out.push_str("\n================================================================\n");
         out.push_str(&format!("Packages: {}\nLicence: {expr}\n{body}", names.iter().cloned().collect::<Vec<_>>().join(", ")));
     }
+    Ok(out)
+}
+
+/// The notices for crates in the given platforms' metadata, then `extra`.
+pub fn notices_multi(metadata: &[&[u8]], extra: &[Notice]) -> Result<String, String> {
+    notices_with_addon(metadata, None, extra)
+}
+
+/// The notices for crates in the given platforms' metadata, then `extra`, then, under
+/// [`ADDON_HEADING`], `addon`, the crates built into the Slidev add-on.
+pub fn notices_with_addon(metadata: &[&[u8]], addon: Option<Vec<Package>>, extra: &[Notice]) -> Result<String, String> {
+    let mut packages = Vec::new();
+    for m in metadata {
+        packages.extend(graph(m)?);
+    }
+    let mut out = String::from(
+        "Stagepack Studio: licence notices\n\nThe packages below are part of this program. Each is listed with its licence and the licence files that came with it.\n",
+    );
+    out.push_str(&grouped(packages)?);
     for n in extra {
         out.push_str("\n================================================================\n");
         out.push_str(&format!("{}\nLicence: {}\n", n.name, n.licence));
         for t in &n.texts {
             out.push_str(&format!("\n{}\n", t.trim_end()));
         }
+    }
+    if let Some(addon) = addon {
+        out.push_str("\n################################################################\n");
+        out.push_str(&format!(
+            "{ADDON_HEADING}\n\nThe packages below are built into the Slidev add-on, the WebAssembly module in its .spaddon file, which runs inside this program.\n"
+        ));
+        out.push_str(&grouped(addon)?);
     }
     Ok(out)
 }
@@ -316,9 +389,10 @@ pub fn extra_notices(metadata_json: &[u8]) -> Result<Vec<Notice>, String> {
 /// Every notice, from this workspace as `cargo metadata` sees it for both platforms.
 pub fn notices_for_workspace() -> Result<String, String> {
     let metas: Vec<Vec<u8>> = PLATFORMS.iter().map(|p| run_metadata(p)).collect::<Result<_, _>>()?;
+    let addon = addon_graph(&run_metadata(ADDON_PLATFORM)?, &run_addon_tree()?)?;
     let extra = extra_notices(&metas[0])?;
     let refs: Vec<&[u8]> = metas.iter().map(Vec::as_slice).collect();
-    notices_multi(&refs, &extra)
+    notices_with_addon(&refs, Some(addon), &extra)
 }
 
 /// Writes the notices to `file` and the toolchain's COPYRIGHT.html to `notices/rust-COPYRIGHT.html` beside it.

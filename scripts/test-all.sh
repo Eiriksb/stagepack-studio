@@ -25,7 +25,7 @@ case "${1:-}" in
     printf '%s\t%s\n' \
       clippy "clippy on the workspace, warnings are errors (CLIPPY_LAX=1 only counts them)" \
       workspace "the workspace's tests" \
-      components "the components' tests, with the compiler bundle" \
+      components "the components' tests, with the compiler bundle, and the Slidev add-on built for WebAssembly" \
       release "the release-only timing tests" \
       packaging "the packaging tests (xtask)"
     exit 0 ;;

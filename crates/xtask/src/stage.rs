@@ -87,8 +87,7 @@ pub fn stage(out: &Path, bundle: Option<&Path>) -> Result<u64, String> {
     // Built one at a time, so that the helper's pseudo-terminal code isn't linked into the app.
     // In a target folder of their own, with the paths of the machine that builds them written
     // out of them, so that nothing of the builder's home ends up in a shipped program.
-    // On Linux cargo runs in a memory-limited scope; Windows has no such wrapper, so the cargo that ran `package` builds.
-    let cargo = if cfg!(windows) { std::env::var_os("CARGO").map_or_else(|| PathBuf::from("cargo"), PathBuf::from) } else { repo.join("scripts/cargo-safe.sh") };
+    let cargo = cargo(&repo);
     let target = package_target(&repo, std::env::var_os("STUDIO_PACKAGE_TARGET").as_deref())?;
     let flags = release_flags(&repo, cfg!(all(windows, target_env = "msvc")));
     let build = |package: &str, features: &[&str]| {
@@ -138,6 +137,12 @@ pub fn stage(out: &Path, bundle: Option<&Path>) -> Result<u64, String> {
         return Err(over_budget(bytes));
     }
     Ok(bytes)
+}
+
+/// The cargo the shipped builds are made with. On Linux cargo runs in a memory-limited scope;
+/// Windows has no such wrapper, so the cargo that ran `package` builds.
+pub fn cargo(repo: &Path) -> PathBuf {
+    if cfg!(windows) { std::env::var_os("CARGO").map_or_else(|| PathBuf::from("cargo"), PathBuf::from) } else { repo.join("scripts/cargo-safe.sh") }
 }
 
 /// The target folder the shipped builds are made in: `target/package-build`, or the folder that

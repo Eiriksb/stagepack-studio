@@ -42,6 +42,18 @@ pub fn open_with(cx: &mut TestAppContext, source: &str, recovery: Option<Recover
     open_folder(cx, folder, recovery)
 }
 
+/// Opens `source` as a packed talk, `talk.sptx`, which `file` names.
+pub fn open_packed(cx: &mut TestAppContext, source: &str) -> Typing {
+    let folder = tempfile::tempdir().unwrap();
+    let unpacked = folder.path().join("talk");
+    std::fs::create_dir(&unpacked).unwrap();
+    std::fs::write(unpacked.join("slides.md"), source).unwrap();
+    let file = folder.path().join("talk.sptx");
+    slides_engine::pack_folder(&unpacked, &file, "test").unwrap();
+    let talk = Document::open_packed(&file, Fonts::bundled_only()).unwrap();
+    open_document(cx, talk, folder, file, |_, _| {})
+}
+
 /// Opens the talk already in `folder`, with its working copies kept in `recovery`, if given.
 pub fn open_folder(cx: &mut TestAppContext, folder: tempfile::TempDir, recovery: Option<Recovery>) -> Typing {
     let file = folder.path().join("slides.md");
