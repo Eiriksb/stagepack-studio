@@ -29,6 +29,27 @@ fn section(text: &str, name: &str) -> Vec<String> {
     lines
 }
 
+/// The raw text of the `[Code]` section (Pascal, so its comments are `//`, not `;`).
+fn pascal(text: &str) -> String {
+    let start = text.find("\n[Code]\n").expect("a [Code] section") + "\n[Code]\n".len();
+    let rest = &text[start..];
+    let end = rest.find("\n[").map_or(rest.len(), |e| e + 1);
+    rest[..end].to_string()
+}
+
+/// One Pascal function or procedure, from its header to its `end;` at column 0.
+fn routine(code: &str, header: &str) -> String {
+    let at = code.find(&format!("\n{header}")).unwrap_or_else(|| panic!("[Code] lacks {header}")) + 1;
+    let end = code[at..].find("\nend;\n").unwrap_or_else(|| panic!("{header} has no end;")) + "\nend;".len();
+    code[at..at + end].to_string()
+}
+
+/// True if `body` has a line `if <condition> then` whose next line is just `call`.
+fn then_calls(body: &str, condition: &str, call: &str) -> bool {
+    let lines: Vec<&str> = body.lines().map(str::trim).collect();
+    lines.windows(2).any(|w| w[0] == format!("if {condition} then") && w[1] == call)
+}
+
 /// The script without its comments.
 fn code(text: &str) -> String {
     text.lines().filter(|l| !l.trim_start().starts_with(';')).collect::<Vec<_>>().join("\n")
@@ -42,12 +63,22 @@ fn the_installer_needs_no_administrator() {
         assert!(setup.iter().any(|l| l == line), "[Setup] lacks the line {line}");
     }
     let code = code(&text);
-    for forbidden in ["HKLM", "HKCR", "{commonpf", "{commonappdata}", "{commondesktop}", "{commonprograms}", "{sys}", "{autopf", "{pf"] {
+    // HKCR is only read, to see whether the earlier program is still there.
+    let without_hkcr_reads = code.replace("RegKeyExists(HKCR, ", "");
+    assert!(!without_hkcr_reads.contains("HKCR"), "the installer writes or reads HKCR beyond RegKeyExists");
+    for forbidden in ["HKLM", "HKEY_LOCAL_MACHINE", "HKEY_CLASSES_ROOT", "{commonpf", "{commonappdata}", "{commondesktop}", "{commonprograms}", "{sys}", "{autopf", "{pf"] {
         assert!(!code.contains(forbidden), "the installer uses {forbidden}");
     }
     // Every registry line is under HKCU\Software\Classes.
     for line in section(&text, "Registry") {
         assert!(line.starts_with("Root: HKCU; Subkey: \"Software\\Classes\\"), "a registry line outside HKCU\\Software\\Classes: {line}");
+    }
+    // Every registry call in [Code] that writes or deletes is under HKCU.
+    let pascal = pascal(&text);
+    for call in ["RegWriteStringValue(", "RegWriteExpandStringValue(", "RegDeleteValue(", "RegDeleteKeyIncludingSubkeys(", "RegQueryStringValue("] {
+        for (at, _) in pascal.match_indices(call) {
+            assert!(pascal[at + call.len()..].starts_with("HKCU, "), "{call} outside HKCU");
+        }
     }
 }
 
@@ -68,7 +99,13 @@ fn the_windows_script_never_touches_the_data() {
     }
     // Before an upgrade the old compiler bundle goes, so that a new toolchain's files don't sit beside the old ones.
     assert_eq!(section(&text, "InstallDelete"), [r#"Type: filesandordirs; Name: "{app}\bundle""#], "[InstallDelete] holds only the old bundle");
-    assert!(section(&text, "Code").is_empty(), "[Code] must stay empty unless something can't be done declaratively");
+    // [Code] deletes no files or folders, and the only key it deletes is our own saved default's.
+    let pascal = pascal(&text);
+    for call in ["DelTree", "DeleteFile", "RemoveDir", "DeleteKey("] {
+        assert!(!pascal.contains(call), "[Code] calls {call}");
+    }
+    assert_eq!(pascal.matches("RegDeleteKeyIncludingSubkeys(").count(), 1);
+    assert!(pascal.contains(r"RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Stagepack Studio');"));
     // The PowerShell script doesn't delete anything under the user's data either.
     let ps = read("scripts/package-windows.ps1");
     assert!(!ps.contains("$env:APPDATA") && !ps.contains("%APPDATA%") && !ps.contains("Remove-Item"), "package-windows.ps1 deletes or reaches the data");
@@ -176,16 +213,17 @@ fn the_installer_script_is_plain() {
     assert!(!text.contains('\t'), "tabs in the .iss");
     assert!(text.is_ascii());
     // No indented line outside the preprocessor's own `#if` blocks, and every section header stands alone at column 0.
+    // ([Code] is Pascal and is indented as Pascal is.)
     let mut seen = Vec::new();
     for (n, line) in text.lines().enumerate() {
         if line.starts_with('[') {
             assert!(line.ends_with(']') && !line.contains(' '), "line {}: {line}", n + 1);
             seen.push(line.to_string());
-        } else if !line.is_empty() && !line.starts_with(';') && !line.starts_with('#') {
+        } else if !line.is_empty() && !line.starts_with(';') && !line.starts_with('#') && seen.last().is_none_or(|s| s != "[Code]") {
             assert!(!line.starts_with(' '), "line {}: indented", n + 1);
         }
     }
-    assert_eq!(seen, ["[Setup]", "[Languages]", "[InstallDelete]", "[Files]", "[Icons]", "[Registry]", "[Run]"]);
+    assert_eq!(seen, ["[Setup]", "[Languages]", "[InstallDelete]", "[Files]", "[Icons]", "[Registry]", "[Run]", "[Code]"]);
     let setup = section(&text, "Setup");
     for line in [
         "WizardStyle=modern",
@@ -269,4 +307,79 @@ fn nested_powershell_runs_bypass_the_execution_policy() {
             assert!(line.contains("-NoProfile -ExecutionPolicy Bypass -File"), "{script}: {line}");
         }
     }
+}
+
+#[test]
+fn the_installer_adds_the_app_to_the_user_path() {
+    let text = iss();
+    assert!(section(&text, "Setup").iter().any(|l| l == "ChangesEnvironment=yes"), "[Setup] lacks ChangesEnvironment=yes");
+    assert!(!text.contains("HKLM"));
+    let code = pascal(&text);
+    let read = "RegQueryStringValue(HKCU, 'Environment', 'Path', Path)";
+    let write = "RegWriteExpandStringValue(HKCU, 'Environment', 'Path', ";
+    // The Path is read as it is (an expandable %USERPROFILE% entry stays one) and written back as REG_EXPAND_SZ.
+    let add = routine(&code, "procedure AddAppToPath();");
+    assert!(add.contains(read) && add.contains(write) && add.contains("ExpandConstant('{app}')") && add.contains("PathHasEntry(Path, App)"), "{add}");
+    // With no Path at all, it is just the app folder; the other entries come first, with no empty ones.
+    assert!(add.contains("Path := '';") && add.contains("PathWithout(Path, App)"), "{add}");
+    let remove = routine(&code, "procedure RemoveAppFromPath();");
+    assert!(remove.contains(read) && remove.contains(write) && remove.contains("PathWithout(Path, App)") && remove.contains("ExpandConstant('{app}')"), "{remove}");
+    assert!(!code.contains("RegWriteStringValue(HKCU, 'Environment'"), "Path must stay REG_EXPAND_SZ");
+    let step = routine(&code, "procedure CurStepChanged(CurStep: TSetupStep);");
+    assert!(then_calls(&step, "CurStep = ssPostInstall", "AddAppToPath();"), "{step}");
+    let unstep = routine(&code, "procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);");
+    assert!(then_calls(&unstep, "CurUninstallStep = usUninstall", "RemoveAppFromPath();"), "{unstep}");
+}
+
+#[test]
+fn an_upgrade_keeps_the_saved_default() {
+    let text = iss();
+    let code = pascal(&text);
+    let step = routine(&code, "procedure CurStepChanged(CurStep: TSetupStep);");
+    assert!(then_calls(&step, "CurStep = ssInstall", "SavePreviousDefault();"), "{step}");
+    let save = routine(&code, "procedure SavePreviousDefault();");
+    let read = save.find(r"RegQueryStringValue(HKCU, 'Software\Classes\.sptx', '', Previous)").expect("reads the current default");
+    let nonempty = save.find("(Previous <> '')").expect("only a non-empty default");
+    let not_ours = save.find("(CompareText(Previous, 'StagepackStudio.Talk') <> 0)").expect("never our own ProgID");
+    let write = save.find(r"RegWriteStringValue(HKCU, 'Software\Stagepack Studio', 'PreviousSptxDefault', Previous);").expect("saves it");
+    assert!(read < nonempty && nonempty < not_ours && not_ours < write, "{save}");
+    assert_eq!(code.matches("'PreviousSptxDefault'").count(), 2, "written once, read once");
+}
+
+#[test]
+fn the_earlier_default_comes_back_only_if_it_still_exists() {
+    let text = iss();
+    let code = pascal(&text);
+    let unstep = routine(&code, "procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);");
+    assert!(then_calls(&unstep, "CurUninstallStep = usPostUninstall", "RestorePreviousDefault();"), "{unstep}");
+    let restore = routine(&code, "procedure RestorePreviousDefault();");
+    let at = |needle: &str| restore.find(needle).unwrap_or_else(|| panic!("RestorePreviousDefault lacks {needle}:\n{restore}"));
+    let saved = at(r"RegQueryStringValue(HKCU, 'Software\Stagepack Studio', 'PreviousSptxDefault', Previous)");
+    // By usPostUninstall our own default is gone, so anything there now was set by someone else and stays.
+    let current = at(r"(not RegQueryStringValue(HKCU, 'Software\Classes\.sptx', '', Current)) or (Current = '')");
+    let exists = at(r"RegKeyExists(HKCU, 'Software\Classes\' + Previous) or RegKeyExists(HKCR, Previous)");
+    let write = at(r"RegWriteStringValue(HKCU, 'Software\Classes\.sptx', '', Previous);");
+    let forget = at(r"RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Stagepack Studio');");
+    assert!(saved < current && current < exists && exists < write && write < forget, "{restore}");
+    // The saved value goes whatever happened: the deletion is not inside the ifs.
+    assert!(restore.lines().any(|l| l == "  RegDeleteKeyIncludingSubkeys(HKCU, 'Software\\Stagepack Studio');"), "{restore}");
+}
+
+#[test]
+fn the_path_code_compares_without_case_or_trailing_slash() {
+    let text = iss();
+    let code = pascal(&text);
+    let strip = routine(&code, "function WithoutTrailingSlash(S: string): string;");
+    assert!(strip.contains("(Result[Length(Result)] = '\\')") && strip.contains("Copy(Result, 1, Length(Result) - 1)") && !strip.contains("while"), "strips exactly one: {strip}");
+    let same = "CompareText(WithoutTrailingSlash(Part), WithoutTrailingSlash(Entry))";
+    let has = routine(&code, "function PathHasEntry(Path, Entry: string): Boolean;");
+    assert!(has.contains(&format!("{same} = 0")) && has.contains("Pos(';', Rest)"), "{has}");
+    let without = routine(&code, "function PathWithout(Path, Entry: string): string;");
+    assert!(without.contains(&format!("{same} <> 0")) && without.contains("Pos(';', Rest)") && without.contains("(Part <> '')"), "{without}");
+    // Each routine is declared before it is used.
+    let order: Vec<usize> = ["function WithoutTrailingSlash", "function PathHasEntry", "function PathWithout", "procedure AddAppToPath", "procedure RemoveAppFromPath", "procedure SavePreviousDefault", "procedure RestorePreviousDefault", "procedure CurStepChanged", "procedure CurUninstallStepChanged"]
+        .iter()
+        .map(|h| code.find(h).unwrap_or_else(|| panic!("[Code] lacks {h}")))
+        .collect();
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "out of order");
 }
