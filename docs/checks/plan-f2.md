@@ -102,4 +102,17 @@ Both sentences point to *Install from file*, which works on either.
 
 ## The final review
 
-*To be written by the controller.*
+A whole-branch review of `f8b19c8..1eff7dc`, on the most capable model, found the chain sound: nothing unverified is installed or run, nothing reaches the network without a click, the notices are right (webpki-roots is CDLA-Permissive-2.0, with its text), and the guide agrees with the app. It still asked for fixes: 2 important findings and 6 minor ones.
+- **The empty repository.** The guide said to create the releases repository with no code, and GitHub can't make a release in an empty repository. It now creates it with `--add-readme`.
+- **One "latest" index.** A single index would have cut off every shipped app once an add-on for a later Slidev was published. Each line of apps now has an index file of its own, at an address that never moves, in the release tagged `index`.
+
+The fix wave was `aefd7e9`, `f10a778`, `1819f11` and `966254e`. Besides those two findings, it fixed:
+- the minor findings;
+- the items parked from the task reviews, among them the resolver `GlobalOnly`, which keeps only globally routable addresses after the name is looked up (the security review's point);
+- the kept-download, version and `is_busy` points.
+
+After the wave, the app suite gave 1542 passed and 0 failed, and clippy was clean.
+
+The re-review, on the same model, confirmed that ureq resolves only a proxy's own address, that the `index` release's redirect passes the checks, and that the guide works as written. It found one more important gap: the index file was named by Slidev's major version while the app accepts only the exact version. The controller fixed it in `60b673f`, which also added the special-purpose ranges the re-review listed (2001::/23, 5f00::/16, 192.88.99/24) to the refused list. The file is now `index-abi1-slidev53.0.0.json`. `package addon-release` wrote it again for the signed 0.1.0 package.
+
+Not checked here: anything against the real GitHub (hand checks 1 and 2), and Windows.
