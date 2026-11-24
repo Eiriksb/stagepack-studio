@@ -17,6 +17,11 @@ yuvutils-rs = "=0.8.3"
 # A 3D model's description, as the 3D spike used it, without its own file and picture reading.
 gltf = { version = "=1.4.1", default-features = false }
 
+# Our own crates keep file and line for panics and backtraces, but no full debug info: with it,
+# each test program was about 540 MB and the build folder grew past 250 GB.
+[profile.dev]
+debug = "line-tables-only"
+
 # Debug info for GPUI is what makes builds use the most memory.
 [profile.dev.package."*"]
 debug = false
