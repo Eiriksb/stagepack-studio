@@ -13,6 +13,8 @@ addon-abi = { path = "../addon-abi" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 slides-format = { path = "../format" }
+# The front matter of a Slidev talk, read as YAML and never evaluated.
+yaml-rust2 = { version = "=0.13.2", default-features = false }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # The tests that run the built add-on the way the app does.

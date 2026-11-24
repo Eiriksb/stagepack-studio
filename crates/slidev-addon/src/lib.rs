@@ -7,6 +7,9 @@
 mod escape;
 pub mod export;
 mod fonts;
+mod headmatter;
+mod html;
+pub mod import;
 mod shapes;
 #[cfg(target_arch = "wasm32")]
 mod wasm;
@@ -14,6 +17,7 @@ mod wasm;
 use addon_abi::{decode, encode, Bundle, ARGS, ERROR, OP, REPORT};
 
 pub use export::{export, is_baked, is_code_name, Baked, ExportArgs};
+pub use import::{import, ImportArgs};
 
 /// The add-on's name, which the app knows it by.
 pub const NAME: &str = "slidev";
@@ -45,7 +49,13 @@ fn answer(input: Vec<u8>) -> Result<Bundle, String> {
             out.push((REPORT.to_string(), serde_json::to_vec(&report).map_err(|error| error.to_string())?));
             Ok(out)
         }
-        b"import" => Err("This version of the add-on can't import a Slidev talk yet.".to_string()),
+        b"import" => {
+            let args: ImportArgs = serde_json::from_slice(&args).map_err(|error| format!("The import's arguments can't be read: {error}."))?;
+            let (mut out, report) = import(&args, &files)?;
+            drop(files);
+            out.push((REPORT.to_string(), serde_json::to_vec(&report).map_err(|error| error.to_string())?));
+            Ok(out)
+        }
         other => Err(format!("The add-on has no operation called {:?}.", String::from_utf8_lossy(other))),
     }
 }

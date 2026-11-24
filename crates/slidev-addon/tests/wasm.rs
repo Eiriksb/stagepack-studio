@@ -113,3 +113,34 @@ fn the_fixture_exports_well_within_the_time_limit() {
     println!("the fixture 20 times over, {} slides, took {took:?}", 20 * 10);
     assert!(took < Duration::from_secs(20), "{took:?}");
 }
+
+/// Every file of the import fixture, as the app hands them over: all but `stagepack.json`.
+fn import_fixture() -> Vec<(String, Vec<u8>)> {
+    let folder = workspace().join("fixtures/slidev-import");
+    ["slides.md", "pages/extra.md", "public/photo.png"].iter().map(|name| file(name, &std::fs::read(folder.join(name)).unwrap())).collect()
+}
+
+#[test]
+#[ignore = "builds the add-on for WebAssembly"]
+fn the_fixture_imports_through_the_addon() {
+    let addon = Addon::load(&built_addon()).expect("the add-on loads");
+    let started = Instant::now();
+    let (files, report) = addon.run("import", r#"{"entry":"slides.md"}"#, import_fixture()).expect("the import finishes");
+    let took = started.elapsed();
+    println!("the import of the fixture took {took:?}");
+    let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["slides.md", "assets/photo.png"]);
+    // As the native build imports it, to the byte.
+    let expected = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/import/the_fixture.md")).unwrap();
+    assert_eq!(String::from_utf8(files[0].1.clone()).unwrap(), expected);
+    let talk = slides_format::parse_talk(&expected);
+    assert!(talk.slides.iter().all(|slide| slide.error.is_none()));
+    assert!(report.notices.iter().any(|notice| notice.kind == NoticeKind::Placeholder && notice.slide == Some(5)), "{report:?}");
+    assert!(took < ADDON_TIME_LIMIT / 10, "{took:?} is too close to the limit of {ADDON_TIME_LIMIT:?}");
+
+    // Odd input reaches the add-on whole and comes back as a talk, never as a stopped run.
+    let odd = format!("\u{feff}---\r\nsrc: ./slides.md\r\n---\r\n```\r\n{}<!--\0", "<div v-click>".repeat(3000));
+    let (files, _) = addon.run("import", "{}", vec![file("slides.md", odd.as_bytes())]).expect("odd input imports");
+    let markdown = String::from_utf8(files[0].1.clone()).unwrap();
+    assert!(slides_format::parse_talk(&markdown).slides.iter().all(|slide| slide.error.is_none()), "{markdown}");
+}
