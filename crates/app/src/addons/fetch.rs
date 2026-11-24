@@ -19,10 +19,8 @@ use sha2::{Digest, Sha256};
 
 use super::{key, SLIDEV_VERSION};
 
-/// Where the latest release's index is.
-pub const INDEX_URL: &str = "https://github.com/Eiriksb/stagepack-studio-addons/releases/latest/download/index.json";
-/// What every package's address starts with.
-pub const PACKAGE_PREFIX: &str = "https://github.com/Eiriksb/stagepack-studio-addons/releases/download/";
+// The addresses are shared with the packaging tool, which writes the index, so they can't drift.
+pub use addon_abi::package::{INDEX_URL, PACKAGE_PREFIX};
 
 /// The most an index may be.
 pub const MAX_INDEX_BYTES: u64 = 64 * 1024;

@@ -8,7 +8,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use addon_abi::package::{package_file_name, read_package, write_package, AddonManifest, ADDON_NAME};
+use addon_abi::package::{package_file_name, read_package, release_tag, write_package, AddonManifest, Index, ADDON_NAME, INDEX_FILE, PACKAGE_PREFIX};
 use addon_abi::ABI_VERSION;
 use ed25519_dalek::{Signer, SigningKey};
 use sha2::{Digest, Sha256};
@@ -137,4 +137,52 @@ pub fn package_addon(key_file: &Path, out: &Path) -> Result<(PathBuf, String), S
 /// Whether the key in `key_file` is the one built into the app, so that the app takes its packages.
 pub fn is_built_in(key_file: &Path) -> Result<bool, String> {
     Ok(read_signing_key(key_file)?.verifying_key().to_bytes() == built_in_key()?)
+}
+
+/// Writes `index.json` in the folder of `package`, for the release that publishes it: the
+/// package is read with `public` first, so an index is only ever made for a package the app
+/// would take, and its `size`, `sha256` and `url` are the package's own. The file name must be
+/// the one `package addon` gives. Gives back the file and what it says.
+pub fn write_release_index(package: &Path, public: &[u8; 32]) -> Result<(PathBuf, Index), String> {
+    let bytes = std::fs::read(package).map_err(|e| format!("can't read {}: {e}", package.display()))?;
+    let manifest = read_package(&bytes, public).map_err(|e| format!("{} isn't a package the app takes: {e}", package.display()))?.manifest;
+    let version_ok = manifest.version.split('.').count() == 3 && manifest.version.split('.').all(|n| !n.is_empty() && n.len() <= 9 && n.bytes().all(|b| b.is_ascii_digit()));
+    if !version_ok {
+        return Err(format!("the version {} isn't three numbers.", manifest.version));
+    }
+    let name = package_file_name(&manifest);
+    if package.file_name().and_then(|n| n.to_str()) != Some(name.as_str()) {
+        return Err(format!("the package must be called {name}, and is {}.", package.display()));
+    }
+    let index = Index {
+        name: manifest.name.clone(),
+        version: manifest.version.clone(),
+        slidev: manifest.slidev.clone(),
+        abi: manifest.abi,
+        size: bytes.len() as u64,
+        sha256: Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect(),
+        url: format!("{PACKAGE_PREFIX}{}/{name}", release_tag(&manifest.version)),
+    };
+    let mut text = serde_json::to_string_pretty(&index).map_err(|e| format!("can't write the index: {e}"))?;
+    text.push('\n');
+    let file = package.with_file_name(INDEX_FILE);
+    std::fs::write(&file, text).map_err(|e| format!("can't write {}: {e}", file.display()))?;
+    Ok((file, index))
+}
+
+/// The owner's steps after `index`, for `package addon-release` to print.
+pub fn publishing_steps(package: &Path, index_file: &Path, index: &Index) -> String {
+    format!(
+        "To publish (the full steps are in docs/guide/publishing-the-addon.md):\n  gh release create {tag} {package} {index} --repo Eiriksb/stagepack-studio-addons --title \"Slidev add-on {version}\" --latest\nThe newest release must always hold {INDEX_FILE}. Never upload the signing key.",
+        tag = release_tag(&index.version),
+        package = package.display(),
+        index = index_file.display(),
+        version = index.version,
+    )
+}
+
+/// The package `package addon` writes by default: `target/package/slidev-<version>.spaddon`.
+pub fn default_package() -> Result<PathBuf, String> {
+    let repo = crate::stage::repo_root();
+    Ok(repo.join("target/package").join(format!("{ADDON_NAME}-{}.spaddon", addon_version(&repo)?)))
 }

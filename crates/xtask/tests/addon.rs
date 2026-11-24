@@ -8,8 +8,9 @@
 use std::path::Path;
 use std::process::Command;
 
-use addon_abi::package::read_package;
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use addon_abi::package::{read_package, write_package, AddonManifest, Index, INDEX_FILE, PACKAGE_PREFIX};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use sha2::{Digest, Sha256};
 
 fn public_of(key_file: &Path) -> [u8; 32] {
     let secret: [u8; 32] = std::fs::read(key_file).unwrap().try_into().unwrap();
@@ -113,4 +114,55 @@ fn package_addon_signs_what_read_package_accepts() {
     }
     // And nothing but the owner's key opens it in the app.
     assert!(read_package(&bytes, &xtask::addon::built_in_key().unwrap()).is_err());
+}
+
+/// A scratch package signed by `key`, as `package addon` would write it, without the build.
+fn scratch_package(folder: &Path, key: &SigningKey, version: &str) -> std::path::PathBuf {
+    let manifest = AddonManifest { name: "slidev".into(), version: version.into(), abi: 1, slidev: "53.0.0".into() };
+    let bytes = write_package(&manifest, b"\0asm\x01\0\0\0", |m| key.sign(m).to_bytes());
+    std::fs::create_dir_all(folder).unwrap();
+    let file = folder.join(format!("slidev-{version}.spaddon"));
+    std::fs::write(&file, bytes).unwrap();
+    file
+}
+
+#[test]
+fn the_release_index_matches_its_package() {
+    let scratch = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let public = key.verifying_key().to_bytes();
+    let package = scratch_package(&scratch.path().join("package"), &key, "1.2.3");
+    let bytes = std::fs::read(&package).unwrap();
+
+    let (file, written) = xtask::addon::write_release_index(&package, &public).unwrap();
+    assert_eq!(file, scratch.path().join("package").join(INDEX_FILE));
+
+    // The app's own type reads it, and it says what the package beside it is.
+    let index: Index = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(index, written);
+    assert_eq!((index.name.as_str(), index.version.as_str(), index.slidev.as_str(), index.abi), ("slidev", "1.2.3", "53.0.0", 1));
+    assert_eq!(index.size, bytes.len() as u64);
+    let hex: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(index.sha256, hex);
+    // The address is the one the published steps' tag makes, under the prefix the app insists on.
+    assert_eq!(index.url, format!("{PACKAGE_PREFIX}slidev-v1.2.3/slidev-1.2.3.spaddon"));
+    let steps = xtask::addon::publishing_steps(&package, &file, &index);
+    assert!(steps.contains("gh release create slidev-v1.2.3 "), "{steps}");
+    assert!(steps.contains("--repo Eiriksb/stagepack-studio-addons") && steps.contains("--latest"), "{steps}");
+    assert!(steps.contains("slidev-1.2.3.spaddon") && steps.contains("index.json"), "{steps}");
+
+    // A package the key didn't sign gets no index, and nor does one under the wrong name.
+    let other = SigningKey::from_bytes(&[8; 32]).verifying_key().to_bytes();
+    let other_dir = scratch.path().join("other");
+    std::fs::create_dir_all(&other_dir).unwrap();
+    let copy = other_dir.join("slidev-1.2.3.spaddon");
+    std::fs::copy(&package, &copy).unwrap();
+    assert!(xtask::addon::write_release_index(&copy, &other).is_err());
+    assert!(!other_dir.join(INDEX_FILE).exists());
+    let renamed = other_dir.join("slidev-9.9.9.spaddon");
+    std::fs::copy(&package, &renamed).unwrap();
+    assert!(xtask::addon::write_release_index(&renamed, &public).unwrap_err().contains("must be called"));
+    // A version that isn't three numbers gets none.
+    let odd = scratch_package(&scratch.path().join("odd"), &key, "1.2");
+    assert!(xtask::addon::write_release_index(&odd, &public).unwrap_err().contains("three numbers"));
 }

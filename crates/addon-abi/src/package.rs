@@ -51,6 +51,16 @@ pub struct AddonManifest {
 /// The file a release publishes beside its package, naming it.
 pub const INDEX_FILE: &str = "index.json";
 
+/// Where the latest release's index is.
+pub const INDEX_URL: &str = "https://github.com/Eiriksb/stagepack-studio-addons/releases/latest/download/index.json";
+/// What every package's address starts with.
+pub const PACKAGE_PREFIX: &str = "https://github.com/Eiriksb/stagepack-studio-addons/releases/download/";
+
+/// The tag of the release that publishes version `version`: `slidev-v<version>`.
+pub fn release_tag(version: &str) -> String {
+    format!("{ADDON_NAME}-v{version}")
+}
+
 /// What `index.json` says of the package a release offers. It proves nothing: the app takes it
 /// only to know what to download, and checks the download against it, and then against the
 /// package's own signed `addon.json`. The packaging tool writes it and the app reads it.
