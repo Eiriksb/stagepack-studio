@@ -14,6 +14,8 @@ try {
     if ($LASTEXITCODE -ne 0) { $status = 1 }
     & cargo test -p stagepack-studio --test ai_tool --no-fail-fast
     if ($LASTEXITCODE -ne 0) { $status = 1 }
+    & cargo test -p slides-format --test wasm_build --no-fail-fast -- --ignored
+    if ($LASTEXITCODE -ne 0) { $status = 1 }
 } finally {
     Pop-Location
 }

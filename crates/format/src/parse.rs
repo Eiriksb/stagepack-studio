@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+#[cfg(not(target_arch = "wasm32"))]
 use std::thread;
 
 use markdown::mdast::{AttributeContent, AttributeValue, Node};
@@ -25,6 +26,7 @@ const UNREADABLE: &str = "This slide could not be read";
 /// The `markdown` crate goes further down the stack for every level of a slide, however
 /// deep, and so does dropping its tree. Only what gets used of this is ever more than
 /// reserved addresses, and it's enough for the deepest slide `MAX_BODY` allows.
+#[cfg(not(target_arch = "wasm32"))]
 const PARSER_STACK: usize = 1024 * 1024 * 1024;
 
 fn options() -> ParseOptions {
@@ -72,12 +74,17 @@ pub(crate) fn read_slides(source: &str, raw_slides: &[&RawSlide]) -> Vec<Slide> 
         return Vec::new();
     }
     SLIDES_PARSED.with(|parsed| parsed.set(parsed.get() + raw_slides.len()));
+    // WebAssembly has no threads to start, and its stack is the module's own to size.
+    #[cfg(target_arch = "wasm32")]
+    return raw_slides.iter().map(|raw| read_slide(source, raw)).collect();
+    #[cfg(not(target_arch = "wasm32"))]
     let slides = thread::scope(|scope| {
         let reader = thread::Builder::new()
             .stack_size(PARSER_STACK)
             .spawn_scoped(scope, || raw_slides.iter().map(|raw| read_slide(source, raw)).collect::<Vec<_>>());
         reader.ok().and_then(|reader| reader.join().ok())
     });
+    #[cfg(not(target_arch = "wasm32"))]
     slides.unwrap_or_else(|| raw_slides.iter().map(|raw| refused_slide(raw, UNREADABLE)).collect())
 }
 

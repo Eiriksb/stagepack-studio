@@ -83,6 +83,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "addon-abi"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7149,11 +7157,13 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 name = "slides-components"
 version = "0.1.0"
 dependencies = [
+ "addon-abi",
  "libc",
  "proc-macro2",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "slides-components",
  "tempfile",
  "thiserror 2.0.21",
  "toolkit",
