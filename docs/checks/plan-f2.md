@@ -6,9 +6,9 @@ The run was on the `plan-f` branch, on a Linux laptop, on 2026-11-24. The branch
 
 The app can get the add-on itself, from the releases of `Eiriksb/stagepack-studio-addons`, only when the owner clicks. Installing still goes through the F1 path: the signature is checked, then the same atomic install.
 
-- **The fetch module** (task 1, `5ededc2`, `22a083a`). `fetch::check` reads `index.json` and `fetch::download` reads the package, over https only (ureq with rustls and the bundled web roots).
+- **The fetch module** (task 1, `5ededc2`, `22a083a`). `fetch::check` reads the index of the app's own line and `fetch::download` reads the package, over https only (ureq with rustls and the bundled web roots).
   - Caps: the index at most 64 KiB, the package at most 48 MiB, both counted while reading. Connecting has 10 s, the index 20 s in total, the package 180 s.
-  - Redirects are followed by hand, at most 5, to `https://` addresses that aren't local or private.
+  - Redirects are followed by hand, at most 5, to `https://` addresses that aren't local or private. Every name is checked again once it is resolved: only globally routable addresses are connected to (final fix wave).
   - Each request sends only `User-Agent` and `Accept`: no cookies, no query string.
   - The index must name `slidev`, three numbers, ABI 1 and a `url` under `PACKAGE_PREFIX`; `size` and `sha256` must match the download; and after the signature check, the signed manifest must agree with the index.
   - Every refusal is one sentence that echoes nothing the server wrote.
@@ -16,8 +16,10 @@ The app can get the add-on itself, from the releases of `Eiriksb/stagepack-studi
   - A download runs on its own thread. Nothing is requested at start-up, on a timer or on opening a talk; a test pins that.
   - An update is offered only for a strictly newer version, and an install that would go back is refused even if the check lost a race.
   - Update says the add-on is in use while an export or import runs, and keeps the download for the next try.
-  - A failed or cancelled download leaves nothing but a temporary file, which is removed.
-- **The release files** (task 3). `package addon-release [--package FILE]` writes `target/package/index.json` beside the signed package: its `size`, `sha256` and `url` (`PACKAGE_PREFIX` + `slidev-vX.Y.Z/slidev-X.Y.Z.spaddon`) come from the package itself, and it reads the package with the app's built-in key first, so a package the app would refuse gets no index. It is written with the same `addon_abi::package::Index` type the app reads. The two addresses now live in `addon-abi` (`INDEX_URL`, `PACKAGE_PREFIX`) and `fetch.rs` re-exports them. It then prints the `gh release create` command. The steps are in `docs/guide/publishing-the-addon.md`.
+  - A failed or cancelled download writes nothing; it is held in memory and dropped.
+  - A damaged install, as an app update to another Slidev leaves one, offers *Get again*, which replaces it (final fix wave).
+- **The release files** (task 3, `1eff7dc`; reworked in the final fix wave). `package addon-release [--package FILE]` writes `target/package/index-abi<abi>-slidev<major>.json` beside the signed package: its `size`, `sha256` and `url` (`PACKAGE_PREFIX` + `slidev-vX.Y.Z/slidev-X.Y.Z.spaddon`) come from the package itself, and it reads the package with the app's built-in key first, so a package the app would refuse gets no index. It is written with the same `addon_abi::package::Index` type the app reads. It then prints the commands to publish. The steps are in `docs/guide/publishing-the-addon.md`.
+- **An index for each line of apps** (final fix wave). Each package has a release of its own, `slidev-vX.Y.Z`. One release, tagged `index`, holds an index file for each line of add-on interface and Slidev major version. The app asks only for its own line's, at an address that never moves: `INDEX_URL` = `PACKAGE_PREFIX` + `index/index-abi1-slidev53.json`, built from `addon_abi::ABI_VERSION` and the app's `SLIDEV_VERSION` by `addon_abi::package::index_url`, which the packaging tool's file name shares. So an app that has shipped keeps finding the last add-on made for it after the owner publishes one for a later Slidev or interface. Nothing reads GitHub's *latest* release any more, so `--latest` is gone. The index is a release file like the package, `releases/download/<tag>/<file>`, so it takes the same redirect to GitHub's storage, and passes the same checks.
 
 ## Tests on Linux
 
@@ -31,16 +33,25 @@ All through `scripts/cargo-safe.sh`. Counts are from each report's own command o
 | `test -p stagepack-studio --test addon_fetch` (task 3, after the constants moved) | 13 passed |
 | `test -p addon-abi` (task 3) | 24 passed (10 bundle, 14 package) |
 | `clippy -p xtask -p addon-abi -p stagepack-studio --all-targets -- -D warnings` (task 3) | clean |
+| `test -p xtask --test xtask` (task 1) | 25 passed as task 1's report gives it, among them `every_dependency_has_its_notice`, the check that NOTICES covers the new crates |
 
-Tasks 1 and 2 each went through one fix round and a re-review that approved it. The re-reviews left minor points for a final fix wave, not yet made:
-- The redirect check refuses only literal local and private addresses; ranges such as 100.64/10, NAT64 and 6to4 pass, and a name that resolves to a private address isn't caught. Only the fixed GitHub addresses are fetched and the result must pass the signature, so the exposure is small.
-- A busy Get keeps a download it never reuses, and a later check can leave a stale one in memory (up to 48 MiB) until the dialog closes.
-- A version that isn't three numbers blocks updates (the packaging tool now refuses to make one).
-- `is_busy` can create a `.lock` behind a linked `addons` folder.
+Tasks 1 and 2 each went through one fix round and a re-review that approved it. The re-reviews' minor points, and the final review's, were all made in the final fix wave; its runs are below.
+
+### The final fix wave
+
+| Command | Result |
+|---|---|
+| `test -p addon-abi` | 26 passed (10 bundle, 16 package) |
+| `test -p xtask --test addon --test xtask` | addon: 4 passed, 1 ignored (the add-on build, run by name); xtask: 9 passed, among them `every_dependency_has_its_notice` |
+| `test -p stagepack-studio --test addon_fetch --test addons --test ui_addons` | 13, 31 and 19 passed |
+| `test -p stagepack-studio --lib addons::fetch` | 7 passed (the resolver's allow-list, with a stub resolver) |
+| `test -p stagepack-studio` (first run) | stopped at `ai_tool`: `a_picture_of_a_model_ends_cleanly_and_soon` took 68.5 s against its 20 s, under the load of the run; alone it passed in 1.0 s |
+| `test -p stagepack-studio --no-fail-fast` | 1542 passed, 0 failed, 42 ignored |
+| `clippy --workspace --all-targets -- -D warnings` | clean |
 
 ## What was run on the real file
 
-`package addon-release` was run on `target/package/slidev-0.1.0.spaddon`, signed with the owner's key earlier. No key was read; the index is made from the package alone. It wrote:
+`package addon-release` was run on `target/package/slidev-0.1.0.spaddon`, signed with the owner's key earlier. No key was read; the index is made from the package alone. In the final fix wave it wrote `target/package/index-abi1-slidev53.json`:
 
 ```json
 {
@@ -54,13 +65,26 @@ Tasks 1 and 2 each went through one fix round and a re-review that approved it. 
 }
 ```
 
+and printed:
+
+```
+To publish (the full steps are in docs/guide/publishing-the-addon.md):
+Once only, before the first release (skip it if the release index is there already):
+  gh release create index --repo Eiriksb/stagepack-studio-addons --title "Add-on index" --notes "The index files the app reads, one for each line of apps. Never delete them."
+The package, in a release of its own:
+  gh release create slidev-v0.1.0 target/package/slidev-0.1.0.spaddon --repo Eiriksb/stagepack-studio-addons --title "Slidev add-on 0.1.0" --notes "Slidev add-on 0.1.0"
+Then its index, in place of the earlier one, once the package is up:
+  gh release upload index target/package/index-abi1-slidev53.json --clobber --repo Eiriksb/stagepack-studio-addons
+Never upload the signing key.
+```
+
 Nothing was published, and no repository or release was created.
 
 ## Hand checks for the owner
 
 Do each on **Linux and Windows**.
 
-1. **Publish 0.1.0** by `docs/guide/publishing-the-addon.md`: create the public repository once, build the package with your key, run `package addon-release`, run the `gh release create` command it prints, and check the release page holds the `.spaddon` and `index.json`, and is marked latest.
+1. **Publish 0.1.0** by `docs/guide/publishing-the-addon.md`: create the public repository once, with a README (`gh repo create … --public --add-readme`), and the release tagged `index`; build the package with your key; run `package addon-release`; run the two commands it prints for the release, the package's and then the index's. Check that the release `slidev-v0.1.0` holds the `.spaddon` alone, and the release `index` holds `index-abi1-slidev53.json`.
 2. **Get.** On a clean user account (no add-on installed), *File ▸ Add-ons… ▸ Get*. Progress shows, then "Installed, version 0.1.0", and an export works.
 3. **Check for updates.** It says this is the newest version.
 4. **With the network off,** *Get* or *Check for updates* shows "Couldn't reach the add-on's download page. Check the internet connection, or install it from a file." and changes nothing.
@@ -68,6 +92,13 @@ Do each on **Linux and Windows**.
 6. **An update.** Publish a newer version (say 0.1.1) the same way; *Check for updates* offers it, *Update* installs it, and an export that was running at the time makes it say the add-on is in use.
 7. **Nothing at start-up.** Watch the network (a firewall log will do) while starting the app and opening a talk: no connection to GitHub until you click.
 8. On Windows, the same steps, and that *Install from file* waits during an export (F1's lock, now shared with Update).
+9. **A damaged install.** Change a byte of `addons/slidev/addon.wasm`: the dialog says it is damaged and offers *Get again*, which installs the published version in its place.
+
+Two limits to know before trying these on a corporate network, both by plan:
+- **Only the environment's proxy is used.** The app reads `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY`. A Windows machine whose proxy is set only in the system settings (WinINET or a PAC file) gets "Couldn't reach the add-on's download page…".
+- **Only the bundled web roots are trusted.** A network that intercepts TLS with its own certificate authority gets "The add-on's download page couldn't be reached securely…", since the system's certificate store isn't read.
+
+Both sentences point to *Install from file*, which works on either.
 
 ## The final review
 
