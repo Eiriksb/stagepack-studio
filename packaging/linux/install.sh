@@ -218,7 +218,7 @@ if ! "$NEW/stagepack-studio" help >/dev/null 2>"$NEW/.start-check"; then
         _d=$(dirname "$APP")
         while rmdir "$_d" 2>/dev/null && [ "$_d" != "$MADE_TOP" ]; do _d=$(dirname "$_d"); done
     fi
-    refuse "The program can't start on this system (${_why:-it gave no reason}). It needs glibc 2.39 or later, libxkbcommon, libxkbcommon-x11, libxcb and libstdc++; an earlier install, if there was one, is still in place."
+    refuse "The program can't start on this system (${_why:-it gave no reason}). It needs glibc 2.35 or later (Ubuntu 22.04, Debian 12 or newer), libxkbcommon, libxkbcommon-x11, libxcb and libstdc++; an earlier install, if there was one, is still in place."
 fi
 rm -f "$NEW/.start-check"
 if [ -d "$APP" ]; then

@@ -40,7 +40,7 @@ The first `run` opens the start screen; the second opens a talk straight away.
 
 Two packages are made, one per system. Both install for the current user only: no administrator rights, no password, no internet. The program holds everything it needs, including the compiler for a talk's own components and the helper for live terminals (which stays off until a talk asks for a command and you say yes). It's about 560 MB installed. Neither package has been signed, and there is no automatic update; to upgrade, install the newer package over the old one. A talk's data folder (permissions, saved-but-unsaved work) is never touched by installing, upgrading or uninstalling.
 
-**Linux** (x86_64): unpack `stagepack-studio-<version>-linux-x86_64.tar.zst` and run its `install.sh`. It needs glibc 2.39 or later (Ubuntu 24.04, Debian 13, Fedora 40 or newer) and the libraries `libxkbcommon`, `libxkbcommon-x11`, `libxcb` and `libstdc++`, which a desktop system nearly always has; `install.sh` checks that the program starts and, if it can't, says why and changes nothing.
+**Linux** (x86_64): unpack `stagepack-studio-<version>-linux-x86_64.tar.zst` and run its `install.sh`. It runs on Ubuntu 22.04, Debian 12 or newer (it needs glibc 2.35 or later) and needs the libraries `libxkbcommon`, `libxkbcommon-x11`, `libxcb` and `libstdc++`, and for its window a Vulkan driver (`libvulkan`) and, on Wayland, `libwayland-client` (on Debian and Ubuntu: `libxkbcommon0 libxkbcommon-x11-0 libxcb1 libstdc++6 libvulkan1 libwayland-client0`), which a desktop system nearly always has; `install.sh` checks that the program starts and, if it can't, says why and changes nothing.
 
 ```bash
 tar --use-compress-program=zstd -xf stagepack-studio-0.1.0-linux-x86_64.tar.zst
@@ -56,14 +56,13 @@ The program goes to `~/.local/lib/stagepack-studio`, a link to it in `~/.local/b
 
 Run the tests first with `scripts/test-all.sh` (or `scripts\test-all.ps1` on Windows; `--quick` / `-Quick` skips the slow steps). Each package is built on its own system, since nothing for Windows can be built on Linux.
 
-Linux, with Rust and `zstd`:
+Linux, with Docker, Rust and `binutils`:
 
 ```bash
-scripts/make-bundle.sh target/bundle                 # the compiler bundle, once
-scripts/cargo-safe.sh run --release -p xtask --bin package -- linux --bundle target/bundle
+scripts/package-linux.sh                # add --bundle-fresh to make the compiler bundle again
 ```
 
-This makes `target/package/stagepack-studio-<version>-linux-x86_64.tar.zst`. The folder it packs is made by `package stage` from release builds, and fails if it is over 600 MB.
+This builds the release, the compiler bundle and the package in an Ubuntu 22.04 container (the image `stagepack-studio-build:22.04`, with cargo's downloads kept in the volume `stagepack-studio-cargo`), so that the package needs no glibc newer than 2.35. It makes `target/package/stagepack-studio-<version>-linux-x86_64.tar.zst`, then checks every program and library in it with `package glibc-check` and fails if one needs more. The folder it packs is made by `package stage` from release builds, and fails if it is over 600 MB. A package built straight on the host (`package linux --bundle target/bundle`) needs the host's glibc, so it is for trying things out only.
 
 Windows, in PowerShell, with Rust (the `x86_64-pc-windows-msvc` and `wasm32-unknown-unknown` targets) and [Inno Setup](https://jrsoftware.org/isdl.php) 6.3 or newer:
 

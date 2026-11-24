@@ -650,7 +650,7 @@ fn a_program_that_cant_start_here_is_not_installed() {
     let text = said(&out);
     assert_ne!(out.status.code(), Some(0), "{text}");
     assert_eq!(text.lines().filter(|l| l.starts_with("install.sh:")).count(), 1, "one sentence expected: {text}");
-    assert!(text.contains("GLIBC_2.39' not found") && text.contains("glibc 2.39") && text.contains("Nothing was changed."), "{text}");
+    assert!(text.contains("GLIBC_2.39' not found") && text.contains("glibc 2.35") && text.contains("Nothing was changed."), "{text}");
     assert_eq!(snapshot(&s.home), before);
 
     // An upgrade: refused, and the earlier install is exactly as it was.

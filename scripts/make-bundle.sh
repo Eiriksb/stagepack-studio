@@ -23,8 +23,12 @@ cp "$sysroot/lib/rustlib/$wasm/lib/"*.rlib "$sysroot/lib/rustlib/$wasm/lib/"*.rm
 
 cd "$repo"
 # A target folder of its own and made afresh, so that only one variant of each library
-# is copied.
-build=target/bundle-build
+# is copied. STUDIO_BUNDLE_BUILD (inside target/) picks another, as the container build does.
+build=${STUDIO_BUNDLE_BUILD:-target/bundle-build}
+case "$build" in
+  target/?*) case "$build" in *..*) echo "make-bundle: STUDIO_BUNDLE_BUILD must be a folder inside target/" >&2; exit 1 ;; esac ;;
+  *) echo "make-bundle: STUDIO_BUNDLE_BUILD must be a folder inside target/" >&2; exit 1 ;;
+esac
 rm -rf "$build"
 # The libraries' panic messages name their source files, and they end up in every build.
 cargo_home=${CARGO_HOME:-$HOME/.cargo}

@@ -1,5 +1,6 @@
 //! Stages the installed folder from release builds and runs it with nothing else around.
-//! Run explicitly: `scripts/cargo-safe.sh test -p xtask --test stage -- --ignored`.
+//! Run explicitly: `scripts/cargo-safe.sh test -p xtask --test stage -- --ignored`, or with
+//! `STUDIO_STAGED=target/package-stage-22.04` to check the container-built folder instead.
 
 use slides_terminal_helper::wire::{self, FromHelper, StartSpec, ToHelper};
 use std::path::Path;
@@ -39,6 +40,20 @@ fn the_windows_programs_carry_their_c_runtime() {
         assert!(flags.iter().any(|f| f.starts_with("--remap-path-prefix=") && f.ends_with("=/studio")), "{flags:?}");
     }
     assert_eq!(windows.len(), linux.len() + 1);
+}
+
+#[test]
+fn the_build_folder_can_be_moved_but_stays_in_target() {
+    use std::ffi::OsStr;
+    use xtask::stage::package_target;
+    let repo = repo_root();
+    assert_eq!(package_target(&repo, None).unwrap(), repo.join("target/package-build"));
+    assert_eq!(package_target(&repo, Some(OsStr::new("target/package-build-22.04"))).unwrap(), repo.join("target/package-build-22.04"));
+    assert_eq!(package_target(&repo, Some(repo.join("target/x").as_os_str())).unwrap(), repo.join("target/x"));
+    for outside in ["/tmp/elsewhere", "target/../crates", "target", "", "crates/target"] {
+        let message = package_target(&repo, Some(OsStr::new(outside))).unwrap_err();
+        assert!(message.contains("STUDIO_PACKAGE_TARGET"), "{outside}: {message}");
+    }
 }
 
 #[test]
@@ -84,10 +99,23 @@ fn bare(program: &Path, home: &Path) -> Command {
 fn the_staged_app_needs_nothing_else() {
     let repo = repo_root();
     let scratch = tempfile::tempdir().unwrap();
-    let out = scratch.path().join("app");
-    let bundle = repo.join("target/bundle");
-    assert!(bundle.join("bin").is_dir(), "make target/bundle first (scripts/make-bundle.sh target/bundle)");
-    let bytes = xtask::stage::stage(&out, Some(&bundle)).unwrap();
+    // STUDIO_STAGED names a folder staged already (the container build's, target/package-stage-22.04),
+    // which is checked as it is instead of staging one here.
+    let (out, bytes) = match std::env::var_os("STUDIO_STAGED") {
+        Some(staged) => {
+            let out = repo.join(staged);
+            assert!(out.join("stagepack-studio").is_file(), "{} isn't a staged app folder", out.display());
+            let bytes = folder_bytes(&out).unwrap();
+            (out, bytes)
+        }
+        None => {
+            let out = scratch.path().join("app");
+            let bundle = repo.join("target/bundle");
+            assert!(bundle.join("bin").is_dir(), "make target/bundle first (scripts/make-bundle.sh target/bundle)");
+            let bytes = xtask::stage::stage(&out, Some(&bundle)).unwrap();
+            (out, bytes)
+        }
+    };
     let mb = bytes.div_ceil(1024 * 1024);
     eprintln!("the staged app folder is {mb} MB");
     assert!(mb <= BUDGET_MB, "{}", over_budget(bytes));

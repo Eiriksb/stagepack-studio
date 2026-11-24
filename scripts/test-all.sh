@@ -97,9 +97,16 @@ step_packaging() {
     return
   fi
   local status=0
+  # Every xtask test that isn't ignored, the glibc reader (--test elf) among them.
   $CARGO test -p xtask --no-fail-fast || status=1
   if [ "$quick" -eq 0 ]; then
     $CARGO test -p xtask --test stage --test linux --no-fail-fast -- --ignored || status=1
+    # The package from scripts/package-linux.sh, installed and run on Ubuntu 22.04 and Debian 12.
+    if command -v docker >/dev/null 2>&1; then
+      $CARGO test -p xtask --test old_systems --no-fail-fast -- --ignored || status=1
+    else
+      echo "docker isn't installed, so the old-systems test (Ubuntu 22.04, Debian 12) is skipped"
+    fi
   fi
   return $status
 }

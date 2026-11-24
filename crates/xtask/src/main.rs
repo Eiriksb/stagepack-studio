@@ -4,7 +4,9 @@
 //!   package notices OUT_FILE   gathers every licence notice (and writes notices/rust-COPYRIGHT.html beside it)
 //!   package linux [--staged DIR] [--bundle DIR]   packs the Linux .tar.zst into target/package (stages first unless DIR is given)
 //!   package windows-folder OUT_DIR [--bundle DIR]   the same as stage, on Windows (refuses elsewhere)
-//!   package stage OUT_DIR [--bundle DIR]   stages the installed app folder from shipped release builds (keep OUT_DIR inside target/)
+//!   package stage OUT_DIR [--bundle DIR]   stages the installed app folder from shipped release builds (keep OUT_DIR inside target/;
+//!                                          STUDIO_PACKAGE_TARGET picks the build folder, inside target/, default target/package-build)
+//!   package glibc-check DIR    prints the glibc each ELF file under DIR needs, and fails if one is above 2.35
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -61,8 +63,37 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("{} is {} MB.", tarball.display(), bytes.div_ceil(1024 * 1024));
             Ok(())
         }
-        Some(other) => Err(format!("unknown subcommand '{other}' (known: icon, notices, stage, windows-folder, linux)")),
-        None => Err("usage: package <icon OUT_DIR | notices OUT_FILE | stage OUT_DIR [--bundle DIR] | windows-folder OUT_DIR [--bundle DIR] | linux [--staged DIR] [--bundle DIR]>".into()),
+        Some("glibc-check") => {
+            let dir = PathBuf::from(args.get(1).filter(|_| args.len() == 2).ok_or("usage: package glibc-check DIR")?);
+            glibc_check(&dir)
+        }
+        Some(other) => Err(format!("unknown subcommand '{other}' (known: icon, notices, stage, windows-folder, linux, glibc-check)")),
+        None => Err("usage: package <icon OUT_DIR | notices OUT_FILE | stage OUT_DIR [--bundle DIR] | windows-folder OUT_DIR [--bundle DIR] | linux [--staged DIR] [--bundle DIR] | glibc-check DIR>".into()),
+    }
+}
+
+/// One line per ELF file under `dir`, `<need> <path relative to dir>`, then the highest; an error names each file above the ceiling.
+fn glibc_check(dir: &std::path::Path) -> Result<(), String> {
+    use xtask::elf::{GLIBC_CEILING, elf_files, max_glibc, version_text};
+    let files = elf_files(dir);
+    if files.is_empty() {
+        return Err(format!("no ELF files under {}", dir.display()));
+    }
+    let (mut highest, mut over) = (None, Vec::new());
+    for file in &files {
+        let need = max_glibc(file)?;
+        let relative = file.strip_prefix(dir).unwrap_or(file).display().to_string();
+        println!("{} {relative}", need.map_or("none".to_string(), version_text));
+        if need > Some(GLIBC_CEILING) {
+            over.push(relative);
+        }
+        highest = highest.max(need);
+    }
+    println!("highest: {}", highest.map_or("none".to_string(), version_text));
+    if over.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("above glibc {}: {}", version_text(GLIBC_CEILING), over.join(", ")))
     }
 }
 
