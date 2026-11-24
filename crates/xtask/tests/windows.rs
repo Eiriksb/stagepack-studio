@@ -336,13 +336,23 @@ fn an_upgrade_keeps_the_saved_default() {
     let text = iss();
     let code = pascal(&text);
     let step = routine(&code, "procedure CurStepChanged(CurStep: TSetupStep);");
-    assert!(then_calls(&step, "CurStep = ssInstall", "SavePreviousDefault();"), "{step}");
+    // The default is only read at ssInstall, into a global, and written at ssPostInstall,
+    // so a cancelled or failed install leaves no HKCU\Software\Stagepack Studio key.
+    let global = code.find("\nvar\n  PreviousDefault: string;\n").expect("a global PreviousDefault");
+    assert!(global < code.find("\nfunction ").unwrap(), "the global comes before the routines");
+    assert!(then_calls(&step, "CurStep = ssInstall", "ReadPreviousDefault();"), "{step}");
+    assert!(then_calls(&step, "CurStep = ssPostInstall", "SavePreviousDefault();"), "{step}");
+    let save_at = step.find("SavePreviousDefault();").unwrap();
+    assert!(save_at < step.find("AddAppToPath();").unwrap(), "{step}");
+    let read = routine(&code, "procedure ReadPreviousDefault();");
+    assert!(read.contains(r"RegQueryStringValue(HKCU, 'Software\Classes\.sptx', '', PreviousDefault)"), "reads the current default: {read}");
+    assert!(!read.contains("RegWrite"), "ReadPreviousDefault writes nothing: {read}");
     let save = routine(&code, "procedure SavePreviousDefault();");
-    let read = save.find(r"RegQueryStringValue(HKCU, 'Software\Classes\.sptx', '', Previous)").expect("reads the current default");
-    let nonempty = save.find("(Previous <> '')").expect("only a non-empty default");
-    let not_ours = save.find("(CompareText(Previous, 'StagepackStudio.Talk') <> 0)").expect("never our own ProgID");
-    let write = save.find(r"RegWriteStringValue(HKCU, 'Software\Stagepack Studio', 'PreviousSptxDefault', Previous);").expect("saves it");
-    assert!(read < nonempty && nonempty < not_ours && not_ours < write, "{save}");
+    assert!(!save.contains("RegQuery"), "SavePreviousDefault reads nothing itself: {save}");
+    let nonempty = save.find("(PreviousDefault <> '')").expect("only a non-empty default");
+    let not_ours = save.find("(CompareText(PreviousDefault, 'StagepackStudio.Talk') <> 0)").expect("never our own ProgID");
+    let write = save.find(r"RegWriteStringValue(HKCU, 'Software\Stagepack Studio', 'PreviousSptxDefault', PreviousDefault);").expect("saves it");
+    assert!(nonempty < not_ours && not_ours < write, "{save}");
     assert_eq!(code.matches("'PreviousSptxDefault'").count(), 2, "written once, read once");
 }
 
@@ -377,7 +387,7 @@ fn the_path_code_compares_without_case_or_trailing_slash() {
     let without = routine(&code, "function PathWithout(Path, Entry: string): string;");
     assert!(without.contains(&format!("{same} <> 0")) && without.contains("Pos(';', Rest)") && without.contains("(Part <> '')"), "{without}");
     // Each routine is declared before it is used.
-    let order: Vec<usize> = ["function WithoutTrailingSlash", "function PathHasEntry", "function PathWithout", "procedure AddAppToPath", "procedure RemoveAppFromPath", "procedure SavePreviousDefault", "procedure RestorePreviousDefault", "procedure CurStepChanged", "procedure CurUninstallStepChanged"]
+    let order: Vec<usize> = ["function WithoutTrailingSlash", "function PathHasEntry", "function PathWithout", "procedure AddAppToPath", "procedure RemoveAppFromPath", "procedure ReadPreviousDefault", "procedure SavePreviousDefault", "procedure RestorePreviousDefault", "procedure CurStepChanged", "procedure CurUninstallStepChanged"]
         .iter()
         .map(|h| code.find(h).unwrap_or_else(|| panic!("[Code] lacks {h}")))
         .collect();

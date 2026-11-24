@@ -22,7 +22,7 @@ The run was on the `plan-e2` branch (from `plan-e`'s merge), on a 16-core Linux 
 - **The Windows installer adds the app to `Path` and gives the earlier default back** (`464b9fc`, wording fixed in `2161a37`).
   - `packaging/windows/stagepack-studio.iss` has `ChangesEnvironment=yes` and a `[Code]` section.
   - `Path`: `{app}` is added once to the user `Path` (compared without case and without one trailing `\`), written back as `REG_EXPAND_SZ`. A user with no `Path` gets just the folder, with no leading `;`. Uninstalling takes off only that entry; if nothing else is left, the value goes.
-  - Earlier default: at install, the `.sptx` default's ProgID is saved in `HKCU\Software\Stagepack Studio` (`PreviousSptxDefault`; never our own `StagepackStudio.Talk`, so a reinstall keeps the earlier one). After uninstalling, if `.sptx` has no default and that ProgID still exists under `HKCU\Software\Classes` or `HKCR`, it becomes the default again. The key is then deleted either way.
+  - Earlier default: at install, the `.sptx` default's ProgID is saved in `HKCU\Software\Stagepack Studio` (`PreviousSptxDefault`; never our own `StagepackStudio.Talk`, so a reinstall keeps the earlier one). It is read before the files go in and written only once they are in, so a cancelled or failed install leaves no such key. After uninstalling, if `.sptx` has no default and that ProgID still exists under `HKCU\Software\Classes` or `HKCR`, it becomes the default again. The key is then deleted either way.
   - Everything is `HKCU`; `HKCR` is only read.
 - README (*Install*, Windows), the console twin's comment and `plan-e.md` carry the new facts. In `plan-e.md` the three answered questions point here, and the size question is marked accepted.
 

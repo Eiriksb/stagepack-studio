@@ -81,6 +81,10 @@ Filename: "{app}\stagepack-studio.exe"; Description: "{cm:LaunchProgram,Stagepac
 [Code]
 // Kept short and plain: Windows can't be run where this is written, so each step is checked by hand (docs/checks/plan-e.md).
 
+// The .sptx default as it was before this install, read at ssInstall and saved at ssPostInstall.
+var
+  PreviousDefault: string;
+
 // S without one trailing backslash, so that C:\A and C:\A\ are the same Path entry.
 function WithoutTrailingSlash(S: string): string;
 begin
@@ -165,15 +169,21 @@ begin
   end;
 end;
 
-// Before [Registry] makes Stagepack Studio the .sptx default, keeps the program that was the default.
+// Before [Registry] makes Stagepack Studio the .sptx default, reads the program that was the default.
+// Nothing is written yet, so a cancelled or failed install leaves no key behind.
+procedure ReadPreviousDefault();
+begin
+  PreviousDefault := '';
+  if not RegQueryStringValue(HKCU, 'Software\Classes\.sptx', '', PreviousDefault) then
+    PreviousDefault := '';
+end;
+
+// Once the install has gone in, keeps the program read at ssInstall.
 // Our own ProgID is never kept, so a reinstall or an upgrade leaves the earlier one saved.
 procedure SavePreviousDefault();
-var
-  Previous: string;
 begin
-  Previous := '';
-  if RegQueryStringValue(HKCU, 'Software\Classes\.sptx', '', Previous) and (Previous <> '') and (CompareText(Previous, 'StagepackStudio.Talk') <> 0) then
-    RegWriteStringValue(HKCU, 'Software\Stagepack Studio', 'PreviousSptxDefault', Previous);
+  if (PreviousDefault <> '') and (CompareText(PreviousDefault, 'StagepackStudio.Talk') <> 0) then
+    RegWriteStringValue(HKCU, 'Software\Stagepack Studio', 'PreviousSptxDefault', PreviousDefault);
 end;
 
 // After uninstalling (our own default is gone by now), makes the saved program the default again, if .sptx has
@@ -195,10 +205,13 @@ begin
   RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Stagepack Studio');
 end;
 
-// Installing: the earlier default is saved before the files and [Registry] go in; the Path changes after.
+// Installing: the earlier default is read before the files and [Registry] go in; it is saved, and the Path
+// changes, once they are in.
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssInstall then
+    ReadPreviousDefault();
+  if CurStep = ssPostInstall then
     SavePreviousDefault();
   if CurStep = ssPostInstall then
     AddAppToPath();
