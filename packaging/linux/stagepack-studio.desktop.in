@@ -8,4 +8,4 @@ Icon=stagepack-studio
 Terminal=false
 X-Stagepack-Studio=1
 Categories=Office;Presentation;
-MimeType=application/vnd.stagepack.talk;
+MimeType=application/vnd.stagepack.talk;application/x-stagepack;

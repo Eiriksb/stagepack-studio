@@ -6,6 +6,9 @@
 NL='
 '
 TYPE=application/vnd.stagepack.talk
+# The types a .sptx can be taken for: ours, and the one Stagepack (the neighbour app) registers for the
+# same files. Our entry opens both and becomes the default for both.
+TYPES="$TYPE application/x-stagepack"
 ENTRY=stagepack-studio.desktop
 MARK=X-Stagepack-Studio=1
 

@@ -123,7 +123,7 @@ old_value() {
 $OLD_MANIFEST
 LIST
 }
-# The default for our type in a mimeapps.list's [Default Applications], other programs only.
+# The default for a type ($2) in a mimeapps.list's [Default Applications], other programs only.
 default_in() {
     [ -f "$1" ] || return 0
     _sec=
@@ -131,7 +131,7 @@ default_in() {
     while IFS= read -r _l || [ -n "$_l" ]; do
         case $_l in
             "["*"]"*) _sec=$_l ;;
-            "$TYPE="*) [ "$_sec" = "[Default Applications]" ] && { _v=${_l#*=}; break; } ;;
+            "$2="*) [ "$_sec" = "[Default Applications]" ] && { _v=${_l#*=}; break; } ;;
         esac
     done <"$1"
     _out=
@@ -145,15 +145,23 @@ default_in() {
     set +f
     printf '%s' "$_out"
 }
-PREV_CONFIG=$(old_value prev_config)
-PREV_APPS=$(old_value prev_apps)
-[ -n "$PREV_CONFIG" ] || PREV_CONFIG=$(default_in "$CONFIG/mimeapps.list")
-[ -n "$PREV_APPS" ] || PREV_APPS=$(default_in "$APPS/mimeapps.list")
+# For each type and each list, the default this install replaces: kept from the first install on an
+# upgrade, so that uninstall gives back what was there before Stagepack Studio came.
+PREVS=
+for _t in $TYPES; do
+    for _list in config apps; do
+        _v=$(old_value "prev_$_list:$_t")
+        if [ -z "$_v" ]; then
+            if [ $_list = config ]; then _v=$(default_in "$CONFIG/mimeapps.list" "$_t"); else _v=$(default_in "$APPS/mimeapps.list" "$_t"); fi
+        fi
+        PREVS="$PREVS${NL}prev_$_list:$_t=$_v"
+    done
+done
 NEW_CONFIG=$(old_value new_config)
 NEW_APPS=$(old_value new_apps)
 [ -e "$CONFIG/mimeapps.list" ] || NEW_CONFIG=1
 [ -e "$APPS/mimeapps.list" ] || NEW_APPS=1
-MANIFEST="DATA=$DATA${NL}CONFIG=$CONFIG${NL}BIN=$BIN${NL}prev_config=$PREV_CONFIG${NL}prev_apps=$PREV_APPS${NL}new_config=$NEW_CONFIG${NL}new_apps=$NEW_APPS"
+MANIFEST="DATA=$DATA${NL}CONFIG=$CONFIG${NL}BIN=$BIN$PREVS${NL}new_config=$NEW_CONFIG${NL}new_apps=$NEW_APPS"
 
 # ---- Put the program in place: copy beside it, then swap, so a failure leaves the old one ----
 NEW="$APP.new-$$"
@@ -233,7 +241,8 @@ if command -v gtk-update-icon-cache >/dev/null 2>&1 && [ -f "$DATA/icons/hicolor
     gtk-update-icon-cache -f -t "$DATA/icons/hicolor" >/dev/null 2>&1 || true
 fi
 if command -v xdg-mime >/dev/null 2>&1; then
-    xdg-mime default stagepack-studio.desktop application/vnd.stagepack.talk || say "Note: couldn't set Stagepack Studio as the program for .sptx files; use Open with on a .sptx file."
+    # shellcheck disable=SC2086 # the types are split on purpose
+    xdg-mime default stagepack-studio.desktop $TYPES || say "Note: couldn't set Stagepack Studio as the program for .sptx files; use Open with on a .sptx file."
 else
     say "Note: xdg-mime isn't installed, so use Open with to choose Stagepack Studio for .sptx files."
 fi

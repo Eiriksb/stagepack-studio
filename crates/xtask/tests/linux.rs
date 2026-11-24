@@ -164,7 +164,7 @@ fn install_in(s: Scratch, spaced: bool) {
     let exec = app.join("stagepack-studio");
     let expected = if spaced { format!("Exec=\"{}\" %f\n", exec.display()) } else { format!("Exec={} %f\n", exec.display()) };
     assert!(entry.contains(&expected), "{entry}");
-    for line in ["MimeType=application/vnd.stagepack.talk;", "Icon=stagepack-studio", "Categories=Office;Presentation;", "Terminal=false"] {
+    for line in ["MimeType=application/vnd.stagepack.talk;application/x-stagepack;", "Icon=stagepack-studio", "Categories=Office;Presentation;", "Terminal=false"] {
         assert!(entry.lines().any(|l| l == line), "{line} is missing from\n{entry}");
     }
     let valid = Command::new("desktop-file-validate").arg(&desktop).output().unwrap();
@@ -350,34 +350,100 @@ fn upgrade_and_uninstall_keep_the_data() {
     assert_eq!(kept(snapshot(&s.home)), kept(before_all), "left behind, changed or missing");
 }
 
+/// Stagepack, the neighbour app, as it really registers itself: its own type, a subclass of zip, with a
+/// glob of weight 90, and a menu entry for that type.
+const THEIR_TYPE: &str = "application/x-stagepack";
+const THEIR_MIME: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-stagepack">
+    <comment>Stagepack presentation</comment>
+    <sub-class-of type="application/zip"/>
+    <glob pattern="*.sptx" weight="90"/>
+  </mime-type>
+</mime-info>
+"#;
+
 #[test]
 fn stagepack_stays_under_open_with() {
     let s = Scratch::new("openwith-");
-    let theirs = "[Desktop Entry]\nType=Application\nName=Stagepack\nExec=stagepack %f\nMimeType=application/vnd.stagepack.talk;\n";
+    let theirs = "[Desktop Entry]\nType=Application\nName=Stagepack\nExec=stagepack %f\nMimeType=application/x-stagepack;\n";
     std::fs::create_dir_all(s.data.join("applications")).unwrap();
     std::fs::write(s.data.join("applications/stagepack.desktop"), theirs).unwrap();
+    std::fs::create_dir_all(s.data.join("mime/packages")).unwrap();
+    std::fs::write(s.data.join("mime/packages/stagepack.xml"), THEIR_MIME).unwrap();
+    let mime_db = s.command("update-mime-database").arg(s.data.join("mime")).output().unwrap();
+    assert!(mime_db.status.success(), "{}", said(&mime_db));
     std::fs::create_dir_all(&s.config).unwrap();
-    let original_list = format!("[Added Associations]\n{TYPE}=stagepack.desktop;\n\n[Default Applications]\n{TYPE}=stagepack.desktop;\n");
+    let original_list = format!("[Added Associations]\n{THEIR_TYPE}=stagepack.desktop;\n\n[Default Applications]\n{THEIR_TYPE}=stagepack.desktop;\n");
     std::fs::write(s.config.join("mimeapps.list"), &original_list).unwrap();
     let their_files = snapshot(&s.data.join("applications")).into_iter().filter(|(k, _)| k.starts_with("stagepack.desktop")).collect::<Vec<_>>();
+    let talk = s.root.join("talk.sptx");
+    std::fs::write(&talk, b"PK\x03\x04 not really a zip").unwrap();
+    let talk = talk.to_str().unwrap();
+    // Before: a .sptx is Stagepack's type and opens in Stagepack.
+    assert_eq!(s.xdg_mime(&["query", "filetype", talk]), THEIR_TYPE);
+    assert_eq!(s.xdg_mime(&["query", "default", THEIR_TYPE]), "stagepack.desktop");
 
     let out = s.install(package());
     assert_eq!(out.status.code(), Some(0), "{}", said(&out));
-    assert_eq!(s.xdg_mime(&["query", "default", TYPE]), "stagepack-studio.desktop");
+    // Whatever type the file is taken to be, its default is now ours.
+    let found = s.xdg_mime(&["query", "filetype", talk]);
+    assert!(found == THEIR_TYPE || found == TYPE, "{found}");
+    eprintln!("with Stagepack installed too, a .sptx is taken for {found}");
+    assert_eq!(s.xdg_mime(&["query", "default", &found]), "stagepack-studio.desktop", "a .sptx of type {found}");
+    for t in [TYPE, THEIR_TYPE] {
+        assert_eq!(s.xdg_mime(&["query", "default", t]), "stagepack-studio.desktop", "{t}");
+    }
     assert_eq!(std::fs::read_to_string(s.data.join("applications/stagepack.desktop")).unwrap(), theirs, "theirs was changed");
+    assert_eq!(std::fs::read_to_string(s.data.join("mime/packages/stagepack.xml")).unwrap(), THEIR_MIME, "their type was changed");
     let cache = std::fs::read_to_string(s.data.join("applications/mimeinfo.cache")).unwrap();
-    let line = cache.lines().find(|l| l.starts_with(TYPE)).expect("the type is in the cache");
+    let line = cache.lines().find(|l| l.starts_with(&format!("{THEIR_TYPE}="))).expect("their type is in the cache");
     assert!(line.contains("stagepack.desktop") && line.contains("stagepack-studio.desktop"), "both programs should offer the type: {line}");
 
     let out = s.uninstall();
     assert_eq!(out.status.code(), Some(0), "{}", said(&out));
     assert_eq!(std::fs::read_to_string(s.data.join("applications/stagepack.desktop")).unwrap(), theirs, "theirs was changed by uninstalling");
+    assert_eq!(std::fs::read_to_string(s.data.join("mime/packages/stagepack.xml")).unwrap(), THEIR_MIME, "their type was changed by uninstalling");
     let after = snapshot(&s.data.join("applications")).into_iter().filter(|(k, _)| k.starts_with("stagepack.desktop")).collect::<Vec<_>>();
     assert_eq!(after, their_files);
     let list = std::fs::read_to_string(s.config.join("mimeapps.list")).unwrap();
     assert_eq!(list, original_list, "Stagepack's own default should be back, byte for byte");
-    assert_eq!(s.xdg_mime(&["query", "default", TYPE]), "stagepack.desktop");
+    assert_eq!(s.xdg_mime(&["query", "filetype", talk]), THEIR_TYPE);
+    assert_eq!(s.xdg_mime(&["query", "default", THEIR_TYPE]), "stagepack.desktop");
     assert!(!s.data.join("applications/stagepack-studio.desktop").exists());
+}
+
+/// Each type's default, in each list, is recorded and given back on its own.
+#[test]
+fn each_types_default_comes_back_on_its_own() {
+    let s = Scratch::new("two-types-");
+    std::fs::create_dir_all(s.data.join("applications")).unwrap();
+    for (name, t) in [("viewer.desktop", TYPE), ("stagepack.desktop", THEIR_TYPE)] {
+        std::fs::write(s.data.join("applications").join(name), format!("[Desktop Entry]\nType=Application\nName={name}\nExec=x %f\nMimeType={t};\n")).unwrap();
+    }
+    std::fs::create_dir_all(&s.config).unwrap();
+    let config_list = format!("[Default Applications]\n{TYPE}=viewer.desktop;\n{THEIR_TYPE}=stagepack.desktop;\n");
+    let apps_list = format!("[Default Applications]\n{THEIR_TYPE}=viewer.desktop;\n");
+    std::fs::write(s.config.join("mimeapps.list"), &config_list).unwrap();
+    std::fs::write(s.data.join("applications/mimeapps.list"), &apps_list).unwrap();
+
+    let out = s.install(package());
+    assert_eq!(out.status.code(), Some(0), "{}", said(&out));
+    let manifest = std::fs::read_to_string(s.app().join("install-manifest.txt")).unwrap();
+    for line in [format!("prev_config:{TYPE}=viewer.desktop;"), format!("prev_config:{THEIR_TYPE}=stagepack.desktop;"), format!("prev_apps:{THEIR_TYPE}=viewer.desktop;")] {
+        assert!(manifest.lines().any(|l| l == line), "{line} isn't in\n{manifest}");
+    }
+    // Hand-made: the apps list now names us for both types, as an older xdg-mime would have written it.
+    std::fs::write(s.data.join("applications/mimeapps.list"), format!("[Default Applications]\n{THEIR_TYPE}=stagepack-studio.desktop;viewer.desktop;\n{TYPE}=stagepack-studio.desktop;\n")).unwrap();
+    // An upgrade keeps what the first install recorded.
+    let out = s.install(package());
+    assert_eq!(out.status.code(), Some(0), "{}", said(&out));
+    assert_eq!(std::fs::read_to_string(s.app().join("install-manifest.txt")).unwrap(), manifest);
+
+    let out = s.uninstall();
+    assert_eq!(out.status.code(), Some(0), "{}", said(&out));
+    assert_eq!(std::fs::read_to_string(s.config.join("mimeapps.list")).unwrap(), config_list);
+    assert_eq!(std::fs::read_to_string(s.data.join("applications/mimeapps.list")).unwrap(), format!("[Default Applications]\n{THEIR_TYPE}=viewer.desktop;\n"));
 }
 
 #[test]

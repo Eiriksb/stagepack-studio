@@ -17,8 +17,6 @@ OWN=$(cd "$(dirname "$0")" && pwd -P)
 
 # The manifest only holds the settings install used and the default it replaced; they are read as
 # text (never run), and checked by the same rules as at install.
-PREV_CONFIG=
-PREV_APPS=
 NEW_CONFIG=
 NEW_APPS=
 while IFS= read -r _l || [ -n "$_l" ]; do
@@ -26,8 +24,6 @@ while IFS= read -r _l || [ -n "$_l" ]; do
         DATA=*) XDG_DATA_HOME=${_l#*=} ;;
         CONFIG=*) XDG_CONFIG_HOME=${_l#*=} ;;
         BIN=*) XDG_BIN_HOME=${_l#*=} ;;
-        prev_config=*) PREV_CONFIG=${_l#*=} ;;
-        prev_apps=*) PREV_APPS=${_l#*=} ;;
         new_config=*) NEW_CONFIG=${_l#*=} ;;
         new_apps=*) NEW_APPS=${_l#*=} ;;
     esac
@@ -48,11 +44,25 @@ entry_exists() {
     return 1
 }
 
-# Our entry comes out of a mimeapps.list. In the default list the program it replaced goes back
-# if that program is still installed. The file goes only if we made it and nothing else is in it.
+# The default install recorded for one list ($1: config or apps) and one type ($2), read from the manifest.
+prev_of() {
+    while IFS= read -r _pl || [ -n "$_pl" ]; do
+        case $_pl in "prev_$1:$2="*) printf '%s' "${_pl#*=}"; return 0 ;; esac
+    done <"$OWN/install-manifest.txt"
+}
+
+# Which of our types a mimeapps.list line is for (empty if none).
+type_of() {
+    for _ty in $TYPES; do
+        case $1 in "$_ty="*) printf '%s' "$_ty"; return 0 ;; esac
+    done
+}
+
+# Our entry comes out of a mimeapps.list. In the default list the program it replaced for that type
+# goes back if that program is still installed. The file goes only if we made it and nothing else is in it.
 fix_list() {
     _file=$1
-    _prev=$2
+    _list=$2
     _made=$3
     [ -f "$_file" ] || return 0
     _tmp="$_file.stagepack-$$"
@@ -64,7 +74,13 @@ fix_list() {
                 _sec=$_line
                 printf '%s\n' "$_line"
                 ;;
-            "$TYPE="*)
+            *=*)
+                _ty=$(type_of "$_line")
+                if [ -z "$_ty" ]; then
+                    printf '%s\n' "$_line"
+                    continue
+                fi
+                _prev=$(prev_of "$_list" "$_ty")
                 _rest=
                 _hit=0
                 _old_ifs=$IFS
@@ -80,9 +96,13 @@ fix_list() {
                             if entry_exists "$_v"; then _back="$_back$_v;"; fi
                         done
                     fi
+                    # What was put back first, then the rest, each once.
+                    _all=$_back
+                    for _v in $_rest; do
+                        case ";$_back" in *";$_v;"*) ;; *) _all="$_all$_v;" ;; esac
+                    done
                     IFS=$_old_ifs
-                    _all="$_back$_rest"
-                    [ -z "$_all" ] || printf '%s=%s\n' "$TYPE" "$_all"
+                    [ -z "$_all" ] || printf '%s=%s\n' "$_ty" "$_all"
                 else
                     IFS=$_old_ifs
                     printf '%s\n' "$_line"
@@ -127,8 +147,8 @@ main() {
         remove_icon "$DATA/icons/hicolor/${_n}x${_n}/mimetypes/application-vnd.stagepack.talk.png" "$_n"
     done
     set -f
-    fix_list "$CONFIG/mimeapps.list" "$PREV_CONFIG" "$NEW_CONFIG"
-    fix_list "$APPS/mimeapps.list" "$PREV_APPS" "$NEW_APPS"
+    fix_list "$CONFIG/mimeapps.list" config "$NEW_CONFIG"
+    fix_list "$APPS/mimeapps.list" apps "$NEW_APPS"
     set +f
 
     # The shared databases are rebuilt without us.
