@@ -265,6 +265,12 @@ fn an_endless_package_is_cut_at_48_mib() {
     assert!(refused.contains("48 MiB"), "{refused}");
     assert!(started.elapsed() < Duration::from_secs(60));
 
+    // With a smaller size in its index, it is cut just past that size.
+    index.size = 1000;
+    let refused = fetch::download(&source, &index, &no_cancel(), &|done, _| assert!(done <= 1000, "{done}")).unwrap_err();
+    one_sentence(&refused);
+    assert!(refused.contains("1000 bytes"), "{refused}");
+
     // An index that says the package is larger is refused before anything is fetched.
     let hits = server.hits.load(Ordering::SeqCst);
     index.size = 48 * 1024 * 1024 + 1;
@@ -286,6 +292,12 @@ fn a_url_outside_the_prefix_is_refused_before_connecting() {
         server.url("/other/slidev-0.2.0.spaddon"),
         server.url("/download/../other/slidev-0.2.0.spaddon"),
         server.url("/download/slidev-0.2.0.spaddon?from=index"),
+        server.url("/download/%2e%2e/other/slidev-0.2.0.spaddon"),
+        server.url("/download/a@b/slidev-0.2.0.spaddon"),
+        server.url("/DOWNLOAD/slidev-0.2.0.spaddon"),
+        server.url("/download/slidev-v0.2.0//slidev-0.2.0.spaddon"),
+        server.url("/download/slidev-v0.2.0/"),
+        server.url("/download/a\\b/slidev-0.2.0.spaddon"),
         "https://example.invalid/slidev-0.2.0.spaddon".to_string(),
     ] {
         let mut index = index_of(&server, &package, "0.2.0");
@@ -319,6 +331,32 @@ fn a_redirect_to_http_is_refused() {
         assert!(refused.contains("https"), "{to}: {refused}");
     }
     assert_eq!(unallowed.hits.load(Ordering::SeqCst), 0);
+
+    // Nor is an https one on this computer or a private network, whichever way it is written.
+    for to in [
+        "https://127.0.0.1/index.json",
+        "https://localhost/index.json",
+        "https://LocalHost./index.json",
+        "https://app.localhost:8443/index.json",
+        "https://192.168.1.1/index.json",
+        "https://10.0.0.1/index.json",
+        "https://169.254.169.254/latest",
+        "https://0.0.0.0/index.json",
+        "https://[::1]/index.json",
+        "https://[fd00::1]/index.json",
+        "https://[::ffff:127.0.0.1]/index.json",
+        "https://2130706433/index.json",
+        "https://0x7f.1/index.json",
+        "https://127.1/index.json",
+        "https://user@example.invalid/index.json",
+    ] {
+        let server = Server::start(move |_| redirect(to));
+        let source = server.allowed("/index.json");
+        let refused = fetch::check(&source, &no_cancel()).unwrap_err();
+        one_sentence(&refused);
+        assert!(refused.contains("local or private") || refused.contains("https"), "{to}: {refused}");
+        assert_ne!(refused, fetch::UNREACHABLE, "{to} was refused before connecting");
+    }
 
     // Five redirects are followed, a sixth isn't.
     let package = package("0.2.0");
@@ -420,6 +458,42 @@ fn an_index_that_disagrees_with_the_signed_manifest_is_refused() {
         one_sentence(&fetch::check(&source, &no_cancel()).unwrap_err());
     }
     assert_eq!(addons::status(app.path()), addons::Status::NotInstalled);
+}
+
+#[test]
+fn an_unreadable_index_says_nothing_the_server_wrote() {
+    let phish = "Your copy is out of date, get it at evil.example";
+    let package = package("0.2.0");
+    let (server, served) = late_server();
+    let source = server.allowed("/index.json");
+    let good = serde_json::to_value(index_of(&server, &package, "0.2.0")).unwrap();
+    let mut wrongs = Vec::new();
+    let mut unknown = good.clone();
+    unknown[phish] = serde_json::json!(1);
+    wrongs.push(serde_json::to_vec(&unknown).unwrap());
+    for field in ["name", "version", "slidev", "sha256", "url"] {
+        let mut wrong = good.clone();
+        wrong[field] = serde_json::json!(phish);
+        wrongs.push(serde_json::to_vec(&wrong).unwrap());
+    }
+    let mut wrong_type = good.clone();
+    wrong_type["size"] = serde_json::json!(phish);
+    wrongs.push(serde_json::to_vec(&wrong_type).unwrap());
+    wrongs.push(format!("{{\"{phish}\"").into_bytes());
+    wrongs.push(format!("<html>{phish}</html>").into_bytes());
+    for wrong in wrongs {
+        *served.lock().unwrap() = Some((wrong.clone(), "/never".into(), Vec::new()));
+        let refused = fetch::check(&source, &no_cancel()).unwrap_err();
+        one_sentence(&refused);
+        for words in ["evil", "out of date", "Your copy"] {
+            assert!(!refused.contains(words), "{refused} from {}", String::from_utf8_lossy(&wrong));
+        }
+    }
+    let mut unknown = good.clone();
+    unknown[phish] = serde_json::json!(1);
+    *served.lock().unwrap() = Some((serde_json::to_vec(&unknown).unwrap(), "/never".into(), Vec::new()));
+    let refused = fetch::check(&source, &no_cancel()).unwrap_err();
+    assert!(refused.starts_with("The add-on's index can't be read (line 1, column "), "{refused}");
 }
 
 #[test]

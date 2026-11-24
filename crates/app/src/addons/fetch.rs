@@ -104,7 +104,7 @@ fn allowed(url: &str) -> bool {
     if url.bytes().any(|byte| !byte.is_ascii_graphic()) || url.contains('\\') {
         return false;
     }
-    if url.starts_with("https://") && url.len() > "https://".len() {
+    if url.starts_with("https://") && url.len() > "https://".len() && !private_host(url) {
         return true;
     }
     #[cfg(feature = "test-hooks")]
@@ -112,6 +112,55 @@ fn allowed(url: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Whether `url`'s host is this computer or a private network's: `localhost`, or an address
+/// that is loopback, private, link-local, unspecified or broadcast, or one written as a number
+/// the resolver might read as such (as `2130706433` or `0x7f.1`). A name that resolves to such an
+/// address isn't caught: the app has no say in how a name is resolved, so DNS rebinding is out
+/// of its reach. Only a GET with a `User-Agent` would reach it, and the signature still decides.
+fn private_host(url: &str) -> bool {
+    let Some((_, rest)) = url.split_once("://") else { return true };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // A user name before the host only hides which host it is.
+    if authority.contains('@') {
+        return true;
+    }
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        let Some((v6, _)) = v6.split_once(']') else { return true };
+        return match v6.parse::<std::net::Ipv6Addr>() {
+            Ok(address) => private_v6(address),
+            Err(_) => true,
+        };
+    } else {
+        authority.rsplit_once(':').map_or(authority, |(host, _)| host)
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() || host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+    // No top-level name starts with a digit: such a host is a number, which only a dotted IPv4
+    // address of four parts may be, and a public one.
+    let last = host.rsplit('.').next().unwrap_or("");
+    if last.starts_with(|c: char| c.is_ascii_digit()) {
+        return match host.parse::<std::net::Ipv4Addr>() {
+            Ok(address) => private_v4(address),
+            Err(_) => true,
+        };
+    }
+    false
+}
+
+fn private_v4(address: std::net::Ipv4Addr) -> bool {
+    address.is_loopback() || address.is_private() || address.is_link_local() || address.is_unspecified() || address.is_broadcast() || address.octets()[0] == 0
+}
+
+fn private_v6(address: std::net::Ipv6Addr) -> bool {
+    if let Some(v4) = address.to_ipv4_mapped() {
+        return private_v4(v4);
+    }
+    let first = address.segments()[0];
+    address.is_loopback() || address.is_unspecified() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
 }
 
 /// Whether the requests to `url` skip a proxy the environment names: only a test's own server.
@@ -136,28 +185,29 @@ fn parse_index(bytes: &[u8]) -> Result<Index, String> {
     if !looks_like_json {
         return Err("The page the app got isn't the add-on's index; the network may want a sign-in first. Check the internet connection, or install it from a file.".into());
     }
-    serde_json::from_slice(bytes).map_err(|error| {
-        let said = error.to_string();
-        format!("The add-on's index can't be read ({}).", slides_components::shortened(said.lines().next().unwrap_or(""), 120))
-    })
+    // serde's own words would carry the server's (an unknown field is named in them), so only
+    // where it stopped is said.
+    serde_json::from_slice(bytes).map_err(|error| format!("The add-on's index can't be read (line {}, column {}).", error.line(), error.column()))
 }
 
 /// Why `index` isn't one the app takes from `source`, if it isn't.
 fn validate(source: &Source, index: &Index) -> Result<(), String> {
     if index.name != ADDON_NAME {
-        return Err(format!("The add-on's index offers {:?}, not the Slidev add-on.", slides_components::shortened(&index.name, 40)));
+        return Err("The add-on's index offers another add-on than the Slidev add-on.".into());
     }
     if numbers(&index.version).is_none() {
-        return Err(format!("The add-on's index gives the version {:?}, which isn't three numbers.", slides_components::shortened(&index.version, 40)));
+        return Err("The add-on's index gives a version that isn't three numbers.".into());
     }
     if index.abi != addon_abi::ABI_VERSION {
         return Err(format!("The add-on on offer is made for add-on interface {}, where the app takes {}.", index.abi, addon_abi::ABI_VERSION));
     }
     if index.slidev != SLIDEV_VERSION {
-        return Err(format!(
-            "The add-on on offer writes for Slidev {}, where Stagepack's talks are for Slidev {SLIDEV_VERSION}.",
-            slides_components::shortened(&index.slidev, 40)
-        ));
+        // Said back only if it is a version, so that none of the server's words are.
+        return Err(if numbers(&index.slidev).is_some() && index.slidev.len() <= 32 {
+            format!("The add-on on offer writes for Slidev {}, where Stagepack's talks are for Slidev {SLIDEV_VERSION}.", index.slidev)
+        } else {
+            format!("The add-on on offer writes for another Slidev than Stagepack's talks, which are for Slidev {SLIDEV_VERSION}.")
+        });
     }
     if index.size == 0 || index.size > MAX_DOWNLOAD_BYTES {
         return Err(format!("The add-on's index gives a size of {} bytes, where a download may be 1 byte to {} MiB.", index.size, MAX_DOWNLOAD_BYTES >> 20));
@@ -236,10 +286,11 @@ enum What {
 }
 
 impl What {
+    /// The most that is read: the package no more than its index's size.
     fn cap(self) -> u64 {
         match self {
             What::Index => MAX_INDEX_BYTES,
-            What::Package(_) => MAX_DOWNLOAD_BYTES,
+            What::Package(size) => size.min(MAX_DOWNLOAD_BYTES),
         }
     }
 
@@ -253,7 +304,11 @@ impl What {
     fn too_large(self) -> String {
         match self {
             What::Index => "The add-on's index is larger than 64 KiB, so it was refused.".into(),
-            What::Package(_) => format!("The download is larger than {} MiB, so it was refused.", MAX_DOWNLOAD_BYTES >> 20),
+            What::Package(size) => format!(
+                "The download is larger than the {} bytes its index gives (a download may be at most {} MiB), so it was refused.",
+                size.min(MAX_DOWNLOAD_BYTES),
+                MAX_DOWNLOAD_BYTES >> 20
+            ),
         }
     }
 
@@ -310,7 +365,9 @@ fn fetch_here(url: &str, what: What, stop: &AtomicBool, tell: &mpsc::Sender<Said
     let mut redirects = 0;
     let response = loop {
         if !allowed(&url) {
-            return Err(if redirects == 0 {
+            return Err(if private_host(&url) && url.starts_with("https://") {
+                "The add-on's download page sent the app on to a local or private address, so it stopped there.".into()
+            } else if redirects == 0 {
                 "The add-on's download address isn't an https one, so the app won't go there.".into()
             } else {
                 "The add-on's download page sent the app on to an address that isn't https, so it stopped there.".into()
@@ -328,6 +385,11 @@ fn fetch_here(url: &str, what: What, stop: &AtomicBool, tell: &mpsc::Sender<Said
             .accept_encoding("")
             .timeout_connect(Some(CONNECT_TIME))
             .timeout_global(Some(left));
+        // ureq refuses plain http itself too, so that only the test hook can open it.
+        #[cfg(not(feature = "test-hooks"))]
+        let config = config.https_only(true);
+        #[cfg(feature = "test-hooks")]
+        let config = config.https_only(!is_loopback(&url));
         let config = if is_loopback(&url) { config.proxy(None) } else { config };
         let agent = ureq::Agent::new_with_config(config.build());
         let response = agent.get(&url).call().map_err(|error| before_response(error, what))?;
@@ -357,6 +419,11 @@ fn fetch_here(url: &str, what: What, stop: &AtomicBool, tell: &mpsc::Sender<Said
         What::Index => 0,
     };
     let body = response.into_body();
+    if let (What::Package(size), Some(length)) = (what, body.content_length())
+        && length != size
+    {
+        return Err(format!("The download page gives a length of {length} bytes, where the add-on's index gives a size of {size}, so it was refused."));
+    }
     if body.content_length().is_some_and(|length| length > what.cap()) {
         return Err(what.too_large());
     }

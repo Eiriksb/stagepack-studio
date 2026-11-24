@@ -152,12 +152,13 @@ pub fn read_package(bytes: &[u8], key: &[u8; 32]) -> Result<Package, String> {
         let file = archive.by_index_raw(index).map_err(|_| format!("Entry {} of the add-on file can't be read.", index + 1))?;
         let name = std::str::from_utf8(file.name_raw()).map_err(|_| format!("The name of entry {} of the add-on file isn't UTF-8.", index + 1))?;
         if !safe_name(name) {
-            return Err(format!("The add-on file has an entry named {name:?}, which isn't a safe name."));
+            // Not named: nothing of an unchecked package is said back.
+            return Err(format!("The name of entry {} of the add-on file isn't a safe one.", index + 1));
         }
         let slot = ENTRIES
             .iter()
             .position(|entry| *entry == name)
-            .ok_or_else(|| format!("The add-on file has an entry named {name:?}, which isn't one of the names a package holds."))?;
+            .ok_or_else(|| format!("The name of entry {} of the add-on file isn't one of the three a package holds.", index + 1))?;
         // With no name twice and three entries, each of the three is found once.
         at[slot] = Some(index);
         if file.encrypted() || !file.is_file() {
