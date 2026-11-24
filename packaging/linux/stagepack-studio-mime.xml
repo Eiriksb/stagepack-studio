@@ -4,7 +4,7 @@
   <mime-type type="application/vnd.stagepack.talk">
     <comment>Stagepack talk</comment>
     <sub-class-of type="application/zip"/>
-    <glob pattern="*.sptx" weight="90"/>
+    <glob pattern="*.sptx"/>
     <icon name="application-vnd.stagepack.talk"/>
     <generic-icon name="x-office-presentation"/>
   </mime-type>

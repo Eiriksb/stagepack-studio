@@ -386,11 +386,9 @@ fn stagepack_stays_under_open_with() {
 
     let out = s.install(package());
     assert_eq!(out.status.code(), Some(0), "{}", said(&out));
-    // Whatever type the file is taken to be, its default is now ours.
-    let found = s.xdg_mime(&["query", "filetype", talk]);
-    assert!(found == THEIR_TYPE || found == TYPE, "{found}");
-    eprintln!("with Stagepack installed too, a .sptx is taken for {found}");
-    assert_eq!(s.xdg_mime(&["query", "default", &found]), "stagepack-studio.desktop", "a .sptx of type {found}");
+    // Stagepack's weight-90 glob still decides the file's type (ours has the default weight, so there is no tie that
+    // could make the file ours and drop Stagepack from Open with), and that type's default is now ours.
+    assert_eq!(s.xdg_mime(&["query", "filetype", talk]), THEIR_TYPE);
     for t in [TYPE, THEIR_TYPE] {
         assert_eq!(s.xdg_mime(&["query", "default", t]), "stagepack-studio.desktop", "{t}");
     }
