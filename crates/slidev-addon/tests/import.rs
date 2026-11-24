@@ -479,3 +479,153 @@ fn odd_inputs_never_panic_and_always_parse() {
     // A file that isn't UTF-8 is refused with a sentence.
     assert!(import(&args(), &vec![file("slides.md", b"\xff\xfe")]).is_err());
 }
+
+/// About `mb` MB of `unit`, over and over.
+fn of_size(unit: &str, mb: usize) -> String {
+    unit.repeat(mb * 1024 * 1024 / unit.len().max(1))
+}
+
+fn four_mb(unit: &str) -> String {
+    of_size(unit, 4)
+}
+
+/// How long the import of `source` takes.
+fn import_time(source: &str) -> std::time::Duration {
+    let started = std::time::Instant::now();
+    let (bundle, _) = import_with(source, Vec::new());
+    let took = started.elapsed();
+    assert_parses(&slides_md(&bundle));
+    took
+}
+
+#[test]
+fn unclosed_constructs_take_time_in_line_with_their_length() {
+    let filler = "a\n".repeat(1024 * 1024);
+    let leads: String = (0..1500).map(|k| format!("{}```\n", [" ", "\t"][k % 2].repeat(k / 2 + 1))).collect();
+    let runs: String = (1..2000).map(|k| format!("{}a", "`".repeat(k))).collect();
+    let cases = [
+        ("a < with no >", four_mb("a<")),
+        ("{{ with no }}", four_mb("{{ a ")),
+        ("<code> with no end", four_mb("<code>x ")),
+        ("![ with no ](", four_mb("![a")),
+        ("![a]( with no )", four_mb("![a](b ")),
+        ("unknown inline tags", four_mb("<x>")),
+        ("closing tags with nothing open", four_mb("<b></i>")),
+        ("formatting opened and never closed", four_mb("<b>")),
+        ("<!-- with no -->", four_mb("a <!-- ")),
+        ("a quoted attribute that never ends", four_mb("<a b=\"")),
+        ("small scripts", four_mb("<script>a</script>\n\n")),
+        ("fences that never close", format!("{leads}{filler}")),
+        ("backtick runs with no partner", format!("{runs}\n{filler}")),
+        ("backtick runs in an element", format!("<div>\n\n{runs}\n{filler}</div>\n")),
+        ("blank lines in a list", format!("- a\n{}b\n", "\n".repeat(4 * 1024 * 1024))),
+        ("indented code", four_mb("    code\n")),
+        ("v-clicks in v-clicks", four_mb("<v-clicks>\n\n")),
+    ];
+    // Under 2 s for 4 MB in a release build; a debug build is several times slower.
+    let most = std::time::Duration::from_secs(if cfg!(debug_assertions) { 10 } else { 2 });
+    for (what, source) in cases {
+        let took = import_time(&source);
+        assert!(took < most, "{what} took {took:?}");
+    }
+    // And in line with the length: four times as much takes about four times as long.
+    for unit in ["a<", "{{ a ", "![a", "<x>", "a <!-- ", "<a b=\"", "<script>a</script>\n\n", "<b>"] {
+        let (one, four) = (import_time(&of_size(unit, 1)), import_time(&of_size(unit, 4)));
+        assert!(four < one * 8 + std::time::Duration::from_millis(50), "{unit:?}: 1 MB took {one:?}, 4 MB {four:?}");
+    }
+}
+
+#[test]
+fn imports_stop_at_a_budget() {
+    // A chain of files, each importing the next ten times: ten to the sixteenth calls unchecked.
+    let mut files = Vec::new();
+    for level in 0..12 {
+        let next = if level == 11 { "end.md#none".to_string() } else { format!("level{}.md", level + 1) };
+        let slides: String = (0..10).map(|_| format!("---\nsrc: ./{next}\n---\n\n")).collect();
+        files.push(file(&format!("level{level}.md"), slides.as_bytes()));
+    }
+    files.push(file("end.md", b"# End\n"));
+    let started = std::time::Instant::now();
+    let (bundle, report) = import_with("# Start\n\n---\nsrc: ./level0.md\n---\n", files);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+    assert_parses(&slides_md(&bundle));
+    assert!(report.notices.iter().any(|notice| notice.slide.is_none() && notice.text.starts_with("The talk's imports go past the most")), "{report:?}");
+    assert!(report.notices.iter().any(|notice| notice.kind == NoticeKind::Placeholder && notice.text.contains("are past the most the import follows")));
+
+    // Many slides importing one big file, which would be read in again for each.
+    let big = format!("# Big\n\n{}\n", "word ".repeat(200 * 1024));
+    let source: String = std::iter::once("# Start\n\n".to_string()).chain((0..2000).map(|_| "---\nsrc: ./big.md\n---\n\n".to_string())).collect();
+    let started = std::time::Instant::now();
+    let (bundle, report) = import_with(&source, vec![file("big.md", big.as_bytes())]);
+    assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
+    let markdown = slides_md(&bundle);
+    assert_parses(&markdown);
+    assert!(markdown.len() < 80 * 1024 * 1024, "{}", markdown.len());
+    assert!(report.notices.iter().any(|notice| notice.text.starts_with("The talk's imports go past the most")));
+}
+
+#[test]
+fn a_pictures_title_cant_write_our_tags() {
+    let source = "![a](/dot.png <Box click=\"3\">x</Box>)\n\n![b](/dot.png \"a <Box click=\\\"3\\\"> title\")\n";
+    let (bundle, report) = import_with(source, vec![file("public/dot.png", PNG)]);
+    let markdown = slides_md(&bundle);
+    let talk = assert_parses(&markdown);
+    let boxes = |blocks: &[Block]| blocks.iter().filter(|block| matches!(block, Block::Tag(tag) if tag.name == "Box")).count();
+    assert_eq!(boxes(&talk.slides[0].blocks), 0, "{markdown}");
+    assert!(markdown.contains("![b](assets/dot.png \"a \\<Box click=\\\"3\\\"> title\")"), "{markdown}");
+    assert!(report.notices.iter().any(|notice| notice.text == "A picture's title can't be read as one, so it was left out."), "{report:?}");
+}
+
+#[test]
+fn indented_code_cant_write_our_tags() {
+    let source = "# Code\n\n    let x = 1;\nThen <Video src=\"assets/x.mp4\" /> {{ y }} and <b>\n\n    more code\n\n        deeper\n";
+    let (bundle, _) = import_with(source, vec![file("public/x.mp4", b"mp4")]);
+    let markdown = slides_md(&bundle);
+    let talk = assert_parses(&markdown);
+    fn tags(blocks: &[Block], out: &mut Vec<String>) {
+        for block in blocks {
+            if let Block::Tag(tag) = block {
+                out.push(tag.name.clone());
+                tags(&tag.children, out);
+            }
+        }
+    }
+    let mut names = Vec::new();
+    tags(&talk.slides[0].blocks, &mut names);
+    // Only the labelled boxes that hold the tag and the expression.
+    assert_eq!(names, ["Box", "Box"], "{markdown}");
+    assert!(markdown.contains("```\nlet x = 1;\n```\n\nThen"), "{markdown}");
+    assert!(markdown.contains("```\nmore code\n\n    deeper\n```"), "{markdown}");
+}
+
+#[test]
+fn v_clicks_counts_a_lists_levels_as_slidev_does() {
+    // As `VClicks.ts` counts `depth="2"`: a, a1, a2 and b each take a click, so the click
+    // after the list is the fifth.
+    let source = "# Depth\n\n<v-clicks depth=\"2\">\n\n- a\n  - a1\n  - a2\n- b\n\n</v-clicks>\n\n<div v-click>After</div>\n\n---\n\n# Bound\n\n<v-clicks :every=\"2\" :at=\"'+1'\">\n\n- a\n- b\n- c\n\n</v-clicks>\n\n<div v-click>After</div>\n";
+    let (bundle, report) = import_with(source, Vec::new());
+    let markdown = slides_md(&bundle);
+    assert_expected("v_clicks_counts_a_lists_levels_as_slidev_does", &markdown);
+    let talk = assert_parses(&markdown);
+    let clicks = |slide: &Slide| -> Vec<String> { slide.blocks.iter().filter_map(|block| if let Block::Tag(tag) = block { tag.attr("click").map(str::to_string) } else { None }).collect() };
+    // a at 1, b at 4, After at 5. Slidev numbers a after a1 and a2 by delta, but shows it at 1.
+    assert_eq!(clicks(&talk.slides[0]), ["1", "4", "5"]);
+    // Two at a time from the first click: a and b at 1, c at 2, After at 3.
+    assert_eq!(clicks(&talk.slides[1]), ["1", "1", "2", "3"]);
+    assert!(report.notices.iter().any(|notice| notice.slide == Some(1) && notice.text.starts_with("The items under a list's items")), "{report:?}");
+}
+
+#[test]
+fn small_things_slidev_reads_its_own_way() {
+    // ` +1` is the number 1 to Slidev; an empty layout is the default one; a path with `\`
+    // is outside the talk; a file name a link can't hold is renamed.
+    let source = "# One\n\n<v-click at=\" +1\">\n\nA\n\n</v-click>\n\n---\nlayout: ''\n---\n\n# Two\n\n---\nsrc: ..\\\\x.md\n---\n\n---\n\n![x](/a%20%28b%29.png)\n";
+    let (bundle, report) = import_with(source, vec![file("public/a (b).png", PNG)]);
+    let markdown = slides_md(&bundle);
+    assert_parses(&markdown);
+    assert!(markdown.contains("<Box click=\"1\""), "{markdown}");
+    assert!(markdown.contains("![x](assets/a--b-.png)"), "{markdown}");
+    assert!(bundle.iter().any(|(name, data)| name == "assets/a--b-.png" && data == PNG));
+    assert!(!report.notices.iter().any(|notice| notice.text.contains("layout")), "{report:?}");
+    assert!(report.notices.iter().any(|notice| notice.text.contains("are outside the talk")), "{report:?}");
+}

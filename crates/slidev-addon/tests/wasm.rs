@@ -143,4 +143,13 @@ fn the_fixture_imports_through_the_addon() {
     let (files, _) = addon.run("import", "{}", vec![file("slides.md", odd.as_bytes())]).expect("odd input imports");
     let markdown = String::from_utf8(files[0].1.clone()).unwrap();
     assert!(slides_format::parse_talk(&markdown).slides.iter().all(|slide| slide.error.is_none()), "{markdown}");
+
+    // Megabytes of what never closes are read in one pass, well within the time limit.
+    let runs: String = (1..2000).map(|k| format!("{}a", "`".repeat(k))).collect();
+    let hostile = format!("{runs}\n{}{}", "<a b=\"".repeat(300_000), "![a {{ <code>x <!-- ".repeat(100_000));
+    let started = Instant::now();
+    addon.run("import", "{}", vec![file("slides.md", hostile.as_bytes())]).expect("hostile input imports");
+    let took = started.elapsed();
+    println!("{} MB of unclosed constructs took {took:?}", hostile.len() / (1024 * 1024));
+    assert!(took < ADDON_TIME_LIMIT / 6, "{took:?}");
 }

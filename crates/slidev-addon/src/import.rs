@@ -4,7 +4,7 @@
 //! can't be carried over, a component, raw HTML, a script, is a labelled box that holds its
 //! original text, and is in the report under its slide.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use addon_abi::{safe_name, Bundle, Notice, NoticeKind, Report, MANIFEST};
 use serde::Deserialize;
@@ -39,6 +39,16 @@ const MAX_NOTICES: usize = 10_000;
 const MAX_NOTICE_CHARS: usize = 500;
 /// How many elements deep a slide is read; what's deeper is a labelled box.
 const MAX_NESTING: usize = 24;
+/// How much inline formatting can be open on one line.
+const MAX_INLINE_DEPTH: usize = 32;
+/// The most `src:` imports followed in all, and the most they bring in. Imports that import
+/// each other many times over could otherwise go on for longer than any run lasts.
+const MAX_IMPORTS: usize = 1000;
+const MAX_IMPORTED_BYTES: usize = 64 * 1024 * 1024;
+/// The most of an import's slide a labelled box holds.
+const MAX_PLACEHOLDER_SLIDE: usize = 4096;
+/// How many levels of a list a `<v-clicks depth>` is followed through.
+const MAX_LIST_LEVELS: usize = 16;
 /// How many files deep `src:` imports are followed.
 const MAX_IMPORT_DEPTH: usize = 16;
 /// The most slides an import makes. Imports that import each other twice over could make
@@ -99,6 +109,57 @@ fn comment_state(line: &str, mut inside: bool) -> bool {
     inside
 }
 
+fn is_js_space(c: char) -> bool {
+    c.is_whitespace() || c == '\u{feff}'
+}
+
+/// JavaScript's `trimStart`, and its `\s`.
+fn js_trim_start(text: &str) -> &str {
+    text.trim_start_matches(is_js_space)
+}
+
+/// Where the fences of a file close, as Slidev's splitter finds them: at the next line that
+/// starts with the same white space and as many backticks. Lines are kept by the white space
+/// they start with, and each search remembers what it found, so a file of fences that never
+/// close is read in one pass rather than one pass for each.
+struct Fences<'l> {
+    /// The lines that start with white space and a backtick, by that white space: each line's
+    /// index and how many backticks start it.
+    by_lead: HashMap<&'l str, Vec<(usize, usize)>>,
+    /// For a lead and a number of backticks, the last line searched after and what was found.
+    found: HashMap<(&'l str, usize), (usize, Option<usize>)>,
+}
+
+impl<'l> Fences<'l> {
+    fn new(lines: &[&'l str]) -> Fences<'l> {
+        let mut by_lead: HashMap<&'l str, Vec<(usize, usize)>> = HashMap::new();
+        for (index, line) in lines.iter().enumerate() {
+            let rest = js_trim_start(line);
+            if rest.starts_with('`') {
+                let lead = &line[..line.len() - rest.len()];
+                let ticks = rest.bytes().take_while(|byte| *byte == b'`').count();
+                by_lead.entry(lead).or_default().push((index, ticks));
+            }
+        }
+        Fences { by_lead, found: HashMap::new() }
+    }
+
+    /// The first line after `after` that starts with `lead` and at least `ticks` backticks.
+    fn close(&mut self, lead: &'l str, ticks: usize, after: usize) -> Option<usize> {
+        if let Some(&(from, found)) = self.found.get(&(lead, ticks))
+            && from <= after
+            && found.is_none_or(|line| line > after)
+        {
+            return found;
+        }
+        let lines = self.by_lead.get(lead)?;
+        let start = lines.partition_point(|(index, _)| *index <= after);
+        let found = lines[start..].iter().find(|(_, run)| *run >= ticks).map(|(index, _)| *index);
+        self.found.insert((lead, ticks), (after, found));
+        found
+    }
+}
+
 /// The slides of `markdown`, as Slidev's `parse` splits them: on lines that start with
 /// `---`, past code fences and comments, each with the front matter block that follows.
 fn split(markdown: &str) -> Vec<SlidevSlide> {
@@ -114,6 +175,7 @@ fn split(markdown: &str) -> Vec<SlidevSlide> {
         slides.push(parse_slide(lines[*start..end].join("\n")));
         *start = end + 1;
     };
+    let mut fences = Fences::new(&lines);
     let mut i = 0;
     while i < lines.len() {
         let raw = lines[i];
@@ -130,12 +192,10 @@ fn split(markdown: &str) -> Vec<SlidevSlide> {
                     i += 1;
                 }
             }
-        } else if line.trim_start().starts_with("```") {
-            let blank = line.len() - line.trim_start().len();
+        } else if js_trim_start(line).starts_with("```") {
+            let blank = line.len() - js_trim_start(line).len();
             let ticks = line[blank..].bytes().take_while(|byte| *byte == b'`').count();
-            let level = &line[..blank + ticks];
-            let close = (i + 1..lines.len()).find(|j| lines[*j].starts_with(level));
-            if let Some(close) = close {
+            if let Some(close) = fences.close(&line[..blank], ticks, i) {
                 i = close;
             }
         } else {
@@ -247,6 +307,8 @@ enum Unread {
     Loop,
     TooDeep,
     NotText,
+    /// Past the most an import follows.
+    TooMuch,
 }
 
 /// A slide the talk shows, as Slidev loads it.
@@ -266,10 +328,14 @@ struct Loaded {
 /// `base`'s entries with `over`'s in their place, as JavaScript's `{ ...base, ...over }`.
 fn merged(base: &[(String, Value)], over: &[(String, Value)]) -> Vec<(String, Value)> {
     let mut out: Vec<(String, Value)> = Vec::with_capacity(base.len() + over.len());
+    let mut places: HashMap<&str, usize> = HashMap::new();
     for (key, value) in base.iter().chain(over) {
-        match out.iter_mut().find(|(name, _)| name == key) {
-            Some(entry) => entry.1 = value.clone(),
-            None => out.push((key.clone(), value.clone())),
+        match places.get(key.as_str()) {
+            Some(&at) => out[at].1 = value.clone(),
+            None => {
+                places.insert(key, out.len());
+                out.push((key.clone(), value.clone()));
+            }
         }
     }
     out
@@ -351,12 +417,12 @@ fn js_number(text: &str) -> Option<f64> {
 /// An `at` as Slidev's `normalizeSingleAtValue` reads it. `Err` for one it can't read, and
 /// `Ok(None)` for one that turns it off.
 fn at_value(text: &str) -> Result<Option<At>, ()> {
-    let text = text.trim();
     match text {
         "false" => return Ok(None),
         "true" => return Ok(Some(At::After(1))),
         _ => {}
     }
+    // Slidev looks at the first character as written: ` +1` is the number 1.
     if text.starts_with(['+', '-']) {
         return js_number(text).map(|value| Some(At::After(value.ceil() as i64))).ok_or(());
     }
@@ -383,6 +449,70 @@ impl Enter {
             Enter::FlyUp => Some("fly-up"),
         }
     }
+}
+
+/// How a `<v-clicks>` numbers what's in it, as `VClicks.ts` does: each thing takes the next
+/// index, shown at `at + ceil(index / every) - 1`, and is registered as so many clicks after the
+/// one registered before it, or at its own click for an `at` that isn't relative.
+struct Counter {
+    at: i64,
+    every: f64,
+    relative: bool,
+    count: i64,
+    done: i64,
+}
+
+impl Counter {
+    /// The click the next thing is shown at.
+    fn index(&mut self) -> i64 {
+        self.count += 1;
+        self.at + (self.count as f64 / self.every).ceil() as i64 - 1
+    }
+
+    /// Registers a thing shown at `show`, and gives the click it starts at.
+    fn register(&mut self, show: i64, clicks: &mut Clicks) -> i64 {
+        let value = if self.relative { At::After(show - self.done) } else { At::On(show) };
+        self.done = show;
+        clicks.since(value, 1)
+    }
+
+    fn next(&mut self, clicks: &mut Clicks) -> i64 {
+        let show = self.index();
+        self.register(show, clicks)
+    }
+
+    /// The size of the gap `VClickGap` leaves after them.
+    fn gap(&self) -> i64 {
+        self.at + (self.count as f64 / self.every).ceil() as i64 - 1 - self.done
+    }
+}
+
+/// Numbers the items of the lists under `item`, at `level`, and those under them up to
+/// `levels`, as `VClicks` does. Whether there were any.
+fn count_nested(item: &str, level: usize, levels: usize, counter: &mut Counter, clicks: &mut Clicks) -> bool {
+    let Some(list) = nested_list(item) else { return false };
+    for sub in list_items(list) {
+        let show = counter.index();
+        if level < levels {
+            count_nested(sub, level + 1, levels, counter, clicks);
+        }
+        counter.register(show, clicks);
+    }
+    true
+}
+
+/// The first list under a list item: from its first line after the item's own that starts
+/// with a list marker, however far in.
+fn nested_list(item: &str) -> Option<&str> {
+    let mut at = line_at(item, 0).1;
+    while at < item.len() {
+        let (end, next) = line_at(item, at);
+        if marker_length(&item[at..end]).is_some() {
+            return Some(item[at..].trim_end_matches('\n'));
+        }
+        at = next;
+    }
+    None
 }
 
 /// A `<v-clicks>`: its pieces as one, for a region shown a piece at a time, and each in a box
@@ -607,12 +737,17 @@ fn slot_name(line: &str) -> Option<&str> {
     (!inner.is_empty() && inner.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-' | b':'))).then_some(inner)
 }
 
-/// The marker of a list item that starts `line`, after its indent: its length.
+/// The marker of a list item that starts `line`, no more than three columns in: its length.
 fn list_marker(line: &str) -> Option<usize> {
-    let (column, lead) = indent_of(line);
-    if column > 3 {
+    if indent_of(line).0 > 3 {
         return None;
     }
+    marker_length(line)
+}
+
+/// The marker of a list item that starts `line`, however far in: its length.
+fn marker_length(line: &str) -> Option<usize> {
+    let (_, lead) = indent_of(line);
     let rest = &line.as_bytes()[lead..];
     let digits = rest.iter().take_while(|byte| byte.is_ascii_digit()).count();
     let length = match (digits, rest.get(digits)) {
@@ -646,21 +781,19 @@ fn is_raw_text(name: &str) -> bool {
 
 /// Where the element opened by `tag`, at `start` in `text`, ends: where what's in it ends,
 /// and just past its closing tag. `None` when it's never closed.
-fn element_end(text: &str, tag: &OpenTag) -> Option<(usize, usize)> {
+fn element_end(text: &str, tag: &OpenTag, runs: &mut Runs) -> Option<(usize, usize)> {
     if tag.self_closing || html::is_void(&tag.name) {
         return Some((tag.end, tag.end));
     }
     let bytes = text.as_bytes();
     if is_raw_text(&tag.name) {
-        let lower = text.get(tag.end..)?.to_ascii_lowercase();
         let close = format!("</{}", tag.name.to_ascii_lowercase());
-        let mut from = 0;
-        while let Some(found) = lower[from..].find(&close) {
-            let at = tag.end + from + found;
+        let mut from = tag.end;
+        while let Some(at) = find_folded(text, from, &close) {
             if let Some((_, end)) = html::close_tag(text, at) {
                 return Some((at, end));
             }
-            from += found + close.len();
+            from = at + close.len();
         }
         return None;
     }
@@ -698,7 +831,7 @@ fn element_end(text: &str, tag: &OpenTag) -> Option<(usize, usize)> {
             b'`' => {
                 let run = bytes[at..].iter().take_while(|byte| **byte == b'`').count();
                 at += run;
-                if let Some(close) = closing_run(text, at, run) {
+                if let Some(close) = runs.closing(text, at, run) {
                     at = close + run;
                 }
             }
@@ -729,27 +862,96 @@ fn element_end(text: &str, tag: &OpenTag) -> Option<(usize, usize)> {
     None
 }
 
-/// Where the run of exactly `run` backticks that closes a code span opened before `from` starts.
-fn closing_run(text: &str, from: usize, run: usize) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let mut at = from;
-    while at < bytes.len() {
-        if bytes[at] == b'`' {
-            let length = bytes[at..].iter().take_while(|byte| **byte == b'`').count();
-            if length == run {
-                return Some(at);
-            }
-            at += length;
-        } else {
-            at += 1;
-        }
-    }
-    None
+/// A search for one pattern in one text, which remembers what it found: a search from a later
+/// place gives the same answer without looking again while that answer still holds. Each of
+/// a slide's unclosed constructs then costs one pass, not one pass for each.
+#[derive(Default)]
+struct Memo {
+    last: Option<(usize, Option<usize>)>,
 }
+
+impl Memo {
+    fn find(&mut self, text: &str, from: usize, pattern: &str) -> Option<usize> {
+        self.find_with(from, |from| text.get(from..).and_then(|rest| rest.find(pattern)).map(|at| from + at))
+    }
+
+    /// As [`Memo::find`], with ASCII letters in any case.
+    fn find_folded(&mut self, text: &str, from: usize, pattern: &str) -> Option<usize> {
+        self.find_with(from, |from| find_folded(text, from, pattern))
+    }
+
+    fn find_with(&mut self, from: usize, search: impl FnOnce(usize) -> Option<usize>) -> Option<usize> {
+        if let Some((searched, found)) = self.last
+            && searched <= from
+            && found.is_none_or(|at| at >= from)
+        {
+            return found;
+        }
+        let found = search(from);
+        self.last = Some((from, found));
+        found
+    }
+}
+
+/// Where `pattern`, which is ASCII, is next in `text` from `from`, in any case, without
+/// copying the text.
+fn find_folded(text: &str, from: usize, pattern: &str) -> Option<usize> {
+    let (bytes, pattern) = (text.as_bytes(), pattern.as_bytes());
+    if pattern.is_empty() || bytes.len() < pattern.len() {
+        return None;
+    }
+    (from..=bytes.len() - pattern.len()).find(|at| bytes[*at..*at + pattern.len()].eq_ignore_ascii_case(pattern))
+}
+
+/// Where each run of backticks in one text starts, by its length, made the first time it's
+/// asked for, so that finding the run that closes a code span never reads the text again.
+#[derive(Default)]
+struct Runs {
+    starts: Option<HashMap<usize, Vec<usize>>>,
+}
+
+impl Runs {
+    /// The first run of exactly `run` backticks from `from`, which is never
+    /// in the middle of a run.
+    fn closing(&mut self, text: &str, from: usize, run: usize) -> Option<usize> {
+        let starts = self.starts.get_or_insert_with(|| {
+            let bytes = text.as_bytes();
+            let mut starts: HashMap<usize, Vec<usize>> = HashMap::new();
+            let mut at = 0;
+            while at < bytes.len() {
+                if bytes[at] == b'`' {
+                    let length = bytes[at..].iter().take_while(|byte| **byte == b'`').count();
+                    starts.entry(length).or_default().push(at);
+                    at += length;
+                } else {
+                    at += 1;
+                }
+            }
+            starts
+        });
+        let list = starts.get(&run)?;
+        list.get(list.partition_point(|start| *start < from)).copied()
+    }
+}
+
+/// The searches one run of text makes, each remembered.
+#[derive(Default)]
+struct Searches {
+    comment: Memo,
+    braces: Memo,
+    code: Memo,
+    label: Memo,
+    alt_line: Memo,
+    paren: Memo,
+    target_line: Memo,
+    runs: Runs,
+}
+
 
 /// The blocks of `text`, a slide's content or what's in an element.
 fn scan(text: &str) -> Vec<Raw<'_>> {
     let mut blocks = Vec::new();
+    let mut runs = Runs::default();
     let mut at = 0;
     while at < text.len() {
         let (end, next) = line_at(text, at);
@@ -800,7 +1002,7 @@ fn scan(text: &str) -> Vec<Raw<'_>> {
             if let Some(tag) = html::open_tag(text, start) {
                 let inline = is_inline(&tag.name) || (tag.name.eq_ignore_ascii_case("img") && !text[tag.end..line_at(text, tag.end).0].trim().is_empty());
                 if !inline {
-                    match element_end(text, &tag) {
+                    match element_end(text, &tag, &mut runs) {
                         Some((inner_end, end)) => {
                             let inner = (inner_end > tag.end).then(|| &text[tag.end..inner_end]);
                             let source = &text[start..end];
@@ -830,6 +1032,47 @@ fn after_element(text: &str, end: usize) -> usize {
     if text[end..line_end].trim().is_empty() { next } else { end }
 }
 
+/// Where code by indentation that goes on at `line` ends: at the first line indented less
+/// than four columns, as such code has no lazy lines. Blank lines inside it are its own.
+fn indented_code_end(text: &str, mut line: usize) -> usize {
+    let mut end = line;
+    while line < text.len() {
+        let (line_end, next) = line_at(text, line);
+        let this = &text[line..line_end];
+        if !this.trim().is_empty() {
+            if indent_of(this).0 < 4 {
+                break;
+            }
+            end = next;
+        }
+        line = next;
+    }
+    end
+}
+
+/// `code`'s lines with the four columns that make it code taken off.
+fn dedented(code: &str) -> String {
+    code.split('\n')
+        .map(|line| {
+            let mut column = 0;
+            let mut cut = 0;
+            for byte in line.bytes() {
+                if column >= 4 {
+                    break;
+                }
+                match byte {
+                    b' ' => column += 1,
+                    b'\t' => column += 4 - column % 4,
+                    _ => break,
+                }
+                cut += 1;
+            }
+            &line[cut..]
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Where a run of Markdown that starts at `at` ends: at a blank line, but for one inside a
 /// list, or at a line that starts a block of another kind.
 fn markdown_end(text: &str, at: usize) -> usize {
@@ -837,6 +1080,9 @@ fn markdown_end(text: &str, at: usize) -> usize {
     let first = &text[at..first_end];
     if is_atx_heading(first) {
         return first_next;
+    }
+    if indent_of(first).0 >= 4 {
+        return indented_code_end(text, first_next);
     }
     let list = list_marker(first).is_some();
     let mut end = first_next;
@@ -862,7 +1108,7 @@ fn markdown_end(text: &str, at: usize) -> usize {
             }
             let ahead_line = &text[ahead..line_at(text, ahead).0];
             if indent_of(ahead_line).0 >= 2 || list_marker(ahead_line).is_some() {
-                line = next;
+                line = ahead;
                 continue;
             }
             break;
@@ -909,6 +1155,8 @@ struct Run<'a> {
     slide: usize,
     /// Each file under `assets/`, and the file of the talk it comes from.
     assets: BTreeMap<String, String>,
+    /// The other way round: each file of the talk under `assets/`, and its name there.
+    asset_of: HashMap<String, String>,
     /// The files read: the Markdown and the pictures.
     used: BTreeSet<String>,
     look: Option<Look>,
@@ -935,10 +1183,19 @@ impl Run<'_> {
 
     /// The name under `assets/` for the talk's file `source`, which is copied there.
     fn asset(&mut self, source: &str) -> Option<String> {
-        if let Some((name, _)) = self.assets.iter().find(|(_, from)| *from == source) {
+        if let Some(name) = self.asset_of.get(source) {
             return Some(name.clone());
         }
-        let rest = source.strip_prefix("public/").or_else(|| source.strip_prefix("assets/")).unwrap_or(source);
+        // A name a Markdown link can hold as it is: what would end it, or be read as more
+        // than a name, is a `-`.
+        let rest: String = source
+            .strip_prefix("public/")
+            .or_else(|| source.strip_prefix("assets/"))
+            .unwrap_or(source)
+            .chars()
+            .map(|c| if matches!(c, ' ' | '(' | ')' | '[' | ']' | '&' | '#' | '?' | '%' | '`' | '{' | '}') || c.is_whitespace() { '-' } else { c })
+            .collect();
+        let rest = rest.as_str();
         let (stem, extension) = match rest.rsplit_once('.') {
             Some((stem, extension)) if !stem.is_empty() && !extension.contains('/') => (stem, format!(".{extension}")),
             _ => (rest, String::new()),
@@ -952,6 +1209,7 @@ impl Run<'_> {
                 continue;
             }
             self.assets.insert(name.clone(), source.to_string());
+            self.asset_of.insert(source.to_string(), name.clone());
             self.used.insert(source.to_string());
             return Some(name);
         }
@@ -975,6 +1233,7 @@ pub fn import(args: &ImportArgs, files: &Bundle) -> Result<(Bundle, Report), Str
         dropped: 0,
         slide: 0,
         assets: BTreeMap::new(),
+        asset_of: HashMap::new(),
         used: BTreeSet::new(),
         look: None,
         quiet: 0,
@@ -983,12 +1242,15 @@ pub fn import(args: &ImportArgs, files: &Bundle) -> Result<(Bundle, Report), Str
     let source = text_of(data).ok_or_else(|| format!("The Slidev talk's {} isn't UTF-8 text.", shortened(&entry, 120)))?;
     run.used.insert(entry.clone());
 
-    let mut loader = Loader { run: &mut run, pages: BTreeMap::new(), slides: Vec::new(), full: false };
+    let mut loader = Loader { run: &mut run, pages: BTreeMap::new(), slides: Vec::new(), full: false, calls: 0, bytes: 0, over_budget: false };
     loader.pages.insert(entry.clone(), split(&source));
     loader.load(&entry, None, &[], &mut Vec::new());
-    let Loader { pages, slides, full, .. } = loader;
+    let Loader { pages, slides, full, over_budget, .. } = loader;
     if full {
         run.notice(NoticeKind::LeftOut, format!("The talk imports more than {MAX_SLIDES} slides, so the rest were left out."));
+    }
+    if over_budget {
+        run.notice(NoticeKind::LeftOut, format!("The talk's imports go past the most that's followed ({MAX_IMPORTS} imports, {} MiB), so those past it are labelled boxes.", MAX_IMPORTED_BYTES / (1024 * 1024)));
     }
     let headmatter: Vec<(String, Value)> = pages.get(&entry).and_then(|page| page.first()).and_then(|slide| slide.front.as_ref().ok()).map(|front| front.entries().to_vec()).unwrap_or_default();
     let markdown = write_talk(&mut run, &slides, &headmatter);
@@ -1034,7 +1296,9 @@ pub fn import(args: &ImportArgs, files: &Bundle) -> Result<(Bundle, Report), Str
 }
 
 /// A file's text, as Slidev reads it: UTF-8, with no byte order mark, and with its line
-/// endings and NULs made ones the format can hold.
+/// endings and NULs made ones the format can hold. A lone `\r` is made a line ending too,
+/// where Slidev's splitter sees none: Markdown, ours as well as Markdown-it, ends a line
+/// there, and a line our splitter can't see could otherwise end a slide or a fence.
 fn text_of(data: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(data).ok()?;
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
@@ -1047,25 +1311,43 @@ struct Loader<'r, 'a> {
     pages: BTreeMap<String, Vec<SlidevSlide>>,
     slides: Vec<Loaded>,
     full: bool,
+    /// How many imports have been followed, and how much they brought in.
+    calls: usize,
+    bytes: usize,
+    over_budget: bool,
 }
 
 impl Loader<'_, '_> {
     fn load(&mut self, path: &str, range: Option<&str>, over: &[(String, Value)], chain: &mut Vec<String>) {
         let total = self.pages.get(path).map_or(0, Vec::len);
+        let imported = !chain.is_empty();
         for index in range_of(total, range) {
             if self.slides.len() >= MAX_SLIDES {
                 self.full = true;
                 return;
             }
-            let Some(slide) = self.pages.get(path).and_then(|page| page.get(index - 1)).cloned() else { continue };
+            let Some(slide) = self.pages.get(path).and_then(|page| page.get(index - 1)) else { continue };
             let (own, front_error) = match &slide.front {
                 Ok(front) => (front.entries().to_vec(), None),
                 Err(error) => (Vec::new(), Some(error.clone())),
             };
             let Some(src) = get_text(&own, "src").filter(|src| !src.trim().is_empty()).map(str::to_string) else {
-                self.slides.push(Loaded { front: merged(&own, over), front_error, content: slide.content, note: slide.note, file: path.to_string(), unread: None });
+                let size = slide.content.len() + slide.note.as_ref().map_or(0, String::len);
+                if imported && self.bytes + size > MAX_IMPORTED_BYTES {
+                    let raw = capped(&slide.raw);
+                    self.over_budget = true;
+                    self.slides.push(Loaded { front: merged(&own, over), front_error, content: String::new(), note: None, file: path.to_string(), unread: Some((path.to_string(), Unread::TooMuch, raw)) });
+                    continue;
+                }
+                if imported {
+                    self.bytes += size;
+                }
+                let (content, note) = (slide.content.clone(), slide.note.clone());
+                self.slides.push(Loaded { front: merged(&own, over), front_error, content, note, file: path.to_string(), unread: None });
                 continue;
             };
+            // What a labelled box would hold, kept short: the import itself is at its start.
+            let raw = capped(&slide.raw);
             let without_src: Vec<(String, Value)> = own.iter().filter(|(key, _)| key != "src").cloned().collect();
             let over = merged(&without_src, over);
             let mut parts = src.split('#');
@@ -1074,9 +1356,11 @@ impl Loader<'_, '_> {
             let target = if let Some(rooted) = raw_path.strip_prefix('/') { normalized(rooted) } else { normalized(&format!("{}{raw_path}", folder_of(path))) };
             let unread = match &target {
                 None => Some(Unread::Outside),
+                Some(target) if !safe_name(target) => Some(Unread::Outside),
                 Some(target) if target == path || chain.iter().any(|file| file == target) => Some(Unread::Loop),
                 Some(_) if chain.len() >= MAX_IMPORT_DEPTH => Some(Unread::TooDeep),
-                Some(target) if !safe_name(target) || !self.run.files.contains_key(target.as_str()) => Some(Unread::Missing),
+                Some(_) if self.calls >= MAX_IMPORTS || self.bytes > MAX_IMPORTED_BYTES => Some(Unread::TooMuch),
+                Some(target) if !self.run.files.contains_key(target.as_str()) => Some(Unread::Missing),
                 Some(target) => {
                     if !self.pages.contains_key(target) {
                         match self.run.files.get(target.as_str()).and_then(|data| text_of(data)) {
@@ -1084,7 +1368,7 @@ impl Loader<'_, '_> {
                                 self.pages.insert(target.clone(), split(&text));
                             }
                             None => {
-                                self.slides.push(Loaded { front: over, front_error, content: String::new(), note: None, file: path.to_string(), unread: Some((src, Unread::NotText, slide.raw)) });
+                                self.slides.push(Loaded { front: over, front_error, content: String::new(), note: None, file: path.to_string(), unread: Some((src, Unread::NotText, raw)) });
                                 continue;
                             }
                         }
@@ -1095,17 +1379,31 @@ impl Loader<'_, '_> {
             };
             match (unread, target) {
                 (None, Some(target)) => {
+                    self.calls += 1;
                     chain.push(path.to_string());
                     self.load(&target, part_range, &over, chain);
                     chain.pop();
                 }
                 (why, _) => {
                     let why = why.unwrap_or(Unread::Missing);
-                    self.slides.push(Loaded { front: over, front_error, content: String::new(), note: None, file: path.to_string(), unread: Some((src, why, slide.raw)) });
+                    self.over_budget |= why == Unread::TooMuch;
+                    self.slides.push(Loaded { front: over, front_error, content: String::new(), note: None, file: path.to_string(), unread: Some((src, why, raw)) });
                 }
             }
         }
     }
+}
+
+/// `text` as a labelled box holds an import's slide: no more than its first few KiB.
+fn capped(text: &str) -> String {
+    if text.len() <= MAX_PLACEHOLDER_SLIDE {
+        return text.to_string();
+    }
+    let mut end = MAX_PLACEHOLDER_SLIDE;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n…", &text[..end])
 }
 
 /// Our layout for Slidev's `layout`, and what's said when it isn't the same.
@@ -1200,7 +1498,7 @@ fn write_talk(run: &mut Run, slides: &[Loaded], headmatter: &[(String, Value)]) 
             run.notice(NoticeKind::Approximation, format!("This slide's settings can't be read as YAML ({}), so they were ignored.", shortened(error, 200)));
         }
         let has_image = get_text(&slide.front, "image").is_some();
-        let layout_name = get_text(&slide.front, "layout").map(str::to_string).or_else(|| default_layout.clone()).unwrap_or_else(|| if Some(index) == first_shown { "cover".to_string() } else { "default".to_string() });
+        let layout_name = get_text(&slide.front, "layout").filter(|layout| !layout.trim().is_empty()).map(str::to_string).or_else(|| default_layout.clone().filter(|layout| !layout.trim().is_empty())).unwrap_or_else(|| if Some(index) == first_shown { "cover".to_string() } else { "default".to_string() });
         let (layout, layout_notice) = our_layout(layout_name.trim(), has_image);
         if let Some(text) = layout_notice {
             run.notice(NoticeKind::Approximation, text);
@@ -1239,6 +1537,7 @@ fn write_talk(run: &mut Run, slides: &[Loaded], headmatter: &[(String, Value)]) 
                     Unread::Loop => "import themselves",
                     Unread::TooDeep => "are imported too many files deep",
                     Unread::NotText => "aren't UTF-8 text",
+                    Unread::TooMuch => "are past the most the import follows",
                 };
                 let src = shortened(src, 120);
                 vec![convert.placeholder(&format!("the slides of {src}"), raw, &format!("The slides of {src} {what}"), true)]
@@ -1277,13 +1576,13 @@ fn write_talk(run: &mut Run, slides: &[Loaded], headmatter: &[(String, Value)]) 
     }
     let look = run.look.clone().unwrap_or_default();
     let fonts = get(headmatter, "fonts");
-    let font_of = |key: &str| fonts.and_then(|fonts| fonts.get(key)).and_then(Value::texts).and_then(|names| names.split(',').next().map(|name| name.trim().trim_matches(['"', '\'']).to_string())).filter(|name| !name.is_empty());
+    let font_of = |key: &str| fonts.and_then(|fonts| fonts.get(key)).and_then(Value::texts).and_then(|names| names.split(',').next().map(escape::font_name)).filter(|name| !name.is_empty());
     for (key, value) in [
         ("color.background", look.background.clone()),
         ("color.text", look.text.clone()),
         ("color.accent", look.accent.clone()),
-        ("font", font_of("sans").or(look.font.clone())),
-        ("font.mono", font_of("mono").or(look.mono.clone())),
+        ("font", font_of("sans").or(look.font.as_deref().map(escape::font_name))),
+        ("font.mono", font_of("mono").or(look.mono.as_deref().map(escape::font_name))),
     ] {
         if let Some(value) = value.map(|value| setting_value(&value)).filter(|value| !value.is_empty()) {
             talk.push((key.to_string(), value));
@@ -1333,22 +1632,26 @@ fn assemble(run: &mut Run, mut slides: Vec<OurSlide>) -> String {
             slide.notes = None;
         }
     }
-    for round in 0..2 {
-        let markdown = slides.iter().map(slide_text).collect::<Vec<_>>().join("\n");
-        let talk = parse_talk(&markdown);
-        let broken: Vec<(usize, String)> = talk.slides.iter().enumerate().filter_map(|(index, slide)| slide.error.as_ref().map(|error| (index, error.message.clone()))).collect();
-        if broken.is_empty() || talk.slides.len() != slides.len() || round == 1 {
-            return markdown;
-        }
-        for (index, message) in broken {
-            run.slide = index + 1;
-            run.notice(NoticeKind::LeftOut, format!("This slide can't be carried over as it was ({message}), so what's on it was left out."));
-            if let Some(slide) = slides.get_mut(index) {
-                slide.body = "This slide couldn't be carried over from Slidev.".to_string();
-                slide.notes = None;
-            }
+    let markdown = slides.iter().map(slide_text).collect::<Vec<_>>().join("\n");
+    let talk = parse_talk(&markdown);
+    let broken: Vec<(usize, String)> = if talk.slides.len() == slides.len() {
+        talk.slides.iter().enumerate().filter_map(|(index, slide)| slide.error.as_ref().map(|error| (index, error.message.clone()))).collect()
+    } else {
+        // Never seen: the slides are each checked above. Should it happen, none is trusted.
+        (0..slides.len()).map(|index| (index, "it runs into the slides around it".to_string())).collect()
+    };
+    if broken.is_empty() {
+        return markdown;
+    }
+    for (index, message) in broken {
+        run.slide = index + 1;
+        run.notice(NoticeKind::LeftOut, format!("This slide can't be carried over as it was ({message}), so what's on it was left out."));
+        if let Some(slide) = slides.get_mut(index) {
+            slide.body = "This slide couldn't be carried over from Slidev.".to_string();
+            slide.notes = None;
         }
     }
+    // Each slide is now a sentence and settings, which always read.
     slides.iter().map(slide_text).collect::<Vec<_>>().join("\n")
 }
 
@@ -1598,8 +1901,8 @@ impl Convert<'_, '_> {
             extras = more;
             Item::Heading(format!("{level} {text}"))
         } else if indent_of(first).0 >= 4 {
-            // Code by its indent, which reads the same in ours.
-            block(chunk.to_string())
+            // Code by its indent, written fenced, so it's read as code whatever is around it.
+            block(fenced("", "", &dedented(chunk)))
         } else if list_marker(first).is_some() {
             let mut text = String::new();
             for (index, item) in list_items(chunk).iter().enumerate() {
@@ -1630,6 +1933,7 @@ impl Convert<'_, '_> {
         let mut out = String::with_capacity(text.len() + 16);
         let mut extras = Vec::new();
         let mut stack: Vec<Inline> = Vec::new();
+        let mut searches = Searches::default();
         let mut at = 0;
         while at < bytes.len() {
             match bytes[at] {
@@ -1640,7 +1944,7 @@ impl Convert<'_, '_> {
                 }
                 b'`' => {
                     let run = bytes[at..].iter().take_while(|byte| **byte == b'`').count();
-                    match closing_run(text, at + run, run) {
+                    match searches.runs.closing(text, at + run, run) {
                         Some(close) => {
                             let span = &text[at..close + run];
                             if span.contains('\n') {
@@ -1662,12 +1966,12 @@ impl Convert<'_, '_> {
                     out.push('\n');
                     at += 1;
                 }
-                b'{' if !self.v_pre && bytes.get(at + 1) == Some(&b'{') => match text[at + 2..].find("}}") {
+                b'{' if !self.v_pre && bytes.get(at + 1) == Some(&b'{') => match searches.braces.find(text, at + 2, "}}") {
                     Some(end) => {
-                        let expression = &text[at..at + 2 + end + 2];
+                        let expression = &text[at..end + 2];
                         let short = shortened(expression, 100);
                         extras.push(self.placeholder(&format!("the expression {short}"), expression, &format!("The expression {short} isn't converted"), false));
-                        at += 2 + end + 2;
+                        at = end + 2;
                     }
                     None => {
                         write_open(&mut out, &mut stack);
@@ -1675,8 +1979,8 @@ impl Convert<'_, '_> {
                         at += 2;
                     }
                 },
-                b'<' => at = self.inline_tag(text, at, one_line, &mut out, &mut stack, &mut extras),
-                b'!' if bytes.get(at + 1) == Some(&b'[') => match self.inline_image(text, at, &mut extras) {
+                b'<' => at = self.inline_tag(text, at, one_line, &mut out, &mut stack, &mut extras, &mut searches),
+                b'!' if bytes.get(at + 1) == Some(&b'[') => match self.inline_image(text, at, &mut extras, &mut searches) {
                     Some((written, end)) => {
                         write_open(&mut out, &mut stack);
                         out.push_str(&written);
@@ -1704,16 +2008,19 @@ impl Convert<'_, '_> {
     }
 
     /// Reads the `<` at `at`, writes what it stands for, and gives where reading goes on.
-    fn inline_tag(&mut self, text: &str, at: usize, one_line: bool, out: &mut String, stack: &mut Vec<Inline>, extras: &mut Vec<Item>) -> usize {
+    #[allow(clippy::too_many_arguments)]
+    fn inline_tag(&mut self, text: &str, at: usize, one_line: bool, out: &mut String, stack: &mut Vec<Inline>, extras: &mut Vec<Item>, searches: &mut Searches) -> usize {
         let rest = &text[at..];
-        if let Some(comment) = rest.strip_prefix("<!--")
-            && let Some(end) = comment.find("-->")
+        if rest.starts_with("<!--")
+            && let Some(end) = searches.comment.find(text, at + 4, "-->")
         {
             self.notice(NoticeKind::LeftOut, "A comment in the slide, which Slidev never shows, was left out.".to_string());
-            return at + 4 + end + 3;
+            return end + 3;
         }
-        // An autolink, written as a link of ours.
-        if let Some(end) = rest.find('>')
+        // An autolink, written as a link of ours. It holds no space or `<`, so it's looked for
+        // no further than one.
+        let autolink_end = rest.bytes().skip(1).position(|byte| matches!(byte, b'>' | b' ' | b'<' | b'\n' | b'\t')).map(|at| at + 1).filter(|end| rest.as_bytes()[*end] == b'>');
+        if let Some(end) = autolink_end
             && let Some(url) = rest.get(1..end)
             && !url.contains([' ', '<', '\n', '\t'])
             && (url.split_once(':').is_some_and(|(scheme, _)| scheme.len() >= 2 && scheme.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'.' | b'-'))) || (url.contains('@') && !url.starts_with('@')))
@@ -1741,10 +2048,7 @@ impl Convert<'_, '_> {
         let comes_in = matches!(lower.as_str(), "v-click" | "v-after" | "vclick" | "vafter") || timing.at.is_some() || timing.motion.is_some();
         if comes_in {
             let at_value = if matches!(lower.as_str(), "v-click" | "vclick") {
-                match tag.attr("at") {
-                    Some(value) => self.read_at(value, "at"),
-                    None => Some(At::After(1)),
-                }
+                self.at_prop(&tag)
             } else if matches!(lower.as_str(), "v-after" | "vafter") {
                 Some(At::After(0))
             } else {
@@ -1756,7 +2060,8 @@ impl Convert<'_, '_> {
             self.notice(NoticeKind::Approximation, "Something in a line of text comes in on a click in Slidev, and here it is shown from the start.".to_string());
         }
         let push = |stack: &mut Vec<Inline>, open: String, close: String| {
-            if !tag.self_closing {
+            // No line holds more than this; past it a tag's formatting is let go.
+            if !tag.self_closing && stack.len() < MAX_INLINE_DEPTH {
                 stack.push(Inline { name: tag.name.clone(), open, close, written: false });
             }
         };
@@ -1789,12 +2094,11 @@ impl Convert<'_, '_> {
                 }
             }
             "code" => {
-                let close = text[tag.end..].find("</code>").or_else(|| text[tag.end..].find("</CODE>"));
-                if let Some(close) = close {
-                    let inner = strip_tags(&text[tag.end..tag.end + close]);
+                if let Some(close) = searches.code.find_folded(text, tag.end, "</code>") {
+                    let inner = strip_tags(&text[tag.end..close]);
                     write_open(out, stack);
                     out.push_str(&code_span(&html::decode(&inner)));
-                    return tag.end + close + "</code>".len();
+                    return close + "</code>".len();
                 }
                 push(stack, String::new(), String::new());
             }
@@ -1818,14 +2122,9 @@ impl Convert<'_, '_> {
                 push(stack, String::new(), String::new());
             }
             _ => {
-                // A component or an element that isn't ours: what's in it is kept, and the
-                // element itself is in a labelled box after the block.
-                let line_end = line_at(text, tag.end).0;
-                let line = &text[..line_end];
-                let source = match element_end(line, &tag) {
-                    Some((_, end)) => &text[at..end],
-                    None => &text[at..tag.end],
-                };
+                // A component or an element that isn't ours: what's in it is kept as text, and
+                // its tag is in a labelled box after the block.
+                let source = &text[at..tag.end];
                 extras.push(self.element_placeholder(&tag.name, None, source, MAX_NESTING, false));
                 push(stack, String::new(), String::new());
             }
@@ -1835,28 +2134,34 @@ impl Convert<'_, '_> {
 
     /// The image `![alt](url)` at `at`, written with its picture's name under `assets/`, and
     /// where it ends. One whose picture isn't in the talk is a labelled box.
-    fn inline_image(&mut self, text: &str, at: usize, extras: &mut Vec<Item>) -> Option<(String, usize)> {
-        let rest = &text[at..];
-        let close = rest.find("](")?;
-        let alt = &rest[2..close];
-        if alt.contains('\n') {
+    fn inline_image(&mut self, text: &str, at: usize, extras: &mut Vec<Item>, searches: &mut Searches) -> Option<(String, usize)> {
+        let close = searches.label.find(text, at + 2, "](")?;
+        if searches.alt_line.find(text, at + 2, "\n").is_some_and(|line| line < close) {
             return None;
         }
+        let alt = &text[at + 2..close];
         let target_start = close + 2;
-        let target_end = target_start + rest[target_start..].find(')')?;
-        let target = &rest[target_start..target_end];
-        if target.contains('\n') {
+        let target_end = searches.paren.find(text, target_start, ")")?;
+        if searches.target_line.find(text, target_start, "\n").is_some_and(|line| line < target_end) {
             return None;
         }
-        let (url, title) = match target.trim().split_once(char::is_whitespace) {
+        let target = text[target_start..target_end].trim();
+        let (url, title) = match target.split_once(char::is_whitespace) {
             Some((url, title)) => (url, Some(title.trim())),
-            None => (target.trim(), None),
+            None => (target, None),
         };
-        let source = &rest[..target_end + 1];
-        let end = at + target_end + 1;
+        let source = &text[at..=target_end];
+        let end = target_end + 1;
         match self.resolve(url) {
             Ok(name) => {
-                let title = title.map(|title| format!(" {title}")).unwrap_or_default();
+                let title = match title.map(link_title) {
+                    None => String::new(),
+                    Some(Some(title)) => format!(" {title}"),
+                    Some(None) => {
+                        self.notice(NoticeKind::LeftOut, "A picture's title can't be read as one, so it was left out.".to_string());
+                        String::new()
+                    }
+                };
                 Some((format!("![{}]({name}{title})", self.inline(alt, true).0), end))
             }
             Err(miss) => {
@@ -1965,6 +2270,17 @@ impl Convert<'_, '_> {
         }
         self.notice(NoticeKind::Approximation, format!("{name}=\"{}\" isn't a click this can read, so it is taken as the next click.", shortened(value, 80)));
         Some(At::After(1))
+    }
+
+    /// A component's `at`, as written or bound (`:at`, `v-bind:at`), or `+1`.
+    fn at_prop(&mut self, tag: &OpenTag) -> Option<At> {
+        if let Some(value) = tag.attr("at") {
+            return self.read_at(value, "at");
+        }
+        match tag.attr(":at").or_else(|| tag.attr("v-bind:at")) {
+            Some(value) => self.directive(Some(value), "at"),
+            None => Some(At::After(1)),
+        }
     }
 
     /// An `at` written as text, or a notice that it can't be read and nothing.
@@ -2088,10 +2404,7 @@ impl Convert<'_, '_> {
     /// `<v-click>`: what's in it comes in on one click.
     fn v_click(&mut self, tag: &OpenTag, inner: &str, depth: usize) -> Vec<Item> {
         let children = self.content(inner, depth + 1, false);
-        let at = match tag.attr("at") {
-            Some(value) => self.read_at(value, "at"),
-            None => Some(At::After(1)),
-        };
+        let at = self.at_prop(tag);
         if !children.iter().any(Item::counts) {
             return children;
         }
@@ -2120,21 +2433,18 @@ impl Convert<'_, '_> {
     /// `<v-clicks>`: each thing in it, or each item of a list alone in it, comes in on a
     /// click of its own, numbered as Slidev's `VClicks` numbers them.
     fn v_clicks(&mut self, tag: &OpenTag, inner: &str, depth: usize) -> Vec<Item> {
-        let at = match tag.attr("at") {
-            Some(value) => self.read_at(value, "at"),
-            None => Some(At::After(1)),
-        };
-        let every = match tag.attr("every").map(js_number) {
+        let at = self.at_prop(tag);
+        let every_text = number_prop(tag, "every");
+        let every = match every_text.as_deref().map(js_number) {
             None => 1.0,
             Some(Some(every)) if every >= 1.0 => every,
             Some(_) => {
-                self.notice(NoticeKind::Approximation, format!("every=\"{}\" isn't a number of things to show at once, so they come in one at a time.", shortened(tag.attr("every").unwrap_or(""), 40)));
+                self.notice(NoticeKind::Approximation, format!("every=\"{}\" isn't a number of things to show at once, so they come in one at a time.", shortened(every_text.as_deref().unwrap_or(""), 40)));
                 1.0
             }
         };
-        if tag.attr("depth").and_then(js_number).is_some_and(|depth| depth > 1.0) {
-            self.notice(NoticeKind::Approximation, "Only a list's own items come in a click at a time, not the items under them.".to_string());
-        }
+        // How many levels of a list come in a click at a time, as `+depth` reads it.
+        let levels = number_prop(tag, "depth").as_deref().and_then(js_number).map_or(1, |levels| levels.ceil().clamp(1.0, MAX_LIST_LEVELS as f64) as usize);
         let hide = tag.has("hide");
         let raws: Vec<Raw> = scan(inner).into_iter().filter(|raw| !matches!(raw, Raw::Comment)).collect();
         let Some(at) = at else {
@@ -2150,15 +2460,7 @@ impl Convert<'_, '_> {
         };
         // Each piece, the items that make it up, and the click it starts at.
         let mut pieces: Vec<(Vec<Item>, i64)> = Vec::new();
-        let mut done = 0i64;
-        let mut count = 0i64;
-        let mut next_click = |clicks: &mut Clicks| {
-            count += 1;
-            let show = at_number + (count as f64 / every).ceil() as i64 - 1;
-            let value = if relative { At::After(show - done) } else { At::On(show) };
-            done = show;
-            clicks.since(value, 1)
-        };
+        let mut counter = Counter { at: at_number, every, relative, count: 0, done: 0 };
         let list = match raws.as_slice() {
             [Raw::Markdown(chunk)] if list_marker(chunk.split('\n').next().unwrap_or("")).is_some() && indent_of(chunk).0 < 4 => Some(*chunk),
             _ => None,
@@ -2168,6 +2470,7 @@ impl Convert<'_, '_> {
             _ => None,
         };
         let mut whole_list = None;
+        let mut nested = false;
         if let Some(chunk) = list {
             let mut text = String::new();
             let mut extras = Vec::new();
@@ -2177,9 +2480,18 @@ impl Convert<'_, '_> {
                     text.push('\n');
                 }
                 text.push_str(&written);
-                let start = next_click(&mut self.clicks);
+                // As `VClicks` numbers a list `depth` levels deep: each item takes its number
+                // before the items under it, and is mounted, and counted, after them.
+                let show = counter.index();
+                if levels > 1 {
+                    nested |= count_nested(item, 2, levels, &mut counter, &mut self.clicks);
+                }
+                let start = counter.register(show, &mut self.clicks);
                 pieces.push((vec![Item::List { text: no_breaks(written.trim_end()) }], start));
                 extras.extend(more);
+            }
+            if nested {
+                self.notice(NoticeKind::Approximation, "The items under a list's items come in a click at a time in Slidev, and here with the item they're under.".to_string());
             }
             whole_list = Some(no_breaks(&text));
             if let Some(last) = pieces.last_mut() {
@@ -2188,10 +2500,10 @@ impl Convert<'_, '_> {
         } else if let Some(chunk) = table {
             let items = self.markdown(chunk);
             let rows = chunk.trim_end().lines().count().saturating_sub(2);
-            let starts: Vec<i64> = (0..rows).map(|_| next_click(&mut self.clicks)).collect();
+            let starts: Vec<i64> = (0..rows).map(|_| counter.next(&mut self.clicks)).collect();
             pieces.push((items, starts.first().copied().unwrap_or(0)));
-            let from_one = !hide && starts.iter().enumerate().all(|(index, start)| *start == index as i64 + 1);
-            let size = at_number + (count as f64 / every).ceil() as i64 - 1 - done;
+            let from_one = !hide && rows as i64 <= MAX_CLICK && starts.iter().enumerate().all(|(index, start)| *start == index as i64 + 1);
+            let size = counter.gap();
             self.clicks.gap(size);
             let whole = written(&pieces[0].0);
             let boxed = match self.our_click(starts.first().copied().unwrap_or(0)) {
@@ -2220,18 +2532,18 @@ impl Convert<'_, '_> {
                 let mut current: Vec<Item> = Vec::new();
                 for item in items {
                     if item.counts() && !current.is_empty() {
-                        let start = next_click(&mut self.clicks);
+                        let start = counter.next(&mut self.clicks);
                         pieces.push((std::mem::take(&mut current), start));
                     }
                     current.push(item);
                 }
                 if !current.is_empty() {
-                    let start = next_click(&mut self.clicks);
+                    let start = counter.next(&mut self.clicks);
                     pieces.push((current, start));
                 }
             }
         }
-        let size = at_number + (count as f64 / every).ceil() as i64 - 1 - done;
+        let size = counter.gap();
         self.clicks.gap(size);
         if pieces.is_empty() {
             return Vec::new();
@@ -2241,7 +2553,7 @@ impl Convert<'_, '_> {
             let items: Vec<Item> = pieces.into_iter().flat_map(|(items, _)| items).collect();
             return vec![block(written(&items))];
         }
-        let from_one = pieces.iter().enumerate().all(|(index, (items, start))| *start == index as i64 + 1 && items.len() == 1);
+        let from_one = !nested && pieces.len() as i64 <= MAX_CLICK && pieces.iter().enumerate().all(|(index, (items, start))| *start == index as i64 + 1 && items.len() == 1);
         let whole = match whole_list {
             Some(list) => {
                 let extras: Vec<Item> = pieces.iter().flat_map(|(items, _)| items.iter().skip(1).cloned()).collect();
@@ -2485,6 +2797,40 @@ fn capitalised(text: &str) -> String {
     }
 }
 
+/// A link's title, as written after its target: in double or single quotes, or in brackets,
+/// written again in double quotes with what could end it or start a tag escaped. `None` for
+/// one that isn't a title.
+fn link_title(title: &str) -> Option<String> {
+    let inner = [('"', '"'), ('\'', '\''), ('(', ')')].iter().find_map(|(open, close)| title.strip_prefix(*open)?.strip_suffix(*close).filter(|_| title.len() >= 2))?;
+    let mut out = String::from("\"");
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            // An escape is kept as written.
+            '\\' => match chars.next() {
+                Some(next) if next.is_ascii_punctuation() => {
+                    out.push('\\');
+                    out.push(next);
+                }
+                next => {
+                    out.push_str("\\\\");
+                    if let Some(next) = next.filter(|next| !next.is_control()) {
+                        out.push(next);
+                    }
+                }
+            },
+            '"' | '<' | '`' | '&' => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if c.is_control() => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    Some(out)
+}
+
 /// `text` with any tags taken out, as the text of what they mark.
 fn strip_tags(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -2511,6 +2857,16 @@ fn no_breaks(text: &str) -> String {
     text.split('\n').map(|line| if line.trim_end_matches(' ') == "---" { "***" } else { line }).collect::<Vec<_>>().join("\n")
 }
 
+/// A number a component is given, as written or bound to a number or a string of one.
+fn number_prop(tag: &OpenTag, name: &str) -> Option<String> {
+    if let Some(value) = tag.attr(name) {
+        return Some(value.to_string());
+    }
+    let bound = tag.attr(&format!(":{name}")).or_else(|| tag.attr(&format!("v-bind:{name}")))?.trim();
+    let unquoted = ['\'', '"', '`'].iter().find_map(|quote| bound.strip_prefix(*quote).and_then(|rest| rest.strip_suffix(*quote)));
+    Some(unquoted.unwrap_or(bound).to_string())
+}
+
 /// Whether a line underlines a heading.
 fn is_setext(line: &str) -> bool {
     let (column, lead) = indent_of(line);
@@ -2534,7 +2890,7 @@ fn list_items(chunk: &str) -> Vec<&str> {
     while at < chunk.len() {
         let (end, next) = line_at(chunk, at);
         let line = &chunk[at..end];
-        if at > start && list_marker(line).is_some() && indent_of(line).0 <= base {
+        if at > start && marker_length(line).is_some() && indent_of(line).0 <= base {
             items.push(chunk[start..at].trim_end_matches('\n'));
             start = at;
         }
@@ -2546,6 +2902,10 @@ fn list_items(chunk: &str) -> Vec<&str> {
 
 /// Opens what's on the stack that hasn't been yet, as text is about to be written in it.
 fn write_open(out: &mut String, stack: &mut [Inline]) {
+    // What isn't open yet is always at the top.
+    if stack.last().is_none_or(|open| open.written) {
+        return;
+    }
     for open in stack.iter_mut().filter(|open| !open.written) {
         out.push_str(&open.open);
         open.written = true;
