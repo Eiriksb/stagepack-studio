@@ -248,8 +248,8 @@ impl WorkspaceView {
             let imported = cx
                 .background_spawn(async move {
                     // Held in use until the import is done, so that no update swaps it meanwhile.
-                    let _in_use = crate::addons::in_use(&app_folder);
-                    match crate::addons::load(&app_folder) {
+                    let (_in_use, loaded) = crate::addons::load_in_use(&app_folder);
+                    match loaded {
                         Some(crate::addons::Installed { state: crate::addons::InstalledState::Ready(addon), .. }) => {
                             crate::addons::import_slidev(&path, &addon)
                         }

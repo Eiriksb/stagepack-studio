@@ -1737,8 +1737,8 @@ impl WorkspaceView {
                 move |out: &Path| {
                     // Loaded here, off the window's thread, and checked again as it is; and held
                     // in use until the export is done, so that no update swaps it meanwhile.
-                    let _in_use = crate::addons::in_use(&app_folder);
-                    let addon = match crate::addons::load(&app_folder) {
+                    let (_in_use, loaded) = crate::addons::load_in_use(&app_folder);
+                    let addon = match loaded {
                         Some(crate::addons::Installed { state: crate::addons::InstalledState::Ready(addon), .. }) => addon,
                         Some(crate::addons::Installed { state: crate::addons::InstalledState::Damaged(sentence), .. }) => {
                             return Err(format!("The Slidev add-on can't be used: {sentence}"));

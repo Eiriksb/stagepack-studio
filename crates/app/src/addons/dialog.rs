@@ -72,6 +72,8 @@ pub struct AddOns {
     offered: Option<Index>,
     /// The Get, check or update going on, if one is.
     fetching: Option<Fetching>,
+    /// A release downloaded already, kept as the add-on was busy when it was to be installed.
+    kept: Option<(Index, Arc<Vec<u8>>)>,
 }
 
 /// A Get, a check or an update going on, on a thread of its own.
@@ -92,8 +94,9 @@ enum Job {
     Get,
     /// Whether the latest release is later than what's installed.
     Check,
-    /// The release a check found, downloaded and installed.
-    Update(Index),
+    /// The release a check found, downloaded and installed; or installed from the bytes kept
+    /// of it, downloaded already, when an export or an import held the add-on last time.
+    Update(Index, Option<Arc<Vec<u8>>>),
 }
 
 /// What the thread doing a [`Job`] tells the dialog.
@@ -103,6 +106,9 @@ enum Told {
     Checked(Index),
     Installed,
     Failed(String),
+    /// The download of the release was had, but an export or an import held the add-on, so it
+    /// is kept for the next *Update*.
+    Busy(Index, Arc<Vec<u8>>),
 }
 
 /// What the dialog's state line says of `status`.
@@ -117,7 +123,7 @@ pub fn state_words(status: &Status) -> String {
 impl AddOns {
     pub fn new(app_folder: Option<PathBuf>) -> AddOns {
         let status = app_folder.as_deref().map_or(Status::NotInstalled, super::status);
-        AddOns { app_folder, status, said: None, busy: false, news: None, offered: None, fetching: None }
+        AddOns { app_folder, status, said: None, busy: false, news: None, offered: None, fetching: None, kept: None }
     }
 
     /// Starts `job` on a thread of its own, the row saying how far it has got.
@@ -130,7 +136,8 @@ impl AddOns {
             return;
         };
         let progress = match &job {
-            Job::Update(index) => downloading_words(0, index.size),
+            Job::Update(_, Some(_)) => INSTALLING.to_string(),
+            Job::Update(index, None) => downloading_words(0, index.size),
             Job::Get | Job::Check => CHECKING.to_string(),
         };
         let cancel = Arc::new(AtomicBool::new(false));
@@ -196,7 +203,7 @@ impl AddOns {
             }
             Told::Installed => {
                 self.fetching = None;
-                (self.said, self.news, self.offered) = (None, None, None);
+                (self.said, self.news, self.offered, self.kept) = (None, None, None, None);
                 self.look_again(cx);
             }
             Told::Failed(sentence) => {
@@ -204,6 +211,15 @@ impl AddOns {
                     (self.news, self.offered) = (before.news, before.offered);
                 }
                 self.said = Some(sentence.replace(['\n', '\r'], " ").into());
+                // Another window may have installed meanwhile.
+                self.look_again(cx);
+            }
+            Told::Busy(index, bytes) => {
+                if let Some(before) = self.fetching.take() {
+                    (self.news, self.offered) = (before.news, before.offered);
+                }
+                self.said = Some(BUSY.into());
+                self.kept = Some((index, bytes));
             }
         }
         cx.notify();
@@ -221,6 +237,14 @@ impl AddOns {
     fn look_again(&mut self, cx: &mut Context<Self>) {
         if let Some(app_folder) = &self.app_folder {
             self.status = super::status(app_folder);
+        }
+        // An update on offer is no longer one once what's installed is as new.
+        let still_later = |index: &Index| matches!(&self.status, Status::Installed(installed) if fetch::newer(installed, &index.version));
+        if self.offered.as_ref().is_some_and(|index| !still_later(index)) {
+            (self.news, self.offered) = (None, None);
+        }
+        if self.kept.as_ref().is_some_and(|(index, _)| !still_later(index)) {
+            self.kept = None;
         }
         cx.notify();
         cx.defer(crate::workspace_view::refresh_addon_status);
@@ -262,7 +286,7 @@ impl AddOns {
                     Ok(_) => this.said = None,
                     Err(problem) => this.said = Some(problem.into()),
                 }
-                (this.news, this.offered) = (None, None);
+                (this.news, this.offered, this.kept) = (None, None, None);
                 this.status = super::status(&app_folder);
                 cx.notify();
                 cx.defer(crate::workspace_view::refresh_addon_status);
@@ -275,7 +299,7 @@ impl AddOns {
     fn remove(&mut self, cx: &mut Context<Self>) {
         let Some(app_folder) = self.app_folder.clone() else { return };
         self.said = super::remove(&app_folder).err().map(Into::into);
-        (self.news, self.offered) = (None, None);
+        (self.news, self.offered, self.kept) = (None, None, None);
         self.status = super::status(&app_folder);
         cx.notify();
         cx.defer(crate::workspace_view::refresh_addon_status);
@@ -299,36 +323,50 @@ impl Drop for AddOns {
 /// Does `job` for the add-on under `app_folder`, from `source`, telling `tell` how far it has got,
 /// until `cancel` is set; and gives what it came to.
 fn run(job: Job, app_folder: &std::path::Path, source: &fetch::Source, cancel: &AtomicBool, tell: &mpsc::Sender<Told>) -> Told {
-    let index = match job {
+    let (index, kept) = match job {
         Job::Check => return fetch::check(source, cancel).map_or_else(Told::Failed, Told::Checked),
         Job::Get => match fetch::check(source, cancel) {
-            Ok(index) => index,
+            Ok(index) => (index, None),
             Err(sentence) => return Told::Failed(sentence),
         },
-        // Said before anything is downloaded, rather than after.
-        Job::Update(_) if super::is_busy(app_folder) => return Told::Failed(BUSY.to_string()),
-        Job::Update(index) => index,
+        Job::Update(index, kept) => {
+            // Said before anything is downloaded, rather than after.
+            if super::is_busy(app_folder) {
+                return match kept {
+                    Some(bytes) => Told::Busy(index, bytes),
+                    None => Told::Failed(BUSY.to_string()),
+                };
+            }
+            (index, kept)
+        }
     };
-    // Never one that isn't later than what is installed by now, from another window or a file.
+    // Never one that isn't later than what is installed by now, from another window or a file:
+    // looked at first, so as not to download what would be refused, and again under the lock.
     if let Status::Installed(installed) = super::status(app_folder)
         && !fetch::newer(&installed, &index.version)
     {
         return Told::Failed(format!("Version {installed} is installed already, which is no older than the one on offer."));
     }
-    let _ = tell.send(Told::Progress(0, index.size));
-    let progress = |done, total| {
-        let _ = tell.send(Told::Progress(done, total));
-    };
-    let bytes = match fetch::download(source, &index, cancel, &progress) {
-        Ok(bytes) => bytes,
-        Err(sentence) => return Told::Failed(sentence),
+    let bytes = match kept {
+        Some(bytes) => bytes,
+        None => {
+            let _ = tell.send(Told::Progress(0, index.size));
+            let progress = |done, total| {
+                let _ = tell.send(Told::Progress(done, total));
+            };
+            match fetch::download(source, &index, cancel, &progress) {
+                Ok(bytes) => Arc::new(bytes),
+                Err(sentence) => return Told::Failed(sentence),
+            }
+        }
     };
     if cancel.load(Ordering::SeqCst) {
         return Told::Failed(fetch::CANCELLED.to_string());
     }
     let _ = tell.send(Told::Installing);
-    match super::install_from_bytes_unless_busy(app_folder, &bytes) {
+    match super::update_from_bytes(app_folder, &bytes) {
         Ok(_) => Told::Installed,
+        Err(sentence) if sentence == BUSY => Told::Busy(index, bytes),
         Err(sentence) => Told::Failed(sentence),
     }
 }
@@ -424,7 +462,9 @@ impl Render for AddOns {
                             this.child(Button::new(ADDON_UPDATE_ID).small().primary().label("Update").disabled(busy).on_click(cx.listener(
                                 |this, _, _, cx| {
                                     if let Some(index) = this.offered.clone() {
-                                        this.start(Job::Update(index), cx);
+                                        // What was downloaded already of it, if the add-on was busy.
+                                        let kept = this.kept.as_ref().filter(|(kept, _)| *kept == index).map(|(_, bytes)| bytes.clone());
+                                        this.start(Job::Update(index, kept), cx);
                                     }
                                 },
                             )))

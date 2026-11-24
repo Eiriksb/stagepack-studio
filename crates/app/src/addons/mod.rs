@@ -88,11 +88,14 @@ fn named_version(manifest: &[u8]) -> Option<String> {
 /// with the key the app was built with, and the Slidev it writes for is the app's.
 ///
 /// The files are read under the add-ons folder's lock, shared, so that an install swapping the
-/// folder isn't seen half done. With `wait`, it waits for an install going on to finish;
-/// without, it reads anyway, for a look that is checked again once the files change.
-fn verified(app_folder: &Path, wait: bool) -> Result<(String, Vec<u8>), (Option<String>, String)> {
+/// folder isn't seen half done, as `shared` says.
+fn verified(app_folder: &Path, shared: Shared) -> Result<(String, Vec<u8>), (Option<String>, String)> {
     let addons = app_folder.join(ADDONS_FOLDER);
-    let _shared = if wait { Lock::shared(&addons) } else { Lock::try_shared(&addons) };
+    let _shared = match shared {
+        Shared::Wait => Lock::shared(&addons),
+        Shared::Try => Lock::try_shared(&addons),
+        Shared::Held => None,
+    };
     let (manifest, wasm, sig) = read_installed(app_folder).map_err(|sentence| (None, sentence))?;
     drop(_shared);
     let version = named_version(&manifest);
@@ -101,6 +104,17 @@ fn verified(app_folder: &Path, wait: bool) -> Result<(String, Vec<u8>), (Option<
         return Err((version, wrong_slidev(&checked.slidev)));
     }
     Ok((checked.version, wasm))
+}
+
+/// How [`verified`] reads the installed files under the lock.
+#[derive(Clone, Copy)]
+enum Shared {
+    /// Waits for an install going on to finish.
+    Wait,
+    /// Reads anyway if one is going on, for a look that is checked again once the files change.
+    Try,
+    /// The caller holds the lock already, shared or not, so it isn't taken again.
+    Held,
 }
 
 /// What status and load say of an add-ons folder that is a link.
@@ -167,7 +181,7 @@ pub fn status(app_folder: &Path) -> Status {
     if let Some((_, _, status)) = looked_at.iter().find(|(folder, was, _)| folder == app_folder && *was == stamped) {
         return status.clone();
     }
-    let status = match verified(app_folder, false) {
+    let status = match verified(app_folder, Shared::Try) {
         Ok((version, _)) => Status::Installed(version),
         Err((_, sentence)) => Status::Damaged(sentence),
     };
@@ -178,13 +192,30 @@ pub fn status(app_folder: &Path) -> Status {
 
 /// The add-on installed under `app_folder`, checked and loaded, or `None` if there's none.
 pub fn load(app_folder: &Path) -> Option<Installed> {
+    load_with(app_folder, Shared::Wait)
+}
+
+/// The add-on installed under `app_folder`, checked and loaded, held in use until the [`InUse`]
+/// is dropped, as an export or an import holds it while it runs. An install cut short is put back
+/// first, and the lock is taken once only.
+pub fn load_in_use(app_folder: &Path) -> (InUse, Option<Installed>) {
+    if is_linked(app_folder) {
+        return (InUse { _shared: None }, load(app_folder));
+    }
+    let held = in_use(app_folder);
+    let loaded = load_with(app_folder, Shared::Held);
+    (held, loaded)
+}
+
+/// [`load`], reading the files as `shared` says.
+fn load_with(app_folder: &Path, shared: Shared) -> Option<Installed> {
     if is_linked(app_folder) {
         return Some(Installed { version: String::new(), state: InstalledState::Damaged(LINKED_READ.to_string()) });
     }
     if !is_there(app_folder) {
         return None;
     }
-    Some(match verified(app_folder, true) {
+    Some(match verified(app_folder, shared) {
         Ok((version, wasm)) => match loaded(&wasm, &version) {
             Ok(addon) => Installed { version, state: InstalledState::Ready(addon) },
             Err(sentence) => Installed { version, state: InstalledState::Damaged(sentence) },
@@ -231,9 +262,11 @@ pub fn install_from_bytes(app_folder: &Path, bytes: &[u8]) -> Result<Installed, 
     install(app_folder, bytes, true)
 }
 
-/// [`install_from_bytes`], unless an export, an import or another install holds the add-on just
-/// now: then it says [`BUSY`] and changes nothing, rather than wait for it.
-pub fn install_from_bytes_unless_busy(app_folder: &Path, bytes: &[u8]) -> Result<Installed, String> {
+/// [`install_from_bytes`], for *Get* and *Update*: unless an export, an import or another
+/// install holds the add-on just now, when it says [`BUSY`] rather than wait; and only if the
+/// package's signed version is later than what is installed by then, so that it never goes back.
+/// Both are found under the lock, so no install from another window slips in between.
+pub fn update_from_bytes(app_folder: &Path, bytes: &[u8]) -> Result<Installed, String> {
     install(app_folder, bytes, false)
 }
 
@@ -241,7 +274,9 @@ pub fn install_from_bytes_unless_busy(app_folder: &Path, bytes: &[u8]) -> Result
 /// just now, so that an install would have to wait for it.
 pub fn is_busy(app_folder: &Path) -> bool {
     let addons = app_folder.join(ADDONS_FOLDER);
-    addons.is_dir() && Lock::try_take(&addons).is_err()
+    // A lock file that can't be opened isn't one held: the install says what's wrong.
+    let Ok(file) = Lock::open(&addons) else { return false };
+    addons.is_dir() && file.try_lock().is_err()
 }
 
 /// What an export or an import holds while it runs the add-on, so that no install or removal
@@ -258,10 +293,13 @@ pub fn in_use(app_folder: &Path) -> InUse {
     if is_linked(app_folder) {
         return InUse { _shared: None };
     }
+    // Put back before it's held, as it can't be while it is.
+    is_there(app_folder);
     InUse { _shared: Lock::shared(&app_folder.join(ADDONS_FOLDER)) }
 }
 
-/// [`install_from_bytes`], waiting for the lock if `wait`, or saying [`BUSY`] if not.
+/// [`install_from_bytes`], waiting for the lock if `wait`; or, if not, as [`update_from_bytes`]:
+/// saying [`BUSY`] rather than wait, and installing only a later version.
 fn install(app_folder: &Path, bytes: &[u8], wait: bool) -> Result<Installed, String> {
     let package = read_package(bytes, &key::addon_key())?;
     if package.manifest.slidev != SLIDEV_VERSION {
@@ -272,8 +310,17 @@ fn install(app_folder: &Path, bytes: &[u8], wait: bool) -> Result<Installed, Str
     std::fs::create_dir_all(&addons).map_err(|error| format!("The add-on couldn't be installed: the app's folder can't be written to ({error})."))?;
     refuse_links(&addons)?;
     // One install or removal at a time, from whichever window.
-    let _lock = if wait { Lock::take(&addons)? } else { Lock::try_take(&addons).map_err(|()| BUSY.to_string())? };
+    let _lock = if wait { Lock::take(&addons)? } else { Lock::take_now(&addons)? };
     put_back_cut_short_locked(app_folder);
+    if !wait
+        && let Ok((current, _)) = verified(app_folder, Shared::Held)
+        && !fetch::newer(&current, &package.manifest.version)
+    {
+        return Err(format!(
+            "Version {current} is installed already, which is no older than the {} downloaded, so it was kept.",
+            slides_components::shortened(&package.manifest.version, 40)
+        ));
+    }
     sweep_leftovers(&addons);
     let fresh = addons.join(format!(".{SLIDEV_FOLDER}-new-{}", unique()));
     let written = (|| -> std::io::Result<()> {
@@ -400,6 +447,13 @@ impl Lock {
     fn take(addons: &Path) -> Result<Lock, String> {
         let file = Lock::open(addons).map_err(|error| format!("The app's add-ons folder can't be written to ({error})."))?;
         file.lock().map_err(|error| format!("The app's add-ons folder can't be locked ({error})."))?;
+        Ok(Lock { _file: file })
+    }
+
+    /// The lock, or [`BUSY`] if something else holds it now.
+    fn take_now(addons: &Path) -> Result<Lock, String> {
+        let file = Lock::open(addons).map_err(|error| format!("The app's add-ons folder can't be written to ({error})."))?;
+        file.try_lock().map_err(|_| BUSY.to_string())?;
         Ok(Lock { _file: file })
     }
 

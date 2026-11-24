@@ -5,9 +5,9 @@
 
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use stagepack_studio::addons::fetch;
@@ -22,6 +22,8 @@ pub enum Reply {
     Stall(u64, usize),
     /// Nothing at all, for a long while.
     Silent,
+    /// The head and the first half of `.0`, then the rest once `.1` is set (or after a long while).
+    Gated(Vec<u8>, Arc<AtomicBool>),
 }
 
 pub fn ok(body: impl Into<Vec<u8>>) -> Reply {
@@ -117,6 +119,17 @@ fn answer(stream: TcpStream, reply: &dyn Fn(&str) -> Reply, hits: &AtomicUsize, 
             std::thread::sleep(Duration::from_secs(30));
         }
         Reply::Silent => std::thread::sleep(Duration::from_secs(30)),
+        Reply::Gated(body, gate) => {
+            let _ = out.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes());
+            let half = body.len() / 2;
+            let _ = out.write_all(&body[..half]);
+            let _ = out.flush();
+            let start = Instant::now();
+            while !gate.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(30) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let _ = out.write_all(&body[half..]);
+        }
     }
 }
 

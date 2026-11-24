@@ -690,3 +690,60 @@ fn an_export_the_add_on_fails_says_so_in_one_sentence() {
     assert!(refused.ends_with('.') && !refused.ends_with(".."), "{refused}");
     assert_eq!(refused.matches(". ").count(), 0, "one sentence: {refused}");
 }
+
+#[test]
+fn an_addon_in_use_makes_an_update_or_removal_say_busy_and_an_install_wait() {
+    test_key();
+    let app = tempfile::tempdir().unwrap();
+    let package = |version: &str| package_signed(&answering_guest_at(&export_answer(), version), version, test_key());
+    addons::install_from_bytes(app.path(), &package("0.1.0")).unwrap();
+
+    // As an export or an import holds it, loaded through the same lock.
+    let (in_use, loaded) = addons::load_in_use(app.path());
+    assert!(matches!(loaded, Some(addons::Installed { state: InstalledState::Ready(_), .. })));
+    assert!(addons::is_busy(app.path()));
+    assert_eq!(addons::update_from_bytes(app.path(), &package("0.2.0")).err().as_deref(), Some(addons::BUSY));
+    assert_eq!(addons::remove(app.path()).err().as_deref(), Some(addons::BUSY));
+    let waiting = {
+        let (app, package) = (app.path().to_path_buf(), package("0.3.0"));
+        std::thread::spawn(move || addons::install_from_bytes(&app, &package).map(|installed| installed.version))
+    };
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(!waiting.is_finished(), "an install from a file waits for it");
+    assert_eq!(ready_version(app.path()).as_deref(), Some("0.1.0"));
+    drop(in_use);
+    assert_eq!(waiting.join().unwrap().as_deref(), Ok("0.3.0"));
+    assert!(!addons::is_busy(app.path()));
+}
+
+#[test]
+fn an_update_only_ever_goes_forward() {
+    test_key();
+    let app = tempfile::tempdir().unwrap();
+    let package = |version: &str| package_signed(&answering_guest_at(&export_answer(), version), version, test_key());
+    addons::install_from_bytes(app.path(), &package("0.2.0")).unwrap();
+    for older in ["0.2.0", "0.1.0"] {
+        let refused = addons::update_from_bytes(app.path(), &package(older)).unwrap_err();
+        assert!(refused.contains("0.2.0 is installed already") && !refused.contains('\n'), "{refused}");
+        assert_eq!(ready_version(app.path()).as_deref(), Some("0.2.0"));
+    }
+    assert_eq!(addons::update_from_bytes(app.path(), &package("0.3.0")).unwrap().version, "0.3.0");
+    // A file is the owner's own choice, and may go back.
+    assert_eq!(addons::install_from_bytes(app.path(), &package("0.1.0")).unwrap().version, "0.1.0");
+    // And with nothing installed, an update installs.
+    let fresh = tempfile::tempdir().unwrap();
+    assert_eq!(addons::update_from_bytes(fresh.path(), &package("0.1.0")).unwrap().version, "0.1.0");
+}
+
+#[test]
+fn an_install_cut_short_is_put_back_before_an_export_holds_it() {
+    test_key();
+    let app = tempfile::tempdir().unwrap();
+    addons::install_from_bytes(app.path(), &package_signed(&answering_guest_at(&export_answer(), "0.1.0"), "0.1.0", test_key())).unwrap();
+    // As an install that stopped after moving the earlier add-on aside.
+    let addons_folder = app.path().join("addons");
+    std::fs::rename(addons_folder.join("slidev"), addons_folder.join(".slidev-old-0123")).unwrap();
+    let (_in_use, loaded) = addons::load_in_use(app.path());
+    assert!(matches!(loaded, Some(addons::Installed { state: InstalledState::Ready(_), .. })));
+    assert!(addons_folder.join("slidev/addon.wasm").is_file());
+}

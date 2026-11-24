@@ -341,12 +341,12 @@ fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
     NETWORK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// What the test's server serves at a path: a file, or the first `.1` bytes of a file `.0`
-/// bytes long, and then nothing for a long while.
+/// What the test's server serves at a path: a file, or the first half of one, and the rest only
+/// once its gate is opened.
 #[derive(Clone)]
 enum Served {
     File(Vec<u8>),
-    Stalled(u64, usize),
+    Gated(Vec<u8>, std::sync::Arc<std::sync::atomic::AtomicBool>),
 }
 
 type Files = std::sync::Arc<std::sync::Mutex<Vec<(String, Served)>>>;
@@ -360,7 +360,7 @@ fn add_on_server() -> (server::Server, Files) {
         let found = held.lock().unwrap().iter().find(|(path, _)| path == asked).map(|(_, served)| served.clone());
         match found {
             Some(Served::File(body)) => server::ok(body),
-            Some(Served::Stalled(length, sent)) => server::Reply::Stall(length, sent),
+            Some(Served::Gated(body, gate)) => server::Reply::Gated(body, gate),
             None => server::Reply::Fixed(404, Vec::new(), b"not here".to_vec()),
         }
     });
@@ -373,16 +373,47 @@ fn package_at(version: &str) -> Vec<u8> {
     package_signed(&answering_guest_at(&export_answer(), version), version, test_key())
 }
 
-/// Has `server` offer the add-on at `version`, its package stalled part way if `stalled`.
-fn offer(server: &server::Server, files: &Files, version: &str, stalled: bool) {
+/// Has `server` offer the add-on at `version`.
+fn offer(server: &server::Server, files: &Files, version: &str) {
+    serve(server, files, version, None);
+}
+
+/// Has `server` offer the add-on at `version`, its package held half way until the gate given
+/// back is opened.
+fn offer_gated(server: &server::Server, files: &Files, version: &str) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    let gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    serve(server, files, version, Some(gate.clone()));
+    gate
+}
+
+fn serve(server: &server::Server, files: &Files, version: &str, gate: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) {
     let package = package_at(version);
     let index = server::index_of(server, &package, version);
     let path = index.url.strip_prefix(&server.base).unwrap().to_string();
-    let served = if stalled { Served::Stalled(package.len() as u64, package.len() / 2) } else { Served::File(package) };
+    let served = match gate {
+        Some(gate) => Served::Gated(package, gate),
+        None => Served::File(package),
+    };
     let mut files = files.lock().unwrap();
     files.clear();
     files.push(("/index.json".into(), Served::File(server::json(&index))));
     files.push((path, served));
+}
+
+fn open_gate(gate: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    gate.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Lets the work off the window's thread go on for `millis` of real time, the dialog looking at
+/// it as it does.
+fn go_on_for(typing: &Typing, cx: &mut TestAppContext, millis: u64) {
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_millis(millis) {
+        cx.executor().advance_clock(stagepack_studio::addons::dialog::FETCH_TICK);
+        cx.run_until_parked();
+        typing.settle(cx);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 fn hits(server: &server::Server) -> usize {
@@ -433,7 +464,7 @@ fn get_installs_from_the_local_server(cx: &mut TestAppContext) {
     let _one = one_at_a_time();
     test_key();
     let (server, files) = add_on_server();
-    offer(&server, &files, "0.2.0", false);
+    offer(&server, &files, "0.2.0");
     let root = tempfile::tempdir().unwrap();
     let app = root.path().join("app");
     let typing = open_start(cx, root.path());
@@ -483,7 +514,7 @@ fn check_for_updates_offers_a_newer_version_only(cx: &mut TestAppContext) {
 
     // The same version, and an older one, are the newest.
     for offered in ["0.2.0", "0.1.0"] {
-        offer(&server, &files, offered, false);
+        offer(&server, &files, offered);
         let before = hits(&server);
         click_on(&typing, cx, ADDON_CHECK_ID);
         wait_until(&typing, cx, "the check", |typing, cx| label_of(typing, cx, ADDON_NEWS_ID).is_some());
@@ -492,7 +523,7 @@ fn check_for_updates_offers_a_newer_version_only(cx: &mut TestAppContext) {
         assert_eq!(hits(&server), before + 1, "only the index was asked for");
     }
 
-    offer(&server, &files, "0.3.0", false);
+    offer(&server, &files, "0.3.0");
     click_on(&typing, cx, ADDON_CHECK_ID);
     wait_until(&typing, cx, "the check", |typing, cx| label_of(typing, cx, ADDON_NEWS_ID).as_deref() == Some("Version 0.3.0 is available"));
     assert!(shows(&typing, cx, ADDON_UPDATE_ID));
@@ -514,8 +545,9 @@ fn cancel_leaves_nothing_behind(cx: &mut TestAppContext) {
     let typing = open_start(cx, root.path());
     show_add_ons(&typing, cx);
 
-    // Get, cancelled part way: back to Get, and nothing is installed.
-    offer(&server, &files, "0.2.0", true);
+    // Get, cancelled part way: back to Get, and nothing is installed, even once the rest of the
+    // package has come.
+    let gate = offer_gated(&server, &files, "0.2.0");
     click_on(&typing, cx, ADDON_GET_ID);
     wait_until(&typing, cx, "the download", |typing, cx| label_of(typing, cx, ADDON_PROGRESS_ID).is_some_and(|said| said.starts_with("Downloading… ")));
     let progress = label_of(&typing, cx, ADDON_PROGRESS_ID).unwrap();
@@ -527,15 +559,17 @@ fn cancel_leaves_nothing_behind(cx: &mut TestAppContext) {
     assert!(cancelled.elapsed() < std::time::Duration::from_secs(1), "{:?}", cancelled.elapsed());
     assert_eq!(label_of(&typing, cx, ADDON_STATE_ID).as_deref(), Some("Not installed"));
     assert!(!shows(&typing, cx, ADDON_CANCEL_ID) && !shows(&typing, cx, ADDON_PROGRESS_ID) && !shows(&typing, cx, ADDON_PROBLEM_ID));
-    settle_work(&typing, cx);
-    assert!(addons_folder(&app).is_empty(), "{:?}", addons_folder(&app));
+    open_gate(&gate);
+    go_on_for(&typing, cx, 600);
+    assert!(!app.join("addons/slidev").exists(), "{:?}", addons_folder(&app));
+    assert_eq!(label_of(&typing, cx, ADDON_STATE_ID).as_deref(), Some("Not installed"));
 
     // Update, cancelled part way: the version on offer still is, and the old install is untouched.
     stagepack_studio::addons::install_from_bytes(&app, &package_at("0.1.0")).unwrap();
     let hashes = installed_hashes(&app);
     let typing = open_start(cx, root.path());
     show_add_ons(&typing, cx);
-    offer(&server, &files, "0.2.0", true);
+    let gate = offer_gated(&server, &files, "0.2.0");
     click_on(&typing, cx, ADDON_CHECK_ID);
     wait_until(&typing, cx, "the check", |typing, cx| shows(typing, cx, ADDON_UPDATE_ID));
     click_on(&typing, cx, ADDON_UPDATE_ID);
@@ -545,10 +579,73 @@ fn cancel_leaves_nothing_behind(cx: &mut TestAppContext) {
     wait_until(&typing, cx, "the row as it was", |typing, cx| shows(typing, cx, ADDON_UPDATE_ID));
     assert!(cancelled.elapsed() < std::time::Duration::from_secs(1), "{:?}", cancelled.elapsed());
     assert_eq!(label_of(&typing, cx, ADDON_NEWS_ID).as_deref(), Some("Version 0.2.0 is available"));
+    open_gate(&gate);
+    go_on_for(&typing, cx, 600);
     assert_eq!(label_of(&typing, cx, ADDON_STATE_ID).as_deref(), Some("Installed, version 0.1.0"));
-    settle_work(&typing, cx);
     assert_eq!(installed_hashes(&app), hashes);
     assert_eq!(addons_folder(&app), ["slidev"]);
+}
+
+#[gpui_kit::test]
+fn a_newer_install_during_a_download_is_kept(cx: &mut TestAppContext) {
+    let _one = one_at_a_time();
+    test_key();
+    let (server, files) = add_on_server();
+    let root = tempfile::tempdir().unwrap();
+    let app = root.path().join("app");
+    stagepack_studio::addons::install_from_bytes(&app, &package_at("0.1.0")).unwrap();
+    let typing = open_start(cx, root.path());
+    show_add_ons(&typing, cx);
+    let gate = offer_gated(&server, &files, "0.3.0");
+    click_on(&typing, cx, ADDON_CHECK_ID);
+    wait_until(&typing, cx, "the check", |typing, cx| shows(typing, cx, ADDON_UPDATE_ID));
+    click_on(&typing, cx, ADDON_UPDATE_ID);
+    wait_until(&typing, cx, "the download", |typing, cx| label_of(typing, cx, ADDON_PROGRESS_ID).is_some_and(|said| said.starts_with("Downloading… ")));
+
+    // Meanwhile a later one is installed, as from a file in another window.
+    stagepack_studio::addons::install_from_bytes(&app, &package_at("0.4.0")).unwrap();
+    let hashes = installed_hashes(&app);
+    open_gate(&gate);
+    wait_until(&typing, cx, "the refusal", |typing, cx| shows(typing, cx, ADDON_PROBLEM_ID));
+    let problem = label_of(&typing, cx, ADDON_PROBLEM_ID).unwrap();
+    assert!(problem.contains("0.4.0 is installed already") && !problem.contains('\n'), "{problem}");
+    assert_eq!(installed_hashes(&app), hashes, "0.4.0 stays");
+    assert_eq!(label_of(&typing, cx, ADDON_STATE_ID).as_deref(), Some("Installed, version 0.4.0"));
+    assert!(!shows(&typing, cx, ADDON_UPDATE_ID) && !shows(&typing, cx, ADDON_NEWS_ID), "0.3.0 is no update now");
+}
+
+#[gpui_kit::test]
+fn an_update_busy_after_its_download_keeps_it(cx: &mut TestAppContext) {
+    let _one = one_at_a_time();
+    test_key();
+    let (server, files) = add_on_server();
+    let root = tempfile::tempdir().unwrap();
+    let app = root.path().join("app");
+    stagepack_studio::addons::install_from_bytes(&app, &package_at("0.1.0")).unwrap();
+    let hashes = installed_hashes(&app);
+    let typing = open_start(cx, root.path());
+    show_add_ons(&typing, cx);
+    let gate = offer_gated(&server, &files, "0.2.0");
+    click_on(&typing, cx, ADDON_CHECK_ID);
+    wait_until(&typing, cx, "the check", |typing, cx| shows(typing, cx, ADDON_UPDATE_ID));
+    click_on(&typing, cx, ADDON_UPDATE_ID);
+    wait_until(&typing, cx, "the download", |typing, cx| label_of(typing, cx, ADDON_PROGRESS_ID).is_some_and(|said| said.starts_with("Downloading… ")));
+
+    // An export starts while it downloads.
+    let in_use = stagepack_studio::addons::in_use(&app);
+    open_gate(&gate);
+    wait_until(&typing, cx, "the problem", |typing, cx| shows(typing, cx, ADDON_PROBLEM_ID));
+    assert_eq!(label_of(&typing, cx, ADDON_PROBLEM_ID).as_deref(), Some(stagepack_studio::addons::BUSY));
+    assert_eq!(installed_hashes(&app), hashes);
+    assert!(shows(&typing, cx, ADDON_UPDATE_ID));
+
+    // Once it's done, Update installs what was downloaded, without asking again.
+    drop(in_use);
+    let before = hits(&server);
+    click_on(&typing, cx, ADDON_UPDATE_ID);
+    wait_until(&typing, cx, "the update", |typing, cx| state_is(typing, cx, "Installed, version 0.2.0"));
+    assert_eq!(hits(&server), before);
+    assert!(!shows(&typing, cx, ADDON_PROBLEM_ID) && !shows(&typing, cx, ADDON_UPDATE_ID));
 }
 
 #[gpui_kit::test]
@@ -562,7 +659,7 @@ fn an_update_while_the_addon_is_busy_says_so(cx: &mut TestAppContext) {
     let hashes = installed_hashes(&app);
     let typing = open_start(cx, root.path());
     show_add_ons(&typing, cx);
-    offer(&server, &files, "0.2.0", false);
+    offer(&server, &files, "0.2.0");
     click_on(&typing, cx, ADDON_CHECK_ID);
     wait_until(&typing, cx, "the check", |typing, cx| shows(typing, cx, ADDON_UPDATE_ID));
 
@@ -588,7 +685,7 @@ fn opening_the_dialog_makes_no_request(cx: &mut TestAppContext) {
     let _one = one_at_a_time();
     test_key();
     let (server, files) = add_on_server();
-    offer(&server, &files, "0.2.0", false);
+    offer(&server, &files, "0.2.0");
     let asked = stagepack_studio::addons::fetch::requests_for_test();
     let root = tempfile::tempdir().unwrap();
     let dir = tempfile::tempdir().unwrap();
@@ -629,7 +726,7 @@ fn start_up_makes_no_request(cx: &mut TestAppContext) {
     let _one = one_at_a_time();
     test_key();
     let (server, files) = add_on_server();
-    offer(&server, &files, "0.2.0", false);
+    offer(&server, &files, "0.2.0");
     let asked = stagepack_studio::addons::fetch::requests_for_test();
     let dir = tempfile::tempdir().unwrap();
     let talk = stagepack_talk(dir.path());
