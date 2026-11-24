@@ -48,6 +48,11 @@ OutputBaseFilename=stagepack-studio-{#AppVersion}-windows-x86_64-setup
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
+[InstallDelete]
+; An upgrade first takes away the old compiler bundle: Inno only adds and replaces files, and a new toolchain's
+; files (named by hash) beside the old ones stop component builds. It is inside {app}, so no data is touched.
+Type: filesandordirs; Name: "{app}\bundle"
+
 [Files]
 ; The whole staged folder, which holds stagepack-studio.exe (the windowed program) and stagepack-studio.com (its console twin, which a shell waits for).
 Source: "{#StagedDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -57,7 +62,11 @@ Name: "{autoprograms}\Stagepack Studio"; Filename: "{app}\stagepack-studio.exe";
 
 [Registry]
 ; .sptx opens with Stagepack Studio by default. Other programs stay offered under Open with:
-; we only add our own name to OpenWithProgids and never delete that key.
+; we only add names to OpenWithProgids and never delete that key.
+; First the program that was the default before ours (Inno reads it as it processes this line; with none, our
+; own name) goes under OpenWithProgids, and stays there after uninstalling. Uninstalling doesn't put that default
+; back: that would need a [Code] step.
+Root: HKCU; Subkey: "Software\Classes\.sptx\OpenWithProgids"; ValueType: string; ValueName: "{reg:HKCU\Software\Classes\.sptx,|StagepackStudio.Talk}"; ValueData: ""
 Root: HKCU; Subkey: "Software\Classes\.sptx"; ValueType: string; ValueName: ""; ValueData: "StagepackStudio.Talk"; Flags: uninsdeletevalue
 Root: HKCU; Subkey: "Software\Classes\.sptx\OpenWithProgids"; ValueType: string; ValueName: "StagepackStudio.Talk"; ValueData: ""; Flags: uninsdeletevalue
 Root: HKCU; Subkey: "Software\Classes\StagepackStudio.Talk"; ValueType: string; ValueName: ""; ValueData: "Stagepack Studio talk"; Flags: uninsdeletekey

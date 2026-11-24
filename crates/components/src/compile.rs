@@ -167,6 +167,10 @@ fn rustc_command(root: &Path, scratch: &Path) -> Command {
     if let Some(root) = std::env::var_os("SYSTEMROOT") {
         command.env("SYSTEMROOT", root);
     }
+    // The shipped app has no console, so Windows would give the compiler (a console program) a
+    // window of its own on every build; CREATE_NO_WINDOW keeps it hidden.
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut command, 0x0800_0000);
     command
 }
 

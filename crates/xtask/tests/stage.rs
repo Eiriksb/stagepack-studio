@@ -4,7 +4,7 @@
 use slides_terminal_helper::wire::{self, FromHelper, StartSpec, ToHelper};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use xtask::stage::{BUDGET_MB, copy_tree, folder_bytes, over_budget, repo_root};
+use xtask::stage::{BUDGET_MB, copy_tree, folder_bytes, may_replace, over_budget, release_flags, repo_root};
 
 #[test]
 fn a_folder_over_the_budget_says_so() {
@@ -25,6 +25,44 @@ fn a_copy_keeps_links_and_sizes() {
     #[cfg(unix)]
     assert_eq!(std::fs::read_link(dir.path().join("to/link")).unwrap(), Path::new("sub/a"));
     assert!(folder_bytes(&dir.path().join("to")).unwrap() >= 1000);
+}
+
+#[test]
+fn the_windows_programs_carry_their_c_runtime() {
+    let repo = repo_root();
+    let windows: Vec<String> = release_flags(&repo, true).split('\x1f').map(str::to_string).collect();
+    let linux: Vec<String> = release_flags(&repo, false).split('\x1f').map(str::to_string).collect();
+    assert!(windows.iter().any(|f| f == "-Ctarget-feature=+crt-static"), "{windows:?}");
+    assert!(!linux.iter().any(|f| f.contains("crt-static")), "{linux:?}");
+    // Both keep the builder's paths out.
+    for flags in [&windows, &linux] {
+        assert!(flags.iter().any(|f| f.starts_with("--remap-path-prefix=") && f.ends_with("=/studio")), "{flags:?}");
+    }
+    assert_eq!(windows.len(), linux.len() + 1);
+}
+
+#[test]
+fn only_a_staged_app_folder_is_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = if cfg!(windows) { "stagepack-studio.exe" } else { "stagepack-studio" };
+    assert!(may_replace(&dir.path().join("missing")));
+    std::fs::create_dir_all(dir.path().join("empty")).unwrap();
+    assert!(may_replace(&dir.path().join("empty")));
+    // A bin folder that holds a link or a copy of the program is not an app folder.
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join(exe), "the program").unwrap();
+    std::fs::write(bin.join("other-tool"), "mine").unwrap();
+    assert!(!may_replace(&bin));
+    std::fs::write(bin.join("NOTICES.txt"), "notices").unwrap();
+    assert!(!may_replace(&bin), "without bundle/ it still isn't one");
+    std::fs::create_dir_all(bin.join("bundle")).unwrap();
+    assert!(may_replace(&bin));
+    // And stage itself refuses one, leaving it as it was.
+    std::fs::remove_dir_all(bin.join("bundle")).unwrap();
+    let message = xtask::stage::stage(&bin, None).unwrap_err();
+    assert!(message.contains("isn't an app folder"), "{message}");
+    assert_eq!(std::fs::read_to_string(bin.join("other-tool")).unwrap(), "mine");
 }
 
 /// What the staged program is run with: no Rust on the path, no `STUDIO_*`, a scratch home.

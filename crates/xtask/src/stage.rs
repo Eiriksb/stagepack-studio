@@ -76,7 +76,7 @@ pub fn stage(out: &Path, bundle: Option<&Path>) -> Result<u64, String> {
     let repo = repo_root();
     let out = std::path::absolute(out).map_err(|e| format!("can't resolve {}: {e}", out.display()))?;
     // The folder is replaced, so make sure it's one of ours.
-    if std::fs::read_dir(&out).is_ok_and(|mut d| d.next().is_some()) && !out.join(format!("stagepack-studio{EXE}")).exists() {
+    if !may_replace(&out) {
         return Err(format!("{} has files in it and isn't an app folder, so it's been left alone", out.display()));
     }
     if out.exists() {
@@ -90,7 +90,7 @@ pub fn stage(out: &Path, bundle: Option<&Path>) -> Result<u64, String> {
     // On Linux cargo runs in a memory-limited scope; Windows has no such wrapper, so the cargo that ran `package` builds.
     let cargo = if cfg!(windows) { std::env::var_os("CARGO").map_or_else(|| PathBuf::from("cargo"), PathBuf::from) } else { repo.join("scripts/cargo-safe.sh") };
     let target = repo.join("target/package-build");
-    let flags = path_free_flags(&repo);
+    let flags = release_flags(&repo, cfg!(all(windows, target_env = "msvc")));
     let build = |package: &str, features: &[&str]| {
         let mut command = Command::new(&cargo);
         command
@@ -140,6 +140,16 @@ pub fn stage(out: &Path, bundle: Option<&Path>) -> Result<u64, String> {
     Ok(bytes)
 }
 
+/// Whether `out` may be cleared for a staging: it is missing or empty, or it is an app folder staged
+/// before (the program, `NOTICES.txt` and `bundle/`). A folder that only holds the program, such as a
+/// bin folder with a link to it, is not.
+pub fn may_replace(out: &Path) -> bool {
+    match std::fs::read_dir(out) {
+        Err(_) => !out.exists(),
+        Ok(mut entries) => entries.next().is_none() || (out.join(format!("stagepack-studio{EXE}")).is_file() && out.join("NOTICES.txt").is_file() && out.join("bundle").is_dir()),
+    }
+}
+
 /// The command that makes the compiler bundle in `dest`: `make-bundle.sh` on Linux, `make-bundle.ps1` on Windows
 /// (run by PowerShell 7 if it is installed, else the PowerShell that comes with Windows).
 fn bundle_command(repo: &Path, dest: &Path) -> Command {
@@ -154,6 +164,16 @@ fn bundle_command(repo: &Path, dest: &Path) -> Command {
     }
     command.current_dir(repo);
     command
+}
+
+/// The Rust flags for the shipped builds: `path_free_flags`, and for Windows (`windows_msvc`) the C
+/// runtime linked in, so that the programs start on a PC without the Visual C++ redistributable.
+pub fn release_flags(repo: &Path, windows_msvc: bool) -> String {
+    let mut flags = path_free_flags(repo);
+    if windows_msvc {
+        flags.push_str("\x1f-Ctarget-feature=+crt-static");
+    }
+    flags
 }
 
 /// Rust flags that write the builder's own folders out of what's built: the cargo home, where
