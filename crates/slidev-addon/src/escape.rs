@@ -53,7 +53,54 @@ pub fn text(text: &str, line_start: bool) -> String {
             _ => out.push(c),
         }
     }
+    no_drag(&out)
+}
+
+/// `text` with Slidev's `v-drag`, which it rewrites wherever it finds it, made so it doesn't
+/// read as that. The `-` is written as its entity, which shows as `-`.
+fn no_drag(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    if !lower.contains("v-drag") {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut at = 0;
+    while let Some(found) = lower[at..].find("v-drag") {
+        let start = at + found;
+        out.push_str(&text[at..=start]);
+        out.push_str("&#45;");
+        at = start + 2;
+    }
+    out.push_str(&text[at..]);
     out
+}
+
+/// `text` as HTML text: `&`, `<` and `>` as entities, and nothing else changed.
+pub fn html(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Whether `text`, code, holds what Slidev's raw passes read before Markdown does: `<!--`,
+/// which starts a comment for its slide splitter and its notes.
+pub fn opens_comment(text: &str) -> bool {
+    text.contains("<!--")
+}
+
+/// `code` as the lines of a `<pre>`, which Markdown leaves alone: as HTML text, with what
+/// starts one of Slidev's own lines (`---`, `::name::`) written as entities, so its slide
+/// splitter and slots don't read it. `{` is an entity too, as Vue reads `{{` as code.
+pub fn pre_lines(code: &str) -> String {
+    code.split('\n')
+        .map(|line| {
+            let line = html(line).replace('{', "&#123;").replace('}', "&#125;");
+            match line.chars().next() {
+                Some('-') => format!("&#45;{}", &line[1..]),
+                Some(':') => format!("&#58;{}", &line[1..]),
+                _ => line,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Whether `written`, a block as written for Slidev, has to be inside `v-pre` for Vue to show
@@ -78,11 +125,13 @@ pub fn attribute(text: &str) -> String {
     out
 }
 
-/// A speaker's notes as the text of the HTML comment Slidev reads them from. Only `-->` would
-/// end the comment early, so its `>` is written as the entity, as Slidev's notes are
-/// Markdown, which shows `--&gt;` as `-->`.
+/// A speaker's notes as the text of the HTML comment Slidev reads them from. Slidev shows
+/// them as Markdown turned to HTML, so `&`, `<` and `>` are written as entities: no HTML in
+/// them reaches the presenter, and neither `-->` nor `--!>` can end the comment early. `[` is
+/// one too, as `[click]` is a mark Slidev reads in notes. `{{` stays as it is: the notes are
+/// shown as HTML, never as a Vue template.
 pub fn notes(text: &str) -> String {
-    text.replace("-->", "--&gt;")
+    html(text).replace('[', "&#91;")
 }
 
 /// `url` as a link's target, or `None` for one that could run code when it is followed:
@@ -157,8 +206,21 @@ mod tests {
     }
 
     #[test]
-    fn notes_cannot_end_their_comment() {
+    fn notes_cannot_end_their_comment_or_hold_html() {
         assert_eq!(notes("a --> b"), "a --&gt; b");
+        assert_eq!(notes("a --!> b"), "a --!&gt; b");
+        assert_eq!(notes("<script>alert(1)</script> & [click]"), "&lt;script&gt;alert(1)&lt;/script&gt; &amp; &#91;click]");
+        assert_eq!(notes("{{ x }}"), "{{ x }}");
+    }
+
+    #[test]
+    fn v_drag_in_text_is_not_slidevs() {
+        assert_eq!(text("use v-drag here, V-Drag too", false), "use v&#45;drag here, V&#45;Drag too");
+    }
+
+    #[test]
+    fn code_in_a_pre_reads_as_itself() {
+        assert_eq!(pre_lines("---\n::right::\n<!-- x -->\n{{ y }}"), "&#45;--\n&#58;:right::\n&lt;!-- x --&gt;\n&#123;&#123; y &#125;&#125;");
     }
 
     #[test]

@@ -120,7 +120,7 @@ fn baked_parts_are_images_at_their_box() {
     let (bundle, report) = export_with(source, files);
     assert_expected("baked_parts_are_images_at_their_box", &slides_md(&bundle));
     let names: Vec<&str> = bundle.iter().map(|(name, _)| name.as_str()).collect();
-    assert_eq!(names, ["slides.md", MANIFEST, "public/baked-1-0.png", "public/baked-1-1.png", "public/baked-1-2.png", "public/waves.mp4", "public/baked-1-3.png"]);
+    assert_eq!(names, ["slides.md", MANIFEST, "public/stagepack-baked/1-0.png", "public/stagepack-baked/1-1.png", "public/stagepack-baked/1-2.png", "public/waves.mp4", "public/stagepack-baked/1-3.png"]);
     assert_eq!(report.notices, vec![notice(1, NoticeKind::LeftOut, "The Model wasn't drawn for the export, so it was left out.")]);
 }
 
@@ -148,9 +148,17 @@ fn a_stepped_component_switches_on_clicks() {
 
 #[test]
 fn clicks_and_entries() {
-    let source = "---\nlayout: two-columns\nregion.left: click=each\nregion.right: click=2 enter=fly-up\n---\n\n# Clicks\n\n- One\n- Two\n- Three\n\n<Region name=\"right\" />\n\nOn the second click.\n\n<Box x=\"100\" y=\"800\" w=\"300\" h=\"100\" click=\"1\" enter=\"fade\">\n\nFades in\n\n</Box>\n\n<Box x=\"500\" y=\"800\" w=\"300\" h=\"100\" click=\"3\">\n\nAppears\n\n</Box>\n\n<Box x=\"900\" y=\"800\" w=\"300\" h=\"100\" click=\"4\" enter=\"fly-up\">\n\nFlies up\n\n</Box>\n\n<Box x=\"1300\" y=\"800\" w=\"300\" h=\"100\" click=\"0\" enter=\"zoom\">\n\nAlways there\n\n</Box>\n";
-    let report = the_slide(source, Vec::new(), "clicks_and_entries");
+    let source = "---\nlayout: two-columns\nregion.left: click=each\nregion.right: click=2 enter=fly-up\n---\n\n# Clicks\n\n- One\n- Two\n- Three\n\n<Region name=\"right\" />\n\nOn the second click.\n\n<Box x=\"100\" y=\"800\" w=\"300\" h=\"100\" click=\"1\" enter=\"fade\">\n\nFades in\n\n</Box>\n\n<Box x=\"500\" y=\"800\" w=\"300\" h=\"100\" click=\"3\">\n\nAppears\n\n</Box>\n\n<Box x=\"900\" y=\"800\" w=\"300\" h=\"100\" click=\"4\" enter=\"fly-up\">\n\nFlies up\n\n</Box>\n\n<Box x=\"1300\" y=\"800\" w=\"300\" h=\"100\" click=\"0\" enter=\"zoom\">\n\nAlways there\n\n</Box>\n\n---\n\n# Only a fly-up\n\n<Box x=\"100\" y=\"300\" w=\"300\" h=\"100\" click=\"2\" enter=\"fly-up\">\n\nFlies up\n\n</Box>\n\n---\n\n# No clicks\n";
+    let (bundle, report) = export_with(source, Vec::new());
+    let markdown = slides_md(&bundle);
+    assert_expected("clicks_and_entries", &markdown);
     assert!(report.notices.is_empty(), "{report:?}");
+    // Slidev doesn't count a fly-up's click, so every slide with a click says how many it takes.
+    let clicks: Vec<Option<String>> = slides_of(&markdown)
+        .iter()
+        .map(|(keys, _)| keys.lines().find_map(|line| line.strip_prefix("clicks: ")).map(String::from))
+        .collect();
+    assert_eq!(clicks, [Some("4".to_string()), Some("2".to_string()), None]);
 }
 
 #[test]
@@ -160,25 +168,95 @@ fn transitions_hidden_and_notes() {
     assert_eq!(report.notices, vec![notice(4, NoticeKind::Approximation, "transition: spin isn't none, fade or push, so this slide has none.")]);
 }
 
+fn transitions(markdown: &str) -> Vec<String> {
+    slides_of(markdown).iter().map(|(keys, _)| keys.lines().find_map(|line| line.strip_prefix("transition: ")).expect("every slide has its transition").to_string()).collect()
+}
+
+#[test]
+fn the_transition_sits_on_the_slide_before() {
+    // Slidev plays a slide's transition on leaving it, so each slide has the next one's way in.
+    let source = "# One\n\n---\ntransition: fade\n---\n\n# Two fades in\n\n---\ntransition: push\n---\n\n# Three is pushed in\n\n---\n\n# Four just appears\n";
+    let (bundle, _) = export_with(source, Vec::new());
+    assert_eq!(transitions(&slides_md(&bundle)), ["fade", "slide-left", "none", "none"]);
+
+    // Slides Slidev never shows, hidden ones and those left out, are passed over.
+    let source = "# One\n\n---\nhidden: true\ntransition: fade\n---\n\n# Hidden\n\n---\n\n<Box>\n\nnever closed\n\n---\ntransition: push\n---\n\n# Pushed in\n";
+    let (bundle, _) = export_with(source, Vec::new());
+    assert_eq!(transitions(&slides_md(&bundle)), ["slide-left", "slide-left", "none"]);
+}
+
+#[test]
+fn notes_hold_no_html_and_cant_end_their_comment() {
+    let source = "# A\n\n<Notes>\nEnds --!> early? Not --> this.\n<script>alert(1)</script> & <b>bold</b>\n{{ x }} stays as written. [click] too.\n</Notes>\n";
+    let (bundle, _) = export_with(source, Vec::new());
+    let markdown = slides_md(&bundle);
+    let notes = &markdown[markdown.rfind("<!--").unwrap()..];
+    assert_eq!(notes, "<!--\nEnds --!&gt; early? Not --&gt; this.\n&lt;script&gt;alert(1)&lt;/script&gt; &amp; &lt;b&gt;bold&lt;/b&gt;\n{{ x }} stays as written. &#91;click] too.\n-->\n");
+    assert_eq!(notes.matches("-->").count(), 1);
+    assert!(!notes.contains("--!>") && !notes.contains("<script") && !notes.contains("<b>"));
+}
+
 #[test]
 fn talk_colours_become_one_style_block() {
-    let source = "---\ncolor.background: #0f172a\ncolor.text: #f8fafc\ncolor.accent: #f59e0b\nfont: Inter\nfont.mono: Fira Code\n---\n\n# Dark\n\n---\n\n# Second\n";
+    let source = "---\ncolor.background: #0f172a\ncolor.text: #f8fafc\ncolor.accent: #f59e0b\nfont: Inter\nfont.mono: Fira Code\n---\n\n# Dark\n\n---\n\n# Second\n\n---\nlayout: blank\n---\n\nA blank slide.\n";
     let font = include_bytes!("../../engine/assets/fonts/Inter-Bold.ttf");
     let files = vec![file("assets/fonts/Inter-Bold.ttf", font), file("assets/fonts/odd.woff2", b"woff2"), file("assets/fonts/deeper/x.ttf", b"x")];
     let (bundle, report) = export_with(source, files);
     let markdown = slides_md(&bundle);
     assert_expected("talk_colours_become_one_style_block", &markdown);
-    assert_eq!(markdown.matches("<style>").count(), 1);
+    // On every slide, as Slidev loads a slide only near it. The style is all the same.
+    let slides = slides_of(&markdown);
+    assert_eq!(slides.len(), 3);
+    let style = |body: &str| body[body.find("<style>").expect("the slide has the style")..body.find("</style>").unwrap()].to_string();
+    assert!(slides.iter().all(|(_, body)| style(body) == style(&slides[0].1)));
+    // The look is the page's, as a blank slide has no layout of Slidev's to hang it on.
+    assert!(markdown.contains(":global(.slidev-page) {\n  height: 100%;\n  background: #0f172a;\n  color: #f8fafc;\n  font-family: \"Inter\", sans-serif;\n  font-size: 40px;\n  line-height: 1.25;\n}"));
+    // Each size has the engine's line height, over the theme's fixed ones.
+    for rule in [":global(.slidev-page p), :global(.slidev-page li) {\n  line-height: 1.25;", ":global(.slidev-page h1) {\n  font-size: 64px;\n  line-height: 1.25;", ":global(.slidev-page h2) {\n  font-size: 48px;\n  line-height: 1.25;", "--slidev-code-line-height: 1.25;", "--slidev-code-font-size: 32px;"] {
+        assert!(markdown.contains(rule), "{rule}");
+    }
+    let keys = headmatter(&markdown);
+    assert!(keys.contains(&("colorSchema".into(), "dark".into())));
+    assert!(keys.contains(&("fonts.sans".into(), "\"Inter\"".into())));
+    assert!(keys.contains(&("fonts.mono".into(), "\"Fira Code\"".into())));
     let names: Vec<&str> = bundle.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(names, ["slides.md", MANIFEST, "public/fonts/Inter-Bold.ttf", "public/fonts/odd.woff2"]);
     assert!(report.notices.is_empty(), "{report:?}");
 }
 
-/// The first frontmatter block of `markdown`, as `key: value` pairs.
+/// The first frontmatter block of `markdown`, as `key: value` pairs. A key under another,
+/// indented, is named `outer.inner`.
 fn headmatter(markdown: &str) -> Vec<(String, String)> {
     let rest = markdown.strip_prefix("---\n").expect("slides.md starts with its headmatter");
     let end = rest.find("\n---\n").expect("the headmatter is closed");
-    rest[..end].lines().map(|line| line.split_once(": ").map(|(key, value)| (key.to_string(), value.to_string())).expect("a key and a value")).collect()
+    let mut outer = String::new();
+    let mut keys = Vec::new();
+    for line in rest[..end].lines() {
+        let (key, value) = line.trim_start().split_once(':').expect("a key and a value");
+        let value = value.trim().to_string();
+        if line.starts_with(' ') {
+            keys.push((format!("{outer}.{key}"), value));
+        } else {
+            outer = key.to_string();
+            keys.push((key.to_string(), value));
+        }
+    }
+    keys
+}
+
+/// The frontmatter of each slide of `markdown`, as Slidev splits them, and its body.
+fn slides_of(markdown: &str) -> Vec<(String, String)> {
+    let mut slides = Vec::new();
+    let mut rest = markdown;
+    while let Some(after) = rest.strip_prefix("---\n") {
+        let end = after.find("\n---\n").expect("a frontmatter is closed");
+        let keys = after[..end + 1].to_string();
+        let body = &after[end + 5..];
+        let next = body.find("\n---\n").map_or(body.len(), |at| at + 1);
+        slides.push((keys, body[..next].to_string()));
+        rest = &body[next..];
+    }
+    slides
 }
 
 /// Holds an export to Global Constraints' list, so that Stagepack asks no code question of it.
@@ -204,6 +282,9 @@ fn assert_no_code_reasons(bundle: &Bundle) {
     assert_eq!(value("aspectRatio"), Some("16/9"));
     assert_eq!(value("addons"), None);
     assert_eq!(value("pwa"), None);
+    // theme-default's fonts would otherwise be fetched from Google.
+    assert_eq!(value("fonts"), Some(""));
+    assert_eq!(value("fonts.provider"), Some("none"));
     assert!(!markdown.contains("<script"), "slides.md holds a script");
     let (_, manifest) = bundle.iter().find(|(name, _)| name == MANIFEST).expect("the export says its title");
     assert_eq!(serde_json::from_slice::<serde_json::Value>(manifest).unwrap(), serde_json::json!({ "title": "A made-up talk" }));
@@ -230,8 +311,60 @@ fn the_fixture_exports_with_no_code_reasons() {
     assert_no_code_reasons(&bundle);
     assert_expected("the_fixture", &slides_md(&bundle));
     let names: Vec<&str> = bundle.iter().map(|(name, _)| name.as_str()).collect();
-    assert_eq!(names, ["slides.md", MANIFEST, "public/baked-7-0.png", "public/photo.png", "public/baked-7-1-0.png", "public/baked-7-1-1.png"]);
+    assert_eq!(names, ["slides.md", MANIFEST, "public/stagepack-baked/7-0.png", "public/photo.png", "public/stagepack-baked/7-1-0.png", "public/stagepack-baked/7-1-1.png"]);
     assert!(report.notices.is_empty(), "{report:?}");
+}
+
+#[test]
+fn a_hidden_first_slide_leaves_the_style_on_the_others() {
+    let (bundle, _) = export_with("---\nhidden: true\n---\n\n# Hidden\n\n---\n\n# Shown\n", Vec::new());
+    let slides = slides_of(&slides_md(&bundle));
+    assert!(slides[0].0.contains("hide: true"));
+    assert!(slides[1].1.trim_start().starts_with("<style>\n"));
+}
+
+#[test]
+fn names_are_taken_for_code_as_stagepack_folds_them() {
+    for name in ["a.ts", "a.TS", "a.tſ", "public/poſtcss.config.png", "public/PostCSS.config.png", "public/\u{212A}.vue", "setup/x.png", "public/Index.HTML"] {
+        assert!(is_code_name(name), "{name}");
+    }
+    for name in ["a.png", "public/postcss.png", "public/settings.png"] {
+        assert!(!is_code_name(name), "{name}");
+    }
+    let (bundle, report) = export_with("<Picture src=\"assets/poſtcss.config.png\" />\n\n<Picture src=\"assets/a.tſ\" />\n", vec![file("assets/poſtcss.config.png", PNG), file("assets/a.tſ", PNG)]);
+    assert_no_code_reasons(&bundle);
+    assert_eq!(bundle.len(), 2, "only slides.md and the title");
+    assert_eq!(report.notices.len(), 2);
+}
+
+#[test]
+fn a_talks_pictures_never_take_the_names_of_others() {
+    let source = "![](assets/photo.png)\n\n![](photo.png)\n\n![](PHOTO.png)\n\n![](assets/stagepack-baked/1-0.png)\n\n<Icon name=\"star\" />\n";
+    let files = vec![
+        file("assets/photo.png", b"one"),
+        file("photo.png", b"two"),
+        file("PHOTO.png", b"three"),
+        file("assets/stagepack-baked/1-0.png", b"talk's"),
+        index(&[baked(1, 0, "Icon", (0.0, 0.0, 64.0, 64.0), &[], false)]),
+        file("baked/1/0.png", PNG),
+    ];
+    let (bundle, report) = export_with(source, files);
+    assert!(report.notices.is_empty(), "{report:?}");
+    let names: Vec<(&str, &[u8])> = bundle.iter().skip(2).map(|(name, data)| (name.as_str(), data.as_slice())).collect();
+    assert_eq!(
+        names,
+        [
+            ("public/photo.png", &b"one"[..]),
+            ("public/photo-2.png", b"two"),
+            ("public/PHOTO-3.png", b"three"),
+            ("public/assets/stagepack-baked/1-0.png", b"talk's"),
+            ("public/stagepack-baked/1-0.png", PNG),
+        ]
+    );
+    let markdown = slides_md(&bundle);
+    for url in ["(/photo.png)", "(/photo-2.png)", "(/PHOTO-3.png)", "(/assets/stagepack-baked/1-0.png)", "src=\"/stagepack-baked/1-0.png\""] {
+        assert!(markdown.contains(url), "{url}");
+    }
 }
 
 #[test]
@@ -274,6 +407,26 @@ fn text_that_slidev_would_read_is_escaped() {
         let closed = before.matches("</div>").count();
         assert_eq!(opened, closed + 1, "the {{{{ at {at} isn't inside v-pre: {body}");
     }
+}
+
+#[test]
+fn a_comment_opened_in_code_reads_as_code() {
+    // Inline: Slidev's splitter would take every later `---` as inside the comment.
+    // Fenced: its notes would run from the code's `<!--` to the notes' end.
+    let source = "# Inline\n\nType `<!-- x` to start one.\n\n---\n\n# Fenced\n\n```html\n<!-- opened\n---\n::right::\n{{ y }}\n```\n\n<Notes>\nThe notes.\n</Notes>\n\n---\n\n# After\n";
+    let (bundle, report) = export_with(source, Vec::new());
+    let markdown = slides_md(&bundle);
+    assert_expected("a_comment_opened_in_code_reads_as_code", &markdown);
+    let slides = slides_of(&markdown);
+    assert_eq!(slides.len(), 3, "{markdown}");
+    assert!(slides[0].1.contains("Type <code v-pre>&lt;\\!-- x</code> to start one."), "{}", slides[0].1);
+    assert!(slides[1].1.contains("<pre v-pre><code>&lt;!-- opened\n&#45;--\n&#58;:right::\n&#123;&#123; y &#125;&#125;</code></pre>"), "{}", slides[1].1);
+    // The only `<!--` left is the notes' own, at the slide's end.
+    for (_, body) in &slides {
+        assert!(body.matches("<!--").count() <= 1);
+    }
+    assert!(slides[1].1.trim_end().ends_with("<!--\nThe notes.\n-->"));
+    assert_eq!(report.notices, vec![notice(2, NoticeKind::Approximation, "A code block holds <!--, so in Slidev it is shown without its colours.")]);
 }
 
 #[test]
@@ -334,4 +487,16 @@ fn run_answers_what_it_cant_do_with_an_error() {
         let output = decode(&run(input)).unwrap();
         assert_eq!(output, vec![file(ERROR, sentence.as_bytes())]);
     }
+}
+
+#[test]
+fn touching_marks_extra_cells_and_alt_text() {
+    let source = "**foo***bar* and **apart** *too*\n\n| A |\n| --- |\n| 1 | 2 |\n\n<Picture src=\"assets/p.png\" alt=\"A pool & a \u{201c}crab\u{201d}\" />\n\nUse v-drag here.\n";
+    let (bundle, report) = export_with(source, vec![file("assets/p.png", PNG)]);
+    let body = body_of(&slides_md(&bundle));
+    assert!(body.contains("<strong>foo</strong><em>bar</em> and **apart** *too*"), "{body}");
+    assert!(body.contains("| A |\n| --- |\n| 1 |\n"), "{body}");
+    assert!(body.contains("alt=\"A pool &amp; a \u{201c}crab\u{201d}\""), "{body}");
+    assert!(body.contains("Use v&#45;drag here."), "{body}");
+    assert_eq!(report.notices, vec![notice(1, NoticeKind::LeftOut, "A table row has more cells than its header, and a Markdown table shows only as many, so the rest were left out.")]);
 }

@@ -2,7 +2,7 @@
 //! app needs for the manifest. Everything is written as Slidev's own Markdown and HTML, with
 //! nothing that runs: what Slidev can't draw as we do is a picture the app drew for it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use addon_abi::{safe_name, Bundle, Notice, NoticeKind, Report, MANIFEST};
 use serde::Deserialize;
@@ -41,6 +41,11 @@ pub struct Baked {
     pub animated: bool,
 }
 
+/// The folder under `public/` that the pictures the app drew go in.
+const BAKED_FOLDER: &str = "stagepack-baked/";
+/// How many numbered names a file is tried at before it's left out.
+const MAX_RENAMES: usize = 100;
+
 /// Where the list of baked parts is.
 pub const BAKED_INDEX: &str = "baked/index.json";
 /// The talk's Markdown, given and given back.
@@ -75,9 +80,27 @@ const MAX_NOTICE_CHARS: usize = 500;
 const CODE_EXTENSIONS: [&str; 11] = ["vue", "js", "mjs", "cjs", "ts", "mts", "cts", "jsx", "tsx", "node", "wasm"];
 const CODE_PREFIXES: [&str; 5] = ["vite.config", "uno.config", "unocss.config", "postcss.config", ".postcssrc"];
 
-/// Whether Stagepack would take a file at `name`, a path in the export, for code.
+/// `name` as a case-insensitive file system may see it, as Stagepack's `fold` makes it: each
+/// letter as the lower case of the least letter it folds with, so `ſ` is `s` and the Kelvin
+/// sign `k`. Rust has no simple folding, so the letters a letter folds with are taken as its
+/// upper and lower case, and the lower case of its upper case.
+pub fn fold(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            let one = |mapped: Vec<char>| (mapped.len() == 1).then(|| mapped[0]);
+            let upper = one(c.to_uppercase().collect());
+            let lower = one(c.to_lowercase().collect());
+            let lower_of_upper = upper.and_then(|upper| one(upper.to_lowercase().collect()));
+            let least = [Some(c), upper, lower, lower_of_upper].into_iter().flatten().min().unwrap_or(c);
+            one(least.to_lowercase().collect()).unwrap_or(least)
+        })
+        .collect()
+}
+
+/// Whether Stagepack would take a file at `name`, a path in the export, for code. Names are
+/// compared as Stagepack compares them, folded.
 pub fn is_code_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
+    let lower = fold(name);
     let base = lower.rsplit('/').next().unwrap_or(&lower);
     let extension = base.rsplit_once('.').map(|(_, extension)| extension);
     extension.is_some_and(|extension| CODE_EXTENSIONS.contains(&extension))
@@ -329,9 +352,12 @@ struct Exporter<'a> {
     public_names: BTreeMap<String, String>,
     /// How many arrows have been drawn, for each head's id.
     arrows: usize,
-    /// Whether the first slide written has a transition. In the headmatter it is every
-    /// slide's, so each slide with none of its own says it has none.
-    deck_transition: bool,
+    /// The notices given so far, to give each once.
+    seen: HashSet<(Option<usize>, NoticeKind, String)>,
+    /// How many notices there were past the most a report holds.
+    dropped: usize,
+    /// The style block every slide has, once it's made.
+    style: Option<String>,
     slide: SlideState,
 }
 
@@ -350,6 +376,8 @@ struct SlideState {
     origin: (f32, f32),
     /// Whether that box, or one it is in, is turned.
     turned: bool,
+    /// Whether that box is one in the text, whose place on the slide isn't known here.
+    unplaced: bool,
 }
 
 /// Writes `talk`, as `args` says, with `files` its own and what the app drew for it.
@@ -369,7 +397,9 @@ pub fn export(args: &ExportArgs, files: &Bundle) -> Result<(Bundle, Report), Str
         public: Vec::new(),
         public_names: BTreeMap::new(),
         arrows: 0,
-        deck_transition: false,
+        seen: HashSet::new(),
+        dropped: 0,
+        style: None,
         slide: SlideState::default(),
     };
     let markdown = exporter.talk(&talk, &args.title);
@@ -377,10 +407,12 @@ pub fn export(args: &ExportArgs, files: &Bundle) -> Result<(Bundle, Report), Str
     let mut bundle: Bundle = vec![(SLIDES.to_string(), markdown.into_bytes()), (MANIFEST.to_string(), manifest)];
     bundle.append(&mut exporter.public);
     let mut notices = exporter.notices;
-    if notices.len() > MAX_NOTICES {
-        let more = notices.len() - (MAX_NOTICES - 1);
-        notices.truncate(MAX_NOTICES - 1);
-        notices.push(Notice { slide: None, kind: NoticeKind::Approximation, text: format!("And {more} more things that couldn't be carried over as they were.") });
+    if exporter.dropped > 0 {
+        notices.push(Notice {
+            slide: None,
+            kind: NoticeKind::Approximation,
+            text: format!("And {} more things that couldn't be carried over as they were.", exporter.dropped),
+        });
     }
     Ok((bundle, Report { notices }))
 }
@@ -494,6 +526,17 @@ fn number_baked(blocks: &[Block], numbers: &mut BTreeMap<usize, usize>) {
     }
 }
 
+/// The engine's text: its body size, its code size and its line height.
+const BODY_SIZE: u32 = 40;
+const CODE_SIZE: u32 = 32;
+const LINE_HEIGHT: f32 = 1.25;
+
+/// Whether `#rrggbb` is a dark colour, for Slidev's own colours around what the talk sets.
+fn is_dark(colour: &str) -> bool {
+    let channel = |at: usize| colour.get(at..at + 2).and_then(|hex| u8::from_str_radix(hex, 16).ok()).map_or(255.0, f32::from);
+    0.2126 * channel(1) + 0.7152 * channel(3) + 0.0722 * channel(5) < 128.0
+}
+
 /// The YAML for a string: JSON's double-quoted string is one YAML reads the same.
 fn yaml_string(text: &str) -> String {
     serde_json::Value::String(text.to_string()).to_string()
@@ -502,14 +545,38 @@ fn yaml_string(text: &str) -> String {
 impl<'a> Exporter<'a> {
     fn notice(&mut self, kind: NoticeKind, text: String) {
         let text = shortened(&text.split_whitespace().collect::<Vec<_>>().join(" "), MAX_NOTICE_CHARS);
-        let notice = Notice { slide: Some(self.slide.number).filter(|number| *number > 0), kind, text };
-        if !self.notices.contains(&notice) {
-            self.notices.push(notice);
+        let slide = Some(self.slide.number).filter(|number| *number > 0);
+        if !self.seen.insert((slide, kind, text.clone())) {
+            return;
+        }
+        // One place is kept for saying how many more there were.
+        if self.notices.len() < MAX_NOTICES - 1 {
+            self.notices.push(Notice { slide, kind, text });
+        } else {
+            self.dropped += 1;
         }
     }
 
     fn talk(&mut self, talk: &Talk, title: &str) -> String {
-        let headmatter = format!("theme: default\ntitle: {}\ncanvasWidth: 1920\naspectRatio: 16/9\n", yaml_string(title));
+        let headmatter = format!(
+            "theme: default\ntitle: {}\ncanvasWidth: 1920\naspectRatio: 16/9\ncolorSchema: {}\nfonts:\n  sans: {}\n  mono: {}\n  provider: none\n",
+            yaml_string(title),
+            if is_dark(&self.theme.background) { "dark" } else { "light" },
+            yaml_string(&self.theme.font),
+            yaml_string(&self.theme.mono),
+        );
+        // How each slide is arrived at. Slidev plays a slide's own transition on leaving it,
+        // so each slide is given the next shown slide's. Slides it never shows, hidden ones and
+        // those left out, are passed over.
+        let mut arriving = Vec::with_capacity(talk.slides.len());
+        for (index, slide) in talk.slides.iter().enumerate() {
+            self.slide = SlideState { number: index + 1, ..SlideState::default() };
+            let shown = slide.error.is_none() && !is_hidden(slide);
+            arriving.push(if slide.error.is_none() { Some((self.arrival(slide), shown)) } else { None });
+        }
+        let leaving = |index: usize| {
+            arriving[index + 1..].iter().flatten().find(|(_, shown)| *shown).map_or("none", |(transition, _)| *transition)
+        };
         let mut slides = Vec::new();
         for (index, slide) in talk.slides.iter().enumerate() {
             self.slide = SlideState { number: index + 1, ..SlideState::default() };
@@ -517,10 +584,9 @@ impl<'a> Exporter<'a> {
                 self.notice(NoticeKind::LeftOut, format!("This slide can't be read ({}), so it was left out.", error.message));
                 continue;
             }
-            let first = slides.is_empty();
-            let body = self.slide_body(slide, first);
-            let mut keys = if first { headmatter.clone() } else { String::new() };
-            keys.push_str(&self.slide_keys(slide, first));
+            let body = self.slide_body(slide);
+            let mut keys = if slides.is_empty() { headmatter.clone() } else { String::new() };
+            keys.push_str(&self.slide_keys(slide, leaving(index)));
             slides.push(format!("---\n{keys}---\n\n{body}"));
         }
         if slides.is_empty() {
@@ -529,8 +595,24 @@ impl<'a> Exporter<'a> {
         slides.join("\n")
     }
 
-    /// The slide's own frontmatter keys, each on a line.
-    fn slide_keys(&mut self, slide: &Slide, first: bool) -> String {
+    /// How `slide` says it is arrived at, as Slidev names it.
+    fn arrival(&mut self, slide: &Slide) -> &'static str {
+        let Some(transition) = slide.settings.as_ref().and_then(|settings| settings.get("transition")) else { return "none" };
+        match transition.trim() {
+            "" | "none" => "none",
+            "fade" => "fade",
+            "push" => "slide-left",
+            other => {
+                let text = format!("transition: {} isn't none, fade or push, so this slide has none.", shortened(other, 80));
+                self.notice(NoticeKind::Approximation, text);
+                "none"
+            }
+        }
+    }
+
+    /// The slide's own frontmatter keys, each on a line. `leaving` is how the slide after it
+    /// is arrived at.
+    fn slide_keys(&mut self, slide: &Slide, leaving: &str) -> String {
         let layout = match layout_of(slide) {
             Ok(layout) => layout,
             Err(name) => {
@@ -538,42 +620,31 @@ impl<'a> Exporter<'a> {
                 default_layout()
             }
         };
-        let mut keys = format!("layout: {}\n", layout.slidev);
-        if let Some(transition) = slide.settings.as_ref().and_then(|settings| settings.get("transition")) {
-            let slidev = match transition.trim() {
-                "" | "none" => "none",
-                "fade" => "fade",
-                "push" => "slide-left",
-                other => {
-                    let text = format!("transition: {} isn't none, fade or push, so this slide has none.", shortened(other, 80));
-                    self.notice(NoticeKind::Approximation, text);
-                    "none"
-                }
-            };
-            keys.push_str(&format!("transition: {slidev}\n"));
-            if first {
-                self.deck_transition = slidev != "none";
-            }
-        } else if self.deck_transition {
-            keys.push_str("transition: none\n");
-        }
+        // Always written, so that the headmatter's is never every slide's.
+        let mut keys = format!("layout: {}\ntransition: {leaving}\n", layout.slidev);
         if is_hidden(slide) {
             keys.push_str("hide: true\n");
         }
-        // Slidev counts the clicks its directives ask for, and a picture for each click asks
-        // for none, so the slide says how many it takes.
-        if self.slide.stepped && self.slide.clicks > 0 {
+        // Slidev counts only some of what comes in on a click: not `v-motion`, nor a picture
+        // for each click. The slide says how many clicks it takes, which is all of them.
+        if self.slide.clicks > 0 {
             keys.push_str(&format!("clicks: {}\n", self.slide.clicks));
         }
         keys
     }
 
-    fn slide_body(&mut self, slide: &Slide, first: bool) -> String {
-        let mut out = String::new();
-        if first {
-            out.push_str(&self.style_block());
-            out.push('\n');
-        }
+    fn slide_body(&mut self, slide: &Slide) -> String {
+        // On every slide: Slidev loads a slide only when it's near, and never a hidden one.
+        let style = match self.style.clone() {
+            Some(style) => style,
+            None => {
+                let style = self.style_block();
+                self.style = Some(style.clone());
+                style
+            }
+        };
+        let mut out = style;
+        out.push('\n');
         number_baked(&slide.blocks, &mut self.slide.baked_n);
         let layout = layout_of(slide).unwrap_or_else(|_| default_layout());
         let contents = assign_blocks(slide, layout);
@@ -607,18 +678,33 @@ impl<'a> Exporter<'a> {
         out
     }
 
-    /// The talk's colours and fonts, and its own fonts' faces, for the first slide. A slide's
-    /// style is its own in Slidev, so each rule says it is the whole talk's.
+    /// The talk's colours, fonts and type sizes, and its own fonts' faces. A slide's style is
+    /// its own in Slidev, so each rule says it is the whole talk's. The page has the look, as
+    /// a blank slide has no layout of Slidev's; the sizes and line heights are the engine's.
     fn style_block(&mut self) -> String {
         let theme = &self.theme;
+        let font = escape::font_family(&theme.font);
+        let mono = escape::font_family(&theme.mono);
+        let heading = |selector: &str, size: u32| format!(":global({selector}) {{\n  font-size: {size}px;\n  line-height: {LINE_HEIGHT};\n}}\n");
         let mut style = format!(
-            "<style>\n:global(:root) {{\n  --slidev-theme-primary: {accent};\n}}\n:global(.slidev-layout) {{\n  background: {background};\n  color: {text};\n  font-family: {font}, sans-serif;\n  font-size: 40px;\n}}\n:global(.slidev-layout h1) {{\n  font-size: 64px;\n}}\n:global(.slidev-layout.cover h1), :global(.slidev-layout.section h1) {{\n  font-size: 96px;\n}}\n:global(.slidev-layout code), :global(.slidev-layout pre) {{\n  font-family: {mono}, monospace;\n}}\n",
+            "<style>\n:global(:root) {{\n  --slidev-theme-primary: {accent};\n  --slidev-code-font-family: {mono}, monospace;\n  --slidev-code-font-size: {CODE_SIZE}px;\n  --slidev-code-line-height: {LINE_HEIGHT};\n}}\n:global(.slidev-page) {{\n  height: 100%;\n  background: {background};\n  color: {text};\n  font-family: {font}, sans-serif;\n  font-size: {BODY_SIZE}px;\n  line-height: {LINE_HEIGHT};\n}}\n:global(.slidev-layout) {{\n  font-size: {BODY_SIZE}px;\n  line-height: {LINE_HEIGHT};\n}}\n:global(.slidev-page p), :global(.slidev-page li) {{\n  line-height: {LINE_HEIGHT};\n}}\n:global(.slidev-page code) {{\n  font-family: {mono}, monospace;\n}}\n",
             accent = theme.accent,
             background = theme.background,
             text = theme.text,
-            font = escape::font_family(&theme.font),
-            mono = escape::font_family(&theme.mono),
         );
+        for (selector, size) in [
+            (".slidev-page h1", 64),
+            (".slidev-page h2", 48),
+            (".slidev-page h3", 40),
+            (".slidev-page h4", BODY_SIZE),
+            (".slidev-page h5", BODY_SIZE),
+            (".slidev-page h6", BODY_SIZE),
+            (".slidev-layout.cover h1), :global(.slidev-layout.section h1", 96),
+        ] {
+            style.push_str(&heading(selector, size));
+        }
+        // The theme makes the smallest headings small, faint and in capitals.
+        style.push_str(":global(.slidev-page h6), :global(.slidev-layout h6:not(.opacity-100)) {\n  font-weight: bold;\n  text-transform: none;\n  letter-spacing: normal;\n  opacity: 1;\n}\n");
         let fonts: Vec<(&str, &[u8])> = self
             .files
             .iter()
@@ -649,18 +735,25 @@ impl<'a> Exporter<'a> {
             self.notice(NoticeKind::LeftOut, format!("The file {} can't be in a Slidev talk, so it was left out.", shortened(from, 120)));
             return None;
         }
-        let path = format!("public/{name}");
-        match self.public_names.get(&path.to_lowercase()) {
-            Some(was) if was == from => return Some(public_url(name)),
-            Some(_) => {
-                self.notice(NoticeKind::LeftOut, format!("The file {} has the name of another in the export, so it was left out.", shortened(from, 120)));
-                return None;
+        // A name another file has, in any letter case, is given a number.
+        let (stem, extension) = match name.rsplit_once('.') {
+            Some((stem, extension)) if !stem.is_empty() && !extension.contains('/') => (stem, format!(".{extension}")),
+            _ => (name, String::new()),
+        };
+        for number in 1..=MAX_RENAMES {
+            let name = if number == 1 { name.to_string() } else { format!("{stem}-{number}{extension}") };
+            let key = fold(&name);
+            match self.public_names.get(&key) {
+                Some(was) if was == from => return Some(public_url(&name)),
+                Some(_) => continue,
+                None => {}
             }
-            None => {}
+            self.public_names.insert(key, from.to_string());
+            self.public.push((format!("public/{name}"), data.to_vec()));
+            return Some(public_url(&name));
         }
-        self.public_names.insert(path.to_lowercase(), from.to_string());
-        self.public.push((path, data.to_vec()));
-        Some(public_url(name))
+        self.notice(NoticeKind::LeftOut, format!("The file {} has the name of others in the export, so it was left out.", shortened(from, 120)));
+        None
     }
 
     /// The URL of the talk's file `src`, put under `public/`, or `None` with a notice.
@@ -671,6 +764,8 @@ impl<'a> Exporter<'a> {
             return None;
         };
         let name = src.strip_prefix("assets/").unwrap_or(src);
+        // The folder the app's pictures go in is never a talk's own.
+        let name = if fold(name).starts_with(BAKED_FOLDER) { src } else { name };
         self.publish(name, src, data)
     }
 
@@ -681,6 +776,16 @@ impl<'a> Exporter<'a> {
         self.slide.turned |= turned;
         let result = work(self);
         (self.slide.origin, self.slide.turned) = was;
+        result
+    }
+
+    /// `work`, inside a box in the text that absolutely placed parts are placed in, whose place
+    /// on the slide isn't known here.
+    fn inside_unplaced<T>(&mut self, work: impl FnOnce(&mut Self) -> T) -> T {
+        let was = self.slide.unplaced;
+        self.slide.unplaced = true;
+        let result = work(self);
+        self.slide.unplaced = was;
         result
     }
 
@@ -740,7 +845,15 @@ impl<'a> Exporter<'a> {
             Block::Paragraph { spans, .. } => self.inline(spans, false),
             Block::List { ordered, items, .. } => return self.list(*ordered, items),
             Block::Table { rows, .. } => self.table(rows),
-            Block::Code { language, code, .. } => code_block(language.as_deref(), code),
+            // Slidev keeps `{{` in a fence as text itself, and `v-pre` around one would stop its
+            // own code block component being built.
+            Block::Code { language, code, .. } if !escape::opens_comment(code) => return code_block(language.as_deref(), code),
+            // Slidev reads `<!--` in a slide's text before Markdown does, fences and all, to find
+            // its notes. In a `<pre>` it is an entity, which shows as `<!--`.
+            Block::Code { code, .. } => {
+                self.notice(NoticeKind::Approximation, "A code block holds <!--, so in Slidev it is shown without its colours.".to_string());
+                return format!("<pre v-pre><code>{}</code></pre>\n", escape::pre_lines(code));
+            }
             Block::Picture { src, alt, .. } => match self.asset(src, "picture") {
                 Some(url) => format!("![{}]({url})", escape::text(alt, false)),
                 None => String::new(),
@@ -789,6 +902,9 @@ impl<'a> Exporter<'a> {
     fn table(&mut self, rows: &[Vec<Vec<Span>>]) -> String {
         let Some(header) = rows.first() else { return String::new() };
         let width = header.len().max(1);
+        if rows.iter().any(|row| row.len() > width) {
+            self.notice(NoticeKind::LeftOut, "A table row has more cells than its header, and a Markdown table shows only as many, so the rest were left out.".to_string());
+        }
         let mut out = String::new();
         for (index, row) in rows.iter().enumerate() {
             let cells: Vec<String> = (0..width).map(|column| row.get(column).map_or(String::new(), |spans| self.inline(spans, true))).collect();
@@ -803,27 +919,41 @@ impl<'a> Exporter<'a> {
     /// A paragraph's or heading's text, on one line. `in_table` is whether it's a cell's, where
     /// a `|` ends the cell even in code.
     fn inline(&mut self, spans: &[Span], in_table: bool) -> String {
-        let mut out = String::new();
+        // Each line's run of each span, and whether a line break comes before it.
+        let mut pieces: Vec<(&str, &Style, bool)> = Vec::new();
         for span in spans {
             for (index, piece) in span.text.split('\n').enumerate() {
-                if index > 0 {
-                    out.push_str("<br>");
-                }
-                if !piece.is_empty() {
-                    let line_start = out.is_empty() && !in_table;
-                    out.push_str(&self.span(piece, &span.style, line_start, in_table));
-                }
+                pieces.push((piece, &span.style, index > 0));
             }
+        }
+        let marked = |style: &Style| (style.bold || style.italic) && !(style.color.as_deref().and_then(colour).is_some() || style.size.is_some() || style.underline);
+        let ends_blank = |text: &str| text.is_empty() || text.ends_with([' ', '\t']);
+        let starts_blank = |text: &str| text.is_empty() || text.starts_with([' ', '\t']);
+        let mut out = String::new();
+        for (at, (piece, style, after_break)) in pieces.iter().enumerate() {
+            if *after_break {
+                out.push_str("<br>");
+            }
+            if piece.is_empty() {
+                continue;
+            }
+            // Markdown's marks of two runs that touch can pair up the wrong way.
+            let before = at.checked_sub(1).map(|at| pieces[at]).filter(|(text, style, _)| !after_break && marked(style) && !ends_blank(text) && !starts_blank(piece));
+            let after = pieces.get(at + 1).filter(|(text, style, broken)| !broken && marked(style) && !starts_blank(text) && !ends_blank(piece));
+            let line_start = out.is_empty() && !in_table;
+            out.push_str(&self.span(piece, style, line_start, in_table, before.is_some() || after.is_some()));
         }
         out
     }
 
-    fn span(&mut self, text: &str, style: &Style, line_start: bool, in_table: bool) -> String {
+    /// One run of text in `style`. `touching` is whether it touches a run with Markdown's marks.
+    fn span(&mut self, text: &str, style: &Style, line_start: bool, in_table: bool, touching: bool) -> String {
         let core = text.trim_matches([' ', '\t']);
         let lead = if line_start { "" } else { &text[..text.len() - text.trim_start_matches([' ', '\t']).len()] };
         let trail = &text[text.trim_end_matches([' ', '\t']).len()..];
         if core.is_empty() {
-            return format!("{lead}{}", if trail.is_empty() { "" } else { " " });
+            // Only white space, which reads as one space, or as none at the start of a line.
+            return if line_start { String::new() } else { " ".to_string() };
         }
         let styled = style.color.as_deref().and_then(colour).is_some() || style.size.is_some() || style.underline;
         let mut inner = if style.code {
@@ -847,7 +977,7 @@ impl<'a> Exporter<'a> {
             inner = format!("<span style=\"{}\">{inner}</span>", css.join(";"));
         } else if style.bold || style.italic {
             // Markdown's marks only hold where the text inside starts and ends with a letter or digit.
-            let plain = core.chars().next().is_some_and(char::is_alphanumeric) && core.chars().last().is_some_and(char::is_alphanumeric) && !style.code;
+            let plain = core.chars().next().is_some_and(char::is_alphanumeric) && core.chars().last().is_some_and(char::is_alphanumeric) && !style.code && !touching;
             inner = match (style.bold, style.italic, plain) {
                 (true, true, true) => format!("***{inner}***"),
                 (true, false, true) => format!("**{inner}**"),
@@ -941,7 +1071,8 @@ impl<'a> Exporter<'a> {
                 }
                 css.extend(timing_css);
                 let children: Vec<&Block> = tag.children.iter().collect();
-                let content = if positioned { self.inside(origin, turned, |this| this.blocks(&children)) } else { self.blocks(&children) };
+                // A shape in the text holds its picture in place, so it's what a part in it is placed in.
+                let content = if positioned { self.inside(origin, turned, |this| this.blocks(&children)) } else { self.inside_unplaced(|this| this.blocks(&children)) };
                 let svg = svg.replacen("overflow:visible", "overflow:visible;z-index:-1", 1);
                 let open = open("div", &css, &attrs);
                 if content.trim().is_empty() { format!("{open}\n{svg}\n</div>\n") } else { format!("{open}\n{svg}\n\n{}\n\n</div>\n", content.trim_end()) }
@@ -970,7 +1101,8 @@ impl<'a> Exporter<'a> {
             "Picture" => {
                 let Some(url) = self.asset(tag.attr("src").unwrap_or_default(), "picture") else { return String::new() };
                 css.extend(timing_css);
-                format!("{}\n", open("img", &css, &format!(" src=\"{}\" alt=\"\"{attrs}", escape::attribute(&url))))
+                let alt = escape::attribute(tag.attr("alt").unwrap_or_default());
+                format!("{}\n", open("img", &css, &format!(" src=\"{}\" alt=\"{alt}\"{attrs}", escape::attribute(&url))))
             }
             "Video" => self.video(tag, css, &attrs, timing_css),
             _ => self.baked(tag, &attrs, timing_css),
@@ -988,8 +1120,14 @@ impl<'a> Exporter<'a> {
         if self.slide.turned {
             self.notice(NoticeKind::Approximation, format!("The {} is in a box that's turned, so it may not sit where it does on the slide.", shortened(&baked.tag, 80)));
         }
-        let (x, y) = (baked.x - self.slide.origin.0, baked.y - self.slide.origin.1);
-        placed_css(x, y, Some(baked.w.max(0.0)), Some(baked.h.max(0.0)), if baked.rotate.is_finite() { baked.rotate } else { 0.0 })
+        if self.slide.unplaced {
+            self.notice(NoticeKind::Approximation, format!("The {} is in a shape in the text, so it may not sit where it does on the slide.", shortened(&baked.tag, 80)));
+        }
+        let held = |value: f32, low: f32, high: f32| if value.is_finite() { value.clamp(low, high) } else { 0.0 };
+        let x = held(baked.x, MIN_POSITION, MAX_POSITION) - self.slide.origin.0;
+        let y = held(baked.y, MIN_POSITION, MAX_POSITION) - self.slide.origin.1;
+        let (w, h) = (held(baked.w, 0.0, MAX_SIZE), held(baked.h, 0.0, MAX_SIZE));
+        placed_css(x, y, Some(w), Some(h), held(baked.rotate, -MAX_ROTATION, MAX_ROTATION))
     }
 
     /// The picture `baked/<slide>/<file>`, put under `public/` as `baked-<slide>-<name>`.
@@ -999,7 +1137,7 @@ impl<'a> Exporter<'a> {
             self.notice(NoticeKind::LeftOut, format!("The picture of the {} wasn't made, so it was left out.", shortened(tag, 80)));
             return None;
         };
-        self.publish(&format!("baked-{}-{name}", self.slide.number), &from, data)
+        self.publish(&format!("{BAKED_FOLDER}{}-{name}", self.slide.number), &from, data)
     }
 
     fn video(&mut self, tag: &Tag, mut css: Vec<String>, attrs: &str, timing_css: Option<String>) -> String {
@@ -1065,6 +1203,11 @@ impl<'a> Exporter<'a> {
 
 /// `code` in backticks enough that none of its own end it.
 fn code_span(code: &str, in_table: bool) -> String {
+    // Slidev's slide splitter reads `<!--` anywhere outside a fence, so in code it's HTML with
+    // the entity, as Slidev writes inline code itself, with `v-pre`.
+    if escape::opens_comment(code) {
+        return format!("<code v-pre>{}</code>", escape::text(code, false));
+    }
     let longest = longest_run(code, '`');
     let fence = "`".repeat(longest + 1);
     let pad = code.starts_with('`') || code.ends_with('`') || (code.starts_with(' ') && code.ends_with(' ') && code.trim() != "");

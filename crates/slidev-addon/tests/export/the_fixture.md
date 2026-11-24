@@ -3,28 +3,73 @@ theme: default
 title: "A made-up talk"
 canvasWidth: 1920
 aspectRatio: 16/9
+colorSchema: light
+fonts:
+  sans: "Inter"
+  mono: "JetBrains Mono"
+  provider: none
 layout: cover
-transition: fade
+transition: slide-left
 ---
 
 <style>
 :global(:root) {
   --slidev-theme-primary: #0d9488;
+  --slidev-code-font-family: "JetBrains Mono", monospace;
+  --slidev-code-font-size: 32px;
+  --slidev-code-line-height: 1.25;
 }
-:global(.slidev-layout) {
+:global(.slidev-page) {
+  height: 100%;
   background: #f8fafc;
   color: #0f172a;
   font-family: "Inter", sans-serif;
   font-size: 40px;
+  line-height: 1.25;
 }
-:global(.slidev-layout h1) {
+:global(.slidev-layout) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page p), :global(.slidev-page li) {
+  line-height: 1.25;
+}
+:global(.slidev-page code) {
+  font-family: "JetBrains Mono", monospace;
+}
+:global(.slidev-page h1) {
   font-size: 64px;
+  line-height: 1.25;
+}
+:global(.slidev-page h2) {
+  font-size: 48px;
+  line-height: 1.25;
+}
+:global(.slidev-page h3) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h4) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h5) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h6) {
+  font-size: 40px;
+  line-height: 1.25;
 }
 :global(.slidev-layout.cover h1), :global(.slidev-layout.section h1) {
   font-size: 96px;
+  line-height: 1.25;
 }
-:global(.slidev-layout code), :global(.slidev-layout pre) {
-  font-family: "JetBrains Mono", monospace;
+:global(.slidev-page h6), :global(.slidev-layout h6:not(.opacity-100)) {
+  font-weight: bold;
+  text-transform: none;
+  letter-spacing: normal;
+  opacity: 1;
 }
 </style>
 
@@ -38,8 +83,70 @@ Welcome everyone. This talk is invented for testing.
 
 ---
 layout: default
-transition: slide-left
+transition: none
+clicks: 3
 ---
+
+<style>
+:global(:root) {
+  --slidev-theme-primary: #0d9488;
+  --slidev-code-font-family: "JetBrains Mono", monospace;
+  --slidev-code-font-size: 32px;
+  --slidev-code-line-height: 1.25;
+}
+:global(.slidev-page) {
+  height: 100%;
+  background: #f8fafc;
+  color: #0f172a;
+  font-family: "Inter", sans-serif;
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-layout) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page p), :global(.slidev-page li) {
+  line-height: 1.25;
+}
+:global(.slidev-page code) {
+  font-family: "JetBrains Mono", monospace;
+}
+:global(.slidev-page h1) {
+  font-size: 64px;
+  line-height: 1.25;
+}
+:global(.slidev-page h2) {
+  font-size: 48px;
+  line-height: 1.25;
+}
+:global(.slidev-page h3) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h4) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h5) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h6) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-layout.cover h1), :global(.slidev-layout.section h1) {
+  font-size: 96px;
+  line-height: 1.25;
+}
+:global(.slidev-page h6), :global(.slidev-layout h6:not(.opacity-100)) {
+  font-weight: bold;
+  text-transform: none;
+  letter-spacing: normal;
+  opacity: 1;
+}
+</style>
 
 # What we counted
 
@@ -55,6 +162,67 @@ transition: slide-left
 layout: two-cols
 transition: none
 ---
+
+<style>
+:global(:root) {
+  --slidev-theme-primary: #0d9488;
+  --slidev-code-font-family: "JetBrains Mono", monospace;
+  --slidev-code-font-size: 32px;
+  --slidev-code-line-height: 1.25;
+}
+:global(.slidev-page) {
+  height: 100%;
+  background: #f8fafc;
+  color: #0f172a;
+  font-family: "Inter", sans-serif;
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-layout) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page p), :global(.slidev-page li) {
+  line-height: 1.25;
+}
+:global(.slidev-page code) {
+  font-family: "JetBrains Mono", monospace;
+}
+:global(.slidev-page h1) {
+  font-size: 64px;
+  line-height: 1.25;
+}
+:global(.slidev-page h2) {
+  font-size: 48px;
+  line-height: 1.25;
+}
+:global(.slidev-page h3) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h4) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h5) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h6) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-layout.cover h1), :global(.slidev-layout.section h1) {
+  font-size: 96px;
+  line-height: 1.25;
+}
+:global(.slidev-page h6), :global(.slidev-layout h6:not(.opacity-100)) {
+  font-weight: bold;
+  text-transform: none;
+  letter-spacing: normal;
+  opacity: 1;
+}
+</style>
 
 # Two transects
 
@@ -73,6 +241,67 @@ layout: section
 transition: none
 ---
 
+<style>
+:global(:root) {
+  --slidev-theme-primary: #0d9488;
+  --slidev-code-font-family: "JetBrains Mono", monospace;
+  --slidev-code-font-size: 32px;
+  --slidev-code-line-height: 1.25;
+}
+:global(.slidev-page) {
+  height: 100%;
+  background: #f8fafc;
+  color: #0f172a;
+  font-family: "Inter", sans-serif;
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-layout) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page p), :global(.slidev-page li) {
+  line-height: 1.25;
+}
+:global(.slidev-page code) {
+  font-family: "JetBrains Mono", monospace;
+}
+:global(.slidev-page h1) {
+  font-size: 64px;
+  line-height: 1.25;
+}
+:global(.slidev-page h2) {
+  font-size: 48px;
+  line-height: 1.25;
+}
+:global(.slidev-page h3) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h4) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h5) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h6) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-layout.cover h1), :global(.slidev-layout.section h1) {
+  font-size: 96px;
+  line-height: 1.25;
+}
+:global(.slidev-page h6), :global(.slidev-layout h6:not(.opacity-100)) {
+  font-weight: bold;
+  text-transform: none;
+  letter-spacing: normal;
+  opacity: 1;
+}
+</style>
+
 # Part two: the data
 
 What the tide left behind
@@ -80,7 +309,69 @@ What the tide left behind
 ---
 layout: none
 transition: none
+clicks: 1
 ---
+
+<style>
+:global(:root) {
+  --slidev-theme-primary: #0d9488;
+  --slidev-code-font-family: "JetBrains Mono", monospace;
+  --slidev-code-font-size: 32px;
+  --slidev-code-line-height: 1.25;
+}
+:global(.slidev-page) {
+  height: 100%;
+  background: #f8fafc;
+  color: #0f172a;
+  font-family: "Inter", sans-serif;
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-layout) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page p), :global(.slidev-page li) {
+  line-height: 1.25;
+}
+:global(.slidev-page code) {
+  font-family: "JetBrains Mono", monospace;
+}
+:global(.slidev-page h1) {
+  font-size: 64px;
+  line-height: 1.25;
+}
+:global(.slidev-page h2) {
+  font-size: 48px;
+  line-height: 1.25;
+}
+:global(.slidev-page h3) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h4) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h5) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h6) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-layout.cover h1), :global(.slidev-layout.section h1) {
+  font-size: 96px;
+  line-height: 1.25;
+}
+:global(.slidev-page h6), :global(.slidev-layout h6:not(.opacity-100)) {
+  font-weight: bold;
+  text-transform: none;
+  letter-spacing: normal;
+  opacity: 1;
+}
+</style>
 
 <div style="position:absolute;left:560px;top:400px;width:800px;height:280px;background:#fef3c7;border:4px solid #d97706;border-radius:32px;padding:24px;box-sizing:border-box" v-click="1">
 
@@ -97,7 +388,69 @@ Then a line of its own, set in italics.
 ---
 layout: default
 transition: none
+clicks: 2
 ---
+
+<style>
+:global(:root) {
+  --slidev-theme-primary: #0d9488;
+  --slidev-code-font-family: "JetBrains Mono", monospace;
+  --slidev-code-font-size: 32px;
+  --slidev-code-line-height: 1.25;
+}
+:global(.slidev-page) {
+  height: 100%;
+  background: #f8fafc;
+  color: #0f172a;
+  font-family: "Inter", sans-serif;
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-layout) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page p), :global(.slidev-page li) {
+  line-height: 1.25;
+}
+:global(.slidev-page code) {
+  font-family: "JetBrains Mono", monospace;
+}
+:global(.slidev-page h1) {
+  font-size: 64px;
+  line-height: 1.25;
+}
+:global(.slidev-page h2) {
+  font-size: 48px;
+  line-height: 1.25;
+}
+:global(.slidev-page h3) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h4) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h5) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h6) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-layout.cover h1), :global(.slidev-layout.section h1) {
+  font-size: 96px;
+  line-height: 1.25;
+}
+:global(.slidev-page h6), :global(.slidev-layout h6:not(.opacity-100)) {
+  font-weight: bold;
+  text-transform: none;
+  letter-spacing: normal;
+  opacity: 1;
+}
+</style>
 
 # Every shape
 
@@ -134,21 +487,143 @@ transition: none
 clicks: 1
 ---
 
+<style>
+:global(:root) {
+  --slidev-theme-primary: #0d9488;
+  --slidev-code-font-family: "JetBrains Mono", monospace;
+  --slidev-code-font-size: 32px;
+  --slidev-code-line-height: 1.25;
+}
+:global(.slidev-page) {
+  height: 100%;
+  background: #f8fafc;
+  color: #0f172a;
+  font-family: "Inter", sans-serif;
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-layout) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page p), :global(.slidev-page li) {
+  line-height: 1.25;
+}
+:global(.slidev-page code) {
+  font-family: "JetBrains Mono", monospace;
+}
+:global(.slidev-page h1) {
+  font-size: 64px;
+  line-height: 1.25;
+}
+:global(.slidev-page h2) {
+  font-size: 48px;
+  line-height: 1.25;
+}
+:global(.slidev-page h3) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h4) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h5) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h6) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-layout.cover h1), :global(.slidev-layout.section h1) {
+  font-size: 96px;
+  line-height: 1.25;
+}
+:global(.slidev-page h6), :global(.slidev-layout h6:not(.opacity-100)) {
+  font-weight: bold;
+  text-transform: none;
+  letter-spacing: normal;
+  opacity: 1;
+}
+</style>
+
 # An icon, a picture and a gauge
 
-<img style="position:absolute;left:100px;top:840px;width:96px;height:96px" src="/baked-7-0.png" alt="">
+<img style="position:absolute;left:100px;top:840px;width:96px;height:96px" src="/stagepack-baked/7-0.png" alt="">
 
 <img style="position:absolute;left:1320px;top:560px;width:480px;height:270px" src="/photo.png" alt="">
 
 <div>
-<img style="position:absolute;left:700px;top:560px;width:400px;height:300px" v-if="$clicks === 0" src="/baked-7-1-0.png" alt="">
-<img style="position:absolute;left:700px;top:560px;width:400px;height:300px" v-if="$clicks >= 1" src="/baked-7-1-1.png" alt="">
+<img style="position:absolute;left:700px;top:560px;width:400px;height:300px" v-if="$clicks === 0" src="/stagepack-baked/7-1-0.png" alt="">
+<img style="position:absolute;left:700px;top:560px;width:400px;height:300px" v-if="$clicks >= 1" src="/stagepack-baked/7-1-1.png" alt="">
 </div>
 
 ---
 layout: default
 transition: none
 ---
+
+<style>
+:global(:root) {
+  --slidev-theme-primary: #0d9488;
+  --slidev-code-font-family: "JetBrains Mono", monospace;
+  --slidev-code-font-size: 32px;
+  --slidev-code-line-height: 1.25;
+}
+:global(.slidev-page) {
+  height: 100%;
+  background: #f8fafc;
+  color: #0f172a;
+  font-family: "Inter", sans-serif;
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-layout) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page p), :global(.slidev-page li) {
+  line-height: 1.25;
+}
+:global(.slidev-page code) {
+  font-family: "JetBrains Mono", monospace;
+}
+:global(.slidev-page h1) {
+  font-size: 64px;
+  line-height: 1.25;
+}
+:global(.slidev-page h2) {
+  font-size: 48px;
+  line-height: 1.25;
+}
+:global(.slidev-page h3) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h4) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h5) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h6) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-layout.cover h1), :global(.slidev-layout.section h1) {
+  font-size: 96px;
+  line-height: 1.25;
+}
+:global(.slidev-page h6), :global(.slidev-layout h6:not(.opacity-100)) {
+  font-weight: bold;
+  text-transform: none;
+  letter-spacing: normal;
+  opacity: 1;
+}
+</style>
 
 # Counts by pool
 
@@ -161,6 +636,67 @@ transition: none
 layout: default
 transition: none
 ---
+
+<style>
+:global(:root) {
+  --slidev-theme-primary: #0d9488;
+  --slidev-code-font-family: "JetBrains Mono", monospace;
+  --slidev-code-font-size: 32px;
+  --slidev-code-line-height: 1.25;
+}
+:global(.slidev-page) {
+  height: 100%;
+  background: #f8fafc;
+  color: #0f172a;
+  font-family: "Inter", sans-serif;
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-layout) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page p), :global(.slidev-page li) {
+  line-height: 1.25;
+}
+:global(.slidev-page code) {
+  font-family: "JetBrains Mono", monospace;
+}
+:global(.slidev-page h1) {
+  font-size: 64px;
+  line-height: 1.25;
+}
+:global(.slidev-page h2) {
+  font-size: 48px;
+  line-height: 1.25;
+}
+:global(.slidev-page h3) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h4) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h5) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h6) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-layout.cover h1), :global(.slidev-layout.section h1) {
+  font-size: 96px;
+  line-height: 1.25;
+}
+:global(.slidev-page h6), :global(.slidev-layout h6:not(.opacity-100)) {
+  font-weight: bold;
+  text-transform: none;
+  letter-spacing: normal;
+  opacity: 1;
+}
+</style>
 
 # The counting script
 
@@ -175,6 +711,67 @@ layout: default
 transition: none
 hide: true
 ---
+
+<style>
+:global(:root) {
+  --slidev-theme-primary: #0d9488;
+  --slidev-code-font-family: "JetBrains Mono", monospace;
+  --slidev-code-font-size: 32px;
+  --slidev-code-line-height: 1.25;
+}
+:global(.slidev-page) {
+  height: 100%;
+  background: #f8fafc;
+  color: #0f172a;
+  font-family: "Inter", sans-serif;
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-layout) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page p), :global(.slidev-page li) {
+  line-height: 1.25;
+}
+:global(.slidev-page code) {
+  font-family: "JetBrains Mono", monospace;
+}
+:global(.slidev-page h1) {
+  font-size: 64px;
+  line-height: 1.25;
+}
+:global(.slidev-page h2) {
+  font-size: 48px;
+  line-height: 1.25;
+}
+:global(.slidev-page h3) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h4) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h5) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-page h6) {
+  font-size: 40px;
+  line-height: 1.25;
+}
+:global(.slidev-layout.cover h1), :global(.slidev-layout.section h1) {
+  font-size: 96px;
+  line-height: 1.25;
+}
+:global(.slidev-page h6), :global(.slidev-layout h6:not(.opacity-100)) {
+  font-weight: bold;
+  text-transform: none;
+  letter-spacing: normal;
+  opacity: 1;
+}
+</style>
 
 # Spare slide
 
