@@ -28,7 +28,7 @@ pub const MAX_PROPS: usize = 64;
 /// The longest path of an asset that can be read. Far longer than any real one.
 pub const MAX_ASSET_PATH_BYTES: usize = 256;
 
-/// How often the clock that stops a component, or an add-on, ticks.
+/// How often the clocks that stop a component, or an add-on, tick.
 pub(crate) const TICK: Duration = Duration::from_millis(10);
 const MAX_ASSET_READS: u32 = 64;
 /// More than any component needs: each element takes a pointer's worth of memory.
@@ -130,9 +130,8 @@ impl WasmComponent {
     }
 }
 
-/// One engine for the process, with one clock that every running component and add-on is
-/// timed by.
-pub(crate) fn engine() -> &'static Engine {
+/// One engine for the process, with one clock that every running component is timed by.
+fn engine() -> &'static Engine {
     static ENGINE: OnceLock<Engine> = OnceLock::new();
     ENGINE.get_or_init(|| {
         let mut config = Config::new();

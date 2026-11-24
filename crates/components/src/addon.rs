@@ -1,20 +1,29 @@
 //! Running an add-on, held to its limits. An add-on is a WebAssembly module with no imports
-//! at all: it is given a bundle of files and gives one back, and nothing else. It runs on
-//! the components' engine and clock, with limits of its own, and everything it hands back
-//! is checked before the app uses it.
+//! at all: it is given a bundle of files and gives one back, and nothing else. It runs on an
+//! engine of its own, with a deep stack on a thread of its own, under limits of its own, and
+//! everything it hands back is checked before the app uses it.
 
 use std::collections::BTreeSet;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use addon_abi::{decode, encode, safe_name, Bundle, Report, ABI_VERSION, ARGS, ERROR, MAX_FILES, OP, REPORT};
 use serde::Deserialize;
-use wasmtime::{ExternType, FuncType, Instance, Memory, Module, ResourceLimiter, Store, Trap, TypedFunc, ValType};
+use wasmtime::{Config, Engine, ExternType, FuncType, Instance, Memory, Module, ResourceLimiter, Store, Trap, TypedFunc, ValType, WasmFeatures};
 
-use crate::sandbox::{engine, unpack, MAX_TABLE_ELEMENTS, TICK};
+use crate::sandbox::{unpack, MAX_TABLE_ELEMENTS, TICK};
 use crate::shortened;
 
-/// The longest an add-on may run, for loading or for one operation.
+/// The longest one operation of an add-on may run.
 pub const ADDON_TIME_LIMIT: Duration = Duration::from_secs(60);
+/// The longest an add-on may take to start and say what it is.
+pub const ADDON_LOAD_TIME_LIMIT: Duration = Duration::from_secs(5);
+/// The most stack an add-on's code may use. A reader of Markdown goes one level further down
+/// for every level a slide nests, which takes far more than a component's stack.
+pub const ADDON_STACK_BYTES: usize = 64 * 1024 * 1024;
+/// The stack of the thread an add-on runs on: room for all of the add-on's, and the app's
+/// own frames under it. An overflow then traps rather than ending the process.
+const THREAD_STACK_BYTES: usize = 128 * 1024 * 1024;
 /// The most memory an add-on may have.
 pub const ADDON_MEMORY_LIMIT_BYTES: usize = 1024 * 1024 * 1024;
 /// The most bytes a bundle may come to, given to an add-on or given back.
@@ -31,6 +40,10 @@ pub const MAX_ERROR_CHARS: usize = 500;
 pub const MAX_INFO_STRING_BYTES: usize = 64;
 /// The most operations an add-on can name.
 pub const MAX_OPERATIONS: usize = 16;
+/// The most notices a report may hold.
+pub const MAX_NOTICES: usize = 10_000;
+/// The most characters of a notice's text.
+pub const MAX_NOTICE_CHARS: usize = 500;
 
 const EXPORTS: [(&str, &[ValType], &[ValType]); 4] = [
     ("addon_abi", &[], &[ValType::I32]),
@@ -45,10 +58,13 @@ pub enum AddonError {
     /// It isn't an add-on this app can run, or it gave back something that can't be read.
     #[error("The add-on can't be used: {0}.")]
     Malformed(String),
+    /// What the app asked of the add-on isn't something an add-on can be given. The sentence says why.
+    #[error("{0}")]
+    InvalidInput(String),
     /// Over one of the limits, which the sentence names.
     #[error("{0}")]
     TooLarge(&'static str),
-    #[error("The add-on took longer than a minute, so it was stopped.")]
+    #[error("The add-on took longer than it may, a minute for a task or 5 seconds to start, so it was stopped.")]
     TookTooLong,
     #[error("The add-on needed more than 1 GiB of memory, so it was stopped.")]
     OutOfMemory,
@@ -71,7 +87,10 @@ pub struct AddonInfo {
 /// What one run of an add-on is held to. Only tests run under limits other than the usual.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AddonLimits {
+    /// For one operation.
     pub time: Duration,
+    /// For starting the add-on and asking it what it is.
+    pub load_time: Duration,
     pub memory_bytes: usize,
     pub input_bytes: usize,
     pub output_bytes: usize,
@@ -82,6 +101,7 @@ impl Default for AddonLimits {
     fn default() -> AddonLimits {
         AddonLimits {
             time: ADDON_TIME_LIMIT,
+            load_time: ADDON_LOAD_TIME_LIMIT,
             memory_bytes: ADDON_MEMORY_LIMIT_BYTES,
             input_bytes: MAX_BUNDLE_BYTES,
             output_bytes: MAX_BUNDLE_BYTES,
@@ -110,13 +130,13 @@ impl std::fmt::Debug for Addon {
 impl Addon {
     /// Compiles and checks the add-on, and asks it once what it is.
     pub fn load(wasm: &[u8]) -> Result<Addon, AddonError> {
-        Addon::load_limited(wasm, &AddonLimits::default())
+        on_deep_stack(|| Addon::load_limited(wasm, &AddonLimits::default()))
     }
 
     /// [`Addon::load`] under limits of the test's own.
     #[cfg(feature = "test-hooks")]
     pub fn load_with_limits(wasm: &[u8], limits: &AddonLimits) -> Result<Addon, AddonError> {
-        Addon::load_limited(wasm, limits)
+        on_deep_stack(|| Addon::load_limited(wasm, limits))
     }
 
     fn load_limited(wasm: &[u8], limits: &AddonLimits) -> Result<Addon, AddonError> {
@@ -126,8 +146,8 @@ impl Addon {
         let module = Module::new(engine(), wasm).map_err(|error| malformed(format!("it isn't WebAssembly this app can run ({})", detail(&error.to_string()))))?;
         check_shape(&module)?;
 
-        // These are the add-on's code too, so they run under the same limits as an operation.
-        let mut running = Running::start(&module, limits)?;
+        // These are the add-on's code too, so they run under limits as an operation does.
+        let mut running = Running::start(&module, limits, limits.load_time)?;
         let version = running.export::<(), u32>("addon_abi")?;
         let version = running.call(&version, ())?;
         if version != ABI_VERSION {
@@ -139,8 +159,7 @@ impl Addon {
         if len > MAX_INFO_BYTES {
             return Err(malformed(format!("its info is more than {} KiB", MAX_INFO_BYTES / 1024)));
         }
-        let info = running.read(at, len)?;
-        let info: AddonInfo = serde_json::from_slice(&info).map_err(|error| malformed(format!("its info can't be read ({})", detail(&error.to_string()))))?;
+        let info: AddonInfo = serde_json::from_slice(running.bytes(at, len)?).map_err(|error| malformed(format!("its info can't be read ({})", detail(&error.to_string()))))?;
         check_info(&info)?;
         Ok(Addon { module, info })
     }
@@ -149,39 +168,45 @@ impl Addon {
         &self.info
     }
 
-    /// Does `op` with `args_json` on `files`, and gives back the files and the report. Every
-    /// name in `files` must pass [`safe_name`].
+    /// Does `op`, one of the info's operations, with `args_json` on `files`, and gives back
+    /// the files and the report. Every name in `files` must pass [`safe_name`].
     pub fn run(&self, op: &str, args_json: &str, files: Bundle) -> Result<(Bundle, Report), AddonError> {
-        self.run_limited(op, args_json, files, &AddonLimits::default())
+        on_deep_stack(|| self.run_limited(op, args_json, files, &AddonLimits::default()))
     }
 
     /// [`Addon::run`] under limits of the test's own.
     #[cfg(feature = "test-hooks")]
     pub fn run_with_limits(&self, op: &str, args_json: &str, files: Bundle, limits: &AddonLimits) -> Result<(Bundle, Report), AddonError> {
-        self.run_limited(op, args_json, files, limits)
+        on_deep_stack(|| self.run_limited(op, args_json, files, limits))
     }
 
     fn run_limited(&self, op: &str, args_json: &str, files: Bundle, limits: &AddonLimits) -> Result<(Bundle, Report), AddonError> {
         // Everything is checked before anything is copied or run.
+        if !self.info.operations.iter().any(|operation| operation == op) {
+            return Err(AddonError::InvalidInput(format!("The add-on has no operation called {:?}.", shortened(op, 80))));
+        }
         if files.len() + 2 > limits.files {
             return Err(AddonError::TooLarge(TOO_MANY_FILES));
         }
         if let Some((name, _)) = files.iter().find(|(name, _)| !safe_name(name)) {
-            return Err(malformed(format!("it can't be given a file named {name:?}")));
+            return Err(AddonError::InvalidInput(format!("A file named {:?} can't be given to an add-on.", shortened(name, 80))));
         }
         let size = 8 + [(OP, op.len()), (ARGS, args_json.len())].iter().map(|(name, len)| 8 + name.len() + len).sum::<usize>()
             + files.iter().map(|(name, data)| 8 + name.len() + data.len()).sum::<usize>();
         if size > limits.input_bytes || u32::try_from(size).is_err() {
             return Err(AddonError::TooLarge(INPUT_TOO_LARGE));
         }
-        let mut input = Vec::with_capacity(files.len() + 2);
-        input.push((OP.to_string(), op.as_bytes().to_vec()));
-        input.push((ARGS.to_string(), args_json.as_bytes().to_vec()));
-        input.extend(files);
-        let input = encode(&input);
+        // The files are dropped once they are encoded, so they aren't held twice through the run.
+        let input = {
+            let mut input = Vec::with_capacity(files.len() + 2);
+            input.push((OP.to_string(), op.as_bytes().to_vec()));
+            input.push((ARGS.to_string(), args_json.as_bytes().to_vec()));
+            input.extend(files);
+            encode(&input)
+        };
         let len = input.len() as u32;
 
-        let mut running = Running::start(&self.module, limits)?;
+        let mut running = Running::start(&self.module, limits, limits.time)?;
         let alloc = running.export::<u32, u32>("alloc")?;
         let run = running.export::<(u32, u32), u64>("run")?;
         let at = running.call(&alloc, len)?;
@@ -195,9 +220,8 @@ impl Addon {
         if len > limits.output_bytes {
             return Err(AddonError::TooLarge(OUTPUT_TOO_LARGE));
         }
-        let output = running.read(at, len)?;
-        drop(running);
-        answer(&output, limits)
+        // Read where it lies, without copying the whole bundle out first.
+        answer(running.bytes(at, len)?, limits)
     }
 }
 
@@ -208,7 +232,7 @@ fn malformed(message: String) -> AddonError {
 /// Another part's message, as part of a sentence: on one line, short, starting in lower case
 /// and without its full stop.
 fn detail(message: &str) -> String {
-    let line = one_line(message.as_bytes());
+    let line = one_line(message);
     let line = shortened(line.trim_end_matches('.'), 200);
     // "The bundle …" reads on as "the bundle …", but "WebAssembly …" stays as it is.
     let mut chars = line.chars();
@@ -225,32 +249,51 @@ fn answer(output: &[u8], limits: &AddonLimits) -> Result<(Bundle, Report), Addon
         return Err(AddonError::TooLarge(TOO_MANY_FILES));
     }
     if let Some((_, sentence)) = files.iter().find(|(name, _)| name == ERROR) {
-        return Err(AddonError::Failed(one_line(sentence)));
+        return Err(AddonError::Failed(closed_sentence(sentence)));
     }
     if let Some((name, _)) = files.iter().find(|(name, _)| name == OP || name == ARGS) {
         return Err(malformed(format!("it gave back {name}, which only the app gives")));
     }
     let at = files.iter().position(|(name, _)| name == REPORT).ok_or_else(|| malformed("it gave back no report".into()))?;
     let (_, report) = files.remove(at);
-    let report = serde_json::from_slice(&report).map_err(|error| malformed(format!("its report can't be read ({})", detail(&error.to_string()))))?;
+    let mut report: Report =
+        serde_json::from_slice(&report).map_err(|error| malformed(format!("its report can't be read ({})", detail(&error.to_string()))))?;
+    if report.notices.len() > MAX_NOTICES {
+        return Err(malformed(format!("its report has more than {MAX_NOTICES} notices")));
+    }
+    for notice in &mut report.notices {
+        if notice.slide == Some(0) {
+            return Err(malformed("its report has a notice on slide 0, and slides count from 1".into()));
+        }
+        notice.text = shortened(&one_line(&notice.text), MAX_NOTICE_CHARS);
+    }
     Ok((files, report))
 }
 
-/// An add-on's sentence, on one line of at most `MAX_ERROR_CHARS` characters.
-fn one_line(sentence: &[u8]) -> String {
-    let text = String::from_utf8_lossy(sentence);
-    let words: Vec<&str> = text.split(|c: char| c.is_control() || c.is_whitespace()).filter(|word| !word.is_empty()).collect();
-    let line = words.join(" ");
+/// `text` on one line, with control characters and runs of white space made single spaces.
+fn one_line(text: &str) -> String {
+    text.split(|c: char| c.is_control() || c.is_whitespace()).filter(|word| !word.is_empty()).collect::<Vec<_>>().join(" ")
+}
+
+/// An add-on's sentence, on one line of at most `MAX_ERROR_CHARS` characters and ending as a
+/// sentence does.
+fn closed_sentence(sentence: &[u8]) -> String {
+    let line = one_line(&String::from_utf8_lossy(sentence));
     if line.is_empty() {
         return "it gave no reason.".into();
     }
-    shortened(&line, MAX_ERROR_CHARS)
+    let mut line = shortened(&line, MAX_ERROR_CHARS - 1);
+    if !line.ends_with(['.', '!', '?']) {
+        line.push('.');
+    }
+    line
 }
 
 /// Checks what the module asks for and offers before anything of it runs.
 fn check_shape(module: &Module) -> Result<(), AddonError> {
     if let Some(import) = module.imports().next() {
-        return Err(malformed(format!("it asks for {}.{}, and an add-on can have nothing from the app", import.module(), import.name())));
+        let wanted = format!("{}.{}", import.module(), import.name());
+        return Err(malformed(format!("it asks for {:?}, and an add-on can have nothing from the app", shortened(&wanted, 80))));
     }
     for (name, params, results) in EXPORTS {
         let Some(ExternType::Func(function)) = module.get_export(name) else {
@@ -332,11 +375,11 @@ struct Running {
 }
 
 impl Running {
-    fn start(module: &Module, limits: &AddonLimits) -> Result<Running, AddonError> {
+    fn start(module: &Module, limits: &AddonLimits, time: Duration) -> Result<Running, AddonError> {
         let mut store = Store::new(engine(), Limiter { memory_bytes: limits.memory_bytes, refused_growth: false });
         store.limiter(|limiter| limiter);
         // Set before instantiating, as a start function is the add-on's code too.
-        store.set_epoch_deadline((limits.time.as_millis() / TICK.as_millis()).max(1) as u64);
+        store.set_epoch_deadline((time.as_millis() / TICK.as_millis()).max(1) as u64);
         store.epoch_deadline_trap();
         // `check_shape` let through no imports, so there is nothing to give it.
         let instance = match Instance::new(&mut store, module, &[]) {
@@ -366,12 +409,10 @@ impl Running {
     }
 
     /// `len` bytes at `at` in the add-on's memory, which the caller has held to a limit.
-    fn read(&self, at: usize, len: usize) -> Result<Vec<u8>, AddonError> {
-        let bytes = at
-            .checked_add(len)
+    fn bytes(&self, at: usize, len: usize) -> Result<&[u8], AddonError> {
+        at.checked_add(len)
             .and_then(|end| self.memory.data(&self.store).get(at..end))
-            .ok_or_else(|| malformed("it points outside its memory".into()))?;
-        Ok(bytes.to_vec())
+            .ok_or_else(|| malformed("it points outside its memory".into()))
     }
 }
 
@@ -384,4 +425,57 @@ fn fault(error: &wasmtime::Error, store: &Store<Limiter>) -> AddonError {
     } else {
         AddonError::Trapped
     }
+}
+
+/// The engine add-ons run on, with a clock of its own. Its stack is far deeper than a
+/// component's, and it reads only the WebAssembly an add-on needs: nothing that shares memory
+/// between threads, reaches past 4 GiB, collects garbage, throws or switches stacks.
+fn engine() -> &'static Engine {
+    static ENGINE: OnceLock<Engine> = OnceLock::new();
+    ENGINE.get_or_init(|| {
+        let mut config = Config::new();
+        // Add-ons never run on async stacks, but wasmtime holds the deepest stack to their size.
+        config
+            .epoch_interruption(true)
+            .max_wasm_stack(ADDON_STACK_BYTES)
+            .async_stack_size(THREAD_STACK_BYTES)
+            .wasm_features(REFUSED_FEATURES, false);
+        let engine = Engine::new(&config).expect("this configuration is always valid");
+        let clock = engine.clone();
+        std::thread::Builder::new()
+            .name("add-on clock".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(TICK);
+                    clock.increment_epoch();
+                }
+            })
+            .expect("the add-on clock couldn't be started");
+        engine
+    })
+}
+
+/// The proposals an add-on's module may not use.
+const REFUSED_FEATURES: WasmFeatures = WasmFeatures::THREADS
+    .union(WasmFeatures::SHARED_EVERYTHING_THREADS)
+    .union(WasmFeatures::MEMORY64)
+    .union(WasmFeatures::MULTI_MEMORY)
+    .union(WasmFeatures::CUSTOM_PAGE_SIZES)
+    .union(WasmFeatures::MEMORY_CONTROL)
+    .union(WasmFeatures::GC)
+    .union(WasmFeatures::GC_TYPES)
+    .union(WasmFeatures::FUNCTION_REFERENCES)
+    .union(WasmFeatures::EXCEPTIONS)
+    .union(WasmFeatures::LEGACY_EXCEPTIONS)
+    .union(WasmFeatures::STACK_SWITCHING)
+    .union(WasmFeatures::COMPONENT_MODEL)
+    .union(WasmFeatures::CUSTOM_DESCRIPTORS);
+
+/// `work`, on a thread whose stack holds all the add-on's engine lets it use. A thread that
+/// can't be started, or that panics, is an add-on that stopped working.
+fn on_deep_stack<T: Send>(work: impl FnOnce() -> Result<T, AddonError> + Send) -> Result<T, AddonError> {
+    std::thread::scope(|scope| {
+        let thread = std::thread::Builder::new().name("add-on".into()).stack_size(THREAD_STACK_BYTES).spawn_scoped(scope, work);
+        thread.ok().and_then(|thread| thread.join().ok()).unwrap_or(Err(AddonError::Trapped))
+    })
 }

@@ -84,6 +84,8 @@ fn decode_refuses() {
     refused(&raw(1, &[(b"../x", b"")]), "../x");
     refused(&raw(1, &[(b".hidden", b"")]), ".hidden");
     refused(&raw(2, &[(b"a.md", b""), (b"a.md", b"")]), "twice");
+    refused(&raw(2, &[(b"public/A.png", b""), (b"public/a.png", b"")]), "letter case");
+    refused(&raw(2, &[(b"public/\xc3\x84.png", b""), (b"public/\xc3\xa4.png", b"")]), "letter case");
 
     let mut trailing = good.clone();
     trailing.push(0);

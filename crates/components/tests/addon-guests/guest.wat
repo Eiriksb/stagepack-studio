@@ -1,9 +1,9 @@
 ;; A test add-on. The test fills in the parts in braces with its own ABI version, imports,
-;; extra top-level parts and the body of `run`. `info` names the add-on, `alloc` hands out
+;; pages of memory, extra top-level parts and the body of `run`. `info` names the add-on, `alloc` hands out
 ;; room past everything else and grows the memory when it must.
 (module
   {imports}
-  (memory (export "memory") 2)
+  (memory (export "memory") {pages})
   (global $heap (mut i32) (i32.const 65536))
   (data (i32.const 1024) "{\"name\":\"test\",\"version\":\"1.0.0\",\"operations\":[\"export\",\"import\"]}")
   {extra}

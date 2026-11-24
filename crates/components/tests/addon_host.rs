@@ -17,15 +17,18 @@ struct Guest<'a> {
     extra: &'a str,
     /// The body of `run(ptr, len) -> i64`, the echo guest's if left out.
     run: Option<&'a str>,
+    /// Pages of memory, if not the usual 2.
+    pages: Option<usize>,
 }
 
 fn guest(parts: Guest) -> Vec<u8> {
-    let Guest { abi, imports, extra, run } = parts;
+    let Guest { abi, imports, extra, run, pages } = parts;
     let echo_report = data(2048, &report_entry());
     let extra = if run.is_none() { format!("{extra}\n{echo_report}") } else { extra.to_string() };
     let text = TEMPLATE
         .replace("{abi}", &abi.unwrap_or(1).to_string())
         .replace("{imports}", imports)
+        .replace("{pages}", &pages.unwrap_or(2).to_string())
         .replace("{extra}", &extra)
         .replace("{run}", run.unwrap_or(ECHO));
     wat::parse_str(&text).unwrap_or_else(|error| panic!("{error}\n{text}"))
@@ -44,15 +47,20 @@ fn data(at: u32, bytes: &[u8]) -> String {
     format!(r#"(data (i32.const {at}) "{escaped}")"#)
 }
 
-/// The parts of a guest whose `run` gives back `bundle`, whatever it is given.
-fn answering(bundle: &Bundle) -> (String, String) {
+/// Where an answering guest's answer lies: past the room `alloc` gives its input from.
+const ANSWER_AT: usize = 1024 * 1024;
+
+/// The parts of a guest whose `run` gives back `bundle`, whatever it is given, and the pages
+/// of memory that holds it.
+fn answering(bundle: &Bundle) -> (String, String, usize) {
     let bytes = encode(bundle);
-    (data(4096, &bytes), format!("(i64.or (i64.shl (i64.const 4096) (i64.const 32)) (i64.const {}))", bytes.len()))
+    let run = format!("(i64.or (i64.shl (i64.const {ANSWER_AT}) (i64.const 32)) (i64.const {}))", bytes.len());
+    (data(ANSWER_AT as u32, &bytes), run, (ANSWER_AT + bytes.len()) / 65536 + 1)
 }
 
 fn load_answering(bundle: &Bundle) -> Addon {
-    let (extra, run) = answering(bundle);
-    Addon::load(&guest(Guest { extra: &extra, run: Some(&run), ..Guest::default() })).expect("the guest loads")
+    let (extra, run, pages) = answering(bundle);
+    Addon::load(&guest(Guest { extra: &extra, run: Some(&run), pages: Some(pages), ..Guest::default() })).expect("the guest loads")
 }
 
 fn file(name: &str, data: &[u8]) -> (String, Vec<u8>) {
@@ -131,6 +139,7 @@ fn a_bad_info_is_refused() {
             .replace("(i64.const 1024) (i64.const 32)) (i64.const 66)", &format!("(i64.const 8192) (i64.const 32)) (i64.const {})", json.len()))
             .replace("{abi}", "1")
             .replace("{imports}", "")
+            .replace("{pages}", "2")
             .replace("{extra}", &extra)
             .replace("{run}", "(i64.const 0)");
         Addon::load(&wat::parse_str(&text).unwrap())
@@ -154,7 +163,7 @@ fn a_guest_that_loops_is_stopped() {
 #[test]
 fn a_guest_that_loops_while_loading_is_stopped() {
     let extra = "(func $start (loop $forever (br $forever))) (start $start)";
-    let limits = AddonLimits { time: Duration::from_millis(200), ..AddonLimits::default() };
+    let limits = AddonLimits { load_time: Duration::from_millis(200), ..AddonLimits::default() };
     let started = Instant::now();
     assert_eq!(Addon::load_with_limits(&guest(Guest { extra, ..Guest::default() }), &limits).err(), Some(AddonError::TookTooLong));
     assert!(started.elapsed() < Duration::from_secs(5), "stopped after {:?}", started.elapsed());
@@ -188,6 +197,15 @@ fn an_error_file_is_a_failure() {
     assert_eq!(addon.run("export", "{}", files()), Err(AddonError::Failed("The talk has no slides.".into())));
     let error = AddonError::Failed("The talk has no slides.".into());
     assert_eq!(error.to_string(), "The add-on couldn't finish: The talk has no slides.");
+}
+
+#[test]
+fn an_error_without_a_full_stop_is_given_one() {
+    let addon = load_answering(&vec![file(".error", b"The talk has no slides")]);
+    let error = addon.run("export", "{}", vec![]).unwrap_err();
+    assert_eq!(error.to_string(), "The add-on couldn't finish: The talk has no slides.");
+    let addon = load_answering(&vec![file(".error", b"")]);
+    assert_eq!(addon.run("export", "{}", vec![]).unwrap_err().to_string(), "The add-on couldn't finish: it gave no reason.");
 }
 
 #[test]
@@ -254,8 +272,87 @@ fn a_too_large_input_is_refused_before_running() {
 #[test]
 fn an_unsafe_name_in_the_input_is_refused_before_running() {
     let addon = Addon::load(&guest(Guest { run: Some("(loop $forever (br $forever)) (i64.const 0)"), ..Guest::default() })).unwrap();
-    malformed(addon.run("export", "{}", vec![file(".gitignore", b"")]), ".gitignore");
-    malformed(addon.run("export", "{}", vec![file(".op", b"")]), ".op");
+    let refused = |name: &str| match addon.run("export", "{}", vec![file(name, b"")]) {
+        Err(AddonError::InvalidInput(sentence)) => sentence,
+        other => panic!("expected InvalidInput for {name:?}, got {other:?}"),
+    };
+    assert_eq!(refused(".gitignore"), r#"A file named ".gitignore" can't be given to an add-on."#);
+    assert!(refused(".op").contains(".op"));
+    let long = refused(&format!("a\n{}", "b".repeat(5000)));
+    assert!(long.len() < 200 && !long.contains('\n'), "{long:?}");
+}
+
+#[test]
+fn an_operation_the_addon_does_not_name_is_refused_before_running() {
+    let addon = Addon::load(&guest(Guest { run: Some("(loop $forever (br $forever)) (i64.const 0)"), ..Guest::default() })).unwrap();
+    assert_eq!(
+        addon.run("delete", "{}", files()),
+        Err(AddonError::InvalidInput(r#"The add-on has no operation called "delete"."#.into()))
+    );
+}
+
+#[test]
+fn a_guest_that_recurses_deeply_is_given_room() {
+    // 200 000 calls deep: megabytes of stack, far past a component's 256 KiB, well within 64 MiB.
+    let extra = "(func $down (param $n i32) (if (local.get $n) (then (call $down (i32.sub (local.get $n) (i32.const 1))))))\n(func $deep (call $down (i32.const 200000))) (start $deep)";
+    let addon = Addon::load(&guest(Guest { extra, ..Guest::default() })).expect("a deep guest loads");
+    assert_eq!(addon.run("export", "{}", files()).unwrap().0, files());
+}
+
+#[test]
+fn a_guest_that_recurses_forever_has_stopped_working() {
+    let extra = "(func $down (call $down))";
+    let addon = Addon::load(&guest(Guest { extra, run: Some("(call $down) (i64.const 0)"), ..Guest::default() })).unwrap();
+    let error = addon.run("export", "{}", files()).unwrap_err();
+    assert_eq!(error, AddonError::Trapped);
+    assert_eq!(error.to_string(), "The add-on stopped working.");
+    // And the app is still here to run it again.
+    assert_eq!(addon.run("export", "{}", files()), Err(AddonError::Trapped));
+}
+
+#[test]
+fn a_guest_using_a_proposal_add_ons_do_without_is_refused() {
+    let modules = [
+        // Memory past 4 GiB.
+        r#"(module (memory (export "memory") i64 1))"#,
+        // Memory shared between threads.
+        r#"(module (memory (export "memory") 1 1 shared))"#,
+        // A second memory.
+        r#"(module (memory (export "memory") 1) (memory 1))"#,
+        // Exceptions.
+        r#"(module (memory (export "memory") 1) (tag $oops) (func (throw $oops)))"#,
+        // Garbage collection.
+        r#"(module (memory (export "memory") 1) (type $pair (struct (field i32) (field i32))))"#,
+        // Typed function references.
+        r#"(module (memory (export "memory") 1) (type $f (func)) (func (param (ref $f))))"#,
+    ];
+    for text in modules {
+        let wasm = wat::parse_str(text).unwrap_or_else(|error| panic!("{error}\n{text}"));
+        malformed(Addon::load(&wasm), "WebAssembly this app can run");
+    }
+}
+
+#[test]
+fn an_import_name_is_kept_to_one_short_line() {
+    let module = format!("env\n{}", "x".repeat(5000));
+    let imports = format!(r#"(import "{}" "now" (func (result i64)))"#, module.replace('\n', "\\0a"));
+    let Err(AddonError::Malformed(message)) = Addon::load(&guest(Guest { imports: &imports, ..Guest::default() })) else {
+        panic!("expected Malformed")
+    };
+    assert!(message.len() < 300 && !message.contains('\n'), "{message:?}");
+}
+
+#[test]
+fn a_report_is_held_to_its_limits() {
+    let report = |json: String| load_answering(&vec![file(REPORT, json.as_bytes())]).run("export", "{}", vec![]);
+    malformed(report(r#"{"notices":[{"slide":0,"kind":"frozen","text":"A chart."}]}"#.into()), "slide 0");
+    let notice = r#"{"slide":null,"kind":"frozen","text":"A."}"#;
+    let many = format!(r#"{{"notices":[{}]}}"#, vec![notice; 10_001].join(","));
+    malformed(report(many), "10000 notices");
+    let long = format!(r#"{{"notices":[{{"slide":1,"kind":"left_out","text":"Two\nlines {}"}}]}}"#, "x".repeat(5000));
+    let (_, report) = report(long).unwrap();
+    let text = &report.notices[0].text;
+    assert!(text.starts_with("Two lines ") && text.chars().count() <= 500, "{} characters", text.chars().count());
 }
 
 #[test]
@@ -272,6 +369,7 @@ fn every_error_is_one_sentence() {
         AddonError::TookTooLong,
         AddonError::OutOfMemory,
         AddonError::Failed("The talk has no slides.".into()),
+        AddonError::InvalidInput("A file named \".git\" can't be given to an add-on.".into()),
         AddonError::Trapped,
     ];
     for error in errors {

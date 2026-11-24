@@ -86,7 +86,8 @@ fn length(len: usize) -> [u8; 4] {
 }
 
 /// The files of a bundle, or a sentence naming what is wrong with it. Every name is either
-/// one of [`OWN_NAMES`] or passes [`safe_name`], and no name is there twice.
+/// one of [`OWN_NAMES`] or passes [`safe_name`], and no name is there twice, even in other
+/// letter case: on Windows and macOS one of them would be written over the other.
 pub fn decode(bytes: &[u8]) -> Result<Bundle, String> {
     let mut reader = Reader { bytes, at: 0 };
     if reader.take(4) != Some(&MAGIC[..]) {
@@ -99,7 +100,7 @@ pub fn decode(bytes: &[u8]) -> Result<Bundle, String> {
         return Err(format!("The bundle's file count, {count}, is more than it holds or than the {MAX_FILES} allowed."));
     }
     let mut bundle = Bundle::with_capacity(count);
-    let mut names = std::collections::BTreeSet::new();
+    let mut names = std::collections::BTreeMap::new();
     for index in 1..=count {
         let len = reader.u32().ok_or_else(|| format!("The bundle ends before the name length of file {index}."))? as usize;
         let name = reader.take(len).ok_or_else(|| format!("The name of file {index} runs past the end of the bundle."))?;
@@ -107,8 +108,12 @@ pub fn decode(bytes: &[u8]) -> Result<Bundle, String> {
         if !(safe_name(name) || OWN_NAMES.contains(&name)) {
             return Err(format!("The bundle has a file named {name:?}, which isn't a safe name."));
         }
-        if !names.insert(name) {
-            return Err(format!("The bundle has the file {name:?} twice."));
+        if let Some(earlier) = names.insert(name.to_lowercase(), name) {
+            return Err(if earlier == name {
+                format!("The bundle has the file {name:?} twice.")
+            } else {
+                format!("The bundle has the files {earlier:?} and {name:?}, whose names differ only in letter case.")
+            });
         }
         let len = reader.u32().ok_or_else(|| format!("The bundle ends before the data length of {name:?}."))? as usize;
         let data = reader.take(len).ok_or_else(|| format!("The data of {name:?} runs past the end of the bundle."))?;

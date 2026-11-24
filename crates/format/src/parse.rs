@@ -75,6 +75,9 @@ pub(crate) fn read_slides(source: &str, raw_slides: &[&RawSlide]) -> Vec<Slide> 
     }
     SLIDES_PARSED.with(|parsed| parsed.set(parsed.get() + raw_slides.len()));
     // WebAssembly has no threads to start, and its stack is the module's own to size.
+    // wasm32-unknown-unknown also aborts on a panic, so `catch_unwind` in `read_slide` does
+    // nothing there: a slide that trips a bug in the `markdown` crate stops the whole read,
+    // and an add-on running this stops working for the whole talk, not just that slide.
     #[cfg(target_arch = "wasm32")]
     return raw_slides.iter().map(|raw| read_slide(source, raw)).collect();
     #[cfg(not(target_arch = "wasm32"))]
