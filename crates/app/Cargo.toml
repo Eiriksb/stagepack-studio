@@ -57,7 +57,7 @@ uuid = { version = "=1.29.2", features = ["v4"] }
 # Reading a Slidev talk made for Stagepack, and writing one, as a zip.
 zip = { version = "=9.5.0", default-features = false, features = ["deflate"] }
 # Getting the Slidev add-on over HTTPS, only when the owner asks: rustls (0.23, already built
-# for the kit) with ring and the webpki roots, and no native TLS, gzip or proxy-less extras.
+# for the kit) with ring and the webpki roots, and no native TLS, gzip, cookies or platform verifier.
 ureq = { version = "=3.5.2", default-features = false, features = ["rustls"] }
 # Which characters hide in a command the owner is asked to say yes to.
 unicode-properties = { version = "=0.1.3", default-features = false, features = ["general-category"] }

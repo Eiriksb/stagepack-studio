@@ -220,15 +220,27 @@ fn a_redirect_to_http_is_refused() {
         "https://2130706433/index.json",
         "https://0x7f.1/index.json",
         "https://127.1/index.json",
-        "https://user@example.invalid/index.json",
+        "https://100.64.0.1/index.json",
+        "https://198.18.0.1/index.json",
+        "https://224.0.0.1/index.json",
+        "https://240.0.0.1/index.json",
+        "https://[::127.0.0.1]/index.json",
+        "https://[64:ff9b::7f00:1]/index.json",
+        "https://[2002:c0a8:101::1]/index.json",
+        "https://[fec0::1]/index.json",
+        "https://[ff02::1]/index.json",
     ] {
         let server = Server::start(move |_| redirect(to));
         let source = server.allowed("/index.json");
         let refused = fetch::check(&source, &no_cancel()).unwrap_err();
-        one_sentence(&refused);
-        assert!(refused.contains("local or private") || refused.contains("https"), "{to}: {refused}");
-        assert_ne!(refused, fetch::UNREACHABLE, "{to} was refused before connecting");
+        // Refused by the check of local and private addresses, and by no other.
+        assert_eq!(refused, "The add-on's download page sent the app on to a local or private address, so it stopped there.", "{to}");
     }
+
+    // A user name before the host is refused with a sentence of its own.
+    let server = Server::start(move |_| redirect("https://user@example.invalid/index.json"));
+    let refused = fetch::check(&server.allowed("/index.json"), &no_cancel()).unwrap_err();
+    assert_eq!(refused, "The add-on's download page sent the app on to an address with a user name in it, so it stopped there.");
 
     // Five redirects are followed, a sixth isn't.
     let package = package("0.2.0");

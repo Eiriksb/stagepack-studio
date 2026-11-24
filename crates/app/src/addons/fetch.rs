@@ -9,6 +9,7 @@
 //! cookies and no query string of the app's own.
 
 use std::io::Read as _;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -17,6 +18,8 @@ use std::time::{Duration, Instant};
 pub use addon_abi::package::Index;
 use addon_abi::package::{index_url, read_package, version_numbers as numbers, ADDON_NAME};
 use sha2::{Digest, Sha256};
+use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
+use ureq::unversioned::transport::NextTimeout;
 
 use super::{key, SLIDEV_VERSION};
 
@@ -128,22 +131,26 @@ fn allowed(url: &str) -> bool {
     false
 }
 
-/// Whether `url`'s host is this computer or a private network's: `localhost`, or an address
-/// that is loopback, private, link-local, unspecified or broadcast, or one written as a number
-/// the resolver might read as such (as `2130706433` or `0x7f.1`). A name that resolves to such an
-/// address isn't caught: the app has no say in how a name is resolved, so DNS rebinding is out
-/// of its reach. Only a GET with a `User-Agent` would reach it, and the signature still decides.
+/// Whether `url` names a user before its host, which only hides which host it is.
+fn has_user(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    rest.split(['/', '?', '#']).next().unwrap_or("").contains('@')
+}
+
+/// Whether `url`'s host is written as one that isn't on the internet at large: `localhost`, an
+/// address [`global`] refuses, or one written as a number the resolver might read as such (as
+/// `2130706433` or `0x7f.1`), or a user name before it. A name is looked at once it's resolved,
+/// by [`GlobalOnly`], which keeps only the addresses [`global`] takes.
 fn private_host(url: &str) -> bool {
     let Some((_, rest)) = url.split_once("://") else { return true };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    // A user name before the host only hides which host it is.
-    if authority.contains('@') {
+    if has_user(url) {
         return true;
     }
     let host = if let Some(v6) = authority.strip_prefix('[') {
         let Some((v6, _)) = v6.split_once(']') else { return true };
-        return match v6.parse::<std::net::Ipv6Addr>() {
-            Ok(address) => private_v6(address),
+        return match v6.parse::<Ipv6Addr>() {
+            Ok(address) => !global(IpAddr::V6(address)),
             Err(_) => true,
         };
     } else {
@@ -154,27 +161,149 @@ fn private_host(url: &str) -> bool {
         return true;
     }
     // No top-level name starts with a digit: such a host is a number, which only a dotted IPv4
-    // address of four parts may be, and a public one.
+    // address of four parts may be, and a global one.
     let last = host.rsplit('.').next().unwrap_or("");
     if last.starts_with(|c: char| c.is_ascii_digit()) {
-        return match host.parse::<std::net::Ipv4Addr>() {
-            Ok(address) => private_v4(address),
+        return match host.parse::<Ipv4Addr>() {
+            Ok(address) => !global(IpAddr::V4(address)),
             Err(_) => true,
         };
     }
     false
 }
 
-fn private_v4(address: std::net::Ipv4Addr) -> bool {
-    address.is_loopback() || address.is_private() || address.is_link_local() || address.is_unspecified() || address.is_broadcast() || address.octets()[0] == 0
+/// Whether `address` is on the internet at large: not this computer's, a private or local
+/// network's, a carrier's shared space, one set aside for benchmarks, documentation, multicast
+/// or later use, nor an IPv6 address that only carries an IPv4 one. A NAT64 or 6to4 address is
+/// as global as the IPv4 address it carries.
+pub(crate) fn global(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(v4) => global_v4(v4),
+        IpAddr::V6(v6) => global_v6(v6),
+    }
 }
 
-fn private_v6(address: std::net::Ipv6Addr) -> bool {
-    if let Some(v4) = address.to_ipv4_mapped() {
-        return private_v4(v4);
+fn global_v4(address: Ipv4Addr) -> bool {
+    let [a, b, c, _] = address.octets();
+    let refused = a == 0 // this network, and unspecified
+        || a == 10 // private
+        || a == 127 // loopback
+        || (a == 100 && (b & 0xc0) == 64) // shared carrier-grade NAT, 100.64/10
+        || (a == 169 && b == 254) // link-local
+        || (a == 172 && (b & 0xf0) == 16) // private
+        || (a == 192 && b == 168) // private
+        || (a == 192 && b == 0 && c == 0) // IETF protocol assignments
+        || (a == 192 && b == 0 && c == 2) // documentation
+        || (a == 198 && (b & 0xfe) == 18) // benchmarking, 198.18/15
+        || (a == 198 && b == 51 && c == 100) // documentation
+        || (a == 203 && b == 0 && c == 113) // documentation
+        || a >= 224; // multicast 224/4, reserved 240/4 and broadcast
+    !refused
+}
+
+fn global_v6(address: Ipv6Addr) -> bool {
+    let s = address.segments();
+    let carried = |high: u16, low: u16| Ipv4Addr::from((u32::from(high) << 16) | u32::from(low));
+    // NAT64's well-known prefix, 64:ff9b::/96, and 6to4, 2002::/16: as global as what they carry.
+    if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        return global_v4(carried(s[6], s[7]));
     }
-    let first = address.segments()[0];
-    address.is_loopback() || address.is_unspecified() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+    if s[0] == 0x2002 {
+        return global_v4(carried(s[1], s[2]));
+    }
+    let refused = s[..5] == [0; 5] && (s[5] == 0 || s[5] == 0xffff) // IPv4-compatible (with :: and ::1) and IPv4-mapped
+        || s[..6] == [0, 0, 0, 0, 0xffff, 0] // IPv4-translated
+        || (s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1) // NAT64 for local use, 64:ff9b:1::/48
+        || s[..4] == [0x100, 0, 0, 0] // discard only, 100::/64
+        || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation
+        || (s[0] == 0x3fff && s[1] < 0x1000) // documentation, 3fff::/20
+        || (s[0] & 0xfe00) == 0xfc00 // unique local, fc00::/7
+        || (s[0] & 0xffc0) == 0xfe80 // link-local
+        || (s[0] & 0xffc0) == 0xfec0 // site-local, fec0::/10
+        || (s[0] & 0xff00) == 0xff00; // multicast
+    !refused
+}
+
+/// A resolver that keeps only the [`global`] addresses `inner` finds for a name, so that a name
+/// that resolves to this computer or a private network, or is made to later, is never connected
+/// to; and refuses the connection, setting `refused`, when none are left. The proxy the
+/// environment names is resolved as it is, since the owner chose it, and the add-on's addresses
+/// are then resolved by the proxy. With the test hook, so are the loopback origins a test allowed.
+#[derive(Debug)]
+struct GlobalOnly<R> {
+    inner: R,
+    refused: Arc<AtomicBool>,
+}
+
+impl<R: Resolver> Resolver for GlobalOnly<R> {
+    fn resolve(&self, uri: &ureq::http::Uri, config: &ureq::config::Config, timeout: NextTimeout) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        let found = self.inner.resolve(uri, config, timeout)?;
+        let is_proxy = config.proxy().is_some_and(|proxy| {
+            uri.host().is_some_and(|host| host.eq_ignore_ascii_case(proxy.host())) && uri.port_u16().or_else(|| default_port(uri)) == Some(proxy.port())
+        });
+        if is_proxy || test_origin(uri) {
+            return Ok(found);
+        }
+        let mut kept = self.inner.empty();
+        for address in found.iter().filter(|address| global(address.ip())) {
+            kept.push(*address);
+        }
+        if kept.is_empty() {
+            self.refused.store(true, Ordering::SeqCst);
+            return Err(ureq::Error::HostNotFound);
+        }
+        Ok(kept)
+    }
+}
+
+fn default_port(uri: &ureq::http::Uri) -> Option<u16> {
+    match uri.scheme_str() {
+        Some("https") => Some(443),
+        Some("http") => Some(80),
+        _ => None,
+    }
+}
+
+/// Whether `uri` is on a loopback origin a test allowed.
+#[cfg(feature = "test-hooks")]
+fn test_origin(uri: &ureq::http::Uri) -> bool {
+    let (Some(scheme), Some(authority)) = (uri.scheme_str(), uri.authority()) else { return false };
+    let origin = format!("{scheme}://{authority}");
+    test_hook().1.contains(&origin)
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn test_origin(_: &ureq::http::Uri) -> bool {
+    false
+}
+
+/// Why the app won't go to `url`, the address it was sent to after `redirects` redirects.
+fn refusal(url: &str, redirects: usize) -> String {
+    let first = redirects == 0;
+    if has_user(url) {
+        return if first {
+            "The add-on's download address has a user name in it, so the app won't go there.".into()
+        } else {
+            "The add-on's download page sent the app on to an address with a user name in it, so it stopped there.".into()
+        };
+    }
+    if url.starts_with("https://") && private_host(url) {
+        return private_refusal(redirects);
+    }
+    if first {
+        "The add-on's download address isn't an https one, so the app won't go there.".into()
+    } else {
+        "The add-on's download page sent the app on to an address that isn't https, so it stopped there.".into()
+    }
+}
+
+/// What the app says of an address on this computer or a private network, after `redirects`.
+fn private_refusal(redirects: usize) -> String {
+    if redirects == 0 {
+        "The add-on's download address leads to a local or private address, so the app won't go there.".into()
+    } else {
+        "The add-on's download page sent the app on to a local or private address, so it stopped there.".into()
+    }
 }
 
 /// Whether the requests to `url` skip a proxy the environment names: only a test's own server.
@@ -364,18 +493,17 @@ fn fetch(url: &str, what: What, cancel: &AtomicBool, progress: &dyn Fn(u64, u64)
 /// [`fetch`], on the fetching thread: follows up to [`MAX_REDIRECTS`] redirects, each to an
 /// allowed address only, then reads the body within the cap.
 fn fetch_here(url: &str, what: What, stop: &AtomicBool, tell: &mpsc::Sender<Said>) -> Result<Vec<u8>, String> {
+    fetch_via(url, what, stop, tell, &DefaultResolver::default)
+}
+
+/// [`fetch_here`], with names resolved by what `resolver` makes, keeping only global addresses.
+fn fetch_via<R: Resolver>(url: &str, what: What, stop: &AtomicBool, tell: &mpsc::Sender<Said>, resolver: &dyn Fn() -> R) -> Result<Vec<u8>, String> {
     let deadline = Instant::now() + what.time();
     let mut url = url.to_string();
     let mut redirects = 0;
     let response = loop {
         if !allowed(&url) {
-            return Err(if private_host(&url) && url.starts_with("https://") {
-                "The add-on's download page sent the app on to a local or private address, so it stopped there.".into()
-            } else if redirects == 0 {
-                "The add-on's download address isn't an https one, so the app won't go there.".into()
-            } else {
-                "The add-on's download page sent the app on to an address that isn't https, so it stopped there.".into()
-            });
+            return Err(refusal(&url, redirects));
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -395,10 +523,11 @@ fn fetch_here(url: &str, what: What, stop: &AtomicBool, tell: &mpsc::Sender<Said
         #[cfg(feature = "test-hooks")]
         let config = config.https_only(!is_loopback(&url));
         let config = if is_loopback(&url) { config.proxy(None) } else { config };
-        let agent = ureq::Agent::new_with_config(config.build());
+        let refused = Arc::new(AtomicBool::new(false));
+        let agent = ureq::Agent::with_parts(config.build(), ureq::unversioned::transport::DefaultConnector::default(), GlobalOnly { inner: resolver(), refused: refused.clone() });
         #[cfg(feature = "test-hooks")]
         REQUESTS.fetch_add(1, Ordering::SeqCst);
-        let response = agent.get(&url).call().map_err(|error| before_response(error, what))?;
+        let response = agent.get(&url).call().map_err(|error| if refused.load(Ordering::SeqCst) { private_refusal(redirects) } else { before_response(error, what) })?;
         if stop.load(Ordering::SeqCst) {
             return Err(CANCELLED.into());
         }
@@ -486,5 +615,133 @@ fn while_reading(error: ureq::Error, what: What) -> String {
     match error {
         ureq::Error::Timeout(_) => what.too_slow(),
         _ => "The download broke off part way. Check the internet connection, and try again or install it from a file.".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use super::*;
+
+    /// A resolver of the test's own, finding `found` for every name.
+    #[derive(Debug)]
+    struct Stub(Vec<SocketAddr>);
+
+    impl Resolver for Stub {
+        fn resolve(&self, _: &ureq::http::Uri, _: &ureq::config::Config, _: NextTimeout) -> Result<ResolvedSocketAddrs, ureq::Error> {
+            let mut found = self.empty();
+            for address in &self.0 {
+                found.push(*address);
+            }
+            Ok(found)
+        }
+    }
+
+    fn addresses(list: &[&str]) -> Vec<SocketAddr> {
+        list.iter().map(|address| address.parse().unwrap()).collect()
+    }
+
+    fn resolved(found: &[&str], uri: &str, config: &ureq::config::Config) -> (Result<Vec<SocketAddr>, ureq::Error>, bool) {
+        let refused = Arc::new(AtomicBool::new(false));
+        let resolver = GlobalOnly { inner: Stub(addresses(found)), refused: refused.clone() };
+        let result = resolver.resolve(&uri.parse().unwrap(), config, NextTimeout::default()).map(|kept| kept.to_vec());
+        (result, refused.load(Ordering::SeqCst))
+    }
+
+    const REFUSED: &[&str] = &[
+        "0.0.0.0", "0.1.2.3", "10.1.2.3", "100.64.0.1", "100.127.255.254", "127.0.0.1", "127.9.9.9", "169.254.169.254", "172.16.0.1",
+        "172.31.255.255", "192.0.0.8", "192.0.2.1", "192.168.1.1", "198.18.0.1", "198.19.255.255", "198.51.100.7", "203.0.113.9", "224.0.0.1",
+        "239.255.255.250", "240.0.0.1", "255.255.255.255", "::", "::1", "::127.0.0.1", "::8.8.8.8", "::ffff:127.0.0.1", "::ffff:8.8.8.8",
+        "::ffff:0:8.8.8.8", "64:ff9b::7f00:1", "64:ff9b::a00:1", "64:ff9b:1::808:808", "2002:7f00:1::", "2002:c0a8:101::1", "100::1",
+        "2001:db8::1", "3fff::1", "fc00::1", "fd12:3456::1", "fe80::1", "febf::1", "fec0::1", "feff::1", "ff02::1", "ff0e::1",
+    ];
+
+    const KEPT: &[&str] = &[
+        "8.8.8.8", "140.82.121.3", "185.199.108.133", "1.1.1.1", "100.63.255.255", "100.128.0.1", "172.15.255.255", "172.32.0.1", "198.17.255.255",
+        "198.20.0.1", "223.255.255.255", "2606:50c0:8000::153", "2a00:1450:4001:80b::200e", "64:ff9b::808:808", "2002:808:808::1", "2001:db9::1",
+        "3fff:1000::1",
+    ];
+
+    #[test]
+    fn only_global_addresses_are_global() {
+        for address in REFUSED {
+            assert!(!global(address.parse().unwrap()), "{address} is not global");
+        }
+        for address in KEPT {
+            assert!(global(address.parse().unwrap()), "{address} is global");
+        }
+    }
+
+    #[test]
+    fn a_name_is_connected_to_only_at_its_global_addresses() {
+        let config = ureq::config::Config::default();
+        let (kept, refused) = resolved(&["10.0.0.1:443", "140.82.121.3:443", "[::1]:443", "[2606:50c0:8000::153]:443"], "https://github.com/x", &config);
+        assert_eq!(kept.unwrap(), addresses(&["140.82.121.3:443", "[2606:50c0:8000::153]:443"]));
+        assert!(!refused);
+
+        // A name with none, as one made to resolve to this computer or a private network.
+        for address in REFUSED {
+            let found = format!("{}:443", if address.contains(':') { format!("[{address}]") } else { address.to_string() });
+            let (kept, refused) = resolved(&[found.as_str()], "https://rebound.example/x", &config);
+            assert!(matches!(kept, Err(ureq::Error::HostNotFound)), "{address}: {kept:?}");
+            assert!(refused, "{address}");
+        }
+    }
+
+    #[test]
+    fn the_proxy_the_environment_names_is_resolved_as_it_is() {
+        let proxy = ureq::Proxy::new("http://10.1.2.3:3128").unwrap();
+        let config = ureq::config::Config::builder().proxy(Some(proxy)).build();
+        let (kept, refused) = resolved(&["10.1.2.3:3128"], "http://10.1.2.3:3128", &config);
+        assert_eq!(kept.unwrap(), addresses(&["10.1.2.3:3128"]));
+        assert!(!refused);
+        // But nothing else on that network, nor the proxy's host on another port.
+        for uri in ["https://rebound.example/x", "http://10.1.2.3:80"] {
+            let (kept, refused) = resolved(&["10.1.2.3:3128"], uri, &config);
+            assert!(kept.is_err() && refused, "{uri}");
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn a_loopback_origin_a_test_allowed_is_resolved_as_it_is() {
+        set_source_for_test(Source { index_url: "http://127.0.0.1:9/index.json".into(), package_prefix: "http://127.0.0.1:9/download/".into() });
+        let config = ureq::config::Config::default();
+        let (kept, _) = resolved(&["127.0.0.1:9"], "http://127.0.0.1:9/index.json", &config);
+        assert_eq!(kept.unwrap(), addresses(&["127.0.0.1:9"]));
+        // Another port isn't.
+        let (kept, refused) = resolved(&["127.0.0.1:10"], "http://127.0.0.1:10/index.json", &config);
+        assert!(kept.is_err() && refused);
+    }
+
+    #[test]
+    fn a_name_resolving_to_a_private_address_is_refused_in_one_sentence() {
+        let (tell, _told) = mpsc::channel();
+        let stub = || Stub(addresses(&["192.168.1.1:443", "[fd00::1]:443"]));
+        let refused = fetch_via("https://rebound.example/index.json", What::Index, &AtomicBool::new(false), &tell, &stub).unwrap_err();
+        assert_eq!(refused, "The add-on's download address leads to a local or private address, so the app won't go there.");
+    }
+
+    #[test]
+    fn the_official_addresses_pass_the_checks() {
+        for url in [INDEX_URL.as_str(), &format!("{PACKAGE_PREFIX}slidev-v0.1.0/slidev-0.1.0.spaddon")] {
+            assert!(allowed(url) && !private_host(url), "{url}");
+        }
+        // And where GitHub sends a release's file on to, signed query string and all.
+        for url in [
+            "https://release-assets.githubusercontent.com/github-production-release-asset/1/2?sp=r&sv=2018-11-09&sr=b&spr=https&se=2026-11-24T10%3A00%3A00Z&sig=abc%2Bdef%3D",
+            "https://objects.githubusercontent.com/github-production-release-asset-2e65be/1/2?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=a%2F20261124%2Fus-east-1",
+        ] {
+            assert!(allowed(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn a_user_name_before_the_host_has_its_own_sentence() {
+        assert_eq!(refusal("https://user@example.com/x", 0), "The add-on's download address has a user name in it, so the app won't go there.");
+        assert_eq!(refusal("https://user@example.com/x", 1), "The add-on's download page sent the app on to an address with a user name in it, so it stopped there.");
+        // An @ in the query string is no user name.
+        assert!(!has_user("https://example.com/x?a=b@c"));
     }
 }
