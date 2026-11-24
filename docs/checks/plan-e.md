@@ -81,4 +81,19 @@ On Linux, with the tarball, under a fresh user (or a scratch home) on a real des
 
 ## The final review
 
-*To be written by the controller.*
+A whole-branch review of `7cb9521..db30a4d` on the most capable model found that the packaging could merge with fixes: 1 critical, 5 important and 8 minor findings. One fix wave (`2889bbb`, `92b2b9e`, `37ae3b2`, `9365060`, `1df84ef`) and one controller fix (`76eaaa6`) answered them; a re-review on the same model passed them, apart from the minor points parked below.
+
+- **Critical: `.sptx` on Linux where Stagepack is installed.** Stagepack registers its own type for the files, `application/x-stagepack`, with a glob of weight 90, so files never took our type and Stagepack Studio wasn't even under *Open with*. Our entry now lists Stagepack's type as well and is the default for both. The default each type had is recorded per list and given back on uninstall. Our glob keeps the default weight: the fix wave first raised it to 90, which tied with Stagepack's, and the tie made the files ours and dropped Stagepack from *Open with*. The re-review caught this, and the controller fixed it. The test now uses a faithful copy of Stagepack's registration; it fails at weight 90 and passes at the default.
+- **Important, Windows:**
+  - an upgrade clears `{app}\bundle` first, so a new toolchain's libraries never sit beside the old ones;
+  - component builds start `rustc` with no console window;
+  - the three programs are built with the C runtime linked in, and so are the bundle's proc-macro DLLs;
+  - the earlier program for `.sptx` stays under *Open with*.
+- **Important, Linux:** `install.sh` runs the new copy before the swap and refuses, with the loader's message, where it can't start (it needs glibc 2.39 or later).
+- **Minor:** messages after the swap; a note to restart a running copy; the zip subclass and generic icon; a stricter `stage` guard; `STUDIO_BUNDLE` restored after the components rerun in `test-all.ps1`; nested scripts run with `-ExecutionPolicy Bypass`; `test_all` always run on Windows, and skipping itself where `bash` can't run the script; this record's wording.
+- **Parked for the Windows hand checks:**
+  - `make-bundle.ps1` turns on `RUSTC_BOOTSTRAP` for the proc-macro build. That also enables proc-macro2's nightly-only code in those DLLs, and the script removes a value the caller had set. If `dumpbin` shows the bundle's `rustc` needs `VCRUNTIME140` anyway, shipping `vcruntime140.dll` and `vcruntime140_1.dll` in `bundle\bin` is the better fix, and the block goes.
+  - Two Windows text tests could be stricter.
+  - The `{reg:…}` entry reads only `HKCU`, so a machine-wide registration isn't kept under *Open with*.
+
+Not done from the review's recommendations: staging into a path with a space and a non-ASCII letter, and building against an older glibc (an owner question above).
