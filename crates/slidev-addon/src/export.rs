@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use addon_abi::{safe_name, Bundle, Notice, NoticeKind, Report, MANIFEST};
+use addon_abi::{normalise, safe_name, Bundle, Notice, NoticeKind, Report, MANIFEST};
 use serde::Deserialize;
 use slides_format::{is_hidden, parse_talk, Block, Slide, Span, Style, Tag, Talk};
 
@@ -759,16 +759,19 @@ impl<'a> Exporter<'a> {
     }
 
     /// The URL of the talk's file `src`, put under `public/`, or `None` with a notice.
+    ///
+    /// The app gives the talk's files under the names [`normalise`] gives them, as the engine
+    /// reads a path, so `./photo.png` is looked up as `photo.png`.
     fn asset(&mut self, src: &str, what: &str) -> Option<String> {
-        let src = src.trim();
-        let Some(&data) = self.files.get(src) else {
-            self.notice(NoticeKind::LeftOut, format!("The {what} {} isn't in the talk, so it was left out.", shortened(src, 120)));
+        let given = src.trim();
+        let Some((src, &data)) = normalise(given).and_then(|src| self.files.get(src.as_str()).map(|data| (src, data))) else {
+            self.notice(NoticeKind::LeftOut, format!("The {what} {} isn't in the talk, so it was left out.", shortened(given, 120)));
             return None;
         };
-        let name = src.strip_prefix("assets/").unwrap_or(src);
+        let name = src.strip_prefix("assets/").unwrap_or(&src);
         // The folder the app's pictures go in is never a talk's own.
-        let name = if fold(name).starts_with(BAKED_FOLDER) { src } else { name };
-        self.publish(name, src, data)
+        let name = if fold(name).starts_with(BAKED_FOLDER) { &src } else { name };
+        self.publish(name, &src, data)
     }
 
     /// `work`, with absolutely placed parts placed inside a box at `origin` on the slide.

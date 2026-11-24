@@ -102,6 +102,20 @@ fn pictures_are_copied_to_public() {
 }
 
 #[test]
+fn a_picture_named_by_a_relative_path_is_found_as_the_app_names_it() {
+    // The app gives each file under the name `normalise` gives it, as the engine reads it.
+    let source = "# Pictures\n\n![Here](./photo.png)\n\n![There](assets/x/../a.png)\n\n<Picture src=\"./assets//b.png\" />\n\n![Again](photo.png)\n";
+    let files = vec![file("photo.png", PNG), file("assets/a.png", b"a"), file("assets/b.png", b"b")];
+    let (bundle, report) = export_with(source, files);
+    assert!(report.notices.is_empty(), "{report:?}");
+    let names: Vec<&str> = bundle.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["slides.md", MANIFEST, "public/photo.png", "public/a.png", "public/b.png"]);
+    let markdown = slides_md(&bundle);
+    assert!(markdown.contains("![Here](/photo.png)") && markdown.contains("![Again](/photo.png)"), "{markdown}");
+    assert!(markdown.contains("![There](/a.png)"), "{markdown}");
+}
+
+#[test]
 fn baked_parts_are_images_at_their_box() {
     let source = "---\nlayout: content\n---\n\n# Baked\n\n<Icon name=\"star\" />\n\n<Chart src=\"assets/counts.csv\" x=\"900\" y=\"300\" w=\"800\" h=\"500\" click=\"1\" />\n\n<Box x=\"100\" y=\"600\" w=\"600\" h=\"400\" outline=\"black\" outline-width=\"2\">\n\n<TideGauge level=\"3\" />\n\n</Box>\n\n<Video src=\"assets/waves.mp4\" x=\"100\" y=\"100\" />\n\n<Model src=\"assets/shell.glb\" x=\"1200\" y=\"800\" w=\"300\" h=\"200\" />\n";
     let files = vec![

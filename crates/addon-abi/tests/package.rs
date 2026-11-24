@@ -2,7 +2,7 @@
 
 use std::io::Write;
 
-use addon_abi::package::{read_package, signed_message, verify_parts, write_package, AddonManifest, MAX_MANIFEST_BYTES, MAX_WASM_BYTES};
+use addon_abi::package::{read_package, signed_message, verify_parts, write_package, AddonManifest, MAX_DIRECTORY_BYTES, MAX_MANIFEST_BYTES, MAX_WASM_BYTES};
 use ed25519_dalek::{Signer, SigningKey};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
@@ -141,6 +141,39 @@ fn a_zip_saying_it_holds_many_entries_is_refused_before_they_are_read() {
     bytes[end + 8..end + 12].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
     let error = read_package(&bytes, &public(&key)).unwrap_err();
     assert!(error.contains("exactly 3"), "{error}");
+}
+
+#[test]
+fn a_zip64_locator_before_the_end_record_is_refused() {
+    let key = key(7);
+    let bytes = signed(&manifest(), WASM, &key);
+    let end = bytes.len() - 22;
+    // A zip64 end-of-directory locator in the 20 bytes before the end record: its signature, the
+    // disk, where the zip64 record is, and the number of disks. A package is never zip64.
+    let mut locator = vec![0x50, 0x4b, 0x06, 0x07];
+    locator.extend(0u32.to_le_bytes());
+    locator.extend(0u64.to_le_bytes());
+    locator.extend(1u32.to_le_bytes());
+    let mut with = bytes[..end].to_vec();
+    with.extend(&locator);
+    with.extend(&bytes[end..]);
+    let error = read_package(&with, &public(&key)).unwrap_err();
+    assert!(error.contains("zip64"), "{error}");
+}
+
+#[test]
+fn a_central_directory_saying_it_is_huge_is_refused_before_it_is_read() {
+    let key = key(7);
+    let mut bytes = signed(&manifest(), WASM, &key);
+    let end = bytes.len() - 22;
+    // The end record's central-directory size, at 12..16.
+    bytes[end + 12..end + 16].copy_from_slice(&0x0100_0000u32.to_le_bytes());
+    let error = read_package(&bytes, &public(&key)).unwrap_err();
+    assert!(error.contains("directory"), "{error}");
+    // Just at the bound it is read: the zip reader finds the directory by its offset.
+    let mut bytes = signed(&manifest(), WASM, &key);
+    bytes[end + 12..end + 16].copy_from_slice(&(MAX_DIRECTORY_BYTES as u32).to_le_bytes());
+    assert!(read_package(&bytes, &public(&key)).is_ok());
 }
 
 #[test]

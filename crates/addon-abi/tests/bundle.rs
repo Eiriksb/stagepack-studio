@@ -1,4 +1,4 @@
-use addon_abi::{decode, encode, safe_name, Bundle, Notice, NoticeKind, Report, ABI_VERSION, ARGS, ERROR, MAGIC, MANIFEST, OP, OWN_NAMES, REPORT};
+use addon_abi::{decode, encode, normalise, safe_name, Bundle, Notice, NoticeKind, Report, ABI_VERSION, ARGS, ERROR, MAGIC, MANIFEST, OP, OWN_NAMES, REPORT};
 
 fn file(name: &str, data: &[u8]) -> (String, Vec<u8>) {
     (name.to_string(), data.to_vec())
@@ -102,6 +102,24 @@ fn safe_name_table() {
         "a.", "a ", "a\u{200B}b",
     ] {
         assert!(!safe_name(name), "{name:?} should be refused");
+    }
+}
+
+#[test]
+fn normalise_reads_a_path_as_the_app_does() {
+    for (path, normal) in [
+        ("photo.png", Some("photo.png")),
+        ("./photo.png", Some("photo.png")),
+        ("a/../photo.png", Some("photo.png")),
+        ("assets//x/./../a.png", Some("assets/a.png")),
+        ("media/", Some("media")),
+        ("/photo.png", None),
+        ("../photo.png", None),
+        ("a/../../photo.png", None),
+        ("", None),
+        ("./", None),
+    ] {
+        assert_eq!(normalise(path).as_deref(), normal, "{path:?}");
     }
 }
 

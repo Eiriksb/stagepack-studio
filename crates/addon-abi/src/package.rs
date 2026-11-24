@@ -63,7 +63,7 @@ pub struct Package {
 
 /// The most entries a zip may say it holds before its directory is read at all. A package
 /// holds 3; this lets a few more through only so that the sentence can say which is wrong.
-const MAX_LISTED_ENTRIES: u64 = 8;
+pub const MAX_LISTED_ENTRIES: u64 = 8;
 
 /// What is signed: `sha256(addon.json) || sha256(addon.wasm)`.
 pub fn signed_message(manifest_bytes: &[u8], wasm: &[u8]) -> [u8; 64] {
@@ -107,7 +107,7 @@ pub fn read_package(bytes: &[u8], key: &[u8; 32]) -> Result<Package, String> {
     let key = VerifyingKey::from_bytes(key).map_err(|_| "The add-on key built into the app isn't an ed25519 public key.".to_string())?;
     let not_a_zip = || "The add-on file isn't a zip archive that can be read.".to_string();
     // The count the zip gives for itself, so that a directory of many entries is never read in.
-    let listed = listed_entries(bytes).ok_or_else(not_a_zip)?;
+    let listed = listed_entries(bytes).ok_or_else(not_a_zip)??;
     if listed > MAX_LISTED_ENTRIES {
         return Err(wrong_count(listed));
     }
@@ -202,20 +202,69 @@ fn wrong_count(count: u64) -> String {
     format!("The add-on file holds {count} entries, where a package holds exactly 3: addon.json, addon.wasm and addon.sig.")
 }
 
-/// The number of entries the zip in `bytes` says it holds, from its end-of-directory record
-/// (the larger of its two counts), or `None` if it has none. A zip64 count reads as 65 535.
-fn listed_entries(bytes: &[u8]) -> Option<u64> {
-    const RECORD: usize = 22;
-    let earliest = bytes.len().saturating_sub(RECORD + usize::from(u16::MAX));
-    (earliest..=bytes.len().checked_sub(RECORD)?).rev().find_map(|at| {
-        let record = &bytes[at..at + RECORD];
-        let comment = usize::from(u16::from_le_bytes([record[20], record[21]]));
-        (record[..4] == [0x50, 0x4b, 0x05, 0x06] && at + RECORD + comment == bytes.len()).then(|| {
+/// One end-of-directory record found in the last bytes of a zip: what it says of the zip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EndRecord {
+    /// The larger of its two entry counts. A zip64 count reads as 65 535.
+    pub entries: u64,
+    /// The size it gives the central directory. A zip64 size reads as 4 GiB less one byte.
+    pub directory_size: u64,
+    /// Where the zip64 end record is, if a zip64 locator comes right before this record.
+    pub zip64_at: Option<u64>,
+}
+
+/// The length of a zip's end-of-directory record, without its comment.
+const END_RECORD: usize = 22;
+/// The length of a zip64 end-of-directory locator.
+const ZIP64_LOCATOR: usize = 20;
+/// The most of a zip's end that can hold its end record: the record, its longest comment and the
+/// zip64 locator before it. Reading this much of a file is enough for [`end_records`].
+pub const END_SEARCH_BYTES: usize = END_RECORD + u16::MAX as usize + ZIP64_LOCATOR;
+
+/// Every end-of-directory record in `tail`, the last bytes of a zip, that a zip reader might take
+/// as the zip's: each signature whose comment ends at or before the end of the file, as the zip
+/// reader allows, latest first. Whatever is refused of these is refused of the one it reads.
+pub fn end_records(tail: &[u8]) -> Vec<EndRecord> {
+    let Some(last) = tail.len().checked_sub(END_RECORD) else { return Vec::new() };
+    let earliest = tail.len().saturating_sub(END_RECORD + usize::from(u16::MAX));
+    (earliest..=last)
+        .rev()
+        .filter_map(|at| {
+            let record = &tail[at..at + END_RECORD];
+            let comment = usize::from(u16::from_le_bytes([record[20], record[21]]));
+            if record[..4] != [0x50, 0x4b, 0x05, 0x06] || at + END_RECORD + comment > tail.len() {
+                return None;
+            }
             let on_disk = u16::from_le_bytes([record[8], record[9]]);
             let total = u16::from_le_bytes([record[10], record[11]]);
-            u64::from(on_disk.max(total))
+            let directory_size = u32::from_le_bytes([record[12], record[13], record[14], record[15]]);
+            let zip64_at = at.checked_sub(ZIP64_LOCATOR).map(|from| &tail[from..at]).filter(|locator| locator[..4] == [0x50, 0x4b, 0x06, 0x07]).map(|locator| {
+                u64::from_le_bytes(locator[8..16].try_into().expect("eight bytes"))
+            });
+            Some(EndRecord { entries: u64::from(on_disk.max(total)), directory_size: u64::from(directory_size), zip64_at })
         })
-    })
+        .collect()
+}
+
+/// The most a package's central directory may say it takes: [`MAX_LISTED_ENTRIES`] entries, each
+/// with its fixed part, a name of up to 64 bytes and 64 KiB of extra fields and comment.
+pub const MAX_DIRECTORY_BYTES: u64 = MAX_LISTED_ENTRIES * (46 + 64 + 64 * 1024);
+
+/// What the zip's end records say of the package, refused before the zip is read if it could make
+/// the reader read much: the larger entry count of any, if none is zip64 or says the directory
+/// is larger than [`MAX_DIRECTORY_BYTES`]; or `None` if there is no end record.
+fn listed_entries(bytes: &[u8]) -> Option<Result<u64, String>> {
+    let records = end_records(&bytes[bytes.len().saturating_sub(END_SEARCH_BYTES)..]);
+    if records.is_empty() {
+        return None;
+    }
+    if records.iter().any(|record| record.zip64_at.is_some()) {
+        return Some(Err("The add-on file is a zip64 archive, which a package never is.".into()));
+    }
+    if records.iter().any(|record| record.directory_size > MAX_DIRECTORY_BYTES) {
+        return Some(Err("The add-on file's central directory says it is larger than a package's can be.".into()));
+    }
+    records.iter().map(|record| record.entries).max().map(Ok)
 }
 
 fn limit(slot: usize) -> u64 {

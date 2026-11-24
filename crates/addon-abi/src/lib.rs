@@ -153,6 +153,27 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// `path` with empty and `.` parts dropped and `..` resolved, or `None` if it starts at the
+/// root, climbs out of the talk or names nothing. It is the rule the app reads a talk's paths
+/// by, so the app gives a talk's files to an add-on under these names, and an add-on looks a
+/// path the talk names up by it: `./photo.png` and `a/../photo.png` are both `photo.png`.
+pub fn normalise(path: &str) -> Option<String> {
+    if path.starts_with('/') {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            part => parts.push(part),
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
 /// Windows' device names, which can't be files there whatever their extension.
 const RESERVED: [&str; 22] = [
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4",
