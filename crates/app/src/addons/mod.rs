@@ -228,6 +228,41 @@ pub fn install_from_file(app_folder: &Path, file: &Path) -> Result<Installed, St
 /// does: its signature is checked first, and whatever was installed before stays as it was if
 /// anything is wrong.
 pub fn install_from_bytes(app_folder: &Path, bytes: &[u8]) -> Result<Installed, String> {
+    install(app_folder, bytes, true)
+}
+
+/// [`install_from_bytes`], unless an export, an import or another install holds the add-on just
+/// now: then it says [`BUSY`] and changes nothing, rather than wait for it.
+pub fn install_from_bytes_unless_busy(app_folder: &Path, bytes: &[u8]) -> Result<Installed, String> {
+    install(app_folder, bytes, false)
+}
+
+/// Whether an export, an import, an install or a removal holds the add-on under `app_folder`
+/// just now, so that an install would have to wait for it.
+pub fn is_busy(app_folder: &Path) -> bool {
+    let addons = app_folder.join(ADDONS_FOLDER);
+    addons.is_dir() && Lock::try_take(&addons).is_err()
+}
+
+/// What an export or an import holds while it runs the add-on, so that no install or removal
+/// swaps its files meanwhile: they wait for it, or say [`BUSY`]. It goes when it's dropped.
+pub struct InUse {
+    /// Held only so that the lock is; `None` if nothing was ever installed.
+    _shared: Option<Lock>,
+}
+
+/// Holds the add-on under `app_folder` in use, once no install is going on, as an export or an
+/// import does while it runs.
+pub fn in_use(app_folder: &Path) -> InUse {
+    // A linked folder is never loaded from, so nothing of it is held either.
+    if is_linked(app_folder) {
+        return InUse { _shared: None };
+    }
+    InUse { _shared: Lock::shared(&app_folder.join(ADDONS_FOLDER)) }
+}
+
+/// [`install_from_bytes`], waiting for the lock if `wait`, or saying [`BUSY`] if not.
+fn install(app_folder: &Path, bytes: &[u8], wait: bool) -> Result<Installed, String> {
     let package = read_package(bytes, &key::addon_key())?;
     if package.manifest.slidev != SLIDEV_VERSION {
         return Err(wrong_slidev(&package.manifest.slidev));
@@ -237,7 +272,7 @@ pub fn install_from_bytes(app_folder: &Path, bytes: &[u8]) -> Result<Installed, 
     std::fs::create_dir_all(&addons).map_err(|error| format!("The add-on couldn't be installed: the app's folder can't be written to ({error})."))?;
     refuse_links(&addons)?;
     // One install or removal at a time, from whichever window.
-    let _lock = Lock::take(&addons)?;
+    let _lock = if wait { Lock::take(&addons)? } else { Lock::try_take(&addons).map_err(|()| BUSY.to_string())? };
     put_back_cut_short_locked(app_folder);
     sweep_leftovers(&addons);
     let fresh = addons.join(format!(".{SLIDEV_FOLDER}-new-{}", unique()));
@@ -313,7 +348,7 @@ pub fn remove(app_folder: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// What remove says while an install holds the add-ons folder.
+/// What remove, and an update, say while an install, an export or an import holds the add-on.
 pub const BUSY: &str = "The add-on is being installed or used just now; try again in a moment.";
 
 /// What install and remove say of an add-ons folder that is a link.

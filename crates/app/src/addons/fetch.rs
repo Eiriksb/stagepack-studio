@@ -99,6 +99,16 @@ pub fn set_source_for_test(source: Source) {
     hook.0 = Some(source);
 }
 
+/// How many requests the app has sent for the add-on, for the tests that pin when it does.
+#[cfg(feature = "test-hooks")]
+static REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many requests the app has sent for the add-on since it started, to any address.
+#[cfg(feature = "test-hooks")]
+pub fn requests_for_test() -> usize {
+    REQUESTS.load(Ordering::SeqCst)
+}
+
 /// Whether `url` is one the app may ask: https, or a loopback address a test allowed.
 fn allowed(url: &str) -> bool {
     if url.bytes().any(|byte| !byte.is_ascii_graphic()) || url.contains('\\') {
@@ -392,6 +402,8 @@ fn fetch_here(url: &str, what: What, stop: &AtomicBool, tell: &mpsc::Sender<Said
         let config = config.https_only(!is_loopback(&url));
         let config = if is_loopback(&url) { config.proxy(None) } else { config };
         let agent = ureq::Agent::new_with_config(config.build());
+        #[cfg(feature = "test-hooks")]
+        REQUESTS.fetch_add(1, Ordering::SeqCst);
         let response = agent.get(&url).call().map_err(|error| before_response(error, what))?;
         if stop.load(Ordering::SeqCst) {
             return Err(CANCELLED.into());
