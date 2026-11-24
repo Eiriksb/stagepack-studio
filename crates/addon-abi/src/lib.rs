@@ -9,6 +9,10 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The signed `.spaddon` package the add-on is installed from. Not built into the add-on itself.
+#[cfg(feature = "package")]
+pub mod package;
+
 /// The version of this interface. An add-on's `addon_abi` must return it.
 pub const ABI_VERSION: u32 = 1;
 

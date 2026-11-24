@@ -9,7 +9,7 @@ license.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-addon-abi = { path = "../addon-abi" }
+addon-abi = { path = "../addon-abi", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
 slides-format = { path = "../format" }

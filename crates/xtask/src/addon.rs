@@ -1,0 +1,124 @@
+//! `package addon-keygen` and `package addon`: the owner's signing key, and the signed
+//! `.spaddon` package of the Slidev add-on.
+//!
+//! The key file is the 32 raw bytes of an ed25519 secret key. It is only ever read here, to
+//! sign, and nothing here prints, logs or copies it: only its public half is shown.
+
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use addon_abi::package::{package_file_name, read_package, write_package, AddonManifest, ADDON_NAME};
+use addon_abi::ABI_VERSION;
+use ed25519_dalek::{Signer, SigningKey};
+use sha2::{Digest, Sha256};
+
+/// The version of Slidev the add-on writes for: the `@slidev/cli` Stagepack bundles.
+pub const SLIDEV_TARGET: &str = "53.0.0";
+
+/// The line of Rust that builds `public` into the app, as `crates/app/src/addons/key.rs` holds it.
+pub fn public_key_line(public: &[u8; 32]) -> String {
+    let bytes: Vec<String> = public.iter().map(u8::to_string).collect();
+    format!("pub const ADDON_PUBLIC_KEY: [u8; 32] = [{}];", bytes.join(", "))
+}
+
+/// The public key built into the app, read from `crates/app/src/addons/key.rs`.
+pub fn built_in_key() -> Result<[u8; 32], String> {
+    let file = crate::stage::repo_root().join("crates/app/src/addons/key.rs");
+    let text = std::fs::read_to_string(&file).map_err(|e| format!("can't read {}: {e}", file.display()))?;
+    let start = text.find("ADDON_PUBLIC_KEY: [u8; 32] = [").ok_or("key.rs has no ADDON_PUBLIC_KEY")? + "ADDON_PUBLIC_KEY: [u8; 32] = [".len();
+    let end = start + text[start..].find(']').ok_or("ADDON_PUBLIC_KEY isn't closed")?;
+    let bytes: Result<Vec<u8>, _> = text[start..end].split(',').map(str::trim).filter(|b| !b.is_empty()).map(str::parse).collect();
+    bytes.map_err(|_| "ADDON_PUBLIC_KEY isn't a list of bytes".to_string())?.try_into().map_err(|_| "ADDON_PUBLIC_KEY isn't 32 bytes".to_string())
+}
+
+/// Makes a new signing key in `path` and gives back its public half. The file is made with
+/// mode 0600, and its folder, if it isn't there yet, with mode 0700. A file that is there
+/// already is never written over.
+pub fn keygen(path: &Path) -> Result<[u8; 32], String> {
+    if let Some(folder) = path.parent().filter(|f| !f.as_os_str().is_empty() && !f.exists()) {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(folder).map_err(|e| format!("can't create {}: {e}", folder.display()))?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => format!("{} is there already, and a key file is never written over.", path.display()),
+        _ => format!("can't create {}: {e}", path.display()),
+    })?;
+    let key = SigningKey::generate(&mut rand_core::OsRng);
+    file.write_all(key.as_bytes()).and_then(|()| file.sync_all()).map_err(|e| format!("can't write {}: {e}", path.display()))?;
+    Ok(key.verifying_key().to_bytes())
+}
+
+/// The signing key in `path`, which must be 32 bytes that only its owner can read.
+pub fn read_signing_key(path: &Path) -> Result<SigningKey, String> {
+    let mut file = std::fs::File::open(path).map_err(|e| format!("can't open the key file {}: {e}", path.display()))?;
+    let meta = file.metadata().map_err(|e| format!("can't read the key file {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(format!("the key file {} can be read by others (mode {mode:o}); make it mode 0600 first.", path.display()));
+        }
+    }
+    if meta.len() != 32 {
+        return Err(format!("the key file {} is {} bytes, where a key file is 32.", path.display(), meta.len()));
+    }
+    let mut secret = [0; 32];
+    file.read_exact(&mut secret).map_err(|e| format!("can't read the key file {}: {e}", path.display()))?;
+    Ok(SigningKey::from_bytes(&secret))
+}
+
+/// The add-on's version, from `crates/slidev-addon/Cargo.toml`.
+fn addon_version(repo: &Path) -> Result<String, String> {
+    let file = repo.join("crates/slidev-addon/Cargo.toml");
+    let text = std::fs::read_to_string(&file).map_err(|e| format!("can't read {}: {e}", file.display()))?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("version = \"").and_then(|rest| rest.strip_suffix('"')))
+        .map(str::to_string)
+        .ok_or_else(|| format!("{} has no version", file.display()))
+}
+
+/// Builds the add-on for WebAssembly in release, with the builder's folders written out of it,
+/// in `target/addon-build`; signs it with the key in `key_file`; and writes
+/// `slidev-<version>.spaddon` in `out`. Gives back the file and its sha256, in hex. The package
+/// is read back with the key's public half before it is given back.
+pub fn package_addon(key_file: &Path, out: &Path) -> Result<(PathBuf, String), String> {
+    let key = read_signing_key(key_file)?;
+    let repo = crate::stage::repo_root();
+    let target = repo.join("target/addon-build");
+    let status = Command::new(crate::stage::cargo(&repo))
+        .current_dir(&repo)
+        .env("CARGO_ENCODED_RUSTFLAGS", crate::stage::release_flags(&repo, false))
+        .args(["build", "--release", "-p", "slidev-addon", "--lib", "--target", "wasm32-unknown-unknown", "--target-dir"])
+        .arg(&target)
+        .status()
+        .map_err(|e| format!("couldn't run cargo: {e}"))?;
+    if !status.success() {
+        return Err(format!("building the add-on failed ({status})"));
+    }
+    let wasm_file = target.join("wasm32-unknown-unknown/release/slidev_addon.wasm");
+    let wasm = std::fs::read(&wasm_file).map_err(|e| format!("can't read {}: {e}", wasm_file.display()))?;
+
+    let manifest = AddonManifest { name: ADDON_NAME.into(), version: addon_version(&repo)?, abi: ABI_VERSION, slidev: SLIDEV_TARGET.into() };
+    let bytes = write_package(&manifest, &wasm, |message| key.sign(message).to_bytes());
+    read_package(&bytes, &key.verifying_key().to_bytes()).map_err(|e| format!("the package doesn't read back: {e}"))?;
+
+    std::fs::create_dir_all(out).map_err(|e| format!("can't create {}: {e}", out.display()))?;
+    let file = out.join(package_file_name(&manifest));
+    std::fs::write(&file, &bytes).map_err(|e| format!("can't write {}: {e}", file.display()))?;
+    let sha256: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+    Ok((file, sha256))
+}
+
+/// Whether the key in `key_file` is the one built into the app, so that the app takes its packages.
+pub fn is_built_in(key_file: &Path) -> Result<bool, String> {
+    Ok(read_signing_key(key_file)?.verifying_key().to_bytes() == built_in_key()?)
+}
