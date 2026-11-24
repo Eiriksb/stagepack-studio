@@ -1,4 +1,4 @@
-use addon_abi::{decode, encode, safe_name, Bundle, Notice, NoticeKind, Report, ABI_VERSION, ARGS, ERROR, MAGIC, OP, REPORT};
+use addon_abi::{decode, encode, safe_name, Bundle, Notice, NoticeKind, Report, ABI_VERSION, ARGS, ERROR, MAGIC, MANIFEST, OP, OWN_NAMES, REPORT};
 
 fn file(name: &str, data: &[u8]) -> (String, Vec<u8>) {
     (name.to_string(), data.to_vec())
@@ -39,7 +39,7 @@ fn an_empty_bundle_round_trips() {
 
 #[test]
 fn the_bundles_own_names_round_trip() {
-    let bundle: Bundle = vec![file(OP, b"export"), file(ARGS, b"{}"), file(REPORT, br#"{"notices":[]}"#), file(ERROR, b"No.")];
+    let bundle: Bundle = vec![file(OP, b"export"), file(ARGS, b"{}"), file(REPORT, br#"{"notices":[]}"#), file(ERROR, b"No."), file(MANIFEST, br#"{"title":"T"}"#)];
     assert_eq!(decode(&encode(&bundle)), Ok(bundle));
 }
 
@@ -107,7 +107,9 @@ fn safe_name_table() {
 
 #[test]
 fn the_bundles_own_names_are_not_safe_file_names() {
-    for name in [OP, ARGS, REPORT, ERROR] {
+    assert_eq!(OWN_NAMES, [OP, ARGS, REPORT, ERROR, MANIFEST]);
+    assert_eq!(MANIFEST, ".stagepack.json");
+    for name in OWN_NAMES {
         assert!(!safe_name(name), "{name} must never be a file of the talk");
     }
 }

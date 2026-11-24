@@ -23,8 +23,11 @@ pub const ARGS: &str = ".args.json";
 pub const REPORT: &str = ".report.json";
 /// One sentence on why the operation failed, the only file of a bundle that says so.
 pub const ERROR: &str = ".error";
+/// What an export says of the talk for the manifest the app writes, as JSON, in the bundle
+/// `run` gives back. It is a name of the bundle's own, as no hidden name can be a talk's file.
+pub const MANIFEST: &str = ".stagepack.json";
 /// The bundle's own names, which are never files of a talk.
-pub const OWN_NAMES: [&str; 4] = [OP, ARGS, REPORT, ERROR];
+pub const OWN_NAMES: [&str; 5] = [OP, ARGS, REPORT, ERROR, MANIFEST];
 
 /// The most files a bundle can hold.
 pub const MAX_FILES: usize = 10_000;

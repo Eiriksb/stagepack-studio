@@ -7287,6 +7287,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "slidev-addon"
+version = "0.1.0"
+dependencies = [
+ "addon-abi",
+ "serde",
+ "serde_json",
+ "slides-components",
+ "slides-format",
+]
+
+[[package]]
 name = "slotmap"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
