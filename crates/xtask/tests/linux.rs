@@ -481,6 +481,21 @@ fn the_tarball_unpacks_to_one_folder() {
     assert_eq!(s.uninstall().status.code(), Some(0));
 }
 
+#[test]
+fn packing_drops_the_container_builds_marker() {
+    // Only scripts/package-linux.sh writes the marker, after its glibc-check; any packing removes it
+    // first, so a tarball from `package linux` on the host is never taken for a container build.
+    let out_dir = repo_root().join("target/package-marker-test");
+    let _ = std::fs::remove_dir_all(&out_dir);
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let marker = out_dir.join(xtask::linux::BUILT_IN_UBUNTU_22_04);
+    std::fs::write(&marker, "0000000000000000000000000000000000000000\n").unwrap();
+    // A staged folder that isn't there: packing fails, but the marker is gone already.
+    assert!(xtask::linux::pack(&out_dir.join("no-such-staged-folder"), &out_dir).is_err());
+    assert!(!marker.exists(), "the marker outlived a packing");
+    std::fs::remove_dir_all(&out_dir).unwrap();
+}
+
 /// Installs into a fresh scratch home and returns it.
 fn installed() -> Scratch {
     let s = Scratch::new("fix-");

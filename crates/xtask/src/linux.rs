@@ -17,6 +17,10 @@ pub fn version() -> Result<String, String> {
         .ok_or_else(|| format!("no version in {}", manifest.display()))
 }
 
+/// The marker `scripts/package-linux.sh` writes beside the tarball once a container build passes
+/// `glibc-check`; it holds the commit. Packing removes it, so a tarball packed any other way never has one.
+pub const BUILT_IN_UBUNTU_22_04: &str = ".built-in-ubuntu-22.04";
+
 /// The package's file name for this version.
 pub fn tarball_name(version: &str) -> String {
     format!("stagepack-studio-{version}-linux-x86_64.tar.zst")
@@ -56,6 +60,7 @@ pub fn assemble(staged: &Path, dest: &Path) -> Result<(), String> {
 pub fn pack(staged: &Path, out_dir: &Path) -> Result<PathBuf, String> {
     let version = version()?;
     let out_dir = std::path::absolute(out_dir).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(out_dir.join(BUILT_IN_UBUNTU_22_04));
     let top = format!("stagepack-studio-{version}");
     let work = out_dir.join("work");
     assemble(staged, &work.join(&top))?;

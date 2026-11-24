@@ -5,9 +5,15 @@
 //! The helper isn't asked to start a program here, since the app has no command that does that; the
 //! container check runs it with its input closed, which shows the loader accepts it, and
 //! `the_staged_app_needs_nothing_else` with `STUDIO_STAGED` drives it fully on the host.
+//!
+//! The containers install the README's runtime libraries, `libvulkan1` among them, but have no
+//! display: opening the window on Ubuntu 22.04 and Debian 12 stays a hand check on real hardware.
+//!
+//! The tarball must come from `scripts/package-linux.sh`: it writes the marker
+//! `target/package/.built-in-ubuntu-22.04` with the commit, and `package linux` on the host removes it.
 
 use std::process::Command;
-use xtask::linux::{tarball_name, version};
+use xtask::linux::{BUILT_IN_UBUNTU_22_04, tarball_name, version};
 use xtask::stage::repo_root;
 
 /// Each step the container runs, by name; each prints `@@step NAME CODE` when it ends.
@@ -22,7 +28,7 @@ step() {{ _name=$1; shift; "$@"; echo "@@step $_name $?"; }}
 export DEBIAN_FRONTEND=noninteractive PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8
 libraries() {{
   apt-get update -qq && apt-get install -y -qq --no-install-recommends \
-    zstd libxkbcommon0 libxkbcommon-x11-0 libxcb1 libstdc++6 libfontconfig1 libfreetype6 libwayland-client0 >/dev/null
+    zstd libxkbcommon0 libxkbcommon-x11-0 libxcb1 libstdc++6 libfontconfig1 libfreetype6 libwayland-client0 libvulkan1 >/dev/null
 }}
 step libraries libraries
 useradd -M -d /tmp/h -s /bin/sh tester && mkdir -p /tmp/h && chown tester: /tmp/h
@@ -57,6 +63,20 @@ fn the_package_runs_on_ubuntu_22_04_and_debian_12() {
     let tarball = tarball_name(&version);
     let package = repo.join("target/package");
     assert!(package.join(&tarball).is_file(), "{} is missing: run scripts/package-linux.sh first", package.join(&tarball).display());
+    let marker = package.join(BUILT_IN_UBUNTU_22_04);
+    let built = std::fs::read_to_string(&marker).unwrap_or_else(|_| {
+        panic!("{} is missing, so {tarball} wasn't built in the Ubuntu 22.04 container (`package linux` on the host replaces it): run scripts/package-linux.sh", marker.display())
+    });
+    let built = built.trim();
+    let head = Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&repo).output().ok().filter(|o| o.status.success());
+    let head = head.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    match head {
+        Some(head) if built.split(' ').next() != Some(head.as_str()) => {
+            eprintln!("warning: {tarball} was built from {built}, not from HEAD ({head}): this tests that build; run scripts/package-linux.sh to test this one")
+        }
+        _ if built.ends_with(" dirty") => eprintln!("warning: {tarball} was built from {built}: the tree had changes the commit doesn't hold"),
+        _ => eprintln!("testing {tarball}, built in the container from {built}"),
+    }
     let script = script(&format!("stagepack-studio-{version}"), &tarball);
 
     let mut failures = Vec::new();
