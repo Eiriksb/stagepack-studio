@@ -93,4 +93,21 @@ On Linux (not in `plan-e.md`'s numbering; its Linux list is unchanged), the one 
 
 ## The final review
 
-*To be written by the controller.*
+A review of the whole branch, `c0b7aea..45c3e6d`, on the most capable model said it could merge with fixes. It found 2 important and 4 minor findings. It checked every figure in this record against the logs and found none wrong.
+
+The important findings:
+- `test-all.sh` ran the old-systems test whenever `docker` was on the `PATH`, on whatever tarball was there.
+- Under rootless Docker the build stopped with a bare "Permission denied".
+
+One fix wave fixed them and the minor findings carried over from the task reviews:
+- `4b67727`: a cancelled Windows install leaves no saved-default key.
+- `efb8c99`: the old-systems test now runs only on a container-built package, after a marker check and `docker info`. Rootless Docker is detected. The script refuses to run as root, and Ctrl-C stops its container. The repository is mounted read-only. A bundle that is reused is reported, and a package that fails `glibc-check` is deleted.
+- `bbc792c`: the docs, including a note to restart an open assistant after installing on Windows.
+
+The package was then rebuilt in the container. Its highest glibc need is 2.35. On both `ubuntu:22.04` and `debian:12` every step passed, and the `xtask` tests gave 54 passed.
+
+A re-review on the same model found every item addressed and approved the merge. Two minor points about messages are left:
+- `test-all.sh` doesn't warn when the package's marker names an older commit than `HEAD`. The test's own warning is hidden when it passes.
+- With Podman standing in for `docker`, the rootless check fails, and the script says the daemon isn't running. That is the wrong reason; Podman's own field is `Host.Security.Rootless`.
+
+Not checked here: a real rootless daemon, Podman, the Windows code (never compiled), and opening the window on the old systems.
