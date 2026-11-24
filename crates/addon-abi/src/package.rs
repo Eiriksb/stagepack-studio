@@ -48,6 +48,31 @@ pub struct AddonManifest {
     pub slidev: String,
 }
 
+/// The file a release publishes beside its package, naming it.
+pub const INDEX_FILE: &str = "index.json";
+
+/// What `index.json` says of the package a release offers. It proves nothing: the app takes it
+/// only to know what to download, and checks the download against it, and then against the
+/// package's own signed `addon.json`. The packaging tool writes it and the app reads it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Index {
+    /// Always [`ADDON_NAME`].
+    pub name: String,
+    /// The version offered, three numbers.
+    pub version: String,
+    /// The version of Slidev it writes for.
+    pub slidev: String,
+    /// The add-on interface it is made for, [`ABI_VERSION`].
+    pub abi: u32,
+    /// The package's length in bytes.
+    pub size: u64,
+    /// The sha256 of the package, as 64 lowercase hex digits.
+    pub sha256: String,
+    /// Where the package is.
+    pub url: String,
+}
+
 /// A package whose signature was checked, and whose manifest is one the app takes. Only
 /// [`read_package`] makes one (it can't be built outside this crate), so holding one means
 /// the check was made.

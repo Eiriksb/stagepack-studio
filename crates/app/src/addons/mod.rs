@@ -5,6 +5,7 @@
 
 pub mod bake;
 pub mod dialog;
+pub mod fetch;
 pub mod key;
 mod slidev;
 
@@ -220,9 +221,14 @@ fn loaded(wasm: &[u8], version: &str) -> Result<Addon, String> {
 /// checked over, written as it was checked. If anything is wrong, the sentence says what, and
 /// whatever was installed before stays as it was.
 pub fn install_from_file(app_folder: &Path, file: &Path) -> Result<Installed, String> {
-    let bytes = read_package_file(file)?;
-    let package = read_package(&bytes, &key::addon_key())?;
-    drop(bytes);
+    install_from_bytes(app_folder, &read_package_file(file)?)
+}
+
+/// Installs the add-on in the package `bytes` under `app_folder`, as [`install_from_file`]
+/// does: its signature is checked first, and whatever was installed before stays as it was if
+/// anything is wrong.
+pub fn install_from_bytes(app_folder: &Path, bytes: &[u8]) -> Result<Installed, String> {
+    let package = read_package(bytes, &key::addon_key())?;
     if package.manifest.slidev != SLIDEV_VERSION {
         return Err(wrong_slidev(&package.manifest.slidev));
     }
