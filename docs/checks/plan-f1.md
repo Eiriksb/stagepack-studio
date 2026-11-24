@@ -16,9 +16,9 @@ A sandboxed wasm translator for Slidev export and import, installed from a signe
 
 ## The add-on file and the owner's key
 
-- File: `target/package/slidev-0.1.0.spaddon` (under the ignored `target/`, not committed). It was built before the final fix wave, which changed the add-on's code (it now finds `./photo.png`, and shows a region a piece at a time as the engine does) but not the package's format, so the file was left as it was. **Build it again with `package addon --key ~/stagepack-studio-signing/addon-signing.key` before the hand checks**, and check its new sha256.
-- Size: 393323 bytes.
-- sha256: `1a45ed851cab1c78daf669cacdf1dc0455f043424111cf7ff49c07a0ca0de194`.
+- File: `target/package/slidev-0.1.0.spaddon` (under the ignored `target/`, not committed), rebuilt with the owner's key after the final fix wave, so it holds every fix. To make it again: `package addon --key ~/stagepack-studio-signing/addon-signing.key`.
+- Size: 394313 bytes.
+- sha256: `b6365436804b7ed481ceedc101c6210fc29989a04ceac8427ad48705a1ff376e`.
 - **The owner's key is `~/stagepack-studio-signing/addon-signing.key`** (mode 600, in a folder of mode 700, outside the repository). **Back it up now, somewhere safe, and never share it.** Anyone with it can sign an add-on that every installed app will trust. If it is lost, the key built into the app (`crates/app/src/addons/key.rs`) can only be changed by updating every installed app, and add-ons signed with a new key are refused until then. The key file was never read or printed while this was built.
 
 ## Tests on Linux
@@ -79,11 +79,32 @@ Do each on **Linux and Windows**. Use a scratch copy of anything you care about.
    - the clicks, transitions and fonts look right.
    If you have Slidev 53.0.0, also run it on the export.
 3. **Import one of your own Stagepack talks** through the add-on: a packed `.sptx` that holds `stagepack.json` (a folder isn't imported). Read the report: every loss should have a notice, and nothing should be lost without one.
-4. **Export the same talk again, to the same file,** and open it in Stagepack again. It should be the same talk to Stagepack: the export keeps the first one's `id` and `created`, so what Stagepack kept of it the first time, such as its notes, is still there.
+4. **Export the same talk again, to the same file,** and open it in Stagepack again. It should be the same talk to Stagepack: the export keeps the first one's `id` and `created`, so Stagepack knows it as the same talk. Its slides and notes are the new export's; notes you wrote in Stagepack since the first export are not kept. (Exporting over any Stagepack talk takes on that talk's `id` and `created` the same way.)
 5. **Open a Stagepack talk without the add-on** (remove it first if installed) and look for the Add-ons offer.
 6. **Remove the add-on** from the Add-ons dialog, and check that the app's other files are untouched.
 7. On Windows only: watch that the first export doesn't stall or run out of memory.
 
 ## The final review
 
-*To be written by the controller.*
+A review of the whole branch, `db98b1b..52cd887` (15 commits, 92 files), on the most capable model said it could merge with fixes. It found 5 important and 9 minor issues:
+- **Pictures and videos written with a relative path** (`./photo.png`) were left out of the export. The app and the add-on now share one path rule, `addon_abi::normalise`.
+- **Export ▸ Slidev… could write over the open talk.** Every export now refuses a file that is open in a window.
+- **Import refused Stagepack talks with many bundled packages.** Only the files actually given to the add-on now count.
+- **The export's notices went onto one status line.** They now go to the same capped report dialog that import uses.
+- **The add-on's own crates had no licence notice.** They are now listed under their own heading in NOTICES.txt.
+
+One fix wave (`b0d4740`, `cc81264`, `ab43934`, `3309f61`, `2727915`) fixed all of them. It also fixed the minor items parked from the task reviews:
+- clicks on tables and lists now match the engine;
+- *Remove* can no longer be undone by a leftover folder;
+- a linked add-ons folder is refused;
+- the security review's point: an add-on file with a zip64 record, or with an oversized directory, is refused before it is read.
+
+The app suite gave 1504 passed and 0 failed. The add-on and round-trip tests passed, and clippy is clean.
+
+A re-review on the same model approved the merge. Of its four new minor points, the controller fixed two: Remove's busy sentence, and hand check 4, which no longer promises that notes written in Stagepack survive a re-export. Two are left:
+- the end-record check could refuse a valid file about once in 100 000, when an end-record signature happens to sit in its last 64 KiB;
+- the import timing test runs about n^1.5 on 4 MB of unclosed tags, which is probably the import parsing its own output. The 60 s limit bounds it.
+
+Not checked here:
+- the export in a running Slidev or Stagepack;
+- anything on Windows.

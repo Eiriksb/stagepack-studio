@@ -308,7 +308,7 @@ pub fn remove(app_folder: &Path) -> Result<(), String> {
 }
 
 /// What remove says while an install holds the add-ons folder.
-pub const BUSY: &str = "An add-on is being installed; try again in a moment.";
+pub const BUSY: &str = "The add-on is being installed or used just now; try again in a moment.";
 
 /// What install and remove say of an add-ons folder that is a link.
 const LINKED: &str = "The add-ons folder, or the Slidev add-on's, is a link to somewhere else, so the app won't write there.";
