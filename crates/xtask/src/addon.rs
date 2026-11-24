@@ -139,7 +139,7 @@ pub fn is_built_in(key_file: &Path) -> Result<bool, String> {
     Ok(read_signing_key(key_file)?.verifying_key().to_bytes() == built_in_key()?)
 }
 
-/// Writes the index of `package`'s line of apps, `index-abi<abi>-slidev<major>.json`, in the
+/// Writes the index of `package`'s line of apps, `index-abi<abi>-slidev<version>.json`, in the
 /// folder of `package`: the package is read with `public` first, so an index is only ever made
 /// for a package the app would take, and its `size`, `sha256` and `url` are the package's own.
 /// The file name must be the one `package addon` gives, and the version three numbers as the app

@@ -9,7 +9,7 @@
 //!   package glibc-check DIR    prints the glibc each ELF file under DIR needs, and fails if one is above 2.35
 //!   package addon --key FILE [--out DIR]   builds the Slidev add-on for WebAssembly, signs it with the key in FILE and
 //!                                          writes slidev-<version>.spaddon in DIR (default target/package)
-//!   package addon-release [--package FILE]   writes index-abi<abi>-slidev<major>.json beside the signed package (default target/package/slidev-<version>.spaddon)
+//!   package addon-release [--package FILE]   writes index-abi<abi>-slidev<version>.json beside the signed package (default target/package/slidev-<version>.spaddon)
 //!                                          for its release, and prints the steps to publish it
 //!   package addon-keygen FILE  makes a new signing key in FILE (mode 0600, never written over) and prints its public half
 

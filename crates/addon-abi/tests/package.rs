@@ -292,13 +292,13 @@ fn the_parts_of_a_read_package_verify_again_and_a_changed_part_does_not() {
 fn each_compatibility_line_has_an_index_of_its_own_that_never_moves() {
     use addon_abi::package::{index_file, index_url, INDEX_TAG, PACKAGE_PREFIX};
     assert_eq!(INDEX_TAG, "index");
-    assert_eq!(index_file(1, "53.0.0"), "index-abi1-slidev53.json");
-    // Only Slidev's major version names the line.
-    assert_eq!(index_file(1, "53.2.7"), "index-abi1-slidev53.json");
-    assert_eq!(index_file(2, "54.0.0"), "index-abi2-slidev54.json");
+    assert_eq!(index_file(1, "53.0.0"), "index-abi1-slidev53.0.0.json");
+    // The exact Slidev version names the line, since an app accepts only that version.
+    assert_eq!(index_file(1, "53.2.7"), "index-abi1-slidev53.2.7.json");
+    assert_eq!(index_file(2, "54.0.0"), "index-abi2-slidev54.0.0.json");
     // In the release tagged `index`, beside the packages' own releases.
-    assert_eq!(index_url(1, "53.0.0"), format!("{PACKAGE_PREFIX}index/index-abi1-slidev53.json"));
-    assert_eq!(index_url(1, "53.0.0"), "https://github.com/Eiriksb/stagepack-studio-addons/releases/download/index/index-abi1-slidev53.json");
+    assert_eq!(index_url(1, "53.0.0"), format!("{PACKAGE_PREFIX}index/index-abi1-slidev53.0.0.json"));
+    assert_eq!(index_url(1, "53.0.0"), "https://github.com/Eiriksb/stagepack-studio-addons/releases/download/index/index-abi1-slidev53.0.0.json");
 }
 
 #[test]

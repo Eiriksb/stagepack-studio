@@ -496,7 +496,7 @@ fn http_is_refused_without_the_test_hook() {
     assert_eq!(official.index_url, *fetch::INDEX_URL);
     assert_eq!(official.package_prefix, fetch::PACKAGE_PREFIX);
     // The index of the app's own line, add-on interface 1 and Slidev 53, which never moves.
-    assert_eq!(*fetch::INDEX_URL, "https://github.com/Eiriksb/stagepack-studio-addons/releases/download/index/index-abi1-slidev53.json");
+    assert_eq!(*fetch::INDEX_URL, "https://github.com/Eiriksb/stagepack-studio-addons/releases/download/index/index-abi1-slidev53.0.0.json");
     assert_eq!(*fetch::INDEX_URL, addon_abi::package::index_url(addon_abi::ABI_VERSION, addons::SLIDEV_VERSION));
     // It is reached as a package is, by a release file's address that GitHub sends on to its
     // storage, so it passes the same checks.

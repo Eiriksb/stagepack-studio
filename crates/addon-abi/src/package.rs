@@ -57,10 +57,11 @@ pub const PACKAGE_PREFIX: &str = "https://github.com/Eiriksb/stagepack-studio-ad
 pub const INDEX_TAG: &str = "index";
 
 /// The index file of the apps that take add-on interface `abi` and write for Slidev `slidev`:
-/// `index-abi<abi>-slidev<major>.json`, by Slidev's major version only.
+/// `index-abi<abi>-slidev<version>.json`, by the exact Slidev version, since that is what an app
+/// accepts: an app for 53.0.0 and one for 53.1.0 are different lines, and neither is cut off when
+/// the other's add-on is published.
 pub fn index_file(abi: u32, slidev: &str) -> String {
-    let major: String = slidev.chars().take_while(char::is_ascii_digit).collect();
-    format!("index-abi{abi}-slidev{major}.json")
+    format!("index-abi{abi}-slidev{slidev}.json")
 }
 
 /// Where the index of that line is: [`index_file`] in the release tagged [`INDEX_TAG`].

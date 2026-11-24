@@ -18,8 +18,8 @@ The app can get the add-on itself, from the releases of `Eiriksb/stagepack-studi
   - Update says the add-on is in use while an export or import runs, and keeps the download for the next try.
   - A failed or cancelled download writes nothing; it is held in memory and dropped.
   - A damaged install, as an app update to another Slidev leaves one, offers *Get again*, which replaces it (final fix wave).
-- **The release files** (task 3, `1eff7dc`; reworked in the final fix wave). `package addon-release [--package FILE]` writes `target/package/index-abi<abi>-slidev<major>.json` beside the signed package: its `size`, `sha256` and `url` (`PACKAGE_PREFIX` + `slidev-vX.Y.Z/slidev-X.Y.Z.spaddon`) come from the package itself, and it reads the package with the app's built-in key first, so a package the app would refuse gets no index. It is written with the same `addon_abi::package::Index` type the app reads. It then prints the commands to publish. The steps are in `docs/guide/publishing-the-addon.md`.
-- **An index for each line of apps** (final fix wave). Each package has a release of its own, `slidev-vX.Y.Z`. One release, tagged `index`, holds an index file for each line of add-on interface and Slidev major version. The app asks only for its own line's, at an address that never moves: `INDEX_URL` = `PACKAGE_PREFIX` + `index/index-abi1-slidev53.json`, built from `addon_abi::ABI_VERSION` and the app's `SLIDEV_VERSION` by `addon_abi::package::index_url`, which the packaging tool's file name shares. So an app that has shipped keeps finding the last add-on made for it after the owner publishes one for a later Slidev or interface. Nothing reads GitHub's *latest* release any more, so `--latest` is gone. The index is a release file like the package, `releases/download/<tag>/<file>`, so it takes the same redirect to GitHub's storage, and passes the same checks.
+- **The release files** (task 3, `1eff7dc`; reworked in the final fix wave). `package addon-release [--package FILE]` writes `target/package/index-abi<abi>-slidev<version>.json` beside the signed package: its `size`, `sha256` and `url` (`PACKAGE_PREFIX` + `slidev-vX.Y.Z/slidev-X.Y.Z.spaddon`) come from the package itself, and it reads the package with the app's built-in key first, so a package the app would refuse gets no index. It is written with the same `addon_abi::package::Index` type the app reads. It then prints the commands to publish. The steps are in `docs/guide/publishing-the-addon.md`.
+- **An index for each line of apps** (final fix wave). Each package has a release of its own, `slidev-vX.Y.Z`. One release, tagged `index`, holds an index file for each line of add-on interface and exact Slidev version. The app asks only for its own line's, at an address that never moves: `INDEX_URL` = `PACKAGE_PREFIX` + `index/index-abi1-slidev53.0.0.json`, built from `addon_abi::ABI_VERSION` and the app's `SLIDEV_VERSION` by `addon_abi::package::index_url`, which the packaging tool's file name shares. So an app that has shipped keeps finding the last add-on made for it after the owner publishes one for a later Slidev or interface. Nothing reads GitHub's *latest* release any more, so `--latest` is gone. The index is a release file like the package, `releases/download/<tag>/<file>`, so it takes the same redirect to GitHub's storage, and passes the same checks.
 
 ## Tests on Linux
 
@@ -33,7 +33,7 @@ All through `scripts/cargo-safe.sh`. Counts are from each report's own command o
 | `test -p stagepack-studio --test addon_fetch` (task 3, after the constants moved) | 13 passed |
 | `test -p addon-abi` (task 3) | 24 passed (10 bundle, 14 package) |
 | `clippy -p xtask -p addon-abi -p stagepack-studio --all-targets -- -D warnings` (task 3) | clean |
-| `test -p xtask --test xtask` (task 1) | 25 passed as task 1's report gives it, among them `every_dependency_has_its_notice`, the check that NOTICES covers the new crates |
+| `test -p xtask --test xtask` (task 1) | passed in task 1 (its report counts 25 tests across the xtask suites; this binary has 9 today), among them `every_dependency_has_its_notice`, the check that NOTICES covers the new crates |
 
 Tasks 1 and 2 each went through one fix round and a re-review that approved it. The re-reviews' minor points, and the final review's, were all made in the final fix wave; its runs are below.
 
@@ -51,7 +51,7 @@ Tasks 1 and 2 each went through one fix round and a re-review that approved it. 
 
 ## What was run on the real file
 
-`package addon-release` was run on `target/package/slidev-0.1.0.spaddon`, signed with the owner's key earlier. No key was read; the index is made from the package alone. In the final fix wave it wrote `target/package/index-abi1-slidev53.json`:
+`package addon-release` was run on `target/package/slidev-0.1.0.spaddon`, signed with the owner's key earlier. No key was read; the index is made from the package alone. In the final fix wave it wrote `target/package/index-abi1-slidev53.0.0.json`:
 
 ```json
 {
@@ -74,7 +74,7 @@ Once only, before the first release (skip it if the release index is there alrea
 The package, in a release of its own:
   gh release create slidev-v0.1.0 target/package/slidev-0.1.0.spaddon --repo Eiriksb/stagepack-studio-addons --title "Slidev add-on 0.1.0" --notes "Slidev add-on 0.1.0"
 Then its index, in place of the earlier one, once the package is up:
-  gh release upload index target/package/index-abi1-slidev53.json --clobber --repo Eiriksb/stagepack-studio-addons
+  gh release upload index target/package/index-abi1-slidev53.0.0.json --clobber --repo Eiriksb/stagepack-studio-addons
 Never upload the signing key.
 ```
 
@@ -84,7 +84,7 @@ Nothing was published, and no repository or release was created.
 
 Do each on **Linux and Windows**.
 
-1. **Publish 0.1.0** by `docs/guide/publishing-the-addon.md`: create the public repository once, with a README (`gh repo create … --public --add-readme`), and the release tagged `index`; build the package with your key; run `package addon-release`; run the two commands it prints for the release, the package's and then the index's. Check that the release `slidev-v0.1.0` holds the `.spaddon` alone, and the release `index` holds `index-abi1-slidev53.json`.
+1. **Publish 0.1.0** by `docs/guide/publishing-the-addon.md`: create the public repository once, with a README (`gh repo create … --public --add-readme`), and the release tagged `index`; build the package with your key; run `package addon-release`; run the two commands it prints for the release, the package's and then the index's. Check that the release `slidev-v0.1.0` holds the `.spaddon` alone, and the release `index` holds `index-abi1-slidev53.0.0.json`.
 2. **Get.** On a clean user account (no add-on installed), *File ▸ Add-ons… ▸ Get*. Progress shows, then "Installed, version 0.1.0", and an export works.
 3. **Check for updates.** It says this is the newest version.
 4. **With the network off,** *Get* or *Check for updates* shows "Couldn't reach the add-on's download page. Check the internet connection, or install it from a file." and changes nothing.

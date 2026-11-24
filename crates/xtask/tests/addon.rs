@@ -136,7 +136,7 @@ fn the_release_index_matches_its_package() {
 
     let (file, written) = xtask::addon::write_release_index(&package, &public).unwrap();
     // Named for its line of apps: add-on interface 1, Slidev 53.
-    assert_eq!(file, scratch.path().join("package").join("index-abi1-slidev53.json"));
+    assert_eq!(file, scratch.path().join("package").join("index-abi1-slidev53.0.0.json"));
 
     // The app's own type reads it, and it says what the package beside it is.
     let index: Index = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
