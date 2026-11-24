@@ -802,18 +802,17 @@ impl<'a> Exporter<'a> {
         let line = region_line(slide, region.name);
         let (rect, rotate, moved) = placement(line, region);
         let (click, enter) = region_timing(line);
-        let (content, steps) = if moved { self.inside((rect.x, rect.y), rotate != 0.0, |this| this.blocks_counted(blocks)) } else { self.blocks_counted(blocks) };
-        let content = match click {
-            RegionClick::Each => {
-                self.clicked((steps as u32).min(MAX_CLICK));
-                if enter == Enter::FlyUp {
-                    self.notice(NoticeKind::Approximation, format!("The {} region comes in a piece at a time, and in Slidev each piece fades in rather than flying up.", region.name));
-                }
-                // From click 1, as the engine shows them, not after what came before on the slide.
-                wrap("v-clicks", &[], " at=\"1\"", &content)
+        // The engine shows a turned region whole, on click 1.
+        let click = if click == RegionClick::Each && rotate != 0.0 { RegionClick::Step(1) } else { click };
+        let each = click == RegionClick::Each;
+        let write = |this: &mut Self| if each { this.blocks_each(blocks) } else { (this.blocks(blocks), 0) };
+        let (content, steps) = if moved { self.inside((rect.x, rect.y), rotate != 0.0, write) } else { write(self) };
+        if each {
+            self.clicked((steps as u32).min(MAX_CLICK));
+            if enter == Enter::FlyUp {
+                self.notice(NoticeKind::Approximation, format!("The {} region comes in a piece at a time, and in Slidev each piece fades in rather than flying up.", region.name));
             }
-            _ => content,
-        };
+        }
         let (attrs, timing_css) = match click {
             RegionClick::Step(step) => {
                 self.clicked(step);
@@ -828,16 +827,7 @@ impl<'a> Exporter<'a> {
 
     /// Blocks, each followed by a blank line.
     fn blocks(&mut self, blocks: &[&Block]) -> String {
-        self.blocks_counted(blocks).0
-    }
-
-    /// Blocks, each followed by a blank line, and how many clicks Slidev's `<v-clicks>` takes
-    /// to show them: one for each element written, or for a list alone each of its items, or
-    /// for a table alone each row of its body. Each block written is one element: what isn't
-    /// written isn't counted.
-    fn blocks_counted(&mut self, blocks: &[&Block]) -> (String, usize) {
         let mut out = String::new();
-        let mut written = Vec::new();
         for block in blocks {
             let text = self.block(block);
             if text.trim().is_empty() {
@@ -845,14 +835,49 @@ impl<'a> Exporter<'a> {
             }
             out.push_str(text.trim_end());
             out.push_str("\n\n");
-            written.push((*block, text.starts_with("<div v-pre>")));
         }
-        let count = match written.as_slice() {
-            [(Block::List { items, .. }, _)] => items.len(),
-            [(Block::Table { rows, .. }, false)] => rows.len().saturating_sub(1),
-            all => all.len(),
-        };
-        (out, count)
+        out
+    }
+
+    /// Blocks shown a piece at a time from click 1, as the engine shows them, and how many clicks
+    /// that takes: each list an item at a time, and each other block whole, a table too. What
+    /// isn't written isn't counted.
+    fn blocks_each(&mut self, blocks: &[&Block]) -> (String, usize) {
+        let mut written = Vec::new();
+        for block in blocks {
+            let text = self.block(block);
+            if !text.trim().is_empty() {
+                written.push((*block, text.trim_end().to_string()));
+            }
+        }
+        let joined = || written.iter().map(|(_, text)| format!("{text}\n\n")).collect::<String>();
+        match written.as_slice() {
+            // Slidev's `<v-clicks>` steps a list alone by its items, as the engine does.
+            [(Block::List { items, .. }, _)] => (wrap("v-clicks", &[], " at=\"1\"", &joined()), items.len()),
+            // And a table alone by the rows of its body, where the engine shows it whole.
+            [(Block::Table { .. }, _)] => (wrap("v-clicks", &[], " at=\"1\" :handle-special-elements=\"false\"", &joined()), 1),
+            all if !all.iter().any(|(block, _)| matches!(block, Block::List { .. })) => (wrap("v-clicks", &[], " at=\"1\"", &joined()), all.len()),
+            // Slidev shows a list among other blocks whole, so each list is a `<v-clicks>` of its
+            // own, from its first item's click, and each other block comes in on its own click.
+            all => {
+                let mut out = String::new();
+                let mut click = 1;
+                for (block, text) in all {
+                    match block {
+                        Block::List { items, .. } => {
+                            out.push_str(&wrap("v-clicks", &[], &format!(" at=\"{click}\""), text));
+                            click += items.len();
+                        }
+                        _ => {
+                            out.push_str(&wrap("div", &[], &format!(" v-click=\"{click}\""), text));
+                            click += 1;
+                        }
+                    }
+                    out.push('\n');
+                }
+                (out, click - 1)
+            }
+        }
     }
 
     fn block(&mut self, block: &Block) -> String {

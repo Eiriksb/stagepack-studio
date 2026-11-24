@@ -202,10 +202,41 @@ fn a_region_shown_a_piece_at_a_time_takes_the_clicks_slidev_counts() {
     ];
     let (bundle, _) = export_with(&slides.join("\n"), Vec::new());
     let markdown = slides_md(&bundle);
-    assert_eq!(clicks(&markdown), [Some(3), Some(2), Some(2), Some(2), Some(3)], "{markdown}");
+    assert_eq!(clicks(&markdown), [Some(1), Some(2), Some(2), Some(2), Some(3)], "{markdown}");
     let bodies = slides_of(&markdown);
     // The unstyled Text is one element, and each region starts at click 1.
     assert!(bodies[2].1.contains("<v-clicks at=\"1\">\n\n<div>\n\nFirst.\n\nSecond.\n\n</div>\n\nThird.\n\n</v-clicks>"), "{}", bodies[2].1);
+    // A table alone comes in whole, as the engine shows it, not a row at a time.
+    assert!(bodies[0].1.contains("<v-clicks at=\"1\" :handle-special-elements=\"false\">\n\n| A | B |"), "{}", bodies[0].1);
+}
+
+#[test]
+fn a_list_among_other_blocks_comes_in_an_item_at_a_time_as_the_engine_shows_it() {
+    let source = "---\nregion.body: click=each\n---\n\n# Mixed\n\nFirst words.\n\n- One\n- Two\n\nLast words.\n\n1. Uno\n2. Dos\n3. Tres\n";
+    let (bundle, _) = export_with(source, Vec::new());
+    let markdown = slides_md(&bundle);
+    // The engine's pieces: the words, each item of the list, the words, each item of the other.
+    assert_eq!(clicks(&markdown), [Some(7)], "{markdown}");
+    let body = &slides_of(&markdown)[0].1;
+    for part in [
+        "<div v-click=\"1\">\n\nFirst words.\n\n</div>",
+        "<v-clicks at=\"2\">\n\n- One\n- Two\n\n</v-clicks>",
+        "<div v-click=\"4\">\n\nLast words.\n\n</div>",
+        "<v-clicks at=\"5\">\n\n1. Uno\n2. Dos\n3. Tres\n\n</v-clicks>",
+    ] {
+        assert!(body.contains(part), "{part:?} isn't in {body}");
+    }
+}
+
+#[test]
+fn a_turned_region_shown_a_piece_at_a_time_comes_in_whole_on_click_1() {
+    let source = "---\nregion.body: click=each rotate=10\n---\n\n# Turned\n\nFirst.\n\n- One\n- Two\n";
+    let (bundle, _) = export_with(source, Vec::new());
+    let markdown = slides_md(&bundle);
+    assert_eq!(clicks(&markdown), [Some(1)], "{markdown}");
+    let body = &slides_of(&markdown)[0].1;
+    assert!(!body.contains("v-clicks"), "{body}");
+    assert!(body.contains("v-click=\"1\""), "{body}");
 }
 
 #[test]
@@ -223,6 +254,11 @@ fn a_backtick_line_in_a_pre_fence_doesnt_open_a_fence_for_slidev() {
     let markdown = slides_md(&bundle);
     assert_eq!(slides_of(&markdown).len(), 2, "{markdown}");
     assert!(markdown.contains("<code v-pre>a \\`\\`\\` b</code>"), "{markdown}");
+    // A byte-order mark is white space to JavaScript's trimStart, so backticks after one too.
+    let (bundle, _) = export_with("# Fenced\n\n````markdown\n<!-- a comment -->\n\u{feff}```html\n````\n\n---\n\n# Second\n", Vec::new());
+    let markdown = slides_md(&bundle);
+    assert_eq!(slides_of(&markdown).len(), 2, "{markdown}");
+    assert!(markdown.contains("\u{feff}&#96;``html"), "{markdown}");
 }
 
 #[test]

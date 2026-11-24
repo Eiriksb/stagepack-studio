@@ -93,8 +93,9 @@ pub fn pre_lines(code: &str) -> String {
     code.split('\n')
         .map(|line| {
             let line = html(line).replace('{', "&#123;").replace('}', "&#125;");
-            // Backticks after any white space open a fence for Slidev's splitter.
-            let blank = line.len() - line.trim_start().len();
+            // Backticks after any white space open a fence for Slidev's splitter, which trims
+            // with JavaScript's trimStart: a byte-order mark is white space there.
+            let blank = line.len() - line.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{feff}').len();
             match line[blank..].chars().next() {
                 Some('-') => format!("{}&#45;{}", &line[..blank], &line[blank + 1..]),
                 Some(':') => format!("{}&#58;{}", &line[..blank], &line[blank + 1..]),
