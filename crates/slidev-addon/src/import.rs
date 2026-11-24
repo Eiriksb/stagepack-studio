@@ -5,6 +5,7 @@
 //! original text, and is in the report under its slide.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
 
 use addon_abi::{safe_name, Bundle, Notice, NoticeKind, Report, MANIFEST};
 use serde::Deserialize;
@@ -47,6 +48,8 @@ const MAX_IMPORTS: usize = 1000;
 const MAX_IMPORTED_BYTES: usize = 64 * 1024 * 1024;
 /// The most of an import's slide a labelled box holds.
 const MAX_PLACEHOLDER_SLIDE: usize = 4096;
+/// The most parts of a `src:` range that are read.
+const MAX_RANGE_PARTS: usize = 256;
 /// How many levels of a list a `<v-clicks depth>` is followed through.
 const MAX_LIST_LEVELS: usize = 16;
 /// How many files deep `src:` imports are followed.
@@ -74,7 +77,9 @@ struct SlidevSlide {
     /// The slide as written, for a labelled box.
     raw: String,
     /// Its front matter as YAML, or why it can't be read.
-    front: Result<Value, String>,
+    front: Result<Rc<Value>, String>,
+    /// How long its front matter is, as it counts against an import's budget.
+    front_size: usize,
     content: String,
     note: Option<String>,
 }
@@ -126,6 +131,9 @@ struct Fences<'l> {
     /// The lines that start with white space and a backtick, by that white space: each line's
     /// index and how many backticks start it.
     by_lead: HashMap<&'l str, Vec<(usize, usize)>>,
+    /// For each of those lists, the most backticks of any line from each place on, so that
+    /// a fence nothing can close is known at once.
+    most_after: HashMap<&'l str, Vec<usize>>,
     /// For a lead and a number of backticks, the last line searched after and what was found.
     found: HashMap<(&'l str, usize), (usize, Option<usize>)>,
 }
@@ -141,7 +149,19 @@ impl<'l> Fences<'l> {
                 by_lead.entry(lead).or_default().push((index, ticks));
             }
         }
-        Fences { by_lead, found: HashMap::new() }
+        let most_after = by_lead
+            .iter()
+            .map(|(lead, lines)| {
+                let mut most = vec![0; lines.len()];
+                let mut so_far = 0;
+                for (index, (_, ticks)) in lines.iter().enumerate().rev() {
+                    so_far = so_far.max(*ticks);
+                    most[index] = so_far;
+                }
+                (*lead, most)
+            })
+            .collect();
+        Fences { by_lead, most_after, found: HashMap::new() }
     }
 
     /// The first line after `after` that starts with `lead` and at least `ticks` backticks.
@@ -154,6 +174,9 @@ impl<'l> Fences<'l> {
         }
         let lines = self.by_lead.get(lead)?;
         let start = lines.partition_point(|(index, _)| *index <= after);
+        if self.most_after.get(lead).and_then(|most| most.get(start)).is_none_or(|most| *most < ticks) {
+            return None;
+        }
         let found = lines[start..].iter().find(|(_, run)| *run >= ticks).map(|(index, _)| *index);
         self.found.insert((lead, ticks), (after, found));
         found
@@ -219,11 +242,12 @@ fn parse_slide(raw: String) -> SlidevSlide {
         note = Some(js_trim(&inner).to_string());
         content = js_trim(&content[..at]).to_string();
     }
+    let front_size = yaml.as_ref().map_or(0, String::len);
     let front = match yaml {
-        Some(yaml) => headmatter::read(&yaml),
-        None => Ok(Value::Map(Vec::new())),
+        Some(yaml) => headmatter::read(&yaml).map(Rc::new),
+        None => Ok(Rc::new(Value::Map(Vec::new()))),
     };
-    SlidevSlide { raw, front, content, note }
+    SlidevSlide { raw, front, front_size, content, note }
 }
 
 /// The YAML of the slide's front matter, as `/^---.*\r?\n([\s\S]*?)---/` or a `yaml` code
@@ -238,7 +262,7 @@ fn front_matter(raw: &str) -> (Option<String>, String) {
             return (Some(raw[body..body + close].to_string()), raw[body + close + 3..].to_string());
         }
     }
-    let lead = raw.len() - raw.trim_start().len();
+    let lead = raw.len() - js_trim_start(raw).len();
     let rest = &raw[lead..];
     for opening in ["```yaml", "```yml"] {
         if let Some(after) = rest.strip_prefix(opening)
@@ -266,14 +290,17 @@ fn last_comment(content: &str) -> Option<(usize, String)> {
     (end + 3 >= content.len()).then(|| (start, content[start + 4..end].to_string()))
 }
 
-/// The slides a `#range` names, as Slidev's `parseRangeString` reads it, of `total`.
-fn range_of(total: usize, range: Option<&str>) -> Vec<usize> {
+/// The slides a `#range` names, as Slidev's `parseRangeString` reads it, of `total`: as
+/// sorted runs `from..=to` that don't overlap, so that a range of many parts, or one that
+/// names a slide many times, costs no more than the slides it names. No more than
+/// [`MAX_RANGE_PARTS`] parts are read; the second value says whether there were more.
+fn range_of(total: usize, range: Option<&str>) -> (Vec<(usize, usize)>, bool) {
     let range = range.unwrap_or("");
     if range.is_empty() || range == "all" || range == "*" {
-        return (1..=total).collect();
+        return (if total == 0 { Vec::new() } else { vec![(1, total)] }, false);
     }
     if range == "none" {
-        return Vec::new();
+        return (Vec::new(), false);
     }
     let number = |text: &str| -> Option<usize> {
         let text = text.trim();
@@ -282,18 +309,35 @@ fn range_of(total: usize, range: Option<&str>) -> Vec<usize> {
         }
         text.parse::<f64>().ok().filter(|number| number.is_finite() && *number >= 0.0).map(|number| number.min((total + 1) as f64) as usize)
     };
-    let mut indexes = BTreeSet::new();
-    for part in range.split([',', ';']) {
-        match part.split_once('-') {
-            None => indexes.extend(number(part)),
+    let mut runs = Vec::new();
+    let mut parts = range.split([',', ';']);
+    for part in parts.by_ref().take(MAX_RANGE_PARTS) {
+        let (from, to) = match part.split_once('-') {
+            None => match number(part) {
+                Some(index) => (index, index),
+                None => continue,
+            },
             Some((from, to)) => {
                 let from = number(from).unwrap_or(0);
                 let to = if to.trim().is_empty() { total } else { number(to.split('-').next().unwrap_or("")).unwrap_or(0) };
-                indexes.extend(from..=to.min(total));
+                (from, to)
             }
+        };
+        let (from, to) = (from.max(1), to.min(total));
+        if from <= to {
+            runs.push((from, to));
         }
     }
-    indexes.into_iter().filter(|index| (1..=total).contains(index)).collect()
+    let more = parts.next().is_some();
+    runs.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
+    for (from, to) in runs {
+        match merged.last_mut() {
+            Some(last) if from <= last.1 + 1 => last.1 = last.1.max(to),
+            _ => merged.push((from, to)),
+        }
+    }
+    (merged, more)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -314,7 +358,7 @@ enum Unread {
 /// A slide the talk shows, as Slidev loads it.
 #[derive(Clone, Debug)]
 struct Loaded {
-    front: Vec<(String, Value)>,
+    front: Front,
     /// Why the slide's own front matter can't be read.
     front_error: Option<String>,
     content: String,
@@ -325,28 +369,31 @@ struct Loaded {
     unread: Option<(String, Unread, String)>,
 }
 
-/// `base`'s entries with `over`'s in their place, as JavaScript's `{ ...base, ...over }`.
-fn merged(base: &[(String, Value)], over: &[(String, Value)]) -> Vec<(String, Value)> {
-    let mut out: Vec<(String, Value)> = Vec::with_capacity(base.len() + over.len());
-    let mut places: HashMap<&str, usize> = HashMap::new();
-    for (key, value) in base.iter().chain(over) {
-        match places.get(key.as_str()) {
-            Some(&at) => out[at].1 = value.clone(),
-            None => {
-                places.insert(key, out.len());
-                out.push((key.clone(), value.clone()));
-            }
-        }
+/// A slide's front matter as Slidev merges it, `{ ...own, ...importer, ...its importer }`, kept
+/// as the blocks it's merged from, each shared, so that an import's front matter isn't copied
+/// into each slide it brings in. The slide's own block is first; later ones win.
+#[derive(Clone, Debug, Default)]
+struct Front {
+    layers: Vec<Rc<Value>>,
+}
+
+impl Front {
+    fn get(&self, key: &str) -> Option<&Value> {
+        // An importer's own `src` is the import itself, which Slidev takes out.
+        self.layers.iter().enumerate().rev().filter(|(index, _)| *index == 0 || key != "src").find_map(|(_, layer)| layer.get(key))
     }
-    out
+
+    fn text(&self, key: &str) -> Option<&str> {
+        self.get(key).and_then(Value::text)
+    }
 }
 
-fn get<'v>(front: &'v [(String, Value)], key: &str) -> Option<&'v Value> {
-    front.iter().rev().find(|(name, _)| name == key).map(|(_, value)| value)
+fn get<'v>(front: &'v Front, key: &str) -> Option<&'v Value> {
+    front.get(key)
 }
 
-fn get_text<'v>(front: &'v [(String, Value)], key: &str) -> Option<&'v str> {
-    get(front, key).and_then(Value::text)
+fn get_text<'v>(front: &'v Front, key: &str) -> Option<&'v str> {
+    front.text(key)
 }
 
 /// The folder of the file `path`, with its `/`, or nothing for the talk's own folder.
@@ -1242,17 +1289,20 @@ pub fn import(args: &ImportArgs, files: &Bundle) -> Result<(Bundle, Report), Str
     let source = text_of(data).ok_or_else(|| format!("The Slidev talk's {} isn't UTF-8 text.", shortened(&entry, 120)))?;
     run.used.insert(entry.clone());
 
-    let mut loader = Loader { run: &mut run, pages: BTreeMap::new(), slides: Vec::new(), full: false, calls: 0, bytes: 0, over_budget: false };
+    let mut loader = Loader { run: &mut run, pages: BTreeMap::new(), slides: Vec::new(), full: false, calls: 0, bytes: 0, over_budget: false, long_range: false };
     loader.pages.insert(entry.clone(), split(&source));
     loader.load(&entry, None, &[], &mut Vec::new());
-    let Loader { pages, slides, full, over_budget, .. } = loader;
+    let Loader { pages, slides, full, over_budget, long_range, .. } = loader;
+    if long_range {
+        run.notice(NoticeKind::LeftOut, format!("A src: range has more than {MAX_RANGE_PARTS} parts, so only its first {MAX_RANGE_PARTS} were read."));
+    }
     if full {
         run.notice(NoticeKind::LeftOut, format!("The talk imports more than {MAX_SLIDES} slides, so the rest were left out."));
     }
     if over_budget {
         run.notice(NoticeKind::LeftOut, format!("The talk's imports go past the most that's followed ({MAX_IMPORTS} imports, {} MiB), so those past it are labelled boxes.", MAX_IMPORTED_BYTES / (1024 * 1024)));
     }
-    let headmatter: Vec<(String, Value)> = pages.get(&entry).and_then(|page| page.first()).and_then(|slide| slide.front.as_ref().ok()).map(|front| front.entries().to_vec()).unwrap_or_default();
+    let headmatter = Front { layers: pages.get(&entry).and_then(|page| page.first()).and_then(|slide| slide.front.as_ref().ok()).cloned().into_iter().collect() };
     let markdown = write_talk(&mut run, &slides, &headmatter);
 
     let mut bundle: Bundle = vec![(SLIDES.to_string(), markdown.into_bytes())];
@@ -1315,41 +1365,51 @@ struct Loader<'r, 'a> {
     calls: usize,
     bytes: usize,
     over_budget: bool,
+    /// Whether a range had more parts than are read.
+    long_range: bool,
 }
 
 impl Loader<'_, '_> {
-    fn load(&mut self, path: &str, range: Option<&str>, over: &[(String, Value)], chain: &mut Vec<String>) {
+    fn load(&mut self, path: &str, range: Option<&str>, over: &[Rc<Value>], chain: &mut Vec<String>) {
         let total = self.pages.get(path).map_or(0, Vec::len);
         let imported = !chain.is_empty();
-        for index in range_of(total, range) {
+        let (runs, more) = range_of(total, range);
+        if more {
+            self.long_range = true;
+        }
+        for index in runs.into_iter().flat_map(|(from, to)| from..=to) {
             if self.slides.len() >= MAX_SLIDES {
                 self.full = true;
                 return;
             }
             let Some(slide) = self.pages.get(path).and_then(|page| page.get(index - 1)) else { continue };
             let (own, front_error) = match &slide.front {
-                Ok(front) => (front.entries().to_vec(), None),
-                Err(error) => (Vec::new(), Some(error.clone())),
+                Ok(front) => (Rc::clone(front), None),
+                Err(error) => (Rc::new(Value::Map(Vec::new())), Some(error.clone())),
             };
-            let Some(src) = get_text(&own, "src").filter(|src| !src.trim().is_empty()).map(str::to_string) else {
-                let size = slide.content.len() + slide.note.as_ref().map_or(0, String::len);
+            let front = Front { layers: std::iter::once(Rc::clone(&own)).chain(over.iter().cloned()).collect() };
+            let Some(src) = own.get("src").and_then(Value::text).filter(|src| !src.trim().is_empty()).map(str::to_string) else {
+                let size = slide.content.len() + slide.note.as_ref().map_or(0, String::len) + slide.front_size;
                 if imported && self.bytes + size > MAX_IMPORTED_BYTES {
                     let raw = capped(&slide.raw);
                     self.over_budget = true;
-                    self.slides.push(Loaded { front: merged(&own, over), front_error, content: String::new(), note: None, file: path.to_string(), unread: Some((path.to_string(), Unread::TooMuch, raw)) });
+                    self.slides.push(Loaded { front, front_error, content: String::new(), note: None, file: path.to_string(), unread: Some((path.to_string(), Unread::TooMuch, raw)) });
                     continue;
                 }
                 if imported {
                     self.bytes += size;
                 }
                 let (content, note) = (slide.content.clone(), slide.note.clone());
-                self.slides.push(Loaded { front: merged(&own, over), front_error, content, note, file: path.to_string(), unread: None });
+                self.slides.push(Loaded { front, front_error, content, note, file: path.to_string(), unread: None });
                 continue;
             };
             // What a labelled box would hold, kept short: the import itself is at its start.
             let raw = capped(&slide.raw);
-            let without_src: Vec<(String, Value)> = own.iter().filter(|(key, _)| key != "src").cloned().collect();
-            let over = merged(&without_src, over);
+            if imported {
+                self.bytes += slide.front_size;
+            }
+            // What the imported slides are given: this slide's block, under its importers'.
+            let over: Vec<Rc<Value>> = std::iter::once(own).chain(over.iter().cloned()).collect();
             let mut parts = src.split('#');
             let raw_path = parts.next().unwrap_or("").trim();
             let part_range = parts.next();
@@ -1368,7 +1428,7 @@ impl Loader<'_, '_> {
                                 self.pages.insert(target.clone(), split(&text));
                             }
                             None => {
-                                self.slides.push(Loaded { front: over, front_error, content: String::new(), note: None, file: path.to_string(), unread: Some((src, Unread::NotText, raw)) });
+                                self.slides.push(Loaded { front, front_error, content: String::new(), note: None, file: path.to_string(), unread: Some((src, Unread::NotText, raw)) });
                                 continue;
                             }
                         }
@@ -1387,7 +1447,7 @@ impl Loader<'_, '_> {
                 (why, _) => {
                     let why = why.unwrap_or(Unread::Missing);
                     self.over_budget |= why == Unread::TooMuch;
-                    self.slides.push(Loaded { front: over, front_error, content: String::new(), note: None, file: path.to_string(), unread: Some((src, why, raw)) });
+                    self.slides.push(Loaded { front, front_error, content: String::new(), note: None, file: path.to_string(), unread: Some((src, why, raw)) });
                 }
             }
         }
@@ -1457,7 +1517,7 @@ struct OurSlide {
     notes: Option<String>,
 }
 
-fn write_talk(run: &mut Run, slides: &[Loaded], headmatter: &[(String, Value)]) -> String {
+fn write_talk(run: &mut Run, slides: &[Loaded], headmatter: &Front) -> String {
     // The headmatter: what the talk is, and how it looks.
     run.slide = 1;
     if let Some(theme) = get_text(headmatter, "theme").filter(|theme| !matches!(theme.trim(), "" | "default" | "none")) {
@@ -2975,11 +3035,15 @@ mod tests {
 
     #[test]
     fn ranges_are_read_as_slidevs() {
-        assert_eq!(range_of(5, None), vec![1, 2, 3, 4, 5]);
-        assert_eq!(range_of(5, Some("2,4-")), vec![2, 4, 5]);
-        assert_eq!(range_of(5, Some("0-2;9")), vec![1, 2]);
-        assert_eq!(range_of(3, Some("1-99999999999")), vec![1, 2, 3]);
-        assert_eq!(range_of(3, Some("none")), Vec::<usize>::new());
+        assert_eq!(range_of(5, None), (vec![(1, 5)], false));
+        assert_eq!(range_of(5, Some("2,4-")), (vec![(2, 2), (4, 5)], false));
+        assert_eq!(range_of(5, Some("0-2;9")), (vec![(1, 2)], false));
+        assert_eq!(range_of(5, Some("3,1-2,2-3,5")), (vec![(1, 3), (5, 5)], false));
+        assert_eq!(range_of(3, Some("1-99999999999")), (vec![(1, 3)], false));
+        assert_eq!(range_of(3, Some("none")), (Vec::new(), false));
+        assert_eq!(range_of(3, Some("x,1-2-3")), (vec![(1, 2)], false));
+        let many = vec!["1-9999999"; MAX_RANGE_PARTS + 1].join(",");
+        assert_eq!(range_of(3, Some(&many)), (vec![(1, 3)], true));
     }
 
     #[test]

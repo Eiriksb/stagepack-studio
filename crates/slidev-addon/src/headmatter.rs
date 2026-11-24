@@ -8,6 +8,10 @@ use yaml_rust2::scanner::TScalarStyle;
 const MAX_LEN: usize = 64 * 1024;
 /// How many lists and maps deep a block can go and still be read.
 const MAX_DEPTH: usize = 32;
+/// The most settings a block can name, at any depth, and the most values it can hold. Slidev's
+/// own settings are a few dozen; a block of thousands is never one a talk needs.
+pub const MAX_KEYS: usize = 256;
+const MAX_VALUES: usize = 1024;
 
 /// A value as the YAML has it.
 #[derive(Clone, Debug, PartialEq)]
@@ -84,6 +88,7 @@ pub fn read(text: &str) -> Result<Value, String> {
     let mut open: Vec<Open> = Vec::new();
     let mut documents = 0;
     let mut root = None;
+    let (mut keys, mut values) = (0, 0);
     loop {
         let (event, _) = parser.next_token().map_err(|error| error.info().to_string())?;
         let value = match event {
@@ -116,17 +121,25 @@ pub fn read(text: &str) -> Result<Value, String> {
                 if plain && matches!(text.as_str(), "" | "~" | "null" | "Null" | "NULL") { Value::Null } else { Value::Scalar { text, plain } }
             }
         };
+        values += 1;
+        if values > MAX_VALUES {
+            return Err(format!("it holds more than {MAX_VALUES} values"));
+        }
         match open.last_mut() {
             None => root = Some(value),
             Some(Open::List(items)) => items.push(value),
             Some(Open::Map(entries, key)) => match key.take() {
                 Some(key) => entries.push((key, value)),
                 // A key that isn't a scalar names nothing Slidev reads.
-                None => *key = Some(match value {
-                    Value::Scalar { text, .. } => text,
-                    Value::Null => String::new(),
-                    _ => "\u{0}".to_string(),
-                }),
+                None if keys >= MAX_KEYS => return Err(format!("it names more than {MAX_KEYS} settings")),
+                None => {
+                    keys += 1;
+                    *key = Some(match value {
+                        Value::Scalar { text, .. } => text,
+                        Value::Null => String::new(),
+                        _ => "\u{0}".to_string(),
+                    });
+                }
             },
         }
     }
@@ -161,6 +174,10 @@ mod tests {
         assert!(read(&format!("a: {}", "[".repeat(100))).is_err());
         assert!(read("a: 1\n...\n---\nb: 2\n").is_err());
         assert!(read(&"x".repeat(MAX_LEN + 1)).is_err());
+        let many: String = (0..=MAX_KEYS).map(|key| format!("k{key}: 1\n")).collect();
+        assert_eq!(read(&many), Err(format!("it names more than {MAX_KEYS} settings")));
+        assert!(read(&(0..MAX_KEYS).map(|key| format!("k{key}: 1\n")).collect::<String>()).is_ok());
+        assert!(read(&format!("a: [{}]", vec!["1"; 2000].join(", "))).is_err());
     }
 
     #[test]

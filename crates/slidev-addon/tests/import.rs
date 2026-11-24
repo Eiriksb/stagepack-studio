@@ -629,3 +629,72 @@ fn small_things_slidev_reads_its_own_way() {
     assert!(!report.notices.iter().any(|notice| notice.text.contains("layout")), "{report:?}");
     assert!(report.notices.iter().any(|notice| notice.text.contains("are outside the talk")), "{report:?}");
 }
+
+/// A generous bound on time for something linear: a debug build is several times slower.
+fn generous(release_secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(if cfg!(debug_assertions) { release_secs * 8 } else { release_secs })
+}
+
+#[test]
+fn a_range_of_many_parts_costs_only_the_slides_it_names() {
+    // A million slides, and a range that names them all six thousand times over.
+    let big = "a\n---\n".repeat(1_000_000);
+    let range = vec!["1-9999999"; 6000].join(",");
+    let source = format!("# Start\n\n---\nsrc: ./big.md#{range}\n---\n\n---\nsrc: ./big.md\n---\n\n---\nsrc: ./big.md\n---\n");
+    let started = std::time::Instant::now();
+    let (bundle, report) = import_with(&source, vec![file("big.md", big.as_bytes())]);
+    let took = started.elapsed();
+    assert!(took < generous(5), "{took:?}");
+    let markdown = slides_md(&bundle);
+    let talk = assert_parses(&markdown);
+    assert_eq!(talk.slides.len(), 5000);
+    assert!(markdown.len() < 2 * 1024 * 1024, "{}", markdown.len());
+    let texts: Vec<&str> = report.notices.iter().filter(|notice| notice.slide.is_none()).map(|notice| notice.text.as_str()).collect();
+    assert!(texts.contains(&"A src: range has more than 256 parts, so only its first 256 were read."), "{texts:?}");
+    assert!(texts.contains(&"The talk imports more than 5000 slides, so the rest were left out."), "{texts:?}");
+}
+
+#[test]
+fn front_matter_is_shared_and_capped() {
+    // An importer's front matter of thousands of keys is refused, with a notice.
+    let keys: String = (0..7000).map(|key| format!("k{key}: 1\n")).collect();
+    let page = "# P\n\n---\n\n".repeat(5000);
+    let source = format!("# Start\n\n---\n{keys}src: ./page.md\n---\n");
+    let started = std::time::Instant::now();
+    let (bundle, report) = import_with(&source, vec![file("page.md", page.as_bytes())]);
+    assert!(started.elapsed() < generous(5), "{:?}", started.elapsed());
+    assert_parses(&slides_md(&bundle));
+    assert!(report.notices.iter().any(|notice| notice.slide == Some(2) && notice.text.contains("it names more than 256 settings")), "{report:?}");
+
+    // Just under the cap, its block is given to each of the 5000 slides it brings in, as one.
+    let keys: String = (0..250).map(|key| format!("k{key}: {}\n", "v".repeat(200))).collect();
+    let source = format!("# Start\n\n---\n{keys}layout: section\nsrc: ./page.md\n---\n");
+    let started = std::time::Instant::now();
+    let (bundle, _) = import_with(&source, vec![file("page.md", page.as_bytes())]);
+    assert!(started.elapsed() < generous(5), "{:?}", started.elapsed());
+    let markdown = slides_md(&bundle);
+    let talk = assert_parses(&markdown);
+    assert_eq!(talk.slides.len(), 5000);
+    assert!(talk.slides[1..].iter().all(|slide| slide.settings.as_ref().and_then(|settings| settings.get("layout")) == Some("section")));
+    assert!(markdown.len() < 4 * 1024 * 1024, "{}", markdown.len());
+}
+
+#[test]
+fn fences_that_cant_close_are_known_at_once() {
+    // Fences of 3000 backticks down to three, none of which a later line can close, and a
+    // million lines of one backtick after them.
+    let fences: String = (3..3000).rev().map(|ticks| format!("{}\n", "`".repeat(ticks))).collect();
+    let source = format!("{fences}{}", "`\n".repeat(1_000_000));
+    let started = std::time::Instant::now();
+    let (bundle, _) = import_with(&source, Vec::new());
+    assert!(started.elapsed() < generous(3), "{:?}", started.elapsed());
+    assert_parses(&slides_md(&bundle));
+}
+
+#[test]
+fn a_yaml_block_after_javascripts_white_space_is_front_matter() {
+    let source = "# One\n\n---\n\n\u{feff}```yaml\nlayout: section\n```\n\n# Two\n";
+    let (bundle, _) = import_with(source, Vec::new());
+    let talk = assert_parses(&slides_md(&bundle));
+    assert_eq!(talk.slides[1].settings.as_ref().and_then(|settings| settings.get("layout")), Some("section"));
+}
