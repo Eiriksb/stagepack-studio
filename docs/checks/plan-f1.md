@@ -16,7 +16,7 @@ A sandboxed wasm translator for Slidev export and import, installed from a signe
 
 ## The add-on file and the owner's key
 
-- File: `target/package/slidev-0.1.0.spaddon` (under the ignored `target/`, not committed).
+- File: `target/package/slidev-0.1.0.spaddon` (under the ignored `target/`, not committed). It was built before the final fix wave, which changed the add-on's code (it now finds `./photo.png`, and shows a region a piece at a time as the engine does) but not the package's format, so the file was left as it was. **Build it again with `package addon --key ~/stagepack-studio-signing/addon-signing.key` before the hand checks**, and check its new sha256.
 - Size: 393323 bytes.
 - sha256: `1a45ed851cab1c78daf669cacdf1dc0455f043424111cf7ff49c07a0ca0de194`.
 - **The owner's key is `~/stagepack-studio-signing/addon-signing.key`** (mode 600, in a folder of mode 700, outside the repository). **Back it up now, somewhere safe, and never share it.** Anyone with it can sign an add-on that every installed app will trust. If it is lost, the key built into the app (`crates/app/src/addons/key.rs`) can only be changed by updating every installed app, and add-ons signed with a new key are refused until then. The key file was never read or printed while this was built.
@@ -35,8 +35,12 @@ All through `scripts/cargo-safe.sh`. Counts are from each report's own command o
 | `test -p addon-abi --test package`, `test -p xtask --test addon -- --include-ignored`, `test -p stagepack-studio --test addon_key` | 9 passed; 4 of 4 passed; 1 passed |
 | `test -p stagepack-studio` (after task 5's fix round) | 1491 passed, 0 failed, 41 ignored |
 | `--test slidev_round -- --ignored` | 2 passed, 12.2 s (the round trip, and a bundle 8 MiB under the budget) |
+| After the final fix wave: `test --no-fail-fast -p addon-abi -p slidev-addon -p slides-components -p xtask` | 238 passed, 1 failed, 12 ignored. The one failure is the import timing test `unclosed_constructs_take_time_in_line_with_their_length` (4 MB of `<a b="` took 8.7 times 1 MB, past its bound of 8), under load. Alone, and with its whole test binary run twice, it passed |
+| After the final fix wave: `test -p stagepack-studio --test addons --test ui_addons` | 25 and 7 passed |
+| After the final fix wave: `test -p slidev-addon --release --test wasm -- --ignored`; `--test slidev_round -- --ignored` | 3 passed; 3 passed (with a talk naming `./photo.png`) |
+| After the final fix wave: `test --no-fail-fast -p stagepack-studio` | 1504 passed, 0 failed, 42 ignored. A first run, which stops at a failure, had two `ai_tool` tests fail under load (a model picture's process ended with signal 11); both passed alone |
 
-- `clippy --workspace --all-targets -- -D warnings`: clean after task 5's fix round. `clippy -p slidev-addon --release --target wasm32-unknown-unknown -D warnings`: clean.
+- `clippy --workspace --all-targets -- -D warnings`: clean after task 5's fix round, and again after the final fix wave, with the wasm32 clippy of the add-on. `clippy -p slidev-addon --release --target wasm32-unknown-unknown -D warnings`: clean.
 - Every task but task 4 went through at least one fix round and a re-review that approved it. Task 4's fix (one finding, the duplicate-name check) was read in full by the controller and not re-reviewed separately.
 
 ## What ran
@@ -47,11 +51,12 @@ All through `scripts/cargo-safe.sh`. Counts are from each report's own command o
 - `70c3efa`, `c9c4b88`: task 4
 - `9b5f521`, `55c69f0`: task 5
 - `ae2ced8`: the dev profile keeps line tables only, so test programs stay small (the owner's request).
+- `b0d4740`, `cc81264`, `ab43934`, `3309f61`: the final fix wave (I1–I5, M1–M9, the parked task 2 and task 5 minors, the zip64 check).
 
 ## Security findings
 
 - **Fixed:** notes escaping (task 2, `196daa8`). `escape::notes` first replaced only `-->`; `--!>` also ends a comment, and Slidev shows notes with `v-html`. Notes now escape `&`, `<`, `>` and `[` (the last because Slidev turns `[click]` in notes into click marks). Pinned by a unit test and an export test.
-- **Still to fix (the final fix wave): the zip64 locator.** `package.rs` reads only the classic end-record counts, so a zip64 locator can make the reader see a much larger central directory than the 3-entry check allows. The fix: refuse any archive with a zip64 locator (`0x07064b50` in the 20 bytes before the end record), cap the central-directory size before `ZipArchive::new`, and test both. The file is signed by the owner and a package that fails the size check never gets that far, but the check isn't yet as strict as it should be.
+- **Fixed in the final fix wave: the zip64 locator.** `read_package` looks at every end record a zip reader might take, before the zip is read. It refuses one with a zip64 locator (`0x07064b50`) in the 20 bytes before it, and one whose central directory says it takes more than 8 × (46 + 64 + 64 KiB) bytes. Both are tested. The import of a Slidev talk does the same with its own bounds (200 000 entries, a 64 MiB directory), reading the zip64 record where there is one, since a talk with large videos can be zip64.
 
 ## Not done, and for the owner
 
@@ -60,22 +65,24 @@ Known limits:
 - **The export has never been seen in a running Slidev or a running Stagepack.** Task 2 was checked against Slidev 53's source by a reviewer, and the tests read the text, but no one has run `slidev` on the output. The hand checks below are the first time.
 - **Windows hasn't been run.** The 128 MiB thread stack is reserved, not used, and should commit only as touched; that needs checking on your PC.
 - **The round trip loses things.** On import: the export's shapes come back as placeholders in positioned boxes; the stepped pictures the app drew come back as placeholders; a region the export moved comes back as a positioned box, not a `region.*` line. Every picture of a part the app drew gets a *Frozen* notice. `vendor/` is left out with a notice, and so are files the add-on doesn't use (such as `components/*.vue`). A relative v-click range stays open with a notice.
-- **Parked as minor:** `Remove` is undone by a leftover `.slidev-old-*` folder; `Remove` waits for the lock on the window thread; a `BufWriter` for the writes; status and load read through a symlinked `addons` folder; a lone table as one click, and lists among other blocks, rotated each-regions and a U+FEFF before a fence (task 2); the funcref test and a setup panic (task 1).
+- **A panic in the parser stops the whole export or import.** Natively, `slides_format` catches a panic on one slide and keeps the rest. In the add-on, on wasm32, a panic aborts, so the whole export or import fails with "The add-on stopped working." How often the `markdown` crate panics hasn't been measured.
+- **Parked as minor, and still open:** the funcref test and a setup panic (task 1). The task 2 and task 5 minors were fixed in the final fix wave.
 
 ## Hand checks for the owner
 
 Do each on **Linux and Windows**. Use a scratch copy of anything you care about.
 
 1. **Install the add-on from the file.** *File ▸ Add-ons…*, choose `slidev-0.1.0.spaddon`. It should show Slidev 0.1.0 as installed. Check the size and sha256 first against the figures above.
-2. **Export the showcase talk.** Open it, then *Export ▸ Slidev…*. Read the report. Open the exported folder in Stagepack. Check:
+2. **Export the showcase talk.** Open it, then *Export ▸ Slidev…*. A report lists what couldn't be carried over as it was, by slide, and the status line says how many notes there are. The export is one `.sptx` file; open it in Stagepack. Check:
    - no code question is asked;
    - it presents;
    - the clicks, transitions and fonts look right.
    If you have Slidev 53.0.0, also run it on the export.
-3. **Import one of your own Stagepack talks** through the add-on (a Slidev folder or zip), and read the report: every loss should have a notice, and nothing should be lost without one.
-4. **Open a Stagepack talk without the add-on** (remove it first if installed) and look for the Add-ons offer.
-5. **Remove the add-on** from the Add-ons dialog, and check that the app's other files are untouched.
-6. On Windows only: watch that the first export doesn't stall or run out of memory.
+3. **Import one of your own Stagepack talks** through the add-on: a packed `.sptx` that holds `stagepack.json` (a folder isn't imported). Read the report: every loss should have a notice, and nothing should be lost without one.
+4. **Export the same talk again, to the same file,** and open it in Stagepack again. It should be the same talk to Stagepack: the export keeps the first one's `id` and `created`, so what Stagepack kept of it the first time, such as its notes, is still there.
+5. **Open a Stagepack talk without the add-on** (remove it first if installed) and look for the Add-ons offer.
+6. **Remove the add-on** from the Add-ons dialog, and check that the app's other files are untouched.
+7. On Windows only: watch that the first export doesn't stall or run out of memory.
 
 ## The final review
 
