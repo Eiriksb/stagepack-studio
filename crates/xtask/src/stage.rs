@@ -89,7 +89,7 @@ pub fn stage(out: &Path, bundle: Option<&Path>) -> Result<u64, String> {
     // out of them, so that nothing of the builder's home ends up in a shipped program.
     // On Linux cargo runs in a memory-limited scope; Windows has no such wrapper, so the cargo that ran `package` builds.
     let cargo = if cfg!(windows) { std::env::var_os("CARGO").map_or_else(|| PathBuf::from("cargo"), PathBuf::from) } else { repo.join("scripts/cargo-safe.sh") };
-    let target = repo.join("target/package-build");
+    let target = package_target(&repo, std::env::var_os("STUDIO_PACKAGE_TARGET").as_deref())?;
     let flags = release_flags(&repo, cfg!(all(windows, target_env = "msvc")));
     let build = |package: &str, features: &[&str]| {
         let mut command = Command::new(&cargo);
@@ -138,6 +138,19 @@ pub fn stage(out: &Path, bundle: Option<&Path>) -> Result<u64, String> {
         return Err(over_budget(bytes));
     }
     Ok(bytes)
+}
+
+/// The target folder the shipped builds are made in: `target/package-build`, or the folder that
+/// `STUDIO_PACKAGE_TARGET` names (relative to the repository), which must lie inside `target/`. The
+/// Linux package's container build keeps its own, so the host's builds are never mixed in.
+pub fn package_target(repo: &Path, chosen: Option<&std::ffi::OsStr>) -> Result<PathBuf, String> {
+    let Some(chosen) = chosen else { return Ok(repo.join("target/package-build")) };
+    let path = repo.join(chosen);
+    let inside = path.strip_prefix(repo.join("target")).is_ok_and(|rest| {
+        let parts: Vec<_> = rest.components().collect();
+        !parts.is_empty() && parts.iter().all(|c| matches!(c, std::path::Component::Normal(_)))
+    });
+    if inside { Ok(path) } else { Err(format!("STUDIO_PACKAGE_TARGET is {}, which isn't a folder inside target/", Path::new(chosen).display())) }
 }
 
 /// Whether `out` may be cleared for a staging: it is missing or empty, or it is an app folder staged

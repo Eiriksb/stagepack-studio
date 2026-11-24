@@ -1,5 +1,6 @@
 //! The packaging tool's parts: the icon and the licence notices.
 
+pub mod elf;
 pub mod icon;
 pub mod linux;
 pub mod notices;

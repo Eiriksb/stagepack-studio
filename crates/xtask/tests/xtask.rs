@@ -109,3 +109,28 @@ fn a_package_with_no_files_gets_the_standard_texts() {
 fn the_toolchain_copyright_file_is_found() {
     assert!(notices::toolchain_copyright().unwrap().is_file());
 }
+
+#[test]
+fn glibc_check_names_each_program_and_the_highest_need() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+    std::fs::copy("/bin/true", dir.path().join("bin/true")).unwrap();
+    std::fs::write(dir.path().join("README"), "text").unwrap();
+    let need = xtask::elf::max_glibc(&dir.path().join("bin/true")).unwrap().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_package")).arg("glibc-check").arg(dir.path()).output().unwrap();
+    let said = String::from_utf8_lossy(&output.stdout);
+    let text = xtask::elf::version_text(need);
+    assert!(said.lines().any(|l| l == format!("{text} bin/true")), "{said}");
+    assert!(said.contains(&format!("highest: {text}")), "{said}");
+    assert!(!said.contains("README"), "{said}");
+    let expected = if need > xtask::elf::GLIBC_CEILING { 1 } else { 0 };
+    assert_eq!(output.status.code(), Some(expected), "{said}{}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn glibc_check_of_a_folder_without_programs_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_package")).arg("glibc-check").arg(dir.path()).output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no ELF files"));
+}
