@@ -13,12 +13,12 @@ The run was on the `plan-e2` branch (from `plan-e`'s merge), on a 16-core Linux 
 ## What was built
 
 - **The Linux release is built on Ubuntu 22.04** (`fa68844`).
-  - `packaging/linux/build.Dockerfile` makes the image `stagepack-studio-build:22.04`. `scripts/package-linux.sh [--bundle-fresh]` runs it with `--rm`, as the host user, with the repo mounted at `/studio` and a cargo volume `stagepack-studio-cargo`. Inside, it builds the compiler bundle (`target/bundle-22.04`), stages the app (`target/package-stage-22.04`) and packs the tarball. On the host it then runs `package glibc-check`.
+  - `packaging/linux/build.Dockerfile` makes the image `stagepack-studio-build:22.04`. `scripts/package-linux.sh [--bundle-fresh]` runs it with `--rm` and `--init`, as the host user (as root inside under rootless Docker, which is the host user there), with the repo mounted read-only at `/studio`, `target/` read-write and a cargo volume `stagepack-studio-cargo`. It refuses to run as root, and Ctrl-C stops its container. Inside, it builds the compiler bundle (`target/bundle-22.04`), stages the app (`target/package-stage-22.04`) and packs the tarball. It says when it reuses the bundle. On the host it then runs `package glibc-check`; on a failure it deletes the tarball, and on a pass it writes the marker `target/package/.built-in-ubuntu-22.04` with the commit (and `dirty` if the tree had changes). `package linux` removes that marker whenever it packs.
   - `crates/xtask/src/elf.rs` and `package glibc-check DIR`: reads each ELF file's `objdump -T` output, counts only `GLIBC_<digits>`, prints the highest need per file and `highest: x.y`, and exits 1 if any file is above 2.35 or the folder holds no ELF files.
   - `STUDIO_PACKAGE_TARGET` (stage) and `STUDIO_BUNDLE_BUILD` (`make-bundle.sh`) pick the build folders, which must be real subfolders of `target/`, so the container never reuses the host's builds.
   - The ignored test `old_systems` installs the tarball in `ubuntu:22.04` and `debian:12` containers (as a made user, since `install.sh` refuses root), runs `help` and `check` on a talk with components, builds the component, starts the helper to the point the loader accepts it, and uninstalls.
   - `install.sh`'s refusal now says glibc 2.35 or later; the README's *Install* and *Build the packages* sections say the same and list the runtime libraries.
-  - `test-all.sh`'s packaging step runs `old_systems` when docker is found and says so when it skips it.
+  - `test-all.sh`'s packaging step runs `old_systems` only when `docker info` succeeds and the marker is there, and otherwise says it skipped the test and why. The test fails without the marker and warns when the marker's commit isn't `HEAD`. The old-systems containers also install `libvulkan1`; opening the window there stays a hand check.
 - **The Windows installer adds the app to `Path` and gives the earlier default back** (`464b9fc`, wording fixed in `2161a37`).
   - `packaging/windows/stagepack-studio.iss` has `ChangesEnvironment=yes` and a `[Code]` section.
   - `Path`: `{app}` is added once to the user `Path` (compared without case and without one trailing `\`), written back as `REG_EXPAND_SZ`. A user with no `Path` gets just the folder, with no leading `;`. Uninstalling takes off only that entry; if nothing else is left, the value goes.
@@ -73,14 +73,14 @@ Known limits:
 Other points, from the reports and reviews:
 
 - `stagepack-studio` needs exactly glibc 2.35, so the build depends on the base image staying 22.04. RHEL 9 (2.34) is still out.
-- The bundle in `target/bundle-22.04` is reused unless `--bundle-fresh` is given; a changed toolkit needs that flag. The host's `package linux` writes the same tarball name as the container build and would overwrite it.
-- Parked for the final fix wave: a cancelled Windows install leaves `HKCU\Software\Stagepack Studio` behind (harmless; the value is right for a later install); `--locked` or a read-only repo mount for the container; saying when the bundle is reused; deleting the tarball if `glibc-check` fails; `libvulkan1` in the old-systems apt line. Parked as harmless: the fixed container name, and a spaced path not run.
+- The bundle in `target/bundle-22.04` is reused unless `--bundle-fresh` is given (the script says so); a changed toolkit needs that flag. The host's `package linux` writes the same tarball name as the container build and would overwrite it, but it removes the marker, so `test-all.sh` then skips the old-systems test and says why.
+- Fixed in the final fix wave: a cancelled Windows install no longer leaves `HKCU\Software\Stagepack Studio` behind; the container mounts the repo read-only; the script says when the bundle is reused, deletes the tarball if `glibc-check` fails, works under rootless Docker, refuses root and stops its container on Ctrl-C; `libvulkan1` is in the old-systems apt line. Parked as harmless: the fixed container name (two runs at once collide with a docker name error), and a spaced path not run.
 - An earlier default that is only in `HKLM` isn't saved, but shows through again once ours is removed.
 - `shellcheck` isn't installed; `bash -n` on the script is fine.
 
 ## Hand checks for the owner
 
-All on Windows, and all new in this plan. They are numbered as in `plan-e.md`; the steps are written there. Run its check 0 and check 1 first (the scripts and the build), since the installer can't be tried until the setup builds.
+All on Windows, and all new or changed in this plan (3 is unchanged from plan E but is needed for 13; 9 and 10 now use the bare name). They are numbered as in `plan-e.md`; the steps are written there. Run its check 0 and check 1 first (the scripts and the build), since the installer can't be tried until the setup builds.
 
 - **4.** Before installing, keep the output of `reg query HKCU\Environment /v Path`.
 - **5.** After installing, a new terminal runs `stagepack-studio help`, and `Path` shows the app's folder once, at the end, as `REG_EXPAND_SZ`, with the other entries as before. Also try a scratch user with no `Path` value: afterwards `Path` is just the folder, with no leading `;`.
