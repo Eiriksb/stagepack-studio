@@ -1,7 +1,9 @@
 use crate::color::{Color, Theme};
 use crate::element::Element;
-use crate::interface::{ComponentSchema, CtxData, PropKind, RenderOutput};
-use std::cell::Cell;
+use crate::interface::{ComponentSchema, CtxData, Event, PropKind, RenderOutput};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 
 /// A tag's attributes, as written.
@@ -15,11 +17,48 @@ pub struct Ctx<'a> {
     steps: Cell<u32>,
     stepped: Cell<bool>,
     animated: Cell<bool>,
+    state: Option<serde_json::Value>,
+    events: Vec<Event>,
+    /// The state set by this render, which it keeps for the next.
+    new_state: RefCell<Option<serde_json::Value>>,
 }
 
 impl<'a> Ctx<'a> {
     pub fn new(data: CtxData, assets: &'a dyn Fn(&str) -> Option<Vec<u8>>) -> Ctx<'a> {
-        Ctx { data, assets, steps: Cell::new(0), stepped: Cell::new(false), animated: Cell::new(false) }
+        Ctx::with_input(data, None, Vec::new(), assets)
+    }
+
+    /// For an interactive component, which kept `state` and has had `events` since.
+    pub fn with_input(data: CtxData, state: Option<serde_json::Value>, events: Vec<Event>, assets: &'a dyn Fn(&str) -> Option<Vec<u8>>) -> Ctx<'a> {
+        Ctx {
+            data,
+            assets,
+            steps: Cell::new(0),
+            stepped: Cell::new(false),
+            animated: Cell::new(false),
+            state,
+            events,
+            new_state: RefCell::new(None),
+        }
+    }
+
+    /// What reached an interactive component since its last render, first to last.
+    pub fn events(&self) -> &[Event] {
+        &self.events
+    }
+
+    /// What an interactive component kept: what this render set, or else what the last one did.
+    /// The default when there's none, or it can't be read as a `T`.
+    pub fn state<T: DeserializeOwned + Default>(&self) -> T {
+        let set = self.new_state.borrow();
+        set.as_ref().or(self.state.as_ref()).and_then(|state| T::deserialize(state).ok()).unwrap_or_default()
+    }
+
+    /// Keeps `state` for the next render, while the slide is shown. At most 64 KiB of it, as JSON.
+    pub fn set_state<T: Serialize>(&self, state: &T) {
+        if let Ok(state) = serde_json::to_value(state) {
+            *self.new_state.borrow_mut() = Some(state);
+        }
     }
 
     /// How many clicks the slide has had. To add clicks to it, use `steps`.
@@ -75,7 +114,7 @@ impl<'a> Ctx<'a> {
 
     /// `element`, with what the component read to make it.
     pub fn finish(self, element: Element) -> RenderOutput {
-        RenderOutput::new(element, self.steps.get(), self.stepped.get(), self.animated.get())
+        RenderOutput::new(element, self.steps.get(), self.stepped.get(), self.animated.get()).with_state(self.new_state.into_inner())
     }
 }
 

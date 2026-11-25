@@ -46,6 +46,8 @@ pub enum Element {
     Canvas { width: f32, height: f32, items: Vec<Placed> },
     /// What can't be shown, and why: a labelled box on the slide.
     Problem { message: String },
+    /// `child`, which an interactive component is told is under the pointer by `name`.
+    Hit { name: String, child: Box<Element> },
     /// Where the content between a component's tags goes.
     Children,
     Empty,
@@ -129,6 +131,11 @@ pub fn at(x: f32, y: f32, element: Element) -> Placed {
 
 pub fn problem(message: impl Into<String>) -> Element {
     Element::Problem { message: message.into() }
+}
+
+/// `child`, named `name` in the events of the pointer over it.
+pub fn hit(name: impl Into<String>, child: Element) -> Element {
+    Element::Hit { name: name.into(), child: Box::new(child) }
 }
 
 #[doc(hidden)]

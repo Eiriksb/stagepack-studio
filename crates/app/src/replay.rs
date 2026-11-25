@@ -514,6 +514,7 @@ pub(crate) fn draw_screen(screen: &Screen, rect: Rect, rotate: f32, scale: f32, 
         model: None,
         terminal: Some(TerminalOn { src: String::new(), run: None, cols: 100, rows: 30, rect, rotate, stops: 0, pending: false }),
         button: None,
+        component: None,
         id: None,
     };
     let layer = render_layer(&spec, scale, fonts);

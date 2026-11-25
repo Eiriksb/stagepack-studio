@@ -126,6 +126,22 @@ impl Document {
         laid_out(|| deck.layers_at(index, moment, scale)).unwrap_or_default()
     }
 
+    /// The lines of text the layer whose tag is written at `source` draws on slide `index` at
+    /// `moment`, as [`Self::layers_at`] draws it then.
+    #[cfg(feature = "test-hooks")]
+    pub fn words_at(&mut self, index: usize, moment: Moment, source: &std::ops::Range<usize>) -> Vec<String> {
+        let (specs, _) = self.deck.specs_and_fonts_at(index, moment);
+        let spec = specs.iter().find(|spec| spec.source.as_ref() == Some(source));
+        spec.into_iter()
+            .flat_map(|spec| spec.items.iter())
+            .filter_map(|item| match item {
+                slides_engine::DisplayItem::Text { text, .. } => Some(text.buffer.lines.iter().map(|line| line.text().to_string()).collect::<Vec<_>>()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
     /// When each layer of slide `index` at `moment` appears, in the order of [`Self::layers_at`]
     /// at that moment.
     pub fn timings_at(&mut self, index: usize, moment: Moment) -> Vec<LayerTiming> {

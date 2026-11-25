@@ -49,7 +49,7 @@ pub fn picture(talk: &mut OpenTalk, slide: usize, step: Option<u32>, width: u32)
         }
         let height = width * 9 / 16;
         let mut pixmap = Pixmap::new(width, height).ok_or_else(|| format!("A picture {width} wide can't be made."))?;
-        let moment = Moment { step, time: 0.0 };
+        let moment = Moment::at(step, 0.0);
         // Both from the one layout, as the show asks them: a layer waiting for a later click isn't there yet.
         let layers = talk.deck.layers_at(index, moment, width as f32 / SLIDE_WIDTH);
         let timings = talk.deck.timings_at(index, moment);

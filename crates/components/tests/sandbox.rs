@@ -280,10 +280,10 @@ fn something_that_is_not_webassembly_is_refused() {
 }
 
 #[test]
-fn a_newer_version_is_refused_with_its_own_message() {
-    let wasm = wat(Wat { abi_version: Some(2), render: "(i64.const 0)", ..Wat::default() });
+fn a_module_saying_three_is_refused() {
+    let wasm = wat(Wat { abi_version: Some(3), render: "(i64.const 0)", ..Wat::default() });
     let error = WasmComponent::load(&wasm).err().unwrap();
-    assert_eq!(error, ComponentError::NewerVersion(2));
+    assert_eq!(error, ComponentError::NewerVersion(3));
     assert_eq!(error.short(), "built by a newer version of this app");
 }
 
@@ -396,11 +396,12 @@ fn each_error_has_words_for_its_box() {
     let all = [
         ComponentError::TooLarge,
         ComponentError::Malformed("x".into()),
-        ComponentError::NewerVersion(2),
+        ComponentError::NewerVersion(3),
         ComponentError::TookTooLong,
         ComponentError::OutOfMemory,
         ComponentError::Crashed,
         ComponentError::BadOutput("x".into()),
+        ComponentError::StateTooLarge,
     ];
     let words: Vec<_> = all.iter().map(ComponentError::short).collect();
     assert_eq!(
@@ -413,6 +414,7 @@ fn each_error_has_words_for_its_box() {
             "used too much memory",
             "stopped working",
             "gave an answer that can't be read",
+            "This component's state is over 64 KiB.",
         ]
     );
 }
@@ -421,7 +423,7 @@ fn each_error_has_words_for_its_box() {
 const SCORE_V1: &[u8] = include_bytes!("fixtures/v1/score.wasm");
 
 #[test]
-fn a_component_built_for_version_one_still_runs() {
+fn a_v1_module_still_runs() {
     let component = load(SCORE_V1);
     let field = |name: &str, kind: PropKind| PropField::new(name, kind, false);
     assert_eq!(
@@ -546,12 +548,63 @@ fn render_with(wasm: &[u8]) -> Result<RenderOutput, ComponentError> {
 
 #[test]
 fn a_toolkit_function_of_a_newer_version_says_so() {
-    let wasm = wat(Wat { abi_version: Some(2), imports: LATER, render: "(i64.const 0)", ..Wat::default() });
-    assert_eq!(WasmComponent::load(&wasm).err(), Some(ComponentError::NewerVersion(2)));
+    let wasm = wat(Wat { abi_version: Some(3), imports: LATER, render: "(i64.const 0)", ..Wat::default() });
+    assert_eq!(WasmComponent::load(&wasm).err(), Some(ComponentError::NewerVersion(3)));
 }
 
 #[test]
 fn a_toolkit_import_that_is_not_a_function_is_refused() {
     let imports = r#"(import "toolkit" "later" (global i32))"#;
     assert_malformed(WasmComponent::load(&wat(Wat { imports, render: "(i64.const 0)", ..Wat::default() })));
+}
+
+/// A version-2 module whose `render` gives `answer`, with a schema that says it's interactive.
+fn interactive_answering(answer: &str) -> Vec<u8> {
+    let schema = r#"{"name":"Test","props":[],"children":false,"interactive":true}"#;
+    let extra = format!("{}\n{}", data(ANSWER_AT, answer.as_bytes()), data(SCHEMA_AT + 512, schema.as_bytes()));
+    let render = format!("(i64.const {})", packed(ANSWER_AT, answer.len()));
+    let schema_body = format!("(i64.const {})", packed(SCHEMA_AT + 512, schema.len()));
+    wat(Wat { abi_version: Some(2), extra: &extra, schema: Some(&schema_body), render: &render, pages: Some(64), ..Wat::default() })
+}
+
+#[test]
+fn a_version_two_module_keeps_state_and_says_it_is_interactive() {
+    let answer = r#"{"element":{"Hit":{"name":"plus","child":"Empty"}},"state":{"count":1}}"#;
+    let component = load(&interactive_answering(answer));
+    assert!(component.schema().interactive);
+    let output = component.render(&input(), no_assets()).unwrap();
+    assert_eq!(output.element, toolkit::hit("plus", Element::Empty));
+    assert_eq!(output.state, Some(serde_json::json!({"count": 1})));
+}
+
+#[test]
+fn a_version_one_module_keeps_no_state() {
+    let answer = r#"{"element":"Empty","state":{"count":1}}"#;
+    assert_eq!(render(&answering(answer)).unwrap().state, None);
+}
+
+#[test]
+fn state_over_64_kib_is_refused() {
+    let big = "x".repeat(64 * 1024);
+    let answer = format!(r#"{{"element":"Empty","state":"{big}"}}"#);
+    let component = load(&interactive_answering(&answer));
+    let error = component.render(&input(), no_assets()).unwrap_err();
+    assert_eq!(error, ComponentError::StateTooLarge);
+    assert_eq!(error.to_string(), "This component's state is over 64 KiB.");
+
+    let ok = load(&interactive_answering(r#"{"element":"Empty"}"#));
+    let given = input().with_state(Some(serde_json::Value::String(big)), Vec::new());
+    assert_eq!(ok.render(&given, no_assets()).unwrap_err().to_string(), "This component's state is over 64 KiB.");
+}
+
+#[test]
+fn a_hit_counts_towards_the_limits() {
+    let mut answer = r#""Empty""#.to_string();
+    for _ in 0..MAX_ELEMENT_DEPTH {
+        answer = format!(r#"{{"Hit":{{"name":"a","child":{answer}}}}}"#);
+    }
+    assert_bad_output(render(&answering(&format!(r#"{{"element":{answer}}}"#))));
+    let picture = r#"{"element":{"Hit":{"name":"a","child":{"Picture":{"src":"/etc/passwd","width":1.0,"height":1.0}}}}}"#;
+    let Element::Hit { child, .. } = render(&answering(picture)).unwrap().element else { panic!("not a hit") };
+    assert!(matches!(*child, Element::Problem { .. }), "{child:?}");
 }

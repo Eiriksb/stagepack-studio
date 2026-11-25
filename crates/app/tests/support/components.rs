@@ -154,3 +154,37 @@ pub fn components_talk(except: Option<(&str, Built)>) -> tempfile::TempDir {
     std::fs::write(dir.path().join("build/index.json"), index).unwrap();
     dir
 }
+
+/// A module of interface version 2 whose schema is `schema`, which draws `element`, and stops
+/// working, as a trap, when what it's given holds `trap_on`.
+pub fn interactive_module(schema: &str, element: &str, trap_on: Option<&str>) -> Vec<u8> {
+    let answer = format!(r#"{{"element":{element}}}"#);
+    let trap = trap_on.map_or(String::new(), |needle| {
+        format!("(if (call $contains (local.get $ptr) (local.get $len) (i32.const 4096) (i32.const {})) (then unreachable))", needle.len())
+    });
+    let text = format!(
+        r#"(module
+  (memory (export "memory") 8)
+  (global $heap (mut i32) (i32.const 262144))
+  {}
+  {}
+  {}
+  {CONTAINS}
+  (func (export "abi_version") (result i32) (i32.const 2))
+  (func (export "alloc") (param $len i32) (result i32)
+    (local $at i32)
+    (local.set $at (global.get $heap))
+    (global.set $heap (i32.add (global.get $heap) (local.get $len)))
+    (local.get $at))
+  (func (export "schema") (result i64) (i64.const {}))
+  (func (export "render") (param $ptr i32) (param $len i32) (result i64)
+    {trap}
+    (i64.const {})))"#,
+        data(1024, schema),
+        data(4096, trap_on.unwrap_or_default()),
+        data(8192, &answer),
+        packed(1024, schema),
+        packed(8192, &answer),
+    );
+    wat::parse_str(&text).unwrap_or_else(|error| panic!("{error}\n{text}"))
+}

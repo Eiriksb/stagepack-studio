@@ -7,8 +7,11 @@
 
 #[path = "support/typing.rs"]
 mod typing;
+#[path = "support/components.rs"]
+mod components;
 
-use std::sync::{Mutex, MutexGuard};
+use std::ops::Range;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
@@ -18,14 +21,17 @@ use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, Entity, InputEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     Pixels, Point, RenderImage, TestAppContext, point, px,
 };
-use slides_engine::{Fonts, Rect};
+use slides_components::{Bundle, compile, source_hash};
+use slides_engine::{BUTTON_ON_NOTHING, Fonts, Rect};
 use slides_model::{AdapterKind, Drawer, DrawerOptions};
 use stagepack_studio::document::Document;
 use stagepack_studio::model_view;
 use stagepack_studio::present::Place;
 use stagepack_studio::present_view::{
-    AudienceView, BUTTON_PRESSED_ID, COUNTER_ID, INTERACTIVE_HOVER_ID, PRESSED_DARKER, NEXT_ID, POINTER_HIDES_AFTER, PressedIn, Presentation, StandInPress, start_show,
+    AudienceView, BUTTON_PRESSED_ID, COUNTER_ID, INTERACTIVE_HOVER_ID, MAX_EVENTS, PRESSED_DARKER, NEXT_ID, POINTER_HIDES_AFTER, PressedIn, Presentation, StandInPress,
+    start_show,
 };
+use toolkit::{Event, PointerKind};
 use stagepack_studio::slide_canvas::SlideCanvas;
 use stagepack_studio::workspace_view;
 
@@ -591,6 +597,230 @@ fn a_button_looks_pressed_only_while_the_pointer_is_down_on_it(cx: &mut TestAppC
     assert!(show.pressed_look(cx, show.presenter).is_none());
 }
 
+/// A talk's own component that counts: a press let go of on its plus adds one, and the action
+/// `add` adds its value. Its count is on its left, and its plus on its right.
+const COUNTER: &str = r#"use toolkit::prelude::*;
+
+#[component(interactive)]
+fn Counter(ctx: &Ctx) -> Element {
+    let mut count: u32 = ctx.state();
+    for event in ctx.events() {
+        match event {
+            Event::Pointer { kind: PointerKind::Up, hit: Some(hit), .. } if hit == "plus" => count += 1,
+            Event::Action { name, value } if name == "add" => count += value.parse::<u32>().unwrap_or(0),
+            _ => {}
+        }
+    }
+    ctx.set_state(&count);
+    let plus = shape(ShapeKind::Rect, 200.0, 200.0).fill(Color::rgb(37, 99, 235));
+    canvas(400.0, 200.0, vec![at(0.0, 0.0, text(count.to_string()).size(64.0)), at(200.0, 0.0, hit("plus", plus))])
+}
+"#;
+
+/// A counter at the top left of a slide, and where its plus and the space beside it are.
+const COUNTER_TAG: &str = r#"<Counter id="c" x="200" y="200" w="400" h="200" />"#;
+const PLUS: (f32, f32) = (500., 300.);
+const BESIDE_PLUS: (f32, f32) = (300., 300.);
+
+/// [`COUNTER`], built with the compiler bundle once for all the tests, or `None` if there's no
+/// bundle, which the tests that need it say and skip.
+fn built_counter() -> Option<&'static [u8]> {
+    static BUILT: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+    let built = BUILT.get_or_init(|| {
+        let bundled = std::env::var_os("STUDIO_BUNDLE").is_some() && Bundle::find().is_some();
+        if !bundled {
+            return None;
+        }
+        let bundle = Bundle::find().expect("a bundle");
+        Some(compile(&bundle, "components/counter.rs", COUNTER).unwrap_or_else(|errors| panic!("the counter doesn't build: {errors:?}")))
+    });
+    if built.is_none() {
+        eprintln!("skipping the counter: no compiler bundle (set STUDIO_BUNDLE)");
+    }
+    built.as_deref()
+}
+
+/// A rehearsal of `source`, with the counter built in its folder: `None` with no compiler bundle.
+fn with_counter(cx: &mut TestAppContext, source: &str) -> Option<Show> {
+    let wasm = built_counter()?;
+    let index = format!(r#"{{"format":1,"components":[{{"tag":"Counter","file":"counter","source_hash":"{}"}}]}}"#, source_hash(COUNTER.as_bytes()));
+    let files: [(&str, &[u8]); 3] = [("components/counter.rs", COUNTER.as_bytes()), ("build/counter.wasm", wasm), ("build/index.json", index.as_bytes())];
+    Some(rehearse_with(cx, source, &files))
+}
+
+/// Where the tag that starts `opening` is written in `source`, `/>` and all.
+fn tag_at(source: &str, opening: &str) -> Range<usize> {
+    let start = source.find(opening).expect("the tag is in the talk");
+    start..start + source[start..].find("/>").expect("the tag closes") + 2
+}
+
+impl Show {
+    /// The lines of text the layer of the tag at `source` draws now.
+    fn words(&self, cx: &mut TestAppContext, source: &Range<usize>) -> Vec<String> {
+        self.show.update(cx, |show, cx| show.words_on(source, cx))
+    }
+
+    /// A click on the slide's point `(x, y)` in the audience's window, and time for what reached a
+    /// component to be drawn.
+    fn press_slide(&self, cx: &mut TestAppContext, slide_at: (f32, f32)) {
+        self.click_slide(cx, slide_at);
+        self.wait(cx, 50);
+    }
+
+    fn reload(&self, cx: &mut TestAppContext, source: &str) {
+        self.document.update(cx, |document, cx| {
+            document.reload(Some(source.to_string()));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        self.settle(cx);
+    }
+}
+
 #[gpui_kit::test]
-#[ignore = "Task 5"]
-fn a_do_button_sends_its_action(_cx: &mut TestAppContext) {}
+fn a_counter_counts_clicks_on_its_plus(cx: &mut TestAppContext) {
+    let source = format!("# One\n\n{COUNTER_TAG}\n\n---\n\n# Two\n");
+    let Some(show) = with_counter(cx, &source) else { return };
+    let counter = tag_at(&source, "<Counter");
+    assert_eq!(show.words(cx, &counter), ["0"]);
+    show.press_slide(cx, PLUS);
+    show.press_slide(cx, PLUS);
+    assert_eq!(show.words(cx, &counter), ["2"]);
+    // Beside the plus, inside the counter, nothing changes.
+    show.press_slide(cx, BESIDE_PLUS);
+    assert_eq!(show.words(cx, &counter), ["2"]);
+    assert_eq!(place(&show, cx), Place { slide: 0, step: 0 }, "the show didn't move");
+    assert_eq!(show.counter(cx), "1 / 2");
+}
+
+#[gpui_kit::test]
+fn leaving_the_slide_clears_state(cx: &mut TestAppContext) {
+    let source = format!("# One\n\n{COUNTER_TAG}\n\n---\n\n# Two\n");
+    let Some(show) = with_counter(cx, &source) else { return };
+    let counter = tag_at(&source, "<Counter");
+    show.press_slide(cx, PLUS);
+    assert_eq!(show.words(cx, &counter), ["1"]);
+    show.show.update(cx, |show, cx| show.next(cx));
+    show.settle(cx);
+    assert_eq!(place(&show, cx), Place { slide: 1, step: 0 });
+    show.show.update(cx, |show, cx| show.previous(cx));
+    show.settle(cx);
+    assert_eq!(show.words(cx, &counter), ["0"]);
+    assert!(cx.read(|cx| show.show.read(cx).components().is_empty()));
+}
+
+#[gpui_kit::test]
+fn a_do_button_sends_its_action(cx: &mut TestAppContext) {
+    let source = format!("# One\n\n{COUNTER_TAG}\n\n<Button label=\"Add\" do=\"add\" on=\"c\" value=\"5\" x=\"800\" y=\"600\" w=\"300\" h=\"100\" />\n\n---\n\n# Two\n");
+    let Some(show) = with_counter(cx, &source) else { return };
+    let counter = tag_at(&source, "<Counter");
+    assert!(!show.document.update(cx, |document, _| document.notices()).iter().any(|notice| notice == BUTTON_ON_NOTHING), "its `on` names the counter");
+    show.press_slide(cx, (950., 650.));
+    assert_eq!(show.words(cx, &counter), ["5"]);
+    assert_eq!(place(&show, cx), Place { slide: 0, step: 0 });
+}
+
+/// A component of interface version 2 that says it's interactive and is a plain pad, named `pad`
+/// under the pointer, and stops working when it's given what `trap_on` says, if it says anything.
+fn pad_files(trap_on: Option<&str>) -> Vec<(&'static str, Vec<u8>)> {
+    let schema = r#"{"name":"Pad","props":[],"children":false,"interactive":true}"#;
+    let element = r#"{"Hit":{"name":"pad","child":{"Shape":{"kind":"Rect","width":400.0,"height":200.0,"fill":{"r":37,"g":99,"b":235,"a":255},"outline":null,"outline_width":0.0,"radius":0.0,"padding":0.0,"child":null}}}}"#;
+    let index = r#"{"format":1,"components":[{"tag":"Pad","file":"pad","source_hash":"built from nothing here"}]}"#;
+    vec![("build/pad.wasm", components::interactive_module(schema, element, trap_on)), ("build/index.json", index.as_bytes().to_vec())]
+}
+
+const PAD_SLIDES: &str = "# One\n\n<Pad x=\"200\" y=\"200\" w=\"400\" h=\"200\" />\n\n---\n\n# Two\n";
+
+fn with_the_pad(cx: &mut TestAppContext, trap_on: Option<&str>) -> Show {
+    let files = pad_files(trap_on);
+    let files: Vec<(&str, &[u8])> = files.iter().map(|(name, bytes)| (*name, bytes.as_slice())).collect();
+    rehearse_with(cx, PAD_SLIDES, &files)
+}
+
+#[gpui_kit::test]
+fn events_are_coalesced_to_sixty_renders_a_second(cx: &mut TestAppContext) {
+    let show = with_the_pad(cx, None);
+    let pad = tag_at(PAD_SLIDES, "<Pad");
+    let canvas = show.canvas(cx);
+    let along = |i: usize| 250. + i as f32 * 0.3;
+    // 1,000 moves over it in a second.
+    for i in 0..1000 {
+        let at = show.at(cx, &canvas, (along(i), 300.));
+        cx.update_window(show.audience, |_, window, cx| {
+            let event = MouseMoveEvent { position: at, pressed_button: None, modifiers: Modifiers::default() };
+            window.dispatch_event(event.to_platform_input(), cx);
+        })
+        .unwrap();
+        cx.executor().advance_clock(Duration::from_millis(1));
+        cx.run_until_parked();
+    }
+    show.wait(cx, 100);
+    let (renders, last) = cx.read(|cx| {
+        let components = show.show.read(cx).components();
+        (components.renders(&pad), components.last_fed(&pad).and_then(|fed| fed.events.last().cloned()))
+    });
+    assert!((30..=61).contains(&renders), "{renders} renders");
+    let Some(Event::Pointer { kind: PointerKind::Move, x, hit, .. }) = last else { panic!("the last move wasn't given it: {last:?}") };
+    assert!((x - (along(999) - 200.)).abs() < 2.0, "the last move, at {x}");
+    assert_eq!(hit.as_deref(), Some("pad"));
+    assert_eq!(place(&show, cx), Place { slide: 0, step: 0 });
+}
+
+#[gpui_kit::test]
+fn a_component_that_fails_under_events_shows_its_problem_and_the_show_moves_on(cx: &mut TestAppContext) {
+    // Its first render with events is fine; it stops working on its second, which is given an Up.
+    let show = with_the_pad(cx, Some(r#""Up""#));
+    let pad = tag_at(PAD_SLIDES, "<Pad");
+    let down = |x: f32| Event::Pointer { kind: PointerKind::Down, x, y: 10., hit: Some("pad".into()) };
+    let up = |x: f32| Event::Pointer { kind: PointerKind::Up, x, y: 10., hit: Some("pad".into()) };
+    show.show.update(cx, |show, cx| show.send_to(&pad, down(0.), cx));
+    show.settle(cx);
+    assert_eq!(cx.read(|cx| show.show.read(cx).components().renders(&pad)), 1);
+    // A flood before it can be drawn again: no more than the most wait.
+    show.show.update(cx, |show, cx| {
+        for i in 0..500 {
+            show.send_to(&pad, if i % 2 == 0 { down(i as f32) } else { up(i as f32) }, cx);
+        }
+    });
+    assert!(cx.read(|cx| show.show.read(cx).components().queued(&pad)) <= MAX_EVENTS);
+    show.wait(cx, 50);
+    assert!(show.words(cx, &pad).iter().any(|line| line.contains("Pad: stopped working")), "{:?}", show.words(cx, &pad));
+    // What comes after is dropped, not queued.
+    show.show.update(cx, |show, cx| {
+        for i in 0..500 {
+            show.send_to(&pad, down(i as f32), cx);
+        }
+    });
+    show.wait(cx, 50);
+    let (renders, queued) = cx.read(|cx| {
+        let components = show.show.read(cx).components();
+        (components.renders(&pad), components.queued(&pad))
+    });
+    assert_eq!((renders, queued), (2, 0));
+    cx.simulate_keystrokes(show.audience, "right");
+    show.settle(cx);
+    assert_eq!(show.counter(cx), "2 / 2");
+}
+
+#[gpui_kit::test]
+fn an_edit_keeps_state_only_for_an_unchanged_component(cx: &mut TestAppContext) {
+    let second = r#"<Counter id="d" x="200" y="600" w="400" h="200" />"#;
+    let button = r#"<Button label="Add" do="add" on="d" x="800" y="600" w="300" h="100" />"#;
+    let source = format!("# One\n\n{COUNTER_TAG}\n\n{second}\n\n{button}\n\n---\n\n# Two\n");
+    let Some(show) = with_counter(cx, &source) else { return };
+    let (first, second_at) = (tag_at(&source, "<Counter id=\"c\""), tag_at(&source, "<Counter id=\"d\""));
+    show.press_slide(cx, PLUS);
+    show.press_slide(cx, (PLUS.0, PLUS.1 + 400.));
+    assert_eq!((show.words(cx, &first), show.words(cx, &second_at)), (vec!["1".to_string()], vec!["1".to_string()]));
+
+    // Saved elsewhere with the second counter's id changed: the first keeps its count, as it's
+    // written as it was where it was, and the second starts again. The button names nothing now.
+    let edited = source.replace(r#"id="d""#, r#"id="e""#);
+    show.reload(cx, &edited);
+    let second_now = tag_at(&edited, "<Counter id=\"e\"");
+    assert_eq!(show.words(cx, &first), ["1"]);
+    assert_eq!(show.words(cx, &second_now), ["0"]);
+    assert!(show.document.update(cx, |document, _| document.notices()).iter().any(|notice| notice == BUTTON_ON_NOTHING));
+    show.press_slide(cx, PLUS);
+    assert_eq!(show.words(cx, &first), ["2"]);
+}

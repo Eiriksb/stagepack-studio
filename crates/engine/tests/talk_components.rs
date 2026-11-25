@@ -925,7 +925,7 @@ fn what_components_read_is_remembered_for_at_most_256_paths() {
     files.put("assets/sales.csv", "L,S\nA,1\n");
     let mut deck = open_with(&files, probe_registry());
     for frame in 0..1000 {
-        let _ = deck.layers_at(0, Moment { step: 0, time: frame as f32 }, 0.1);
+        let _ = deck.layers_at(0, Moment::at(0, frame as f32), 0.1);
     }
     assert!(deck.assets_remembered() <= 256, "{}", deck.assets_remembered());
     // The chart's file is read once the record is full, so it isn't in it. Past what it can
@@ -951,7 +951,7 @@ fn a_show_holds_the_layouts_of_at_most_two_slides_at_a_moment() {
     let slides = ["<Ticking />\n"; 5].join("\n---\n\n");
     files.put("slides.md", slides);
     let mut deck = open_with(&files, probe_registry());
-    let at = |time: f32| Moment { step: 0, time };
+    let at = |time: f32| Moment::at(0, time);
     for slide in 0..5 {
         let _ = deck.layers_at(slide, at(1.0), 0.1);
         // The next one, as a presenter's thumbnail would.

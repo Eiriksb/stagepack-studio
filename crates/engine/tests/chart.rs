@@ -117,7 +117,7 @@ fn lay_out_at(source: &str, step: u32) -> LaidOutSlide {
         files: &files(&[]),
         pictures: &mut PictureCache::default(),
         components: &mut TalkComponents::none(),
-        moment: Moment { step, time: 0.0 },
+        moment: Moment::at(step, 0.0),
         asks: ComponentAsks::default(),
     };
     layout_slide(&talk, 0, &mut env)

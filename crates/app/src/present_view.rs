@@ -7,10 +7,11 @@ use std::time::{Duration, Instant};
 use gpui_kit::component::{ActiveTheme as _, TitleBar, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use slides_engine::{ButtonLayer, Enter, LayerTiming, ModelLayer, Moment, Rect, TerminalLayer, Transition, VideoLayer};
+use slides_engine::{BUTTON_ON_NOTHING, ButtonLayer, Enter, LayerTiming, ModelLayer, Moment, Rect, TerminalLayer, Transition, VideoLayer};
+use toolkit::{Event, PointerKind};
 
 use crate::document::{Document, LargeOpen};
-use crate::interactive::{Acted, InteractiveKind, InteractiveThing, Press, interactive_at, interactive_on, press_button};
+use crate::interactive::{Acted, InteractiveKind, InteractiveThing, Press, interactive_at, interactive_on, pointer_event, press_button};
 use crate::present::{
     ENTER_SECONDS, MOMENTS_PER_SECOND, Moved, Place, ScreenInfo, Session, TRANSITION_SECONDS,
     WindowPlan, choose_windows, clock_text, layer_look, moment_time, slide_looks,
@@ -30,7 +31,7 @@ pub const COUNTER_ID: &str = "counter";
 /// The faint line around the interactive thing under the pointer.
 pub const INTERACTIVE_HOVER_ID: &str = "interactive-hover";
 
-pub use crate::interactive::PressedIn;
+pub use crate::interactive::{MAX_EVENTS, PressedIn, RENDER_EVERY, StateStore};
 #[cfg(feature = "test-hooks")]
 pub use crate::interactive::StandInPress;
 
@@ -139,6 +140,10 @@ pub struct Presentation {
     /// A press on an interactive thing, by where its tag is written, and the window it began in,
     /// which has it until it's let go of there.
     pressed: Option<(Range<usize>, PressedIn)>,
+    /// What the interactive components of the slide the show is on keep, and what reached them.
+    components: StateStore,
+    /// The wait until one of them can be given what reached it.
+    feeding: Option<Task<()>>,
     /// The tests' boxes, each on a slide by its place among the shown ones, and what reached them.
     #[cfg(feature = "test-hooks")]
     stand_ins: Vec<(usize, Rect)>,
@@ -176,6 +181,8 @@ impl Presentation {
             ask_pending: false,
             visits: 0,
             pressed: None,
+            components: StateStore::default(),
+            feeding: None,
             #[cfg(feature = "test-hooks")]
             stand_ins: Vec::new(),
             #[cfg(feature = "test-hooks")]
@@ -299,6 +306,7 @@ impl Presentation {
             Moved::Revealed { step } => self.reveal = Some(Reveal { step, began }),
             Moved::Arrived { transition, .. } => {
                 self.visits += 1;
+                self.forget_components(cx);
                 self.reveal = None;
                 self.slide_began = None;
                 self.arrival = (transition != Transition::None).then_some(Arrival {
@@ -341,17 +349,109 @@ impl Presentation {
         if moved != Moved::Stayed {
             self.reveal = None;
             self.arrival = None;
-            self.slide_changed_from(left);
+            self.slide_changed_from(left, cx);
             cx.notify();
         }
     }
 
-    /// Starts the time again if the show is no longer on slide `left`.
-    fn slide_changed_from(&mut self, left: usize) {
+    /// Starts the time again if the show is no longer on slide `left`, and forgets what its
+    /// components kept.
+    fn slide_changed_from(&mut self, left: usize, cx: &mut Context<Self>) {
         if self.session.place().slide != left {
             self.slide_began = None;
             self.visits += 1;
+            self.forget_components(cx);
         }
+    }
+
+    /// Forgets what the components of the slide the show is on kept, and what reached them.
+    fn forget_components(&mut self, cx: &mut Context<Self>) {
+        self.feeding = None;
+        if !self.components.is_empty() {
+            self.components.clear();
+            self.give_feeds(cx);
+        }
+    }
+
+    /// The moment `time` seconds after the slide of `place` appeared, at its step: with the state
+    /// its components are drawn from if it's the slide the show is on.
+    pub(crate) fn moment_at(&self, place: Place, time: f32) -> Moment {
+        let state = if place.slide == self.session.place().slide { self.components.state() } else { 0 };
+        Moment { state, ..Moment::at(place.step, time) }
+    }
+
+    /// Sends `event` to the interactive component whose tag is written at `source` on the slide the
+    /// show is on. It's drawn from what reached it at most 60 times a second.
+    pub fn send_to(&mut self, source: &Range<usize>, event: Event, cx: &mut Context<Self>) {
+        let text = self.document.read(cx).source().get(source.clone()).unwrap_or_default().to_string();
+        self.components.send(source, &text, event);
+        self.feed(cx);
+    }
+
+    /// Gives each component what reached it, if it's time to, and waits for when it is if not.
+    fn feed(&mut self, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        let fed = self.components.feed_due(now);
+        if fed.fed {
+            self.give_feeds(cx);
+            cx.notify();
+        }
+        if let Some(wait) = fed.wait
+            && self.feeding.is_none()
+        {
+            self.feeding = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(wait).await;
+                this.update(cx, |this, cx| {
+                    this.feeding = None;
+                    this.feed(cx);
+                })
+                .ok();
+            }));
+        }
+    }
+
+    /// Has the deck draw the components from what the store gives them.
+    fn give_feeds(&self, cx: &mut Context<Self>) {
+        let feeds = self.components.feeds();
+        self.document.update(cx, |document, _| document.feed_components(feeds));
+    }
+
+    /// Takes in what came of drawing the components from what they were given, and gives them what
+    /// reached them since.
+    fn take_answers(&mut self, cx: &mut Context<Self>) {
+        let answers = self.document.update(cx, |document, _| document.take_component_answers());
+        if !answers.is_empty() && self.components.answered(answers) {
+            self.feed(cx);
+        }
+    }
+
+    /// The pointer doing `kind` at `at` on the slide, in slide units, sent to the component `thing`.
+    fn send_pointer(&mut self, thing: &InteractiveThing, at: Point<f32>, kind: PointerKind, cx: &mut Context<Self>) {
+        if let Some(event) = pointer_event(thing, at, kind) {
+            self.send_to(&thing.source, event, cx);
+        }
+    }
+
+    /// The pointer moved to `at` on the slide in `window`, over `over`: a move of the component the
+    /// press `window` holds began on, or else of the one under it.
+    fn pointer_moved(&mut self, over: Option<&InteractiveThing>, at: Point<f32>, window: PressedIn, cx: &mut Context<Self>) {
+        let held = self.pressed.as_ref().filter(|(_, began)| *began == window).map(|(source, _)| source.clone());
+        let thing = match held {
+            Some(source) => self.thing_here(&source, cx),
+            None => over.cloned(),
+        };
+        if let Some(thing) = thing {
+            self.send_pointer(&thing, at, PointerKind::Move, cx);
+        }
+    }
+
+    /// The interactive thing whose tag is written at `source` on the slide the show is on.
+    fn thing_here(&self, source: &Range<usize>, cx: &mut Context<Self>) -> Option<InteractiveThing> {
+        let now = cx.background_executor().now();
+        let place = self.session.place();
+        let moment = self.moment_at(place, self.time_at(now));
+        let things = interactive_things_at(&self.document, place, moment, cx);
+        things.into_iter().find(|thing| thing.source == *source)
     }
 
     /// Ends the show and closes its windows.
@@ -412,7 +512,21 @@ impl Presentation {
         // What was on its way in may be gone by now.
         self.reveal = None;
         self.arrival = None;
-        self.slide_changed_from(left);
+        self.slide_changed_from(left, cx);
+        // A component keeps what it had only if its tag is as it was.
+        if !self.components.is_empty() {
+            let now = cx.background_executor().now();
+            let place = self.session.place();
+            let moment = self.moment_at(place, self.time_at(now));
+            let interactive: Vec<Range<usize>> = interactive_things_at(&self.document, place, moment, cx)
+                .into_iter()
+                .filter(|thing| matches!(thing.kind, InteractiveKind::Component { .. }))
+                .map(|thing| thing.source)
+                .collect();
+            let source = self.document.read(cx).source().to_string();
+            self.components.keep_unchanged(&source, &interactive);
+            self.give_feeds(cx);
+        }
         cx.notify();
     }
 
@@ -478,24 +592,35 @@ impl Presentation {
         taking
     }
 
-    /// A press in `window` on `hit`, an interactive thing, or on none: the window has it until it's
-    /// let go of.
-    fn press_on(&mut self, hit: Option<&InteractiveThing>, window: PressedIn) {
+    /// A press in `window` on `hit`, an interactive thing, or on none, at `at` on the slide: the
+    /// window has it until it's let go of. A component is sent it.
+    fn press_on(&mut self, hit: Option<&InteractiveThing>, at: Option<Point<f32>>, window: PressedIn, cx: &mut Context<Self>) {
         self.pressed = hit.map(|thing| (thing.source.clone(), window));
+        if let (Some(thing), Some(at)) = (hit, at) {
+            self.send_pointer(thing, at, PointerKind::Down, cx);
+        }
         #[cfg(feature = "test-hooks")]
         if hit.is_some_and(|thing| thing.kind == InteractiveKind::StandIn) {
             self.stand_in_presses.push(StandInPress::Down(window));
         }
     }
 
-    /// The press `window` has let go of over `over`, or over nothing interactive. It's for the thing
-    /// it began on only if it's let go of over that thing, and otherwise for nothing.
-    fn let_go(&mut self, over: Option<&InteractiveThing>, window: PressedIn, cx: &mut Context<Self>) {
+    /// The press `window` has let go of over `over`, or over nothing interactive, at `at` on the
+    /// slide. It's for the thing it began on only if it's let go of over that thing, and otherwise for
+    /// nothing: but a component it began on is told it was let go of, wherever.
+    fn let_go(&mut self, over: Option<&InteractiveThing>, at: Option<Point<f32>>, window: PressedIn, cx: &mut Context<Self>) {
         let Some((source, _)) = self.pressed.take_if(|(_, began)| *began == window) else { return };
+        if let Some(at) = at
+            && let Some(component) = self.thing_here(&source, cx).filter(|thing| matches!(thing.kind, InteractiveKind::Component { .. }))
+        {
+            self.send_pointer(&component, at, PointerKind::Up, cx);
+            return;
+        }
         let Some(thing) = over.filter(|thing| thing.source == source) else { return };
         match thing.kind {
-            // A terminal took the keys as it was pressed, and a model turns as it's dragged.
-            InteractiveKind::Terminal(_) | InteractiveKind::Model(_) => {}
+            // A terminal took the keys as it was pressed, and a model turns as it's dragged. A
+            // component was told above.
+            InteractiveKind::Terminal(_) | InteractiveKind::Model(_) | InteractiveKind::Component { .. } => {}
             // A button acts, once, whichever window it was pressed in: both show what it did.
             InteractiveKind::Button => {
                 let Some(button) = self.button_here(&source, cx) else { return };
@@ -511,7 +636,7 @@ impl Presentation {
     /// The button whose tag is written at `source` on the slide the show is on, as it is now.
     fn button_here(&self, source: &Range<usize>, cx: &mut Context<Self>) -> Option<ButtonLayer> {
         let now = cx.background_executor().now();
-        let moment = Moment { step: self.session.place().step, time: self.time_at(now) };
+        let moment = self.moment_at(self.session.place(), self.time_at(now));
         let slide = self.session.place().slide;
         self.document.update(cx, |document, _| {
             let slide = document.shown_slide(slide);
@@ -553,6 +678,22 @@ impl Presentation {
         &self.stand_in_presses
     }
 
+    /// What the components of the slide the show is on keep, and what reached them.
+    pub fn components(&self) -> &StateStore {
+        &self.components
+    }
+
+    /// The lines of text the layer whose tag is written at `source` draws on the slide the show is
+    /// on, as it's drawn now.
+    pub fn words_on(&self, source: &Range<usize>, cx: &mut App) -> Vec<String> {
+        let place = self.session.place();
+        let moment = self.moment_at(place, self.time_at(cx.background_executor().now()));
+        self.document.update(cx, |document, _| {
+            let slide = document.shown_slide(place.slide);
+            document.words_at(slide, moment, source)
+        })
+    }
+
     /// The tests' boxes on the slide the show is on, in front of everything else on it. Each is
     /// told from the others by a place no tag can be written at.
     fn stand_ins_here(&self) -> impl Iterator<Item = InteractiveThing> + '_ {
@@ -583,6 +724,19 @@ pub(crate) fn act(show: &mut Presentation, button: &ButtonLayer, cx: &mut Contex
             show.go_to_step(step, cx);
             Acted::Done
         }
+        Press::Do { name, target, value } => {
+            let place = show.session.place();
+            let moment = show.moment_at(place, show.time_at(cx.background_executor().now()));
+            let things = interactive_things_at(&show.document, place, moment, cx);
+            let component = things.into_iter().find(|thing| matches!(thing.kind, InteractiveKind::Component { .. }) && thing.id.as_deref() == Some(target.as_str()));
+            match component {
+                Some(component) => {
+                    show.send_to(&component.source, Event::Action { name, value }, cx);
+                    Acted::Done
+                }
+                None => Acted::Refused(BUTTON_ON_NOTHING.to_string()),
+            }
+        }
         Press::Run { text, terminal } => {
             let Some((workspace, _)) = show.owner.clone() else { return Acted::Refused(BUTTON_NO_TERMINALS.to_string()) };
             let visit = show.visits;
@@ -601,14 +755,17 @@ pub(crate) fn act(show: &mut Presentation, button: &ButtonLayer, cx: &mut Contex
 /// What's said of a button that types, in a show that runs no live terminals.
 const BUTTON_NO_TERMINALS: &str = "This show runs no live terminals, so this button types nothing.";
 
-/// The interactive things of the talk at `place`, `time` seconds after its slide appeared, whether
-/// or not they take a press now.
-fn interactive_things_at(document: &Entity<Document>, place: Place, time: f32, cx: &mut App) -> Vec<InteractiveThing> {
-    let moment = Moment { step: place.step, time };
+/// The interactive things of the talk at `place`, at `moment`, whether or not they take a press now.
+fn interactive_things_at(document: &Entity<Document>, place: Place, moment: Moment, cx: &mut App) -> Vec<InteractiveThing> {
     document.update(cx, |document, _| {
         let slide = document.shown_slide(place.slide);
         interactive_on(document, slide, moment)
     })
+}
+
+/// Whether any of `things` is an interactive component, which the pointer's moves are sent to.
+fn has_components(things: &[InteractiveThing]) -> bool {
+    things.iter().any(|thing| matches!(thing.kind, InteractiveKind::Component { .. }))
 }
 
 /// Where `position`, in the window, is on the slide drawn on `canvas`, in slide units. `None` until
@@ -690,15 +847,11 @@ fn show_on(
     canvas: &Entity<SlideCanvas>,
     document: &Entity<Document>,
     place: Place,
-    time: f32,
+    moment: Moment,
     cx: &mut App,
 ) -> Vec<LayerTiming> {
     let Some(scale) = canvas.read(cx).scale() else {
         return Vec::new();
-    };
-    let moment = Moment {
-        step: place.step,
-        time,
     };
     // Both from the one layout, as a component can give a layer at one moment and none at another.
     let (layers, timings) = document.update(cx, |document, _| {
@@ -738,7 +891,8 @@ fn catch_up(
         return None;
     }
     *drawn_time = time;
-    Some(show_on(canvas, &document, place, time, cx))
+    let moment = show.moment_at(place, time);
+    Some(show_on(canvas, &document, place, moment, cx))
 }
 
 /// Notifies the view once the slide's time reaches its next moment, unless that's already
@@ -963,10 +1117,7 @@ impl AudienceView {
     /// one with a click once that's reached, and nothing else. On a slide come to, every video
     /// starts from its start, and none plays on the slide left.
     fn play_videos(&mut self, document: &Entity<Document>, place: Place, time: f32, cx: &mut Context<Self>) {
-        let moment = Moment {
-            step: place.step,
-            time,
-        };
+        let moment = self.show.read(cx).moment_at(place, time);
         let videos: Vec<VideoLayer> = document.update(cx, |document, _| {
             let slide = document.shown_slide(place.slide);
             document.videos_at(slide, moment)
@@ -1005,10 +1156,7 @@ impl AudienceView {
     /// each a click has sent to one of its views, which flies there. On a slide come to, every
     /// model is back at its view, and none is drawn live on the slide left.
     fn show_models(&mut self, document: &Entity<Document>, place: Place, time: f32, cx: &mut Context<Self>) {
-        let moment = Moment {
-            step: place.step,
-            time,
-        };
+        let moment = self.show.read(cx).moment_at(place, time);
         let models: Vec<ModelLayer> = document.update(cx, |document, _| {
             let slide = document.shown_slide(place.slide);
             document.models_at(slide, moment)
@@ -1061,10 +1209,7 @@ impl AudienceView {
     /// once: the first of the slide shown, by their order on it, and then those readied for the
     /// next; the rest show their stills.
     fn play_recordings(&mut self, document: &Entity<Document>, place: Place, time: f32, cx: &mut Context<Self>) {
-        let moment = Moment {
-            step: place.step,
-            time,
-        };
+        let moment = self.show.read(cx).moment_at(place, time);
         let (terminals, pending, slide): (Vec<TerminalLayer>, bool, usize) = document.update(cx, |document, _| {
             let slide = document.shown_slide(place.slide);
             (document.terminals_at(slide, moment), document.terminal_pending(slide), slide)
@@ -1250,7 +1395,7 @@ impl AudienceView {
         let upcoming = self.show.update(cx, |show, cx| show.upcoming(cx)).filter(|upcoming| upcoming.slide != here);
         self.ready.retain(|(at, _)| upcoming.is_some_and(|upcoming| upcoming.slide == *at));
         let (Some(scale), Some(upcoming)) = (self.current.read(cx).scale(), upcoming) else { return };
-        let moment = Moment { step: upcoming.step, time: 0.0 };
+        let moment = self.show.read(cx).moment_at(upcoming, 0.0);
         let (terminals, pending, slide) = document.update(cx, |document, _| {
             let slide = document.shown_slide(upcoming.slide);
             document.layers_at(slide, moment, scale);
@@ -1321,7 +1466,8 @@ impl AudienceView {
             self.focus_handle.focus(window, cx);
         }
         self.swallow_click = keys || hit.is_some();
-        self.show.update(cx, |show, _| show.press_on(hit.as_ref(), PressedIn::Audience));
+        let at = slide_point(&self.current, event.position, cx);
+        self.show.update(cx, |show, cx| show.press_on(hit.as_ref(), at, PressedIn::Audience, cx));
         // A button under it looks pressed.
         cx.notify();
         self.turned = false;
@@ -1339,10 +1485,15 @@ impl AudienceView {
     /// outlines what it's over.
     fn drag(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         self.pointer_to(event.position, cx);
+        let at = slide_point(&self.current, event.position, cx);
+        if let Some(at) = at.filter(|_| has_components(&self.things)) {
+            let over = self.thing_at(event.position, cx);
+            self.show.update(cx, |show, cx| show.pointer_moved(over.as_ref(), at, PressedIn::Audience, cx));
+        }
         if event.pressed_button != Some(MouseButton::Left) {
             // A press let go of where this window didn't see it is for nothing.
             if self.show.read(cx).holds_press(PressedIn::Audience) {
-                self.show.update(cx, |show, cx| show.let_go(None, PressedIn::Audience, cx));
+                self.show.update(cx, |show, cx| show.let_go(None, at, PressedIn::Audience, cx));
             }
             self.end_turn(cx);
             return;
@@ -1366,7 +1517,8 @@ impl AudienceView {
     /// of over it, and it ends a drag on a model.
     fn let_go(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         let over = self.thing_at(position, cx);
-        self.show.update(cx, |show, cx| show.let_go(over.as_ref(), PressedIn::Audience, cx));
+        let at = slide_point(&self.current, position, cx);
+        self.show.update(cx, |show, cx| show.let_go(over.as_ref(), at, PressedIn::Audience, cx));
         self.end_turn(cx);
         cx.notify();
     }
@@ -1385,6 +1537,12 @@ impl AudienceView {
             return;
         }
         let hit = self.thing_at(event.position, cx);
+        if let Some(thing) = hit.as_ref().filter(|thing| matches!(thing.kind, InteractiveKind::Component { .. }))
+            && let Some(at) = slide_point(&self.current, event.position, cx)
+        {
+            self.show.update(cx, |show, cx| show.send_pointer(thing, at, PointerKind::Wheel { dy: steps }, cx));
+            return;
+        }
         let Some(model) = self.model_in_front(hit.as_ref()) else { return };
         self.make_live(&model, cx);
         let layer = model.layer;
@@ -1420,8 +1578,11 @@ impl AudienceView {
         }
         self.slide = place.slide;
         self.moves = self.show.update(cx, |show, cx| show.slide_moves(cx));
-        self.timings = show_on(&self.current, &document, place, time, cx);
-        self.things = interactive_things_at(&document, place, time, cx);
+        let moment = self.show.read(cx).moment_at(place, time);
+        self.timings = show_on(&self.current, &document, place, moment, cx);
+        self.things = interactive_things_at(&document, place, moment, cx);
+        // Both windows draw the one moment: what its components answered is taken in once.
+        self.show.update(cx, |show, cx| show.take_answers(cx));
         self.drawn_time = time;
         self.play_videos(&document, place, time, cx);
         self.show_models(&document, place, time, cx);
@@ -1433,7 +1594,7 @@ impl AudienceView {
                 &self.leaving,
                 &document,
                 arrival.left,
-                arrival.left_time,
+                Moment::at(arrival.left.step, arrival.left_time),
                 cx,
             );
         }
@@ -1566,8 +1727,7 @@ fn press_for_keys(show: &Entity<Presentation>, hit: Option<&InteractiveThing>, c
 }
 
 /// The terminals of `slide` at `moment` that run a command and are there at the place's step.
-fn live_terminals_at(document: &Entity<Document>, place: Place, time: f32, cx: &mut App) -> (Vec<TerminalLayer>, usize) {
-    let moment = Moment { step: place.step, time };
+fn live_terminals_at(document: &Entity<Document>, place: Place, moment: Moment, cx: &mut App) -> (Vec<TerminalLayer>, usize) {
     document.update(cx, |document, _| {
         let slide = document.shown_slide(place.slide);
         let on = document
@@ -1693,14 +1853,17 @@ impl PresenterView {
             self.slide = place.slide;
             self.notes_scroll.set_offset(Point::default());
         }
-        show_on(&self.current, &document, place, time, cx);
-        self.live_on = live_terminals_at(&document, place, time, cx).0;
-        self.things = interactive_things_at(&document, place, time, cx);
+        let moment = show.moment_at(place, time);
+        show_on(&self.current, &document, place, moment, cx);
+        self.live_on = live_terminals_at(&document, place, moment, cx).0;
+        self.things = interactive_things_at(&document, place, moment, cx);
+        self.show.update(cx, |show, cx| show.take_answers(cx));
         self.drawn_time = time;
         match upcoming {
             // What the next press brings, as it first looks.
             Some(upcoming) => {
-                show_on(&self.upcoming, &document, upcoming, 0.0, cx);
+                let moment = self.show.read(cx).moment_at(upcoming, 0.0);
+                show_on(&self.upcoming, &document, upcoming, moment, cx);
             }
             None => self
                 .upcoming
@@ -1752,7 +1915,8 @@ impl PresenterView {
         if on_slide && press_for_keys(&self.show, hit.as_ref(), cx) {
             self.focus_handle.focus(window, cx);
         }
-        self.show.update(cx, |show, _| show.press_on(hit.as_ref(), PressedIn::Presenter));
+        let at = slide_point(&self.current, event.position, cx);
+        self.show.update(cx, |show, cx| show.press_on(hit.as_ref(), at, PressedIn::Presenter, cx));
         cx.notify();
     }
 
@@ -1760,8 +1924,13 @@ impl PresenterView {
     /// see it is for nothing.
     fn pointer_to(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         self.pointer = Some(event.position);
+        let at = slide_point(&self.current, event.position, cx);
+        if let Some(at) = at.filter(|_| has_components(&self.things)) {
+            let over = self.thing_at(event.position, cx);
+            self.show.update(cx, |show, cx| show.pointer_moved(over.as_ref(), at, PressedIn::Presenter, cx));
+        }
         if event.pressed_button != Some(MouseButton::Left) && self.show.read(cx).holds_press(PressedIn::Presenter) {
-            self.show.update(cx, |show, cx| show.let_go(None, PressedIn::Presenter, cx));
+            self.show.update(cx, |show, cx| show.let_go(None, at, PressedIn::Presenter, cx));
         }
         if self.thing_at(event.position, cx).map(|thing| thing.source) != self.hovered {
             cx.notify();
@@ -1772,8 +1941,21 @@ impl PresenterView {
     /// of over it.
     fn let_go(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         let over = self.thing_at(position, cx);
-        self.show.update(cx, |show, cx| show.let_go(over.as_ref(), PressedIn::Presenter, cx));
+        let at = slide_point(&self.current, position, cx);
+        self.show.update(cx, |show, cx| show.let_go(over.as_ref(), at, PressedIn::Presenter, cx));
         cx.notify();
+    }
+
+    /// The wheel over an interactive component on the current slide is sent to it.
+    fn wheel(&mut self, event: &ScrollEvent, window: &Window, cx: &mut Context<Self>) {
+        let steps = f32::from(event.delta.pixel_delta(window.line_height()).y) / f32::from(window.line_height());
+        let hit = self.thing_at(event.position, cx).filter(|thing| matches!(thing.kind, InteractiveKind::Component { .. }));
+        if steps == 0.0 {
+            return;
+        }
+        if let (Some(thing), Some(at)) = (hit, slide_point(&self.current, event.position, cx)) {
+            self.show.update(cx, |show, cx| show.send_pointer(&thing, at, PointerKind::Wheel { dy: steps }, cx));
+        }
     }
 
     /// Draws the slide on `current` again if it moves and its time has changed since, and
@@ -1844,6 +2026,7 @@ impl Render for PresenterView {
                     .bg(black())
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| this.press(event, window, cx)))
                     .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| this.pointer_to(event, cx)))
+                    .on_scroll(cx.listener(|this, event: &ScrollEvent, window, cx| this.wheel(event, window, cx)))
                     .on_mouse_up(MouseButton::Left, cx.listener(|this, event: &MouseUpEvent, _, cx| this.let_go(event.position, cx)))
                     .on_mouse_up_out(MouseButton::Left, cx.listener(|this, event: &MouseUpEvent, _, cx| this.let_go(event.position, cx)))
                     .child(self.current.clone())

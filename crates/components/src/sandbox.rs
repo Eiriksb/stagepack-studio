@@ -25,6 +25,11 @@ pub const MAX_SCHEMA_STRING_BYTES: usize = 64;
 /// The most props a schema can list.
 pub const MAX_PROPS: usize = 64;
 
+/// The most an interactive component's state can be, as JSON, going in and coming out.
+pub const MAX_STATE_BYTES: usize = 64 * 1024;
+/// The first interface version whose components keep state.
+const STATE_VERSION: u32 = 2;
+
 /// The longest path of an asset that can be read. Far longer than any real one.
 pub const MAX_ASSET_PATH_BYTES: usize = 256;
 
@@ -52,6 +57,8 @@ pub enum ComponentError {
     Crashed,
     #[error("gave an answer that can't be read: {0}")]
     BadOutput(String),
+    #[error("This component's state is over 64 KiB.")]
+    StateTooLarge,
 }
 
 impl ComponentError {
@@ -65,6 +72,7 @@ impl ComponentError {
             ComponentError::OutOfMemory => "used too much memory",
             ComponentError::Crashed => "stopped working",
             ComponentError::BadOutput(_) => "gave an answer that can't be read",
+            ComponentError::StateTooLarge => "This component's state is over 64 KiB.",
         }
     }
 }
@@ -76,6 +84,8 @@ pub type Assets = Rc<dyn Fn(&str) -> Option<Vec<u8>>>;
 pub struct WasmComponent {
     module: Module,
     schema: ComponentSchema,
+    /// The interface version it says it speaks.
+    version: u32,
 }
 
 impl WasmComponent {
@@ -101,15 +111,31 @@ impl WasmComponent {
         let schema = running.export::<(), u64>("schema")?;
         let packed = running.call(&schema, ())?;
         let schema = serde_json::from_slice(&running.answer(packed)?).map_err(|error| ComponentError::BadOutput(error.to_string()))?;
+        let mut schema: ComponentSchema = schema;
         check_schema(&schema)?;
-        Ok(WasmComponent { module, schema })
+        // Only a module of version 2 or later can take presses.
+        schema.interactive &= version >= STATE_VERSION;
+        Ok(WasmComponent { module, schema, version })
     }
 
     pub fn schema(&self) -> &ComponentSchema {
         &self.schema
     }
 
+    /// A version-1 module is given, and keeps, no state and no events, so it's sent exactly what it
+    /// was before there were any.
     pub fn render(&self, input: &RenderInput, assets: Assets) -> Result<RenderOutput, ComponentError> {
+        let keeps_state = self.version >= STATE_VERSION;
+        if keeps_state && input.state.as_ref().is_some_and(|state| state_bytes(state) > MAX_STATE_BYTES) {
+            return Err(ComponentError::StateTooLarge);
+        }
+        let plain;
+        let input = if keeps_state {
+            input
+        } else {
+            plain = input.clone().with_state(None, Vec::new());
+            &plain
+        };
         let input = serde_json::to_vec(input).expect("render input is always JSON");
         let len = u32::try_from(input.len()).map_err(|_| ComponentError::TooLarge)?;
         let mut running = Running::start(&self.module, assets)?;
@@ -123,11 +149,22 @@ impl WasmComponent {
         let packed = running.call(&render, (at, len))?;
         let answer = running.answer(packed)?;
         let mut output: RenderOutput = serde_json::from_slice(&answer).map_err(|error| ComponentError::BadOutput(error.to_string()))?;
+        if !keeps_state {
+            output.state = None;
+        }
+        if output.state.as_ref().is_some_and(|state| state_bytes(state) > MAX_STATE_BYTES) {
+            return Err(ComponentError::StateTooLarge);
+        }
 
         Measure::default().element(&output.element, 1)?;
         keep_pictures_in_assets(&mut output.element);
         Ok(output)
     }
+}
+
+/// How many bytes `state` is as JSON.
+fn state_bytes(state: &serde_json::Value) -> usize {
+    serde_json::to_vec(state).map_or(usize::MAX, |bytes| bytes.len())
 }
 
 /// One engine for the process, with one clock that every running component is timed by.
@@ -388,6 +425,10 @@ impl Measure {
             Element::Stack { children, .. } => children.iter().try_for_each(|child| self.element(child, depth + 1)),
             Element::Shape { child: Some(child), .. } => self.element(child, depth + 1),
             Element::Canvas { items, .. } => items.iter().try_for_each(|item| self.element(&item.element, depth + 1)),
+            Element::Hit { name, child } => {
+                self.text(name)?;
+                self.element(child, depth + 1)
+            }
             _ => Ok(()),
         }
     }
@@ -409,6 +450,7 @@ fn keep_pictures_in_assets(element: &mut Element) {
         Element::Stack { children, .. } => children.iter_mut().for_each(keep_pictures_in_assets),
         Element::Shape { child: Some(child), .. } => keep_pictures_in_assets(child),
         Element::Canvas { items, .. } => items.iter_mut().for_each(|item| keep_pictures_in_assets(&mut item.element)),
+        Element::Hit { child, .. } => keep_pictures_in_assets(child),
         _ => {}
     }
 }

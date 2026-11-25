@@ -1,11 +1,15 @@
 //! The things on a slide in the show that a press is for, rather than the show: a press, a drag or
 //! the wheel on one goes to it, and the show doesn't move. Both of a show's windows find them the
-//! same way.
+//! same way. And what an interactive component of the talk's keeps while its slide is shown.
 
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
 use gpui_kit::Point;
-use slides_engine::{BUTTON_ON_NOTHING, BUTTON_STEP_PAST, ButtonAction, ButtonOn, Moment, Rect};
+use slides_engine::{BUTTON_STEP_PAST, ButtonAction, ButtonOn, ComponentAnswer, ComponentFeed, Moment, Rect};
+use toolkit::{Event, PointerKind};
 
 use crate::document::Document;
 use crate::live_terminal::{LiveId, untypable};
@@ -20,6 +24,9 @@ pub(crate) enum InteractiveKind {
     Terminal(LiveId),
     /// A model, by the place of its layer among the slide's: a drag turns it, the wheel zooms it.
     Model(usize),
+    /// A talk's own component that says it's interactive: what the pointer does on it, and a
+    /// button's `do`, are sent to it. `hits` are what it named under the pointer, and where.
+    Component { hits: Vec<(String, Rect)> },
     /// A plain box the tests put on a slide, which says what reached it.
     #[cfg(feature = "test-hooks")]
     StandIn,
@@ -59,7 +66,11 @@ pub(crate) fn interactive_on(document: &mut Document, slide: usize, moment: Mome
         let on = button.on;
         (button.layer, InteractiveThing { source: button.source, rect: on.rect, rotate: on.rotate, kind: InteractiveKind::Button, id: on.id })
     });
-    let mut things: Vec<(usize, InteractiveThing)> = terminals.chain(models).chain(buttons).collect();
+    let components = document.components_at(slide, moment).into_iter().filter(|component| shown(component.click)).map(|component| {
+        let on = component.on;
+        (component.layer, InteractiveThing { source: component.source, rect: on.rect, rotate: on.rotate, kind: InteractiveKind::Component { hits: on.hits }, id: component.id })
+    });
+    let mut things: Vec<(usize, InteractiveThing)> = terminals.chain(models).chain(buttons).chain(components).collect();
     things.sort_by_key(|(layer, _)| *layer);
     things.into_iter().map(|(_, thing)| thing).collect()
 }
@@ -76,6 +87,9 @@ pub(crate) enum Press {
     Step(u32),
     /// Type `text`, then Enter, into the live terminal on the slide whose `id` is `terminal`.
     Run { text: String, terminal: String },
+    /// Send the action `name`, with `value`, to the interactive component on the slide whose `id`
+    /// is `target`.
+    Do { name: String, target: String, value: String },
     /// Nothing, for this, which the status line says.
     Refused(String),
 }
@@ -98,13 +112,200 @@ pub(crate) fn press_button(button: &ButtonOn, steps: u32) -> Press {
     match action {
         ButtonAction::Step(step) if *step > steps => Press::Refused(BUTTON_STEP_PAST.to_string()),
         ButtonAction::Step(step) => Press::Step(*step),
-        // What a button acts on comes with plan H1 task 5.
-        ButtonAction::Do { .. } => Press::Refused(BUTTON_ON_NOTHING.to_string()),
+        ButtonAction::Do { action, target, value } => Press::Do { name: action.clone(), target: target.clone(), value: value.clone() },
         ButtonAction::Run { text, .. } if text.is_empty() => Press::Refused(BUTTON_TEXT_EMPTY.to_string()),
         ButtonAction::Run { text, terminal } => match untypable(text) {
             Some(why) => Press::Refused(why.to_string()),
             None => Press::Run { text: text.clone(), terminal: terminal.clone() },
         },
+    }
+}
+
+/// What the pointer doing `kind` at `at` on the slide, in slide units, is to the interactive
+/// component `thing`: where it is in the component's own units, with its box's top-left at 0,0, and
+/// what the component named in front under it. `None` if `thing` is no component.
+pub(crate) fn pointer_event(thing: &InteractiveThing, at: Point<f32>, kind: PointerKind) -> Option<Event> {
+    let InteractiveKind::Component { hits } = &thing.kind else { return None };
+    let rect = thing.rect;
+    let (middle_x, middle_y) = (rect.x + rect.w / 2., rect.y + rect.h / 2.);
+    let (sin, cos) = (-thing.rotate).to_radians().sin_cos();
+    let (dx, dy) = (at.x - middle_x, at.y - middle_y);
+    let (x, y) = (dx * cos - dy * sin + rect.w / 2., dx * sin + dy * cos + rect.h / 2.);
+    let inside = |hit: &Rect| x >= hit.x && x <= hit.x + hit.w && y >= hit.y && y <= hit.y + hit.h;
+    let hit = hits.iter().rev().find(|(_, rect)| inside(rect)).map(|(name, _)| name.clone());
+    Some(Event::Pointer { kind, x, y, hit })
+}
+
+/// The most events that go to one render of a component.
+pub const MAX_EVENTS: usize = 64;
+
+/// The least time between two renders of one component from what reached it: 60 a second.
+pub const RENDER_EVERY: Duration = Duration::from_nanos(1_000_000_000 / 60);
+
+/// What one interactive component has, while its slide is shown.
+#[derive(Default)]
+struct Held {
+    /// Its tag as it was written when something was first sent to it: an edit to it starts it afresh.
+    text: String,
+    /// What its last render kept.
+    state: Option<serde_json::Value>,
+    /// What reached it since it was last fed.
+    queue: Vec<Event>,
+    /// What it was last given, which it's drawn from until it's given more.
+    fed: Option<ComponentFeed>,
+    /// Whether what came of that is yet to be known: it's given no more until it is.
+    waiting: bool,
+    last_fed: Option<Instant>,
+    /// Whether its render failed while it was fed: it's sent nothing more, and shows its problem.
+    failed: bool,
+    /// How many times it's been drawn from what it was fed.
+    renders: usize,
+}
+
+/// What [`StateStore::feed_due`] did: whether it gave a component more to draw from, and how long
+/// until it can give one that has to wait.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Fed {
+    pub fed: bool,
+    pub wait: Option<Duration>,
+}
+
+/// What a slide's interactive components have, by where their tags are written: the state each
+/// keeps, and what reached it since its last render. It lives while the slide is shown: a show holds
+/// one, and so does whatever else tries them. Nothing of it is written to the talk.
+#[derive(Default)]
+pub struct StateStore {
+    held: HashMap<Range<usize>, Held>,
+    /// How many feeds it has made: each is told from every other by it.
+    made: u64,
+}
+
+impl StateStore {
+    /// Sends `event` to the component whose tag, written `text`, is at `source`. Of the moves since
+    /// it was last fed only the last is kept, and at most [`MAX_EVENTS`]: a move goes first, and
+    /// past them what comes is dropped. A component whose render failed is sent nothing.
+    pub fn send(&mut self, source: &Range<usize>, text: &str, event: Event) {
+        let held = self.held.entry(source.clone()).or_insert_with(|| Held { text: text.to_string(), ..Held::default() });
+        if held.failed {
+            return;
+        }
+        let moves = |event: &Event| matches!(event, Event::Pointer { kind: PointerKind::Move, .. });
+        if moves(&event) {
+            held.queue.retain(|queued| !moves(queued));
+        }
+        held.queue.push(event);
+        if held.queue.len() > MAX_EVENTS {
+            match held.queue.iter().position(moves) {
+                Some(at) => held.queue.remove(at),
+                None => held.queue.pop().expect("the queue isn't empty"),
+            };
+        }
+    }
+
+    /// Gives each component what reached it, if it's been at least [`RENDER_EVERY`] since it was
+    /// last given something, at `now`, and what came of that is known.
+    pub fn feed_due(&mut self, now: Instant) -> Fed {
+        let mut done = Fed::default();
+        for held in self.held.values_mut() {
+            if held.queue.is_empty() || held.waiting || held.failed {
+                continue;
+            }
+            if let Some(since) = held.last_fed.map(|at| now.saturating_duration_since(at))
+                && since < RENDER_EVERY
+            {
+                let wait = RENDER_EVERY - since;
+                done.wait = Some(done.wait.map_or(wait, |other| other.min(wait)));
+                continue;
+            }
+            self.made += 1;
+            let events = std::mem::take(&mut held.queue);
+            let mut hasher = DefaultHasher::new();
+            (self.made, serde_json::to_string(&(&held.state, &events)).unwrap_or_default()).hash(&mut hasher);
+            held.fed = Some(ComponentFeed { state: held.state.clone(), events, hash: hasher.finish().max(1) });
+            held.waiting = true;
+            held.last_fed = Some(now);
+            done.fed = true;
+        }
+        done
+    }
+
+    /// What each component is drawn from, for the deck.
+    pub fn feeds(&self) -> HashMap<Range<usize>, ComponentFeed> {
+        self.held.iter().filter_map(|(source, held)| Some((source.clone(), held.fed.clone()?))).collect()
+    }
+
+    /// The state the slide is drawn at, for its [`Moment`]: 0 while nothing has been fed.
+    pub fn state(&self) -> u64 {
+        let mut fed: Vec<(usize, usize, u64)> = self.held.iter().filter_map(|(source, held)| Some((source.start, source.end, held.fed.as_ref()?.hash))).collect();
+        if fed.is_empty() {
+            return 0;
+        }
+        fed.sort_unstable();
+        let mut hasher = DefaultHasher::new();
+        fed.hash(&mut hasher);
+        hasher.finish().max(1)
+    }
+
+    /// Takes in what came of drawing components from their feeds: the state each keeps, or that it
+    /// failed. Says whether any of them can be fed again.
+    pub fn answered(&mut self, answers: Vec<ComponentAnswer>) -> bool {
+        let mut changed = false;
+        for answer in answers {
+            let Some(held) = self.held.get_mut(&answer.source) else { continue };
+            if held.fed.as_ref().is_none_or(|fed| fed.hash != answer.hash) {
+                continue;
+            }
+            held.renders += 1;
+            // Drawn again from the same feed, it says what it said before.
+            if !std::mem::take(&mut held.waiting) {
+                continue;
+            }
+            changed = true;
+            match answer.state {
+                Ok(Some(state)) => held.state = Some(state),
+                Ok(None) => {}
+                Err(_) => {
+                    held.failed = true;
+                    held.queue.clear();
+                }
+            }
+        }
+        changed
+    }
+
+    /// Forgets everything: the slide was left.
+    pub fn clear(&mut self) {
+        self.held.clear();
+    }
+
+    /// After an edit of the talk, now `source`: keeps what each component has only if it's still
+    /// one of `interactive` and its tag is written as it was, where it was.
+    pub fn keep_unchanged(&mut self, source: &str, interactive: &[Range<usize>]) {
+        self.held.retain(|at, held| interactive.contains(at) && source.get(at.clone()) == Some(held.text.as_str()));
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
+
+    /// How many times the component at `source` has been drawn from what it was fed.
+    pub fn renders(&self, source: &Range<usize>) -> usize {
+        self.held.get(source).map_or(0, |held| held.renders)
+    }
+
+    /// How many events wait for the component at `source`.
+    pub fn queued(&self, source: &Range<usize>) -> usize {
+        self.held.get(source).map_or(0, |held| held.queue.len())
+    }
+
+    /// What the component at `source` was last given.
+    pub fn last_fed(&self, source: &Range<usize>) -> Option<&ComponentFeed> {
+        self.held.get(source)?.fed.as_ref()
+    }
+
+    /// What the component at `source` keeps.
+    pub fn state_of(&self, source: &Range<usize>) -> Option<&serde_json::Value> {
+        self.held.get(source)?.state.as_ref()
     }
 }
 

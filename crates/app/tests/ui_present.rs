@@ -227,7 +227,7 @@ fn pixels_at(
     let scale = cx
         .read(|cx| canvas.read(cx).scale())
         .expect("it has measured itself");
-    let moment = Moment { step, time: 0.0 };
+    let moment = Moment::at(step, 0.0);
     let layers = cx.update(|cx| {
         show.document
             .update(cx, |document, _| document.layers_at(slide, moment, scale))

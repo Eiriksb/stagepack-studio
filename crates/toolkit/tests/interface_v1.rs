@@ -27,9 +27,21 @@ fn holds<T: Serialize + DeserializeOwned + PartialEq + Debug>(literal: &str, val
     assert_eq!(serde_json::to_string(&parsed).unwrap(), literal);
 }
 
+/// The app speaks version 2 now, and what it sends a version-1 module, and reads back from one,
+/// is the same text as before: no state, no events, and no `interactive` in its schema.
 #[test]
-fn the_version_is_one() {
-    assert_eq!(ABI_VERSION, 1);
+fn a_v1_module_still_runs() {
+    assert_eq!(ABI_VERSION, 2);
+    let input: RenderInput = serde_json::from_str(INPUT).unwrap();
+    assert_eq!(input.state, None);
+    assert!(input.events.is_empty());
+    assert_eq!(serde_json::to_string(&input).unwrap(), INPUT);
+    let output: RenderOutput = serde_json::from_str(OUTPUT).unwrap();
+    assert_eq!(output.state, None);
+    assert_eq!(serde_json::to_string(&output).unwrap(), OUTPUT);
+    let schema: ComponentSchema = serde_json::from_str(SCHEMA).unwrap();
+    assert!(!schema.interactive);
+    assert_eq!(serde_json::to_string(&schema).unwrap(), SCHEMA);
 }
 
 #[test]

@@ -8,11 +8,12 @@ mod props;
 mod wasm;
 
 pub use color::{Color, Theme};
-pub use element::{at, canvas, icon, path, picture, problem, shape, text, Children, Element, Placed, ShapeKind, TextAlign};
+pub use element::{at, canvas, hit, icon, path, picture, problem, shape, text, Children, Element, Placed, ShapeKind, TextAlign};
 #[doc(hidden)]
 pub use element::stack;
 pub use interface::{
-    asset_path_allowed, ComponentSchema, CtxData, PropField, PropKind, RenderInput, RenderOutput, ABI_VERSION, RESERVED_NAMES,
+    asset_path_allowed, ComponentSchema, CtxData, Event, PointerKind, PropField, PropKind, RenderInput, RenderOutput, ABI_VERSION,
+    RESERVED_NAMES,
 };
 pub use props::{Ctx, DataFile, NativeComponent, PictureFile, Prop, Props, Registry};
 pub use toolkit_macros::{component, Prop};
@@ -27,8 +28,8 @@ pub mod __private {
 
 pub mod prelude {
     pub use crate::{
-        asset_path_allowed, at, canvas, col, component, icon, path, picture, problem, row, shape, text, Children, Color,
-        ComponentSchema, Ctx, CtxData, DataFile, Element, NativeComponent, PictureFile, Placed, Prop, PropField, PropKind,
-        Props, Registry, RenderInput, RenderOutput, ShapeKind, TextAlign, Theme, ABI_VERSION,
+        asset_path_allowed, at, canvas, col, component, hit, icon, path, picture, problem, row, shape, text, Children, Color,
+        ComponentSchema, Ctx, CtxData, DataFile, Element, Event, NativeComponent, PictureFile, Placed, PointerKind, Prop,
+        PropField, PropKind, Props, Registry, RenderInput, RenderOutput, ShapeKind, TextAlign, Theme, ABI_VERSION,
     };
 }

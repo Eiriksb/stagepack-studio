@@ -236,6 +236,7 @@ fn turned_picture_layer(width: u32, height: u32, bgra: &[u8], opaque: bool, rect
         model: None,
         terminal: None,
         button: None,
+        component: None,
         id: None,
     };
     let layer = draw_layer(&spec, scale, |_, _, _| {});
@@ -374,7 +375,7 @@ mod tests {
 
     /// A spec over `rect` with nothing in it.
     fn spec(rect: Rect) -> LayerSpec {
-        LayerSpec { source: None, rect, rotate: 0.0, items: Vec::new().into(), click: None, enter: Enter::Appear, native: Vec::new(), is_title: false, varies: false, video: None, model: None, terminal: None, button: None, id: None }
+        LayerSpec { source: None, rect, rotate: 0.0, items: Vec::new().into(), click: None, enter: Enter::Appear, native: Vec::new(), is_title: false, varies: false, video: None, model: None, terminal: None, button: None, component: None, id: None }
     }
 
     #[test]

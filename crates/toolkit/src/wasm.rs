@@ -45,17 +45,12 @@ pub fn render(ptr: u32, len: u32, component: NativeComponent) -> u64 {
     // The app made this with `alloc`, and passes it once.
     let input = unsafe { take(ptr, len) };
     let output = match serde_json::from_slice::<RenderInput>(&input) {
-        Ok(RenderInput { props, ctx }) => {
-            let ctx = Ctx::new(ctx, &asset);
+        Ok(RenderInput { props, ctx, state, events }) => {
+            let ctx = Ctx::with_input(ctx, state, events, &asset);
             let element = (component.render)(&Props(props), &ctx);
             ctx.finish(element)
         }
-        Err(_) => RenderOutput {
-            element: problem("This component can't read what the app sent it"),
-            steps: 0,
-            stepped: false,
-            animated: false,
-        },
+        Err(_) => RenderOutput::new(problem("This component can't read what the app sent it"), 0, false, false),
     };
     answer(&output)
 }

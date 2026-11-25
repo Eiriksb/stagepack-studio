@@ -11,7 +11,7 @@ pub use compile::{compile, compile_with_limit, Bundle, COMPILE_TIME_LIMIT};
 pub use index::{safe_stem, source_hash, BuildEntry, BuildIndex, INDEX_FILE};
 pub use sandbox::{
     Assets, ComponentError, WasmComponent, MAX_ASSET_PATH_BYTES, MAX_ELEMENTS, MAX_ELEMENT_DEPTH, MAX_MODULE_BYTES, MAX_OUTPUT_BYTES, MAX_PROPS,
-    MAX_SCHEMA_STRING_BYTES, MAX_TEXT_BYTES, MEMORY_LIMIT_BYTES, RENDER_TIME_LIMIT,
+    MAX_SCHEMA_STRING_BYTES, MAX_STATE_BYTES, MAX_TEXT_BYTES, MEMORY_LIMIT_BYTES, RENDER_TIME_LIMIT,
 };
 pub use source_check::{check_source, component_tag, SourceInfo};
 

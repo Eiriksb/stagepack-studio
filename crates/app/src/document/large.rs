@@ -946,6 +946,23 @@ impl Document {
         guarded(|| self.deck.buttons_at(index, moment)).unwrap_or_default()
     }
 
+    /// The interactive components on slide `index` at `moment`, among its layers as the show draws
+    /// them then.
+    pub fn components_at(&mut self, index: usize, moment: slides_engine::Moment) -> Vec<slides_engine::ComponentLayer> {
+        guarded(|| self.deck.components_at(index, moment)).unwrap_or_default()
+    }
+
+    /// What each interactive component, by where its tag is written, is given when it's next drawn
+    /// at a moment with state: see [`slides_engine::Deck::feed_components`].
+    pub fn feed_components(&mut self, feeds: std::collections::HashMap<std::ops::Range<usize>, slides_engine::ComponentFeed>) {
+        self.deck.feed_components(feeds);
+    }
+
+    /// What came of drawing interactive components from their feeds since this was last asked.
+    pub fn take_component_answers(&mut self) -> Vec<slides_engine::ComponentAnswer> {
+        self.deck.take_component_answers()
+    }
+
     /// The one thing selected on the slide shown, if it's a terminal recording placed on it.
     pub fn selected_terminal(&mut self) -> Option<TerminalLayer> {
         let selected = self.selected()?.clone();

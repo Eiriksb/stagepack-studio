@@ -167,6 +167,12 @@ pub(crate) struct Flow<'a, 'env> {
     tables: HashMap<NodeId, (Range<usize>, Vec<Vec<NodeId>>)>,
     /// Where `draw` found those, for the editor.
     drawn: LayerText,
+    /// The nodes an interactive component named, by the names it gave them.
+    pub(crate) hit_names: HashMap<NodeId, String>,
+    /// Where `draw` found those, in layer coordinates, in the order they're drawn.
+    hits: Vec<(String, Rect)>,
+    /// The state the tag laid out is drawn from, if it's an interactive component: 0 for none yet.
+    pub(crate) interactive: Option<u64>,
 }
 
 /// A layer's drawing, what it is for export, and where its text is.
@@ -174,6 +180,10 @@ pub(crate) struct Drawing {
     pub items: Vec<DisplayItem>,
     pub native: Vec<NativeElement>,
     pub text: LayerText,
+    /// What an interactive component named under the pointer, and where, in the order drawn.
+    pub hits: Vec<(String, Rect)>,
+    /// The state an interactive component is drawn from, if the layer is one: 0 for none yet.
+    pub interactive: Option<u64>,
 }
 
 /// A column with the gap between blocks.
@@ -290,6 +300,9 @@ impl<'a, 'env> Flow<'a, 'env> {
             blocks: HashMap::new(),
             tables: HashMap::new(),
             drawn: LayerText::default(),
+            hit_names: HashMap::new(),
+            hits: Vec::new(),
+            interactive: None,
         }
     }
 
@@ -300,7 +313,7 @@ impl<'a, 'env> Flow<'a, 'env> {
         let mut items = Vec::new();
         self.draw(root, (0.0, 0.0), &mut items);
         let native = self.native(root, (0.0, 0.0));
-        Drawing { items, native, text: self.drawn }
+        Drawing { items, native, text: self.drawn, hits: self.hits, interactive: self.interactive }
     }
 
     /// What `node` and its children are, for export. Call it once, after laying out.
@@ -699,6 +712,9 @@ impl<'a, 'env> Flow<'a, 'env> {
         }
         if let Some(range) = self.blocks.get(&node) {
             self.drawn.blocks.push(DrawnBlock { range: range.clone(), rect: Rect { x, y, w, h } });
+        }
+        if let Some(name) = self.hit_names.get(&node) {
+            self.hits.push((name.clone(), Rect { x, y, w, h }));
         }
         if let Some((range, grid)) = self.tables.get(&node) {
             let cells = grid

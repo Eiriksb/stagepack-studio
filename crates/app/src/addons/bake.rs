@@ -121,14 +121,14 @@ pub fn bake_within(deck: &mut Deck, most_bytes: u64, most_files: usize) -> (Bund
             let Some(whole) = picture_at(deck, None) else { continue };
             let changes = varying.contains(&tag.name);
             let animated = changes && timeline.animated && {
-                let start = picture_at(deck, Some(Moment { step: 0, time: 0.0 }));
-                start != picture_at(deck, Some(Moment { step: 0, time: LATER }))
+                let start = picture_at(deck, Some(Moment::at(0, 0.0)));
+                start != picture_at(deck, Some(Moment::at(0, LATER)))
             };
             let mut steps = Vec::new();
             if changes && !animated && timeline.steps > 0 {
                 let mut pictures: Vec<(u32, Vec<u8>)> = Vec::new();
                 for step in 0..=timeline.steps.min(MOST_STEPS) {
-                    let Some(drawn) = picture_at(deck, Some(Moment { step, time: 0.0 })) else { continue };
+                    let Some(drawn) = picture_at(deck, Some(Moment::at(step, 0.0))) else { continue };
                     if pictures.last().is_none_or(|(_, last)| *last != drawn) {
                         pictures.push((step, drawn));
                     }

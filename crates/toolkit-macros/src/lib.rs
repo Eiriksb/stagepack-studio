@@ -1,5 +1,6 @@
 //! `#[component]` turns a function returning an `Element` into a `NativeComponent`, and
-//! `#[derive(Prop)]` turns an enum into a choice between its variants.
+//! `#[derive(Prop)]` turns an enum into a choice between its variants. `#[component(interactive)]`
+//! makes one that takes presses and actions in the show, and keeps state.
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
@@ -27,8 +28,19 @@ fn kind_of(ty: &Type) -> Kind {
     }
 }
 
+/// The interface version a component built now says it speaks: 2 for an interactive one, which
+/// needs it, and 1 for any other, so that it runs in any app that runs version 1.
+const PLAIN_VERSION: u32 = 1;
+const INTERACTIVE_VERSION: u32 = 2;
+
 #[proc_macro_attribute]
-pub fn component(_args: TokenStream, input: TokenStream) -> TokenStream {
+pub fn component(args: TokenStream, input: TokenStream) -> TokenStream {
+    let interactive = match args.to_string().trim() {
+        "" => false,
+        "interactive" => true,
+        _ => return quote!(compile_error!("a component can only be `#[component]` or `#[component(interactive)]`");).into(),
+    };
+    let version = if interactive { INTERACTIVE_VERSION } else { PLAIN_VERSION };
     let function = parse_macro_input!(input as ItemFn);
     let name = &function.sig.ident;
     let constructor = format_ident!("{}_component", name);
@@ -75,7 +87,7 @@ pub fn component(_args: TokenStream, input: TokenStream) -> TokenStream {
         #[allow(non_snake_case)]
         pub fn #constructor() -> ::toolkit::NativeComponent {
             fn schema() -> ::toolkit::ComponentSchema {
-                ::toolkit::ComponentSchema::new(#tag, ::std::vec![#(#fields),*], #children)
+                ::toolkit::ComponentSchema::new(#tag, ::std::vec![#(#fields),*], #children).with_interactive(#interactive)
             }
             fn render(props: &::toolkit::Props, ctx: &::toolkit::Ctx) -> ::toolkit::Element {
                 #name(#(#call_args),*)
@@ -88,7 +100,7 @@ pub fn component(_args: TokenStream, input: TokenStream) -> TokenStream {
         const _: () = {
             #[unsafe(no_mangle)]
             pub extern "C" fn abi_version() -> u32 {
-                ::toolkit::ABI_VERSION
+                #version
             }
 
             #[unsafe(no_mangle)]

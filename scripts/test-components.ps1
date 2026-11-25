@@ -14,6 +14,8 @@ try {
     if ($LASTEXITCODE -ne 0) { $status = 1 }
     & cargo test -p stagepack-studio --test ai_tool --no-fail-fast
     if ($LASTEXITCODE -ne 0) { $status = 1 }
+    & cargo test -p stagepack-studio --test ui_interactive --no-fail-fast
+    if ($LASTEXITCODE -ne 0) { $status = 1 }
     & cargo test -p slides-format --test wasm_build --no-fail-fast -- --ignored
     if ($LASTEXITCODE -ne 0) { $status = 1 }
     # The Slidev add-on, built for WebAssembly: run as the app runs it, signed as it's shipped,

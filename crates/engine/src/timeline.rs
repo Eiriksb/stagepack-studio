@@ -41,16 +41,25 @@ pub struct SlideTimeline {
     pub animated: bool,
 }
 
-/// A point in the playing of a slide: how many clicks it has had, and the seconds since it appeared.
+/// A point in the playing of a slide: how many clicks it has had, the seconds since it appeared,
+/// and the state its interactive components are drawn from, which is 0 until any is given some.
+/// Their layers are drawn from the feeds given the deck while it isn't 0: each different one
+/// is a different moment.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Moment {
     pub step: u32,
     pub time: f32,
+    pub state: u64,
 }
 
 impl Moment {
     /// The slide as it is on arriving at it.
-    pub const START: Moment = Moment { step: 0, time: 0.0 };
+    pub const START: Moment = Moment { step: 0, time: 0.0, state: 0 };
+
+    /// Click step `step`, `time` seconds after the slide appeared, with no state.
+    pub const fn at(step: u32, time: f32) -> Moment {
+        Moment { step, time, state: 0 }
+    }
 }
 
 /// What the components of a slide, or of one layer, looked at to draw it.

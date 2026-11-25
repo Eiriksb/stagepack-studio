@@ -77,7 +77,7 @@ fn deck(source: &str) -> Deck {
 }
 
 fn at_step(step: u32) -> Moment {
-    Moment { step, time: 0.0 }
+    Moment::at(step, 0.0)
 }
 
 /// Slide 0 of `source` laid out at `moment`.
@@ -160,7 +160,7 @@ fn the_same_moment_is_not_drawn_twice() {
 fn a_slide_with_nothing_varying_is_laid_out_once() {
     let mut d = deck("<Rows />\n\n<Box x=\"0\" y=\"0\" w=\"100\" h=\"100\" click=\"2\" />\n");
     let before = probes::ROWS_RENDERED.get();
-    let layers: Vec<_> = (0..3).map(|step| d.layers_at(0, Moment { step, time: step as f32 }, 0.5)).collect();
+    let layers: Vec<_> = (0..3).map(|step| d.layers_at(0, Moment::at(step, step as f32), 0.5)).collect();
     d.specs(0);
     assert_eq!(probes::ROWS_RENDERED.get() - before, 1);
     assert!(layers.windows(2).all(|pair| pair[0].iter().zip(&pair[1]).all(|(a, b)| Arc::ptr_eq(a, b))));
@@ -183,10 +183,10 @@ fn the_whole_slide_is_its_last_step() {
 
 #[test]
 fn the_time_reaches_the_component() {
-    assert_eq!(texts_of(&lay_out_at("<Clock />\n", Moment { step: 0, time: 1.5 }).layers), ["1.5"]);
+    assert_eq!(texts_of(&lay_out_at("<Clock />\n", Moment::at(0, 1.5)).layers), ["1.5"]);
     let mut d = deck("<Clock />\n");
     let start = d.layers_at(0, Moment::START, 0.5);
-    let later = d.layers_at(0, Moment { step: 0, time: 1.5 }, 0.5);
+    let later = d.layers_at(0, Moment::at(0, 1.5), 0.5);
     assert_ne!(start[1].pixmap.data(), later[1].pixmap.data());
 }
 
@@ -204,7 +204,7 @@ fn a_slide_that_moves_says_so() {
 fn a_slide_that_moves_is_still_at_time_zero_for_an_export() {
     let mut d = deck("<Clock />\n");
     // Another moment first, so that time 0 isn't simply the last one laid out.
-    let _ = d.layers_at(0, Moment { step: 0, time: 1.5 }, 0.5);
+    let _ = d.layers_at(0, Moment::at(0, 1.5), 0.5);
     assert_eq!(texts_of(d.specs(0)), ["0"]);
     assert!(d.notices_whole(0).is_empty());
 }

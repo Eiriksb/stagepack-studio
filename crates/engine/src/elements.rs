@@ -16,7 +16,7 @@ use slides_components::shortened;
 use crate::pictures::{ModelStill, Still, icon_pixmap, model_still_size};
 use crate::slide::{ALIGN_UNPLACED, MAX_SIZE, SLIDE_HEIGHT, SLIDE_WIDTH, is_positioned, placeholder_color};
 use crate::native::Semantic;
-use crate::talk_components::{Rendered, read_asset};
+use crate::talk_components::{ComponentAnswer, Rendered, read_asset};
 use crate::builtins::{BUTTON_IN_TEXT, BUTTON_TAG, button_colours, read_button_look};
 use crate::{Align, DisplayItem, LayoutEnv, NativeContent, Notice, PLACEMENT_ATTRS, PathStep, RegionDef, layout_by_name};
 
@@ -225,10 +225,28 @@ impl Flow<'_, '_> {
             return Some(output.element);
         }
         let name = &tag.name;
-        let Some(rendered) = self.env.components.render(name, &RenderInput::new(props, data)) else {
+        // An interactive component is drawn from its feed at a moment with state.
+        let feed = if moment.state != 0 { self.env.components.feed(&tag.range) } else { None };
+        let input = match &feed {
+            Some(feed) => RenderInput::new(props, data).with_state(feed.state.clone(), feed.events.clone()),
+            None => RenderInput::new(props, data),
+        };
+        let Some(rendered) = self.env.components.render(name, &input) else {
             self.notice(format!("There is no component called {name}"));
             return None;
         };
+        if self.env.components.is_interactive(name) {
+            self.interactive = Some(feed.as_ref().map_or(0, |feed| feed.hash));
+        }
+        if let Some(feed) = &feed {
+            let state = match &rendered {
+                Rendered::Output(output) => Ok(output.state.clone()),
+                Rendered::Failed(error) => Err(error.to_string()),
+                Rendered::NeedsBuilding => Err("needs building".to_string()),
+                Rendered::OutOfTime => Err(NOT_RUN.to_string()),
+            };
+            self.env.components.answer(ComponentAnswer { source: tag.range.clone(), hash: feed.hash, state });
+        }
         Some(match rendered {
             Rendered::Output(output) => {
                 if self.env.components.is_out_of_date(name) {
@@ -254,6 +272,7 @@ impl Flow<'_, '_> {
                 Some((picture.width() as f32, picture.height() as f32))
             }
             Element::Icon { size, .. } => Some((icon_side(*size), icon_side(*size))),
+            Element::Hit { child, .. } => self.natural_size(child),
             _ => None,
         }
     }
@@ -365,6 +384,12 @@ impl Flow<'_, '_> {
                 let message = shortened(message, MAX_NOTICE_CHARS);
                 self.notice(message.clone());
                 Some(self.placeholder(message, size_when_empty(0.0, 0.0, boxed)))
+            }
+            // Where it is is found once it's laid out.
+            Element::Hit { name, child } => {
+                let node = self.element(child, blocks, align, boxed)?;
+                self.hit_names.insert(node, name.clone());
+                Some(node)
             }
             Element::Children if self.place_children() => self.child_blocks(blocks, align),
             Element::Children => None,

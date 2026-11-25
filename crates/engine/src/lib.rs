@@ -39,7 +39,7 @@ pub use pictures::{DrawModel, MadeStill, MeasureVideo, PictureCache, PictureForm
 pub use render::*;
 pub use slide::*;
 pub use talk_components::{
-    COMPONENTS_FOLDER, ComponentInfo, ComponentState, MAX_ASSETS_REMEMBERED, MAX_COMPONENTS, MAX_INDEX_BYTES, MAX_SOURCE_BYTES, SLIDE_RENDER_BUDGET, SchemaLoad, TalkComponents,
+    COMPONENTS_FOLDER, ComponentAnswer, ComponentFeed, ComponentInfo, ComponentState, MAX_ASSETS_REMEMBERED, MAX_COMPONENTS, MAX_INDEX_BYTES, MAX_SOURCE_BYTES, SLIDE_RENDER_BUDGET, SchemaLoad, TalkComponents,
 };
 pub use terminal_screen::{TERMINAL_BAD_SIZE, TERMINAL_IN_TEXT, TERMINAL_NO_FILE, TERMINAL_ROW, screen_items, terminal_complaint, terminal_run_complaint, terminal_size};
 pub use text::*;

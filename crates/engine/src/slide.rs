@@ -13,7 +13,7 @@ use crate::placeholder::placeholder_items;
 use crate::text_geometry::{LayerText, RegionBox};
 use crate::{
     Align, ComponentAsks, DisplayItem, Enter, Fonts, LayerSpec, LayoutDef, Moment, Notice, PictureCache, Rect, RegionDef, TalkComponents, TalkFiles, TextRun,
-    Transition, VideoOn, ModelOn, TerminalOn, ButtonAction, ButtonOn, layout_by_name, shape_text,
+    Transition, VideoOn, ModelOn, TerminalOn, ButtonAction, ButtonOn, ComponentOn, layout_by_name, shape_text,
 };
 use crate::builtins::{BUTTON_IN_NOTHING, BUTTON_ON_NOTHING, BUTTON_STEP_PAST, BUTTON_TAG, button_fault_notice, read_button_action, read_button_look};
 use crate::terminal_screen::{LaidTerminal, TERMINAL_TAG, lay_out_terminal, read_terminal};
@@ -244,6 +244,7 @@ pub(crate) fn layout_slide_placed(talk: &Talk, index: usize, env: &mut LayoutEnv
                             model: None,
                             terminal: None,
                             button: None,
+                            component: None,
                             id: None,
                         });
                         texts.push(LayerText { region: Some((region.name, rect)), ..piece.text });
@@ -255,7 +256,7 @@ pub(crate) fn layout_slide_placed(talk: &Talk, index: usize, env: &mut LayoutEnv
         }
         let (drawing, varies) = noting_asks(env, |env| flow_region(blocks, region, rect.w, &theme, env, &mut notices));
         let (items, native) = (drawing.items, drawing.native);
-        layers.push(LayerSpec { source: Some(source), rect, rotate, items: items.into(), click, enter: timing.enter, native, is_title, varies, video: None, model: None, terminal: None, button: None, id: None });
+        layers.push(LayerSpec { source: Some(source), rect, rotate, items: items.into(), click, enter: timing.enter, native, is_title, varies, video: None, model: None, terminal: None, button: None, component: None, id: None });
         texts.push(LayerText { region: Some((region.name, rect)), ..drawing.text });
     }
     for block in &slide.blocks {
@@ -399,6 +400,7 @@ fn positioned_layer(tag: &Tag, placing: Option<&Placing>, theme: &Theme, env: &m
             rotate,
         }
     });
+    let component = drawing.interactive.map(|state| ComponentOn { hits: drawing.hits, rect, rotate, state });
     let layer = LayerSpec {
         source: Some(tag.range.clone()),
         rect,
@@ -413,6 +415,7 @@ fn positioned_layer(tag: &Tag, placing: Option<&Placing>, theme: &Theme, env: &m
         model,
         terminal: None,
         button,
+        component,
         id: place.id.clone(),
     };
     (layer, drawing.text)
@@ -443,6 +446,7 @@ fn terminal_layer(tag: &Tag, place: &TagPlace, placing: bool, theme: &Theme, env
         model: None,
         terminal: Some(TerminalOn { src: written.src, run: written.run, cols: written.cols, rows: written.rows, rect, rotate, stops, pending }),
         button: None,
+        component: None,
         id: place.id.clone(),
     }
 }
@@ -482,9 +486,10 @@ pub(crate) fn button_target_problem(on: &ButtonOn, layers: &[LayerSpec], steps: 
             let live = |spec: &LayerSpec| spec.id.as_deref() == Some(terminal.as_str()) && spec.terminal.as_ref().is_some_and(|on| on.run.is_some());
             (!layers.iter().any(live)).then_some(BUTTON_IN_NOTHING)
         }
-        // Nothing on a slide takes an action yet: a talk's own component will, once it can say
-        // it's interactive.
-        ButtonAction::Do { .. } => Some(BUTTON_ON_NOTHING),
+        ButtonAction::Do { target, .. } => {
+            let interactive = |spec: &LayerSpec| spec.id.as_deref() == Some(target.as_str()) && spec.component.is_some();
+            (!layers.iter().any(interactive)).then_some(BUTTON_ON_NOTHING)
+        }
         ButtonAction::Step(step) => (*step > steps).then_some(BUTTON_STEP_PAST),
     }
 }
@@ -693,6 +698,7 @@ pub(crate) fn empty_region_layer(region: &EmptyRegion, theme: &Theme, fonts: &mu
         model: None,
         terminal: None,
         button: None,
+        component: None,
         id: None,
     }
 }
@@ -714,6 +720,7 @@ fn error_layer(slide: &Slide, message: &str, theme: &Theme, fonts: &mut Fonts) -
         model: None,
         terminal: None,
         button: None,
+        component: None,
         id: None,
     }
 }
@@ -810,6 +817,7 @@ fn background(theme: &Theme) -> LayerSpec {
         model: None,
         terminal: None,
         button: None,
+        component: None,
         id: None,
     }
 }

@@ -719,7 +719,7 @@ fn a_placing_shows_without_changing_the_source() {
     assert_eq!((d.source(), d.slide_version(0)), (source.as_str(), version));
     assert!(Arc::ptr_eq(&thumbnail, &d.thumbnail(0, 320).unwrap()), "the thumbnail is the source's");
     let steps = d.timeline(0).steps;
-    assert!(same_pixels(&d.layers_at(0, Moment { step: steps, time: 0.0 }, SCALE), &before[..shown.len()]), "a moment is the source's");
+    assert!(same_pixels(&d.layers_at(0, Moment::at(steps, 0.0), SCALE), &before[..shown.len()]), "a moment is the source's");
 
     d.clear_placing();
     assert_eq!(d.placing(), None);

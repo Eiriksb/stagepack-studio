@@ -4,6 +4,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -11,7 +12,7 @@ use slides_components::{
     Assets, BuildIndex, ComponentError, Diagnostic, INDEX_FILE, MAX_ASSET_PATH_BYTES, MAX_MODULE_BYTES, MEMORY_LIMIT_BYTES, WasmComponent, check_source, component_tag,
     safe_stem, source_hash,
 };
-use toolkit::{ComponentSchema, Registry, RenderInput, RenderOutput, asset_path_allowed};
+use toolkit::{ComponentSchema, Event, Registry, RenderInput, RenderOutput, asset_path_allowed};
 
 use crate::TalkFiles;
 use crate::flow::TEXT_TAG;
@@ -66,6 +67,28 @@ pub enum SchemaLoad {
     Failed,
     Loaded(ComponentSchema),
 }
+
+/// What an interactive component on the slide shown is given when it's next drawn: the state it
+/// kept and the events since, and a number told from every other feed's, which is the state the
+/// layer it's drawn on is drawn from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComponentFeed {
+    pub state: Option<serde_json::Value>,
+    pub events: Vec<Event>,
+    pub hash: u64,
+}
+
+/// What came of drawing an interactive component from a feed: the state it keeps, or why it
+/// couldn't be drawn. `source` is where its tag is written, and `hash` the feed's.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComponentAnswer {
+    pub source: Range<usize>,
+    pub hash: u64,
+    pub state: Result<Option<serde_json::Value>, String>,
+}
+
+/// The most answers kept until they're taken: a show takes them as it draws.
+const MAX_ANSWERS: usize = 64;
 
 /// What came of asking a talk's component to render.
 pub(crate) enum Rendered {
@@ -135,6 +158,11 @@ pub struct TalkComponents {
     loads: usize,
     /// Changes whenever a module is loaded or let go of, and so whenever what takes content can.
     loaded_generation: u64,
+    /// What each interactive component, by where its tag is written, is given when it's drawn at
+    /// a moment of some state.
+    feeds: HashMap<Range<usize>, ComponentFeed>,
+    /// What came of drawing them so, oldest first, until it's taken.
+    answers: Vec<ComponentAnswer>,
 }
 
 struct NoFiles;
@@ -256,6 +284,8 @@ impl TalkComponents {
             assets_read: AssetsRead::default(),
             loads: 0,
             loaded_generation: 0,
+            feeds: HashMap::new(),
+            answers: Vec::new(),
         };
         components.rescan(registry);
         components
@@ -323,6 +353,33 @@ impl TalkComponents {
     /// takes content: what's written between its tags is its to draw. Nothing is loaded.
     pub(crate) fn takes_content(&self, tag: &str) -> bool {
         self.loaded_schema(tag).flatten().is_some_and(|schema| schema.children)
+    }
+
+    /// Whether `tag` is a component of the talk's whose build is loaded and working and says it's
+    /// interactive. Nothing is loaded.
+    pub(crate) fn is_interactive(&self, tag: &str) -> bool {
+        self.loaded_schema(tag).flatten().is_some_and(|schema| schema.interactive)
+    }
+
+    pub(crate) fn set_feeds(&mut self, feeds: HashMap<Range<usize>, ComponentFeed>) {
+        self.feeds = feeds;
+    }
+
+    /// What the interactive component whose tag is written at `source` is given, if anything.
+    pub(crate) fn feed(&self, source: &Range<usize>) -> Option<ComponentFeed> {
+        self.feeds.get(source).cloned()
+    }
+
+    /// Notes what came of drawing a component from a feed, forgetting the oldest past the most kept.
+    pub(crate) fn answer(&mut self, answer: ComponentAnswer) {
+        if self.answers.len() >= MAX_ANSWERS {
+            self.answers.remove(0);
+        }
+        self.answers.push(answer);
+    }
+
+    pub(crate) fn take_answers(&mut self) -> Vec<ComponentAnswer> {
+        std::mem::take(&mut self.answers)
     }
 
     /// Changes whenever a module is loaded or let go of.

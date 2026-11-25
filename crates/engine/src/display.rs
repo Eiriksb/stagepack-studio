@@ -51,8 +51,33 @@ pub struct LayerSpec {
     pub terminal: Option<TerminalOn>,
     /// The button this layer draws, which a press in the show acts on.
     pub button: Option<ButtonOn>,
+    /// The interactive component this layer draws, which presses and actions in the show go to.
+    pub component: Option<ComponentOn>,
     /// The `id` its tag gives, by which a button names it: none for a region, or a tag that gives none.
     pub id: Option<String>,
+}
+
+/// An interactive component among a slide's layers: the place of its layer among them, where its
+/// tag is written, the click it appears on, the `id` its tag gives, by which a button's `on` names
+/// it, and where it is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComponentLayer {
+    pub layer: usize,
+    pub source: Range<usize>,
+    pub click: Option<u32>,
+    pub id: Option<String>,
+    pub on: ComponentOn,
+}
+
+/// An interactive component on a slide: what it named under the pointer and where, in its own
+/// units with its box's top-left at 0,0, in the order drawn, where it is, as its layer is placed,
+/// and the state it was drawn from, 0 if none.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComponentOn {
+    pub hits: Vec<(String, Rect)>,
+    pub rect: Rect,
+    pub rotate: f32,
+    pub state: u64,
 }
 
 /// A video among a slide's layers: the place of its layer among them, where its tag is written,

@@ -82,9 +82,13 @@ fn place_of_group(trees: &[TokenTree], index: usize, around: Place) -> Place {
     }
 }
 
-/// True of `component`, and of a path ending in it such as `toolkit::component`.
+/// True of `component`, of a path ending in it such as `toolkit::component`, and of either with
+/// what it's given in brackets, as `component(interactive)`.
 fn names_component(attribute: &Group) -> bool {
-    let trees: Vec<TokenTree> = attribute.stream().into_iter().collect();
+    let mut trees: Vec<TokenTree> = attribute.stream().into_iter().collect();
+    if is_group(trees.last(), Delimiter::Parenthesis) {
+        trees.pop();
+    }
     let is_path = trees.iter().all(|tree| matches!(tree, TokenTree::Ident(_)) || is_punct(tree, ':'));
     is_path && matches!(trees.last(), Some(TokenTree::Ident(last)) if last == "component")
 }

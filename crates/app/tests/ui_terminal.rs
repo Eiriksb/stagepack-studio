@@ -299,7 +299,7 @@ fn shown_layer(document: &Entity<Document>, cx: &mut TestAppContext) -> usize {
 
 /// The place among the layers of slide `slide` at step `step` of its recording.
 fn layer_on(document: &Entity<Document>, slide: usize, step: u32, cx: &mut TestAppContext) -> usize {
-    document.update(cx, |document, _| document.terminals_at(slide, Moment { step, time: 0.0 })[0].layer)
+    document.update(cx, |document, _| document.terminals_at(slide, Moment::at(step, 0.0))[0].layer)
 }
 
 /// What shows of layer `layer` on `canvas`.
@@ -436,7 +436,7 @@ fn the_presenter_shows_the_last_screen(cx: &mut TestAppContext) {
     // Its slide shows the still, the last screen, drawn at its own scale.
     let layer = shown_layer(&show.document, cx);
     let scale = cx.read(|cx| presenter.read(cx).scale()).expect("drawn");
-    let still = show.document.update(cx, |document, _| document.layers_at(0, Moment { step: 0, time: 0.0 }, scale))[layer].clone();
+    let still = show.document.update(cx, |document, _| document.layers_at(0, Moment::at(0, 0.0), scale))[layer].clone();
     let shown = image_of(cx, &presenter, layer);
     let wanted = slides_engine::to_bgra_frame(&still.pixmap);
     assert_eq!((shown.size(0).width.0 as u32, shown.size(0).height.0 as u32), (wanted.buffer().width(), wanted.buffer().height()));
@@ -984,7 +984,7 @@ fn said_by_form(typing: &Typing, cx: &mut TestAppContext, id: &'static str) -> S
 fn problem_of(typing: &Typing, cx: &mut TestAppContext, slide: usize) -> Option<String> {
     stills_made(typing, cx);
     let source = typing.document(cx).update(cx, |document, _| {
-        document.terminals_at(slide, Moment { step: 0, time: 0.0 }).first().and_then(|terminal| terminal.source.clone())
+        document.terminals_at(slide, Moment::at(0, 0.0)).first().and_then(|terminal| terminal.source.clone())
     });
     let source = source.expect("a recording on the slide");
     typing.document(cx).update(cx, |document, _| document.terminal_problem_on(slide, &source))
@@ -1198,7 +1198,7 @@ fn in_pack(pack: &std::path::Path, path: &str) -> Option<(Vec<u8>, bool)> {
 
 /// Whether `document`'s first slide's recording plays, once its still has been made.
 fn plays(document: &mut Document) -> bool {
-    let Some(source) = document.terminals_at(0, Moment { step: 0, time: 0.0 }).first().and_then(|terminal| terminal.source.clone()) else {
+    let Some(source) = document.terminals_at(0, Moment::at(0, 0.0)).first().and_then(|terminal| terminal.source.clone()) else {
         return false;
     };
     // Its still is made here, as the window makes it aside.
@@ -1371,7 +1371,7 @@ fn many_talk(first: usize, second: usize) -> String {
 
 /// The layers of the recordings on slide `slide` at its start, in their order.
 fn recording_layers(document: &Entity<Document>, slide: usize, cx: &mut TestAppContext) -> Vec<usize> {
-    let mut layers: Vec<usize> = document.update(cx, |document, _| document.terminals_at(slide, Moment { step: 0, time: 0.0 })).iter().map(|terminal| terminal.layer).collect();
+    let mut layers: Vec<usize> = document.update(cx, |document, _| document.terminals_at(slide, Moment::at(0, 0.0))).iter().map(|terminal| terminal.layer).collect();
     layers.sort();
     layers
 }

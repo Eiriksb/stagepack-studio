@@ -476,6 +476,7 @@ mod tests {
             model: None,
             terminal: None,
             button: None,
+            component: None,
             id: None,
         };
         let pkg: SharedPackage = Rc::new(RefCell::new(Package::default()));

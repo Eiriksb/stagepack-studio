@@ -19,7 +19,7 @@ use crate::timeline::MAX_CLICK;
 use crate::render::device_offset;
 use crate::{
     ComponentAsks, ComponentInfo, DisplayItem, Fonts, Layer, LayerSpec, LayerTiming, LayoutEnv, Moment, MadeStill, PictureCache, Placing,
-    SlideTimeline, SchemaLoad, ButtonLayer, MeasureVideo, StillJob, StillWanted, TalkComponents, TalkFiles, TerminalLayer, Transition, VideoLayer, DrawModel, ModelLayer, builtin_registry, compose, render_layer, talk_theme,
+    SlideTimeline, SchemaLoad, ButtonLayer, ComponentAnswer, ComponentFeed, ComponentLayer, MeasureVideo, StillJob, StillWanted, TalkComponents, TalkFiles, TerminalLayer, Transition, VideoLayer, DrawModel, ModelLayer, builtin_registry, compose, render_layer, talk_theme,
 };
 
 /// How many scales of one slide are kept drawn. A zoom or a resize asks for many in a row.
@@ -47,6 +47,8 @@ struct LayerKey {
     moment: Option<(u32, u32)>,
     /// The terminal recording it's the last screen of, if it is one.
     terminal: Option<String>,
+    /// The state an interactive component's layer was drawn from: 0 for any other layer.
+    state: u64,
 }
 
 impl LayerKey {
@@ -56,6 +58,7 @@ impl LayerKey {
             && self.drawing == other.drawing
             && self.files_generation == other.files_generation
             && self.moment == other.moment
+            && self.state == other.state
             && self.text == other.text
     }
 }
@@ -920,6 +923,27 @@ impl Deck {
         buttons_of(&self.slides[index].laid_at(moment).specs)
     }
 
+    /// The interactive components on slide `index` at `moment`, among its layers as `layers_at`
+    /// gives them then.
+    pub fn components_at(&mut self, index: usize, moment: Moment) -> Vec<ComponentLayer> {
+        if index >= self.slides.len() {
+            return Vec::new();
+        }
+        let moment = self.ensure_laid_at(index, moment);
+        components_of(&self.slides[index].laid_at(moment).specs)
+    }
+
+    /// What each interactive component, by where its tag is written, is given when it's drawn at a
+    /// moment whose state isn't 0. A moment with other feeds has another state.
+    pub fn feed_components(&mut self, feeds: HashMap<std::ops::Range<usize>, ComponentFeed>) {
+        self.components.set_feeds(feeds);
+    }
+
+    /// What came of drawing interactive components from their feeds since this was last asked.
+    pub fn take_component_answers(&mut self) -> Vec<ComponentAnswer> {
+        self.components.take_answers()
+    }
+
     /// The plain sentence saying why the button at `source` on slide `index` does nothing, or
     /// what it names that isn't there, if it's a button and either is so. It's among the slide's
     /// notices too.
@@ -1520,14 +1544,15 @@ impl Deck {
         let laid = self.slides[index].laid.as_ref().expect("the slide was just laid out");
         let step = if laid.asks.stepped { moment.step.min(laid.steps()) } else { 0 };
         let time = if laid.asks.animated && moment.time.is_finite() { moment.time.max(0.0) } else { 0.0 };
-        Moment { step, time }
+        let state = if laid.specs.iter().any(|spec| spec.component.is_some()) { moment.state } else { 0 };
+        Moment { step, time, state }
     }
 
     /// Lays out slide `index` in its whole state, and gives the moment that is.
     fn ensure_whole(&mut self, index: usize) -> Moment {
         self.ensure_laid(index);
         let steps = self.slides[index].laid.as_ref().expect("the slide was just laid out").steps();
-        self.ensure_laid_at(index, Moment { step: steps, time: 0.0 })
+        self.ensure_laid_at(index, Moment::at(steps, 0.0))
     }
 
     /// Lays out slide `index` at `moment` if it isn't already, and gives the moment it is
@@ -1569,6 +1594,7 @@ impl Deck {
             files_generation: self.files_generation,
             moment: spec.varies.then_some((moment.step, moment.time.to_bits())),
             terminal: spec.terminal.as_ref().map(|on| on.src.clone()),
+            state: spec.component.as_ref().map_or(0, |on| on.state),
         }
     }
 
@@ -1831,6 +1857,17 @@ fn buttons_of(specs: &[LayerSpec]) -> Vec<ButtonLayer> {
         .collect()
 }
 
+/// The interactive components among `specs`.
+fn components_of(specs: &[LayerSpec]) -> Vec<ComponentLayer> {
+    specs
+        .iter()
+        .enumerate()
+        .filter_map(|(layer, spec)| {
+            Some(ComponentLayer { layer, source: spec.source.clone()?, click: spec.click, id: spec.id.clone(), on: spec.component.clone()? })
+        })
+        .collect()
+}
+
 /// The videos among `specs`.
 fn videos_of(specs: &[LayerSpec]) -> Vec<VideoLayer> {
     specs
@@ -1910,6 +1947,7 @@ mod tests {
             model: None,
             terminal: Some(terminal),
             button: None,
+            component: None,
             id: None,
         };
         let (one, two) = (FileVersion::Hash(1), FileVersion::Hash(2));

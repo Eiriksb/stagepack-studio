@@ -243,3 +243,12 @@ fn a_diagnostic_keeps_at_most_500_characters() {
     assert!(made.message.ends_with('…'));
     assert_eq!(slides_components::Diagnostic::new("f", 0, "short").message, "short");
 }
+
+#[test]
+fn an_interactive_component_is_found() {
+    let source = "use toolkit::prelude::*;\n#[component(interactive)]\nfn Counter(ctx: &Ctx) -> Element {\n    text(ctx.events().len().to_string())\n}\n";
+    assert_eq!(check_source(FILE, source).unwrap(), SourceInfo { tag: "Counter".to_string() });
+    assert_eq!(component_tag(source), Some("Counter".to_string()));
+    let pathed = source.replace("#[component(interactive)]", "#[toolkit::component(interactive)]");
+    assert_eq!(component_tag(&pathed), Some("Counter".to_string()));
+}

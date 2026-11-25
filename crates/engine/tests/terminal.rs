@@ -255,14 +255,14 @@ fn marks_are_steps() {
 fn a_slides_recordings_at_a_moment_are_those_of_its_layers_then() {
     let files = [("assets/run.cast", make_test_cast(20, 4, &[(0.1, "o", "one"), (0.5, "m", "first"), (0.6, "o", " two")]))];
     let mut deck = deck_of("# Run\n\n<Terminal src=\"assets/run.cast\" x=\"100\" y=\"50\" w=\"640\" h=\"360\" click=\"1\" />\n", &files);
-    let terminals = deck.terminals_at(0, Moment { step: 0, time: 0.0 });
+    let terminals = deck.terminals_at(0, Moment::at(0, 0.0));
     assert_eq!(terminals.len(), 1);
     let terminal = &terminals[0];
     assert_eq!((terminal.click, terminal.on.stops, terminal.on.src.as_str()), (Some(1), 1, "assets/run.cast"));
     assert_eq!(terminal.on.rect.x, 100.0);
-    let layers = deck.layers_at(0, Moment { step: 0, time: 0.0 }, 1.0);
+    let layers = deck.layers_at(0, Moment::at(0, 0.0), 1.0);
     assert!(terminal.layer < layers.len());
-    assert!(deck.terminals_at(1, Moment { step: 0, time: 0.0 }).is_empty(), "no such slide");
+    assert!(deck.terminals_at(1, Moment::at(0, 0.0)).is_empty(), "no such slide");
 }
 
 #[test]
