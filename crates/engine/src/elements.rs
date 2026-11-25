@@ -55,6 +55,8 @@ const DEFAULT_WIDTH: f32 = 400.0;
 const DEFAULT_HEIGHT: f32 = 200.0;
 /// The width a positioned tag that gives none is told it has.
 const POSITIONED_ROOM: f32 = 1200.0;
+/// What's said of an interactive component inside another tag, which draws but takes no presses.
+pub const INTERACTIVE_NOT_PLACED: &str = "An interactive component works only when it's placed on the slide itself.";
 /// What's said for a component that didn't run, as the slide's components had used up their time.
 const NOT_RUN: &str = "not run, as this slide's components took too long";
 const DEFAULT_RADIUS: f32 = 24.0;
@@ -182,7 +184,7 @@ pub(crate) fn lay_out_positioned_tag(
         let (node, natural) = flow.placed_button(tag, wanted);
         (Some(natural), Some(node))
     } else {
-        let element = flow.render_tag(tag, room);
+        let element = flow.render_tag(tag, room, true);
         let natural = element.as_ref().and_then(|element| flow.natural_size(element));
         let content = match element {
             Some(element) => flow.tag_element(tag, &element, align.unwrap_or(Align::Left), true),
@@ -206,7 +208,9 @@ impl Flow<'_, '_> {
     /// component. It looks for a built-in first, then for one of the talk's own. `room` is
     /// the width and height of the box the tag sits in, where a height of 0 grows with it.
     /// A talk's component that can't give an element gives a problem in its place.
-    fn render_tag(&mut self, tag: &Tag, room: (f32, f32)) -> Option<Element> {
+    /// `placed` says the tag is the positioned layer's own: only then is an interactive component
+    /// interactive, fed what reached it.
+    fn render_tag(&mut self, tag: &Tag, room: (f32, f32), placed: bool) -> Option<Element> {
         if tag.name == TEXT_TAG {
             return Some(Element::Children);
         }
@@ -225,20 +229,28 @@ impl Flow<'_, '_> {
             return Some(output.element);
         }
         let name = &tag.name;
-        // An interactive component is drawn from its feed at a moment with state.
-        let feed = if moment.state != 0 { self.env.components.feed(&tag.range) } else { None };
-        let input = match &feed {
-            Some(feed) => RenderInput::new(props, data).with_state(feed.state.clone(), feed.events.clone()),
-            None => RenderInput::new(props, data),
+        // An interactive component placed on the slide is drawn from its feed at a moment with state.
+        let feed = if placed && moment.state != 0 { self.env.components.feed(&tag.range) } else { None };
+        let (rendered, ran) = match &feed {
+            Some(feed) => {
+                let input = RenderInput::new(props, data).with_state(feed.state.clone(), feed.events.clone());
+                self.env.components.render_fed(name, &tag.range, &input).map_or((None, false), |(rendered, ran)| (Some(rendered), ran))
+            }
+            None => (self.env.components.render(name, &RenderInput::new(props, data)), true),
         };
-        let Some(rendered) = self.env.components.render(name, &input) else {
+        let Some(rendered) = rendered else {
             self.notice(format!("There is no component called {name}"));
             return None;
         };
         if self.env.components.is_interactive(name) {
-            self.interactive = Some(feed.as_ref().map_or(0, |feed| feed.hash));
+            if placed {
+                self.interactive = Some(feed.as_ref().map_or(0, |feed| feed.hash));
+            } else {
+                self.notice(INTERACTIVE_NOT_PLACED.to_string());
+            }
         }
-        if let Some(feed) = &feed {
+        // What came of a run of the module from its feed, once for each run.
+        if let Some(feed) = feed.as_ref().filter(|_| ran) {
             let state = match &rendered {
                 Rendered::Output(output) => Ok(output.state.clone()),
                 Rendered::Failed(error) => Err(error.to_string()),
@@ -301,7 +313,7 @@ impl Flow<'_, '_> {
             self.notice(crate::TERMINAL_IN_TEXT.to_string());
             return Some(self.block_placeholder(crate::terminal_screen::TERMINAL_LABEL.to_string()));
         }
-        match self.render_tag(tag, (self.width, 0.0)) {
+        match self.render_tag(tag, (self.width, 0.0), false) {
             Some(element) => self.tag_element(tag, &element, align, false),
             None => Some(self.block_placeholder(tag.name.clone())),
         }

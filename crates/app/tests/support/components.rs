@@ -156,9 +156,9 @@ pub fn components_talk(except: Option<(&str, Built)>) -> tempfile::TempDir {
 }
 
 /// A module of interface version 2 whose schema is `schema`, which draws `element`, and stops
-/// working, as a trap, when what it's given holds `trap_on`.
-pub fn interactive_module(schema: &str, element: &str, trap_on: Option<&str>) -> Vec<u8> {
-    let answer = format!(r#"{{"element":{element}}}"#);
+/// working, as a trap, when what it's given holds `trap_on`. `stepped` says it looked at the click step.
+pub fn interactive_module(schema: &str, element: &str, trap_on: Option<&str>, stepped: bool) -> Vec<u8> {
+    let answer = format!(r#"{{"element":{element},"stepped":{stepped}}}"#);
     let trap = trap_on.map_or(String::new(), |needle| {
         format!("(if (call $contains (local.get $ptr) (local.get $len) (i32.const 4096) (i32.const {})) (then unreachable))", needle.len())
     });

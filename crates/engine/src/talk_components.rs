@@ -4,6 +4,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
@@ -163,6 +164,10 @@ pub struct TalkComponents {
     feeds: HashMap<Range<usize>, ComponentFeed>,
     /// What came of drawing them so, oldest first, until it's taken.
     answers: Vec<ComponentAnswer>,
+    /// The last render of each fed component, by where its tag is written, and the input it was
+    /// drawn from: laid out again from the same input, as both of a show's windows and the next
+    /// click's preview do, it isn't run again.
+    fed_renders: HashMap<Range<usize>, (u64, Result<RenderOutput, ComponentError>)>,
 }
 
 struct NoFiles;
@@ -286,6 +291,7 @@ impl TalkComponents {
             loaded_generation: 0,
             feeds: HashMap::new(),
             answers: Vec::new(),
+            fed_renders: HashMap::new(),
         };
         components.rescan(registry);
         components
@@ -314,6 +320,8 @@ impl TalkComponents {
     /// are the same. Returns whether anything is different.
     pub(crate) fn rescan(&mut self, registry: &Registry) -> bool {
         let assets_changed = self.assets_changed();
+        // A module or an asset may have changed since.
+        self.fed_renders.clear();
         let before = self.summary();
         self.infos.clear();
         self.problems.clear();
@@ -362,7 +370,38 @@ impl TalkComponents {
     }
 
     pub(crate) fn set_feeds(&mut self, feeds: HashMap<Range<usize>, ComponentFeed>) {
+        self.fed_renders.retain(|source, _| feeds.contains_key(source));
         self.feeds = feeds;
+    }
+
+    /// Renders `tag`, written at `source`, from `input`, which holds its feed: once for each input,
+    /// as the last is kept. Gives whether the module ran.
+    pub(crate) fn render_fed(&mut self, tag: &str, source: &Range<usize>, input: &RenderInput) -> Option<(Rendered, bool)> {
+        let mut hasher = DefaultHasher::new();
+        (tag, serde_json::to_string(input).unwrap_or_default()).hash(&mut hasher);
+        let key = hasher.finish();
+        if let Some((kept, result)) = self.fed_renders.get(source)
+            && *kept == key
+        {
+            let rendered = match result {
+                Ok(output) => Rendered::Output(output.clone()),
+                Err(error) => Rendered::Failed(error.clone()),
+            };
+            return Some((rendered, false));
+        }
+        let rendered = self.render(tag, input)?;
+        match &rendered {
+            Rendered::Output(output) => {
+                self.fed_renders.insert(source.clone(), (key, Ok(output.clone())));
+            }
+            Rendered::Failed(error) => {
+                self.fed_renders.insert(source.clone(), (key, Err(error.clone())));
+            }
+            Rendered::NeedsBuilding | Rendered::OutOfTime => {
+                self.fed_renders.remove(source);
+            }
+        }
+        Some((rendered, true))
     }
 
     /// What the interactive component whose tag is written at `source` is given, if anything.

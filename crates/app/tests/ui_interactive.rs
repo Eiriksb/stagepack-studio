@@ -721,26 +721,39 @@ fn a_do_button_sends_its_action(cx: &mut TestAppContext) {
 }
 
 /// A component of interface version 2 that says it's interactive and is a plain pad, named `pad`
-/// under the pointer, and stops working when it's given what `trap_on` says, if it says anything.
+/// under the pointer, and stops working when it's given what `trap_on` says, if it says anything. It
+/// says it looks at the click step, so each of its slide's clicks is laid out apart.
 fn pad_files(trap_on: Option<&str>) -> Vec<(&'static str, Vec<u8>)> {
     let schema = r#"{"name":"Pad","props":[],"children":false,"interactive":true}"#;
     let element = r#"{"Hit":{"name":"pad","child":{"Shape":{"kind":"Rect","width":400.0,"height":200.0,"fill":{"r":37,"g":99,"b":235,"a":255},"outline":null,"outline_width":0.0,"radius":0.0,"padding":0.0,"child":null}}}}"#;
     let index = r#"{"format":1,"components":[{"tag":"Pad","file":"pad","source_hash":"built from nothing here"}]}"#;
-    vec![("build/pad.wasm", components::interactive_module(schema, element, trap_on)), ("build/index.json", index.as_bytes().to_vec())]
+    vec![("build/pad.wasm", components::interactive_module(schema, element, trap_on, true)), ("build/index.json", index.as_bytes().to_vec())]
 }
 
 const PAD_SLIDES: &str = "# One\n\n<Pad x=\"200\" y=\"200\" w=\"400\" h=\"200\" />\n\n---\n\n# Two\n";
 
+/// [`PAD_SLIDES`] with a box coming in on a click after the pad: the presenter's window shows that
+/// click of the same slide as what's next.
+const PAD_AND_A_CLICK: &str = "# One\n\n<Pad x=\"200\" y=\"200\" w=\"400\" h=\"200\" />\n\n<Box x=\"1200\" y=\"700\" w=\"200\" h=\"100\" click=\"1\">\n\nLater\n\n</Box>\n\n---\n\n# Two\n";
+
 fn with_the_pad(cx: &mut TestAppContext, trap_on: Option<&str>) -> Show {
+    with_the_pad_in(cx, PAD_SLIDES, trap_on)
+}
+
+fn with_the_pad_in(cx: &mut TestAppContext, source: &str, trap_on: Option<&str>) -> Show {
     let files = pad_files(trap_on);
     let files: Vec<(&str, &[u8])> = files.iter().map(|(name, bytes)| (*name, bytes.as_slice())).collect();
-    rehearse_with(cx, PAD_SLIDES, &files)
+    rehearse_with(cx, source, &files)
 }
 
 #[gpui_kit::test]
 fn events_are_coalesced_to_sixty_renders_a_second(cx: &mut TestAppContext) {
-    let show = with_the_pad(cx, None);
-    let pad = tag_at(PAD_SLIDES, "<Pad");
+    // On a slide with a further click, which the presenter's window shows as what's next: the
+    // module runs once for each time it's given something, however many windows lay it out.
+    let show = with_the_pad_in(cx, PAD_AND_A_CLICK, None);
+    let pad = tag_at(PAD_AND_A_CLICK, "<Pad");
+    let next = cx.read(|cx| show.show.read(cx).presenter().expect("the presenter's window").1.read(cx).upcoming().clone());
+    assert!(cx.read(|cx| !next.read(cx).images().is_empty()), "the presenter's window shows the next click");
     let canvas = show.canvas(cx);
     let along = |i: usize| 250. + i as f32 * 0.3;
     // 1,000 moves over it in a second.
@@ -759,7 +772,8 @@ fn events_are_coalesced_to_sixty_renders_a_second(cx: &mut TestAppContext) {
         let components = show.show.read(cx).components();
         (components.renders(&pad), components.last_fed(&pad).and_then(|fed| fed.events.last().cloned()))
     });
-    assert!((30..=61).contains(&renders), "{renders} renders");
+    // Each render is a run of the module.
+    assert!((30..=61).contains(&renders), "{renders} runs of the module");
     let Some(Event::Pointer { kind: PointerKind::Move, x, hit, .. }) = last else { panic!("the last move wasn't given it: {last:?}") };
     assert!((x - (along(999) - 200.)).abs() < 2.0, "the last move, at {x}");
     assert_eq!(hit.as_deref(), Some("pad"));
@@ -823,4 +837,17 @@ fn an_edit_keeps_state_only_for_an_unchanged_component(cx: &mut TestAppContext) 
     assert!(show.document.update(cx, |document, _| document.notices()).iter().any(|notice| notice == BUTTON_ON_NOTHING));
     show.press_slide(cx, PLUS);
     assert_eq!(show.words(cx, &first), ["2"]);
+}
+
+#[gpui_kit::test]
+fn an_interactive_component_inside_another_tag_takes_no_presses(cx: &mut TestAppContext) {
+    let source = "# One\n\n<Box x=\"200\" y=\"200\" w=\"400\" h=\"200\">\n\n<Pad />\n\n</Box>\n\n---\n\n# Two\n";
+    let show = with_the_pad_in(cx, source, None);
+    let notices = show.document.update(cx, |document, _| document.notices());
+    assert!(notices.iter().any(|notice| notice == slides_engine::INTERACTIVE_NOT_PLACED), "{notices:?}");
+    assert_eq!(slides_engine::INTERACTIVE_NOT_PLACED, "An interactive component works only when it's placed on the slide itself.");
+    // The box it's in isn't interactive either: a click on it is the show's.
+    show.click_slide(cx, (400., 300.));
+    assert_eq!(show.counter(cx), "2 / 2");
+    assert!(cx.read(|cx| show.show.read(cx).components().is_empty()));
 }
