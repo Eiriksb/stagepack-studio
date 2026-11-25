@@ -17,7 +17,8 @@ use typing::*;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, InputEvent as _, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Modifiers, Point, TestAppContext, px};
 use stagepack_studio::live_terminal::{
-    HELPER_ENV, LiveId, LiveTerminals, MOST_LIVE, Session, NOT_INSTALLED, RUN_ASK_ID, RUN_NO_ID, RUN_YES_ID, RunPermissions, TOO_MANY, threads_running,
+    HELPER_ENV, LiveId, LiveTerminals, MOST_LIVE, Session, NOT_INSTALLED, RUN_ASK_ID, RUN_HEAD_ID, RUN_INTO_ID, RUN_LINE_ID, RUN_NO_ID, RUN_TITLE, RUN_TITLE_ID,
+    RUN_TYPED_ID, RUN_YES_ID, RunPermissions, RunQuestion, TOO_MANY, TYPE_TITLE, ask_to_run, threads_running,
 };
 use stagepack_studio::present_view::{COUNTER_ID, Presentation};
 use stagepack_studio::slide_canvas::{LIVE_HINT_ID, SlideCanvas};
@@ -922,4 +923,59 @@ fn start_runs_a_program_that_ended_again(cx: &mut TestAppContext) {
     assert!(until(cx, &windows, 10, |_| screen_text(&second).contains("again31510") && second.state().is_over()));
     assert!(until(cx, &windows, 5, |_| live.sessions() == 1), "the old one is let go of");
     assert!(!dialog_open(cx, typing.handle), "nothing was asked again");
+}
+
+/// The question for `question`, put directly in `window`, and closed with *Don't run* once looked at.
+fn ask_directly(cx: &mut TestAppContext, window: AnyWindowHandle, question: RunQuestion) {
+    let asked = cx.update_window(window, |_, window, cx| ask_to_run(window, cx, question, |_, _, _| {})).unwrap();
+    cx.run_until_parked();
+    assert!(asked);
+}
+
+/// The label of `id`, and where its top is, in `window`.
+fn label_and_top(cx: &mut TestAppContext, window: AnyWindowHandle, id: impl Into<gpui_kit::ElementId>) -> Option<(String, f32)> {
+    let id = id.into();
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.try_find(id).filter(|found| found.visible()).map(|found| (found.label().unwrap_or_default().to_string(), f32::from(found.bounds().origin.y)))
+    })
+    .unwrap()
+}
+
+#[gpui_kit::test]
+fn the_question_for_typed_text_shows_the_text_then_into_and_the_terminal(cx: &mut TestAppContext) {
+    let around = surroundings(Some(&helper::helper_program()));
+    let typing = open_talk(cx, &around, &format!("# One\n\n{}\n", tag("sh", 100)));
+    let window = typing.handle;
+    let question = RunQuestion {
+        command: vec!["/bin/sh".to_string(), "-l".to_string()],
+        program_in_talk: false,
+        program_by_path: false,
+        folder: None,
+        typed: Some("make demo\t\"fast\"".to_string()),
+    };
+    ask_directly(cx, window, question);
+    let (title, _) = label_and_top(cx, window, RUN_TITLE_ID).expect("a title");
+    assert_eq!(title, TYPE_TITLE);
+    assert_eq!(title, "Type this into the terminal?");
+    // The whole text, as it can be seen: a tab is written out, a quote escaped.
+    let (typed, typed_top) = label_and_top(cx, window, RUN_TYPED_ID).expect("the text");
+    assert_eq!(typed, "\"make demo\\u{9}\\\"fast\\\"\"");
+    let (into, into_top) = label_and_top(cx, window, RUN_INTO_ID).expect("into");
+    assert_eq!(into, "into");
+    let (first, first_top) = label_and_top(cx, window, (RUN_LINE_ID, 0usize)).expect("the terminal's command");
+    let (second, _) = label_and_top(cx, window, (RUN_LINE_ID, 1usize)).expect("its argument");
+    assert_eq!((first.as_str(), second.as_str()), ("\"/bin/sh\"", "\"-l\""));
+    assert!(typed_top < into_top && into_top < first_top, "the text, then into, then the command: {typed_top} {into_top} {first_top}");
+    assert!(label_and_top(cx, window, RUN_HEAD_ID).is_none(), "nothing about running a program");
+    click(cx, window, RUN_NO_ID);
+    assert!(!dialog_open(cx, window));
+
+    // The question about running a program is as it was.
+    let question = RunQuestion { command: vec!["/bin/sh".to_string()], program_in_talk: false, program_by_path: false, folder: None, typed: None };
+    ask_directly(cx, window, question);
+    assert_eq!(label_and_top(cx, window, RUN_TITLE_ID).map(|(title, _)| title).as_deref(), Some(RUN_TITLE));
+    assert!(label_and_top(cx, window, RUN_TYPED_ID).is_none() && label_and_top(cx, window, RUN_INTO_ID).is_none());
+    assert!(label_and_top(cx, window, RUN_HEAD_ID).is_some());
+    click(cx, window, RUN_NO_ID);
 }

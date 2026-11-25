@@ -1,6 +1,9 @@
 //! The dialog that asks for the yes: what the talk wants to run, in full, and where, with *Run*,
 //! *Always for this folder* (for a talk kept in a folder) and *Don't run*. *Don't run* has the
 //! keyboard, and is what Escape and Enter choose. A click beside the dialog does nothing.
+//!
+//! The same dialog asks whether a button may type a text into a live terminal: the text, in full,
+//! then *into* and the terminal's command.
 
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -27,6 +30,12 @@ pub const RUN_HEAD_LINE_ID: &str = "run-head-line";
 pub const RUN_WORDS_ID: &str = "run-words";
 /// The layer over the words that holds their scrollbar.
 pub const RUN_WORDS_BAR_ID: &str = "run-words-bar";
+/// The dialog's title.
+pub const RUN_TITLE_ID: &str = "run-title";
+/// The text a button would type, when that's what is asked.
+pub const RUN_TYPED_ID: &str = "run-typed";
+/// The line *into* after the typed text, before the terminal's command.
+pub const RUN_INTO_ID: &str = "run-into";
 /// How the words' scrollbar is shown: always, so a list that goes on beyond its box shows it does
 /// before anyone scrolls. (The theme's own way shows a scrollbar only once something is scrolled.)
 pub const RUN_WORDS_SCROLLBAR: ScrollbarMode = ScrollbarMode::Always;
@@ -34,6 +43,9 @@ pub const RUN_WORDS_SCROLLBAR: ScrollbarMode = ScrollbarMode::Always;
 const WORDS_HEIGHT: f32 = 240.;
 
 pub const RUN_QUESTION: &str = "This talk wants to run a program on your computer.";
+pub const RUN_TITLE: &str = "Run a program?";
+pub const TYPE_TITLE: &str = "Type this into the terminal?";
+pub const TYPE_INTO: &str = "into";
 pub const RUN_WARNING: &str = "It can do anything you can do. Run it only if you trust this talk.";
 pub const RUN_IN_NEW_FOLDER: &str = "in a new empty folder";
 pub const RUN_PROGRAM_IN_TALK: &str = "This program comes with the talk.";
@@ -59,6 +71,9 @@ pub struct RunQuestion {
     pub program_by_path: bool,
     /// The talk's folder, or none for a packed or untitled talk, which runs in a new empty folder.
     pub folder: Option<PathBuf>,
+    /// The text a button would type into the terminal running `command`, when that's what is
+    /// asked, rather than whether to run `command`.
+    pub typed: Option<String>,
 }
 
 /// What the person chose.
@@ -115,8 +130,16 @@ pub fn ask_to_run(
             let mono = cx.theme().mono_font_family.clone();
             let words = word_lines(&question);
             let head = head_lines(&question);
+            let (title, label) = if question.typed.is_some() { (TYPE_TITLE, TYPE_TITLE) } else { (RUN_TITLE, RUN_QUESTION) };
+            // The text to type, in full and as it can be seen, then *into*, before the command.
+            let typed = question.typed.as_deref().map(|text| {
+                let shown = SharedString::from(visible(text));
+                v_flex()
+                    .child(div().id(RUN_TYPED_ID).test_support().aria_label(shown.clone()).font_family(mono.clone()).child(shown))
+                    .child(div().id(RUN_INTO_ID).test_support().aria_label(TYPE_INTO).child(TYPE_INTO))
+            });
             dialog
-                .title("Run a program?")
+                .title(div().id(RUN_TITLE_ID).test_support().aria_label(title).child(title))
                 .close_button(false)
                 .overlay_closable(false)
                 .on_cancel(move |_, window, cx| escape(RunAnswer::DontRun, window, cx))
@@ -127,9 +150,9 @@ pub fn ask_to_run(
                     v_flex()
                         .id(RUN_ASK_ID)
                         .test_support()
-                        .aria_label(RUN_QUESTION)
+                        .aria_label(label)
                         .gap_2()
-                        .child(
+                        .when(question.typed.is_none(), |ask| ask.child(
                             v_flex()
                                 .id(RUN_HEAD_ID)
                                 .test_support()
@@ -138,7 +161,7 @@ pub fn ask_to_run(
                                 .children(head.into_iter().enumerate().map(|(index, line)| {
                                     div().id((RUN_HEAD_LINE_ID, index)).test_support().aria_label(line.clone()).text_sm().child(line)
                                 })),
-                        )
+                        ))
                         .child(
                             // The words scroll in their box, with a scrollbar that is always drawn.
                             div()
@@ -155,12 +178,11 @@ pub fn ask_to_run(
                                         .overflow_y_scroll()
                                         .track_scroll(&words_scroll)
                                         .child(
-                                            v_flex()
-                                                .pr(Scrollbar::width())
-                                                .font_family(mono)
-                                                .children(words.into_iter().enumerate().map(|(index, line)| {
+                                            v_flex().pr(Scrollbar::width()).children(typed).child(v_flex().font_family(mono).children(
+                                                words.into_iter().enumerate().map(|(index, line)| {
                                                     div().id((RUN_LINE_ID, index)).test_support().aria_label(line.clone()).child(line)
-                                                })),
+                                                }),
+                                            )),
                                         ),
                                 )
                                 .child(

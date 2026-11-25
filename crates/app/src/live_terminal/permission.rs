@@ -2,6 +2,10 @@
 //! untrusted, and can't give itself permission. A yes is for one exact command, for the session
 //! of one talk in one window; or, for a talk kept in a folder only, remembered for that folder
 //! and that command in the app's own data folder.
+//!
+//! Text a button types into a live terminal has a yes of its own, kept the same way: for that text,
+//! exactly, into a terminal running that command, exactly. A yes to run the command is never one to
+//! type into it.
 
 use std::ffi::OsStr;
 use std::io::{self, Write as _};
@@ -28,9 +32,41 @@ struct Remembered {
     command: Vec<String>,
 }
 
+/// One text a button may type, remembered: this text, into a terminal running this command, in
+/// this folder.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RememberedTyped {
+    folder: PathBuf,
+    /// The terminal's command, its words exactly as the talk gives them.
+    terminal_command: Vec<String>,
+    text: String,
+}
+
+/// The file as it's written. A key it doesn't know is passed over when it's read, so a file
+/// written by a newer app reads here, and the `typed` an older app doesn't know is passed over by
+/// it. A key that's missing is empty.
 #[derive(Default, Serialize, Deserialize)]
 struct Stored {
+    #[serde(default)]
     always_run: Vec<Remembered>,
+    #[serde(default)]
+    typed: Vec<RememberedTyped>,
+}
+
+impl Stored {
+    /// `self` with what `other` has that it hasn't.
+    fn merge(&mut self, other: &Stored) {
+        for known in &other.always_run {
+            if !self.always_run.contains(known) {
+                self.always_run.push(known.clone());
+            }
+        }
+        for known in &other.typed {
+            if !self.typed.contains(known) {
+                self.typed.push(known.clone());
+            }
+        }
+    }
 }
 
 /// A talk's folder, for a talk kept in one: the only place a yes can be remembered for. There is
@@ -98,17 +134,18 @@ pub fn plain_drive_path(verbatim: &str) -> Option<String> {
     Some(if after.is_empty() { format!("{rest}\\") } else { rest.to_string() })
 }
 
-/// The commands the user has said can always run, each in one folder.
+/// The commands the user has said can always run, each in one folder, and the texts a button may
+/// always type into a terminal, each in one folder.
 pub struct RunPermissions {
     file: PathBuf,
-    always_run: Vec<Remembered>,
+    stored: Stored,
 }
 
 impl RunPermissions {
     /// The permissions kept in `file`. A file that is missing or can't be read counts as no
     /// permissions at all.
     pub fn load(file: PathBuf) -> RunPermissions {
-        RunPermissions { always_run: read(&file).always_run, file }
+        RunPermissions { stored: read(&file), file }
     }
 
     /// The file these permissions are kept in.
@@ -124,28 +161,42 @@ impl RunPermissions {
     /// Whether `command`, exactly, is remembered for `folder`, which is the same folder however
     /// it's written.
     pub fn always(&self, folder: &Path, command: &[String]) -> bool {
-        folder.canonicalize().is_ok_and(|folder| self.always_run.iter().any(|one| one.folder == folder && one.command == command))
+        folder.canonicalize().is_ok_and(|folder| self.stored.always_run.iter().any(|one| one.folder == folder && one.command == command))
+    }
+
+    /// Whether `text`, exactly, may always be typed into a terminal running `terminal_command`,
+    /// exactly, in `folder`.
+    pub fn always_typed(&self, folder: &Path, text: &str, terminal_command: &[String]) -> bool {
+        folder.canonicalize().is_ok_and(|folder| {
+            self.stored.typed.iter().any(|one| one.folder == folder && one.text == text && one.terminal_command == terminal_command)
+        })
     }
 
     /// Says from now on that `command` runs in `folder` without asking, and writes that down.
     pub fn remember(&mut self, folder: &TalkFolder, command: &[String]) -> io::Result<()> {
         let one = Remembered { folder: folder.0.canonicalize()?, command: command.to_vec() };
+        self.write_with(Stored { always_run: vec![one], typed: Vec::new() })
+    }
+
+    /// Says from now on that `text` is typed without asking into a terminal running
+    /// `terminal_command` in `folder`, and writes that down.
+    pub fn remember_typed(&mut self, folder: &TalkFolder, text: &str, terminal_command: &[String]) -> io::Result<()> {
+        let one = RememberedTyped { folder: folder.0.canonicalize()?, terminal_command: terminal_command.to_vec(), text: text.to_string() };
+        self.write_with(Stored { always_run: Vec::new(), typed: vec![one] })
+    }
+
+    /// Writes the file with what it has, what this has, and `new`.
+    fn write_with(&mut self, new: Stored) -> io::Result<()> {
         // Another window may have added one since this one read the file.
         let mut stored = read(&self.file);
-        for known in &self.always_run {
-            if !stored.always_run.contains(known) {
-                stored.always_run.push(known.clone());
-            }
-        }
-        if !stored.always_run.contains(&one) {
-            stored.always_run.push(one);
-        }
+        stored.merge(&self.stored);
+        stored.merge(&new);
         let json = serde_json::to_vec_pretty(&stored).map_err(io::Error::other)?;
         if let Some(parent) = self.file.parent() {
             std::fs::create_dir_all(parent)?;
         }
         write_atomically(&self.file, |file| file.write_all(&json))?;
-        self.always_run = stored.always_run;
+        self.stored = stored;
         Ok(())
     }
 }
@@ -177,6 +228,10 @@ impl RunKey {
 pub struct SessionYes {
     allowed: Vec<RunKey>,
     refused: Vec<RunKey>,
+    /// Typed text is said yes or no to on its own: a yes to run a terminal's command is never one
+    /// to type into it.
+    typed_allowed: Vec<TypeKey>,
+    typed_refused: Vec<TypeKey>,
 }
 
 impl SessionYes {
@@ -220,6 +275,110 @@ impl SessionYes {
     /// Whether `key`, exactly, has been said no to.
     pub fn refused(&self, key: &RunKey) -> bool {
         self.refused.contains(key)
+    }
+
+    /// Says yes to typing what `key` is for, exactly, for the rest of the session.
+    #[cfg_attr(not(feature = "test-hooks"), expect(dead_code, reason = "a button's press asks for it from plan H1 task 4"))]
+    pub(crate) fn allow_typed(&mut self, key: &TypeKey) {
+        self.typed_refused.retain(|one| one != key);
+        if !self.typed_allowed.contains(key) {
+            self.typed_allowed.push(key.clone());
+        }
+    }
+
+    /// Says no to typing what `key` is for, exactly, for the rest of the session.
+    #[cfg_attr(not(feature = "test-hooks"), expect(dead_code, reason = "a button's press asks for it from plan H1 task 4"))]
+    pub(crate) fn refuse_typed(&mut self, key: &TypeKey) {
+        self.typed_allowed.retain(|one| one != key);
+        if !self.typed_refused.contains(key) {
+            self.typed_refused.push(key.clone());
+        }
+    }
+
+    /// [`Self::allow_typed`] for `text` into a terminal running `terminal_command` in `talk`, for
+    /// tests. It does nothing for a text that can't be typed.
+    #[cfg(feature = "test-hooks")]
+    pub fn allow_typed_for_tests(&mut self, talk: &TalkPlace, text: &str, terminal_command: &[String]) {
+        if let Ok(key) = type_key(talk, text, terminal_command) {
+            self.allow_typed(&key);
+        }
+    }
+
+    /// [`Self::refuse_typed`], for tests.
+    #[cfg(feature = "test-hooks")]
+    pub fn refuse_typed_for_tests(&mut self, talk: &TalkPlace, text: &str, terminal_command: &[String]) {
+        if let Ok(key) = type_key(talk, text, terminal_command) {
+            self.refuse_typed(&key);
+        }
+    }
+}
+
+/// What a yes to typed text is for: this text, exactly, into a terminal running this command,
+/// exactly, in this folder (none for a packed or untitled talk). Another text, another terminal
+/// command or another folder is another thing to say yes to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TypeKey {
+    text: String,
+    terminal_command: Vec<String>,
+    folder: Option<PathBuf>,
+}
+
+/// The most bytes a button may type.
+pub const MOST_TYPED_BYTES: usize = 4096;
+pub const TYPED_CONTROL: &str = "This button's text has a control character.";
+pub const TYPED_TOO_LONG: &str = "This button's text is over 4,096 bytes.";
+pub const TYPED_HIDES: &str = "This button's text has a character that can't be seen, so it isn't typed. Write it plainly.";
+
+/// Why `text` can't be typed into a terminal by a button, if it can't: it may hold no control
+/// character but a tab, be no more than [`MOST_TYPED_BYTES`], and hold nothing that hides or
+/// stacks, as [`unrunnable`] refuses in a command's words.
+pub fn untypable(text: &str) -> Option<&'static str> {
+    if text.chars().any(|c| c.is_control() && c != '\t') {
+        return Some(TYPED_CONTROL);
+    }
+    if text.len() > MOST_TYPED_BYTES {
+        return Some(TYPED_TOO_LONG);
+    }
+    if text.chars().any(|c| c != '\t' && hides(c)) || stacked(text) {
+        return Some(TYPED_HIDES);
+    }
+    None
+}
+
+/// What a yes to typing `text` into a terminal running `terminal_command` for `talk` is for, or
+/// why it can't be typed.
+pub(crate) fn type_key(talk: &TalkPlace, text: &str, terminal_command: &[String]) -> Result<TypeKey, String> {
+    if let Some(why) = untypable(text) {
+        return Err(why.to_string());
+    }
+    if let Some(why) = unrunnable(terminal_command) {
+        return Err(why);
+    }
+    let folder = match talk {
+        TalkPlace::Folder(_) => Some(TalkFolder::of(talk).ok_or("This talk's folder can't be found, so nothing is typed.")?.0),
+        TalkPlace::Packed(_) | TalkPlace::Untitled(_) => None,
+    };
+    Ok(TypeKey { text: text.to_string(), terminal_command: terminal_command.to_vec(), folder })
+}
+
+/// Whether a button may type `text` into the live terminal running `terminal_command` for `talk`
+/// now. As [`may_run`]: `Run` only from a yes given in this session to this text into this
+/// terminal command, or, for a talk kept in a folder only, one remembered for that folder; a yes
+/// to run the terminal's command is never one to type into it. A text that can't be typed is
+/// `Refused`, and [`untypable`] says why.
+pub fn may_type(talk: &TalkPlace, text: &str, terminal_command: &[String], session: &SessionYes, remembered: &RunPermissions) -> Decision {
+    let Ok(key) = type_key(talk, text, terminal_command) else {
+        return Decision::Refused;
+    };
+    if session.typed_refused.contains(&key) {
+        return Decision::Refused;
+    }
+    if session.typed_allowed.contains(&key) {
+        return Decision::Run;
+    }
+    match &key.folder {
+        Some(folder) if remembered.always_typed(folder, &key.text, &key.terminal_command) => Decision::Run,
+        _ => Decision::Ask,
     }
 }
 

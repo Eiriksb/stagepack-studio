@@ -21,7 +21,8 @@ use stagepack_studio::export::{ExportKind, run_export};
 use stagepack_studio::live_terminal::{
     Decision, HELPER_ENV, RUN_ALWAYS_ID, RUN_ASK_ID, RUN_HEAD_ID, RUN_HEAD_LINE_ID, RUN_IN_NEW_FOLDER, RUN_LINE_ID, RUN_NO_ID, RUN_NOT_ASCII, RUN_PROGRAM_BY_PATH, RUN_PROGRAM_IN_TALK,
     RUN_LONG, RUN_QUESTION, RUN_WARNING, RUN_WORDS_BAR_ID, RUN_WORDS_ID, RUN_WORDS_SCROLLBAR, RUN_YES_ID,
-    RunPermissions, SessionYes, may_run, may_run_with_path, permit, plan, plan_with_path, start_after_yes,
+    RunAnswer, RunPermissions, RunQuestion, SessionYes, TalkFolder, ask_to_run, may_run, may_run_with_path, may_type, permit, plan, plan_with_path, start_after_yes,
+    untypable,
 };
 use stagepack_studio::present_view::start_show;
 
@@ -505,6 +506,176 @@ fn on_windows_a_relative_program_is_found_in_the_talk() {
     let found = plan_with_path(&talk, &words(&["./tool.exe"]), None).unwrap();
     assert!(found.program_in_talk());
     assert_eq!(found.shown_words()[0], "<talk>/tool.exe");
+}
+
+// Typed text: what a button types into a live terminal has a yes of its own.
+
+#[test]
+fn typed_text_is_asked_once_per_text() {
+    let folder = tempfile::tempdir().unwrap();
+    let talk = TalkPlace::Folder(folder.path().to_path_buf());
+    let scratch = tempfile::tempdir().unwrap();
+    let remembered = permissions_in(scratch.path());
+    let sh = words(&["sh"]);
+    let mut session = SessionYes::new();
+    assert_eq!(may_type(&talk, "ls -la", &sh, &session, &remembered), Decision::Ask, "the first press asks");
+    session.allow_typed_for_tests(&talk, "ls -la", &sh);
+    assert_eq!(may_type(&talk, "ls -la", &sh, &session, &remembered), Decision::Run, "a second press doesn't");
+    for other in ["ls -lb", "ls -la ", "ls -l", "LS -la", "ls\t-la"] {
+        assert_eq!(may_type(&talk, other, &sh, &session, &remembered), Decision::Ask, "{other:?} is matched exactly");
+    }
+    session.refuse_typed_for_tests(&talk, "ls -lb", &sh);
+    assert_eq!(may_type(&talk, "ls -lb", &sh, &session, &remembered), Decision::Refused, "a no isn't asked again");
+    assert_eq!(may_type(&talk, "ls -la", &sh, &session, &remembered), Decision::Run);
+    // A yes is for the talk's folder too.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let other_talk = TalkPlace::Folder(elsewhere.path().to_path_buf());
+    assert_eq!(may_type(&other_talk, "ls -la", &sh, &session, &remembered), Decision::Ask);
+    let packed = TalkPlace::Packed(folder.path().join("talk.stagepack"));
+    assert_eq!(may_type(&packed, "ls -la", &sh, &session, &remembered), Decision::Ask);
+}
+
+#[test]
+fn a_yes_for_the_shell_does_not_cover_typed_text() {
+    let folder = tempfile::tempdir().unwrap();
+    let talk = TalkPlace::Folder(folder.path().to_path_buf());
+    let scratch = tempfile::tempdir().unwrap();
+    let mut remembered = permissions_in(scratch.path());
+    let sh = words(&["sh"]);
+    let mut session = SessionYes::new();
+    let kept = plan(&talk, &sh).unwrap();
+    session.allow_for_tests(kept.key());
+    remembered.remember(kept.folder().unwrap(), kept.key().command()).unwrap();
+    assert_eq!(may_run(&talk, &sh, &session, &remembered), Decision::Run);
+    let resolved = kept.key().command().join(" ");
+    for text in ["sh", resolved.as_str(), "rm -rf ~", ""] {
+        assert_eq!(may_type(&talk, text, &sh, &session, &remembered), Decision::Ask, "{text:?}");
+        assert_eq!(may_type(&talk, text, kept.key().command(), &session, &remembered), Decision::Ask, "{text:?}");
+    }
+    // Nor the other way round.
+    let mut typed_only = SessionYes::new();
+    typed_only.allow_typed_for_tests(&talk, "ls", &words(&["ls"]));
+    assert_eq!(may_run(&talk, &words(&["ls"]), &typed_only, &permissions_in(tempfile::tempdir().unwrap().path())), Decision::Ask);
+}
+
+#[gpui_kit::test]
+fn always_remembers_typed_text_for_a_folder_talk_only(cx: &mut TestAppContext) {
+    let folder = tempfile::tempdir().unwrap();
+    let talk = TalkPlace::Folder(folder.path().to_path_buf());
+    let scratch = tempfile::tempdir().unwrap();
+    let file = scratch.path().join("terminal-permissions.json");
+    let sh = words(&["sh"]);
+    let session = SessionYes::new();
+
+    // A file written before typed text was remembered has no `typed`: it reads as none, and keeps
+    // what it had when a text is remembered.
+    let canonical = folder.path().canonicalize().unwrap();
+    let old = serde_json::json!({ "always_run": [{ "folder": canonical, "command": ["/bin/sh"] }] });
+    std::fs::write(&file, serde_json::to_vec(&old).unwrap()).unwrap();
+    let mut remembered = permissions_in(scratch.path());
+    assert!(remembered.always(folder.path(), &words(&["/bin/sh"])));
+    assert_eq!(may_type(&talk, "make demo", &sh, &session, &remembered), Decision::Ask);
+
+    remembered.remember_typed(&TalkFolder::of(&talk).unwrap(), "make demo", &sh).unwrap();
+    let again = permissions_in(scratch.path());
+    assert_eq!(may_type(&talk, "make demo", &sh, &session, &again), Decision::Run, "kept for the folder");
+    assert!(again.always(folder.path(), &words(&["/bin/sh"])), "what was there is kept");
+    assert_eq!(may_type(&talk, "make demo2", &sh, &session, &again), Decision::Ask);
+    assert_eq!(may_type(&talk, "make demo", &words(&["bash"]), &session, &again), Decision::Ask);
+    let written: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(written["typed"].as_array().map(Vec::len), Some(1), "under its own key: {written}");
+    assert_eq!(written["always_run"].as_array().map(Vec::len), Some(1));
+    // Remembering a command keeps the typed text.
+    let mut more = permissions_in(scratch.path());
+    let cat = plan(&talk, &words(&["cat"])).unwrap();
+    more.remember(cat.folder().unwrap(), cat.key().command()).unwrap();
+    assert_eq!(may_type(&talk, "make demo", &sh, &session, &permissions_in(scratch.path())), Decision::Run);
+    // A key the reader doesn't know is passed over, as an older app passes over `typed`.
+    let mut newer = written.clone();
+    newer["from_a_newer_app"] = serde_json::json!([1, 2, 3]);
+    std::fs::write(&file, serde_json::to_vec(&newer).unwrap()).unwrap();
+    assert_eq!(may_type(&talk, "make demo", &sh, &session, &permissions_in(scratch.path())), Decision::Run);
+
+    // A packed talk is never remembered for, wherever it's kept, and its question has no Always.
+    let packed = TalkPlace::Packed(folder.path().join("talk.stagepack"));
+    assert!(TalkFolder::of(&packed).is_none());
+    assert_eq!(may_type(&packed, "make demo", &sh, &session, &permissions_in(scratch.path())), Decision::Ask);
+    let (typing, _scratch) = window(cx);
+    for (folder, always) in [(Some(canonical.clone()), true), (None, false)] {
+        let question = RunQuestion {
+            command: sh.clone(),
+            program_in_talk: false,
+            program_by_path: false,
+            folder,
+            typed: Some("make demo".to_string()),
+        };
+        let answered = std::rc::Rc::new(std::cell::Cell::new(None));
+        let heard = answered.clone();
+        let asked = cx.update_window(typing.handle, |_, window, cx| ask_to_run(window, cx, question, move |answer, _, _| heard.set(Some(answer)))).unwrap();
+        typing.settle(cx);
+        assert!(asked);
+        assert!(showing(&typing, cx, RUN_YES_ID));
+        assert_eq!(showing(&typing, cx, RUN_ALWAYS_ID), always);
+        click_on(&typing, cx, RUN_YES_ID);
+        assert_eq!(answered.get(), Some(RunAnswer::Run));
+    }
+}
+
+#[test]
+fn typed_text_with_control_characters_or_over_4096_bytes_is_refused() {
+    let folder = tempfile::tempdir().unwrap();
+    let talk = TalkPlace::Folder(folder.path().to_path_buf());
+    let scratch = tempfile::tempdir().unwrap();
+    let remembered = permissions_in(scratch.path());
+    let sh = words(&["sh"]);
+    let control = "This button's text has a control character.";
+    let long = "This button's text is over 4,096 bytes.";
+    let refused = [
+        ("echo hi\r".to_string(), control),
+        ("echo hi\nrm -rf ~".to_string(), control),
+        ("\u{1b}[31mred".to_string(), control),
+        ("bell\u{7}".to_string(), control),
+        ("del\u{7f}".to_string(), control),
+        ("c1\u{9b}".to_string(), control),
+        ("a".repeat(4097), long),
+        // Bytes, not characters.
+        ("é".repeat(2049), long),
+    ];
+    for (text, why) in &refused {
+        assert_eq!(untypable(text), Some(*why), "{text:?}");
+        let mut session = SessionYes::new();
+        session.allow_typed_for_tests(&talk, text, &sh);
+        assert_eq!(may_type(&talk, text, &sh, &session, &remembered), Decision::Refused, "never typed, whatever was said: {text:?}");
+    }
+    // What hides, as a command's words can't.
+    for text in ["ls\u{200B}", "ls\u{202E}", "a\u{00A0}b", "a\u{2028}b", "x\u{301}\u{301}\u{301}"] {
+        assert!(untypable(text).is_some(), "{text:?}");
+        assert_eq!(may_type(&talk, text, &sh, &SessionYes::new(), &remembered), Decision::Refused, "{text:?}");
+    }
+    for fine in ["a\tb".to_string(), "a".repeat(4096), "echo \"hi\" | wc -c".to_string(), "  two  spaces ".to_string(), "café".to_string()] {
+        assert_eq!(untypable(&fine), None, "{fine:?}");
+        assert_eq!(may_type(&talk, &fine, &sh, &SessionYes::new(), &remembered), Decision::Ask, "{fine:?}");
+    }
+}
+
+#[test]
+fn a_changed_terminal_command_asks_again_for_the_same_text() {
+    let folder = tempfile::tempdir().unwrap();
+    let talk = TalkPlace::Folder(folder.path().to_path_buf());
+    let scratch = tempfile::tempdir().unwrap();
+    let mut remembered = permissions_in(scratch.path());
+    let sh = words(&["sh"]);
+    let mut session = SessionYes::new();
+    session.allow_typed_for_tests(&talk, "make demo", &sh);
+    remembered.remember_typed(&TalkFolder::of(&talk).unwrap(), "make demo", &sh).unwrap();
+    assert_eq!(may_type(&talk, "make demo", &sh, &session, &remembered), Decision::Run);
+    for other in [&["sh", "-l"][..], &["bash"], &["sh", ""]] {
+        assert_eq!(may_type(&talk, "make demo", &words(other), &session, &remembered), Decision::Ask, "{other:?}");
+    }
+    // A terminal command that can't be run has nothing to type into.
+    for broken in [&[][..], &["sh\u{200B}"], &["", "x"]] {
+        assert_eq!(may_type(&talk, "make demo", &words(broken), &session, &remembered), Decision::Refused, "{broken:?}");
+    }
 }
 
 // The dialog.

@@ -940,6 +940,7 @@ impl WorkspaceView {
             program_in_talk: plan.program_in_talk(),
             program_by_path: plan.program_named_by_path(),
             folder: plan.folder().map(|folder| crate::live_terminal::spelled_plainly(folder.path())),
+            typed: None,
         };
         let view = cx.weak_entity();
         ask_to_run(window, cx, question, move |answer, window, cx| {
