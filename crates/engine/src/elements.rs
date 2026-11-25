@@ -179,7 +179,8 @@ pub(crate) fn lay_out_positioned_tag(
         let (w, h) = box_size(wanted, Some(MODEL_ROOM));
         (Some(MODEL_ROOM), Some(flow.model(tag, Some((w, h)))))
     } else if tag.name == BUTTON_TAG {
-        (None, Some(flow.button(tag, true)))
+        let (node, natural) = flow.placed_button(tag, wanted);
+        (Some(natural), Some(node))
     } else {
         let element = flow.render_tag(tag, room);
         let natural = element.as_ref().and_then(|element| flow.natural_size(element));
@@ -420,6 +421,21 @@ impl Flow<'_, '_> {
     /// A button: its label in the middle of a rounded box, 16 across and 10 down from its edge,
     /// coloured from the theme for its look. `boxed` says it fills a box of a known size.
     fn button(&mut self, tag: &Tag, boxed: bool) -> NodeId {
+        self.button_and_label(tag, boxed).0
+    }
+
+    /// A button placed on the slide, and the size of its box: what `wanted` gives, and for a side it
+    /// doesn't give, its label's with the padding, the label on one line unless a width is given.
+    fn placed_button(&mut self, tag: &Tag, wanted: (Option<f32>, Option<f32>)) -> (NodeId, (f32, f32)) {
+        let (node, label) = self.button_and_label(tag, true);
+        let inside = wanted.0.map(|w| (w - 2.0 * BUTTON_PADDING.0).max(0.0));
+        let (w, h) = self.text_size(label, inside);
+        let natural = (wanted.0.unwrap_or(w + 2.0 * BUTTON_PADDING.0), wanted.1.unwrap_or(h + 2.0 * BUTTON_PADDING.1));
+        (node, natural)
+    }
+
+    /// [`Self::button`], and the node of its label.
+    fn button_and_label(&mut self, tag: &Tag, boxed: bool) -> (NodeId, NodeId) {
         let (look, problem) = read_button_look(tag.attr("look"));
         if let Some(problem) = problem {
             self.notice(problem);
@@ -435,7 +451,7 @@ impl Flow<'_, '_> {
             ..Style::default()
         };
         let look = ShapeLook { kind: ShapeKind::Rounded, fill: Some(fill), outline: None, outline_width: 0.0, radius: BUTTON_RADIUS, centered: true };
-        self.node_with_content(style, &[label], Content::Shape(look))
+        (self.node_with_content(style, &[label], Content::Shape(look)), label)
     }
 
     /// A video's still: the picture its `poster` names, if that can be read, or else its first

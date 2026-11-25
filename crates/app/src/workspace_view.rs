@@ -60,7 +60,8 @@ use crate::slide_strip::{
 use crate::watcher::{self, Change};
 use crate::working_copies::{KEEP_FAILED, KeepFailed, WorkingCopies};
 
-pub use running::LiveStep;
+pub use running::{BUTTON_TERMINAL_ENDED, BUTTON_TERMINAL_FULL, BUTTON_TERMINAL_REFUSED, BUTTON_TEXT_REFUSED, LiveStep};
+pub(crate) use running::RunPressed;
 
 mod editing;
 mod inserting;
@@ -510,6 +511,8 @@ pub struct WorkspaceView {
     live_watch: Option<Task<()>>,
     /// The terminal *Start* asked about, to be started if the answer is yes.
     start_when_yes: Option<(usize, slides_engine::TerminalLayer)>,
+    /// The button pressed last in the show that waits for a yes before it types.
+    type_when_yes: Option<running::ButtonRun>,
     /// Whether this talk's folder is one of them.
     always_build: bool,
     /// Where an untitled talk is first saved, in place of the person's Documents folder.
@@ -837,6 +840,7 @@ impl WorkspaceView {
             live,
             live_watch: None,
             start_when_yes: None,
+            type_when_yes: None,
             documents: None,
             stagepack: None,
             always_build: false,
@@ -949,7 +953,7 @@ impl WorkspaceView {
     }
 
     /// Takes in what was answered about running what `plan` says.
-    fn run_answered(&mut self, plan: &Plan, answer: RunAnswer, _window: &mut Window, cx: &mut Context<Self>) {
+    fn run_answered(&mut self, plan: &Plan, answer: RunAnswer, window: &mut Window, cx: &mut Context<Self>) {
         let key = plan.key();
         match answer {
             RunAnswer::DontRun => self.run_yes.refuse(key),
@@ -977,6 +981,8 @@ impl WorkspaceView {
                 self.start_live(slide, &now, true, cx);
             }
         }
+        // A button asked: a yes goes on to its text.
+        self.button_run_answered(window, cx);
         cx.notify();
     }
 
@@ -1338,6 +1344,11 @@ impl WorkspaceView {
             })
             .ok();
         });
+    }
+
+    /// Puts `status` on the status line, for the show.
+    pub(crate) fn tell(&mut self, status: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.say(status, cx);
     }
 
     /// Puts `status` on the status line.

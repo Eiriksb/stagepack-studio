@@ -36,6 +36,9 @@ pub const RUN_TITLE_ID: &str = "run-title";
 pub const RUN_TYPED_ID: &str = "run-typed";
 /// The line *into* after the typed text, before the terminal's command.
 pub const RUN_INTO_ID: &str = "run-into";
+/// The line under the terminal's command saying which folder *Always for this folder* is for, when
+/// typed text is asked about for a talk kept in one.
+pub const RUN_TYPED_FOLDER_ID: &str = "run-typed-folder";
 /// How the words' scrollbar is shown: always, so a list that goes on beyond its box shows it does
 /// before anyone scrolls. (The theme's own way shows a scrollbar only once something is scrolled.)
 pub const RUN_WORDS_SCROLLBAR: ScrollbarMode = ScrollbarMode::Always;
@@ -132,11 +135,18 @@ pub fn ask_to_run(
             let head = head_lines(&question);
             let (title, label) = if question.typed.is_some() { (TYPE_TITLE, TYPE_TITLE) } else { (RUN_TITLE, RUN_QUESTION) };
             // The text to type, in full and as it can be seen, then *into*, before the command.
+            // A text with no spaces wraps at any letter, so all of it is there to scroll to.
             let typed = question.typed.as_deref().map(|text| {
                 let shown = SharedString::from(visible(text));
                 v_flex()
-                    .child(div().id(RUN_TYPED_ID).test_support().aria_label(shown.clone()).font_family(mono.clone()).child(shown))
+                    .min_w_0()
+                    .child(div().id(RUN_TYPED_ID).test_support().aria_label(shown.clone()).w_full().min_w_0().whitespace_normal().font_family(mono.clone()).child(shown))
                     .child(div().id(RUN_INTO_ID).test_support().aria_label(TYPE_INTO).child(TYPE_INTO))
+            });
+            // Which folder *Always* would be for, under the terminal's command.
+            let typed_folder = question.typed.as_ref().and(question.folder.as_ref()).map(|folder| {
+                let line = SharedString::from(format!("in {}", visible(&folder.display().to_string())));
+                div().id(RUN_TYPED_FOLDER_ID).test_support().aria_label(line.clone()).text_sm().min_w_0().whitespace_normal().child(line)
             });
             dialog
                 .title(div().id(RUN_TITLE_ID).test_support().aria_label(title).child(title))
@@ -178,11 +188,14 @@ pub fn ask_to_run(
                                         .overflow_y_scroll()
                                         .track_scroll(&words_scroll)
                                         .child(
-                                            v_flex().pr(Scrollbar::width()).children(typed).child(v_flex().font_family(mono).children(
-                                                words.into_iter().enumerate().map(|(index, line)| {
+                                            v_flex()
+                                                .min_w_0()
+                                                .pr(Scrollbar::width())
+                                                .children(typed)
+                                                .child(v_flex().font_family(mono).children(words.into_iter().enumerate().map(|(index, line)| {
                                                     div().id((RUN_LINE_ID, index)).test_support().aria_label(line.clone()).child(line)
-                                                }),
-                                            )),
+                                                })))
+                                                .children(typed_folder),
                                         ),
                                 )
                                 .child(

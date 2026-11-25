@@ -22,6 +22,7 @@ use slides_engine::{Fonts, Rect};
 use slides_model::{AdapterKind, Drawer, DrawerOptions};
 use stagepack_studio::document::Document;
 use stagepack_studio::model_view;
+use stagepack_studio::present::Place;
 use stagepack_studio::present_view::{
     AudienceView, COUNTER_ID, INTERACTIVE_HOVER_ID, NEXT_ID, POINTER_HIDES_AFTER, PressedIn, Presentation, StandInPress, start_show,
 };
@@ -429,3 +430,101 @@ fn insert_button_adds_a_button_tag_and_selects_it(cx: &mut TestAppContext) {
     });
     assert_eq!(name.as_deref(), Some("Button"));
 }
+
+// Buttons in the show.
+
+/// A slide of three clicks, each bringing a box, with a button at [`BOX`] that goes to click
+/// `step`, then two plain slides.
+fn stepped(step: &str) -> String {
+    let boxes: Vec<String> =
+        (1..=3).map(|click| format!("<Box x=\"{}\" y=\"700\" w=\"200\" h=\"100\" click=\"{click}\">\n\nBox {click}\n\n</Box>", 300 * click)).collect();
+    format!(
+        "# One\n\n{}\n\n<Button label=\"Go\" step=\"{step}\" x=\"200\" y=\"200\" w=\"400\" h=\"300\" />\n\n---\n\n# Two\n\n---\n\n# Three\n",
+        boxes.join("\n\n")
+    )
+}
+
+/// How many of the layers drawn on `canvas` are shown.
+fn shown_layers(cx: &TestAppContext, canvas: &Entity<SlideCanvas>) -> usize {
+    cx.read(|cx| canvas.read(cx).looks().iter().filter(|look| look.visible).count())
+}
+
+fn place(show: &Show, cx: &TestAppContext) -> Place {
+    cx.read(|cx| show.show.read(cx).place())
+}
+
+#[gpui_kit::test]
+fn a_step_button_goes_to_its_step(cx: &mut TestAppContext) {
+    let show = rehearse(cx, &stepped("2"));
+    assert_eq!(show.counter(cx), "1 / 3");
+    let canvas = show.canvas(cx);
+    let at_first = shown_layers(cx, &canvas);
+    show.click_slide(cx, ON_IT);
+    assert_eq!(place(&show, cx), Place { slide: 0, step: 2 });
+    assert_eq!(show.counter(cx), "1 / 3", "the same slide");
+    // Once the boxes have come in, the first two show, and not the third.
+    show.wait(cx, 1000);
+    assert_eq!(shown_layers(cx, &show.canvas(cx)), at_first + 2);
+    // A click beside it goes on from there, to the third box.
+    show.click_slide(cx, BESIDE_IT);
+    assert_eq!(place(&show, cx), Place { slide: 0, step: 3 });
+    // Pressed again, it goes back to its step.
+    show.click_slide(cx, ON_IT);
+    assert_eq!(place(&show, cx), Place { slide: 0, step: 2 });
+    show.settle(cx);
+    assert_eq!(shown_layers(cx, &show.canvas(cx)), at_first + 2);
+}
+
+#[gpui_kit::test]
+fn a_step_button_past_the_last_click_does_nothing(cx: &mut TestAppContext) {
+    let show = rehearse(cx, &stepped("9"));
+    show.click_slide(cx, ON_IT);
+    assert_eq!(place(&show, cx), Place { slide: 0, step: 0 }, "neither its step nor a click of the show's");
+}
+
+#[gpui_kit::test]
+fn a_press_in_the_presenter_window_acts_once_and_both_windows_agree(cx: &mut TestAppContext) {
+    let show = rehearse(cx, &stepped("2"));
+    let canvas = show.presenter_canvas(cx);
+    let on = show.at(cx, &canvas, ON_IT);
+    show.click(cx, show.presenter, on);
+    assert_eq!(place(&show, cx), Place { slide: 0, step: 2 }, "it moved once, and no click of the show's followed");
+    assert_eq!(show.counter(cx), "1 / 3");
+    show.wait(cx, 1000);
+    let (theirs, ours) = (show.canvas(cx), show.presenter_canvas(cx));
+    assert_eq!(shown_layers(cx, &theirs), shown_layers(cx, &ours), "both windows show the same");
+    let looks = |canvas: &Entity<SlideCanvas>| cx.read(|cx| canvas.read(cx).looks().iter().map(|look| look.visible).collect::<Vec<_>>());
+    assert_eq!(looks(&theirs), looks(&ours));
+    // The audience's window held no press of it: a click there is the show's again.
+    show.click_slide(cx, BESIDE_IT);
+    assert_eq!(place(&show, cx), Place { slide: 0, step: 3 });
+}
+
+#[gpui_kit::test]
+fn go_to_step_goes_straight_there_and_back(cx: &mut TestAppContext) {
+    let show = rehearse(cx, &stepped("2"));
+    let at_first = shown_layers(cx, &show.canvas(cx));
+    let go = |cx: &mut TestAppContext, step: u32| {
+        show.show.update(cx, |show, cx| show.go_to_step(step, cx));
+        show.settle(cx);
+        place(&show, cx)
+    };
+    assert_eq!(go(cx, 3), Place { slide: 0, step: 3 });
+    assert_eq!(go(cx, 9), Place { slide: 0, step: 3 }, "no further than the slide's last click");
+    show.wait(cx, 1000);
+    assert_eq!(shown_layers(cx, &show.canvas(cx)), at_first + 3);
+    // Going back shows the place at once, with nothing coming in.
+    assert_eq!(go(cx, 1), Place { slide: 0, step: 1 });
+    assert_eq!(shown_layers(cx, &show.canvas(cx)), at_first + 1);
+    assert_eq!(go(cx, 0), Place { slide: 0, step: 0 });
+    assert_eq!(shown_layers(cx, &show.canvas(cx)), at_first);
+    // On a slide with no clicks it stays.
+    cx.simulate_keystrokes(show.audience, "right right right right");
+    show.settle(cx);
+    assert_eq!(place(&show, cx), Place { slide: 1, step: 0 });
+    assert_eq!(go(cx, 1), Place { slide: 1, step: 0 });
+}
+
+#[gpui_kit::test]
+#[ignore = "Task 5"]
+fn a_do_button_sends_its_action(_cx: &mut TestAppContext) {}

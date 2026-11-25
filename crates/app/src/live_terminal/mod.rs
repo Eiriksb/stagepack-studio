@@ -14,7 +14,7 @@ mod resolve;
 mod session;
 
 pub use ask::{
-    CHARACTERS_THAT_FIT, LONGEST_WORD_THAT_FITS, RUN_LONG, RUN_WORDS_BAR_ID, RUN_WORDS_SCROLLBAR, WORDS_THAT_FIT, RUN_ALWAYS_ID, RUN_ASK_ID, RUN_HEAD_ID, RUN_HEAD_LINE_ID, RUN_IN_NEW_FOLDER, RUN_LINE_ID, RUN_NOT_ASCII, RUN_NO_ID, RUN_WORDS_ID, RUN_PROGRAM_BY_PATH, RUN_PROGRAM_IN_TALK, RUN_QUESTION, RUN_WARNING, RUN_YES_ID, RUN_INTO_ID, RUN_TITLE, RUN_TITLE_ID, RUN_TYPED_ID, TYPE_INTO, TYPE_TITLE, RunAnswer, RunQuestion, ask_to_run,
+    CHARACTERS_THAT_FIT, LONGEST_WORD_THAT_FITS, RUN_LONG, RUN_WORDS_BAR_ID, RUN_WORDS_SCROLLBAR, WORDS_THAT_FIT, RUN_ALWAYS_ID, RUN_ASK_ID, RUN_HEAD_ID, RUN_HEAD_LINE_ID, RUN_IN_NEW_FOLDER, RUN_LINE_ID, RUN_NOT_ASCII, RUN_NO_ID, RUN_WORDS_ID, RUN_PROGRAM_BY_PATH, RUN_PROGRAM_IN_TALK, RUN_QUESTION, RUN_WARNING, RUN_YES_ID, RUN_INTO_ID, RUN_TITLE, RUN_TITLE_ID, RUN_TYPED_FOLDER_ID, RUN_TYPED_ID, TYPE_INTO, TYPE_TITLE, RunAnswer, RunQuestion, ask_to_run,
 };
 pub use helper::{HELPER_ENV, find_helper};
 pub use keys::{key_bytes, key_bytes_in};
@@ -24,6 +24,7 @@ pub use live::{
 pub use permission::{
     Decision, MOST_TYPED_BYTES, Permit, Plan, RunKey, RunPermissions, SessionYes, TYPED_CONTROL, TYPED_HIDES, TYPED_TOO_LONG, TalkFolder, may_run, may_type, untypable, plain_drive_path, spelled_plainly, may_run_with_path, permit, plan, plan_with_path, start_after_yes,
 };
+pub(crate) use permission::{TypeKey, type_key};
 pub use resolve::{Program, resolve_program};
 #[cfg(feature = "test-hooks")]
 pub use resolve::forbid_for_tests;

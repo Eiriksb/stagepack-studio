@@ -470,6 +470,19 @@ impl<'a, 'env> Flow<'a, 'env> {
         node
     }
 
+    /// How big the text of `node`, a leaf of text, is on lines `width` wide, or on one line with no
+    /// width. A node that isn't text has no size.
+    pub(crate) fn text_size(&mut self, node: NodeId, width: Option<f32>) -> (f32, f32) {
+        let fonts = &mut *self.env.fonts;
+        match self.tree.get_node_context(node) {
+            Some(Content::Text(leaf)) => {
+                let text = leaf.shape(width, fonts);
+                (text.width, text.height)
+            }
+            _ => (0.0, 0.0),
+        }
+    }
+
     /// Text from a component. Whatever it leaves out comes from the region.
     pub(crate) fn plain_text(&mut self, text: &str, size: Option<f32>, bold: bool, color: Option<Color>, align: Align) -> NodeId {
         let look = TextLook { size: size.unwrap_or(self.region.size), bold: bold || self.region.bold };

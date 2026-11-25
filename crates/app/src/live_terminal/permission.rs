@@ -278,7 +278,6 @@ impl SessionYes {
     }
 
     /// Says yes to typing what `key` is for, exactly, for the rest of the session.
-    #[cfg_attr(not(feature = "test-hooks"), expect(dead_code, reason = "a button's press asks for it from plan H1 task 4"))]
     pub(crate) fn allow_typed(&mut self, key: &TypeKey) {
         self.typed_refused.retain(|one| one != key);
         if !self.typed_allowed.contains(key) {
@@ -287,7 +286,6 @@ impl SessionYes {
     }
 
     /// Says no to typing what `key` is for, exactly, for the rest of the session.
-    #[cfg_attr(not(feature = "test-hooks"), expect(dead_code, reason = "a button's press asks for it from plan H1 task 4"))]
     pub(crate) fn refuse_typed(&mut self, key: &TypeKey) {
         self.typed_allowed.retain(|one| one != key);
         if !self.typed_refused.contains(key) {
@@ -321,6 +319,18 @@ pub(crate) struct TypeKey {
     text: String,
     terminal_command: Vec<String>,
     folder: Option<PathBuf>,
+}
+
+impl TypeKey {
+    /// The text, exactly.
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// The terminal's command, its words exactly as the talk gives them.
+    pub(crate) fn terminal_command(&self) -> &[String] {
+        &self.terminal_command
+    }
 }
 
 /// The most bytes a button may type.

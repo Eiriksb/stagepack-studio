@@ -1812,6 +1812,28 @@ fn a_button_keeps_its_label_clear_of_its_edge() {
 }
 
 #[test]
+fn a_button_with_no_size_takes_its_labels_with_the_padding() {
+    let (slide, _) = lay_out("<Button label=\"Go on\" step=\"0\" x=\"10\" y=\"20\" />\n", &[]);
+    let layer = slide.layers.last().unwrap();
+    let lines = text_boxes(layer);
+    assert_eq!(lines.len(), 1, "one line: {lines:?}");
+    let (x, y, w, h) = lines[0];
+    assert!(layer.rect.w < 200.0 && layer.rect.h < 200.0, "not the 200 box: {:?}", layer.rect);
+    assert!((layer.rect.w - (w + 32.0)).abs() < 1.0 && (layer.rect.h - (h + 20.0)).abs() < 1.0, "{:?} for {lines:?}", layer.rect);
+    assert!((x - 16.0).abs() < 1.0 && (y - 10.0).abs() < 1.0, "16 across and 10 down: {lines:?}");
+    assert_eq!((layer.rect.x, layer.rect.y), (10.0, 20.0));
+    // A longer label, a wider button.
+    let (slide, _) = lay_out("<Button label=\"Go on to the next part\" step=\"0\" x=\"10\" y=\"20\" />\n", &[]);
+    assert!(slide.layers.last().unwrap().rect.w > layer.rect.w);
+    // A width given is kept, and the height is the label's at that width.
+    let (slide, _) = lay_out("<Button label=\"Go on to the next part of the demo\" step=\"0\" x=\"0\" y=\"0\" w=\"200\" />\n", &[]);
+    let layer = slide.layers.last().unwrap();
+    let lines = text_boxes(layer);
+    assert_eq!(layer.rect.w, 200.0);
+    assert!((layer.rect.h - (lines[0].3 + 20.0)).abs() < 1.0, "{:?} for {lines:?}", layer.rect);
+}
+
+#[test]
 fn a_button_reads_one_action() {
     let action = |attrs: &str| {
         let (slide, _) = lay_out(&format!("<Button label=\"Go\" {attrs} x=\"0\" y=\"0\" />\n"), &[]);

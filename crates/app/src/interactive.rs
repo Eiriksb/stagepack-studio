@@ -5,10 +5,10 @@
 use std::ops::Range;
 
 use gpui_kit::Point;
-use slides_engine::{Moment, Rect};
+use slides_engine::{BUTTON_ON_NOTHING, BUTTON_STEP_PAST, ButtonAction, ButtonOn, Moment, Rect};
 
 use crate::document::Document;
-use crate::live_terminal::LiveId;
+use crate::live_terminal::{LiveId, untypable};
 use crate::model_view::inside_turned;
 
 /// What an interactive thing is.
@@ -62,6 +62,50 @@ pub(crate) fn interactive_on(document: &mut Document, slide: usize, moment: Mome
     let mut things: Vec<(usize, InteractiveThing)> = terminals.chain(models).chain(buttons).collect();
     things.sort_by_key(|(layer, _)| *layer);
     things.into_iter().map(|(_, thing)| thing).collect()
+}
+
+/// What's said of a button whose `run` text is empty.
+pub const BUTTON_TEXT_EMPTY: &str = "This button's text is empty.";
+
+/// What pressing a button is to do, from what it says and the clicks its slide takes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Press {
+    /// Nothing: it has no action, or more than one, and its notice says so.
+    Nothing,
+    /// Go to this click step of the slide.
+    Step(u32),
+    /// Type `text`, then Enter, into the live terminal on the slide whose `id` is `terminal`.
+    Run { text: String, terminal: String },
+    /// Nothing, for this, which the status line says.
+    Refused(String),
+}
+
+/// What came of acting on a button's press.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Acted {
+    /// It did what it does, or there was nothing for it to do.
+    Done,
+    /// It waits for a yes, which is being asked.
+    Asked,
+    /// It did nothing, for this, the one line the status line shows.
+    Refused(String),
+}
+
+/// What pressing `button` is to do, on a slide that takes `steps` clicks. A text that can't be typed
+/// is refused here, before anything is asked.
+pub(crate) fn press_button(button: &ButtonOn, steps: u32) -> Press {
+    let Ok(action) = &button.action else { return Press::Nothing };
+    match action {
+        ButtonAction::Step(step) if *step > steps => Press::Refused(BUTTON_STEP_PAST.to_string()),
+        ButtonAction::Step(step) => Press::Step(*step),
+        // What a button acts on comes with plan H1 task 5.
+        ButtonAction::Do { .. } => Press::Refused(BUTTON_ON_NOTHING.to_string()),
+        ButtonAction::Run { text, .. } if text.is_empty() => Press::Refused(BUTTON_TEXT_EMPTY.to_string()),
+        ButtonAction::Run { text, terminal } => match untypable(text) {
+            Some(why) => Press::Refused(why.to_string()),
+            None => Press::Run { text: text.clone(), terminal: terminal.clone() },
+        },
+    }
 }
 
 /// What reached a test's box, and in which window.

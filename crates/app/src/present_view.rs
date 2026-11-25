@@ -7,19 +7,19 @@ use std::time::{Duration, Instant};
 use gpui_kit::component::{ActiveTheme as _, TitleBar, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use slides_engine::{Enter, LayerTiming, ModelLayer, Moment, Rect, TerminalLayer, Transition, VideoLayer};
+use slides_engine::{ButtonLayer, Enter, LayerTiming, ModelLayer, Moment, Rect, TerminalLayer, Transition, VideoLayer};
 
 use crate::document::{Document, LargeOpen};
-use crate::interactive::{InteractiveKind, InteractiveThing, interactive_at, interactive_on};
+use crate::interactive::{Acted, InteractiveKind, InteractiveThing, Press, interactive_at, interactive_on, press_button};
 use crate::present::{
     ENTER_SECONDS, MOMENTS_PER_SECOND, Moved, Place, ScreenInfo, Session, TRANSITION_SECONDS,
     WindowPlan, choose_windows, clock_text, layer_look, moment_time, slide_looks,
 };
 use crate::live_terminal::{LiveId, LiveTerminals, gives_keys_back};
-use crate::model_view::{Aim, aim_at, inside_turned};
+use crate::model_view::{Aim, aim_at};
 use crate::replay::{Aim as ReplayAim, MOST_PLAYING, Replay, Source as ReplaySource};
 use crate::slide_canvas::{LivePlace, ModelLetGo, ScaleChanged, SlideCanvas, VideoLetGo, VideoOpened};
-use crate::workspace_view::{APP_ID, LiveStep, WorkspaceView};
+use crate::workspace_view::{APP_ID, LiveStep, RunPressed, WorkspaceView};
 
 pub const AUDIENCE_ID: &str = "audience";
 pub const CURRENT_ID: &str = "current-slide";
@@ -208,6 +208,20 @@ impl Presentation {
     /// Asks, in the window the presenter looks at, whether `command` may run, unless that's
     /// already on its way.
     fn ask_for_live(&mut self, command: Vec<String>, cx: &mut Context<Self>) {
+        self.ask_in_window(cx, move |workspace, window, cx| {
+            workspace.ask_to_run(command, window, cx);
+        });
+    }
+
+    /// Asks, in the window the presenter looks at, what the button pressed last waits for, unless a
+    /// question is already on its way: its answer has the button go on.
+    fn ask_for_button(&mut self, cx: &mut Context<Self>) {
+        self.ask_in_window(cx, |workspace, window, cx| workspace.ask_for_button(window, cx));
+    }
+
+    /// Has the window of the talk `ask` in the window the presenter looks at, once the window is free
+    /// to, unless a question is already on its way.
+    fn ask_in_window(&mut self, cx: &mut Context<Self>, ask: impl FnOnce(&mut WorkspaceView, &mut Window, &mut Context<WorkspaceView>) + 'static) {
         if self.ask_pending {
             return;
         }
@@ -222,7 +236,7 @@ impl Presentation {
         cx.defer(move |cx| {
             window
                 .update(cx, |_, window, cx| {
-                    workspace.update(cx, |workspace, cx| workspace.ask_to_run(command, window, cx)).ok();
+                    workspace.update(cx, |workspace, cx| ask(workspace, window, cx)).ok();
                 })
                 .ok();
             show.update(cx, |show, _| show.ask_pending = false).ok();
@@ -290,7 +304,10 @@ impl Presentation {
                 let began = cx.background_executor().now();
                 self.reveal = Some(Reveal { step, began });
             }
-            Moved::BackedUp => self.reveal = None,
+            Moved::BackedUp => {
+                self.reveal = None;
+                self.arrival = None;
+            }
             Moved::Arrived { .. } | Moved::Stayed => return,
         }
         cx.notify();
@@ -453,15 +470,39 @@ impl Presentation {
 
     /// The press `window` has let go of over `over`, or over nothing interactive. It's for the thing
     /// it began on only if it's let go of over that thing, and otherwise for nothing.
-    fn let_go(&mut self, over: Option<&InteractiveThing>, window: PressedIn) {
+    fn let_go(&mut self, over: Option<&InteractiveThing>, window: PressedIn, cx: &mut Context<Self>) {
         let Some((source, _)) = self.pressed.take_if(|(_, began)| *began == window) else { return };
         let Some(thing) = over.filter(|thing| thing.source == source) else { return };
         match thing.kind {
-            // A terminal took the keys as it was pressed, and a model turns as it's dragged. A
-            // button does nothing yet: it's let go of here once it acts.
-            InteractiveKind::Terminal(_) | InteractiveKind::Model(_) | InteractiveKind::Button => {}
+            // A terminal took the keys as it was pressed, and a model turns as it's dragged.
+            InteractiveKind::Terminal(_) | InteractiveKind::Model(_) => {}
+            // A button acts, once, whichever window it was pressed in: both show what it did.
+            InteractiveKind::Button => {
+                let Some(button) = self.button_here(&source, cx) else { return };
+                if let Acted::Refused(why) = act(self, &button, cx) {
+                    self.tell(why, cx);
+                }
+            }
             #[cfg(feature = "test-hooks")]
             InteractiveKind::StandIn => self.stand_in_presses.push(StandInPress::Up(window)),
+        }
+    }
+
+    /// The button whose tag is written at `source` on the slide the show is on, as it is now.
+    fn button_here(&self, source: &Range<usize>, cx: &mut Context<Self>) -> Option<ButtonLayer> {
+        let now = cx.background_executor().now();
+        let moment = Moment { step: self.session.place().step, time: self.time_at(now) };
+        let slide = self.session.place().slide;
+        self.document.update(cx, |document, _| {
+            let slide = document.shown_slide(slide);
+            document.buttons_at(slide, moment).into_iter().find(|button| button.source == *source)
+        })
+    }
+
+    /// Puts `sentence` on the status line of the window of the talk, if the show has one.
+    fn tell(&self, sentence: String, cx: &mut Context<Self>) {
+        if let Some((workspace, _)) = &self.owner {
+            workspace.update(cx, |workspace, cx| workspace.tell(sentence, cx)).ok();
         }
     }
 
@@ -505,6 +546,39 @@ impl Presentation {
         })
     }
 }
+
+/// Does what pressing `button`, on the slide `show` is on, does: goes to its step, or types its text
+/// into its terminal, starting that first, once each has its yes. What it can't do comes back, with
+/// the sentence the status line shows.
+pub(crate) fn act(show: &mut Presentation, button: &ButtonLayer, cx: &mut Context<Presentation>) -> Acted {
+    let at = show.session.place().slide;
+    let (slide, steps) = show.document.update(cx, |document, _| {
+        let slide = document.shown_slide(at);
+        (slide, document.timeline_of(slide).steps)
+    });
+    match press_button(&button.on, steps) {
+        Press::Nothing => Acted::Done,
+        Press::Refused(why) => Acted::Refused(why),
+        Press::Step(step) => {
+            show.go_to_step(step, cx);
+            Acted::Done
+        }
+        Press::Run { text, terminal } => {
+            let Some((workspace, _)) = show.owner.clone() else { return Acted::Refused(BUTTON_NO_TERMINALS.to_string()) };
+            match workspace.update(cx, |workspace, cx| workspace.press_run_button(slide, &terminal, &text, cx)) {
+                Ok(RunPressed::Typed) | Err(_) => Acted::Done,
+                Ok(RunPressed::Refused(why)) => Acted::Refused(why),
+                Ok(RunPressed::Ask) => {
+                    show.ask_for_button(cx);
+                    Acted::Asked
+                }
+            }
+        }
+    }
+}
+
+/// What's said of a button that types, in a show that runs no live terminals.
+const BUTTON_NO_TERMINALS: &str = "This show runs no live terminals, so this button types nothing.";
 
 /// The interactive things of the talk at `place`, `time` seconds after its slide appeared, whether
 /// or not they take a press now.
@@ -1177,20 +1251,6 @@ impl AudienceView {
         self.current.update(cx, |canvas, cx| canvas.turn_model(layer, on.clone(), open, on.turn, aim, cx));
     }
 
-    /// The model on the slide shown at `position`, in the window, if there's one there.
-    fn model_at(&self, position: Point<Pixels>, cx: &App) -> Option<ModelLayer> {
-        let at = slide_point(&self.current, position, cx)?;
-        // The one in front.
-        self.models.iter().rev().find(|model| inside_turned(model.on.rect, model.on.rotate, (at.x, at.y))).cloned()
-    }
-
-    /// The model on the slide shown at `position`, drawn live, being so now if it wasn't.
-    fn live_model_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> Option<usize> {
-        let model = self.model_at(position, cx)?;
-        self.make_live(&model, cx);
-        Some(model.layer)
-    }
-
     /// Has `model` drawn live, if it isn't.
     fn make_live(&mut self, model: &ModelLayer, cx: &mut Context<Self>) {
         if self.current.read(cx).model_aim(model.layer).is_none() {
@@ -1215,7 +1275,14 @@ impl AudienceView {
         self.swallow_click = keys || hit.is_some();
         self.show.update(cx, |show, _| show.press_on(hit.as_ref(), PressedIn::Audience));
         self.turned = false;
-        self.turn_drag = self.model_at(event.position, cx).map(|model| (model, event.position, false));
+        // Only a model in front of everything else under the pointer turns.
+        self.turn_drag = self.model_in_front(hit.as_ref()).map(|model| (model, event.position, false));
+    }
+
+    /// The model `hit` is, if the interactive thing in front under the pointer is one.
+    fn model_in_front(&self, hit: Option<&InteractiveThing>) -> Option<ModelLayer> {
+        let Some(InteractiveKind::Model(layer)) = hit.map(|thing| &thing.kind) else { return None };
+        self.models.iter().find(|model| model.layer == *layer).cloned()
     }
 
     /// A drag on a model turns it, and isn't a click of the show's. Any move shows the pointer, and
@@ -1225,7 +1292,7 @@ impl AudienceView {
         if event.pressed_button != Some(MouseButton::Left) {
             // A press let go of where this window didn't see it is for nothing.
             if self.show.read(cx).holds_press(PressedIn::Audience) {
-                self.show.update(cx, |show, _| show.let_go(None, PressedIn::Audience));
+                self.show.update(cx, |show, cx| show.let_go(None, PressedIn::Audience, cx));
             }
             self.end_turn(cx);
             return;
@@ -1249,7 +1316,7 @@ impl AudienceView {
     /// of over it, and it ends a drag on a model.
     fn let_go(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         let over = self.thing_at(position, cx);
-        self.show.update(cx, |show, _| show.let_go(over.as_ref(), PressedIn::Audience));
+        self.show.update(cx, |show, cx| show.let_go(over.as_ref(), PressedIn::Audience, cx));
         self.end_turn(cx);
     }
 
@@ -1266,9 +1333,11 @@ impl AudienceView {
         if steps == 0.0 {
             return;
         }
-        if let Some(layer) = self.live_model_at(event.position, cx) {
-            self.current.update(cx, |canvas, cx| canvas.zoom_by(layer, steps, cx));
-        }
+        let hit = self.thing_at(event.position, cx);
+        let Some(model) = self.model_in_front(hit.as_ref()) else { return };
+        self.make_live(&model, cx);
+        let layer = model.layer;
+        self.current.update(cx, |canvas, cx| canvas.zoom_by(layer, steps, cx));
     }
 
     /// Makes the stills that waited for a video to be unpacked to play, or a model to turn.
@@ -1407,7 +1476,7 @@ impl Render for AudienceView {
                     .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
                         let turned = std::mem::take(&mut this.turned);
                         let swallowed = std::mem::take(&mut this.swallow_click);
-                        if turned || swallowed || this.show.read(cx).pressed.is_some() {
+                        if turned || swallowed || this.show.read(cx).holds_press(PressedIn::Audience) {
                             return;
                         }
                         // Let go of over an interactive thing, it's no click, wherever it began.
@@ -1638,7 +1707,7 @@ impl PresenterView {
     fn pointer_to(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         self.pointer = Some(event.position);
         if event.pressed_button != Some(MouseButton::Left) && self.show.read(cx).holds_press(PressedIn::Presenter) {
-            self.show.update(cx, |show, _| show.let_go(None, PressedIn::Presenter));
+            self.show.update(cx, |show, cx| show.let_go(None, PressedIn::Presenter, cx));
         }
         if self.thing_at(event.position, cx).map(|thing| thing.source) != self.hovered {
             cx.notify();
@@ -1649,7 +1718,7 @@ impl PresenterView {
     /// of over it.
     fn let_go(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         let over = self.thing_at(position, cx);
-        self.show.update(cx, |show, _| show.let_go(over.as_ref(), PressedIn::Presenter));
+        self.show.update(cx, |show, cx| show.let_go(over.as_ref(), PressedIn::Presenter, cx));
     }
 
     /// Draws the slide on `current` again if it moves and its time has changed since, and

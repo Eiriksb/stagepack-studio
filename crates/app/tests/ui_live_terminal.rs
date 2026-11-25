@@ -17,9 +17,10 @@ use typing::*;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, InputEvent as _, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Modifiers, Point, TestAppContext, px};
 use stagepack_studio::live_terminal::{
-    HELPER_ENV, LiveId, LiveTerminals, MOST_LIVE, Session, NOT_INSTALLED, RUN_ASK_ID, RUN_HEAD_ID, RUN_INTO_ID, RUN_LINE_ID, RUN_NO_ID, RUN_TITLE, RUN_TITLE_ID,
-    RUN_TYPED_ID, RUN_YES_ID, RunPermissions, RunQuestion, TOO_MANY, TYPE_TITLE, ask_to_run, threads_running,
+    HELPER_ENV, LiveId, LiveTerminals, MOST_LIVE, Session, NOT_INSTALLED, RUN_ALWAYS_ID, RUN_ASK_ID, RUN_HEAD_ID, RUN_INTO_ID, RUN_LINE_ID, RUN_NO_ID, RUN_TITLE,
+    RUN_TITLE_ID, RUN_TYPED_FOLDER_ID, RUN_TYPED_ID, RUN_WORDS_ID, RUN_YES_ID, RunPermissions, RunQuestion, TOO_MANY, TYPE_TITLE, ask_to_run, threads_running,
 };
+use stagepack_studio::workspace_view::BUTTON_TERMINAL_FULL;
 use stagepack_studio::present_view::{COUNTER_ID, Presentation};
 use stagepack_studio::slide_canvas::{LIVE_HINT_ID, SlideCanvas};
 use stagepack_studio::slide_editor::{TERMINAL_END_ID, TERMINAL_KEEP_ID, TERMINAL_START_ID};
@@ -977,5 +978,205 @@ fn the_question_for_typed_text_shows_the_text_then_into_and_the_terminal(cx: &mu
     assert_eq!(label_and_top(cx, window, RUN_TITLE_ID).map(|(title, _)| title).as_deref(), Some(RUN_TITLE));
     assert!(label_and_top(cx, window, RUN_TYPED_ID).is_none() && label_and_top(cx, window, RUN_INTO_ID).is_none());
     assert!(label_and_top(cx, window, RUN_HEAD_ID).is_some());
+    click(cx, window, RUN_NO_ID);
+}
+
+// Buttons that type into a live terminal.
+
+/// A terminal tag with the `id` `id`, running `command` at `x`, with a screen of 40 by 6.
+fn tag_with_id(id: &str, command: &str, x: u32) -> String {
+    format!("<Terminal id=\"{id}\" run='{command}' cols=\"40\" rows=\"6\" x=\"{x}\" y=\"100\" w=\"640\" h=\"360\" />")
+}
+
+/// A button that types `text` into the terminal `t`, at (1000, 600) to (1400, 800).
+fn typing_button(text: &str) -> String {
+    format!("<Button label=\"Type\" run=\"{text}\" in=\"t\" x=\"1000\" y=\"600\" w=\"400\" h=\"200\" />")
+}
+
+/// Where the button of [`typing_button`] is.
+const ON_THE_BUTTON: (f32, f32) = (1200., 700.);
+
+/// A talk of one slide: a terminal `t` that runs `cat`, marked with `mark`, and a button that types
+/// `hello` into it.
+fn hello_talk(mark: u32) -> String {
+    format!("# One\n\n{}\n\n{}\n", tag_with_id("t", &format!("sh -c \"cat; : {mark}\""), 100), typing_button("hello"))
+}
+
+/// The title of the question open in `window`, if one is.
+fn question_title(cx: &mut TestAppContext, window: AnyWindowHandle) -> Option<String> {
+    label_and_top(cx, window, RUN_TITLE_ID).map(|(title, _)| title)
+}
+
+/// How many lines of `session`'s screen are `hello`.
+fn hellos(session: &Session) -> usize {
+    screen_text(session).lines().filter(|line| line.trim() == "hello").count()
+}
+
+/// Presses the button, then answers the terminal's question and the text's with *Run*: the text is
+/// typed. The session it was typed into comes back.
+fn press_and_say_yes_twice(cx: &mut TestAppContext, show: &Rehearsal, live: &LiveTerminals) -> Rc<Session> {
+    // Coming to the slide asks about the terminal; the button pressed meanwhile waits for it.
+    assert!(until(cx, &show.windows(), 5, |cx| dialog_open(cx, show.presenter)), "the terminal's question");
+    assert_eq!(question_title(cx, show.presenter).as_deref(), Some(RUN_TITLE));
+    show.click_slide(cx, ON_THE_BUTTON.0, ON_THE_BUTTON.1);
+    assert_eq!(show.counter(cx), "1 / 1");
+    click(cx, show.presenter, RUN_YES_ID);
+    // Then the text's own question, with the whole text.
+    assert!(until(cx, &show.windows(), 5, |cx| question_title(cx, show.presenter).as_deref() == Some(TYPE_TITLE)), "the text's question");
+    assert_eq!(label_and_top(cx, show.presenter, RUN_TYPED_ID).map(|(text, _)| text).as_deref(), Some("\"hello\""));
+    assert!(until(cx, &show.windows(), 5, |_| live.running() == 1), "the terminal runs");
+    let session = live.get(&live.ids()[0]).unwrap();
+    assert_eq!(hellos(&session), 0, "nothing is typed before the yes");
+    click(cx, show.presenter, RUN_YES_ID);
+    assert!(!dialog_open(cx, show.presenter));
+    // Typed, and given back by cat.
+    assert!(until(cx, &show.windows(), 2, |_| hellos(&session) == 2), "{}", screen_text(&session));
+    session
+}
+
+#[gpui_kit::test]
+fn a_run_button_types_its_text_into_the_terminal_after_the_yes(cx: &mut TestAppContext) {
+    let around = surroundings(Some(&helper::helper_program()));
+    let typing = open_talk(cx, &around, &hello_talk(31601));
+    let live = live_of(&typing, cx);
+    let show = rehearse(&typing, cx);
+    press_and_say_yes_twice(cx, &show, &live);
+    // The press was the button's, and no click of the show's.
+    assert_eq!(show.counter(cx), "1 / 1");
+    press(cx, show.presenter, "escape");
+    nothing_left(cx, &[typing.handle], &live, "31601");
+}
+
+#[gpui_kit::test]
+fn a_second_press_types_again_without_asking(cx: &mut TestAppContext) {
+    let around = surroundings(Some(&helper::helper_program()));
+    let typing = open_talk(cx, &around, &hello_talk(31602));
+    let live = live_of(&typing, cx);
+    let show = rehearse(&typing, cx);
+    let session = press_and_say_yes_twice(cx, &show, &live);
+    show.click_slide(cx, ON_THE_BUTTON.0, ON_THE_BUTTON.1);
+    assert!(!dialog_open(cx, show.presenter) && !dialog_open(cx, show.audience), "nothing is asked");
+    assert!(until(cx, &show.windows(), 2, |_| hellos(&session) == 4), "{}", screen_text(&session));
+    // A yes to run the terminal's command was never one to type: it was asked for on its own, once.
+    press(cx, show.presenter, "escape");
+    nothing_left(cx, &[typing.handle], &live, "31602");
+}
+
+#[gpui_kit::test]
+fn a_run_into_a_terminal_that_cant_start_says_why(cx: &mut TestAppContext) {
+    let around = surroundings(Some(&helper::helper_program()));
+    let command = "sh -c \"cat; : 31603\"";
+    // Four terminals before the button's, all running the same command.
+    let mut tags: Vec<String> = (0..4).map(|n| tag(command, 100 + 200 * n)).collect();
+    tags.push(tag_with_id("t", command, 900));
+    let talk = format!("# One\n\n{}\n\n{}\n", tags.join("\n\n"), typing_button("hello"));
+    let typing = open_talk(cx, &around, &talk);
+    let live = live_of(&typing, cx);
+    let show = rehearse(&typing, cx);
+    say_yes(cx, show.presenter);
+    assert!(until(cx, &show.windows(), 10, |_| live.running() == MOST_LIVE), "four run");
+    assert!(until(cx, &show.windows(), 10, |cx| typing.status(cx).as_deref() == Some(TOO_MANY)));
+    show.click_slide(cx, ON_THE_BUTTON.0, ON_THE_BUTTON.1);
+    assert_eq!(typing.status(cx).as_deref(), Some(BUTTON_TERMINAL_FULL));
+    assert_eq!(BUTTON_TERMINAL_FULL, "This button's terminal can't start: 4 are already running.");
+    assert!(!dialog_open(cx, show.presenter) && !dialog_open(cx, show.audience), "nothing is asked");
+    assert_eq!(show.counter(cx), "1 / 1");
+    std::thread::sleep(Duration::from_millis(500));
+    for window in show.windows() {
+        render(cx, window);
+    }
+    assert_eq!(live.running(), MOST_LIVE, "no fifth");
+    for id in live.ids() {
+        let session = live.get(&id).unwrap();
+        assert!(!screen_text(&session).contains("hello"), "nothing is typed anywhere else: {}", screen_text(&session));
+    }
+    press(cx, show.presenter, "escape");
+    nothing_left(cx, &[typing.handle], &live, "31603");
+}
+
+#[gpui_kit::test]
+fn a_run_button_with_an_empty_text_is_refused(cx: &mut TestAppContext) {
+    let around = surroundings(Some(&helper::helper_program()));
+    let talk = format!("# One\n\n{}\n\n{}\n", tag_with_id("t", "sh -c \"cat; : 31604\"", 100), typing_button(""));
+    let typing = open_talk(cx, &around, &talk);
+    let live = live_of(&typing, cx);
+    let show = rehearse(&typing, cx);
+    say_yes(cx, show.presenter);
+    assert!(until(cx, &show.windows(), 10, |_| live.running() == 1));
+    show.click_slide(cx, ON_THE_BUTTON.0, ON_THE_BUTTON.1);
+    assert_eq!(typing.status(cx).as_deref(), Some("This button's text is empty."));
+    assert!(!dialog_open(cx, show.presenter), "nothing is asked");
+    press(cx, show.presenter, "escape");
+    nothing_left(cx, &[typing.handle], &live, "31604");
+}
+
+#[gpui_kit::test]
+fn a_run_button_on_a_packed_talk_asks_every_time_it_is_opened(cx: &mut TestAppContext) {
+    let around = surroundings(Some(&helper::helper_program()));
+    for _ in 0..2 {
+        let typing = open_packed(cx, &hello_talk(31605));
+        let permissions = around.permissions();
+        typing.view.update(cx, |view, _| view.set_run_permissions_for_test(permissions));
+        let live = live_of(&typing, cx);
+        let show = rehearse(&typing, cx);
+        assert!(until(cx, &show.windows(), 5, |cx| dialog_open(cx, show.presenter)));
+        show.click_slide(cx, ON_THE_BUTTON.0, ON_THE_BUTTON.1);
+        click(cx, show.presenter, RUN_YES_ID);
+        assert!(until(cx, &show.windows(), 5, |cx| question_title(cx, show.presenter).as_deref() == Some(TYPE_TITLE)), "asked each time");
+        let always = cx.update_window(show.presenter, |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find(RUN_ALWAYS_ID).is_some()
+        });
+        assert!(!always.unwrap(), "no Always for a packed talk");
+        assert!(label_and_top(cx, show.presenter, RUN_TYPED_FOLDER_ID).is_none(), "nor a folder");
+        click(cx, show.presenter, RUN_YES_ID);
+        assert!(until(cx, &show.windows(), 5, |_| live.running() == 1));
+        let session = live.get(&live.ids()[0]).unwrap();
+        assert!(until(cx, &show.windows(), 2, |_| hellos(&session) == 2), "{}", screen_text(&session));
+        press(cx, show.presenter, "escape");
+        nothing_left(cx, &[typing.handle], &live, "31605");
+        cx.update_window(typing.handle, |_, window, _| window.remove_window()).unwrap();
+        cx.run_until_parked();
+    }
+}
+
+#[gpui_kit::test]
+fn the_typed_text_question_wraps_a_long_text_and_names_the_folder(cx: &mut TestAppContext) {
+    let around = surroundings(Some(&helper::helper_program()));
+    let typing = open_talk(cx, &around, &format!("# One\n\n{}\n", tag("sh", 100)));
+    let window = typing.handle;
+    let text = "x".repeat(4096);
+    let folder = around.scratch.path().to_path_buf();
+    let question = RunQuestion {
+        command: vec!["sh".to_string()],
+        program_in_talk: false,
+        program_by_path: false,
+        folder: Some(folder.clone()),
+        typed: Some(text.clone()),
+    };
+    ask_directly(cx, window, question);
+    let (typed, words) = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            (window.find(RUN_TYPED_ID).bounds(), window.find(RUN_WORDS_ID).bounds())
+        })
+        .unwrap();
+    let (label, _) = label_and_top(cx, window, RUN_TYPED_ID).expect("the text");
+    assert_eq!(label, format!("\"{text}\""), "all of it");
+    // It wraps within the dialog rather than going on sideways, and is as tall as all its lines.
+    assert!(typed.size.width <= words.size.width + px(0.5), "{typed:?} in {words:?}");
+    assert!(f32::from(typed.size.height) > 20. * 16., "it wraps onto many lines: {typed:?}");
+    assert!(typed.size.height > words.size.height, "more than shows at once, so it scrolls");
+    // The folder Always would be for is named under the command, scrolled to with the rest.
+    let (line, line_top, command_top) = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let line = window.find(RUN_TYPED_FOLDER_ID);
+            let command = window.find((RUN_LINE_ID, 0usize));
+            (line.label().unwrap_or_default().to_string(), line.bounds().origin.y, command.bounds().origin.y)
+        })
+        .unwrap();
+    assert!(line.starts_with("in \"") && line.contains(&folder.display().to_string()), "{line}");
+    assert!(command_top < line_top);
     click(cx, window, RUN_NO_ID);
 }

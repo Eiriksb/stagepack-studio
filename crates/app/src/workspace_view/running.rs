@@ -3,9 +3,12 @@
 
 use super::*;
 
-use slides_engine::TerminalLayer;
+use slides_engine::{BUTTON_IN_NOTHING, TerminalLayer};
 
-use crate::live_terminal::{COULDNT_START, LiveId, LiveTerminals, NOT_INSTALLED, TOO_MANY, find_helper, split_command, start_after_yes};
+use crate::live_terminal::{
+    COULDNT_START, LiveId, LiveTerminals, NOT_INSTALLED, TOO_MANY, TalkFolder, TypeKey, find_helper, may_type, spelled_plainly, split_command, start_after_yes,
+    type_key,
+};
 
 /// What came of trying to have a terminal run.
 #[derive(Debug, PartialEq, Eq)]
@@ -20,6 +23,65 @@ pub enum LiveStep {
 
 /// How often the sessions are looked at, to say what became of them.
 const WATCH_EVERY: Duration = Duration::from_millis(200);
+
+/// What's said of a button whose terminal can't start as 4 already run.
+pub const BUTTON_TERMINAL_FULL: &str = "This button's terminal can't start: 4 are already running.";
+/// What's said of a button whose terminal's command was said no to.
+pub const BUTTON_TERMINAL_REFUSED: &str = "This button's terminal can't start: its command was said no to.";
+/// What's said of a button whose terminal's program has ended.
+pub const BUTTON_TERMINAL_ENDED: &str = "This button's terminal has ended, so nothing is typed.";
+/// What's said of a button whose text was said no to.
+pub const BUTTON_TEXT_REFUSED: &str = "This button's text was said no to, so it isn't typed.";
+
+/// Why a terminal doesn't run.
+enum NotLive {
+    /// For this, which is said.
+    Said(String),
+    /// Its command was said no to.
+    Refused,
+    /// Its program couldn't be started.
+    Failed,
+}
+
+impl NotLive {
+    /// What's said of a button whose terminal doesn't run for this.
+    fn for_a_button(self) -> String {
+        match self {
+            NotLive::Said(why) if why == TOO_MANY => BUTTON_TERMINAL_FULL.to_string(),
+            NotLive::Said(why) => format!("This button's terminal can't start. {why}"),
+            NotLive::Refused => BUTTON_TERMINAL_REFUSED.to_string(),
+            NotLive::Failed => "This button's terminal couldn't be started.".to_string(),
+        }
+    }
+}
+
+/// A button's press that types its text into a terminal, waiting for a yes: on the talk's slide
+/// `slide`, into the terminal whose `id` is `terminal`.
+#[derive(Clone, Debug)]
+pub(crate) struct ButtonRun {
+    slide: usize,
+    terminal: String,
+    text: String,
+}
+
+/// What came of a button's press that types its text into a terminal.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RunPressed {
+    /// It was typed.
+    Typed,
+    /// It waits for a yes, which [`WorkspaceView::ask_for_button`] asks.
+    Ask,
+    /// It can't be, for this, which the status line says.
+    Refused(String),
+}
+
+/// What a button's press that types does next.
+enum ButtonNext {
+    Typed,
+    AskRun(Vec<String>),
+    AskType(TypeKey, RunQuestion),
+    Refused(String),
+}
 
 impl WorkspaceView {
     /// The show of this talk, while one is on.
@@ -45,52 +107,46 @@ impl WorkspaceView {
     /// a session that is over, ended by itself or failed, is run again in its place, through the
     /// same yes. The show's own looking never does: a program that ended stays as its last screen.
     pub(super) fn start_live(&mut self, slide: usize, terminal: &TerminalLayer, explicit: bool, cx: &mut Context<Self>) -> LiveStep {
+        match self.live_step(slide, terminal, explicit, cx) {
+            Ok(step) => step,
+            Err(NotLive::Said(sentence)) => {
+                // What stops it is said once.
+                if self.live.first_time(&sentence) {
+                    self.say(sentence, cx);
+                }
+                LiveStep::Nothing
+            }
+            Err(NotLive::Refused | NotLive::Failed) => LiveStep::Nothing,
+        }
+    }
+
+    /// What [`Self::start_live`] does, saying nothing: why the terminal doesn't run comes back.
+    fn live_step(&mut self, slide: usize, terminal: &TerminalLayer, explicit: bool, cx: &mut Context<Self>) -> Result<LiveStep, NotLive> {
         let (Some(document), Some(run), Some(source)) = (self.document.clone(), terminal.on.run.clone(), terminal.source.clone()) else {
-            return LiveStep::Nothing;
+            return Ok(LiveStep::Nothing);
         };
         let id = LiveId::new(source.clone(), run.clone());
         if self.live.get(&id).is_some_and(|session| !explicit || !session.state().is_over()) {
-            return LiveStep::Going;
+            return Ok(LiveStep::Going);
         }
-        // One whose tag or screen is wrong never starts, and says why.
+        // One whose tag or screen is wrong never starts.
         if let Some(problem) = document.update(cx, |document, _| document.terminal_run_problem_on(slide, &source)) {
-            if self.live.first_time(&problem) {
-                self.say(problem, cx);
-            }
-            return LiveStep::Nothing;
+            return Err(NotLive::Said(problem));
         }
         let Some(helper) = find_helper() else {
-            if self.live.first_time(NOT_INSTALLED) {
-                self.say(NOT_INSTALLED, cx);
-            }
-            return LiveStep::Nothing;
+            return Err(NotLive::Said(NOT_INSTALLED.to_string()));
         };
-        let command = match split_command(&run) {
-            Ok(command) => command,
-            Err(why) => {
-                if self.live.first_time(&why) {
-                    self.say(why, cx);
-                }
-                return LiveStep::Nothing;
-            }
-        };
-        // A program that isn't there, or a command that can't be run, is said, once.
+        let command = split_command(&run).map_err(NotLive::Said)?;
+        // A program that isn't there, or a command that can't be run.
         if let Err(why) = plan(document.read(cx).place(), &command) {
-            let sentence = format!("{COULDNT_START}{why}");
-            if self.live.first_time(&sentence) {
-                self.say(sentence, cx);
-            }
-            return LiveStep::Nothing;
+            return Err(NotLive::Said(format!("{COULDNT_START}{why}")));
         }
         match self.run_decision(&command, cx) {
-            Decision::Refused => LiveStep::Nothing,
-            Decision::Ask => LiveStep::Ask(command),
+            Decision::Refused => Err(NotLive::Refused),
+            Decision::Ask => Ok(LiveStep::Ask(command)),
             Decision::Run => {
                 if self.live.is_full() {
-                    if self.live.first_time(TOO_MANY) {
-                        self.say(TOO_MANY, cx);
-                    }
-                    return LiveStep::Nothing;
+                    return Err(NotLive::Said(TOO_MANY.to_string()));
                 }
                 let none = RunPermissions::load(PathBuf::new());
                 let remembered = self.run_permissions.as_ref().unwrap_or(&none);
@@ -102,11 +158,145 @@ impl WorkspaceView {
                         document.update(cx, |document, _| document.keep_moves(true));
                         self.watch_live(cx);
                         cx.notify();
-                        LiveStep::Going
+                        Ok(LiveStep::Going)
                     }
-                    Err(_) => LiveStep::Nothing,
+                    Err(_) => Err(NotLive::Failed),
                 }
             }
+        }
+    }
+
+    /// A button on the talk's slide `slide` was pressed in the show, to type `text`, then Enter, into
+    /// the live terminal on that slide whose `id` is `terminal`, started first if it isn't running.
+    /// Both the terminal's command and the text must have their yes: what has none is asked by
+    /// [`Self::ask_for_button`] in a window of the show, and once it's answered yes the press goes
+    /// on from where it stopped, looking at everything again. A new press takes the place of one
+    /// still waiting.
+    pub(crate) fn press_run_button(&mut self, slide: usize, terminal: &str, text: &str, cx: &mut Context<Self>) -> RunPressed {
+        let press = ButtonRun { slide, terminal: terminal.to_string(), text: text.to_string() };
+        let next = self.button_next(&press, cx);
+        self.type_when_yes = matches!(next, ButtonNext::AskRun(_) | ButtonNext::AskType(..)).then_some(press);
+        match next {
+            ButtonNext::Typed => RunPressed::Typed,
+            ButtonNext::AskRun(_) | ButtonNext::AskType(..) => RunPressed::Ask,
+            ButtonNext::Refused(why) => RunPressed::Refused(why),
+        }
+    }
+
+    /// Asks in `window` what the button pressed last waits for: the yes to run its terminal's command,
+    /// or the yes to type its text. While another question is open nothing is asked, and the press
+    /// waits for that one's answer.
+    pub(crate) fn ask_for_button(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(press) = self.type_when_yes.clone() else { return };
+        match self.button_next(&press, cx) {
+            ButtonNext::Typed => self.type_when_yes = None,
+            ButtonNext::Refused(why) => {
+                self.type_when_yes = None;
+                self.say(why, cx);
+            }
+            ButtonNext::AskRun(command) => {
+                self.ask_to_run(command, window, cx);
+            }
+            ButtonNext::AskType(key, question) => {
+                let view = cx.weak_entity();
+                ask_to_run(window, cx, question, move |answer, window, cx| {
+                    view.update(cx, |view, cx| view.typed_answered(&key, answer, window, cx)).ok();
+                });
+            }
+        }
+    }
+
+    /// Takes in what was answered about the button pressed last typing what `key` is for, and types it
+    /// on a yes.
+    fn typed_answered(&mut self, key: &TypeKey, answer: RunAnswer, _window: &mut Window, cx: &mut Context<Self>) {
+        match answer {
+            RunAnswer::DontRun => {
+                self.run_yes.refuse_typed(key);
+                self.type_when_yes = None;
+                return;
+            }
+            RunAnswer::Run => self.run_yes.allow_typed(key),
+            RunAnswer::Always => {
+                self.run_yes.allow_typed(key);
+                let folder = self.document.as_ref().and_then(|document| TalkFolder::of(document.read(cx).place()));
+                let kept = match (folder, &mut self.run_permissions) {
+                    (Some(folder), Some(permissions)) => permissions.remember_typed(&folder, key.text(), key.terminal_command()).is_ok(),
+                    _ => false,
+                };
+                if !kept {
+                    self.say("The permission couldn't be kept, so it's only for now.".to_string(), cx);
+                }
+            }
+        }
+        // Everything is looked at again: the text is typed only if it still may be.
+        let Some(press) = self.type_when_yes.take() else { return };
+        match self.button_next(&press, cx) {
+            ButtonNext::Typed => {}
+            ButtonNext::Refused(why) => self.say(why, cx),
+            // The talk changed under the question: it's for the next press to ask.
+            ButtonNext::AskRun(_) | ButtonNext::AskType(..) => {}
+        }
+        cx.notify();
+    }
+
+    /// A question about running a command was answered while a button waits: it goes on from where
+    /// it stopped, in `window`, which asks about its text after a yes to its terminal, its terminal
+    /// again if the question was about another, or says it can't after a no.
+    pub(super) fn button_run_answered(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.type_when_yes.is_none() {
+            return;
+        }
+        // Once the question that was answered has gone.
+        let view = cx.weak_entity();
+        window.defer(cx, move |window, cx| {
+            view.update(cx, |view, cx| view.ask_for_button(window, cx)).ok();
+        });
+    }
+
+    /// What the button `press` does next: types its text now, waits for a yes, or can't, and why.
+    fn button_next(&mut self, press: &ButtonRun, cx: &mut Context<Self>) -> ButtonNext {
+        let Some(document) = self.document.clone() else { return ButtonNext::Refused(BUTTON_IN_NOTHING.to_string()) };
+        let terminal = document.update(cx, |document, _| {
+            document.terminals_on(press.slide).into_iter().find(|terminal| terminal.id.as_deref() == Some(press.terminal.as_str()))
+        });
+        let Some((terminal, source, run)) = terminal.and_then(|terminal| Some((terminal.clone(), terminal.source?, terminal.on.run?))) else {
+            return ButtonNext::Refused(BUTTON_IN_NOTHING.to_string());
+        };
+        match self.live_step(press.slide, &terminal, false, cx) {
+            Ok(LiveStep::Going) => {}
+            Ok(LiveStep::Ask(command)) => return ButtonNext::AskRun(command),
+            Ok(LiveStep::Nothing) => return ButtonNext::Refused(BUTTON_IN_NOTHING.to_string()),
+            Err(why) => return ButtonNext::Refused(why.for_a_button()),
+        }
+        let Some(session) = self.live.get(&LiveId::new(source, run.clone())) else {
+            return ButtonNext::Refused(BUTTON_TERMINAL_ENDED.to_string());
+        };
+        if session.state().is_over() {
+            return ButtonNext::Refused(BUTTON_TERMINAL_ENDED.to_string());
+        }
+        // The terminal's command as the talk writes it, both for the yes and for the question.
+        let Ok(words) = split_command(&run) else { return ButtonNext::Refused(BUTTON_IN_NOTHING.to_string()) };
+        let place = document.read(cx).place().clone();
+        let key = match type_key(&place, &press.text, &words) {
+            Ok(key) => key,
+            Err(why) => return ButtonNext::Refused(why),
+        };
+        let none = RunPermissions::load(PathBuf::new());
+        let remembered = self.run_permissions.as_ref().unwrap_or(&none);
+        match may_type(&place, &press.text, &words, &self.run_yes, remembered) {
+            Decision::Run => {
+                // Enter only once it may be typed.
+                let mut bytes = press.text.clone().into_bytes();
+                bytes.push(b'\r');
+                session.send_keys(&bytes);
+                ButtonNext::Typed
+            }
+            Decision::Ask => {
+                let folder = TalkFolder::of(&place).map(|folder| spelled_plainly(folder.path()));
+                let question = RunQuestion { command: words, program_in_talk: false, program_by_path: false, folder, typed: Some(press.text.clone()) };
+                ButtonNext::AskType(key, question)
+            }
+            Decision::Refused => ButtonNext::Refused(BUTTON_TEXT_REFUSED.to_string()),
         }
     }
 
