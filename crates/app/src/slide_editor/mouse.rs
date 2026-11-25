@@ -63,6 +63,12 @@ impl SlideEditor {
             self.focus_handle.focus(window, cx);
             return;
         }
+        // On a thing being tried, a press is that thing's, and selects nothing.
+        if self.press_trying(event.position, cx) {
+            cx.stop_propagation();
+            self.focus_handle.focus(window, cx);
+            return;
+        }
         // A colour held for the selection goes to it before the click moves it.
         self.give_held_color(cx);
         self.end_drag(cx);
@@ -321,6 +327,9 @@ impl SlideEditor {
         if self.release_turning(cx) {
             return;
         }
+        if self.release_trying(event.position, cx) {
+            return;
+        }
         if self.drop_drag(event, window, cx) {
             return;
         }
@@ -394,6 +403,9 @@ impl SlideEditor {
 
     pub(super) fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.drag_turning(event, cx) {
+            return;
+        }
+        if self.move_trying(event.position, cx) {
             return;
         }
         if self.drag.is_some() {

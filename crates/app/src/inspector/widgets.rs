@@ -104,6 +104,17 @@ impl Inspector {
             .gap_1()
             .child(div().text_xs().text_color(cx.theme().muted_foreground).child(label))
             .child(control)
+            .when_some(field.spec.note.clone(), |this, note| {
+                this.child(
+                    div()
+                        .id(SharedString::from(note_id(&field.spec.attr)))
+                        .test_support()
+                        .aria_label(note.clone())
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(note),
+                )
+            })
             .when_some(field.problem.clone(), |this, problem| {
                 this.child(
                     div()

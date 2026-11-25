@@ -497,12 +497,13 @@ impl SlideEditor {
     }
 
     /// Draws the slide's layers again as they're shown now, as a drag goes.
-    fn show_layers(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn show_layers(&mut self, cx: &mut Context<Self>) {
         let (Some(document), Some(scale)) = (self.document.clone(), self.canvas.read(cx).scale()) else {
             return;
         };
+        let state = self.tried_state();
         let (layers, message, videos, models, terminals) = document.update(cx, |document, _| {
-            (document.editor_layers(scale), document.take_message(), document.videos_here(), document.models_here(), document.terminals_here())
+            (document.editor_layers_in(state, scale), document.take_message(), document.videos_here(), document.models_here(), document.terminals_here())
         });
         if let Some(message) = message {
             cx.emit(EditorEvent::Said(message.into()));

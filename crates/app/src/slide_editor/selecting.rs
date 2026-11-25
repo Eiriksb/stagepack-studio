@@ -3,7 +3,11 @@
 
 use super::*;
 use crate::document::LargeOpen;
+use crate::inspector::RUNS_IN_SHOW;
+use crate::interactive::{self, HoldsComponents, InteractiveKind, InteractiveThing, Press, StateStore, interactive_at, interactive_on, pointer_event, press_button};
 use crate::model_view::inside_turned;
+use slides_engine::{BUTTON_ON_NOTHING, ButtonAction, Moment};
+use toolkit::{Event, PointerKind};
 
 impl SlideEditor {
     /// What's selected, if it's on the slide shown.
@@ -318,10 +322,250 @@ impl SlideEditor {
         }
     }
 
+    /// The button or interactive component that's the one thing selected on the slide shown, by
+    /// where its tag is written, and its layer.
+    pub(super) fn selected_to_try(&self, cx: &mut App) -> Option<(Range<usize>, usize)> {
+        let document = self.document.clone()?;
+        document.update(cx, |document, _| {
+            let selected = document.selected()?.clone();
+            if selected.slide != document.current() || document.selection().is_none_or(|selection| selection.things.len() != 1) {
+                return None;
+            }
+            let moment = whole_moment(document, selected.slide, 0);
+            let button = document.buttons_at(selected.slide, moment).into_iter().find(|button| button.source == selected.source);
+            button.map(|button| (button.source, button.layer)).or_else(|| {
+                let component = document.components_at(selected.slide, moment).into_iter().find(|component| component.source == selected.source)?;
+                Some((component.source, component.layer))
+            })
+        })
+    }
+
+    /// Has the button or interactive component selected work by hand, as in the show, or stops
+    /// that while it does, as its buttons and Space do. With neither selected, the key goes on.
+    /// While a show runs, nothing is tried here: the show draws the talk's components.
+    pub(super) fn try_or_stop(&mut self, cx: &mut Context<Self>) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        let Some((source, layer)) = self.selected_to_try(cx) else {
+            cx.propagate();
+            return;
+        };
+        if self.trying.is_some() {
+            self.stop_trying(cx);
+            return;
+        }
+        if self.live.show_on() {
+            return;
+        }
+        self.stop_video(cx);
+        self.stop_recording(cx);
+        self.stop_turning(cx);
+        let (slide, talk) = {
+            let document = document.read(cx);
+            (document.current(), talk_hash(document.source()))
+        };
+        self.trying = Some((PlayingHere { slide, source, talk }, layer));
+        cx.notify();
+    }
+
+    /// Stops trying what was tried, if anything was: what its components kept is forgotten, and
+    /// they're drawn as the talk has them again.
+    pub fn stop_trying(&mut self, cx: &mut Context<Self>) {
+        self.try_press = None;
+        if self.trying.take().is_some() {
+            interactive::forget(self, cx);
+            self.show_layers(cx);
+            cx.notify();
+        }
+    }
+
+    /// What's being tried, by where its tag is written, if anything is.
+    pub fn trying(&self) -> Option<Range<usize>> {
+        self.trying.as_ref().map(|(trying, _)| trying.source.clone())
+    }
+
+    /// The state the slide shown is drawn at: that of the components tried, or 0.
+    pub fn tried_state(&self) -> u64 {
+        if self.trying.is_some() { self.tried.store.state() } else { 0 }
+    }
+
+    /// What the components tried keep, and what reached them.
+    pub fn tried_components(&self) -> &StateStore {
+        &self.tried.store
+    }
+
+    /// The lines of text the layer whose tag is written at `source` draws on the slide shown, as
+    /// it's drawn now.
+    #[cfg(feature = "test-hooks")]
+    pub fn words_on(&self, source: &Range<usize>, cx: &mut App) -> Vec<String> {
+        let Some(document) = self.document.clone() else {
+            return Vec::new();
+        };
+        let state = self.tried_state();
+        document.update(cx, |document, _| {
+            let slide = document.current();
+            let moment = whole_moment(document, slide, state);
+            document.words_at(slide, moment, source)
+        })
+    }
+
+    /// What a press goes to while trying, in the order drawn: what's tried, and with it, for a
+    /// button whose `do` names a component on its slide, that component.
+    fn tried_things(&self, cx: &mut App) -> Vec<InteractiveThing> {
+        let (Some((trying, _)), Some(document)) = (self.trying.clone(), self.document.clone()) else {
+            return Vec::new();
+        };
+        let state = self.tried_state();
+        document.update(cx, |document, _| {
+            let moment = whole_moment(document, trying.slide, state);
+            let target = document.buttons_at(trying.slide, moment).into_iter().find(|button| button.source == trying.source).and_then(|button| match button.on.action {
+                Ok(ButtonAction::Do { target, .. }) => Some(target),
+                _ => None,
+            });
+            let targeted = |thing: &InteractiveThing| {
+                matches!(thing.kind, InteractiveKind::Component { .. }) && target.is_some() && thing.id == target
+            };
+            interactive_on(document, trying.slide, moment).into_iter().filter(|thing| thing.source == trying.source || targeted(thing)).collect()
+        })
+    }
+
+    /// The pointer doing `kind` at `at` on the slide, in slide units, sent to `thing`, if it's a
+    /// component.
+    fn send_pointer(&mut self, thing: &InteractiveThing, at: Point<f32>, kind: PointerKind, cx: &mut Context<Self>) {
+        if let Some(event) = pointer_event(thing, at, kind) {
+            interactive::send_to(self, &thing.source, event, cx);
+        }
+    }
+
+    /// A press at `position` while trying: on a thing tried, it's that thing's, and true.
+    pub(super) fn press_trying(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        if self.trying.is_none() {
+            return false;
+        }
+        let Some((x, y)) = self.slide_units(position, cx) else {
+            return false;
+        };
+        let at = point(x, y);
+        let things = self.tried_things(cx);
+        let Some(thing) = interactive_at(&things, at).cloned() else {
+            return false;
+        };
+        self.try_press = Some(thing.source.clone());
+        self.send_pointer(&thing, at, PointerKind::Down, cx);
+        true
+    }
+
+    /// The pointer moved while trying: a move of the component a press began on, or else of the one
+    /// under it. True while a press holds, which nothing else takes.
+    pub(super) fn move_trying(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        if self.trying.is_none() {
+            return false;
+        }
+        let Some((x, y)) = self.slide_units(position, cx) else {
+            return false;
+        };
+        let at = point(x, y);
+        let things = self.tried_things(cx);
+        let thing = match &self.try_press {
+            Some(source) => things.iter().find(|thing| thing.source == *source),
+            None => interactive_at(&things, at),
+        };
+        if let Some(thing) = thing.cloned() {
+            self.send_pointer(&thing, at, PointerKind::Move, cx);
+        }
+        self.try_press.is_some()
+    }
+
+    /// The press while trying is let go of at `position`: a component it began on is told, and a
+    /// button acts if it's let go of over it. True if a press was held.
+    pub(super) fn release_trying(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        let Some(source) = self.try_press.take() else {
+            return false;
+        };
+        let things = self.tried_things(cx);
+        let (Some(thing), Some((x, y))) = (things.iter().find(|thing| thing.source == source).cloned(), self.slide_units(position, cx)) else {
+            return true;
+        };
+        let at = point(x, y);
+        match thing.kind {
+            InteractiveKind::Button => {
+                if interactive_at(&things, at).is_some_and(|over| over.source == source) {
+                    self.press_tried_button(&source, cx);
+                }
+            }
+            _ => self.send_pointer(&thing, at, PointerKind::Up, cx),
+        }
+        true
+    }
+
+    /// The wheel turned by `steps` at `position` while trying: true if it's over a component
+    /// tried, which it's sent to.
+    pub(super) fn wheel_trying(&mut self, position: Point<Pixels>, steps: f32, cx: &mut Context<Self>) -> bool {
+        if self.trying.is_none() {
+            return false;
+        }
+        let Some((x, y)) = self.slide_units(position, cx) else {
+            return false;
+        };
+        let at = point(x, y);
+        let things = self.tried_things(cx);
+        let Some(thing) = interactive_at(&things, at).filter(|thing| matches!(thing.kind, InteractiveKind::Component { .. })).cloned() else {
+            return false;
+        };
+        self.send_pointer(&thing, at, PointerKind::Wheel { dy: steps }, cx);
+        true
+    }
+
+    /// Does what pressing the button tried at `source` does in the editor: a `do` reaches its
+    /// component, which is tried with it; a `run` and a `step` do nothing here, and that's said.
+    fn press_tried_button(&mut self, source: &Range<usize>, cx: &mut Context<Self>) {
+        let (Some((trying, _)), Some(document)) = (self.trying.clone(), self.document.clone()) else {
+            return;
+        };
+        let (button, steps) = document.update(cx, |document, _| {
+            let moment = whole_moment(document, trying.slide, 0);
+            let button = document.buttons_at(trying.slide, moment).into_iter().find(|button| button.source == *source);
+            (button, document.timeline_of(trying.slide).steps)
+        });
+        let Some(button) = button else { return };
+        match press_button(&button.on, steps) {
+            Press::Nothing => {}
+            Press::Refused(why) => cx.emit(EditorEvent::Said(why.into())),
+            Press::Step(_) | Press::Run { .. } => cx.emit(EditorEvent::Said(RUNS_IN_SHOW.into())),
+            Press::Do { name, target, value } => {
+                let things = self.tried_things(cx);
+                let component = things.into_iter().find(|thing| matches!(thing.kind, InteractiveKind::Component { .. }) && thing.id.as_deref() == Some(target.as_str()));
+                match component {
+                    Some(component) => interactive::send_to(self, &component.source, Event::Action { name, value }, cx),
+                    None => cx.emit(EditorEvent::Said(BUTTON_ON_NOTHING.into())),
+                }
+            }
+        }
+    }
+
+    /// Stops trying unless what's tried is still the one thing selected, on the slide it was
+    /// tried on, with the talk's text as it was.
+    fn keep_trying_only_what_holds(&mut self, cx: &mut Context<Self>) {
+        let (Some((trying, _)), Some(document)) = (self.trying.clone(), self.document.clone()) else {
+            return;
+        };
+        let holds = document.read_with(cx, |document, _| {
+            document.current() == trying.slide
+                && talk_hash(document.source()) == trying.talk
+                && document.selection().is_some_and(|selection| selection.things.len() == 1)
+                && document.selected().is_some_and(|selected| selected.slide == trying.slide && selected.source == trying.source)
+        });
+        if !holds {
+            self.stop_trying(cx);
+        }
+    }
+
     /// Stops the video played unless it's still the one thing selected, on the slide it was
     /// played on, with the talk's text as it was; and opens it again once a save that let go of
     /// its file is done. So for a model turned.
     pub(super) fn keep_playing_only_what_holds(&mut self, cx: &mut Context<Self>) {
+        self.keep_trying_only_what_holds(cx);
         self.keep_turning_only_what_holds(cx);
         self.keep_replaying_only_what_holds(cx);
         let (Some(playing), Some(document)) = (self.playing.clone(), self.document.clone()) else {
@@ -556,6 +800,28 @@ pub(super) struct PlayingHere {
     slide: usize,
     source: Range<usize>,
     talk: u64,
+}
+
+impl HoldsComponents for SlideEditor {
+    fn components_mut(&mut self) -> &mut Components {
+        &mut self.tried
+    }
+
+    fn components_document(&self) -> Option<&Entity<Document>> {
+        self.document.as_ref()
+    }
+
+    /// The slide is drawn again from what they were fed, and what came of it is taken in.
+    fn components_fed(&mut self, cx: &mut Context<Self>) {
+        self.show_layers(cx);
+        interactive::take_answers(self, cx);
+        cx.notify();
+    }
+}
+
+/// Slide `slide` in its whole state, as the editor shows it, with its components drawn at `state`.
+fn whole_moment(document: &mut Document, slide: usize, state: u64) -> Moment {
+    Moment { state, ..Moment::at(document.timeline_of(slide).steps, 0.0) }
 }
 
 fn talk_hash(text: &str) -> u64 {

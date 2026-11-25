@@ -3,7 +3,8 @@
 //! the pointer is over it, and the pointer hides on a slide with nothing to press.
 //!
 //! The interactive thing is a plain box the tests put on a slide, which says what reached it, and,
-//! where it matters, a model.
+//! where it matters, a model. And trying a button or a component in the editor, which works it by hand
+//! there as the show does.
 
 #[path = "support/typing.rs"]
 mod typing;
@@ -32,7 +33,9 @@ use stagepack_studio::present_view::{
     start_show,
 };
 use toolkit::{Event, PointerKind};
+use stagepack_studio::inspector;
 use stagepack_studio::slide_canvas::SlideCanvas;
+use stagepack_studio::slide_editor::{SlideEditor, TRY_DONE_ID, TRY_ID};
 use stagepack_studio::workspace_view;
 
 const TWO_SLIDES: &str = "# One\n\n---\n\n# Two\n";
@@ -850,4 +853,204 @@ fn an_interactive_component_inside_another_tag_takes_no_presses(cx: &mut TestApp
     show.click_slide(cx, (400., 300.));
     assert_eq!(show.counter(cx), "2 / 2");
     assert!(cx.read(|cx| show.show.read(cx).components().is_empty()));
+}
+
+// Trying in the editor.
+
+/// A window on `source`, in a folder holding `files` as well.
+fn edit_with(cx: &mut TestAppContext, source: &str, files: &[(&str, &[u8])]) -> typing::Typing {
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::write(folder.path().join("slides.md"), source).unwrap();
+    for (name, bytes) in files {
+        let path = folder.path().join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    typing::open_folder(cx, folder, None)
+}
+
+/// A window on `source`, with the counter built in its folder: `None` with no compiler bundle.
+fn edit_counter(cx: &mut TestAppContext, source: &str) -> Option<typing::Typing> {
+    let wasm = built_counter()?;
+    let index = format!(r#"{{"format":1,"components":[{{"tag":"Counter","file":"counter","source_hash":"{}"}}]}}"#, source_hash(COUNTER.as_bytes()));
+    let files: [(&str, &[u8]); 3] = [("components/counter.rs", COUNTER.as_bytes()), ("build/counter.wasm", wasm), ("build/index.json", index.as_bytes())];
+    Some(edit_with(cx, source, &files))
+}
+
+/// A window on `source`, with the pad in its folder.
+fn edit_pad(cx: &mut TestAppContext, source: &str) -> typing::Typing {
+    let files = pad_files(None);
+    let files: Vec<(&str, &[u8])> = files.iter().map(|(name, bytes)| (*name, bytes.as_slice())).collect();
+    edit_with(cx, source, &files)
+}
+
+fn slide_editor(typing: &typing::Typing, cx: &TestAppContext) -> Entity<SlideEditor> {
+    cx.read(|cx| typing.view.read(cx).slide_editor().clone())
+}
+
+/// What's being tried in the editor, by where its tag is written.
+fn trying(typing: &typing::Typing, cx: &TestAppContext) -> Option<Range<usize>> {
+    let editor = slide_editor(typing, cx);
+    cx.read(|cx| editor.read(cx).trying())
+}
+
+/// The lines of text the layer of the tag at `source` draws in the editor now.
+fn edited_words(typing: &typing::Typing, cx: &mut TestAppContext, source: &Range<usize>) -> Vec<String> {
+    let editor = slide_editor(typing, cx);
+    editor.update(cx, |editor, cx| editor.words_on(source, cx))
+}
+
+/// A click on the slide's point `(x, y)` in the editor, and time for what reached a component to be
+/// drawn.
+fn click_editor(typing: &typing::Typing, cx: &mut TestAppContext, (x, y): (f32, f32)) {
+    let at = typing.at(cx, x, y);
+    typing.click(cx, at);
+    typing::wait(cx, 50);
+    typing.settle(cx);
+}
+
+fn selected_source(typing: &typing::Typing, cx: &TestAppContext) -> Option<Range<usize>> {
+    typing::selected(typing, cx).map(|(_, source)| source)
+}
+
+const ELSEWHERE: &str = "<Box x=\"1200\" y=\"700\" w=\"300\" h=\"200\">\n\nElse\n\n</Box>";
+
+#[gpui_kit::test]
+fn try_lets_the_counter_count_in_the_editor_and_selection_still_works_after(cx: &mut TestAppContext) {
+    let source = format!("# One\n\n{COUNTER_TAG}\n\n{ELSEWHERE}\n");
+    let Some(typing) = edit_counter(cx, &source) else { return };
+    let counter = tag_at(&source, "<Counter");
+    // Not tried, a click on its plus selects it, and counts nothing.
+    click_editor(&typing, cx, PLUS);
+    assert_eq!(selected_source(&typing, cx), Some(counter.clone()));
+    assert_eq!(edited_words(&typing, cx, &counter), ["0"]);
+    assert!(typing::bounds_of(&typing, cx, TRY_ID).is_some(), "Try shows on the counter selected");
+    assert!(typing::bounds_of(&typing, cx, TRY_DONE_ID).is_none());
+    typing::click_on(&typing, cx, TRY_ID);
+    assert_eq!(trying(&typing, cx), Some(counter.clone()));
+    assert!(typing::bounds_of(&typing, cx, TRY_DONE_ID).is_some(), "Done shows while it's tried");
+    click_editor(&typing, cx, PLUS);
+    click_editor(&typing, cx, PLUS);
+    assert_eq!(edited_words(&typing, cx, &counter), ["2"]);
+    // Beside the plus, inside the counter, nothing changes, and nothing moved or was written.
+    click_editor(&typing, cx, BESIDE_PLUS);
+    assert_eq!(edited_words(&typing, cx, &counter), ["2"]);
+    assert_eq!(typing.source(cx), source, "nothing written");
+    assert_eq!(selected_source(&typing, cx), Some(counter.clone()), "still selected");
+    // Done: it's drawn as the talk has it again.
+    typing::click_on(&typing, cx, TRY_DONE_ID);
+    assert_eq!(trying(&typing, cx), None);
+    assert_eq!(edited_words(&typing, cx, &counter), ["0"]);
+    // And a click selects again: the box, then the counter, by its plus.
+    click_editor(&typing, cx, (1350., 800.));
+    let boxed = selected_source(&typing, cx).expect("the box is selected");
+    assert!(source[boxed].starts_with("<Box"));
+    click_editor(&typing, cx, PLUS);
+    assert_eq!(selected_source(&typing, cx), Some(counter.clone()));
+    assert_eq!(edited_words(&typing, cx, &counter), ["0"]);
+}
+
+#[gpui_kit::test]
+fn space_tries_and_stops_a_selected_component(cx: &mut TestAppContext) {
+    let typing = edit_pad(cx, PAD_SLIDES);
+    let pad = tag_at(PAD_SLIDES, "<Pad");
+    click_editor(&typing, cx, (300., 300.));
+    assert_eq!(selected_source(&typing, cx), Some(pad.clone()));
+    let editor = slide_editor(&typing, cx);
+    assert_eq!(cx.read(|cx| editor.read(cx).tried_components().renders(&pad)), 0, "a click selecting it isn't the pad's");
+    typing.press(cx, "space");
+    assert_eq!(trying(&typing, cx), Some(pad.clone()));
+    click_editor(&typing, cx, (300., 300.));
+    assert!(cx.read(|cx| editor.read(cx).tried_components().renders(&pad)) >= 1, "the press reached it");
+    typing.press(cx, "space");
+    assert_eq!(trying(&typing, cx), None);
+    assert!(cx.read(|cx| editor.read(cx).tried_components().is_empty()));
+    assert!(typing.editing(cx).is_none(), "Space typed nothing");
+    assert_eq!(typing.source(cx), PAD_SLIDES);
+    assert_eq!(selected_source(&typing, cx), Some(pad));
+}
+
+#[gpui_kit::test]
+fn a_run_or_step_button_does_nothing_in_the_editor_and_its_form_says_so(cx: &mut TestAppContext) {
+    let source = "# One\n\n<Terminal id=\"t\" run=\"echo 31367\" cols=\"40\" rows=\"6\" x=\"1000\" y=\"100\" w=\"640\" h=\"360\" />\n\n\
+        <Button label=\"Run\" run=\"echo 31368\" in=\"t\" x=\"200\" y=\"200\" w=\"400\" h=\"200\" />\n\n\
+        <Button label=\"Go\" step=\"1\" x=\"200\" y=\"600\" w=\"400\" h=\"200\" />\n\n\
+        <Box x=\"1200\" y=\"700\" w=\"200\" h=\"100\" click=\"1\">\n\nLater\n\n</Box>\n\n---\n\n# Two\n";
+    let typing = edit_with(cx, source, &[]);
+    let live = typing.view.read_with(cx, |view, _| view.live());
+    for (at, opening) in [((400., 300.), "<Button label=\"Run\""), ((400., 700.), "<Button label=\"Go\"")] {
+        click_editor(&typing, cx, at);
+        assert_eq!(selected_source(&typing, cx), Some(tag_at(source, opening)));
+        // Its form says what its `run` and `step` do.
+        for attr in ["run", "step"] {
+            let note = typing.with_window(cx, |window, cx| {
+                window.render_frame(cx);
+                window.try_find(gpui_kit::SharedString::from(inspector::note_id(attr))).and_then(|found| found.label().map(str::to_string))
+            });
+            assert_eq!(note.as_deref(), Some(inspector::RUNS_IN_SHOW), "under {attr}");
+        }
+        typing::click_on(&typing, cx, TRY_ID);
+        assert_eq!(trying(&typing, cx), Some(tag_at(source, opening)));
+        click_editor(&typing, cx, at);
+        assert_eq!(typing.status(cx).as_deref(), Some(inspector::RUNS_IN_SHOW));
+        assert_eq!(live.running(), 0, "no terminal started");
+        assert_eq!(live.sessions(), 0);
+        assert_eq!(typing.current(cx), 0, "the editor stays on its slide");
+        assert_eq!(typing.source(cx), source, "nothing written");
+        typing::click_on(&typing, cx, TRY_DONE_ID);
+    }
+    assert_eq!(inspector::RUNS_IN_SHOW, "Runs in the show.");
+}
+
+#[gpui_kit::test]
+fn a_do_button_tried_in_the_editor_reaches_a_target_being_tried(cx: &mut TestAppContext) {
+    let source = "# One\n\n<Pad id=\"p\" x=\"200\" y=\"200\" w=\"400\" h=\"200\" />\n\n<Button label=\"Go\" do=\"go\" on=\"p\" value=\"7\" x=\"800\" y=\"600\" w=\"300\" h=\"100\" />\n\n---\n\n# Two\n";
+    let typing = edit_pad(cx, source);
+    let pad = tag_at(source, "<Pad");
+    let button = tag_at(source, "<Button");
+    let editor = slide_editor(&typing, cx);
+    click_editor(&typing, cx, (950., 650.));
+    assert_eq!(selected_source(&typing, cx), Some(button.clone()));
+    // Not tried, a press selects it and sends nothing.
+    assert!(cx.read(|cx| editor.read(cx).tried_components().is_empty()));
+    typing::click_on(&typing, cx, TRY_ID);
+    assert_eq!(trying(&typing, cx), Some(button.clone()));
+    click_editor(&typing, cx, (950., 650.));
+    let fed = cx.read(|cx| editor.read(cx).tried_components().last_fed(&pad).map(|fed| fed.events.clone()));
+    assert_eq!(fed, Some(vec![Event::Action { name: "go".into(), value: "7".into() }]), "the action reached the pad");
+    // The pad is tried with its button: a press on it is its own, and it stays unselected.
+    click_editor(&typing, cx, (300., 300.));
+    let last = cx.read(|cx| editor.read(cx).tried_components().last_fed(&pad).and_then(|fed| fed.events.last().cloned()));
+    assert!(matches!(last, Some(Event::Pointer { kind: PointerKind::Up, .. })), "{last:?}");
+    assert_eq!(selected_source(&typing, cx), Some(button));
+    assert_eq!(typing.source(cx), source);
+}
+
+#[gpui_kit::test]
+fn selecting_something_else_stops_trying_and_clears_its_state(cx: &mut TestAppContext) {
+    let source = format!("# One\n\n{COUNTER_TAG}\n\n{ELSEWHERE}\n");
+    let Some(typing) = edit_counter(cx, &source) else { return };
+    let counter = tag_at(&source, "<Counter");
+    let editor = slide_editor(&typing, cx);
+    click_editor(&typing, cx, PLUS);
+    typing::click_on(&typing, cx, TRY_ID);
+    click_editor(&typing, cx, PLUS);
+    assert_eq!(edited_words(&typing, cx, &counter), ["1"]);
+    assert!(cx.read(|cx| editor.read(cx).tried_components().state_of(&counter).is_some()));
+    // The box selected: the counter's tried no more, and what it kept is gone.
+    click_editor(&typing, cx, (1350., 800.));
+    assert_ne!(selected_source(&typing, cx), Some(counter.clone()));
+    assert_eq!(trying(&typing, cx), None);
+    assert!(cx.read(|cx| editor.read(cx).tried_components().is_empty()));
+    assert!(typing::bounds_of(&typing, cx, TRY_DONE_ID).is_none());
+    assert_eq!(edited_words(&typing, cx, &counter), ["0"]);
+    // Tried again, it starts from nothing.
+    click_editor(&typing, cx, PLUS);
+    typing::click_on(&typing, cx, TRY_ID);
+    click_editor(&typing, cx, PLUS);
+    assert_eq!(edited_words(&typing, cx, &counter), ["1"]);
+    // Escape lets go of it, which stops trying too.
+    typing.press(cx, "escape");
+    assert_eq!(trying(&typing, cx), None);
+    assert!(cx.read(|cx| editor.read(cx).tried_components().is_empty()));
 }

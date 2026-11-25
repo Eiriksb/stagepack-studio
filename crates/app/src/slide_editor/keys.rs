@@ -43,6 +43,7 @@ actions!(
         PlayOrStopVideo,
         TurnOrStopModel,
         PlayOrStopRecording,
+        TryOrStop,
     ]
 );
 
@@ -117,6 +118,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("space", TurnOrStopModel, Some(MODEL_CONTEXT)),
         // Nor does a terminal recording: Space plays it, or stops it.
         KeyBinding::new("space", PlayOrStopRecording, Some(TERMINAL_CONTEXT)),
+        // Nor does a button or an interactive component: Space tries it, or stops.
+        KeyBinding::new("space", TryOrStop, Some(INTERACTIVE_CONTEXT)),
     ]);
     crate::text_tools::bind_keys(cx);
 }

@@ -26,6 +26,7 @@ use crate::document::{Beside, CellMove, Document, EditRefused};
 use crate::selection::{self, Thing};
 use crate::slide_canvas::{ModelFailed, ModelLetGo, SLIDE_WIDTH, SlideCanvas, VideoFailed, VideoLetGo, VideoOpened, letterbox};
 use crate::insert::TEXT_BOX_SIZE;
+use crate::interactive::Components;
 use crate::live_terminal::LiveTerminals;
 use crate::text_editing::{Composing, EditingText, clean_typed, one_line, utf16_slice};
 use crate::text_tools::{
@@ -118,6 +119,11 @@ pub const MODEL_TURN_ID: &str = "model-turn";
 pub const MODEL_SET_VIEW_ID: &str = "model-set-view";
 pub const MODEL_DONE_ID: &str = "model-done";
 
+/// The button under a button or an interactive component selected that has it work by hand, as
+/// in the show, and the one that stops that while it does.
+pub const TRY_ID: &str = "interactive-try";
+pub const TRY_DONE_ID: &str = "interactive-try-done";
+
 /// The key context the editor's keys apply in, while text is being typed.
 pub const EDITOR_CONTEXT: &str = "SlideEditor";
 /// The key context the editor's keys apply in while a thing on the slide is selected and no
@@ -130,6 +136,9 @@ pub const MODEL_CONTEXT: &str = "SlideModel";
 /// The key context added to [`SELECTION_CONTEXT`] while the one thing selected is a terminal
 /// recording.
 pub const TERMINAL_CONTEXT: &str = "SlideTerminal";
+/// The key context added to [`SELECTION_CONTEXT`] while the one thing selected is a button or an
+/// interactive component.
+pub const INTERACTIVE_CONTEXT: &str = "SlideInteractive";
 
 /// How long the caret shows, and then doesn't, as it blinks.
 const BLINK: Duration = Duration::from_millis(500);
@@ -243,6 +252,13 @@ pub struct SlideEditor {
     turning: Option<(selecting::PlayingHere, usize)>,
     /// Where the pointer was as a drag turning the model last moved it.
     turn_drag: Option<Point<Pixels>>,
+    /// The button or interactive component selected that's being tried, and its layer, while it's
+    /// let work.
+    trying: Option<(selecting::PlayingHere, usize)>,
+    /// What the components tried keep, and what reached them.
+    tried: Components,
+    /// What a press while trying began on, by where its tag is written, until it's let go of.
+    try_press: Option<Range<usize>>,
 
     /// Where the caret and any composition were last drawn, so that the system's input method
     /// is told when they move, and only then.
@@ -306,6 +322,7 @@ impl SlideEditor {
                     this.stop_video(cx);
                     this.stop_recording(cx);
                     this.stop_turning(cx);
+                    this.stop_trying(cx);
                 }
             }),
         ];
@@ -388,6 +405,9 @@ impl SlideEditor {
             live: LiveTerminals::new(),
             turning: None,
             turn_drag: None,
+            trying: None,
+            tried: Components::default(),
+            try_press: None,
             ime_place: None,
             _subscriptions: subscriptions,
         }

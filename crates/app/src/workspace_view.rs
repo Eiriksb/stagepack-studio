@@ -1084,8 +1084,10 @@ impl WorkspaceView {
             return;
         };
         let scale = self.slide_canvas.read(cx).scale();
+        // What the editor tries is drawn as it's been worked.
+        let state = self.slide_editor.read(cx).tried_state();
         let (notices, layers, message) = document.update(cx, |document, _| {
-            let layers = scale.map(|scale| document.editor_layers(scale));
+            let layers = scale.map(|scale| document.editor_layers_in(state, scale));
             (document.notices(), layers, document.take_message())
         });
         if let Some(message) = message {
@@ -1325,11 +1327,13 @@ impl WorkspaceView {
         if running {
             return;
         }
-        // The show plays the talk's videos and turns its models: none does here meanwhile.
+        // The show plays the talk's videos, turns its models and works its buttons and components:
+        // none does here meanwhile.
         self.slide_editor.update(cx, |editor, cx| {
             editor.stop_video(cx);
             editor.stop_recording(cx);
             editor.stop_turning(cx);
+            editor.stop_trying(cx);
         });
         let this = cx.entity().downgrade();
         let owner = (this.clone(), self.live.clone());

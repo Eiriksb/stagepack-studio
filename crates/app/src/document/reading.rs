@@ -80,8 +80,14 @@ impl Document {
     ///
     /// If laying the slide out goes wrong, it has none, and [`Self::take_message`] says so.
     pub fn editor_layers(&mut self, scale: f32) -> Vec<Arc<Layer>> {
+        self.editor_layers_in(0, scale)
+    }
+
+    /// [`Self::editor_layers`], with the interactive components the editor tries drawn from what
+    /// they're fed, at `state`: 0 while it tries none.
+    pub fn editor_layers_in(&mut self, state: u64, scale: f32) -> Vec<Arc<Layer>> {
         let (deck, current) = (&mut self.deck, self.current);
-        laid_out(|| deck.editor_layers(current, scale)).unwrap_or_else(|| {
+        laid_out(|| deck.editor_layers_in(current, state, scale)).unwrap_or_else(|| {
             self.layout_failed();
             Vec::new()
         })

@@ -61,6 +61,8 @@ pub struct Spec {
     pub kind: Kind,
     pub optional: bool,
     pub place: bool,
+    /// What's said under the field of what it does, if anything is.
+    pub note: Option<String>,
 }
 
 impl Spec {
@@ -77,7 +79,7 @@ impl Spec {
             PropKind::File(extensions) => Kind::File(extensions.iter().map(|ext| ext.to_ascii_lowercase()).collect()),
             _ => Kind::Text,
         };
-        Spec { attr: labels::attribute(&prop.name), label, kind, optional: prop.optional, place: false }
+        Spec { attr: labels::attribute(&prop.name), label, kind, optional: prop.optional, place: false, note: None }
     }
 
     /// The fields that place a thing.
@@ -88,6 +90,7 @@ impl Spec {
             kind: Kind::Number { whole: false, range: Some(range) },
             optional: true,
             place: true,
+            note: None,
         })
     }
 }

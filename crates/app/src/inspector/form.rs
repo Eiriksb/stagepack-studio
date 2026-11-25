@@ -61,6 +61,12 @@ impl Inspector {
                     let pictures = self.talk_pictures(&document, pick, cx);
                     video_form(&mut shape, &tag, pictures);
                 }
+                // What a button's `run` and `step` do happens only in the show.
+                if tag.name == "Button" {
+                    for spec in shape.specs.iter_mut().filter(|spec| spec.attr == "run" || spec.attr == "step") {
+                        spec.note = Some(RUNS_IN_SHOW.to_string());
+                    }
+                }
                 if (tag.name == "Model" || tag.name == "Terminal") && shape.message.is_none() {
                     named_by_its_file(&mut shape, &tag);
                 }

@@ -7,7 +7,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-use gpui_kit::Point;
+use gpui_kit::{Context, Entity, Point, Task};
 use slides_engine::{BUTTON_STEP_PAST, ButtonAction, ButtonOn, ComponentAnswer, ComponentFeed, Moment, Rect};
 use toolkit::{Event, PointerKind};
 
@@ -306,6 +306,83 @@ impl StateStore {
     /// What the component at `source` keeps.
     pub fn state_of(&self, source: &Range<usize>) -> Option<&serde_json::Value> {
         self.held.get(source)?.state.as_ref()
+    }
+}
+
+/// What a slide's interactive components keep, and the wait until one of them can be given what
+/// reached it: a show holds one for the slide it's on, and the editor one for what it tries.
+#[derive(Default)]
+pub(crate) struct Components {
+    pub store: StateStore,
+    feeding: Option<Task<()>>,
+}
+
+/// What holds [`Components`] for the talk `components_document`, if it has one, and draws them
+/// again once they're given what reached them.
+pub(crate) trait HoldsComponents: Sized + 'static {
+    fn components_mut(&mut self) -> &mut Components;
+    fn components_document(&self) -> Option<&Entity<Document>>;
+    /// The components were given what reached them: they're to be drawn from it.
+    fn components_fed(&mut self, cx: &mut Context<Self>);
+}
+
+/// Sends `event` to the interactive component whose tag is written at `source`. It's drawn from
+/// what reached it at most 60 times a second.
+pub(crate) fn send_to<T: HoldsComponents>(this: &mut T, source: &Range<usize>, event: Event, cx: &mut Context<T>) {
+    let Some(document) = this.components_document() else { return };
+    let text = document.read(cx).source().get(source.clone()).unwrap_or_default().to_string();
+    this.components_mut().store.send(source, &text, event);
+    feed(this, cx);
+}
+
+/// Gives each component what reached it, if it's time to, and waits for when it is if not.
+pub(crate) fn feed<T: HoldsComponents>(this: &mut T, cx: &mut Context<T>) {
+    let now = cx.background_executor().now();
+    let fed = this.components_mut().store.feed_due(now);
+    if fed.fed {
+        give_feeds(this, cx);
+        this.components_fed(cx);
+    }
+    if let Some(wait) = fed.wait
+        && this.components_mut().feeding.is_none()
+    {
+        let waiting = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            this.update(cx, |this, cx| {
+                this.components_mut().feeding = None;
+                feed(this, cx);
+            })
+            .ok();
+        });
+        this.components_mut().feeding = Some(waiting);
+    }
+}
+
+/// Has the deck draw the components from what the store gives them.
+pub(crate) fn give_feeds<T: HoldsComponents>(this: &mut T, cx: &mut Context<T>) {
+    let feeds = this.components_mut().store.feeds();
+    if let Some(document) = this.components_document() {
+        document.update(cx, |document, _| document.feed_components(feeds));
+    }
+}
+
+/// Takes in what came of drawing the components from what they were given, and gives them what
+/// reached them since.
+pub(crate) fn take_answers<T: HoldsComponents>(this: &mut T, cx: &mut Context<T>) {
+    let Some(document) = this.components_document() else { return };
+    let answers = document.update(cx, |document, _| document.take_component_answers());
+    if !answers.is_empty() && this.components_mut().store.answered(answers) {
+        feed(this, cx);
+    }
+}
+
+/// Forgets what the components kept, and what reached them.
+pub(crate) fn forget<T: HoldsComponents>(this: &mut T, cx: &mut Context<T>) {
+    let components = this.components_mut();
+    components.feeding = None;
+    if !components.store.is_empty() {
+        components.store.clear();
+        give_feeds(this, cx);
     }
 }
 

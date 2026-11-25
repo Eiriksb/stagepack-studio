@@ -1253,6 +1253,19 @@ impl Deck {
         layers
     }
 
+    /// The slide's layers as `editor_layers` gives them, but with its interactive components drawn
+    /// from what they're fed, at `state`, as the editor draws what it tries. With a state of 0, or
+    /// with the deck's placing here, just `editor_layers`.
+    pub fn editor_layers_in(&mut self, index: usize, state: u64, scale: f32) -> Vec<Arc<Layer>> {
+        if state == 0 || index >= self.slides.len() || self.ensure_placed(index) {
+            return self.editor_layers(index, scale);
+        }
+        let whole = self.ensure_whole(index);
+        let mut layers = self.layers_at(index, Moment { state, ..whole }, scale);
+        layers.extend(self.empty_region_layers(index, scale));
+        layers
+    }
+
     /// What the editor shows in slide `index`'s empty regions, as its source has them, drawn at `scale`.
     fn empty_region_layers(&mut self, index: usize, scale: f32) -> Vec<Arc<Layer>> {
         let drawn = self.slides[index].drawn.entry(scale.to_bits()).or_default();

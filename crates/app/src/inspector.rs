@@ -96,6 +96,14 @@ pub fn field_id(name: &str) -> String {
     format!("inspector-field-{name}")
 }
 
+/// The id of what's said under the field for attribute `name` of what it does.
+pub fn note_id(name: &str) -> String {
+    format!("inspector-note-{name}")
+}
+
+/// What a button's form says under `run` and `step`, which do nothing in the editor.
+pub const RUNS_IN_SHOW: &str = "Runs in the show.";
+
 /// The id of what's said under the field for attribute `name` when it can't be written.
 pub fn problem_id(name: &str) -> String {
     format!("inspector-problem-{name}")

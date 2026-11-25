@@ -7,6 +7,8 @@ use crate::arrange_tools::{order_items, reason};
 
 /// How many sides the round turn handle is drawn with.
 const HANDLE_ROUND: usize = 16;
+/// How far below the thing selected, in the window's pixels, its *Try* button is.
+const TRY_GAP: f32 = 12.;
 
 impl Render for SlideEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -73,6 +75,10 @@ impl Render for SlideEditor {
             _ => (None, false),
         };
         let terminal_playing = terminal.is_some() && self.recording_playing(cx);
+        // A button or an interactive component selected: a button under it that has it work by
+        // hand, or stops that while it does. Under it, as its middle is for pressing.
+        let tryable = selecting && self.selected_to_try(cx).is_some();
+        let trying = tryable && self.trying().is_some();
         // A terminal selected that runs a command: *Start*, or *Stop* and *Keep as recording* while
         // it runs, below its middle.
         let live_selected = if selecting { self.selected_runs(cx) } else { None };
@@ -208,6 +214,13 @@ impl Render for SlideEditor {
             let middle = slide.origin + point(px((rect.x + rect.w / 2.) * unit), px((rect.y + rect.h / 2.) * unit));
             in_editor(Bounds { origin: middle, size: size(px(0.), px(0.)) }, area).origin
         });
+        let try_button = outlines.first().filter(|_| tryable).zip(placed).map(|(corners, (slide, area))| {
+            let unit = f32::from(slide.size.width) / SLIDE_WIDTH;
+            let middle = corners.iter().map(|(x, _)| x).sum::<f32>() / 4.;
+            let bottom = corners.iter().map(|(_, y)| *y).fold(f32::MIN, f32::max);
+            let under = slide.origin + point(px(middle * unit), px(bottom * unit));
+            in_editor(Bounds { origin: under, size: size(px(0.), px(0.)) }, area).origin
+        });
         let lift_box = lift_outline.as_ref().and_then(|corners| Some((SharedString::from(LIFT_OUTLINE_ID), boxed(corners)?)));
         let frame_box = frame.as_ref().and_then(|(name, corners)| Some((SharedString::from(region_frame_id(name)), boxed(corners)?)));
         // Where the new box is in the editor, for whoever looks for it.
@@ -335,6 +348,7 @@ impl Render for SlideEditor {
             (true, true, _) => format!("{SELECTION_CONTEXT} {VIDEO_CONTEXT}"),
             (true, _, true) => format!("{SELECTION_CONTEXT} {MODEL_CONTEXT}"),
             (true, false, false) if terminal_selected => format!("{SELECTION_CONTEXT} {TERMINAL_CONTEXT}"),
+            (true, false, false) if tryable => format!("{SELECTION_CONTEXT} {INTERACTIVE_CONTEXT}"),
             (true, false, false) => SELECTION_CONTEXT.to_string(),
             (false, _, _) => EDITOR_CONTEXT.to_string(),
         };
@@ -455,10 +469,12 @@ impl Render for SlideEditor {
             .on_action(cx.listener(|this, _: &PlayOrStopVideo, _, cx| this.play_or_stop(cx)))
             .on_action(cx.listener(|this, _: &TurnOrStopModel, _, cx| this.turn_or_stop(cx)))
             .on_action(cx.listener(|this, _: &PlayOrStopRecording, _, cx| this.play_or_stop_recording(cx)))
-            // The wheel over a model being turned brings it nearer, or takes it further away.
+            .on_action(cx.listener(|this, _: &TryOrStop, _, cx| this.try_or_stop(cx)))
+            // The wheel over a model being turned brings it nearer, or takes it further away; over
+            // a component tried, it's the component's.
             .on_scroll(cx.listener(|this, event: &ScrollEvent, window, cx| {
                 let steps = f32::from(event.delta.pixel_delta(window.line_height()).y) / f32::from(window.line_height());
-                if steps != 0.0 && this.wheel_turning(event.position, steps, cx) {
+                if steps != 0.0 && (this.wheel_trying(event.position, steps, cx) || this.wheel_turning(event.position, steps, cx)) {
                     cx.stop_propagation();
                 }
             }))
@@ -605,6 +621,37 @@ impl Render for SlideEditor {
                             .child(label),
                     )
                 }))
+            })
+            .when_some(try_button, |this, under| {
+                let (id, label) = if trying { (TRY_DONE_ID, "Done") } else { (TRY_ID, "Try") };
+                this.child(
+                    div().absolute().left(under.x).top(under.y).child(
+                        div()
+                            .id(id)
+                            .test_support()
+                            .aria_label(label)
+                            .absolute()
+                            // Its middle under the thing's, clear of the handle on its edge.
+                            .left(px(-40.))
+                            .top(px(TRY_GAP))
+                            .w(px(80.))
+                            .h(px(32.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .bg(button_color)
+                            .text_color(button_text)
+                            .text_sm()
+                            .cursor_pointer()
+                            // The press is the button's, not the slide's beneath it.
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.try_or_stop(cx);
+                            }))
+                            .child(label),
+                    ),
+                )
             })
             .when_some(model_button, |this, middle| {
                 this.children(model_buttons.into_iter().map(|(id, label, across)| {

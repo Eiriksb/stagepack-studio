@@ -11,7 +11,7 @@ use slides_engine::{BUTTON_ON_NOTHING, ButtonLayer, Enter, LayerTiming, ModelLay
 use toolkit::{Event, PointerKind};
 
 use crate::document::{Document, LargeOpen};
-use crate::interactive::{Acted, InteractiveKind, InteractiveThing, Press, interactive_at, interactive_on, pointer_event, press_button};
+use crate::interactive::{self, Acted, Components, HoldsComponents, InteractiveKind, InteractiveThing, Press, interactive_at, interactive_on, pointer_event, press_button};
 use crate::present::{
     ENTER_SECONDS, MOMENTS_PER_SECOND, Moved, Place, ScreenInfo, Session, TRANSITION_SECONDS,
     WindowPlan, choose_windows, clock_text, layer_look, moment_time, slide_looks,
@@ -141,9 +141,7 @@ pub struct Presentation {
     /// which has it until it's let go of there.
     pressed: Option<(Range<usize>, PressedIn)>,
     /// What the interactive components of the slide the show is on keep, and what reached them.
-    components: StateStore,
-    /// The wait until one of them can be given what reached it.
-    feeding: Option<Task<()>>,
+    components: Components,
     /// The tests' boxes, each on a slide by its place among the shown ones, and what reached them.
     #[cfg(feature = "test-hooks")]
     stand_ins: Vec<(usize, Rect)>,
@@ -152,6 +150,21 @@ pub struct Presentation {
     _talk_changed: Subscription,
     _window_closed: Subscription,
     _owner_changed: Option<Subscription>,
+}
+
+impl HoldsComponents for Presentation {
+    fn components_mut(&mut self) -> &mut Components {
+        &mut self.components
+    }
+
+    fn components_document(&self) -> Option<&Entity<Document>> {
+        Some(&self.document)
+    }
+
+    /// Both windows draw the slide again, and take in what came of it.
+    fn components_fed(&mut self, cx: &mut Context<Self>) {
+        cx.notify();
+    }
 }
 
 impl Presentation {
@@ -181,8 +194,7 @@ impl Presentation {
             ask_pending: false,
             visits: 0,
             pressed: None,
-            components: StateStore::default(),
-            feeding: None,
+            components: Components::default(),
             #[cfg(feature = "test-hooks")]
             stand_ins: Vec::new(),
             #[cfg(feature = "test-hooks")]
@@ -366,63 +378,26 @@ impl Presentation {
 
     /// Forgets what the components of the slide the show is on kept, and what reached them.
     fn forget_components(&mut self, cx: &mut Context<Self>) {
-        self.feeding = None;
-        if !self.components.is_empty() {
-            self.components.clear();
-            self.give_feeds(cx);
-        }
+        interactive::forget(self, cx);
     }
 
     /// The moment `time` seconds after the slide of `place` appeared, at its step: with the state
     /// its components are drawn from if it's the slide the show is on.
     pub(crate) fn moment_at(&self, place: Place, time: f32) -> Moment {
-        let state = if place.slide == self.session.place().slide { self.components.state() } else { 0 };
+        let state = if place.slide == self.session.place().slide { self.components.store.state() } else { 0 };
         Moment { state, ..Moment::at(place.step, time) }
     }
 
     /// Sends `event` to the interactive component whose tag is written at `source` on the slide the
     /// show is on. It's drawn from what reached it at most 60 times a second.
     pub fn send_to(&mut self, source: &Range<usize>, event: Event, cx: &mut Context<Self>) {
-        let text = self.document.read(cx).source().get(source.clone()).unwrap_or_default().to_string();
-        self.components.send(source, &text, event);
-        self.feed(cx);
-    }
-
-    /// Gives each component what reached it, if it's time to, and waits for when it is if not.
-    fn feed(&mut self, cx: &mut Context<Self>) {
-        let now = cx.background_executor().now();
-        let fed = self.components.feed_due(now);
-        if fed.fed {
-            self.give_feeds(cx);
-            cx.notify();
-        }
-        if let Some(wait) = fed.wait
-            && self.feeding.is_none()
-        {
-            self.feeding = Some(cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(wait).await;
-                this.update(cx, |this, cx| {
-                    this.feeding = None;
-                    this.feed(cx);
-                })
-                .ok();
-            }));
-        }
-    }
-
-    /// Has the deck draw the components from what the store gives them.
-    fn give_feeds(&self, cx: &mut Context<Self>) {
-        let feeds = self.components.feeds();
-        self.document.update(cx, |document, _| document.feed_components(feeds));
+        interactive::send_to(self, source, event, cx);
     }
 
     /// Takes in what came of drawing the components from what they were given, and gives them what
     /// reached them since.
     fn take_answers(&mut self, cx: &mut Context<Self>) {
-        let answers = self.document.update(cx, |document, _| document.take_component_answers());
-        if !answers.is_empty() && self.components.answered(answers) {
-            self.feed(cx);
-        }
+        interactive::take_answers(self, cx);
     }
 
     /// The pointer doing `kind` at `at` on the slide, in slide units, sent to the component `thing`.
@@ -514,7 +489,7 @@ impl Presentation {
         self.arrival = None;
         self.slide_changed_from(left, cx);
         // A component keeps what it had only if its tag is as it was.
-        if !self.components.is_empty() {
+        if !self.components.store.is_empty() {
             let now = cx.background_executor().now();
             let place = self.session.place();
             let moment = self.moment_at(place, self.time_at(now));
@@ -524,8 +499,8 @@ impl Presentation {
                 .map(|thing| thing.source)
                 .collect();
             let source = self.document.read(cx).source().to_string();
-            self.components.keep_unchanged(&source, &interactive);
-            self.give_feeds(cx);
+            self.components.store.keep_unchanged(&source, &interactive);
+            interactive::give_feeds(self, cx);
         }
         cx.notify();
     }
@@ -680,7 +655,7 @@ impl Presentation {
 
     /// What the components of the slide the show is on keep, and what reached them.
     pub fn components(&self) -> &StateStore {
-        &self.components
+        &self.components.store
     }
 
     /// The lines of text the layer whose tag is written at `source` draws on the slide the show is
