@@ -1180,3 +1180,34 @@ fn the_typed_text_question_wraps_a_long_text_and_names_the_folder(cx: &mut TestA
     assert!(command_top < line_top);
     click(cx, window, RUN_NO_ID);
 }
+
+#[gpui_kit::test]
+fn a_press_waiting_for_its_yes_ends_with_the_show(cx: &mut TestAppContext) {
+    let around = surroundings(Some(&helper::helper_program()));
+    let command = "sh -c \"cat; : 31606\"";
+    // Another terminal running the same command comes first, for *Start* in the editor.
+    let talk = format!("# One\n\n{}\n\n{}\n\n{}\n", tag_with_id("u", command, 100), tag_with_id("t", command, 900), typing_button("hello"));
+    let typing = open_talk(cx, &around, &talk);
+    let live = live_of(&typing, cx);
+    let show = rehearse(&typing, cx);
+    // The button is pressed while the arrival's question is open, then the show ends unanswered.
+    assert!(until(cx, &show.windows(), 5, |cx| dialog_open(cx, show.presenter)));
+    show.click_slide(cx, ON_THE_BUTTON.0, ON_THE_BUTTON.1);
+    cx.update_window(show.presenter, |_, window, _| window.remove_window()).unwrap();
+    cx.run_until_parked();
+    assert!(show.show.read_with(cx, |show, _| show.has_ended()), "closing a window of it ends the show");
+    let windows = [typing.handle];
+    // *Start* and *Run* in the editor start the selected terminal, and nothing else.
+    start_here(&typing, cx, &live, &windows);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!until(cx, &windows, 1, |_| live.sessions() > 1), "the button's terminal didn't start");
+    assert_eq!(live.running(), 1);
+    let started = live.ids()[0].clone();
+    let source = typing.source(cx);
+    assert!(source[started.source().clone()].contains("id=\"u\""), "the one selected ran");
+    assert!(!dialog_open(cx, typing.handle), "no question about typing");
+    let session = live.get(&started).unwrap();
+    assert_eq!(hellos(&session), 0, "nothing is typed: {}", screen_text(&session));
+    click_on(&typing, cx, TERMINAL_END_ID);
+    nothing_left(cx, &windows, &live, "31606");
+}

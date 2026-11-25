@@ -60,6 +60,8 @@ impl NotLive {
 #[derive(Clone, Debug)]
 pub(crate) struct ButtonRun {
     slide: usize,
+    /// Which visit of the show to that slide it was made in.
+    visit: u64,
     terminal: String,
     text: String,
 }
@@ -172,8 +174,8 @@ impl WorkspaceView {
     /// [`Self::ask_for_button`] in a window of the show, and once it's answered yes the press goes
     /// on from where it stopped, looking at everything again. A new press takes the place of one
     /// still waiting.
-    pub(crate) fn press_run_button(&mut self, slide: usize, terminal: &str, text: &str, cx: &mut Context<Self>) -> RunPressed {
-        let press = ButtonRun { slide, terminal: terminal.to_string(), text: text.to_string() };
+    pub(crate) fn press_run_button(&mut self, slide: usize, visit: u64, terminal: &str, text: &str, cx: &mut Context<Self>) -> RunPressed {
+        let press = ButtonRun { slide, visit, terminal: terminal.to_string(), text: text.to_string() };
         let next = self.button_next(&press, cx);
         self.type_when_yes = matches!(next, ButtonNext::AskRun(_) | ButtonNext::AskType(..)).then_some(press);
         match next {
@@ -188,6 +190,10 @@ impl WorkspaceView {
     /// waits for that one's answer.
     pub(crate) fn ask_for_button(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(press) = self.type_when_yes.clone() else { return };
+        if !self.still_shown(&press, cx) {
+            self.type_when_yes = None;
+            return;
+        }
         match self.button_next(&press, cx) {
             ButtonNext::Typed => self.type_when_yes = None,
             ButtonNext::Refused(why) => {
@@ -228,8 +234,12 @@ impl WorkspaceView {
                 }
             }
         }
-        // Everything is looked at again: the text is typed only if it still may be.
+        // Everything is looked at again: the text is typed only if it still may be, and only while
+        // the show is still where it was pressed.
         let Some(press) = self.type_when_yes.take() else { return };
+        if !self.still_shown(&press, cx) {
+            return;
+        }
         match self.button_next(&press, cx) {
             ButtonNext::Typed => {}
             ButtonNext::Refused(why) => self.say(why, cx),
@@ -242,8 +252,14 @@ impl WorkspaceView {
     /// A question about running a command was answered while a button waits: it goes on from where
     /// it stopped, in `window`, which asks about its text after a yes to its terminal, its terminal
     /// again if the question was about another, or says it can't after a no.
-    pub(super) fn button_run_answered(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.type_when_yes.is_none() {
+    pub(super) fn button_run_answered(&mut self, answered: &Plan, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(press) = self.type_when_yes.clone() else { return };
+        if !self.still_shown(&press, cx) {
+            self.type_when_yes = None;
+            return;
+        }
+        // A question about another command leaves it waiting for its own.
+        if !self.press_runs(&press, answered, cx) {
             return;
         }
         // Once the question that was answered has gone.
@@ -251,6 +267,25 @@ impl WorkspaceView {
         window.defer(cx, move |window, cx| {
             view.update(cx, |view, cx| view.ask_for_button(window, cx)).ok();
         });
+    }
+
+    /// Whether the show this window runs is still on the visit to the slide `press` was made in.
+    fn still_shown(&self, press: &ButtonRun, cx: &mut Context<Self>) -> bool {
+        let Some(show) = self.current_show() else { return false };
+        if show.read(cx).has_ended() {
+            return false;
+        }
+        show.update(cx, |show, cx| show.visit(cx)) == (press.slide, press.visit)
+    }
+
+    /// Whether `answered` is what a yes to run the terminal `press` types into is for.
+    fn press_runs(&self, press: &ButtonRun, answered: &Plan, cx: &mut Context<Self>) -> bool {
+        let Some(document) = self.document.clone() else { return false };
+        let run = document.update(cx, |document, _| {
+            document.terminals_on(press.slide).into_iter().find(|terminal| terminal.id.as_deref() == Some(press.terminal.as_str())).and_then(|terminal| terminal.on.run)
+        });
+        let Some(words) = run.and_then(|run| split_command(&run).ok()) else { return false };
+        plan(document.read(cx).place(), &words).is_ok_and(|plan| plan.key() == answered.key())
     }
 
     /// What the button `press` does next: types its text now, waits for a yes, or can't, and why.
@@ -331,6 +366,7 @@ impl WorkspaceView {
     /// talk takes the window. What can't be ended says so on the status line.
     pub fn end_live(&mut self, cx: &mut Context<Self>) {
         self.start_when_yes = None;
+        self.type_when_yes = None;
         let said = self.live.end_all();
         for sentence in said {
             self.say(sentence, cx);

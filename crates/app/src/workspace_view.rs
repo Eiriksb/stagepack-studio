@@ -982,7 +982,7 @@ impl WorkspaceView {
             }
         }
         // A button asked: a yes goes on to its text.
-        self.button_run_answered(window, cx);
+        self.button_run_answered(plan, window, cx);
         cx.notify();
     }
 

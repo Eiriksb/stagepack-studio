@@ -40,6 +40,13 @@ pub const POINTER_HIDES_AFTER: Duration = Duration::from_secs(2);
 /// How strong the line around an interactive thing under the pointer is: the talk's accent, faint.
 const HOVER_OPACITY: f32 = 0.4;
 
+/// The shade laid over a button while the pointer is down on it: black at this strength makes it
+/// darker by 15 %. It's drawn in the window only, never into the slide's bitmap.
+pub const BUTTON_PRESSED_ID: &str = "button-pressed";
+pub const PRESSED_DARKER: f32 = 0.15;
+/// How round a button's corners are, in slide units, as the engine draws them.
+const BUTTON_RADIUS: f32 = 8.0;
+
 const KEY_CONTEXT: &str = "Show";
 
 /// The key context of a show's window while a live terminal has the keys: none of the show's keys
@@ -126,6 +133,9 @@ pub struct Presentation {
     owner: Option<Owner>,
     /// Whether a question about running a command is on its way to a window.
     ask_pending: bool,
+    /// How many times the show has come to a slide: a button's press waiting for a yes is for the
+    /// visit it was made in, and none after.
+    visits: u64,
     /// A press on an interactive thing, by where its tag is written, and the window it began in,
     /// which has it until it's let go of there.
     pressed: Option<(Range<usize>, PressedIn)>,
@@ -164,6 +174,7 @@ impl Presentation {
             ended: false,
             owner,
             ask_pending: false,
+            visits: 0,
             pressed: None,
             #[cfg(feature = "test-hooks")]
             stand_ins: Vec::new(),
@@ -243,6 +254,13 @@ impl Presentation {
         });
     }
 
+    /// The talk's slide the show is on, and which visit to it this is: what a button's press that
+    /// waits for a yes is for.
+    pub(crate) fn visit(&self, cx: &mut App) -> (usize, u64) {
+        let at = self.session.place().slide;
+        (self.document.update(cx, |document, _| document.shown_slide(at)), self.visits)
+    }
+
     /// Whether the show is over, or never got a window to run in.
     pub fn has_ended(&self) -> bool {
         self.ended
@@ -280,6 +298,7 @@ impl Presentation {
         match moved {
             Moved::Revealed { step } => self.reveal = Some(Reveal { step, began }),
             Moved::Arrived { transition, .. } => {
+                self.visits += 1;
                 self.reveal = None;
                 self.slide_began = None;
                 self.arrival = (transition != Transition::None).then_some(Arrival {
@@ -331,6 +350,7 @@ impl Presentation {
     fn slide_changed_from(&mut self, left: usize) {
         if self.session.place().slide != left {
             self.slide_began = None;
+            self.visits += 1;
         }
     }
 
@@ -565,7 +585,8 @@ pub(crate) fn act(show: &mut Presentation, button: &ButtonLayer, cx: &mut Contex
         }
         Press::Run { text, terminal } => {
             let Some((workspace, _)) = show.owner.clone() else { return Acted::Refused(BUTTON_NO_TERMINALS.to_string()) };
-            match workspace.update(cx, |workspace, cx| workspace.press_run_button(slide, &terminal, &text, cx)) {
+            let visit = show.visits;
+            match workspace.update(cx, |workspace, cx| workspace.press_run_button(slide, visit, &terminal, &text, cx)) {
                 Ok(RunPressed::Typed) | Err(_) => Acted::Done,
                 Ok(RunPressed::Refused(why)) => Acted::Refused(why),
                 Ok(RunPressed::Ask) => {
@@ -632,6 +653,33 @@ fn hover_outline(canvas: &Entity<SlideCanvas>, document: &Entity<Document>, thin
         .border_1()
         .border_color(color);
     Some(outline.into_any_element())
+}
+
+/// The shade over `thing`, under the pointer in `window`, while it's a button the press `window`
+/// holds began on: darker by [`PRESSED_DARKER`], within its rounded box, over the slide drawn on
+/// `canvas` and never in it. A button turned on the slide gets none, as its box can't be shaded
+/// turned.
+fn pressed_look(canvas: &Entity<SlideCanvas>, show: &Presentation, thing: &InteractiveThing, window: PressedIn, cx: &App) -> Option<AnyElement> {
+    let held = show.pressed.as_ref().is_some_and(|(source, began)| *began == window && *source == thing.source);
+    if !held || thing.kind != InteractiveKind::Button || thing.rotate != 0.0 {
+        return None;
+    }
+    let canvas = canvas.read(cx);
+    let (slide, area) = (canvas.slide_bounds()?, canvas.area()?);
+    let unit = f32::from(slide.size.width) / slides_engine::SLIDE_WIDTH;
+    let across = slide.origin - area.origin;
+    let rect = thing.rect;
+    let shade = div()
+        .id(BUTTON_PRESSED_ID)
+        .test_support()
+        .absolute()
+        .left(across.x + px(rect.x * unit))
+        .top(across.y + px(rect.y * unit))
+        .w(px(rect.w * unit))
+        .h(px(rect.h * unit))
+        .rounded(px(BUTTON_RADIUS * unit))
+        .bg(black().opacity(PRESSED_DARKER));
+    Some(shade.into_any_element())
 }
 
 /// Puts a moment of the talk on `canvas`: `place`, `time` seconds after its slide appeared. It
@@ -1274,6 +1322,8 @@ impl AudienceView {
         }
         self.swallow_click = keys || hit.is_some();
         self.show.update(cx, |show, _| show.press_on(hit.as_ref(), PressedIn::Audience));
+        // A button under it looks pressed.
+        cx.notify();
         self.turned = false;
         // Only a model in front of everything else under the pointer turns.
         self.turn_drag = self.model_in_front(hit.as_ref()).map(|model| (model, event.position, false));
@@ -1318,6 +1368,7 @@ impl AudienceView {
         let over = self.thing_at(position, cx);
         self.show.update(cx, |show, cx| show.let_go(over.as_ref(), PressedIn::Audience, cx));
         self.end_turn(cx);
+        cx.notify();
     }
 
     /// Ends a drag on a model.
@@ -1455,6 +1506,7 @@ impl Render for AudienceView {
             .and_then(|at| interactive_at(&taking, at).cloned());
         self.hovered = hovered.as_ref().map(|thing| thing.source.clone());
         let document = self.show.read(cx).document.clone();
+        let pressed = hovered.as_ref().and_then(|thing| pressed_look(&self.current, self.show.read(cx), thing, PressedIn::Audience, cx));
         let outline = hovered.and_then(|thing| hover_outline(&self.current, &document, &thing, cx));
         window_root(&self.show, &self.focus_handle, title, self.show.read(cx).keys_held())
             .bg(black())
@@ -1492,6 +1544,7 @@ impl Render for AudienceView {
                     }))
                     .child(self.leaving.clone())
                     .child(self.current.clone())
+                    .children(pressed)
                     .children(outline),
             )
     }
@@ -1700,6 +1753,7 @@ impl PresenterView {
             self.focus_handle.focus(window, cx);
         }
         self.show.update(cx, |show, _| show.press_on(hit.as_ref(), PressedIn::Presenter));
+        cx.notify();
     }
 
     /// The pointer moved: what it's over is outlined, and a press let go of where this window didn't
@@ -1719,6 +1773,7 @@ impl PresenterView {
     fn let_go(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         let over = self.thing_at(position, cx);
         self.show.update(cx, |show, cx| show.let_go(over.as_ref(), PressedIn::Presenter, cx));
+        cx.notify();
     }
 
     /// Draws the slide on `current` again if it moves and its time has changed since, and
@@ -1771,6 +1826,7 @@ impl Render for PresenterView {
             .and_then(|pointer| slide_point(&self.current, pointer, cx))
             .and_then(|at| interactive_at(&show.taking_presses(&self.things), at).cloned());
         self.hovered = hovered.as_ref().map(|thing| thing.source.clone());
+        let pressed = hovered.as_ref().and_then(|thing| pressed_look(&self.current, show, thing, PressedIn::Presenter, cx));
         let outline = hovered.and_then(|thing| hover_outline(&self.current, &document, &thing, cx));
 
         let slide_and_figures = v_flex()
@@ -1791,6 +1847,7 @@ impl Render for PresenterView {
                     .on_mouse_up(MouseButton::Left, cx.listener(|this, event: &MouseUpEvent, _, cx| this.let_go(event.position, cx)))
                     .on_mouse_up_out(MouseButton::Left, cx.listener(|this, event: &MouseUpEvent, _, cx| this.let_go(event.position, cx)))
                     .child(self.current.clone())
+                    .children(pressed)
                     .children(outline),
             )
             .child(

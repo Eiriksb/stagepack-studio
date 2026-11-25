@@ -24,7 +24,7 @@ use stagepack_studio::document::Document;
 use stagepack_studio::model_view;
 use stagepack_studio::present::Place;
 use stagepack_studio::present_view::{
-    AudienceView, COUNTER_ID, INTERACTIVE_HOVER_ID, NEXT_ID, POINTER_HIDES_AFTER, PressedIn, Presentation, StandInPress, start_show,
+    AudienceView, BUTTON_PRESSED_ID, COUNTER_ID, INTERACTIVE_HOVER_ID, PRESSED_DARKER, NEXT_ID, POINTER_HIDES_AFTER, PressedIn, Presentation, StandInPress, start_show,
 };
 use stagepack_studio::slide_canvas::SlideCanvas;
 use stagepack_studio::workspace_view;
@@ -523,6 +523,72 @@ fn go_to_step_goes_straight_there_and_back(cx: &mut TestAppContext) {
     show.settle(cx);
     assert_eq!(place(&show, cx), Place { slide: 1, step: 0 });
     assert_eq!(go(cx, 1), Place { slide: 1, step: 0 });
+}
+
+impl Show {
+    /// Where the pressed look is in `window`, while it's drawn.
+    fn pressed_look(&self, cx: &mut TestAppContext, window: AnyWindowHandle) -> Option<gpui_kit::Bounds<Pixels>> {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find(BUTTON_PRESSED_ID).map(|shade| shade.bounds())
+        })
+        .unwrap()
+    }
+}
+
+#[gpui_kit::test]
+fn a_button_looks_pressed_only_while_the_pointer_is_down_on_it(cx: &mut TestAppContext) {
+    assert_eq!(PRESSED_DARKER, 0.15, "darker by 15 %");
+    let show = rehearse(cx, &stepped("2"));
+    let canvas = show.canvas(cx);
+    let before = fingerprints(cx, &canvas);
+    let on = show.at(cx, &canvas, ON_IT);
+    let off = show.at(cx, &canvas, BESIDE_IT);
+    show.move_to(cx, show.audience, on, None);
+    assert!(show.pressed_look(cx, show.audience).is_none(), "not before it's pressed");
+
+    // Down on it: it looks pressed, over its box, in this window only and never in the slide.
+    show.down(cx, show.audience, on);
+    let shade = show.pressed_look(cx, show.audience).expect("it looks pressed");
+    let (top_left, bottom_right) = (show.at(cx, &canvas, (BOX.x, BOX.y)), show.at(cx, &canvas, (BOX.x + BOX.w, BOX.y + BOX.h)));
+    let near = |a: Pixels, b: Pixels| (f32::from(a) - f32::from(b)).abs() <= 1.5;
+    assert!(near(shade.origin.x, top_left.x) && near(shade.origin.y, top_left.y), "{shade:?} from {top_left:?}");
+    assert!(near(shade.origin.x + shade.size.width, bottom_right.x) && near(shade.origin.y + shade.size.height, bottom_right.y));
+    assert_eq!(fingerprints(cx, &canvas), before, "the slide's layers are as they were");
+    assert!(show.pressed_look(cx, show.presenter).is_none());
+
+    // Leaving it with the button down, it looks as it did; back over it, pressed again.
+    show.move_to(cx, show.audience, off, Some(MouseButton::Left));
+    assert!(show.pressed_look(cx, show.audience).is_none(), "not while the pointer is off it");
+    show.move_to(cx, show.audience, on, Some(MouseButton::Left));
+    assert!(show.pressed_look(cx, show.audience).is_some());
+
+    // Let go of: as it was, and it acted.
+    show.up(cx, show.audience, on);
+    show.settle(cx);
+    assert!(show.pressed_look(cx, show.audience).is_none(), "not once let go of");
+    assert_eq!(place(&show, cx), Place { slide: 0, step: 2 });
+
+    // Let go of off it: as it was, and it didn't act.
+    show.show.update(cx, |show, cx| show.go_to_step(0, cx));
+    show.move_to(cx, show.audience, on, None);
+    show.down(cx, show.audience, on);
+    show.move_to(cx, show.audience, off, Some(MouseButton::Left));
+    show.up(cx, show.audience, off);
+    show.settle(cx);
+    show.move_to(cx, show.audience, on, None);
+    assert!(show.pressed_look(cx, show.audience).is_none());
+    assert_eq!(place(&show, cx), Place { slide: 0, step: 0 });
+
+    // In the presenter's window it looks pressed there, and not in the audience's.
+    let theirs = show.presenter_canvas(cx);
+    let at = show.at(cx, &theirs, ON_IT);
+    show.move_to(cx, show.presenter, at, None);
+    show.down(cx, show.presenter, at);
+    assert!(show.pressed_look(cx, show.presenter).is_some());
+    assert!(show.pressed_look(cx, show.audience).is_none());
+    show.up(cx, show.presenter, at);
+    assert!(show.pressed_look(cx, show.presenter).is_none());
 }
 
 #[gpui_kit::test]
