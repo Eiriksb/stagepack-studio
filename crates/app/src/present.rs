@@ -101,6 +101,21 @@ impl Session {
         Moved::BackedUp
     }
 
+    /// Goes straight to click step `step` of the slide the show is on, or to its last if it has
+    /// fewer. Going to an earlier one is going back.
+    pub fn go_to_step(&mut self, talk: &mut impl TalkShape, step: u32) -> Moved {
+        if self.place.slide >= talk.slide_count() {
+            return Moved::Stayed;
+        }
+        let step = step.min(talk.steps(self.place.slide));
+        let was = std::mem::replace(&mut self.place.step, step);
+        match step.cmp(&was) {
+            std::cmp::Ordering::Greater => Moved::Revealed { step },
+            std::cmp::Ordering::Less => Moved::BackedUp,
+            std::cmp::Ordering::Equal => Moved::Stayed,
+        }
+    }
+
     pub fn place(&self) -> Place {
         self.place
     }

@@ -76,6 +76,30 @@ fn previous_steps_back_with_no_animation() {
 }
 
 #[test]
+fn going_to_a_step_stays_on_the_slide() {
+    let (mut s, mut t) = (Session::new(), talk());
+    assert_eq!(s.go_to_step(&mut t, 2), Moved::Revealed { step: 2 });
+    assert_eq!(s.place(), Place { slide: 0, step: 2 });
+    assert_eq!(s.go_to_step(&mut t, 1), Moved::BackedUp, "back is back");
+    assert_eq!(s.place(), Place { slide: 0, step: 1 });
+    assert_eq!(s.go_to_step(&mut t, 1), Moved::Stayed);
+    assert_eq!(s.go_to_step(&mut t, 0), Moved::BackedUp);
+    assert_eq!(s.place(), Place { slide: 0, step: 0 });
+}
+
+#[test]
+fn going_to_a_step_past_the_last_goes_to_the_last() {
+    let (mut s, mut t) = (Session::new(), talk());
+    assert_eq!(s.go_to_step(&mut t, 9), Moved::Revealed { step: 2 });
+    assert_eq!(s.place(), Place { slide: 0, step: 2 });
+    assert_eq!(s.go_to_step(&mut t, 9), Moved::Stayed);
+    s.next(&mut t);
+    // A slide with no clicks has only its step 0.
+    assert_eq!(s.go_to_step(&mut t, 3), Moved::Stayed);
+    assert_eq!(s.place(), Place { slide: 1, step: 0 });
+}
+
+#[test]
 fn going_back_a_slide_lands_on_its_last_step() {
     let (mut s, mut t) = (Session::new(), talk());
     s.next(&mut t);

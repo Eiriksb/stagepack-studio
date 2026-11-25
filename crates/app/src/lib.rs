@@ -18,6 +18,7 @@ pub mod history;
 pub mod icon_picker;
 pub mod insert;
 pub mod insert_tools;
+mod interactive;
 pub mod large_files;
 pub mod live_terminal;
 pub mod inspector;
