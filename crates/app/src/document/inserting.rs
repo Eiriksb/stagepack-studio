@@ -108,6 +108,12 @@ impl Document {
         self.insert_sized(INSERT_SHAPE, "Shape", &attrs, insert::shape_size(kind), None)
     }
 
+    /// Puts a button on the current slide, as [`Self::insert_sized`] does, with the words and the
+    /// step [`insert::NEW_BUTTON`] gives it, and selects it.
+    pub fn insert_button(&mut self) -> Result<Vec<usize>, EditRefused> {
+        self.insert_sized(INSERT_BUTTON, slides_engine::BUTTON_TAG, &insert::NEW_BUTTON, insert::BUTTON_SIZE, None)
+    }
+
     /// Starts typing in a new text box on the current slide, which isn't written until something
     /// is typed in it: the first character typed writes it, with that character, as one step
     /// named "Insert text box". Till then it's nothing of the talk's: no change, no step, nothing

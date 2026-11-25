@@ -941,6 +941,11 @@ impl Document {
         guarded(|| self.deck.terminals_at(index, moment)).unwrap_or_default()
     }
 
+    /// The buttons on slide `index` at `moment`, among its layers as the show draws them then.
+    pub fn buttons_at(&mut self, index: usize, moment: slides_engine::Moment) -> Vec<slides_engine::ButtonLayer> {
+        guarded(|| self.deck.buttons_at(index, moment)).unwrap_or_default()
+    }
+
     /// The one thing selected on the slide shown, if it's a terminal recording placed on it.
     pub fn selected_terminal(&mut self) -> Option<TerminalLayer> {
         let selected = self.selected()?.clone();

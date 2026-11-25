@@ -63,7 +63,7 @@ pub struct Description {
 }
 
 /// The order the built-ins are listed in.
-const BUILT_IN_ORDER: [&str; 8] = ["Shape", "Box", "Icon", "Picture", "Video", "Model", "Terminal", "Chart"];
+const BUILT_IN_ORDER: [&str; 9] = ["Shape", "Box", "Icon", "Picture", "Video", "Model", "Terminal", "Chart", "Button"];
 
 fn setting(name: &str, meaning: &str, values: Option<&[&str]>) -> SettingInfo {
     SettingInfo { name: name.to_string(), meaning: meaning.to_string(), values: values.map(|all| all.iter().map(ToString::to_string).collect()) }
@@ -108,6 +108,7 @@ fn placement() -> Vec<SettingInfo> {
             "click" => setting(name, "The click the thing first shows on, from 1 to 999, or `each` to show a line at a time; without it, it shows from the start.", None),
             "enter" => setting(name, "How the thing arrives on its click.", Some(&["appear", "fade", "fly-up"])),
             "align" => setting(name, "Where text sits across its width.", Some(&["left", "center", "right"])),
+            "id" => setting(name, "A name for the thing, by which a button on its slide names it in `in` or `on`. No two things on a slide may have the same one.", None),
             other => setting(other, "A setting every placed thing takes.", None),
         })
         .collect()

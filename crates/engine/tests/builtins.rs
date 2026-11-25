@@ -268,6 +268,18 @@ mod probe {
         NativeComponent { name: "Probe", schema, render }
     }
 
+    /// Says whether an `id` reaches it, which `#[component]` can't take either.
+    #[allow(non_snake_case)]
+    pub fn Named_component() -> NativeComponent {
+        fn schema() -> ComponentSchema {
+            ComponentSchema::new("Named", Vec::new(), false)
+        }
+        fn render(props: &Props, _: &Ctx) -> Element {
+            text(format!("id [{}] note [{}]", props.0.get("id").cloned().unwrap_or_default(), props.0.get("note").cloned().unwrap_or_default()))
+        }
+        NativeComponent { name: "Named", schema, render }
+    }
+
     #[component]
     pub fn Stacked() -> Element {
         row![icon("arrow-right", 40.0), icon("arrow-right", 40.0)].gap(10.0)
@@ -292,6 +304,7 @@ mod probe {
 fn probe_registry() -> Registry {
     let mut registry = builtin_registry();
     registry.add(probe::Probe_component());
+    registry.add(probe::Named_component());
     registry.add(probe::Stacked_component());
     registry.add(probe::Drawn_component());
     registry.add(probe::Written_component());
@@ -312,7 +325,7 @@ fn text_of(layer: &LayerSpec) -> String {
 
 #[test]
 fn placement_attributes_do_not_reach_the_component() {
-    assert_eq!(PLACEMENT_ATTRS, ["x", "y", "w", "h", "rotate", "click", "enter", "align"]);
+    assert_eq!(PLACEMENT_ATTRS, ["x", "y", "w", "h", "rotate", "click", "enter", "align", "id"]);
     let src = "<Probe x=\"1\" rotate=\"2\" click=\"3\" note=\"kept\" />\n";
     let (slide, _) = lay_out_with(src, &[], &probe_registry());
     assert_eq!(text_of(slide.layers.last().unwrap()), "[][][][kept]");
@@ -1739,4 +1752,173 @@ fn a_model_resized_shows_its_still_until_the_new_one_is_drawn() {
     let made = jobs.into_iter().next().unwrap().make(Some(Box::new(std::io::Cursor::new(box_model()))));
     deck.take_still(made);
     assert_eq!(picture_of(&model_layer(&mut deck)).0.width(), 800);
+}
+
+// Buttons.
+
+/// The fill colours and the words drawn in a layer.
+fn fills_and_words(layer: &LayerSpec) -> (Vec<toolkit::Color>, Vec<String>) {
+    let mut fills = Vec::new();
+    let mut words = Vec::new();
+    for item in layer.items.iter() {
+        match item {
+            DisplayItem::Fill { color, .. } => fills.push(*color),
+            DisplayItem::Text { text, .. } => words.extend(text.buffer.layout_runs().map(|run| run.text.to_string())),
+            _ => {}
+        }
+    }
+    (fills, words)
+}
+
+fn button_on(layer: &LayerSpec) -> &ButtonOn {
+    layer.button.as_ref().expect("the layer is a button")
+}
+
+#[test]
+fn a_button_draws_its_label_in_each_look() {
+    let mut drawn = Vec::new();
+    for look in ["primary", "secondary", "quiet"] {
+        let src = format!("<Button label=\"Go on\" look=\"{look}\" step=\"0\" x=\"100\" y=\"100\" w=\"300\" h=\"80\" />\n");
+        let (slide, _) = lay_out(&src, &[]);
+        assert!(slide.notices.is_empty(), "{look}: {:?}", slide.notices);
+        let layer = slide.layers.last().unwrap();
+        assert_eq!(layer.rect, Rect { x: 100.0, y: 100.0, w: 300.0, h: 80.0 });
+        let (fills, words) = fills_and_words(layer);
+        assert_eq!(fills.len(), 1, "{look}");
+        assert_eq!(words, ["Go on"], "{look}");
+        drawn.push((button_on(layer).look, fills[0]));
+    }
+    assert_eq!(drawn.iter().map(|(look, _)| *look).collect::<Vec<_>>(), [ButtonLook::Primary, ButtonLook::Secondary, ButtonLook::Quiet]);
+    let fills: Vec<toolkit::Color> = drawn.iter().map(|(_, fill)| *fill).collect();
+    assert!(fills[0] != fills[1] && fills[1] != fills[2] && fills[0] != fills[2], "{fills:?}");
+    assert_eq!(fills[0], toolkit::Theme::default().accent, "a primary button is the accent");
+    // With no look, it's primary.
+    let (slide, _) = lay_out("<Button label=\"Go\" step=\"0\" x=\"0\" y=\"0\" />\n", &[]);
+    assert_eq!(button_on(slide.layers.last().unwrap()).look, ButtonLook::Primary);
+}
+
+#[test]
+fn a_button_keeps_its_label_clear_of_its_edge() {
+    let src = "<Button label=\"Go on to the next part of the demo\" step=\"0\" x=\"0\" y=\"0\" w=\"200\" h=\"400\" />\n";
+    let (slide, _) = lay_out(src, &[]);
+    let layer = slide.layers.last().unwrap();
+    let lines = text_boxes(layer);
+    assert!(lines.len() == 1 && lines[0].3 > 100.0, "it wraps: {lines:?}");
+    for (x, _, w, _) in lines {
+        assert!(x >= 16.0 - 0.5 && x + w <= 200.0 - 16.0 + 0.5, "16 from each side: {x} {w}");
+        assert!((x + w / 2.0 - 100.0).abs() < 1.0, "in the middle: {x} {w}");
+    }
+    assert_eq!(bounds(fills(layer)[0]), (0.0, 0.0, 200.0, 400.0));
+}
+
+#[test]
+fn a_button_reads_one_action() {
+    let action = |attrs: &str| {
+        let (slide, _) = lay_out(&format!("<Button label=\"Go\" {attrs} x=\"0\" y=\"0\" />\n"), &[]);
+        button_on(slide.layers.last().unwrap()).action.clone()
+    };
+    assert_eq!(action("run=\"ls\" in=\"t\""), Ok(ButtonAction::Run { text: "ls".to_string(), terminal: "t".to_string() }));
+    assert_eq!(action("do=\"next\" on=\"m\""), Ok(ButtonAction::Do { action: "next".to_string(), target: "m".to_string(), value: String::new() }));
+    assert_eq!(action("do=\"go\" on=\"m\" value=\"3\""), Ok(ButtonAction::Do { action: "go".to_string(), target: "m".to_string(), value: "3".to_string() }));
+    assert_eq!(action("step=\"2\""), Ok(ButtonAction::Step(2)));
+    assert_eq!(action("step=\"-1\""), Err(ButtonFault::BadStep));
+    assert_eq!(action("step=\"two\""), Err(ButtonFault::BadStep));
+}
+
+#[test]
+fn a_button_without_or_with_two_actions_has_its_notice() {
+    let (slide, _) = lay_out("<Button label=\"Go\" x=\"0\" y=\"0\" />\n", &[]);
+    let layer = slide.layers.last().unwrap();
+    assert_eq!(button_on(layer).action, Err(ButtonFault::NoAction));
+    assert_eq!(fills_and_words(layer).1, ["Go"], "it's drawn all the same");
+    assert_eq!(slide.notices, [Notice("This button has no action.".to_string())]);
+    let (slide, _) = lay_out("<Button label=\"Go\" run=\"ls\" in=\"t\" step=\"1\" x=\"0\" y=\"0\" />\n", &[]);
+    assert_eq!(button_on(slide.layers.last().unwrap()).action, Err(ButtonFault::ManyActions));
+    assert_eq!(slide.notices, [Notice("This button has more than one action: run, do or step.".to_string())]);
+}
+
+#[test]
+fn a_button_in_the_text_is_drawn_and_says_it_must_be_placed() {
+    let (slide, _) = lay_out("<Button label=\"Go\" step=\"0\" />\n", &[]);
+    assert!(notice_about(&slide, BUTTON_IN_TEXT), "{:?}", slide.notices);
+    assert!(slide.layers.iter().all(|layer| layer.button.is_none()));
+}
+
+#[test]
+fn a_buttons_unknown_look_is_primary_and_a_notice() {
+    let (slide, _) = lay_out("<Button label=\"Go\" look=\"loud\" step=\"0\" x=\"0\" y=\"0\" />\n", &[]);
+    assert_eq!(button_on(slide.layers.last().unwrap()).look, ButtonLook::Primary);
+    assert!(notice_about(&slide, "not loud"), "{:?}", slide.notices);
+}
+
+#[test]
+fn what_a_button_names_is_checked_on_its_slide() {
+    let src = concat!(
+        "<Terminal id=\"t\" run=\"bash\" x=\"0\" y=\"0\" w=\"400\" h=\"300\" />\n\n",
+        "<Terminal id=\"rec\" src=\"assets/a.cast\" x=\"0\" y=\"400\" w=\"400\" h=\"300\" />\n\n",
+        "<Box x=\"900\" y=\"0\" click=\"2\">\n\nLater\n\n</Box>\n\n",
+        "<Button label=\"A\" run=\"ls\" in=\"t\" x=\"500\" y=\"0\" />\n\n",
+        "<Button label=\"B\" step=\"2\" x=\"500\" y=\"200\" />\n",
+    );
+    let (slide, _) = lay_out(src, &[]);
+    let said = |text: &str| slide.notices.iter().any(|notice| notice.0 == text);
+    assert!(!said(BUTTON_IN_NOTHING) && !said(BUTTON_STEP_PAST), "{:?}", slide.notices);
+    let wrong = src.replace("in=\"t\"", "in=\"rec\"").replace("step=\"2\"", "step=\"3\"");
+    let (slide, _) = lay_out(&wrong, &[]);
+    let said = |text: &str| slide.notices.iter().any(|notice| notice.0 == text);
+    assert!(said("This button's `in` names no live terminal on this slide."), "a recording isn't live: {:?}", slide.notices);
+    assert!(said("This button's step is past the slide's last click."), "{:?}", slide.notices);
+    let (slide, _) = lay_out("<Button label=\"Go\" do=\"next\" on=\"m\" x=\"0\" y=\"0\" />\n", &[]);
+    assert_eq!(slide.notices, [Notice("This button's `on` names nothing it can act on.".to_string())]);
+}
+
+#[test]
+fn an_id_is_read_as_placement_and_a_duplicate_has_its_notice() {
+    let (slide, _) = lay_out_with("<Named id=\"c\" note=\"kept\" x=\"0\" y=\"0\" />\n", &[], &probe_registry());
+    let layer = slide.layers.last().unwrap();
+    assert_eq!(text_of(layer), "id [] note [kept]");
+    assert_eq!(layer.id.as_deref(), Some("c"));
+    assert!(slide.notices.is_empty(), "{:?}", slide.notices);
+    let src = "<Named id=\"c\" x=\"0\" y=\"0\" />\n\n<Button id=\" c \" label=\"Go\" step=\"0\" x=\"0\" y=\"300\" />\n";
+    let (slide, _) = lay_out_with(src, &[], &probe_registry());
+    assert_eq!(slide.notices, [Notice("Two things on this slide have the id \"c\".".to_string())]);
+    assert_eq!(button_on(slide.layers.last().unwrap()).id.as_deref(), Some("c"));
+    // A terminal's `id` is its place's too, and never one of what it's given.
+    let (slide, _) = lay_out("<Terminal id=\"t\" run=\"bash\" x=\"0\" y=\"0\" w=\"400\" h=\"300\" />\n", &[]);
+    let layer = slide.layers.last().unwrap();
+    assert_eq!(layer.id.as_deref(), Some("t"));
+    assert_eq!(layer.terminal.as_ref().unwrap().run.as_deref(), Some("bash"));
+}
+
+#[test]
+fn a_deck_lists_the_buttons_shown_at_a_moment() {
+    let source = "# One\n\n<Button label=\"Go\" id=\"b\" step=\"1\" x=\"10\" y=\"20\" w=\"300\" h=\"80\" click=\"1\" />\n";
+    let mut deck = Deck::open(Box::new(MapFiles(HashMap::new())), Fonts::bundled_only(), source.to_string());
+    let buttons = deck.buttons_at(0, Moment::START);
+    assert_eq!(buttons.len(), 1);
+    let button = &buttons[0];
+    assert_eq!(&source[button.source.clone()], source.trim_start_matches("# One\n\n").trim_end());
+    assert_eq!(button.click, Some(1));
+    assert_eq!(button.on.rect, Rect { x: 10.0, y: 20.0, w: 300.0, h: 80.0 });
+    assert_eq!(button.on.id.as_deref(), Some("b"));
+    assert_eq!(button.on.label, "Go");
+    assert!(deck.buttons_at(1, Moment::START).is_empty());
+    assert_eq!(deck.button_problem(0, &button.source), None);
+    let past = source.replace("step=\"1\"", "step=\"5\"");
+    deck.update(past);
+    let source = deck.buttons_at(0, Moment::START)[0].source.clone();
+    assert_eq!(deck.button_problem(0, &source).as_deref(), Some(BUTTON_STEP_PAST));
+}
+
+#[test]
+fn the_button_takes_what_its_form_shows() {
+    let schema = (builtin_registry().get("Button").unwrap().schema)();
+    let names: Vec<&str> = schema.props.iter().map(|prop| prop.name.as_str()).collect();
+    assert_eq!(names, ["label", "look", "run", "in", "do", "on", "value", "step"]);
+    let look = schema.props.iter().find(|prop| prop.name == "look").unwrap();
+    assert_eq!(look.kind, toolkit::PropKind::Choice(["primary", "secondary", "quiet"].map(String::from).to_vec()));
+    // The terminal's are as they were: `id` is a place's, never one of its own.
+    let schema = (builtin_registry().get("Terminal").unwrap().schema)();
+    let names: Vec<&str> = schema.props.iter().map(|prop| prop.name.as_str()).collect();
+    assert_eq!(names, ["src", "run", "cols", "rows"]);
 }

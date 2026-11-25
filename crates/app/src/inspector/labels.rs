@@ -8,7 +8,7 @@ type Setting = (&'static str, &'static str, &'static str);
 
 /// A built-in component's settings, by argument, in the order they're shown, with their labels
 /// and what each means: `(argument, label, meaning)`.
-const BUILT_INS: [(&str, &[Setting]); 8] = [
+const BUILT_INS: [(&str, &[Setting]); 9] = [
     (
         "Shape",
         &[
@@ -59,6 +59,19 @@ const BUILT_INS: [(&str, &[Setting]); 8] = [
             ("build", "Build up by clicks", "Shows the chart a series at a time, or for one series a bar, point or slice at a time, one for each click."),
         ],
     ),
+    (
+        "Button",
+        &[
+            ("label", "Label", "The words on the button."),
+            ("look", "Look", "How the button looks: `primary` is filled with the talk's accent colour, `secondary` tinted with it, and `quiet` barely tinted."),
+            ("run", "Types", "Text to type, then Enter, into the live terminal `in` names, when the button is pressed in the show. A button has one of `run`, `do` or `step`."),
+            ("in", "Into terminal", "The `id` of the live terminal on this slide that `run` types into. It is started first if it isn't running."),
+            ("do", "Action", "The name of an action to send to the interactive thing `on` names, when the button is pressed. A button has one of `run`, `do` or `step`."),
+            ("on", "Acts on", "The `id` of the interactive thing on this slide that `do` sends its action to."),
+            ("value", "Value", "What is sent with `do`'s action. It is empty if left out."),
+            ("step", "Go to click", "The click of this slide to go straight to when the button is pressed in the show, from 0 to the slide's last. A button has one of `run`, `do` or `step`."),
+        ],
+    ),
 ];
 
 /// The built-ins' arguments the form leaves out: `(tag, argument, meaning)`. A video's, a model's
@@ -78,8 +91,9 @@ const LEFT_OUT: [(&str, &str, &str); 8] = [
 /// The built-ins' arguments a talk can't do without: a missing file is a problem. Every other
 /// argument left out is filled in by the engine, and a chart's `labels` and `values` are needed
 /// only when it has no `data`, which their meanings say.
-/// A terminal needs a `src` or a `run`, either one, so neither is listed.
-const NEEDED: [(&str, &str); 3] = [("Picture", "src"), ("Video", "src"), ("Model", "src")];
+/// A terminal needs a `src` or a `run`, either one, so neither is listed, and a button one of its
+/// actions, which their meanings say.
+const NEEDED: [(&str, &str); 4] = [("Picture", "src"), ("Video", "src"), ("Model", "src"), ("Button", "label")];
 
 /// Whether the built-in `tag`'s setting `argument` must be written.
 pub fn needed(tag: &str, argument: &str) -> bool {
@@ -107,9 +121,12 @@ const COLOURS: [(&str, &str); 5] = [("Shape", "fill"), ("Shape", "outline"), ("B
 
 /// What a choice of a built-in is called where its own name won't do: `(tag, argument, value,
 /// label)`.
-const CHOICES: [(&str, &str, &str, &str); 2] = [
+const CHOICES: [(&str, &str, &str, &str); 5] = [
     ("Shape", "kind", "rect", "Rectangle"),
     ("Shape", "kind", "rounded", "Rounded rectangle"),
+    ("Button", "look", "primary", "Primary (filled)"),
+    ("Button", "look", "secondary", "Secondary (tinted)"),
+    ("Button", "look", "quiet", "Quiet (faint)"),
 ];
 
 /// `name`, an argument's or a choice's, as words: `_` and `-` are spaces, and the first letter
@@ -272,7 +289,7 @@ mod tests {
     #[test]
     fn every_built_in_setting_has_a_meaning() {
         let registry = slides_engine::builtin_registry();
-        assert_eq!(registry.names().len(), 8);
+        assert_eq!(registry.names().len(), 9);
         for tag in registry.names() {
             let schema = (registry.get(tag).expect("a built-in").schema)();
             for prop in &schema.props {

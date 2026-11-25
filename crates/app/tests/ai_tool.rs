@@ -174,7 +174,7 @@ fn describe_without_a_talk_lists_every_built_in() {
     assert_eq!(layouts[2]["regions"], serde_json::json!(["title", "left", "right"]));
     assert_eq!(layouts[2]["main"], "left");
 
-    assert_eq!(names(&json, "placement"), ["x", "y", "w", "h", "rotate", "click", "enter", "align"]);
+    assert_eq!(names(&json, "placement"), ["x", "y", "w", "h", "rotate", "click", "enter", "align", "id"]);
     let enter = json["placement"].as_array().unwrap().iter().find(|item| item["name"] == "enter").unwrap();
     assert_eq!(enter["values"], serde_json::json!(["appear", "fade", "fly-up"]));
     assert!(names(&json, "slide_settings").contains(&"transition".to_string()));
@@ -737,4 +737,56 @@ fn nothing_runs_from_the_ai_tool() {
     let output = run(&["check", talk_text], dir.path());
     assert_eq!(output.status.code(), Some(1));
     assert!(text(&output.stdout).contains("The command to run is empty."), "{}", text(&output.stdout));
+}
+
+#[test]
+fn describe_lists_the_button() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = run(&["describe", "--json"], dir.path());
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let button = json["tags"].as_array().unwrap().iter().find(|entry| entry["tag"] == "Button").expect("Button is listed");
+    assert_eq!(button["built_in"], true);
+    let settings = button["settings"].as_array().unwrap();
+    let setting = |name: &str| settings.iter().find(|item| item["name"] == name).unwrap_or_else(|| panic!("no {name}")).clone();
+    assert_eq!(setting("label")["needed"], true);
+    assert_eq!(setting("look")["choices"], serde_json::json!(["primary", "secondary", "quiet"]));
+    assert_eq!(setting("look")["needed"], false);
+    for name in ["run", "in", "do", "on", "value", "step"] {
+        assert_eq!(setting(name)["needed"], false, "{name}");
+    }
+    assert!(settings.iter().all(|item| item["name"] != "id"), "an id is a place's: {settings:?}");
+    let placement: Vec<&str> = json["placement"].as_array().unwrap().iter().map(|item| item["name"].as_str().unwrap()).collect();
+    assert!(placement.contains(&"id"), "{placement:?}");
+}
+
+#[test]
+fn check_reports_what_a_button_names_that_isnt_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let talk = dir.path().join("buttons");
+    std::fs::create_dir_all(&talk).unwrap();
+    let slide = concat!(
+        "# Buttons\n\n",
+        "<Box x=\"900\" y=\"0\" click=\"2\">\n\nLater\n\n</Box>\n\n",
+        "<Button label=\"Type\" run=\"ls\" in=\"t\" x=\"0\" y=\"0\" w=\"300\" h=\"80\" />\n\n",
+        "<Button label=\"Act\" do=\"next\" on=\"m\" x=\"0\" y=\"200\" w=\"300\" h=\"80\" />\n\n",
+        "<Button label=\"Jump\" step=\"9\" x=\"0\" y=\"400\" w=\"300\" h=\"80\" />\n\n",
+        "<Button label=\"Fine\" step=\"2\" x=\"0\" y=\"600\" w=\"300\" h=\"80\" />\n",
+    );
+    std::fs::write(talk.join("slides.md"), slide).unwrap();
+    let output = run(&["check", talk.to_str().unwrap(), "--json"], dir.path());
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output.stderr));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["slides"],
+        serde_json::json!([{
+            "slide": 1,
+            "hidden": false,
+            "problems": [
+                "This button's `in` names no live terminal on this slide.",
+                "This button's `on` names nothing it can act on.",
+                "This button's step is past the slide's last click.",
+            ],
+        }])
+    );
 }

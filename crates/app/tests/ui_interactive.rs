@@ -5,6 +5,9 @@
 //! The interactive thing is a plain box the tests put on a slide, which says what reached it, and,
 //! where it matters, a model.
 
+#[path = "support/typing.rs"]
+mod typing;
+
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -401,4 +404,28 @@ fn a_click_on_a_model_does_not_advance(cx: &mut TestAppContext) {
     assert_eq!(show.counter(cx), "1 / 2", "a click on the model is the model's");
     show.click_slide(cx, BESIDE_IT);
     assert_eq!(show.counter(cx), "2 / 2");
+}
+
+// The Insert tab's Button.
+
+#[gpui_kit::test]
+fn insert_button_adds_a_button_tag_and_selects_it(cx: &mut TestAppContext) {
+    let editor = typing::open(cx, "# One\n\nSome words\n");
+    typing::click_on(&editor, cx, stagepack_studio::ribbon::TAB_INSERT_ID);
+    typing::click_on(&editor, cx, stagepack_studio::insert_tools::INSERT_BUTTON_ID);
+    let source = editor.source(cx);
+    let selected = editor.document(cx).read_with(cx, |document, _| document.selected().map(|selected| selected.source.clone()));
+    let selected = selected.expect("the new button is selected");
+    let written = &source[selected];
+    assert!(written.starts_with("<Button label=\"Button\" step=\"0\" x=\""), "{written}");
+    assert!(written.ends_with(" w=\"320\" h=\"96\" />"), "{written}");
+    assert!(source.starts_with("# One\n\nSome words\n\n<Button "), "it goes after the slide's content: {source}");
+    let (undo, notices) = editor.document(cx).update(cx, |document, _| (document.undo_label(), document.notices()));
+    assert_eq!(undo, Some("Insert button"));
+    assert!(notices.is_empty(), "a new button has nothing wrong with it: {notices:?}");
+    let name = editor.document(cx).read_with(cx, |document, _| {
+        let selected = document.selected().unwrap();
+        stagepack_studio::selection::name_of(document.talk(), selected.slide, &selected.source)
+    });
+    assert_eq!(name.as_deref(), Some("Button"));
 }

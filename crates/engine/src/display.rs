@@ -49,6 +49,10 @@ pub struct LayerSpec {
     pub model: Option<ModelOn>,
     /// The terminal recording this layer is the last screen of, which plays over it when asked.
     pub terminal: Option<TerminalOn>,
+    /// The button this layer draws, which a press in the show acts on.
+    pub button: Option<ButtonOn>,
+    /// The `id` its tag gives, by which a button names it: none for a region, or a tag that gives none.
+    pub id: Option<String>,
 }
 
 /// A video among a slide's layers: the place of its layer among them, where its tag is written,
@@ -94,6 +98,8 @@ pub struct ModelLayer {
     pub layer: usize,
     pub source: Option<Range<usize>>,
     pub click: Option<u32>,
+    /// The `id` its tag gives.
+    pub id: Option<String>,
     pub on: ModelOn,
 }
 
@@ -117,6 +123,8 @@ pub struct TerminalLayer {
     pub layer: usize,
     pub source: Option<Range<usize>>,
     pub click: Option<u32>,
+    /// The `id` its tag gives, by which a button's `in` names it.
+    pub id: Option<String>,
     pub on: TerminalOn,
 }
 
@@ -147,4 +155,61 @@ impl PartialEq for TerminalOn {
     fn eq(&self, other: &TerminalOn) -> bool {
         (&self.src, &self.run, self.cols, self.rows, self.rect, self.rotate, self.stops) == (&other.src, &other.run, other.cols, other.rows, other.rect, other.rotate, other.stops)
     }
+}
+
+/// A button among a slide's layers: the place of its layer among them, where its tag is written,
+/// the click it appears on, and what it is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ButtonLayer {
+    pub layer: usize,
+    pub source: Range<usize>,
+    pub click: Option<u32>,
+    pub on: ButtonOn,
+}
+
+/// A button on a slide: the words on it, how it looks, what pressing it does, or why it does
+/// nothing, its own `id`, and where it is, as its layer is placed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ButtonOn {
+    pub label: String,
+    pub look: ButtonLook,
+    pub action: Result<ButtonAction, ButtonFault>,
+    pub id: Option<String>,
+    pub rect: Rect,
+    pub rotate: f32,
+}
+
+/// What pressing a button does: one of these, as its attributes say.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ButtonAction {
+    /// Types `text`, then Enter, into the live terminal on the slide whose `id` is `terminal`.
+    Run { text: String, terminal: String },
+    /// Sends the action `action`, with `value`, empty if it gives none, to the interactive thing
+    /// on the slide whose `id` is `target`.
+    Do { action: String, target: String, value: String },
+    /// Goes to this click step of the slide.
+    Step(u32),
+}
+
+/// Why a button does nothing when it's pressed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ButtonFault {
+    /// It gives none of `run`, `do` and `step`.
+    NoAction,
+    /// It gives more than one of them.
+    ManyActions,
+    /// Its `step` isn't a whole number from 0.
+    BadStep,
+}
+
+/// How a button looks, coloured from the theme.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ButtonLook {
+    /// Filled with the accent colour.
+    #[default]
+    Primary,
+    /// Tinted with the accent colour.
+    Secondary,
+    /// Barely tinted, with the text colour.
+    Quiet,
 }

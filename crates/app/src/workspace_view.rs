@@ -31,7 +31,7 @@ use crate::document::{Document, EditRefused, OpenProblem, Reload, SLIDES_FILE, T
 use crate::export::{self, ExportKind, stagepack_executable};
 use crate::icon_picker::{self, IconPicked, IconPicker};
 use crate::palette::InsertComponent;
-use crate::insert_tools::{InsertModel, InsertPicture, InsertShape, InsertTerminal, InsertTextBox, InsertVideo};
+use crate::insert_tools::{InsertButton, InsertModel, InsertPicture, InsertShape, InsertTerminal, InsertTextBox, InsertVideo};
 use crate::layout_picker::SetLayout;
 use crate::inspector::{self, Inspector};
 use crate::markdown_panel::MarkdownPanel;
@@ -2147,6 +2147,10 @@ impl Render for WorkspaceView {
                 this.keyboard_to_the_slide(window, cx);
             }))
             .on_action(cx.listener(|this, _: &InsertTextBox, _, cx| this.insert_text_box(cx)))
+            .on_action(cx.listener(|this, _: &InsertButton, window, cx| {
+                this.edit(Document::insert_button, cx);
+                this.keyboard_to_the_slide(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &TableRowAbove, _, cx| this.edit(|document| document.add_row(false), cx)))
             .on_action(cx.listener(|this, _: &TableRowBelow, _, cx| this.edit(|document| document.add_row(true), cx)))
             .on_action(cx.listener(|this, _: &TableColumnLeft, _, cx| this.edit(|document| document.add_column(false), cx)))

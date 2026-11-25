@@ -457,8 +457,9 @@ impl Presentation {
         let Some((source, _)) = self.pressed.take_if(|(_, began)| *began == window) else { return };
         let Some(thing) = over.filter(|thing| thing.source == source) else { return };
         match thing.kind {
-            // A terminal took the keys as it was pressed, and a model turns as it's dragged.
-            InteractiveKind::Terminal(_) | InteractiveKind::Model(_) => {}
+            // A terminal took the keys as it was pressed, and a model turns as it's dragged. A
+            // button does nothing yet: it's let go of here once it acts.
+            InteractiveKind::Terminal(_) | InteractiveKind::Model(_) | InteractiveKind::Button => {}
             #[cfg(feature = "test-hooks")]
             InteractiveKind::StandIn => self.stand_in_presses.push(StandInPress::Up(window)),
         }
@@ -500,6 +501,7 @@ impl Presentation {
             rect: *rect,
             rotate: 0.0,
             kind: InteractiveKind::StandIn,
+            id: None,
         })
     }
 }

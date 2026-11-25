@@ -475,6 +475,8 @@ mod tests {
             video: None,
             model: None,
             terminal: None,
+            button: None,
+            id: None,
         };
         let pkg: SharedPackage = Rc::new(RefCell::new(Package::default()));
         let mut media = MediaStore::default();

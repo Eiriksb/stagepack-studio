@@ -87,7 +87,7 @@ fn problem_line(problem: &Diagnostic) -> String {
 }
 
 /// What's wrong with slide `index` (from 0), in the order the window tells it: its parse error,
-/// what laying it out says of it (its parse error is the first), then what's wrong with each video, model and terminal on it.
+/// what laying it out says of it (its parse error is the first), then what's wrong with each video, model, terminal and button on it.
 /// Nothing is built. A slide that can't be laid out gives one sentence saying so.
 pub fn slide_problems(talk: &mut OpenTalk, index: usize) -> Vec<String> {
     let deck = &mut talk.deck;
@@ -103,6 +103,7 @@ pub fn slide_problems(talk: &mut OpenTalk, index: usize) -> Vec<String> {
             let problem = match name.as_str() {
                 "Video" => deck.video_problem(index, &range),
                 "Model" => deck.model_problem(index, &range),
+                "Button" => deck.button_problem(index, &range),
                 _ => deck.terminal_problem(index, &range),
             };
             problems.extend(problem);
@@ -122,11 +123,11 @@ pub fn slide_problems(talk: &mut OpenTalk, index: usize) -> Vec<String> {
     found.unwrap_or_else(|_| vec![COULDNT_LAY_OUT.to_string()])
 }
 
-/// The `<Video>`, `<Model>` and `<Terminal>` tags among `blocks`, at any depth, with where each is.
+/// The `<Video>`, `<Model>`, `<Terminal>` and `<Button>` tags among `blocks`, at any depth, with where each is.
 fn tags_on(blocks: &[Block], found: &mut Vec<(String, std::ops::Range<usize>)>) {
     for block in blocks {
         if let Block::Tag(tag) = block {
-            if matches!(tag.name.as_str(), "Video" | "Model" | "Terminal") {
+            if matches!(tag.name.as_str(), "Video" | "Model" | "Terminal" | "Button") {
                 found.push((tag.name.clone(), tag.range.clone()));
             }
             tags_on(&tag.children, found);

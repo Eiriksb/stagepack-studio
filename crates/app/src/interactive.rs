@@ -14,6 +14,8 @@ use crate::model_view::inside_turned;
 /// What an interactive thing is.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum InteractiveKind {
+    /// A button, which acts when it's pressed and let go of over it.
+    Button,
     /// A terminal that runs a command: it takes the keys while it runs.
     Terminal(LiveId),
     /// A model, by the place of its layer among the slide's: a drag turns it, the wheel zooms it.
@@ -24,13 +26,14 @@ pub(crate) enum InteractiveKind {
 }
 
 /// An interactive thing on a slide, in slide units: where its tag is written, where it is, turned by
-/// `rotate` degrees, and what it is.
+/// `rotate` degrees, what it is, and the `id` its tag gives, by which a button names it.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct InteractiveThing {
     pub source: Range<usize>,
     pub rect: Rect,
     pub rotate: f32,
     pub kind: InteractiveKind,
+    pub id: Option<String>,
 }
 
 /// The interactive thing at `at`, in slide units, among `things`, which are in the order they're
@@ -45,14 +48,18 @@ pub(crate) fn interactive_on(document: &mut Document, slide: usize, moment: Mome
     let shown = |click: Option<u32>| click.is_none_or(|click| click <= moment.step);
     let terminals = document.terminals_at(slide, moment).into_iter().filter(|terminal| shown(terminal.click)).filter_map(|terminal| {
         let source = terminal.source?;
-        let id = LiveId::new(source.clone(), terminal.on.run?);
-        Some((terminal.layer, InteractiveThing { source, rect: terminal.on.rect, rotate: terminal.on.rotate, kind: InteractiveKind::Terminal(id) }))
+        let live = LiveId::new(source.clone(), terminal.on.run?);
+        Some((terminal.layer, InteractiveThing { source, rect: terminal.on.rect, rotate: terminal.on.rotate, kind: InteractiveKind::Terminal(live), id: terminal.id }))
     });
     let models = document.models_at(slide, moment).into_iter().filter(|model| shown(model.click)).filter_map(|model| {
         let source = model.source?;
-        Some((model.layer, InteractiveThing { source, rect: model.on.rect, rotate: model.on.rotate, kind: InteractiveKind::Model(model.layer) }))
+        Some((model.layer, InteractiveThing { source, rect: model.on.rect, rotate: model.on.rotate, kind: InteractiveKind::Model(model.layer), id: model.id }))
     });
-    let mut things: Vec<(usize, InteractiveThing)> = terminals.chain(models).collect();
+    let buttons = document.buttons_at(slide, moment).into_iter().filter(|button| shown(button.click)).map(|button| {
+        let on = button.on;
+        (button.layer, InteractiveThing { source: button.source, rect: on.rect, rotate: on.rotate, kind: InteractiveKind::Button, id: on.id })
+    });
+    let mut things: Vec<(usize, InteractiveThing)> = terminals.chain(models).chain(buttons).collect();
     things.sort_by_key(|(layer, _)| *layer);
     things.into_iter().map(|(_, thing)| thing).collect()
 }

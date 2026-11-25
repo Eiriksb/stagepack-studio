@@ -1,4 +1,4 @@
-//! The Insert tab's tools: Picture, Video, Model, Terminal recording, the Shapes list, Text box, Icon, Table and Component. What
+//! The Insert tab's tools: Picture, Video, Model, Terminal recording, the Shapes list, Text box, Button, Icon, Table and Component. What
 //! they put on the slide is [`crate::insert`]'s and [`crate::document::Document`]'s; the window
 //! does what they ask. Icon opens the [`IconPicker`], whose pick the window hears of, Table the
 //! [`TableGrid`], whose square clicked asks for a table that size, and Component the
@@ -26,6 +26,8 @@ pub const INSERT_TERMINAL_ID: &str = "insert-terminal";
 /// The Shapes button, which lists the shapes.
 pub const INSERT_SHAPES_ID: &str = "insert-shapes";
 pub const INSERT_TEXT_BOX_ID: &str = "insert-text-box";
+/// The Button tool, which puts a button on the slide.
+pub const INSERT_BUTTON_ID: &str = "insert-button";
 /// The Icon tool, which opens the icon picker.
 pub const INSERT_ICON_ID: &str = "insert-icon";
 /// The Table tool, which opens the grid of table sizes.
@@ -33,7 +35,7 @@ pub const INSERT_TABLE_ID: &str = "insert-table";
 /// The Component tool, which opens the list of components.
 pub const INSERT_COMPONENT_ID: &str = "insert-component";
 
-actions!(insert_tools, [InsertPicture, InsertVideo, InsertModel, InsertTerminal, InsertTextBox]);
+actions!(insert_tools, [InsertPicture, InsertVideo, InsertModel, InsertTerminal, InsertTextBox, InsertButton]);
 
 /// Puts a shape of kind `kind`, the talk's name for it, on the slide.
 #[derive(Clone, PartialEq, Debug, Action)]
@@ -136,6 +138,11 @@ pub fn insert_tab(
                     .tooltip("Put a box to type in on the slide")
                     .disabled(!has_talk)
                     .on_click(|_, window, cx| window.dispatch_action(InsertTextBox.boxed_clone(), cx))
+                    .into_any_element(),
+                tool(INSERT_BUTTON_ID, Icons::MousePointerClick, "Button")
+                    .tooltip("Put a button on the slide, which does something when it's pressed in the show")
+                    .disabled(!has_talk)
+                    .on_click(|_, window, cx| window.dispatch_action(InsertButton.boxed_clone(), cx))
                     .into_any_element(),
             ],
             cx,

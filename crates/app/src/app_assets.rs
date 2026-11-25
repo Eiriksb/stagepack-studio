@@ -12,7 +12,7 @@ icon_assets!(
         TextAlignCenter, TextAlignEnd, ImagePlus, Shapes, RectangleHorizontal, SquareRoundCorner, Circle, Minus,
         MoveRight, MessageSquare, TextCursorInput, Star, Table, BetweenHorizontalStart, BetweenHorizontalEnd,
         BetweenVerticalStart, BetweenVerticalEnd, Blocks, BringToFront, Film, CopyCheck, Sparkles, StepBack, StepForward,
-        ListStart, LayoutTemplate, Video, Box, SquareTerminal,
+        ListStart, LayoutTemplate, Video, Box, SquareTerminal, MousePointerClick,
     ]
 );
 

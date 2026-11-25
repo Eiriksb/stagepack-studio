@@ -7,7 +7,7 @@ const RED: Color = Color { r: 255, g: 0, b: 0, a: 255 };
 
 fn square_layer(rotate: f32) -> LayerSpec {
     let path = PathBuilder::from_rect(tiny_skia::Rect::from_xywh(0.0, 0.0, 100.0, 100.0).unwrap());
-    LayerSpec { source: None, rect: Rect { x: 200.0, y: 100.0, w: 100.0, h: 100.0 }, rotate, items: vec![DisplayItem::Fill { path, color: RED }].into(), click: None, enter: Enter::Appear, native: Vec::new(), is_title: false, varies: false, video: None, model: None, terminal: None }
+    LayerSpec { source: None, rect: Rect { x: 200.0, y: 100.0, w: 100.0, h: 100.0 }, rotate, items: vec![DisplayItem::Fill { path, color: RED }].into(), click: None, enter: Enter::Appear, native: Vec::new(), is_title: false, varies: false, video: None, model: None, terminal: None, button: None, id: None }
 }
 
 #[test]
@@ -37,7 +37,7 @@ fn square(x: f32, y: f32) -> tiny_skia::Path {
 }
 
 fn layer_of(rect: Rect, rotate: f32, item: DisplayItem) -> LayerSpec {
-    LayerSpec { source: None, rect, rotate, items: vec![item].into(), click: None, enter: Enter::Appear, native: Vec::new(), is_title: false, varies: false, video: None, model: None, terminal: None }
+    LayerSpec { source: None, rect, rotate, items: vec![item].into(), click: None, enter: Enter::Appear, native: Vec::new(), is_title: false, varies: false, video: None, model: None, terminal: None, button: None, id: None }
 }
 
 fn is_red(layer: &Layer, x: u32, y: u32) -> bool {

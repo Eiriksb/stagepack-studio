@@ -209,7 +209,7 @@ pub fn name_of(talk: &Talk, slide: usize, range: &Range<usize>) -> Option<String
         Block::Tag(tag) if is_placed_box(tag) && matches!(tag.children.as_slice(), [Block::Table { .. }]) => "Table in a box".to_string(),
         Block::Tag(tag) if is_placed_box(tag) && matches!(tag.children.as_slice(), [Block::Picture { .. }]) => "Picture in a box".to_string(),
         Block::Tag(tag) => match tag.name.as_str() {
-            "Picture" | "Shape" | "Icon" | "Table" | "Chart" => tag.name.clone(),
+            "Picture" | "Shape" | "Icon" | "Table" | "Chart" | "Button" => tag.name.clone(),
             // Text boxes, as the Insert tab and the format name them.
             "Text" | "Box" => "Text box".to_string(),
             // As the Insert tab names it.

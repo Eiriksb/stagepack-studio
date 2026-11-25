@@ -13,16 +13,18 @@ use crate::placeholder::placeholder_items;
 use crate::text_geometry::{LayerText, RegionBox};
 use crate::{
     Align, ComponentAsks, DisplayItem, Enter, Fonts, LayerSpec, LayoutDef, Moment, Notice, PictureCache, Rect, RegionDef, TalkComponents, TalkFiles, TextRun,
-    Transition, VideoOn, ModelOn, TerminalOn, layout_by_name, shape_text,
+    Transition, VideoOn, ModelOn, TerminalOn, ButtonAction, ButtonOn, layout_by_name, shape_text,
 };
+use crate::builtins::{BUTTON_IN_NOTHING, BUTTON_ON_NOTHING, BUTTON_STEP_PAST, BUTTON_TAG, button_fault_notice, read_button_action, read_button_look};
 use crate::terminal_screen::{LaidTerminal, TERMINAL_TAG, lay_out_terminal, read_terminal};
 
 /// How wide and high a slide is, in slide units.
 pub const SLIDE_WIDTH: f32 = 1920.0;
 pub const SLIDE_HEIGHT: f32 = 1080.0;
 
-/// The attributes that place a component, which it doesn't see as props.
-pub const PLACEMENT_ATTRS: [&str; 8] = ["x", "y", "w", "h", "rotate", "click", "enter", "align"];
+/// The attributes that place a component, which it doesn't see as props. `id` names it, so that
+/// a button can act on it.
+pub const PLACEMENT_ATTRS: [&str; 9] = ["x", "y", "w", "h", "rotate", "click", "enter", "align", "id"];
 
 // The most a talk can ask for in a place on the slide, so one line of a settings block
 // can't make a layer that needs gigabytes.
@@ -241,6 +243,8 @@ pub(crate) fn layout_slide_placed(talk: &Talk, index: usize, env: &mut LayoutEnv
                             video: None,
                             model: None,
                             terminal: None,
+                            button: None,
+                            id: None,
                         });
                         texts.push(LayerText { region: Some((region.name, rect)), ..piece.text });
                     }
@@ -251,7 +255,7 @@ pub(crate) fn layout_slide_placed(talk: &Talk, index: usize, env: &mut LayoutEnv
         }
         let (drawing, varies) = noting_asks(env, |env| flow_region(blocks, region, rect.w, &theme, env, &mut notices));
         let (items, native) = (drawing.items, drawing.native);
-        layers.push(LayerSpec { source: Some(source), rect, rotate, items: items.into(), click, enter: timing.enter, native, is_title, varies, video: None, model: None, terminal: None });
+        layers.push(LayerSpec { source: Some(source), rect, rotate, items: items.into(), click, enter: timing.enter, native, is_title, varies, video: None, model: None, terminal: None, button: None, id: None });
         texts.push(LayerText { region: Some((region.name, rect)), ..drawing.text });
     }
     for block in &slide.blocks {
@@ -265,6 +269,7 @@ pub(crate) fn layout_slide_placed(talk: &Talk, index: usize, env: &mut LayoutEnv
             texts.push(LayerText { whole: true, ..text });
         }
     }
+    named_notices(&layers, steps_of(&layers, env.asks.steps), &mut notices);
     let notices = notices.into_iter().map(|notice| Notice(shortened(&notice.0, MAX_NOTICE_CHARS))).collect();
     LaidOutSlide { layers, notices, transition, asks: std::mem::take(&mut env.asks), texts, empty_regions, regions, each_steps, each_regions }
 }
@@ -311,6 +316,8 @@ struct TagPlace {
     align: Option<Align>,
     click: Option<u32>,
     enter: Enter,
+    /// The `id` it gives, by which a button names it, if it gives one that isn't blank.
+    id: Option<String>,
     /// What was wrong with the `click`, `enter` and `align` it gave.
     notices: Vec<Notice>,
 }
@@ -332,6 +339,7 @@ impl TagPlace {
             align: tag.attr("align").and_then(|value| read_align(value, &format!("The {} box", tag.name), &mut notices)),
             click,
             enter,
+            id: tag.attr("id").map(str::trim).filter(|id| !id.is_empty()).map(str::to_string),
             notices,
         }
     }
@@ -369,6 +377,14 @@ fn positioned_layer(tag: &Tag, placing: Option<&Placing>, theme: &Theme, env: &m
         rect,
         rotate,
     });
+    let button = (tag.name == BUTTON_TAG).then(|| {
+        let action = read_button_action(tag);
+        if let Err(fault) = action {
+            add_notice(notices, button_fault_notice(fault).to_string());
+        }
+        let (look, _) = read_button_look(tag.attr("look"));
+        ButtonOn { label: tag.attr("label").unwrap_or_default().to_string(), look, action, id: place.id.clone(), rect, rotate }
+    });
     let model = (tag.name == MODEL_TAG).then(|| {
         let (views, left_out) = model_views(tag.attr("views"));
         if left_out {
@@ -396,6 +412,8 @@ fn positioned_layer(tag: &Tag, placing: Option<&Placing>, theme: &Theme, env: &m
         video,
         model,
         terminal: None,
+        button,
+        id: place.id.clone(),
     };
     (layer, drawing.text)
 }
@@ -424,6 +442,50 @@ fn terminal_layer(tag: &Tag, place: &TagPlace, placing: bool, theme: &Theme, env
         video: None,
         model: None,
         terminal: Some(TerminalOn { src: written.src, run: written.run, cols: written.cols, rows: written.rows, rect, rotate, stops, pending }),
+        button: None,
+        id: place.id.clone(),
+    }
+}
+
+/// The steps a slide of `layers` takes: as far as any of them appears, a model's views and a
+/// terminal recording's stops go on from where it appears, and `stepped` are those its components
+/// step through.
+pub(crate) fn steps_of(layers: &[LayerSpec], stepped: u32) -> u32 {
+    let views = layers.iter().filter_map(|spec| Some(spec.click.unwrap_or(0) + spec.model.as_ref()?.views.len() as u32));
+    let stops = layers.iter().filter_map(|spec| Some(spec.click.unwrap_or(0).saturating_add(spec.terminal.as_ref()?.stops.min(MAX_CLICK as usize) as u32)));
+    let clicks = layers.iter().filter_map(|spec| spec.click).chain(views).chain(stops).max().unwrap_or(0);
+    clicks.max(stepped).min(MAX_CLICK)
+}
+
+/// What's said of what the slide's `layers` name by `id`: each `id` given twice, and what's wrong
+/// with what each button names, on a slide of `steps` steps.
+fn named_notices(layers: &[LayerSpec], steps: u32, notices: &mut Vec<Notice>) {
+    let ids: Vec<&str> = layers.iter().filter_map(|spec| spec.id.as_deref()).collect();
+    for (at, id) in ids.iter().enumerate() {
+        if ids[..at].contains(id) {
+            add_notice(notices, format!("Two things on this slide have the id \"{id}\"."));
+        }
+    }
+    for on in layers.iter().filter_map(|spec| spec.button.as_ref()) {
+        if let Some(problem) = button_target_problem(on, layers, steps) {
+            add_notice(notices, problem.to_string());
+        }
+    }
+}
+
+/// What's wrong with what the button `on` names, among the slide's `layers`, on a slide of
+/// `steps` steps: a live terminal its `in` doesn't name, a thing its `on` doesn't, or a step past
+/// the last. Why it does nothing at all is said apart.
+pub(crate) fn button_target_problem(on: &ButtonOn, layers: &[LayerSpec], steps: u32) -> Option<&'static str> {
+    match on.action.as_ref().ok()? {
+        ButtonAction::Run { terminal, .. } => {
+            let live = |spec: &LayerSpec| spec.id.as_deref() == Some(terminal.as_str()) && spec.terminal.as_ref().is_some_and(|on| on.run.is_some());
+            (!layers.iter().any(live)).then_some(BUTTON_IN_NOTHING)
+        }
+        // Nothing on a slide takes an action yet: a talk's own component will, once it can say
+        // it's interactive.
+        ButtonAction::Do { .. } => Some(BUTTON_ON_NOTHING),
+        ButtonAction::Step(step) => (*step > steps).then_some(BUTTON_STEP_PAST),
     }
 }
 
@@ -630,6 +692,8 @@ pub(crate) fn empty_region_layer(region: &EmptyRegion, theme: &Theme, fonts: &mu
         video: None,
         model: None,
         terminal: None,
+        button: None,
+        id: None,
     }
 }
 
@@ -649,6 +713,8 @@ fn error_layer(slide: &Slide, message: &str, theme: &Theme, fonts: &mut Fonts) -
         video: None,
         model: None,
         terminal: None,
+        button: None,
+        id: None,
     }
 }
 
@@ -743,6 +809,8 @@ fn background(theme: &Theme) -> LayerSpec {
         video: None,
         model: None,
         terminal: None,
+        button: None,
+        id: None,
     }
 }
 

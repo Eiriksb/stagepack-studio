@@ -18,7 +18,7 @@ mod terminal_screen;
 mod text;
 mod text_geometry;
 mod timeline;
-pub use builtins::builtin_registry;
+pub use builtins::{BUTTON_IN_NOTHING, BUTTON_IN_TEXT, BUTTON_MANY_ACTIONS, BUTTON_NO_ACTION, BUTTON_ON_NOTHING, BUTTON_STEP_PAST, BUTTON_TAG, builtin_registry, button_fault_notice};
 pub use chart::ChartKind;
 /// The chart's workings, for its tests.
 #[doc(hidden)]

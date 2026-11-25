@@ -247,6 +247,30 @@ Look here.
 <Terminal run="bash" src="assets/run.cast" cols="100" rows="30" x="460" y="300" w="1000" h="560" />
 ```
 
+### Buttons
+
+`<Button>` is a button the owner presses in the show. Give it a `label` and exactly one action: `step="N"` goes straight to click N of its slide (0 to the slide's last click); `run="…"` with `in="<id>"` types that text, then Enter, into the live terminal on the same slide whose `id` it names; `do="<action>"` with `on="<id>"`, and an optional `value`, sends an action to an interactive thing on the slide. `look` is `primary` (the default), `secondary` or `quiet`. Any placed tag can take an `id`, which is how a button names it; no two things on a slide may share one. As with a live terminal, this tool never types anything: the owner is asked before a button's text is typed.
+
+```markdown
+# Press to go on
+
+<Box x="360" y="300" w="1200" h="200" click="1">
+
+The second half
+
+</Box>
+
+<Button label="Show the rest" step="1" x="810" y="700" w="300" h="96" />
+```
+
+```markdown
+# A button for the terminal
+
+<Terminal id="shell" run="bash" src="assets/run.cast" x="460" y="200" w="1000" h="560" />
+
+<Button label="List the files" run="ls" in="shell" look="secondary" x="810" y="820" w="300" h="96" />
+```
+
 `<Chart>` draws `kind` `bar`, `line` or `pie`. Give `labels` and `values` set apart by commas, with one value for each label, or `data` naming a CSV file in the talk whose first column holds labels and whose other columns are series:
 
 ```markdown

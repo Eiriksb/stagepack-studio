@@ -32,6 +32,13 @@ pub const INSERT_COMPONENT: &str = "Insert component";
 pub const INSERT_VIDEO: &str = "Insert video";
 pub const INSERT_MODEL: &str = "Insert 3D model";
 pub const INSERT_TERMINAL: &str = "Insert terminal recording";
+pub const INSERT_BUTTON: &str = "Insert button";
+
+/// What a new button is written with: words on it, and an action every slide has, so that
+/// nothing's wrong with it until it's given its own.
+pub const NEW_BUTTON: [(&str, &str); 2] = [("label", "Button"), ("step", "0")];
+/// The size of a new button.
+pub const BUTTON_SIZE: (f32, f32) = (320.0, 96.0);
 
 /// How big a new icon is, as its `size` is written: its width and its height.
 pub const ICON_SIZE: &str = "128";

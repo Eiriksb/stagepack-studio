@@ -17,7 +17,13 @@ use crate::pictures::{ModelStill, Still, icon_pixmap, model_still_size};
 use crate::slide::{ALIGN_UNPLACED, MAX_SIZE, SLIDE_HEIGHT, SLIDE_WIDTH, is_positioned, placeholder_color};
 use crate::native::Semantic;
 use crate::talk_components::{Rendered, read_asset};
+use crate::builtins::{BUTTON_IN_TEXT, BUTTON_TAG, button_colours, read_button_look};
 use crate::{Align, DisplayItem, LayoutEnv, NativeContent, Notice, PLACEMENT_ATTRS, PathStep, RegionDef, layout_by_name};
+
+/// How far a button's label is kept from its edge, across and down, in slide units.
+const BUTTON_PADDING: (f32, f32) = (16.0, 10.0);
+/// How round a button's corners are, in slide units.
+const BUTTON_RADIUS: f32 = 8.0;
 
 /// The tag of a video on a slide.
 pub(crate) const VIDEO_TAG: &str = "Video";
@@ -172,6 +178,8 @@ pub(crate) fn lay_out_positioned_tag(
     } else if tag.name == MODEL_TAG {
         let (w, h) = box_size(wanted, Some(MODEL_ROOM));
         (Some(MODEL_ROOM), Some(flow.model(tag, Some((w, h)))))
+    } else if tag.name == BUTTON_TAG {
+        (None, Some(flow.button(tag, true)))
     } else {
         let element = flow.render_tag(tag, room);
         let natural = element.as_ref().and_then(|element| flow.natural_size(element));
@@ -264,6 +272,10 @@ impl Flow<'_, '_> {
         if tag.name == MODEL_TAG {
             self.notice(MODEL_IN_TEXT.to_string());
             return Some(self.model(tag, None));
+        }
+        if tag.name == BUTTON_TAG {
+            self.notice(BUTTON_IN_TEXT.to_string());
+            return Some(self.button(tag, false));
         }
         if tag.name == crate::terminal_screen::TERMINAL_TAG {
             self.notice(crate::TERMINAL_IN_TEXT.to_string());
@@ -403,6 +415,27 @@ impl Flow<'_, '_> {
                 self.placeholder(src.to_string(), size_when_empty(width, height, boxed))
             }
         }
+    }
+
+    /// A button: its label in the middle of a rounded box, 16 across and 10 down from its edge,
+    /// coloured from the theme for its look. `boxed` says it fills a box of a known size.
+    fn button(&mut self, tag: &Tag, boxed: bool) -> NodeId {
+        let (look, problem) = read_button_look(tag.attr("look"));
+        if let Some(problem) = problem {
+            self.notice(problem);
+        }
+        let (fill, words) = button_colours(look, self.theme);
+        let label = self.plain_text(tag.attr("label").unwrap_or_default(), None, false, Some(words), Align::Center);
+        let style = Style {
+            size: size_of(0.0, 0.0, boxed),
+            flex_direction: FlexDirection::Column,
+            justify_content: JustifyContent::CENTER,
+            align_items: AlignItems::CENTER,
+            padding: taffy::Rect { left: length(BUTTON_PADDING.0), right: length(BUTTON_PADDING.0), top: length(BUTTON_PADDING.1), bottom: length(BUTTON_PADDING.1) },
+            ..Style::default()
+        };
+        let look = ShapeLook { kind: ShapeKind::Rounded, fill: Some(fill), outline: None, outline_width: 0.0, radius: BUTTON_RADIUS, centered: true };
+        self.node_with_content(style, &[label], Content::Shape(look))
     }
 
     /// A video's still: the picture its `poster` names, if that can be read, or else its first

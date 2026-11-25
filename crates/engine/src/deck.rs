@@ -19,7 +19,7 @@ use crate::timeline::MAX_CLICK;
 use crate::render::device_offset;
 use crate::{
     ComponentAsks, ComponentInfo, DisplayItem, Fonts, Layer, LayerSpec, LayerTiming, LayoutEnv, Moment, MadeStill, PictureCache, Placing,
-    SlideTimeline, SchemaLoad, MeasureVideo, StillJob, StillWanted, TalkComponents, TalkFiles, TerminalLayer, Transition, VideoLayer, DrawModel, ModelLayer, builtin_registry, compose, render_layer, talk_theme,
+    SlideTimeline, SchemaLoad, ButtonLayer, MeasureVideo, StillJob, StillWanted, TalkComponents, TalkFiles, TerminalLayer, Transition, VideoLayer, DrawModel, ModelLayer, builtin_registry, compose, render_layer, talk_theme,
 };
 
 /// How many scales of one slide are kept drawn. A zoom or a resize asks for many in a row.
@@ -141,10 +141,7 @@ impl Laid {
     /// its views, after the click it appears on, and a terminal recording one for each of its
     /// stops.
     fn steps(&self) -> u32 {
-        let views = self.specs.iter().filter_map(|spec| Some(spec.click.unwrap_or(0) + spec.model.as_ref()?.views.len() as u32));
-        let stops = self.specs.iter().filter_map(|spec| Some(spec.click.unwrap_or(0).saturating_add(spec.terminal.as_ref()?.stops.min(MAX_CLICK as usize) as u32)));
-        let clicks = self.specs.iter().filter_map(|spec| spec.click).chain(views).chain(stops).max().unwrap_or(0);
-        clicks.max(self.asks.steps).min(MAX_CLICK)
+        crate::slide::steps_of(&self.specs, self.asks.steps)
     }
 }
 
@@ -912,6 +909,31 @@ impl Deck {
         }
         let moment = self.ensure_laid_at(index, moment);
         models_of(&self.slides[index].laid_at(moment).specs)
+    }
+
+    /// The buttons on slide `index` at `moment`, among its layers as `layers_at` gives them then.
+    pub fn buttons_at(&mut self, index: usize, moment: Moment) -> Vec<ButtonLayer> {
+        if index >= self.slides.len() {
+            return Vec::new();
+        }
+        let moment = self.ensure_laid_at(index, moment);
+        buttons_of(&self.slides[index].laid_at(moment).specs)
+    }
+
+    /// The plain sentence saying why the button at `source` on slide `index` does nothing, or
+    /// what it names that isn't there, if it's a button and either is so. It's among the slide's
+    /// notices too.
+    pub fn button_problem(&mut self, index: usize, source: &std::ops::Range<usize>) -> Option<String> {
+        if index >= self.slides.len() {
+            return None;
+        }
+        let moment = self.ensure_whole(index);
+        let laid = self.slides[index].laid_at(moment);
+        let on = laid.specs.iter().find(|spec| spec.source.as_ref() == Some(source))?.button.as_ref()?;
+        match &on.action {
+            Err(fault) => Some(crate::button_fault_notice(*fault).to_string()),
+            Ok(_) => crate::slide::button_target_problem(on, &laid.specs, laid.steps()).map(str::to_string),
+        }
     }
 
     /// Whether the video `src`, with the still `poster` names if it names one, is drawn as a
@@ -1787,7 +1809,7 @@ fn terminals_of(specs: &[LayerSpec]) -> Vec<TerminalLayer> {
     specs
         .iter()
         .enumerate()
-        .filter_map(|(layer, spec)| Some(TerminalLayer { layer, source: spec.source.clone(), click: spec.click, on: spec.terminal.clone()? }))
+        .filter_map(|(layer, spec)| Some(TerminalLayer { layer, source: spec.source.clone(), click: spec.click, id: spec.id.clone(), on: spec.terminal.clone()? }))
         .collect()
 }
 
@@ -1796,7 +1818,16 @@ fn models_of(specs: &[LayerSpec]) -> Vec<ModelLayer> {
     specs
         .iter()
         .enumerate()
-        .filter_map(|(layer, spec)| Some(ModelLayer { layer, source: spec.source.clone(), click: spec.click, on: spec.model.clone()? }))
+        .filter_map(|(layer, spec)| Some(ModelLayer { layer, source: spec.source.clone(), click: spec.click, id: spec.id.clone(), on: spec.model.clone()? }))
+        .collect()
+}
+
+/// The buttons among `specs`.
+fn buttons_of(specs: &[LayerSpec]) -> Vec<ButtonLayer> {
+    specs
+        .iter()
+        .enumerate()
+        .filter_map(|(layer, spec)| Some(ButtonLayer { layer, source: spec.source.clone()?, click: spec.click, on: spec.button.clone()? }))
         .collect()
 }
 
@@ -1878,6 +1909,8 @@ mod tests {
             video: None,
             model: None,
             terminal: Some(terminal),
+            button: None,
+            id: None,
         };
         let (one, two) = (FileVersion::Hash(1), FileVersion::Hash(2));
         assert_eq!(drawing_fingerprint(&spec, Some(&one)), drawing_fingerprint(&spec, Some(&one)));
