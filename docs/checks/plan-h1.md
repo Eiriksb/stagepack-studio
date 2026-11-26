@@ -26,6 +26,21 @@ A slide can answer clicks in the show, and a talk's own component can keep a sta
 - `a_big_talk_is_checked_quickly` and `a_picture_of_a_model_ends_cleanly_and_soon` (`ai_tool`) failed once in the full run at 116 s and passed in the run of `ai_tool` alone (31 passed in 2.9 s).
 - `builds`, run with the bundle: 2 passed, after the example talk's 6 components were counted.
 
+- The last `scripts/test-all.sh --quick` of Task 7 was not clean from one end to the other: the failures above were rerun alone, not in a clean full run. The fixes after the final review ran it again; its counts are below.
+
+- After the final-review fixes, run on 2026-11-26: `scripts/test-components.sh` passed every step but the Slidev round-trip: `ui_interactive` 31 passed with the bundle, the counter tests among them, and `ai_tool` 31 passed. The round-trip's 3 tests failed because a stale `xtask` build in `target/` named a folder that no longer exists. After a rebuild of `xtask` they passed (3 passed). `ui_live_terminal` 26 passed, `live_terminal_yes` 40 passed, `slides-engine` and `slides-components` 694 passed, and clippy, warnings as errors, was clean.
+- `scripts/test-all.sh --quick` after the fixes: clippy ok and packaging ok (59 passed). The workspace step had 2,941 passed and 5 failed, and the components step 75 passed and 2 failed. So this run wasn't clean from one end to the other either. Failed tests, rerun alone:
+  - `a_guest_that_loops_while_loading_is_stopped` failed at 15.2 s in the full run and passed alone in 0.22 s.
+  - `a_big_talk_is_checked_quickly` failed in the full run and on its first rerun at 27 s. It then passed alone in 1.9 s.
+  - Four tests in `slides-model`'s `draw` failed: `a_closed_drawer_says_so`, `draw_never_blocks_the_caller`, `only_the_newest_picture_of_a_scene_is_drawn` and `two_drawers_do_not_fight`, with *the drawer's thread never ended* or *the drawer never said whether it can draw*. So did `a_picture_of_a_model_ends_cleanly_and_soon` (`ai_tool`). They failed again alone. Run alone, the whole `draw` file hangs on asking the graphics device for an adapter, though 13 of its tests passed in the full run. `slides-model` depends on nothing these fixes touched, so this is the machine's graphics device. It has to be run again on a machine whose device answers.
+
+## Found in the final review
+
+- **A component froze on a repeated input.** A component given exactly what it was given the time before (a counter's *Reset* pressed a third time, or a `do` to a component that keeps nothing) was never told it had been drawn, so it took nothing more until its slide was left. A second rehearsal of the same talk, or the editor's *Try* before a show, could start the same way. Fixed: every feed is answered, feeds are told apart across shows and the editor, and a show forgets its components when it ends.
+- **Duplicate ids acted on the first match.** A button whose `in` or `on` named an `id` two things share typed into, or sent to, the first. Fixed: it acts on neither, and the status line, the slide's notice and `check` say *Two things on this slide have the id "…".*
+- **`run` reached a terminal not yet shown.** A button could start and type into a `<Terminal click="2">` the audience couldn't see yet. Fixed: nothing is asked or typed, and the status line says *This button's terminal isn't on the slide yet.*
+- A press on a button takes the keys back from a terminal that had them. That is meant, and the AI guide's *Buttons* section says so.
+
 ## Hand checks for the owner
 
 On a scratch display, with a scratch copy of the example talk:
