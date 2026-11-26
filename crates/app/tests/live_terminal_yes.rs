@@ -521,7 +521,7 @@ fn typed_text_is_asked_once_per_text() {
     assert_eq!(may_type(&talk, "ls -la", &sh, &session, &remembered), Decision::Ask, "the first press asks");
     session.allow_typed_for_tests(&talk, "ls -la", &sh);
     assert_eq!(may_type(&talk, "ls -la", &sh, &session, &remembered), Decision::Run, "a second press doesn't");
-    for other in ["ls -lb", "ls -la ", "ls -l", "LS -la", "ls\t-la"] {
+    for other in ["ls -lb", "ls -la ", "ls -l", "LS -la", "ls  -la"] {
         assert_eq!(may_type(&talk, other, &sh, &session, &remembered), Decision::Ask, "{other:?} is matched exactly");
     }
     session.refuse_typed_for_tests(&talk, "ls -lb", &sh);
@@ -632,6 +632,9 @@ fn typed_text_with_control_characters_or_over_4096_bytes_is_refused() {
     let long = "This button's text is over 4,096 bytes.";
     let refused = [
         ("echo hi\r".to_string(), control),
+        // A shell completes at a tab, so what ran could differ from what was said yes to.
+        ("a\tb".to_string(), control),
+        ("ls\t-la".to_string(), control),
         ("echo hi\nrm -rf ~".to_string(), control),
         ("\u{1b}[31mred".to_string(), control),
         ("bell\u{7}".to_string(), control),
@@ -652,7 +655,7 @@ fn typed_text_with_control_characters_or_over_4096_bytes_is_refused() {
         assert!(untypable(text).is_some(), "{text:?}");
         assert_eq!(may_type(&talk, text, &sh, &SessionYes::new(), &remembered), Decision::Refused, "{text:?}");
     }
-    for fine in ["a\tb".to_string(), "a".repeat(4096), "echo \"hi\" | wc -c".to_string(), "  two  spaces ".to_string(), "café".to_string()] {
+    for fine in ["a".repeat(4096), "echo \"hi\" | wc -c".to_string(), "  two  spaces ".to_string(), "café".to_string()] {
         assert_eq!(untypable(&fine), None, "{fine:?}");
         assert_eq!(may_type(&talk, &fine, &sh, &SessionYes::new(), &remembered), Decision::Ask, "{fine:?}");
     }

@@ -340,16 +340,17 @@ pub const TYPED_TOO_LONG: &str = "This button's text is over 4,096 bytes.";
 pub const TYPED_HIDES: &str = "This button's text has a character that can't be seen, so it isn't typed. Write it plainly.";
 
 /// Why `text` can't be typed into a terminal by a button, if it can't: it may hold no control
-/// character but a tab, be no more than [`MOST_TYPED_BYTES`], and hold nothing that hides or
+/// character (a tab neither, since a shell completes at one and what ran would differ from what was
+/// said yes to), be no more than [`MOST_TYPED_BYTES`], and hold nothing that hides or
 /// stacks, as [`unrunnable`] refuses in a command's words.
 pub fn untypable(text: &str) -> Option<&'static str> {
-    if text.chars().any(|c| c.is_control() && c != '\t') {
+    if text.chars().any(char::is_control) {
         return Some(TYPED_CONTROL);
     }
     if text.len() > MOST_TYPED_BYTES {
         return Some(TYPED_TOO_LONG);
     }
-    if text.chars().any(|c| c != '\t' && hides(c)) || stacked(text) {
+    if text.chars().any(hides) || stacked(text) {
         return Some(TYPED_HIDES);
     }
     None
