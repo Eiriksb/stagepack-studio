@@ -434,6 +434,8 @@ impl Presentation {
         if std::mem::replace(&mut self.ended, true) {
             return;
         }
+        // What the slide's components kept, and what the deck draws them from, go with the show.
+        interactive::forget(self, cx);
         // What was started ends with the show.
         if let Some((workspace, live)) = self.owner.clone() {
             live.set_show_on(false);
@@ -700,6 +702,10 @@ pub(crate) fn act(show: &mut Presentation, button: &ButtonLayer, cx: &mut Contex
             Acted::Done
         }
         Press::Do { name, target, value } => {
+            // An `id` more than one thing has names neither.
+            if show.document.update(cx, |document, _| document.id_named_twice(slide, &target)) {
+                return Acted::Refused(slides_engine::duplicate_id_notice(&target));
+            }
             let place = show.session.place();
             let moment = show.moment_at(place, show.time_at(cx.background_executor().now()));
             let things = interactive_things_at(&show.document, place, moment, cx);
@@ -714,8 +720,8 @@ pub(crate) fn act(show: &mut Presentation, button: &ButtonLayer, cx: &mut Contex
         }
         Press::Run { text, terminal } => {
             let Some((workspace, _)) = show.owner.clone() else { return Acted::Refused(BUTTON_NO_TERMINALS.to_string()) };
-            let visit = show.visits;
-            match workspace.update(cx, |workspace, cx| workspace.press_run_button(slide, visit, &terminal, &text, cx)) {
+            let (visit, step) = (show.visits, show.session.place().step);
+            match workspace.update(cx, |workspace, cx| workspace.press_run_button(slide, visit, step, &terminal, &text, cx)) {
                 Ok(RunPressed::Typed) | Err(_) => Acted::Done,
                 Ok(RunPressed::Refused(why)) => Acted::Refused(why),
                 Ok(RunPressed::Ask) => {

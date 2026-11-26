@@ -164,10 +164,18 @@ pub struct TalkComponents {
     feeds: HashMap<Range<usize>, ComponentFeed>,
     /// What came of drawing them so, oldest first, until it's taken.
     answers: Vec<ComponentAnswer>,
-    /// The last render of each fed component, by where its tag is written, and the input it was
-    /// drawn from: laid out again from the same input, as both of a show's windows and the next
-    /// click's preview do, it isn't run again.
-    fed_renders: HashMap<Range<usize>, (u64, Result<RenderOutput, ComponentError>)>,
+    /// The last render of each fed component, by where its tag is written: laid out again from
+    /// the same input, as both of a show's windows and the next click's preview do, it isn't run
+    /// again.
+    fed_renders: HashMap<Range<usize>, FedRender>,
+}
+
+/// A fed component's last render: the input it was drawn from, what came of it, and the feed
+/// that was last answered with it. A new feed is always answered, even with the same input.
+struct FedRender {
+    input: u64,
+    result: Result<RenderOutput, ComponentError>,
+    answered: u64,
 }
 
 struct NoFiles;
@@ -374,30 +382,35 @@ impl TalkComponents {
         self.feeds = feeds;
     }
 
-    /// Renders `tag`, written at `source`, from `input`, which holds its feed: once for each input,
-    /// as the last is kept. Gives whether the module ran.
-    pub(crate) fn render_fed(&mut self, tag: &str, source: &Range<usize>, input: &RenderInput) -> Option<(Rendered, bool)> {
+    /// Renders `tag`, written at `source`, from `input`, which holds its feed, told from every other
+    /// by `feed`: once for each input, as the last is kept. Gives whether what came of it is for
+    /// that feed to be answered with: the first time each feed is drawn, whether or not the module
+    /// ran, so a feed giving what the one before gave is answered too.
+    pub(crate) fn render_fed(&mut self, tag: &str, source: &Range<usize>, input: &RenderInput, feed: u64) -> Option<(Rendered, bool)> {
         let mut hasher = DefaultHasher::new();
         (tag, serde_json::to_string(input).unwrap_or_default()).hash(&mut hasher);
         let key = hasher.finish();
-        if let Some((kept, result)) = self.fed_renders.get(source)
-            && *kept == key
+        if let Some(kept) = self.fed_renders.get_mut(source)
+            && kept.input == key
         {
-            let rendered = match result {
+            let rendered = match &kept.result {
                 Ok(output) => Rendered::Output(output.clone()),
                 Err(error) => Rendered::Failed(error.clone()),
             };
-            return Some((rendered, false));
+            let answer = std::mem::replace(&mut kept.answered, feed) != feed;
+            return Some((rendered, answer));
         }
         let rendered = self.render(tag, input)?;
-        match &rendered {
-            Rendered::Output(output) => {
-                self.fed_renders.insert(source.clone(), (key, Ok(output.clone())));
+        let result = match &rendered {
+            Rendered::Output(output) => Some(Ok(output.clone())),
+            Rendered::Failed(error) => Some(Err(error.clone())),
+            Rendered::NeedsBuilding | Rendered::OutOfTime => None,
+        };
+        match result {
+            Some(result) => {
+                self.fed_renders.insert(source.clone(), FedRender { input: key, result, answered: feed });
             }
-            Rendered::Failed(error) => {
-                self.fed_renders.insert(source.clone(), (key, Err(error.clone())));
-            }
-            Rendered::NeedsBuilding | Rendered::OutOfTime => {
+            None => {
                 self.fed_renders.remove(source);
             }
         }

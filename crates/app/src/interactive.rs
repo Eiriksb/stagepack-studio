@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui_kit::{Context, Entity, Point, Task};
@@ -176,9 +177,11 @@ pub struct Fed {
 #[derive(Default)]
 pub struct StateStore {
     held: HashMap<Range<usize>, Held>,
-    /// How many feeds it has made: each is told from every other by it.
-    made: u64,
 }
+
+/// How many feeds every store has made: each is told from every other by it, so no two feeds are
+/// alike, in one show, the next, or the editor's.
+static FEEDS_MADE: AtomicU64 = AtomicU64::new(0);
 
 impl StateStore {
     /// Sends `event` to the component whose tag, written `text`, is at `source`. Of the moves since
@@ -217,10 +220,10 @@ impl StateStore {
                 done.wait = Some(done.wait.map_or(wait, |other| other.min(wait)));
                 continue;
             }
-            self.made += 1;
+            let made = FEEDS_MADE.fetch_add(1, Ordering::Relaxed) + 1;
             let events = std::mem::take(&mut held.queue);
             let mut hasher = DefaultHasher::new();
-            (self.made, serde_json::to_string(&(&held.state, &events)).unwrap_or_default()).hash(&mut hasher);
+            (made, serde_json::to_string(&(&held.state, &events)).unwrap_or_default()).hash(&mut hasher);
             held.fed = Some(ComponentFeed { state: held.state.clone(), events, hash: hasher.finish().max(1) });
             held.waiting = true;
             held.last_fed = Some(now);

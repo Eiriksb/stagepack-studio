@@ -941,6 +941,12 @@ impl Document {
         guarded(|| self.deck.terminals_at(index, moment)).unwrap_or_default()
     }
 
+    /// Whether more than one thing on slide `index` has the `id` `id`, which a button then acts on
+    /// neither of.
+    pub fn id_named_twice(&mut self, index: usize, id: &str) -> bool {
+        guarded(|| self.deck.id_named_twice(index, id)).unwrap_or(false)
+    }
+
     /// The buttons on slide `index` at `moment`, among its layers as the show draws them then.
     pub fn buttons_at(&mut self, index: usize, moment: slides_engine::Moment) -> Vec<slides_engine::ButtonLayer> {
         guarded(|| self.deck.buttons_at(index, moment)).unwrap_or_default()

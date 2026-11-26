@@ -533,6 +533,9 @@ impl SlideEditor {
             Press::Nothing => {}
             Press::Refused(why) => cx.emit(EditorEvent::Said(why.into())),
             Press::Step(_) | Press::Run { .. } => cx.emit(EditorEvent::Said(RUNS_IN_SHOW.into())),
+            Press::Do { target, .. } if document.update(cx, |document, _| document.id_named_twice(trying.slide, &target)) => {
+                cx.emit(EditorEvent::Said(slides_engine::duplicate_id_notice(&target).into()));
+            }
             Press::Do { name, target, value } => {
                 let things = self.tried_things(cx);
                 let component = things.into_iter().find(|thing| matches!(thing.kind, InteractiveKind::Component { .. }) && thing.id.as_deref() == Some(target.as_str()));

@@ -956,8 +956,18 @@ impl Deck {
         let on = laid.specs.iter().find(|spec| spec.source.as_ref() == Some(source))?.button.as_ref()?;
         match &on.action {
             Err(fault) => Some(crate::button_fault_notice(*fault).to_string()),
-            Ok(_) => crate::slide::button_target_problem(on, &laid.specs, laid.steps()).map(str::to_string),
+            Ok(_) => crate::slide::button_target_problem(on, &laid.specs, laid.steps()),
         }
+    }
+
+    /// Whether more than one thing on slide `index` has the `id` `id`: a button naming it acts on
+    /// neither, and [`crate::duplicate_id_notice`] says so.
+    pub fn id_named_twice(&mut self, index: usize, id: &str) -> bool {
+        if index >= self.slides.len() {
+            return false;
+        }
+        let moment = self.ensure_whole(index);
+        self.slides[index].laid_at(moment).specs.iter().filter(|spec| spec.id.as_deref() == Some(id)).count() > 1
     }
 
     /// Whether the video `src`, with the still `poster` names if it names one, is drawn as a

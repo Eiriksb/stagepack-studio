@@ -60,7 +60,7 @@ use crate::slide_strip::{
 use crate::watcher::{self, Change};
 use crate::working_copies::{KEEP_FAILED, KeepFailed, WorkingCopies};
 
-pub use running::{BUTTON_TERMINAL_ENDED, BUTTON_TERMINAL_FULL, BUTTON_TERMINAL_REFUSED, BUTTON_TEXT_REFUSED, LiveStep};
+pub use running::{BUTTON_TERMINAL_ENDED, BUTTON_TERMINAL_FULL, BUTTON_TERMINAL_NOT_SHOWN, BUTTON_TERMINAL_REFUSED, BUTTON_TEXT_REFUSED, LiveStep};
 pub(crate) use running::RunPressed;
 
 mod editing;

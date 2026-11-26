@@ -20,7 +20,7 @@ use stagepack_studio::live_terminal::{
     HELPER_ENV, LiveId, LiveTerminals, MOST_LIVE, Session, NOT_INSTALLED, RUN_ALWAYS_ID, RUN_ASK_ID, RUN_HEAD_ID, RUN_INTO_ID, RUN_LINE_ID, RUN_NO_ID, RUN_TITLE,
     RUN_TITLE_ID, RUN_TYPED_FOLDER_ID, RUN_TYPED_ID, RUN_WORDS_ID, RUN_YES_ID, RunPermissions, RunQuestion, TOO_MANY, TYPE_TITLE, ask_to_run, threads_running,
 };
-use stagepack_studio::workspace_view::BUTTON_TERMINAL_FULL;
+use stagepack_studio::workspace_view::{BUTTON_TERMINAL_FULL, BUTTON_TERMINAL_NOT_SHOWN};
 use stagepack_studio::present_view::{COUNTER_ID, Presentation};
 use stagepack_studio::slide_canvas::{LIVE_HINT_ID, SlideCanvas};
 use stagepack_studio::slide_editor::{TERMINAL_END_ID, TERMINAL_KEEP_ID, TERMINAL_START_ID};
@@ -1210,4 +1210,52 @@ fn a_press_waiting_for_its_yes_ends_with_the_show(cx: &mut TestAppContext) {
     assert_eq!(hellos(&session), 0, "nothing is typed: {}", screen_text(&session));
     click_on(&typing, cx, TERMINAL_END_ID);
     nothing_left(cx, &windows, &live, "31606");
+}
+
+#[gpui_kit::test]
+fn a_run_button_naming_a_duplicated_id_types_into_neither(cx: &mut TestAppContext) {
+    let around = surroundings(Some(&helper::helper_program()));
+    let command = "sh -c \"cat; : 31607\"";
+    let talk = format!("# One\n\n{}\n\n{}\n\n{}\n", tag_with_id("t", command, 100), tag_with_id("t", command, 900), typing_button("hello"));
+    let typing = open_talk(cx, &around, &talk);
+    let live = live_of(&typing, cx);
+    let show = rehearse(&typing, cx);
+    say_yes(cx, show.presenter);
+    assert!(until(cx, &show.windows(), 10, |_| live.running() == 2), "both run");
+    show.click_slide(cx, ON_THE_BUTTON.0, ON_THE_BUTTON.1);
+    assert_eq!(typing.status(cx).as_deref(), Some("Two things on this slide have the id \"t\"."));
+    assert!(!dialog_open(cx, show.presenter) && !dialog_open(cx, show.audience), "nothing is asked");
+    std::thread::sleep(Duration::from_millis(300));
+    for window in show.windows() {
+        render(cx, window);
+    }
+    for id in live.ids() {
+        let session = live.get(&id).unwrap();
+        assert_eq!(hellos(&session), 0, "nothing is typed: {}", screen_text(&session));
+    }
+    assert_eq!(show.counter(cx), "1 / 1");
+    press(cx, show.presenter, "escape");
+    nothing_left(cx, &[typing.handle], &live, "31607");
+}
+
+#[gpui_kit::test]
+fn a_run_button_reaches_no_terminal_the_slide_does_not_show_yet(cx: &mut TestAppContext) {
+    let around = surroundings(Some(&helper::helper_program()));
+    let later = tag_with_id("t", "sh -c \"cat; : 31608\"", 100).replace(" />", " click=\"2\" />");
+    let talk = format!("# One\n\n{later}\n\n{}\n", typing_button("hello"));
+    let typing = open_talk(cx, &around, &talk);
+    let live = live_of(&typing, cx);
+    let show = rehearse(&typing, cx);
+    show.click_slide(cx, ON_THE_BUTTON.0, ON_THE_BUTTON.1);
+    assert_eq!(typing.status(cx).as_deref(), Some(BUTTON_TERMINAL_NOT_SHOWN));
+    assert_eq!(BUTTON_TERMINAL_NOT_SHOWN, "This button's terminal isn't on the slide yet.");
+    std::thread::sleep(Duration::from_millis(300));
+    for window in show.windows() {
+        render(cx, window);
+    }
+    assert!(!dialog_open(cx, show.presenter) && !dialog_open(cx, show.audience), "nothing is asked");
+    assert_eq!(live.sessions(), 0, "nothing started");
+    assert_eq!(show.show.read_with(cx, |show, _| show.place().step), 0, "and the show didn't move");
+    press(cx, show.presenter, "escape");
+    nothing_left(cx, &[typing.handle], &live, "31608");
 }

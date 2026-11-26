@@ -461,36 +461,43 @@ pub(crate) fn steps_of(layers: &[LayerSpec], stepped: u32) -> u32 {
     clicks.max(stepped).min(MAX_CLICK)
 }
 
+/// What's said of an `id` that more than one thing on a slide has: a button naming it acts on neither.
+pub fn duplicate_id_notice(id: &str) -> String {
+    format!("Two things on this slide have the id \"{id}\".")
+}
+
 /// What's said of what the slide's `layers` name by `id`: each `id` given twice, and what's wrong
 /// with what each button names, on a slide of `steps` steps.
 fn named_notices(layers: &[LayerSpec], steps: u32, notices: &mut Vec<Notice>) {
     let ids: Vec<&str> = layers.iter().filter_map(|spec| spec.id.as_deref()).collect();
     for (at, id) in ids.iter().enumerate() {
         if ids[..at].contains(id) {
-            add_notice(notices, format!("Two things on this slide have the id \"{id}\"."));
+            add_notice(notices, duplicate_id_notice(id));
         }
     }
     for on in layers.iter().filter_map(|spec| spec.button.as_ref()) {
         if let Some(problem) = button_target_problem(on, layers, steps) {
-            add_notice(notices, problem.to_string());
+            add_notice(notices, problem);
         }
     }
 }
 
 /// What's wrong with what the button `on` names, among the slide's `layers`, on a slide of
-/// `steps` steps: a live terminal its `in` doesn't name, a thing its `on` doesn't, or a step past
-/// the last. Why it does nothing at all is said apart.
-pub(crate) fn button_target_problem(on: &ButtonOn, layers: &[LayerSpec], steps: u32) -> Option<&'static str> {
+/// `steps` steps: an `id` more than one thing has, a live terminal its `in` doesn't name, a thing
+/// its `on` doesn't, or a step past the last. Why it does nothing at all is said apart.
+pub(crate) fn button_target_problem(on: &ButtonOn, layers: &[LayerSpec], steps: u32) -> Option<String> {
+    let named = |id: &str| layers.iter().filter(|spec| spec.id.as_deref() == Some(id)).count();
     match on.action.as_ref().ok()? {
+        ButtonAction::Run { terminal: id, .. } | ButtonAction::Do { target: id, .. } if named(id) > 1 => Some(duplicate_id_notice(id)),
         ButtonAction::Run { terminal, .. } => {
             let live = |spec: &LayerSpec| spec.id.as_deref() == Some(terminal.as_str()) && spec.terminal.as_ref().is_some_and(|on| on.run.is_some());
-            (!layers.iter().any(live)).then_some(BUTTON_IN_NOTHING)
+            (!layers.iter().any(live)).then(|| BUTTON_IN_NOTHING.to_string())
         }
         ButtonAction::Do { target, .. } => {
             let interactive = |spec: &LayerSpec| spec.id.as_deref() == Some(target.as_str()) && spec.component.is_some();
-            (!layers.iter().any(interactive)).then_some(BUTTON_ON_NOTHING)
+            (!layers.iter().any(interactive)).then(|| BUTTON_ON_NOTHING.to_string())
         }
-        ButtonAction::Step(step) => (*step > steps).then_some(BUTTON_STEP_PAST),
+        ButtonAction::Step(step) => (*step > steps).then(|| BUTTON_STEP_PAST.to_string()),
     }
 }
 

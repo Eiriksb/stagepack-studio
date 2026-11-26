@@ -51,7 +51,7 @@ const BESIDE_IT: (f32, f32) = (1400., 800.);
 
 /// A show of a talk, rehearsed, in both its windows.
 struct Show {
-    _folder: TempDir,
+    _folder: Option<TempDir>,
     document: Entity<Document>,
     show: Entity<Presentation>,
     audience: AnyWindowHandle,
@@ -187,6 +187,11 @@ fn rehearse_with(cx: &mut TestAppContext, source: &str, files: &[(&str, &[u8])])
     let document = Document::open(folder.path(), Fonts::bundled_only()).unwrap();
     let document = cx.new(|_| document);
     let show = cx.update(|cx| start_show(document.clone(), true, cx));
+    show_of(cx, Some(folder), document, show)
+}
+
+/// The show `show` of `document`, in the folder `folder` if the show keeps it.
+fn show_of(cx: &mut TestAppContext, folder: Option<TempDir>, document: Entity<Document>, show: Entity<Presentation>) -> Show {
     let (audience, presenter) = cx.read(|cx| {
         let show = show.read(cx);
         (show.audience().expect("its window").0, show.presenter().expect("its window").0)
@@ -194,6 +199,15 @@ fn rehearse_with(cx: &mut TestAppContext, source: &str, files: &[(&str, &[u8])])
     let show = Show { _folder: folder, document, show, audience, presenter };
     show.settle(cx);
     show
+}
+
+/// A rehearsal started from the talk's window, as *Rehearse* does: the window shares its live
+/// terminals with the show and says on its status line what the show says.
+fn rehearse_from(typing: &typing::Typing, cx: &mut TestAppContext) -> Show {
+    typing.press(cx, "shift-f5");
+    cx.run_until_parked();
+    let show = typing.view.read_with(cx, |view, _| view.current_show()).expect("a show was started");
+    show_of(cx, None, typing.document(cx), show)
 }
 
 fn rehearse(cx: &mut TestAppContext, source: &str) -> Show {
@@ -601,7 +615,7 @@ fn a_button_looks_pressed_only_while_the_pointer_is_down_on_it(cx: &mut TestAppC
 }
 
 /// A talk's own component that counts: a press let go of on its plus adds one, and the action
-/// `add` adds its value. Its count is on its left, and its plus on its right.
+/// `add` adds its value, and `reset` makes it 0. Its count is on its left, and its plus on its right.
 const COUNTER: &str = r#"use toolkit::prelude::*;
 
 #[component(interactive)]
@@ -611,6 +625,7 @@ fn Counter(ctx: &Ctx) -> Element {
         match event {
             Event::Pointer { kind: PointerKind::Up, hit: Some(hit), .. } if hit == "plus" => count += 1,
             Event::Action { name, value } if name == "add" => count += value.parse::<u32>().unwrap_or(0),
+            Event::Action { name, .. } if name == "reset" => count = 0,
             _ => {}
         }
     }
@@ -1053,4 +1068,114 @@ fn selecting_something_else_stops_trying_and_clears_its_state(cx: &mut TestAppCo
     typing.press(cx, "escape");
     assert_eq!(trying(&typing, cx), None);
     assert!(cx.read(|cx| editor.read(cx).tried_components().is_empty()));
+}
+
+// What the final review found.
+
+/// A pad `p`, and a button that sends it `go`, at (800, 600) to (1100, 700).
+const PAD_AND_GO: &str = "# One\n\n<Pad id=\"p\" x=\"200\" y=\"200\" w=\"400\" h=\"200\" />\n\n<Button label=\"Go\" do=\"go\" on=\"p\" x=\"800\" y=\"600\" w=\"300\" h=\"100\" />\n\n---\n\n# Two\n";
+const ON_GO: (f32, f32) = (950., 650.);
+
+#[gpui_kit::test]
+fn the_same_do_three_times_keeps_working(cx: &mut TestAppContext) {
+    // The pad keeps nothing, so each press gives it what the one before did.
+    let show = with_the_pad_in(cx, PAD_AND_GO, None);
+    let pad = tag_at(PAD_AND_GO, "<Pad");
+    for _ in 0..3 {
+        show.press_slide(cx, ON_GO);
+        show.wait(cx, 100);
+    }
+    let (renders, queued) = cx.read(|cx| {
+        let components = show.show.read(cx).components();
+        (components.renders(&pad), components.queued(&pad))
+    });
+    assert_eq!((renders, queued), (3, 0));
+}
+
+#[gpui_kit::test]
+fn a_counter_reset_three_times_still_counts(cx: &mut TestAppContext) {
+    let buttons = "<Button label=\"Reset\" do=\"reset\" on=\"c\" x=\"800\" y=\"600\" w=\"300\" h=\"100\" />\n\n\
+        <Button label=\"Add 1\" do=\"add\" on=\"c\" value=\"1\" x=\"800\" y=\"800\" w=\"300\" h=\"100\" />";
+    let source = format!("# One\n\n{COUNTER_TAG}\n\n{buttons}\n\n---\n\n# Two\n");
+    let Some(show) = with_counter(cx, &source) else { return };
+    let counter = tag_at(&source, "<Counter");
+    for _ in 0..3 {
+        show.press_slide(cx, PLUS);
+    }
+    assert_eq!(show.words(cx, &counter), ["3"]);
+    for _ in 0..3 {
+        show.press_slide(cx, (950., 650.));
+        show.wait(cx, 100);
+    }
+    assert_eq!(show.words(cx, &counter), ["0"]);
+    show.press_slide(cx, (950., 850.));
+    assert_eq!(show.words(cx, &counter), ["1"]);
+    show.press_slide(cx, PLUS);
+    assert_eq!(show.words(cx, &counter), ["2"]);
+}
+
+#[gpui_kit::test]
+fn rehearsing_twice_the_second_shows_first_press_acts(cx: &mut TestAppContext) {
+    let first = with_the_pad_in(cx, PAD_AND_GO, None);
+    let pad = tag_at(PAD_AND_GO, "<Pad");
+    first.press_slide(cx, ON_GO);
+    assert_eq!(cx.read(|cx| first.show.read(cx).components().renders(&pad)), 1);
+    first.show.update(cx, |show, cx| show.end(cx));
+    cx.run_until_parked();
+    // The same talk, rehearsed again.
+    let document = first.document.clone();
+    let show = cx.update(|cx| start_show(document.clone(), true, cx));
+    let second = show_of(cx, None, document, show);
+    second.press_slide(cx, ON_GO);
+    let (renders, queued) = cx.read(|cx| {
+        let components = second.show.read(cx).components();
+        (components.renders(&pad), components.queued(&pad))
+    });
+    assert_eq!((renders, queued), (1, 0), "the second show's first press reached the pad");
+}
+
+#[gpui_kit::test]
+fn a_counter_tried_in_the_editor_is_not_the_shows(cx: &mut TestAppContext) {
+    let source = format!("# One\n\n{COUNTER_TAG}\n\n{ELSEWHERE}\n");
+    let Some(typing) = edit_counter(cx, &source) else { return };
+    let counter = tag_at(&source, "<Counter");
+    click_editor(&typing, cx, PLUS);
+    typing::click_on(&typing, cx, TRY_ID);
+    click_editor(&typing, cx, PLUS);
+    click_editor(&typing, cx, PLUS);
+    assert_eq!(edited_words(&typing, cx, &counter), ["2"]);
+    // Rehearsed from the window: trying stops, and the show starts from nothing.
+    let show = rehearse_from(&typing, cx);
+    assert_eq!(trying(&typing, cx), None);
+    assert!(cx.read(|cx| show.show.read(cx).components().is_empty()));
+    assert_eq!(show.words(cx, &counter), ["0"]);
+    // While the show runs nothing is tried in the editor.
+    assert_eq!(selected_source(&typing, cx), Some(counter.clone()));
+    typing.press(cx, "space");
+    assert_eq!(trying(&typing, cx), None);
+    // And the show's own counter counts from 0.
+    show.press_slide(cx, PLUS);
+    assert_eq!(show.words(cx, &counter), ["1"]);
+}
+
+#[gpui_kit::test]
+fn a_do_button_naming_a_duplicated_id_acts_on_neither(cx: &mut TestAppContext) {
+    let source = "# One\n\n<Pad id=\"p\" x=\"200\" y=\"200\" w=\"400\" h=\"200\" />\n\n<Pad id=\"p\" x=\"200\" y=\"500\" w=\"400\" h=\"200\" />\n\n\
+        <Button label=\"Go\" do=\"go\" on=\"p\" x=\"800\" y=\"600\" w=\"300\" h=\"100\" />\n\n---\n\n# Two\n";
+    let duplicated = slides_engine::duplicate_id_notice("p");
+    let typing = edit_pad(cx, source);
+    let editor = slide_editor(&typing, cx);
+    // Tried in the editor, with its targets: nothing reaches either.
+    click_editor(&typing, cx, ON_GO);
+    typing::click_on(&typing, cx, TRY_ID);
+    click_editor(&typing, cx, ON_GO);
+    assert!(cx.read(|cx| editor.read(cx).tried_components().is_empty()));
+    assert_eq!(typing.status(cx).as_deref(), Some(duplicated.as_str()));
+    typing::click_on(&typing, cx, TRY_DONE_ID);
+    // In the show: the same.
+    let show = rehearse_from(&typing, cx);
+    show.press_slide(cx, ON_GO);
+    assert!(cx.read(|cx| show.show.read(cx).components().is_empty()), "nothing was sent");
+    assert_eq!(typing.status(cx).as_deref(), Some(duplicated.as_str()));
+    assert_eq!(place(&show, cx), Place { slide: 0, step: 0 });
 }

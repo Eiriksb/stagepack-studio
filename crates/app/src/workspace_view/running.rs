@@ -3,7 +3,7 @@
 
 use super::*;
 
-use slides_engine::{BUTTON_IN_NOTHING, TerminalLayer};
+use slides_engine::{BUTTON_IN_NOTHING, TerminalLayer, duplicate_id_notice};
 
 use crate::live_terminal::{
     COULDNT_START, LiveId, LiveTerminals, NOT_INSTALLED, TOO_MANY, TalkFolder, TypeKey, find_helper, may_type, spelled_plainly, split_command, start_after_yes,
@@ -30,6 +30,8 @@ pub const BUTTON_TERMINAL_FULL: &str = "This button's terminal can't start: 4 ar
 pub const BUTTON_TERMINAL_REFUSED: &str = "This button's terminal can't start: its command was said no to.";
 /// What's said of a button whose terminal's program has ended.
 pub const BUTTON_TERMINAL_ENDED: &str = "This button's terminal has ended, so nothing is typed.";
+/// What's said of a button that types into a terminal the slide doesn't show yet.
+pub const BUTTON_TERMINAL_NOT_SHOWN: &str = "This button's terminal isn't on the slide yet.";
 /// What's said of a button whose text was said no to.
 pub const BUTTON_TEXT_REFUSED: &str = "This button's text was said no to, so it isn't typed.";
 
@@ -62,6 +64,8 @@ pub(crate) struct ButtonRun {
     slide: usize,
     /// Which visit of the show to that slide it was made in.
     visit: u64,
+    /// The click step the slide was at, which its terminal must be shown by.
+    step: u32,
     terminal: String,
     text: String,
 }
@@ -174,8 +178,8 @@ impl WorkspaceView {
     /// [`Self::ask_for_button`] in a window of the show, and once it's answered yes the press goes
     /// on from where it stopped, looking at everything again. A new press takes the place of one
     /// still waiting.
-    pub(crate) fn press_run_button(&mut self, slide: usize, visit: u64, terminal: &str, text: &str, cx: &mut Context<Self>) -> RunPressed {
-        let press = ButtonRun { slide, visit, terminal: terminal.to_string(), text: text.to_string() };
+    pub(crate) fn press_run_button(&mut self, slide: usize, visit: u64, step: u32, terminal: &str, text: &str, cx: &mut Context<Self>) -> RunPressed {
+        let press = ButtonRun { slide, visit, step, terminal: terminal.to_string(), text: text.to_string() };
         let next = self.button_next(&press, cx);
         self.type_when_yes = matches!(next, ButtonNext::AskRun(_) | ButtonNext::AskType(..)).then_some(press);
         match next {
@@ -189,11 +193,12 @@ impl WorkspaceView {
     /// or the yes to type its text. While another question is open nothing is asked, and the press
     /// waits for that one's answer.
     pub(crate) fn ask_for_button(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(press) = self.type_when_yes.clone() else { return };
-        if !self.still_shown(&press, cx) {
+        let Some(mut press) = self.type_when_yes.clone() else { return };
+        let Some(step) = self.shown_step(&press, cx) else {
             self.type_when_yes = None;
             return;
-        }
+        };
+        press.step = step;
         match self.button_next(&press, cx) {
             ButtonNext::Typed => self.type_when_yes = None,
             ButtonNext::Refused(why) => {
@@ -236,10 +241,9 @@ impl WorkspaceView {
         }
         // Everything is looked at again: the text is typed only if it still may be, and only while
         // the show is still where it was pressed.
-        let Some(press) = self.type_when_yes.take() else { return };
-        if !self.still_shown(&press, cx) {
-            return;
-        }
+        let Some(mut press) = self.type_when_yes.take() else { return };
+        let Some(step) = self.shown_step(&press, cx) else { return };
+        press.step = step;
         match self.button_next(&press, cx) {
             ButtonNext::Typed => {}
             ButtonNext::Refused(why) => self.say(why, cx),
@@ -254,7 +258,7 @@ impl WorkspaceView {
     /// again if the question was about another, or says it can't after a no.
     pub(super) fn button_run_answered(&mut self, answered: &Plan, window: &mut Window, cx: &mut Context<Self>) {
         let Some(press) = self.type_when_yes.clone() else { return };
-        if !self.still_shown(&press, cx) {
+        if self.shown_step(&press, cx).is_none() {
             self.type_when_yes = None;
             return;
         }
@@ -269,13 +273,15 @@ impl WorkspaceView {
         });
     }
 
-    /// Whether the show this window runs is still on the visit to the slide `press` was made in.
-    fn still_shown(&self, press: &ButtonRun, cx: &mut Context<Self>) -> bool {
-        let Some(show) = self.current_show() else { return false };
+    /// The click step the show this window runs is at, if it's still on the visit to the slide
+    /// `press` was made in.
+    fn shown_step(&self, press: &ButtonRun, cx: &mut Context<Self>) -> Option<u32> {
+        let show = self.current_show()?;
         if show.read(cx).has_ended() {
-            return false;
+            return None;
         }
-        show.update(cx, |show, cx| show.visit(cx)) == (press.slide, press.visit)
+        let (visit, step) = show.update(cx, |show, cx| (show.visit(cx), show.place().step));
+        (visit == (press.slide, press.visit)).then_some(step)
     }
 
     /// Whether `answered` is what a yes to run the terminal `press` types into is for.
@@ -291,12 +297,21 @@ impl WorkspaceView {
     /// What the button `press` does next: types its text now, waits for a yes, or can't, and why.
     fn button_next(&mut self, press: &ButtonRun, cx: &mut Context<Self>) -> ButtonNext {
         let Some(document) = self.document.clone() else { return ButtonNext::Refused(BUTTON_IN_NOTHING.to_string()) };
-        let terminal = document.update(cx, |document, _| {
-            document.terminals_on(press.slide).into_iter().find(|terminal| terminal.id.as_deref() == Some(press.terminal.as_str()))
+        let (twice, terminal) = document.update(cx, |document, _| {
+            let twice = document.id_named_twice(press.slide, &press.terminal);
+            (twice, document.terminals_on(press.slide).into_iter().find(|terminal| terminal.id.as_deref() == Some(press.terminal.as_str())))
         });
+        // An `id` more than one thing has names neither.
+        if twice {
+            return ButtonNext::Refused(duplicate_id_notice(&press.terminal));
+        }
         let Some((terminal, source, run)) = terminal.and_then(|terminal| Some((terminal.clone(), terminal.source?, terminal.on.run?))) else {
             return ButtonNext::Refused(BUTTON_IN_NOTHING.to_string());
         };
+        // Only a terminal the slide shows by now is started, or typed into.
+        if terminal.click.is_some_and(|click| click > press.step) {
+            return ButtonNext::Refused(BUTTON_TERMINAL_NOT_SHOWN.to_string());
+        }
         match self.live_step(press.slide, &terminal, false, cx) {
             Ok(LiveStep::Going) => {}
             Ok(LiveStep::Ask(command)) => return ButtonNext::AskRun(command),

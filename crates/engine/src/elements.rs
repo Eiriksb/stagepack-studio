@@ -231,10 +231,10 @@ impl Flow<'_, '_> {
         let name = &tag.name;
         // An interactive component placed on the slide is drawn from its feed at a moment with state.
         let feed = if placed && moment.state != 0 { self.env.components.feed(&tag.range) } else { None };
-        let (rendered, ran) = match &feed {
+        let (rendered, answer) = match &feed {
             Some(feed) => {
                 let input = RenderInput::new(props, data).with_state(feed.state.clone(), feed.events.clone());
-                self.env.components.render_fed(name, &tag.range, &input).map_or((None, false), |(rendered, ran)| (Some(rendered), ran))
+                self.env.components.render_fed(name, &tag.range, &input, feed.hash).map_or((None, false), |(rendered, answer)| (Some(rendered), answer))
             }
             None => (self.env.components.render(name, &RenderInput::new(props, data)), true),
         };
@@ -249,8 +249,8 @@ impl Flow<'_, '_> {
                 self.notice(INTERACTIVE_NOT_PLACED.to_string());
             }
         }
-        // What came of a run of the module from its feed, once for each run.
-        if let Some(feed) = feed.as_ref().filter(|_| ran) {
+        // What came of drawing it from its feed, once for each feed.
+        if let Some(feed) = feed.as_ref().filter(|_| answer) {
             let state = match &rendered {
                 Rendered::Output(output) => Ok(output.state.clone()),
                 Rendered::Failed(error) => Err(error.to_string()),

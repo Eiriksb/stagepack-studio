@@ -1913,6 +1913,25 @@ fn an_id_is_read_as_placement_and_a_duplicate_has_its_notice() {
 }
 
 #[test]
+fn a_button_naming_a_duplicated_id_says_so() {
+    let duplicated = duplicate_id_notice("t");
+    assert_eq!(duplicated, "Two things on this slide have the id \"t\".");
+    for (button, target) in [
+        ("<Button label=\"Type\" run=\"ls\" in=\"t\" x=\"0\" y=\"600\" />", "<Terminal id=\"t\" run=\"bash\" x=\"{x}\" y=\"0\" w=\"400\" h=\"300\" />"),
+        ("<Button label=\"Act\" do=\"go\" on=\"t\" x=\"0\" y=\"600\" />", "<Box id=\"t\" x=\"{x}\" y=\"0\" w=\"400\" h=\"300\">\n\nA\n\n</Box>"),
+    ] {
+        let targets = [target.replace("{x}", "0"), target.replace("{x}", "500")];
+        let source = format!("# One\n\n{}\n\n{}\n\n{button}\n", targets[0], targets[1]);
+        let mut deck = Deck::open(Box::new(MapFiles(HashMap::new())), Fonts::bundled_only(), source.clone());
+        let at = source.find("<Button").unwrap();
+        let range = at..at + button.len();
+        assert_eq!(deck.button_problem(0, &range).as_deref(), Some(duplicated.as_str()), "{button}");
+        let notices = deck.notices_whole(0);
+        assert_eq!(notices.iter().filter(|notice| **notice == duplicated).count(), 1, "said once: {notices:?}");
+    }
+}
+
+#[test]
 fn a_deck_lists_the_buttons_shown_at_a_moment() {
     let source = "# One\n\n<Button label=\"Go\" id=\"b\" step=\"1\" x=\"10\" y=\"20\" w=\"300\" h=\"80\" click=\"1\" />\n";
     let mut deck = Deck::open(Box::new(MapFiles(HashMap::new())), Fonts::bundled_only(), source.to_string());
