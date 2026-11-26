@@ -35,10 +35,11 @@ struct Case {
     attrs: &'static [(&'static str, &'static str)],
 }
 
-const CASES: [Case; 5] = [
+const CASES: [Case; 6] = [
     Case { file: "bars.rs", tag: "Bars", attrs: &[("data", "assets/sales.csv")] },
     Case { file: "callout.rs", tag: "Callout", attrs: &[("title", "Remember")] },
     Case { file: "clock.rs", tag: "Clock", attrs: &[("size", "240")] },
+    Case { file: "counter.rs", tag: "Counter", attrs: &[] },
     Case { file: "reveal.rs", tag: "Reveal", attrs: &[("first", "One"), ("second", "Two"), ("third", "Three")] },
     Case { file: "score.rs", tag: "Score", attrs: &[("team", "Oslo"), ("points", "3"), ("colour", "#2563eb")] },
 ];

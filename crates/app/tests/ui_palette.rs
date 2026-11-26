@@ -142,10 +142,10 @@ fn the_palette_lists_chart_then_the_talks_own(cx: &mut TestAppContext) {
     open_list(&typing, cx);
     let palette = palette_of(&typing, cx);
     let tags: Vec<&str> = palette.iter().map(|entry| entry.tag.as_str()).collect();
-    assert_eq!(tags, ["Chart", "Bars", "Callout", "Clock", "Reveal", "Score"]);
+    assert_eq!(tags, ["Chart", "Bars", "Callout", "Clock", "Counter", "Reveal", "Score"]);
     assert!(palette.iter().all(|entry| !entry.loading), "{palette:?}");
     let labels: Vec<&str> = palette.iter().map(|entry| entry.label.as_str()).collect();
-    assert_eq!(labels, ["Chart", "Bars", "Callout", "Clock", "Reveal", "Score"]);
+    assert_eq!(labels, ["Chart", "Bars", "Callout", "Clock", "Counter", "Reveal", "Score"]);
     assert!(!palette[0].ours && palette[0].state.is_none());
     assert!(palette[1..].iter().all(|entry| entry.ours && entry.state == Some(ComponentState::UpToDate)));
     let content: Vec<&str> = palette.iter().filter(|entry| entry.takes_content).map(|entry| entry.tag.as_str()).collect();
@@ -417,7 +417,7 @@ fn a_packed_talk_lists_and_inserts_its_components(cx: &mut TestAppContext) {
     assert!(typing.document(cx).read_with(cx, |document, _| document.is_packed()));
     let palette = palette_of(&typing, cx);
     let tags: Vec<&str> = palette.iter().map(|entry| entry.tag.as_str()).collect();
-    assert_eq!(tags, ["Chart", "Bars", "Callout", "Clock", "Reveal", "Score"]);
+    assert_eq!(tags, ["Chart", "Bars", "Callout", "Clock", "Counter", "Reveal", "Score"]);
     assert_eq!(palette.iter().find(|entry| entry.tag == "Clock").unwrap().state, Some(ComponentState::NeedsBuilding));
     let source = typing.source(cx);
     insert(&typing, cx, "Clock");
@@ -434,7 +434,7 @@ fn opening_a_talk_loads_no_component() {
     let mut document = Document::open(folder.path(), Fonts::bundled_only()).unwrap();
     assert_eq!(document.modules_loaded(), 0, "opening loads nothing");
     let palette = document.palette();
-    assert_eq!(palette.len(), 6, "listed, without anything loaded");
+    assert_eq!(palette.len(), 7, "listed, without anything loaded");
     assert!(palette[1..].iter().all(|entry| entry.loading && !entry.takes_content), "{palette:?}");
     assert_eq!(palette::note(&palette[1]), Some(STILL_LOADING));
     assert_eq!(document.modules_loaded(), 0);
@@ -448,7 +448,7 @@ fn opening_a_talk_loads_no_component() {
     assert!(palette.iter().all(|entry| !entry.loading), "{palette:?}");
     let content: Vec<&str> = palette.iter().filter(|entry| entry.takes_content).map(|entry| entry.tag.as_str()).collect();
     assert_eq!(content, ["Callout"]);
-    assert_eq!(document.modules_loaded(), 5);
+    assert_eq!(document.modules_loaded(), 6);
 }
 
 /// A module whose `schema` spins for as long as it's let.

@@ -362,6 +362,67 @@ When a component can't be shown, a labelled box takes its place and says why:
 
 A note under the slide saying *Score is out of date, so this is its last build* means that you changed the file since its last build.
 
+## Reacting to clicks: `ctx.events` and `ctx.state`
+
+A component can react to the pointer, and to buttons on its slide. Mark it `#[component(interactive)]` and give it two new things: `ctx.events()` says what has reached it since it was last drawn, and `ctx.state()` and `ctx.set_state(&value)` keep a value from one drawing to the next.
+
+This is `components/counter.rs`:
+
+```rust
+use toolkit::prelude::*;
+
+/// A count that goes up when its plus is pressed, or when a button on the slide says `add`, and
+/// goes back to 0 when a button says `reset`.
+#[component(interactive)]
+fn Counter(ctx: &Ctx) -> Element {
+    // What the count was after the last drawing: 0 when the slide has just appeared.
+    let mut count: u32 = ctx.state();
+    for event in ctx.events() {
+        match event {
+            // A press let go of on the plus.
+            Event::Pointer { kind: PointerKind::Up, hit: Some(name), .. } if name == "plus" => count += 1,
+            // A button's `do="add" value="1"` adds its value; a bad value adds nothing.
+            Event::Action { name, value } if name == "add" => count += value.parse::<u32>().unwrap_or(0),
+            Event::Action { name, .. } if name == "reset" => count = 0,
+            _ => {}
+        }
+    }
+    // Kept for the next drawing, for as long as the slide is shown.
+    ctx.set_state(&count);
+```
+
+The function goes on to draw the number and the plus, shown under [Placing things by hand](#placing-things-by-hand). To use it, put its tag on a slide with an `id`, and give buttons the same name in `on`. This slide is in the example talk:
+
+```markdown
+# A counter, with buttons
+
+<Counter id="count" x="660" y="300" w="400" h="160" />
+
+<Button label="Add 1" do="add" value="1" on="count" x="560" y="620" w="300" h="96" />
+
+<Button label="Reset" do="reset" on="count" look="secondary" x="1060" y="620" w="300" h="96" />
+```
+
+**Events.** `ctx.events()` is the list of what happened, first to last. There are two kinds:
+
+- `Event::Pointer { kind, x, y, hit }` is the pointer. `kind` is `PointerKind::Down`, `Move`, `Up` or `Wheel { dy }`. `x` and `y` are in the component's own units, with the top-left of its box at 0, 0. `hit` is the name of the part under the pointer, or `None`.
+- `Event::Action { name, value }` is a button's `do` and `value` (an empty `value` if the button gave none).
+
+**Parts that can be pressed.** Wrap an element in `hit("plus", element)`, which gives back an `Element::Hit`, and the pointer events over it carry `hit: Some("plus")`. A wrapped element looks the same as before. A press that starts on one part and is let go of on another is not a click on either, so a component that counts clicks should count the `Up` and look at its `hit`, as the counter does.
+
+**State.** `ctx.state()` gives back what the last drawing gave to `ctx.set_state(&value)`, or the default of its type (0 for a number) when there is none or it can't be read as that type. `ctx.set_state` keeps anything that can be turned into JSON, so a number, some text, a list or a small record all work. If a drawing doesn't call `ctx.set_state`, the component keeps what it had.
+
+**What the app does with them:**
+
+- **Only a component placed on the slide itself is interactive.** One inside another component, or inside a `<Callout>`'s children, is refused with *An interactive component works only when it's placed on the slide itself.*
+- **State lives while its slide is shown.** Leaving the slide clears it, and it is never written to the talk. Editing the talk while the slide is shown keeps the state of a component whose tag and settings haven't changed, and clears the rest.
+- **At most 60 drawings a second.** Events that come faster are gathered up and sent together, keeping every `Down`, `Up` and `Action` and only the last `Move`. At most 64 events go to one drawing, and a `Move` is dropped before anything else.
+- **State is at most 64 KiB, in and out.** A component that gives back more shows *This component's state is over 64 KiB.*
+- **The usual limits apply to every drawing:** 250 ms, 64 MiB of memory and 4 MiB of answer. A component that fails under events, by running out of time, trapping or giving back bad state, shows its problem, and the show moves on.
+- **A click on a part that is interactive goes to the component, and the show doesn't advance.** Everywhere else a click advances as usual, and the keys always move the show.
+- **In the editor,** select the component and press *Try* (or Space) to click it in place; selecting something else stops it.
+- **A component without `#[component(interactive)]` stays as it was.** It gets no events and no state, and it still runs in older apps. An interactive one needs an app that knows interface version 2.
+
 ## What a component can't do, and why
 
 A talk is shared like any other file, so a component is held to some limits. They keep a talk you open from reaching anything else on your computer.

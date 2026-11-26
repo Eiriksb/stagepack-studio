@@ -99,6 +99,11 @@ pub fn fixture_modules() -> Vec<(&'static str, &'static str, Vec<u8>)> {
         ("bars", "Bars", module(&schema("Bars", &[r#"{"name":"data","kind":{"File":["csv"]},"optional":false}"#.to_string()], false), &[], &words("Bars"))),
         ("callout", "Callout", module(&schema("Callout", &[text("title")], true), &[], &callout)),
         ("clock", "Clock", module(&schema("Clock", &[r#"{"name":"size","kind":"Number","optional":false}"#.to_string()], false), &[], &words("Clock"))),
+        (
+            "counter",
+            "Counter",
+            interactive_module(r#"{"name":"Counter","props":[],"children":false,"interactive":true}"#, &words("0"), None, false),
+        ),
         ("reveal", "Reveal", module(&schema("Reveal", &[text("first"), text("second"), text("third")], false), &[], &words("Reveal"))),
         (
             "score",

@@ -12,6 +12,7 @@ A native desktop editor for Markdown slide talks, for people who are used to Pow
 - **Animation.** Things appear, fade in or fly up on a click. Lists can show one point at a time, and you can set how each slide arrives.
 - **Presenting.** F5 starts the show. Shift+F5 rehearses it, with a presenter window showing your notes, the next slide and a timer.
 - **Live terminals.** A slide can run a real program during the show. It runs only after you say yes to that exact command.
+- **Clickable slides.** A `<Button>` can go to a click step, type a line into a live terminal after a yes of its own, or send an action to a component of your own, and that component can take clicks and keep a state.
 - **Your own components.** A talk can bring small pieces of Rust that draw on its slides. The app builds them to WebAssembly with its own bundled compiler and runs them in a sandbox. See [the components guide](docs/guide/components.md).
 - **Files.** A talk can be a folder or a single packed `.sptx` file. It exports to PDF and PowerPoint. With the free Slidev add-on, it also exports to Slidev and opens Slidev talks. The app keeps unsaved work and offers it back after a crash.
 - **For AI assistants and scripts.** Commands work without a window: `describe`, `check` and `picture`, plus an MCP server (`stagepack-studio mcp ./talk`). See [writing talks for an AI](docs/guide/writing-talks-for-ai.md).

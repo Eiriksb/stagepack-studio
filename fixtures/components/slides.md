@@ -45,6 +45,16 @@ What's written between the tags goes **below the title**.
 
 ---
 
+# A counter, with buttons
+
+<Counter id="count" x="660" y="300" w="400" h="160" />
+
+<Button label="Add 1" do="add" value="1" on="count" x="560" y="620" w="300" h="96" />
+
+<Button label="Reset" do="reset" on="count" look="secondary" x="1060" y="620" w="300" h="96" />
+
+---
+
 # The same data, as a chart
 
 <Chart kind="bar" data="assets/sales.csv" title="Sales" build="true" />

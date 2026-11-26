@@ -630,7 +630,7 @@ fn the_example_talk_needs_building_then_builds_and_shows() {
     let dir = tempfile::tempdir().unwrap();
     copy_folder(&example_talk(), dir.path());
     let unbuilt = states(dir.path());
-    assert_eq!(unbuilt.len(), 5, "{unbuilt:?}");
+    assert_eq!(unbuilt.len(), 6, "{unbuilt:?}");
     assert!(
         unbuilt
             .iter()
@@ -643,7 +643,7 @@ fn the_example_talk_needs_building_then_builds_and_shows() {
     let outcome = build_components(dir.path(), &compile);
 
     assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
-    assert_eq!(outcome.built.len(), 5);
+    assert_eq!(outcome.built.len(), 6);
     let mut document = Document::open(dir.path(), Fonts::with_system_fallback()).unwrap();
     assert!(document.component_problems().is_empty());
     for slide in 0..document.slide_count() {
